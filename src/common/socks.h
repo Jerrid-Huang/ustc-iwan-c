@@ -14,9 +14,11 @@ typedef struct {
     uint16_t sid;
     uint32_t token;
     uint8_t  encryption;
+    int      gso_ok;       /* 0 untried, 1 usable, -1 failed */
+    size_t   gso_mss;      /* last UDP_SEGMENT mss set, 0 = none */
 } SocksConfig;
 
 /* Run SOCKS5 server (blocks). sockfd = authenticated UDP socket. */
-void run_socks(int sockfd, const SocksConfig *cfg);
+void run_socks(int sockfd, SocksConfig *cfg);
 
 #endif

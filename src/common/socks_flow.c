@@ -364,9 +364,32 @@ void service_local_inputs(Flow *fs) {
             buf_put(&f->input, rbuf, (size_t)n);
             process_socks_handshake(f);
         } else if (n > 0) {
+            /* feed the stack until it stops accepting (pending full) or
+             * the local socket is drained; one 16KB read per round would
+             * cap the pipe at 16KB/round and leave the sndbuf idle */
             size_t sent = ns_send(&g_ns, f->ns_idx, rbuf, (size_t)n);
-            if (sent < (size_t)n)
+            if (sent < (size_t)n) {
                 buf_put(&f->input, rbuf + sent, (size_t)n - sent);
+            } else {
+                for (;;) {
+                    ssize_t r2 = read(f->fd, rbuf, sizeof rbuf);
+                    if (r2 > 0) {
+                        size_t s2 = ns_send(&g_ns, f->ns_idx, rbuf,
+                                            (size_t)r2);
+                        if (s2 < (size_t)r2) {
+                            buf_put(&f->input, rbuf + s2, (size_t)r2 - s2);
+                            break;
+                        }
+                    } else if (r2 == 0) {
+                        f->local_eof = true;
+                        ns_close(&g_ns, f->ns_idx);
+                        set_flow_state(f, ST_CLOSING);
+                        break;
+                    } else {
+                        break;   /* EAGAIN or error */
+                    }
+                }
+            }
         } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
             f->local_eof = true;
             if (f->ns_idx >= 0) {

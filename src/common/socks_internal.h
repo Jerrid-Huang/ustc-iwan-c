@@ -56,11 +56,9 @@ extern volatile sig_atomic_t g_stop;
 void on_sig(int sig);
 void wait_events(int listener, int sockfd, int timeout_ms);
 void accept_connections(int listener);
-void send_vpn_packet(int sockfd, const uint8_t *pkt, size_t n,
-                     const SocksConfig *cfg);
 void send_vpn_keepalive(int sockfd, const SocksConfig *cfg,
                         uint64_t *last_ka);
-int  receive_vpn(int sockfd, const SocksConfig *cfg);
+int  receive_vpn(int sockfd, SocksConfig *cfg);
 
 /* ---- flow lifecycle / SOCKS5 handshake / DNS / port alloc / I/O (socks_flow.c) ---- */
 uint64_t now_mono(void);

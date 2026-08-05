@@ -16,7 +16,7 @@
 #define NS_WINDOW         16384u
 #define NS_RTO_INIT       500u
 #define NS_RTO_MAX        8000u
-#define NS_MAX_OUTSTANDING 8
+#define NS_MAX_OUTSTANDING 48
 #define NS_MAX_SYN_TRIES  6
 #define NS_IDLE_TIMEOUT   120000u
 #define NS_CONNECT_TIMEOUT 30000u
@@ -627,10 +627,11 @@ static bool conn_retransmit_loop(Netstack *ns, TcpConn *c, NsPriv *p, int idx,
  * outstanding/window limits */
 static void conn_send_new(Netstack *ns, TcpConn *c, NsPriv *p, uint64_t now) {
     uint32_t in_flight = c->snd_nxt - c->snd_una;
+    size_t consumed = 0;
     while (p->nsegs < NS_MAX_OUTSTANDING && in_flight < c->remote_win) {
-        if (p->pending.len > 0) {
+        if (p->pending.len - consumed > 0) {
             uint32_t win_free = c->remote_win - in_flight;
-            size_t seglen = p->pending.len;
+            size_t seglen = p->pending.len - consumed;
             Seg *s = &p->segs[p->nsegs];
             if (seglen > c->mss)
                 seglen = c->mss;
@@ -642,13 +643,13 @@ static void conn_send_new(Netstack *ns, TcpConn *c, NsPriv *p, uint64_t now) {
             s->cnt = 1;
             s->fin = 0;
             s->last_sent_ms = now;
-            memcpy(s->data, p->pending.data, seglen);
+            memcpy(s->data, p->pending.data + consumed, seglen);
             emit_tcp(ns, c, TCP_ACK, s->seq, c->rcv_nxt, s->data,
                      (uint16_t)seglen, 0);
             p->nsegs++;
             c->snd_nxt += (uint32_t)seglen;
             in_flight += (uint32_t)seglen;
-            b_consume(&p->pending, seglen);
+            consumed += seglen;
         } else if (c->local_fin && !p->fin_sent) {
             Seg *s = &p->segs[p->nsegs];
             s->seq = c->snd_nxt;
@@ -667,6 +668,8 @@ static void conn_send_new(Netstack *ns, TcpConn *c, NsPriv *p, uint64_t now) {
             break;
         }
     }
+    if (consumed > 0)
+        b_consume(&p->pending, consumed);   /* one memmove per round */
 }
 
 /* earliest retransmit deadline (ms) of the queued segments; INT64_MAX if none */
