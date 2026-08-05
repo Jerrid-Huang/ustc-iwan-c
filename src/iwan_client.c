@@ -230,6 +230,7 @@ static void parse_cmd(int argc, char **argv, int start, const char *sub,
 {
     g_usage_sub = sub;
     Cli u;
+    memset(&u, 0, sizeof u);
     cli_ctl ctl = {
         .on_help = on_help,
         .version_is_unknown = true,
