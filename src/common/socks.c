@@ -16,6 +16,8 @@
 #include "common.h"
 #include "crypto.h"
 #include "netstack.h"
+
+
 #include "protocol.h"
 #include "socks.h"
 #include "socks_internal.h"
@@ -90,7 +92,7 @@ void accept_connections(int listener) {
 /* ---- VPN framing (mirrors netstack/tunnel.rs) ---- */
 
 #define SOCKS_TX_MAX 65543   /* one GSO unit (65507) + one 8B header */
-#define SOCKS_MAX_PK 64      /* drain the whole tx queue: 48 segments +
+#define SOCKS_MAX_PK 128     /* drain the whole tx queue: 48 segments +
                               * control ACKs must not accumulate (a 48-item
                               * cap left 1 item/round and drop-oldest
                               * evicted ACKs under load) */
@@ -103,10 +105,9 @@ void accept_connections(int listener) {
  * stop the proxy. */
 static void socks_send_batch2(int sockfd, SocksConfig *cfg,
                               struct iovec *iovs, struct mmsghdr *msgs,
-                              int npk, size_t total, int uniform,
-                              size_t mss)
+                              int npk, size_t total, size_t mss)
 {
-    if (npk >= 2 && uniform && total <= 65507) {
+    if (npk >= 2 && total <= 65507) {
         if (cfg->gso_ok == 0) {
             int m = (int)mss;
             cfg->gso_ok = setsockopt(sockfd, SOL_UDP, UDP_SEGMENT,
@@ -198,19 +199,13 @@ static void sock_drain_tx(int sockfd, SocksConfig *cfg)
     struct mmsghdr msgs[SOCKS_MAX_PK];
     const TxItem *items[SOCKS_MAX_PK];
     size_t lens[SOCKS_MAX_PK];
-    int npk = 0, uniform = 1;
-    size_t mss = 0, total = 0;
+    int npk = 0;
+    size_t total = 0;
     const TxItem *it;
     (void)cfg;
 
     while (npk < SOCKS_MAX_PK && (it = ns_tx_peek(&g_ns)) != NULL) {
         size_t l = ns_tx_item_len(it);
-        if (npk > 0 && total + l > 65507 && uniform)
-            break;                     /* GSO unit cap: leave for next */
-        if (npk == 0)
-            mss = l;
-        else if (l != mss)
-            uniform = 0;
         items[npk] = it;
         lens[npk] = l;
         total += l;
@@ -223,7 +218,22 @@ static void sock_drain_tx(int sockfd, SocksConfig *cfg)
         iovs[k].iov_base = (void *)ns_tx_item_buf(items[k]);
         iovs[k].iov_len = lens[k];
     }
-    socks_send_batch2(sockfd, cfg, iovs, msgs, npk, total, uniform, mss);
+    /* drain the whole queue in uniform runs: a GSO cap of 65507 must not
+     * leave items behind, because their segment pointers go stale once
+     * receive_vpn/ns_tick drop+compact the retransmit table */
+    for (int k = 0; k < npk;) {
+        size_t run_total = lens[k];
+        int j = k;
+        while (j + 1 < npk && lens[j + 1] == lens[k]) {
+            if (run_total + lens[k] > 65507)
+                break;                 /* split oversized uniform run */
+            run_total += lens[k];
+            j++;
+        }
+        socks_send_batch2(sockfd, cfg, iovs + k, msgs + k, j - k + 1,
+                          run_total, lens[k]);
+        k = j + 1;
+    }
 }
 
 void send_vpn_keepalive(int sockfd, const SocksConfig *cfg,
@@ -350,6 +360,14 @@ void run_socks(int sockfd, SocksConfig *cfg) {
     }
     set_nonblock(listener);
     set_nonblock(sockfd);
+    {
+        /* high-BDP tunnel: default UDP buffers (~212KB) overflow once
+         * the TCP window keeps >~150 segments in flight, silently
+         * dropping packets at full rate */
+        int rbuf = 4 * 1024 * 1024;
+        setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &rbuf, sizeof rbuf);
+        setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &rbuf, sizeof rbuf);
+    }
 
     /* Rust prints the configured address (config.listen), not the bound one */
     const char *listen_s = cfg->listen_str ? cfg->listen_str : "?";
@@ -388,6 +406,10 @@ void run_socks(int sockfd, SocksConfig *cfg) {
     uint64_t last_ka = now_mono() - 10000;
 
     while (!g_stop) {
+        /* flush leftover tx items first: their segment pointers stay
+         * valid only until receive_vpn's handle_rx drop/compact moves
+         * the retransmit table */
+        sock_drain_tx(sockfd, cfg);
         send_vpn_keepalive(sockfd, cfg, &last_ka);
         accept_connections(listener);
         if (receive_vpn(sockfd, cfg) < 0)
@@ -395,10 +417,11 @@ void run_socks(int sockfd, SocksConfig *cfg) {
         service_local_inputs(g_flows);
         handle_dns_results();
         /* consume the rxq BEFORE ns_tick advertises the window: an
-         * unconsumed 16KB rxq would make conn_win() report 0 and the
-         * peer would stop echoing (advertised-window stall) */
+         * unconsumed rxq would make conn_win() report 0 and the peer
+         * would stop echoing (advertised-window stall) */
         service_local_outputs();
         int tick_ms = ns_tick(&g_ns, now_mono());
+        /* flush freshly enqueued segments (same-round, pointers valid) */
         sock_drain_tx(sockfd, cfg);
         update_tcp_states();
         reap_flows();

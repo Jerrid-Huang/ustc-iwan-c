@@ -15,16 +15,16 @@
 #include "protocol.h"
 #include "util.h"
 
-#define NS_TX_MAX         64
-#define NS_WINDOW         16384u
+#define NS_WINDOW         65535u
+#define NS_WSCALE         6u      /* our advertised window shift */
 #define NS_RTO_INIT       500u
 #define NS_RTO_MAX        8000u
-#define NS_MAX_OUTSTANDING 48
+#define NS_MAX_OUTSTANDING 128
 #define NS_MAX_SYN_TRIES  6
 #define NS_IDLE_TIMEOUT   120000u
 #define NS_CONNECT_TIMEOUT 30000u
 #define NS_SEND_CAP       (64u * 1024u)
-#define NS_SEG_CAP        2048u
+#define NS_SEG_CAP        1408u
 
 #define TCP_FIN 0x01
 #define TCP_SYN 0x02
@@ -102,6 +102,12 @@ static uint16_t conn_win(const TcpConn *c)
 {
     uint32_t free = NS_WINDOW - (uint32_t)c->rxq.len;
     return free > 0xFFFF ? 0xFFFF : (uint16_t)free;
+}
+
+/* window field on the wire: actual bytes >> our shift */
+static uint16_t conn_win_field(const TcpConn *c)
+{
+    return (uint16_t)(conn_win(c) >> NS_WSCALE);
 }
 
 /* Incremental 16-bit one's-complement checksum update for ack/win
@@ -215,7 +221,7 @@ static void emit_tcp(Netstack *ns, TcpConn *c, uint8_t flags, uint32_t seq,
     /* control packet: [8B outer VPN header][IP hdr][TCP hdr][opt/data].
      * No payload on control packets, so no XOR needed. */
     uint8_t pkt[64];
-    size_t olen = mss_opt ? 4 : 0;
+    size_t olen = mss_opt ? (4 + 3 + 1) : 0;   /* MSS + WSCALE + NOP pad */
     size_t thlen = 20 + olen;
     size_t iplen = 20 + thlen + dlen;
     uint8_t *ip = pkt + 8;
@@ -240,13 +246,17 @@ static void emit_tcp(Netstack *ns, TcpConn *c, uint8_t flags, uint32_t seq,
     wr_be32(t + 8, ack);
     t[12] = (uint8_t)((thlen / 4) << 4);
     t[13] = flags;
-    wr_be16(t + 14, conn_win(c));
+    wr_be16(t + 14, conn_win_field(c));
     wr_be16(t + 16, 0);
     wr_be16(t + 18, 0);
     if (olen) {
         t[20] = 2;
         t[21] = 4;
         wr_be16(t + 22, mss_opt);
+        t[24] = 3;          /* WSCALE */
+        t[25] = 3;
+        t[26] = (uint8_t)NS_WSCALE;
+        t[27] = 1;          /* NOP pad to 4-byte alignment */
     }
     if (dlen)
         memcpy(t + thlen, data, dlen);
@@ -262,6 +272,30 @@ static void emit_tcp(Netstack *ns, TcpConn *c, uint8_t flags, uint32_t seq,
 
 static bool validate_inner_ipv4(const uint8_t *pkt, size_t len, size_t mtu) {
     return len != 0 && len <= mtu && (pkt[0] >> 4) == 4 && len >= 20;
+}
+
+static uint8_t parse_wscale(const uint8_t *opts, size_t olen)
+{
+    size_t i = 0;
+    while (i < olen) {
+        uint8_t k = opts[i];
+        uint8_t l;
+        if (k == 0)
+            break;
+        if (k == 1) {
+            i++;
+            continue;
+        }
+        if (i + 1 >= olen || opts[i + 1] < 2)
+            break;
+        l = opts[i + 1];
+        if (i + l > olen)
+            break;
+        if (k == 3 && l == 3)
+            return opts[i + 2] > 14 ? 14 : opts[i + 2];
+        i += l;
+    }
+    return 0;
 }
 
 static uint16_t parse_mss(const uint8_t *opts, size_t olen) {
@@ -355,9 +389,10 @@ static void handle_rx(Netstack *ns, TcpConn *c, int idx, const uint8_t *t,
         om = parse_mss(t + 20, thlen - 20);
         if (om > 0 && om < c->mss)
             c->mss = om;
+        c->peer_scale = parse_wscale(t + 20, thlen - 20);
         c->rcv_nxt = seq + 1;
         c->snd_una = ack;
-        c->remote_win = win;
+        c->remote_win = (uint32_t)win << c->peer_scale;
         c->state = NS_ESTABLISHED;
         c->state_ms = now;
         c->last_rx_ms = now;
@@ -378,7 +413,7 @@ static void handle_rx(Netstack *ns, TcpConn *c, int idx, const uint8_t *t,
     if (!(flags & TCP_ACK))
         return;
     c->last_rx_ms = now;
-    c->remote_win = win;
+    c->remote_win = (uint32_t)win << c->peer_scale;
     if ((int32_t)(ack - c->snd_una) > 0)
         c->snd_una = ack;
     drop_acked(c, p);
@@ -770,7 +805,7 @@ static bool conn_retransmit_loop(Netstack *ns, TcpConn *c, NsPriv *p, int idx,
             uint8_t *t = ip + 20;
             uint32_t old_ack = rd_be32(t + 8);
             uint16_t old_win = rd_be16(t + 14);
-            uint16_t win = conn_win(c);
+            uint16_t win = conn_win_field(c);
             if (ns->outer_hdr[1])
                 xor_crypt(ip, 40, ns->xor_key, 8);
             wr_be32(t + 8, c->rcv_nxt);
@@ -821,7 +856,7 @@ static void conn_send_new(Netstack *ns, TcpConn *c, NsPriv *p, uint64_t now) {
             uint8_t *t = ip + 20;
             uint32_t old_ack = rd_be32(t + 8);
             uint16_t old_win = rd_be16(t + 14);
-            uint16_t win = conn_win(c);
+            uint16_t win = conn_win_field(c);
             if (ns->outer_hdr[1])
                 xor_crypt(ip, 40, ns->xor_key, 8);
             wr_be32(t + 8, c->rcv_nxt);

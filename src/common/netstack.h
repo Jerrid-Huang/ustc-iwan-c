@@ -15,6 +15,7 @@ typedef struct TxItem {
 } TxItem;
 
 #define DNS_SERVER_IP "114.114.114.114"
+#define NS_TX_MAX     128      /* device queue slots */
 
 /* ---------------- userspace TCP connection ---------------- */
 typedef struct TcpConn TcpConn;
@@ -54,7 +55,8 @@ struct TcpConn {
     uint64_t state_ms;      /* when state last changed */
     uint64_t last_rx_ms;
     uint16_t mss;
-    uint32_t remote_win;    /* last advertised window */
+    uint8_t  peer_scale;    /* peer's window shift (WSCALE) */
+    uint32_t remote_win;    /* last advertised window, unscaled */
 };
 
 #define NS_MAX_CONN 64
@@ -68,7 +70,7 @@ typedef struct {
     uint8_t  xor_key[8];    /* payload cipher, filled after auth */
     TcpConn conns[NS_MAX_CONN];
     /* device queue: ready packets (segment-slot pointers or control) */
-    struct TxItem tx_queue[64];
+    struct TxItem tx_queue[NS_TX_MAX];
     int tx_head, tx_count;
     NsHooks hooks;
 } Netstack;
