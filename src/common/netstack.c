@@ -71,14 +71,27 @@ static void wr_be32(uint8_t *p, uint32_t v) {
 }
 
 static uint32_t csum_buf(uint32_t sum, const uint8_t *p, size_t n) {
+    /* big-endian 32-bit words into a 64-bit accumulator (Linux
+     * csum_partial style): 4-byte steps, no carry loss for segment-sized
+     * buffers; the single final fold matches the old 16-bit path */
+    uint64_t acc = sum;
+    while (n >= 4) {
+        uint32_t v = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                     ((uint32_t)p[2] << 8) | p[3];
+        acc += v;
+        p += 4;
+        n -= 4;
+    }
     while (n >= 2) {
-        sum += ((uint32_t)p[0] << 8) | p[1];
+        acc += ((uint32_t)p[0] << 8) | p[1];
         p += 2;
         n -= 2;
     }
     if (n)
-        sum += (uint32_t)p[0] << 8;
-    return sum;
+        acc += (uint32_t)p[0] << 8;
+    while (acc >> 32)
+        acc = (acc & 0xffffffffu) + (acc >> 32);
+    return (uint32_t)acc;
 }
 
 static uint16_t csum_fold(uint32_t sum) {
@@ -248,17 +261,23 @@ static uint16_t parse_mss(const uint8_t *opts, size_t olen) {
 }
 
 static bool drop_acked(TcpConn *c, NsPriv *p) {
-    int w = 0;
-    for (int i = 0; i < p->nsegs; i++) {
+    /* segments are appended in seq order and ACKs are cumulative, so only
+     * a prefix of the retransmit table can be acked; scan from the head
+     * (was: full-table scan per ACK, the RX hot path) */
+    int i = 0;
+    while (i < p->nsegs) {
         Seg *s = &p->segs[i];
         uint32_t end = s->seq + s->len + (s->fin ? 1u : 0u);
-        if ((int32_t)(c->snd_una - end) >= 0)
-            continue;
-        if (w != i)
-            p->segs[w] = p->segs[i];
-        w++;
+        if ((int32_t)(c->snd_una - end) < 0)
+            break;
+        i++;
     }
-    p->nsegs = w;
+    if (i > 0) {
+        if (i < p->nsegs)
+            memmove(p->segs, p->segs + i,
+                    (size_t)(p->nsegs - i) * sizeof *p->segs);
+        p->nsegs -= i;
+    }
     return true;
 }
 

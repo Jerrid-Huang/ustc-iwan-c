@@ -64,6 +64,11 @@ static void *dns_worker(void *arg) {
     DnsJob *j = (DnsJob *)arg;
     uint32_t ip = dns_query_a(j->domain);
     dns_push(j->flow_id, ip != 0, ip, j->port);
+    if (g_dns_evfd >= 0) {
+        uint64_t one = 1;
+        ssize_t w = write(g_dns_evfd, &one, sizeof one);   /* wake loop */
+        (void)w;
+    }
     free(j->domain);
     free(j);
     return NULL;
@@ -292,6 +297,22 @@ void handle_dns_results(void) {
             break;
         }
     }
+}
+
+/* ms until the earliest ST_CONNECTING flow times out, INT64_MAX if none */
+int64_t next_conn_timeout_ms(void)
+{
+    int64_t d = INT64_MAX;
+    uint64_t now = now_ms();
+    for (int i = 0; i < MAX_FLOWS; i++) {
+        Flow *f = &g_flows[i];
+        if (f->active && f->state == ST_CONNECTING) {
+            int64_t dd = (int64_t)(f->state_ms + CONNECT_TIMEOUT - now);
+            if (dd < d)
+                d = dd;
+        }
+    }
+    return d;
 }
 
 void update_tcp_states(void) {

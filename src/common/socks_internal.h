@@ -49,12 +49,13 @@ typedef struct {
 extern Netstack g_ns;
 extern Flow *g_flows;          /* NULL-terminated? no: MAX_FLOWS array */
 extern uint64_t g_next_id;
+extern int g_dns_evfd;         /* -1 = disabled; written by DNS workers */
 extern int g_flow_len;         /* active count */
 extern volatile sig_atomic_t g_stop;
 
 /* ---- server lifecycle / event loop / VPN framing (socks.c) ---- */
 void on_sig(int sig);
-void wait_events(int listener, int sockfd, int timeout_ms);
+void wait_events(int listener, int sockfd, int dns_evfd, int timeout_ms);
 void accept_connections(int listener);
 void send_vpn_keepalive(int sockfd, const SocksConfig *cfg,
                         uint64_t *last_ka);
@@ -74,6 +75,7 @@ void open_tcp_connection(Flow *f, uint32_t rip, uint16_t rport);
 void process_socks_handshake(Flow *f);
 void handle_dns_results(void);
 void update_tcp_states(void);
+int64_t next_conn_timeout_ms(void);
 void service_local_inputs(Flow *fs);
 void service_local_outputs(void);
 void reap_flows(void);

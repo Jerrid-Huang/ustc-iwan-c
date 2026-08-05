@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -28,13 +29,14 @@ void on_sig(int sig) {
     g_stop = 1;
 }
 
+int g_dns_evfd = -1;      /* DNS workers write here to wake the loop */
 Flow *g_flows;          /* NULL-terminated? no: MAX_FLOWS array */
 
 /* event-driven wait: listener, VPN socket, and client flows; wakes on any
  * readable fd or the next netstack tick. Replaces fixed sleep polling. */
-void wait_events(int listener, int sockfd, int timeout_ms)
+void wait_events(int listener, int sockfd, int dns_evfd, int timeout_ms)
 {
-    struct pollfd fds[2 + MAX_FLOWS];
+    struct pollfd fds[3 + MAX_FLOWS];
     int n = 0;
     fds[n].fd = listener;
     fds[n].events = POLLIN;
@@ -42,6 +44,11 @@ void wait_events(int listener, int sockfd, int timeout_ms)
     fds[n].fd = sockfd;
     fds[n].events = POLLIN;
     n++;
+    if (dns_evfd >= 0) {
+        fds[n].fd = dns_evfd;
+        fds[n].events = POLLIN;
+        n++;
+    }
     for (int i = 0; i < MAX_FLOWS; i++) {
         Flow *f = &g_flows[i];
         if (!f->active)
@@ -367,6 +374,7 @@ void run_socks(int sockfd, SocksConfig *cfg) {
         return;
     }
     g_next_id = 1;
+    g_dns_evfd = eventfd(0, EFD_NONBLOCK);
 
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
@@ -399,12 +407,26 @@ void run_socks(int sockfd, SocksConfig *cfg) {
         service_local_outputs();
         reap_flows();
 
-        int d = tick_ms;
+        /* event-driven wait: sleep until the earliest real deadline
+         * (retransmit/idle, keepalive, connect timeout) instead of a fixed
+         * 10ms tick; DNS completions wake us via the eventfd */
+        int64_t d = tick_ms;
+        int64_t kad = (int64_t)last_ka + 10000 - (int64_t)now_ms();
+        int64_t ctd = next_conn_timeout_ms();
+        if (kad < d)
+            d = kad;
+        if (ctd < d)
+            d = ctd;
         if (d < 0)
             d = 0;
-        if (d > 10)
-            d = 10;   /* cap: DNS-thread results are noticed via timeout */
-        wait_events(listener, sockfd, d);
+        if (d > 1000)
+            d = 1000;   /* safety ceiling, not a polling tick */
+        wait_events(listener, sockfd, g_dns_evfd, (int)d);
+        if (g_dns_evfd >= 0) {
+            uint64_t ev;
+            ssize_t r = read(g_dns_evfd, &ev, sizeof ev);
+            (void)r;   /* EFD_NONBLOCK: drain the counter */
+        }
     }
 
     for (int i = 0; i < MAX_FLOWS; i++) {
@@ -422,6 +444,10 @@ void run_socks(int sockfd, SocksConfig *cfg) {
     }
 
     close(listener);
+    if (g_dns_evfd >= 0) {
+        close(g_dns_evfd);
+        g_dns_evfd = -1;
+    }
     for (int i = 0; i < MAX_FLOWS; i++)
         flow_free(&g_flows[i]);
     free(g_flows);
