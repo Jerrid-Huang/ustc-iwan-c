@@ -17,7 +17,7 @@
 
 #define NS_WINDOW         65535u
 #define NS_WSCALE         6u      /* our advertised window shift */
-#define NS_RTO_INIT       500u
+#define NS_RTO_INIT       1000u
 #define NS_RTO_MAX        8000u
 #define NS_MAX_OUTSTANDING 128
 #define NS_MAX_SYN_TRIES  6
@@ -39,7 +39,7 @@
 #define SEG_HDR_LEN 48
 typedef struct {
     uint32_t seq;
-    uint16_t len;              uint8_t  rto;
+    uint16_t len;              uint16_t rto;
     uint8_t  cnt;
     uint8_t  fin;
     uint8_t  sent;             uint64_t last_sent_ms;
@@ -414,8 +414,34 @@ static void handle_rx(Netstack *ns, TcpConn *c, int idx, const uint8_t *t,
         return;
     c->last_rx_ms = now;
     c->remote_win = (uint32_t)win << c->peer_scale;
-    if ((int32_t)(ack - c->snd_una) > 0)
+    if ((int32_t)(ack - c->snd_una) > 0) {
+        /* RTT sample: the oldest segment this ACK covers (snd_una moves
+         * to the ack'ed frontier; scan for the first covered segment) */
+        for (int j = 0; j < p->nsegs; j++) {
+            Seg *s2 = seg_at(p, j);
+            uint32_t end = s2->seq + s2->len + (s2->fin ? 1u : 0u);
+            if ((int32_t)(ack - end) < 0)
+                break;
+            if (s2->sent && s2->last_sent_ms > 0 &&
+                (int32_t)(ack - c->snd_una) >= 0) {
+                uint32_t rtt = (uint32_t)(now - s2->last_sent_ms);
+                if (rtt < 10000) {
+                    uint32_t sr = c->srtt ? c->srtt : rtt;
+                    uint32_t var = c->rttvar ? c->rttvar : sr / 2;
+                    c->srtt = (uint16_t)((sr * 7 + rtt) / 8);
+                    var = (var * 3 +
+                           (sr > rtt ? sr - rtt : rtt - sr)) / 4;
+                    c->rttvar = (uint16_t)var;
+                    uint32_t rto = c->srtt + 4u * var;
+                    c->rto = (uint16_t)(rto < 200 ? 200
+                                        : (rto > NS_RTO_MAX ? NS_RTO_MAX
+                                                            : rto));
+                }
+                break;             /* oldest covered segment only */
+            }
+        }
         c->snd_una = ack;
+    }
     drop_acked(c, p);
     if (p->fin_sent && (int32_t)(ack - c->snd_nxt) >= 0 &&
         (c->state == NS_FIN_WAIT ||
@@ -498,6 +524,7 @@ int ns_connect(Netstack *ns, uint16_t lport, uint32_t rip, uint16_t rport) {
     c->state_ms = now;
     c->last_rx_ms = now;
     c->remote_win = NS_WINDOW;
+    c->rto = (uint16_t)NS_RTO_INIT;
     mss = (int)ns->mtu - 40;
     c->mss = (uint16_t)(mss < 536 ? 536 : (mss > 1460 ? 1460 : mss));
 
@@ -906,7 +933,7 @@ static void conn_send_new(Netstack *ns, TcpConn *c, NsPriv *p, uint64_t now) {
         tx_enqueue(ns, s, NULL, 0);
         s->sent = 1;
         s->last_sent_ms = now;
-        s->rto = (uint8_t)NS_RTO_INIT;
+        s->rto = c->rto;
         s->cnt = 1;
         c->sent_nxt = s->seq + s->len + (s->fin ? 1u : 0u);
         in_flight = c->sent_nxt - c->snd_una;

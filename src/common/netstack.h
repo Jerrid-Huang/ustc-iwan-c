@@ -62,6 +62,10 @@ struct TcpConn {
     uint8_t  ack_pending;
     uint8_t  rx_segs;
     uint64_t ack_ms;
+    /* smoothed RTT estimates (ms): RTO = srtt + 4*rttvar */
+    uint16_t srtt;
+    uint16_t rttvar;
+    uint16_t rto;
 };
 
 #define NS_MAX_CONN 64
