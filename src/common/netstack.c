@@ -437,7 +437,14 @@ static void handle_rx(Netstack *ns, TcpConn *c, int idx, const uint8_t *t,
                 emit_tcp(ns, c, TCP_ACK, c->snd_nxt, c->rcv_nxt, NULL, 0, 0);
             }
         } else if (paylen > 0) {
-            emit_tcp(ns, c, TCP_ACK, c->snd_nxt, c->rcv_nxt, NULL, 0, 0);
+            if (!c->ack_pending)
+                c->ack_ms = now;
+            c->ack_pending = 1;
+            if (++c->rx_segs >= 2) {     /* RFC 1122: ACK every 2nd seg */
+                c->rx_segs = 0;
+                emit_tcp(ns, c, TCP_ACK, c->snd_nxt, c->rcv_nxt, NULL, 0, 0);
+                c->ack_pending = 0;
+            }
         }
     } else {
         emit_tcp(ns, c, TCP_ACK, c->snd_nxt, c->rcv_nxt, NULL, 0, 0);
@@ -545,6 +552,7 @@ static void seg_seal(Netstack *ns, TcpConn *c, NsPriv *p, uint8_t extra)
     wr_be16(t, c->lport);
     wr_be16(t + 2, c->rport);
     wr_be32(t + 4, s->seq);
+    wr_be32(t + 8, c->rcv_nxt);
     t[12] = 0x50;
     t[13] = (uint8_t)(TCP_ACK | extra);
     wr_be16(t + 14, conn_win(c));                  wr_be16(t + 16, 0);
@@ -926,6 +934,13 @@ int ns_tick(Netstack *ns, uint64_t now) {
             if (conn_retransmit_loop(ns, c, p, i, now))
                 continue;
             conn_send_new(ns, c, p, now);
+            /* delayed ACK: flush pending at 40ms so the peer's window
+             * advances even under low/irregular traffic */
+            if (c->ack_pending && now - c->ack_ms >= 40) {
+                c->ack_pending = 0;
+                c->rx_segs = 0;
+                emit_tcp(ns, c, TCP_ACK, c->snd_nxt, c->rcv_nxt, NULL, 0, 0);
+            }
             d = conn_next_deadline(p, now);
         }
         d = (int64_t)(c->last_rx_ms + NS_IDLE_TIMEOUT - now);

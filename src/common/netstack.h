@@ -57,6 +57,11 @@ struct TcpConn {
     uint16_t mss;
     uint8_t  peer_scale;    /* peer's window shift (WSCALE) */
     uint32_t remote_win;    /* last advertised window, unscaled */
+    /* delayed-ACK state: pending flag, segment count (2 -> immediate
+     * ACK), timestamp of the first unacked segment */
+    uint8_t  ack_pending;
+    uint8_t  rx_segs;
+    uint64_t ack_ms;
 };
 
 #define NS_MAX_CONN 64
