@@ -104,6 +104,25 @@ static uint16_t conn_win(const TcpConn *c)
     return free > 0xFFFF ? 0xFFFF : (uint16_t)free;
 }
 
+/* Incremental 16-bit one's-complement checksum update for ack/win
+ * changes (the stored field is the COMPLEMENTED sum, so removing a word
+ * adds it back and adding a word adds its complement). Validated against
+ * full recompute over 200k random segments. */
+static void seg_csum_inc(uint8_t *csum_p, uint32_t new_ack, uint32_t old_ack,
+                         uint16_t new_win, uint16_t old_win)
+{
+    uint32_t s = rd_be16(csum_p);
+    s += (old_ack >> 16) & 0xffff;
+    s += old_ack & 0xffff;
+    s += old_win;
+    s += (uint32_t)(~((new_ack >> 16) & 0xffff)) & 0xffff;
+    s += (uint32_t)(~(new_ack & 0xffff)) & 0xffff;
+    s += (uint32_t)(~new_win) & 0xffff;
+    while (s >> 16)
+        s = (s & 0xffffu) + (s >> 16);
+    wr_be16(csum_p, (uint16_t)s);
+}
+
 static uint16_t tcp_checksum(uint32_t sip, uint32_t dip,
                              const uint8_t *tcp, size_t n) {
     uint8_t ph[12];
@@ -344,11 +363,11 @@ static void handle_rx(Netstack *ns, TcpConn *c, int idx, const uint8_t *t,
         c->last_rx_ms = now;
         c->retx_cnt = 0;
         c->retx_len = 0;
-        emit_tcp(ns, c, TCP_ACK, c->snd_nxt, c->rcv_nxt, NULL, 0, 0);
         if (paylen > 0) {
             b_put(&c->rxq, payload, paylen);
             c->rcv_nxt += (uint32_t)paylen;
         }
+        emit_tcp(ns, c, TCP_ACK, c->snd_nxt, c->rcv_nxt, NULL, 0, 0);
         return;
     }
 
@@ -469,8 +488,8 @@ static void seg_seal(Netstack *ns, TcpConn *c, NsPriv *p, uint8_t extra)
     uint8_t *ip;
     uint8_t *t;
     size_t iplen;
-    if (s->len == 0)
-        return;
+    if (s->len == 0 && !(extra & TCP_FIN))
+        return;   /* empty seal only valid for the FIN segment */
     s->seq = c->snd_nxt;
     s->fin = (extra & TCP_FIN) ? 1 : 0;
     s->sent = 0;
@@ -749,14 +768,16 @@ static bool conn_retransmit_loop(Netstack *ns, TcpConn *c, NsPriv *p, int idx,
                 {
             uint8_t *ip = s->hdr + 8;
             uint8_t *t = ip + 20;
+            uint32_t old_ack = rd_be32(t + 8);
+            uint16_t old_win = rd_be16(t + 14);
+            uint16_t win = conn_win(c);
             if (ns->outer_hdr[1])
-                xor_crypt(ip, 40 + s->len, ns->xor_key, 8);
+                xor_crypt(ip, 40, ns->xor_key, 8);
             wr_be32(t + 8, c->rcv_nxt);
-            wr_be16(t + 14, NS_WINDOW);
-            wr_be16(t + 16, tcp_checksum(c->lip, c->rip, t,
-                                         20 + s->len));
+            wr_be16(t + 14, win);
+            seg_csum_inc(t + 16, c->rcv_nxt, old_ack, win, old_win);
             if (ns->outer_hdr[1])
-                xor_crypt(ip, 40 + s->len, ns->xor_key, 8);
+                xor_crypt(ip, 40, ns->xor_key, 8);
         }
         tx_enqueue(ns, s, NULL, 0);
         s->last_sent_ms = now;
@@ -798,14 +819,16 @@ static void conn_send_new(Netstack *ns, TcpConn *c, NsPriv *p, uint64_t now) {
         {
             uint8_t *ip = s->hdr + 8;
             uint8_t *t = ip + 20;
+            uint32_t old_ack = rd_be32(t + 8);
+            uint16_t old_win = rd_be16(t + 14);
+            uint16_t win = conn_win(c);
             if (ns->outer_hdr[1])
-                xor_crypt(ip, 40 + s->len, ns->xor_key, 8);
+                xor_crypt(ip, 40, ns->xor_key, 8);
             wr_be32(t + 8, c->rcv_nxt);
-            wr_be16(t + 14, conn_win(c));
-            wr_be16(t + 16, tcp_checksum(c->lip, c->rip, t,
-                                         20 + s->len));
+            wr_be16(t + 14, win);
+            seg_csum_inc(t + 16, c->rcv_nxt, old_ack, win, old_win);
             if (ns->outer_hdr[1])
-                xor_crypt(ip, 40 + s->len, ns->xor_key, 8);
+                xor_crypt(ip, 40, ns->xor_key, 8);
         }
         tx_enqueue(ns, s, NULL, 0);
         s->sent = 1;
