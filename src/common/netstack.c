@@ -414,7 +414,34 @@ static void handle_rx(Netstack *ns, TcpConn *c, int idx, const uint8_t *t,
         return;
     c->last_rx_ms = now;
     c->remote_win = (uint32_t)win << c->peer_scale;
-    if ((int32_t)(ack - c->snd_una) > 0) {
+    if (paylen == 0 && ack == c->snd_una && !(flags & (TCP_SYN | TCP_FIN)) &&
+        c->state != NS_SYN_SENT && c->snd_una != 0) {
+        /* fast retransmit: 3 duplicate ACKs -> resend the oldest
+         * unacked segment now instead of waiting for its RTO */
+        if (++c->dup_acks >= 3 && p->nsegs > 0) {
+            Seg *s0 = seg_at(p, 0);
+            if (s0->sent) {
+                uint8_t *ip = s0->hdr + 8;
+                uint8_t *t = ip + 20;
+                uint32_t old_ack = rd_be32(t + 8);
+                uint16_t old_win = rd_be16(t + 14);
+                uint16_t win = conn_win_field(c);
+                if (ns->outer_hdr[1])
+                    xor_crypt(ip, 40, ns->xor_key, 8);
+                wr_be32(t + 8, c->rcv_nxt);
+                wr_be16(t + 14, win);
+                seg_csum_inc(t + 16, c->rcv_nxt, old_ack, win, old_win);
+                if (ns->outer_hdr[1])
+                    xor_crypt(ip, 40, ns->xor_key, 8);
+                tx_enqueue(ns, s0, NULL, 0);
+                s0->last_sent_ms = now;
+                s0->rto = c->rto;
+                s0->cnt++;
+                c->dup_acks = 0;
+            }
+        }
+    } else if ((int32_t)(ack - c->snd_una) > 0) {
+        c->dup_acks = 0;
         /* RTT sample: the oldest segment this ACK covers (snd_una moves
          * to the ack'ed frontier; scan for the first covered segment) */
         for (int j = 0; j < p->nsegs; j++) {

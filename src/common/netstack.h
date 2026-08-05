@@ -66,6 +66,7 @@ struct TcpConn {
     uint16_t srtt;
     uint16_t rttvar;
     uint16_t rto;
+    uint8_t  dup_acks;      /* consecutive duplicate ACKs (fast retx) */
 };
 
 #define NS_MAX_CONN 64
