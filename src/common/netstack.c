@@ -22,6 +22,8 @@
 #define NS_MAX_OUTSTANDING 128
 #define NS_MAX_SYN_TRIES  6
 #define NS_IDLE_TIMEOUT   120000u
+#define NS_KEEPALIVE_MS   30000u
+#define NS_KEEPALIVE_MAX  3
 #define NS_CONNECT_TIMEOUT 30000u
 #define NS_SEND_CAP       (64u * 1024u)
 #define NS_SEG_CAP        1408u
@@ -413,6 +415,8 @@ static void handle_rx(Netstack *ns, TcpConn *c, int idx, const uint8_t *t,
     if (!(flags & TCP_ACK))
         return;
     c->last_rx_ms = now;
+    c->keepalive_cnt = 0;
+    c->keepalive_ms = 0;
     c->remote_win = (uint32_t)win << c->peer_scale;
     if (paylen == 0 && ack == c->snd_una && !(flags & (TCP_SYN | TCP_FIN)) &&
         c->state != NS_SYN_SENT && c->snd_una != 0) {
@@ -994,8 +998,22 @@ int ns_tick(Netstack *ns, uint64_t now) {
         if (c->state == NS_CLOSED)
             continue;
         if (now > c->last_rx_ms + NS_IDLE_TIMEOUT) {
-            ns_abort(ns, i);
-            continue;
+            /* idle: keepalive probe instead of dropping the conn; a
+             * probe is a bare ACK with seq = snd_nxt - 1, which any
+             * peer answers with an ACK for snd_nxt */
+            if (c->state != NS_ESTABLISHED) {
+                ns_abort(ns, i);
+                continue;
+            }
+            if (now >= c->keepalive_ms) {
+                emit_tcp(ns, c, TCP_ACK, c->snd_nxt - 1u, c->rcv_nxt,
+                         NULL, 0, 0);
+                c->keepalive_ms = now + NS_KEEPALIVE_MS;
+                if (++c->keepalive_cnt > NS_KEEPALIVE_MAX) {
+                    ns_abort(ns, i);
+                    continue;
+                }
+            }
         }
         if (c->state == NS_SYN_SENT && now > c->state_ms + NS_CONNECT_TIMEOUT) {
             ns_abort(ns, i);
