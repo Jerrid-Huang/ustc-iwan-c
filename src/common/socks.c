@@ -93,19 +93,17 @@ void accept_connections(int listener) {
 #define SOCKS_MAX_PK 48
 
 /* Send one accumulated batch: uniform batches (>=2 packets, total <= 65507)
- * go out as a single GSO sendmsg (kernel segments; wire-identical to
- * per-packet sends, same invariant the TUN pump relies on), everything
- * else via sendmmsg. EAGAIN/ENOBUFS block on POLLOUT instead of dropping;
- * only fatal errors stop the proxy. */
-static void socks_send_batch(int sockfd, SocksConfig *cfg, const uint8_t *tx,
-                             size_t blen, int npk, const size_t *offs,
-                             const size_t *lens, int uniform, size_t mss)
+ * go out as a single GSO sendmsg with a multi-iovec message (the kernel
+ * treats the iovecs as one continuous stream and segments it; wire output
+ * is identical to per-packet sends). Everything else goes via sendmmsg.
+ * EAGAIN/ENOBUFS block on POLLOUT instead of dropping; only fatal errors
+ * stop the proxy. */
+static void socks_send_batch2(int sockfd, SocksConfig *cfg,
+                              struct iovec *iovs, struct mmsghdr *msgs,
+                              int npk, size_t total, int uniform,
+                              size_t mss)
 {
-    struct mmsghdr msgs[SOCKS_MAX_PK];
-    struct iovec iovs[SOCKS_MAX_PK];
-
-    if (npk >= 2 && uniform && blen <= 65507) {
-        struct iovec iov = { .iov_base = (void *)tx, .iov_len = blen };
+    if (npk >= 2 && uniform && total <= 65507) {
         if (cfg->gso_ok == 0) {
             int m = (int)mss;
             cfg->gso_ok = setsockopt(sockfd, SOL_UDP, UDP_SEGMENT,
@@ -124,11 +122,11 @@ static void socks_send_batch(int sockfd, SocksConfig *cfg, const uint8_t *tx,
         if (cfg->gso_ok > 0) {
             struct msghdr mh;
             memset(&mh, 0, sizeof mh);
-            mh.msg_iov = &iov;
-            mh.msg_iovlen = 1;
+            mh.msg_iov = iovs;
+            mh.msg_iovlen = (size_t)npk;
             while (!g_stop) {
                 ssize_t r = sendmsg(sockfd, &mh, 0);
-                if (r == (ssize_t)blen)
+                if (r == (ssize_t)total)
                     return;
                 if (r < 0 &&
                     (errno == EAGAIN || errno == EWOULDBLOCK ||
@@ -156,11 +154,7 @@ static void socks_send_batch(int sockfd, SocksConfig *cfg, const uint8_t *tx,
         setsockopt(sockfd, SOL_UDP, UDP_SEGMENT, &z, sizeof z);
         cfg->gso_mss = 0;
     }
-    for (int k = 0; k < npk; k++) {
-        iovs[k].iov_base = (void *)(tx + offs[k]);
-        iovs[k].iov_len = 8 + lens[k];
-    }
-    memset(msgs, 0, sizeof msgs);   /* garbage msg_name would EFAULT */
+    memset(msgs, 0, (size_t)npk * sizeof *msgs);   /* zero msg_name etc */
     for (int k = 0; k < npk; k++) {
         msgs[k].msg_hdr.msg_iov = &iovs[k];
         msgs[k].msg_hdr.msg_iovlen = 1;
@@ -191,58 +185,42 @@ static void socks_send_batch(int sockfd, SocksConfig *cfg, const uint8_t *tx,
     }
 }
 
-/* Drain the netstack output queue into one batch and send it: packets are
- * appended to a contiguous buffer as [8B header][inner packet]; the whole
- * batch then goes out via GSO (uniform lengths) or sendmmsg. A packet that
- * would overflow the batch is carried over to the next flush (pend). */
+/* drain the netstack device queue: ready packets are referenced by
+ * pointer (zero-copy segment slots / inline control), batched, and sent
+ * via GSO (uniform lengths) or sendmmsg. Framing + XOR were done at seal
+ * time inside the stack. */
 static void sock_drain_tx(int sockfd, SocksConfig *cfg)
 {
-    static _Alignas(8) uint8_t tx[SOCKS_TX_MAX];
-    static uint8_t pend[2048];
-    static size_t pend_n;
-    static uint8_t scratch[2048];
-    size_t offs[SOCKS_MAX_PK], lens[SOCKS_MAX_PK];
-    size_t blen = 0;
+    struct iovec iovs[SOCKS_MAX_PK];
+    struct mmsghdr msgs[SOCKS_MAX_PK];
+    const TxItem *items[SOCKS_MAX_PK];
+    size_t lens[SOCKS_MAX_PK];
     int npk = 0, uniform = 1;
-    size_t mss = 0;
-    uint8_t typ = cfg->encryption ? PT_DATA_ENC : PT_DATA;
+    size_t mss = 0, total = 0;
+    const TxItem *it;
+    (void)cfg;
 
-    for (;;) {
-        size_t n;
-        if (pend_n) {
-            n = pend_n;
-            memcpy(scratch, pend, n);
-            pend_n = 0;
-        } else {
-            n = ns_device_pop(&g_ns, scratch, sizeof scratch);
-            if (n == 0)
-                break;
-        }
-        if (blen > 0 &&
-            (blen + 8 + n > SOCKS_TX_MAX || npk == SOCKS_MAX_PK)) {
-            /* batch full: carry this packet into the next flush */
-            memcpy(pend, scratch, n);
-            pend_n = n;
-            break;
-        }
+    while (npk < SOCKS_MAX_PK && (it = ns_tx_peek(&g_ns)) != NULL) {
+        size_t l = ns_tx_item_len(it);
+        if (npk > 0 && total + l > 65507)
+            break;                     /* GSO unit cap: leave for next */
         if (npk == 0)
-            mss = 8 + n;
-        else if (8 + n != mss)
+            mss = l;
+        else if (l != mss)
             uniform = 0;
-        pkhdr(typ, cfg->encryption, cfg->sid, cfg->token, tx + blen);
-        memcpy(tx + blen + 8, scratch, n);
-        offs[npk] = blen;
-        lens[npk] = n;
-        blen += 8 + n;
+        items[npk] = it;
+        lens[npk] = l;
+        total += l;
         npk++;
+        ns_tx_pop(&g_ns);
     }
-    if (npk > 0) {
-        if (cfg->encryption)
-            for (int k = 0; k < npk; k++)
-                xor_crypt(tx + offs[k] + 8, lens[k], cfg->xor_key, 8);
-        socks_send_batch(sockfd, cfg, tx, blen, npk, offs, lens, uniform,
-                         mss);
+    if (npk == 0)
+        return;
+    for (int k = 0; k < npk; k++) {
+        iovs[k].iov_base = (void *)ns_tx_item_buf(items[k]);
+        iovs[k].iov_len = lens[k];
     }
+    socks_send_batch2(sockfd, cfg, iovs, msgs, npk, total, uniform, mss);
 }
 
 void send_vpn_keepalive(int sockfd, const SocksConfig *cfg,
@@ -375,6 +353,12 @@ void run_socks(int sockfd, SocksConfig *cfg) {
 
     ns_init(&g_ns, cfg->inner_ip, cfg->gateway, (uint16_t)cfg->mtu,
             (uint32_t)((uint64_t)now_mono() ^ (uint32_t)getpid()));
+    {
+        uint8_t oh[8];
+        pkhdr(cfg->encryption ? PT_DATA_ENC : PT_DATA, cfg->encryption,
+              cfg->sid, cfg->token, oh);
+        ns_set_outer(&g_ns, oh, cfg->xor_key);
+    }
 
     g_flows = calloc(MAX_FLOWS, sizeof *g_flows);
     if (!g_flows) {
@@ -407,10 +391,8 @@ void run_socks(int sockfd, SocksConfig *cfg) {
             break;
         service_local_inputs(g_flows);
         handle_dns_results();
-
         int tick_ms = ns_tick(&g_ns, now_mono());
         sock_drain_tx(sockfd, cfg);
-
         update_tcp_states();
         service_local_outputs();
         reap_flows();
@@ -425,8 +407,9 @@ void run_socks(int sockfd, SocksConfig *cfg) {
             d = kad;
         if (ctd < d)
             d = ctd;
-        if (d < 0)
-            d = 0;
+        if (d < 1)
+            d = 1;      /* never busy-poll: an expired RTO would otherwise
+                         * make ns_tick return 0 and burn a core */
         if (d > 1000)
             d = 1000;   /* safety ceiling, not a polling tick */
         wait_events(listener, sockfd, g_dns_evfd, (int)d);

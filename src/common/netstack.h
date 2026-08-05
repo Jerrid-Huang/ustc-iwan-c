@@ -6,6 +6,14 @@
 #include <stdint.h>
 #include "common.h"
 
+/* device-queue item: a segment slot reference (zero-copy) or a small
+ * inline control packet */
+typedef struct TxItem {
+    const void *seg;   /* const Seg * in netstack.c */
+    uint16_t    clen;  /* 0 for segment items */
+    uint8_t     ctl[64];
+} TxItem;
+
 #define DNS_SERVER_IP "114.114.114.114"
 
 /* ---------------- userspace TCP connection ---------------- */
@@ -32,6 +40,7 @@ struct TcpConn {
     uint32_t lip, rip;      /* host-order IPv4 addrs */
     uint16_t lport, rport;  /* host order */
     uint32_t snd_una, snd_nxt, snd_isn;
+    uint32_t sent_nxt;      /* seq after the last TRANSMITTED segment */
     uint32_t rcv_nxt;
     bool     remote_fin;
     bool     local_fin;     /* we sent our FIN */
@@ -55,22 +64,31 @@ typedef struct {
     uint32_t gw;            /* gateway (host order) */
     uint16_t mtu;
     uint32_t isn_base;
+    uint8_t  outer_hdr[8];  /* VPN outer header, filled after auth */
+    uint8_t  xor_key[8];    /* payload cipher, filled after auth */
     TcpConn conns[NS_MAX_CONN];
-    /* device queue: complete IP packets to send to VPN */
-    buf_t tx_queue[64];
+    /* device queue: ready packets (segment-slot pointers or control) */
+    struct TxItem tx_queue[64];
     int tx_head, tx_count;
     NsHooks hooks;
 } Netstack;
 
 void ns_init(Netstack *ns, uint32_t inner_ip, uint32_t gw, uint16_t mtu, uint32_t seed);
 
+/* auth completed: record the outer VPN header and XOR key; data segments
+ * are framed and encrypted in place at seal time */
+void ns_set_outer(Netstack *ns, const uint8_t hdr[8], const uint8_t key[8]);
+
 /* find/allocate a conn slot; returns index or -1 */
 int  ns_connect(Netstack *ns, uint16_t lport, uint32_t rip, uint16_t rport);
 TcpConn *ns_conn(Netstack *ns, int idx);
 NsState ns_state(const TcpConn *c);
 
-/* queue app data to send; returns bytes queued (=n, buffered internally) */
-size_t ns_send(Netstack *ns, int idx, const uint8_t *data, size_t n);
+/* zero-copy app-data path: reserve writable space in the pending segment
+ * slot (read() straight into it), then commit what was filled. Returns
+ * NULL/0 when the stack is full (backpressure). */
+uint8_t *ns_send_reserve(Netstack *ns, int idx, size_t *room);
+void ns_send_commit(Netstack *ns, int idx, size_t n);
 /* read received data into out; returns n bytes (0 = none) */
 size_t ns_recv(Netstack *ns, int idx, uint8_t *out, size_t n);
 /* graceful close (FIN). */
@@ -85,8 +103,15 @@ void ns_rx_packet(Netstack *ns, const uint8_t *pkt, size_t n);
  * Returns ms until next needed tick (<=0 means immediately). */
 int  ns_tick(Netstack *ns, uint64_t now);
 
-/* pop one IP packet the stack wants to emit (to VPN). Returns len or 0. */
-size_t ns_device_pop(Netstack *ns, uint8_t *out, size_t maxlen);
+/* peek/pop one ready packet the stack wants to emit (to VPN).
+ * Returns a pointer (segment slot or inline control) or NULL. */
+const struct TxItem *ns_tx_peek(Netstack *ns);
+const struct TxItem *ns_tx_pop(Netstack *ns);
+/* TX item helpers: total packet length and send buffer (segment slot or
+ * inline control) */
+size_t ns_tx_item_len(const struct TxItem *it);
+const uint8_t *ns_tx_item_buf(const struct TxItem *it);
+#define NS_SEG_HDR_LEN 48    /* [8B outer][40B inner] before payload */
 
 /* ---------------- DNS (hardcoded 114.114.114.114) ---------------- */
 /* resolve domain to IPv4 via 114.114.114.114:53. Returns sock-order IP or 0. */

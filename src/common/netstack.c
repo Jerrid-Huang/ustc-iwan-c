@@ -10,6 +10,7 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 
+#include "crypto.h"
 #include "netstack.h"
 #include "protocol.h"
 #include "util.h"
@@ -31,22 +32,25 @@
 #define TCP_PSH 0x08
 #define TCP_ACK 0x10
 
+/* one TCP segment. The payload lives here from the moment the app data
+ * is read (ns_send_reserve) until it is ACKed — it is never copied.
+ * hdr = [8B outer VPN header][40B inner IP+TCP header]; the inner TCP
+ * header's ack/win/checksum are refreshed on every (re)transmission. */
+#define SEG_HDR_LEN 48
 typedef struct {
     uint32_t seq;
-    uint16_t len;
-    uint8_t  rto;
+    uint16_t len;              uint8_t  rto;
     uint8_t  cnt;
     uint8_t  fin;
-    uint64_t last_sent_ms;
-    uint8_t  data[NS_SEG_CAP];
+    uint8_t  sent;             uint64_t last_sent_ms;
+    uint8_t  hdr[SEG_HDR_LEN];
+    _Alignas(16) uint8_t data[NS_SEG_CAP];
 } Seg;
 
 typedef struct {
-    buf_t    pending;
     Seg      segs[NS_MAX_OUTSTANDING];
-    int      nsegs;
-    int      seg_head;   /* ring index of segs[0]; compacted periodically */
-    uint8_t  fin_sent;
+    Seg      fill;            int      nsegs;
+    int      seg_head;       uint8_t  fin_sent;
 } NsPriv;
 
 static NsPriv priv[NS_MAX_CONN];
@@ -90,6 +94,14 @@ static uint16_t csum_fold(uint32_t sum) {
     while (sum >> 16)
         sum = (sum & 0xffffu) + (sum >> 16);
     return (uint16_t)~sum;
+}
+
+/* advertised receive window = remaining rxq space (TCP flow control:
+ * the peer must stop sending when we cannot buffer) */
+static uint16_t conn_win(const TcpConn *c)
+{
+    uint32_t free = NS_WINDOW - (uint32_t)c->rxq.len;
+    return free > 0xFFFF ? 0xFFFF : (uint16_t)free;
 }
 
 static uint16_t tcp_checksum(uint32_t sip, uint32_t dip,
@@ -147,60 +159,61 @@ static void b_reset(buf_t *b) {
     b->cap = 0;
 }
 
+
+
+
+
+
+
 static void conn_clear(TcpConn *c, int idx) {
     NsPriv *p = &priv[idx];
     b_reset(&c->rxq);
-    b_reset(&p->pending);
     memset(c, 0, sizeof *c);
     memset(p, 0, sizeof *p);
 }
 
-static void tx_enqueue(Netstack *ns, const uint8_t *pkt, size_t n) {
+static void tx_enqueue(Netstack *ns, const Seg *seg, const uint8_t *pkt,
+                       size_t n) {
     int pos;
-    buf_t *slot;
+    TxItem *it;
     if (ns->tx_count >= NS_TX_MAX) {
-        buf_t *old = &ns->tx_queue[ns->tx_head];
-        free(old->data);
-        old->data = NULL;
-        old->len = 0;
-        old->cap = 0;
         ns->tx_head = (ns->tx_head + 1) % NS_TX_MAX;
-    }
-    pos = (ns->tx_head + ns->tx_count) % NS_TX_MAX;
-    if (ns->tx_count < NS_TX_MAX)
+    } else
         ns->tx_count++;
-    slot = &ns->tx_queue[pos];
-    if (slot->cap < n) {
-        uint8_t *nd = realloc(slot->data, n);
-        if (!nd)
-            return;
-        slot->data = nd;
-        slot->cap = n;
+    pos = (ns->tx_head + ns->tx_count - 1) % NS_TX_MAX;
+    it = &ns->tx_queue[pos];
+    it->seg = seg;
+    it->clen = 0;
+    if (!seg) {
+        it->clen = (uint16_t)n;
+        memcpy(it->ctl, pkt, n);
     }
-    memcpy(slot->data, pkt, n);
-    slot->len = n;
 }
 
 static void emit_tcp(Netstack *ns, TcpConn *c, uint8_t flags, uint32_t seq,
                      uint32_t ack, const uint8_t *data, uint16_t dlen,
                      uint16_t mss_opt) {
-    uint8_t pkt[2048];
+    /* control packet: [8B outer VPN header][IP hdr][TCP hdr][opt/data].
+     * No payload on control packets, so no XOR needed. */
+    uint8_t pkt[64];
     size_t olen = mss_opt ? 4 : 0;
     size_t thlen = 20 + olen;
     size_t iplen = 20 + thlen + dlen;
-    uint8_t *t = pkt + 20;
+    uint8_t *ip = pkt + 8;
+    uint8_t *t = ip + 20;
 
-    pkt[0] = 0x45;
-    pkt[1] = 0;
-    wr_be16(pkt + 2, (uint16_t)iplen);
-    wr_be16(pkt + 4, ++g_ip_id);
-    pkt[6] = 0x40;
-    pkt[7] = 0;
-    pkt[8] = 64;
-    pkt[9] = 6;
-    wr_be16(pkt + 10, 0);
-    u32_ip4(c->lip, pkt + 12);
-    u32_ip4(c->rip, pkt + 16);
+    memcpy(pkt, ns->outer_hdr, 8);
+    ip[0] = 0x45;
+    ip[1] = 0;
+    wr_be16(ip + 2, (uint16_t)iplen);
+    wr_be16(ip + 4, ++g_ip_id);
+    ip[6] = 0x40;
+    ip[7] = 0;
+    ip[8] = 64;
+    ip[9] = 6;
+    wr_be16(ip + 10, 0);
+    u32_ip4(c->lip, ip + 12);
+    u32_ip4(c->rip, ip + 16);
 
     wr_be16(t, c->lport);
     wr_be16(t + 2, c->rport);
@@ -208,7 +221,7 @@ static void emit_tcp(Netstack *ns, TcpConn *c, uint8_t flags, uint32_t seq,
     wr_be32(t + 8, ack);
     t[12] = (uint8_t)((thlen / 4) << 4);
     t[13] = flags;
-    wr_be16(t + 14, NS_WINDOW);
+    wr_be16(t + 14, conn_win(c));
     wr_be16(t + 16, 0);
     wr_be16(t + 18, 0);
     if (olen) {
@@ -219,10 +232,13 @@ static void emit_tcp(Netstack *ns, TcpConn *c, uint8_t flags, uint32_t seq,
     if (dlen)
         memcpy(t + thlen, data, dlen);
 
-    wr_be16(pkt + 10, csum_fold(csum_buf(0, pkt, 20)));
+    wr_be16(ip + 10, csum_fold(csum_buf(0, ip, 20)));
     wr_be16(t + 16, tcp_checksum(c->lip, c->rip, t, thlen + dlen));
+    if (ns->outer_hdr[1])          /* same framing as data segments:
+                                    * outer header says encrypted */
+        xor_crypt(ip, iplen, ns->xor_key, 8);
 
-    tx_enqueue(ns, pkt, iplen);
+    tx_enqueue(ns, NULL, pkt, 8 + iplen);
 }
 
 static bool validate_inner_ipv4(const uint8_t *pkt, size_t len, size_t mtu) {
@@ -260,8 +276,16 @@ static void seg_compact(NsPriv *p)
 {
     if (p->seg_head == 0)
         return;
+    /* move the sealed segments AND the fill slot (ring tail, where app
+     * data accumulates) to the front; forgetting the fill slot would
+     * leave it behind and reserve() would read a sealed segment as
+     * "full", stalling the pipe forever */
     memmove(p->segs, p->segs + p->seg_head,
-            (size_t)p->nsegs * sizeof *p->segs);
+            (size_t)(p->nsegs + 1) * sizeof *p->segs);
+    /* stale slots behind the fill would otherwise be mistaken for fill
+     * data and re-sealed forever (duplicate transmission storm) */
+    for (int k = p->nsegs + 1; k < NS_MAX_OUTSTANDING; k++)
+        p->segs[k].len = 0;
     p->seg_head = 0;
 }
 
@@ -402,6 +426,7 @@ int ns_connect(Netstack *ns, uint16_t lport, uint32_t rip, uint16_t rport) {
     c->snd_isn = isn;
     c->snd_una = isn;
     c->snd_nxt = isn;
+    c->sent_nxt = isn;
     c->rcv_nxt = 0;
     c->remote_fin = false;
     c->local_fin = false;
@@ -417,7 +442,7 @@ int ns_connect(Netstack *ns, uint16_t lport, uint32_t rip, uint16_t rport) {
 
     emit_tcp(ns, c, TCP_SYN, isn, 0, NULL, 0, c->mss);
     c->snd_nxt = isn + 1u;
-    return idx;
+    c->sent_nxt = isn + 1u;       return idx;
 }
 
 TcpConn *ns_conn(Netstack *ns, int idx) {
@@ -430,22 +455,90 @@ NsState ns_state(const TcpConn *c) {
     return c->state;
 }
 
-size_t ns_send(Netstack *ns, int idx, const uint8_t *data, size_t n) {
-    NsPriv *p;
-    size_t avail;
-    if (idx < 0 || idx >= NS_MAX_CONN)
-        return 0;
-    if (ns->conns[idx].state == NS_CLOSED)
-        return 0;
-    p = &priv[idx];
-    avail = NS_SEND_CAP - p->pending.len;
-    if (avail == 0)
-        return 0;
-    if (n > avail)
-        n = avail;
-    b_put(&p->pending, data, n);
-    return n;
+void ns_set_outer(Netstack *ns, const uint8_t hdr[8], const uint8_t key[8])
+{
+    memcpy(ns->outer_hdr, hdr, 8);
+    memcpy(ns->xor_key, key, 8);
 }
+
+/* the fill slot is the ring's append position; sealing it = headers +
+ * in-place XOR + nsegs++ (payload never moves) */
+static void seg_seal(Netstack *ns, TcpConn *c, NsPriv *p, uint8_t extra)
+{
+    Seg *s = &p->segs[p->seg_head + p->nsegs];
+    uint8_t *ip;
+    uint8_t *t;
+    size_t iplen;
+    if (s->len == 0)
+        return;
+    s->seq = c->snd_nxt;
+    s->fin = (extra & TCP_FIN) ? 1 : 0;
+    s->sent = 0;
+    ip = s->hdr + 8;
+    t = ip + 20;
+    iplen = 40 + s->len;
+    memcpy(s->hdr, ns->outer_hdr, 8);              ip[0] = 0x45;
+    ip[1] = 0;
+    wr_be16(ip + 2, (uint16_t)iplen);
+    wr_be16(ip + 4, ++g_ip_id);
+    ip[6] = 0x40;
+    ip[7] = 0;
+    ip[8] = 64;
+    ip[9] = 6;
+    wr_be16(ip + 10, 0);
+    u32_ip4(c->lip, ip + 12);
+    u32_ip4(c->rip, ip + 16);
+    wr_be16(t, c->lport);
+    wr_be16(t + 2, c->rport);
+    wr_be32(t + 4, s->seq);
+    t[12] = 0x50;
+    t[13] = (uint8_t)(TCP_ACK | extra);
+    wr_be16(t + 14, conn_win(c));                  wr_be16(t + 16, 0);
+    wr_be16(t + 18, 0);
+    wr_be16(ip + 10, csum_fold(csum_buf(0, ip, 20)));
+    if (ns->outer_hdr[1])   /* encrypt the whole inner packet once;
+                             * same framing as the old per-packet path */
+        xor_crypt(ip, iplen, ns->xor_key, 8);
+    c->snd_nxt += s->len;
+    p->nsegs++;
+    if (extra & TCP_FIN) {
+        p->fin_sent = 1;
+        c->snd_nxt += 1;
+    }
+}
+
+uint8_t *ns_send_reserve(Netstack *ns, int idx, size_t *room)
+{
+    TcpConn *c;
+    NsPriv *p;
+    Seg *s;
+    *room = 0;
+    if (idx < 0 || idx >= NS_MAX_CONN)
+        return NULL;
+    c = &ns->conns[idx];
+    if (c->state == NS_CLOSED || c->state == NS_FIN_WAIT)
+        return NULL;
+    p = &priv[idx];
+    if (p->nsegs >= NS_MAX_OUTSTANDING)
+        return NULL;
+    if (p->seg_head > 0 &&
+        p->seg_head + p->nsegs >= NS_MAX_OUTSTANDING)
+        seg_compact(p);
+    s = &p->segs[p->seg_head + p->nsegs];
+    if (s->len >= c->mss)
+        return NULL;                       /* full slot not yet sealed */
+    *room = c->mss - s->len;
+    return s->data + s->len;
+}
+
+void ns_send_commit(Netstack *ns, int idx, size_t n)
+{
+    TcpConn *c = &ns->conns[idx];
+    NsPriv *p = &priv[idx];
+    Seg *s = &p->segs[p->seg_head + p->nsegs];
+    s->len += (uint16_t)n;
+    if (s->len >= c->mss)
+        seg_seal(ns, c, p, 0);             }
 
 size_t ns_recv(Netstack *ns, int idx, uint8_t *out, size_t n) {
     buf_t *b;
@@ -575,7 +668,6 @@ static int rx_lookup_conn(const Netstack *ns, uint16_t dport, uint32_t sip,
     return -1;
 }
 
-/* reply RST to a packet that matched no connection (unless it was a RST) */
 static void rx_reject_unknown(Netstack *ns, uint32_t dip, uint32_t sip,
                               uint16_t dport, uint16_t sport, uint8_t flags,
                               uint32_t seq, uint32_t paylen) {
@@ -648,12 +740,25 @@ static bool conn_retransmit_loop(Netstack *ns, TcpConn *c, NsPriv *p, int idx,
                                  uint64_t now) {
     for (int j = 0; j < p->nsegs; j++) {
         Seg *s = seg_at(p, j);
+        if (!s->sent)
+            continue;
         if (now < s->last_sent_ms + s->rto)
             continue;
         if ((int64_t)(c->snd_nxt - c->snd_una) > (int64_t)c->remote_win)
             continue;
-        emit_tcp(ns, c, TCP_ACK | (s->fin ? TCP_FIN : 0), s->seq,
-                 c->rcv_nxt, s->data, s->len, 0);
+                {
+            uint8_t *ip = s->hdr + 8;
+            uint8_t *t = ip + 20;
+            if (ns->outer_hdr[1])
+                xor_crypt(ip, 40 + s->len, ns->xor_key, 8);
+            wr_be32(t + 8, c->rcv_nxt);
+            wr_be16(t + 14, NS_WINDOW);
+            wr_be16(t + 16, tcp_checksum(c->lip, c->rip, t,
+                                         20 + s->len));
+            if (ns->outer_hdr[1])
+                xor_crypt(ip, 40 + s->len, ns->xor_key, 8);
+        }
+        tx_enqueue(ns, s, NULL, 0);
         s->last_sent_ms = now;
         s->rto = (uint8_t)((int)s->rto * 2 > NS_RTO_MAX
                                ? NS_RTO_MAX
@@ -670,58 +775,54 @@ static bool conn_retransmit_loop(Netstack *ns, TcpConn *c, NsPriv *p, int idx,
 /* build and send fresh segments (pending data, then FIN) up to the
  * outstanding/window limits */
 static void conn_send_new(Netstack *ns, TcpConn *c, NsPriv *p, uint64_t now) {
-    uint32_t in_flight = c->snd_nxt - c->snd_una;
-    size_t consumed = 0;
-    while (p->nsegs < NS_MAX_OUTSTANDING && in_flight < c->remote_win) {
-        /* ring safety: the append slot must not wrap; compact whenever the
-         * head has walked far enough for head+nsegs to reach the end */
-        if (p->seg_head > 0 &&
-            p->seg_head + p->nsegs >= NS_MAX_OUTSTANDING)
-            seg_compact(p);
-        if (p->pending.len - consumed > 0) {
-            uint32_t win_free = c->remote_win - in_flight;
-            size_t seglen = p->pending.len - consumed;
-            Seg *s = &p->segs[p->seg_head + p->nsegs];
-            if (seglen > c->mss)
-                seglen = c->mss;
-            if (seglen > win_free)
-                seglen = win_free;
-            s->seq = c->snd_nxt;
-            s->len = (uint16_t)seglen;
-            s->rto = (uint8_t)NS_RTO_INIT;
-            s->cnt = 1;
-            s->fin = 0;
-            s->last_sent_ms = now;
-            memcpy(s->data, p->pending.data + consumed, seglen);
-            emit_tcp(ns, c, TCP_ACK, s->seq, c->rcv_nxt, s->data,
-                     (uint16_t)seglen, 0);
-            p->nsegs++;
-            c->snd_nxt += (uint32_t)seglen;
-            in_flight += (uint32_t)seglen;
-            consumed += seglen;
-        } else if (c->local_fin && !p->fin_sent) {
-            Seg *s = &p->segs[p->seg_head + p->nsegs];
-            s->seq = c->snd_nxt;
-            s->len = 0;
-            s->rto = (uint8_t)NS_RTO_INIT;
-            s->cnt = 1;
-            s->fin = 1;
-            s->last_sent_ms = now;
-            emit_tcp(ns, c, TCP_ACK | TCP_FIN, s->seq, c->rcv_nxt, NULL, 0, 0);
-            p->nsegs++;
-            p->fin_sent = 1;
-            c->snd_nxt += 1;
-            in_flight += 1;
-            break;
-        } else {
-            break;
+    /* in-flight = TRANSMITTED-but-unacked bytes (seal reserves seq space
+     * in snd_nxt; counting sealed-but-unsent would fake a full window) */
+    uint32_t in_flight = c->sent_nxt - c->snd_una;
+    Seg *s;
+
+        if (p->nsegs < NS_MAX_OUTSTANDING && in_flight < c->remote_win) {
+        s = &p->segs[p->seg_head + p->nsegs];
+        if (s->len > 0) {
+            uint8_t x = (c->local_fin && !p->fin_sent) ? TCP_FIN : 0;
+            seg_seal(ns, c, p, x);
         }
     }
-    if (consumed > 0)
-        b_consume(&p->pending, consumed);   /* one memmove per round */
+    for (int j = 0; j < p->nsegs; j++) {
+        s = seg_at(p, j);
+        if (s->sent)
+            continue;
+        if (in_flight >= c->remote_win)
+            break;
+        /* refresh dynamic TCP fields (ack/win) + checksum; the slot is
+         * encrypted, so decrypt the header, patch, re-encrypt */
+        {
+            uint8_t *ip = s->hdr + 8;
+            uint8_t *t = ip + 20;
+            if (ns->outer_hdr[1])
+                xor_crypt(ip, 40 + s->len, ns->xor_key, 8);
+            wr_be32(t + 8, c->rcv_nxt);
+            wr_be16(t + 14, conn_win(c));
+            wr_be16(t + 16, tcp_checksum(c->lip, c->rip, t,
+                                         20 + s->len));
+            if (ns->outer_hdr[1])
+                xor_crypt(ip, 40 + s->len, ns->xor_key, 8);
+        }
+        tx_enqueue(ns, s, NULL, 0);
+        s->sent = 1;
+        s->last_sent_ms = now;
+        s->rto = (uint8_t)NS_RTO_INIT;
+        s->cnt = 1;
+        c->sent_nxt = s->seq + s->len + (s->fin ? 1u : 0u);
+        in_flight = c->sent_nxt - c->snd_una;
+    }
+        if (c->local_fin && !p->fin_sent && p->nsegs < NS_MAX_OUTSTANDING &&
+        in_flight < c->remote_win) {
+        emit_tcp(ns, c, TCP_ACK | TCP_FIN, c->snd_nxt, c->rcv_nxt, NULL, 0, 0);
+        p->fin_sent = 1;
+        c->snd_nxt += 1;
+    }
 }
 
-/* earliest retransmit deadline (ms) of the queued segments; INT64_MAX if none */
 static int64_t conn_next_deadline(const NsPriv *p, uint64_t now) {
     int64_t d = INT64_MAX;
     for (int j = 0; j < p->nsegs; j++) {
@@ -780,23 +881,32 @@ int ns_tick(Netstack *ns, uint64_t now) {
     return (int)next;
 }
 
-size_t ns_device_pop(Netstack *ns, uint8_t *out, size_t maxlen) {
-    buf_t *slot;
-    size_t n;
+const TxItem *ns_tx_peek(Netstack *ns)
+{
     if (ns->tx_count == 0)
-        return 0;
-    slot = &ns->tx_queue[ns->tx_head];
-    n = slot->len;
-    if (n > maxlen)
-        n = maxlen;
-    memcpy(out, slot->data, n);
-    free(slot->data);
-    slot->data = NULL;
-    slot->len = 0;
-    slot->cap = 0;
+        return NULL;
+    return &ns->tx_queue[ns->tx_head];
+}
+
+size_t ns_tx_item_len(const TxItem *it)
+{
+    return it->seg ? SEG_HDR_LEN + ((const Seg *)it->seg)->len : it->clen;
+}
+
+const uint8_t *ns_tx_item_buf(const TxItem *it)
+{
+    return it->seg ? ((const Seg *)it->seg)->hdr : it->ctl;
+}
+
+const TxItem *ns_tx_pop(Netstack *ns)
+{
+    const TxItem *it;
+    if (ns->tx_count == 0)
+        return NULL;
+    it = &ns->tx_queue[ns->tx_head];
     ns->tx_head = (ns->tx_head + 1) % NS_TX_MAX;
     ns->tx_count--;
-    return n;
+    return it;
 }
 
 static size_t skip_name(const uint8_t *p, size_t n, size_t off) {

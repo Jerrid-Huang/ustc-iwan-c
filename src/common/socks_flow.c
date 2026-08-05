@@ -1,5 +1,6 @@
 #include <arpa/inet.h>
 #include <errno.h>
+#include <stdio.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdlib.h>
@@ -354,68 +355,55 @@ void service_local_inputs(Flow *fs) {
         if (!f->active || f->local_eof)
             continue;
         if (f->ns_idx >= 0 && f->state == ST_ESTABLISHED && f->input.len > 0) {
-            size_t n = f->input.len > TCP_TX_CHUNK ? TCP_TX_CHUNK
-                                                   : f->input.len;
-            size_t sent = ns_send(&g_ns, f->ns_idx, f->input.data, n);
-            if (sent > 0)
-                buf_consume(&f->input, sent);
+            /* spill leftover input into the stack's pending segment slot */
+            size_t room = 0;
+            uint8_t *dst = ns_send_reserve(&g_ns, f->ns_idx, &room);
+            if (dst && room > 0) {
+                size_t n = f->input.len > room ? room : f->input.len;
+                memcpy(dst, f->input.data, n);
+                ns_send_commit(&g_ns, f->ns_idx, n);
+                buf_consume(&f->input, n);
+            }
             if (f->input.len > 0)
                 continue;
         }
 
-        size_t max_read = 0;
-        if (f->ns_idx >= 0 && f->state == ST_ESTABLISHED)
-            max_read = 16 * 1024;
-        else if (f->ns_idx < 0 &&
-                 (f->state == ST_GREETING || f->state == ST_REQUEST))
-            max_read = 16 * 1024;
-        if (max_read == 0)
-            continue;
-
-        uint8_t rbuf[16 * 1024];
-        ssize_t n = read(f->fd, rbuf, sizeof rbuf < max_read ? sizeof rbuf
-                                                             : max_read);
-        if (n == 0) {
-            f->local_eof = true;
-            if (f->ns_idx >= 0) {
-                ns_close(&g_ns, f->ns_idx);
-                set_flow_state(f, ST_CLOSING);
-            }
-        } else if (n > 0 && f->ns_idx < 0) {
-            buf_put(&f->input, rbuf, (size_t)n);
-            process_socks_handshake(f);
-        } else if (n > 0) {
-            /* feed the stack until it stops accepting (pending full) or
-             * the local socket is drained; one 16KB read per round would
-             * cap the pipe at 16KB/round and leave the sndbuf idle */
-            size_t sent = ns_send(&g_ns, f->ns_idx, rbuf, (size_t)n);
-            if (sent < (size_t)n) {
-                buf_put(&f->input, rbuf + sent, (size_t)n - sent);
-            } else {
-                for (;;) {
-                    ssize_t r2 = read(f->fd, rbuf, sizeof rbuf);
-                    if (r2 > 0) {
-                        size_t s2 = ns_send(&g_ns, f->ns_idx, rbuf,
-                                            (size_t)r2);
-                        if (s2 < (size_t)r2) {
-                            buf_put(&f->input, rbuf + s2, (size_t)r2 - s2);
-                            break;
-                        }
-                    } else if (r2 == 0) {
-                        f->local_eof = true;
-                        ns_close(&g_ns, f->ns_idx);
-                        set_flow_state(f, ST_CLOSING);
-                        break;
-                    } else {
-                        break;   /* EAGAIN or error */
-                    }
+        if (f->ns_idx >= 0 && f->state == ST_ESTABLISHED) {
+            /* zero-copy feed: read() straight into the stack's pending
+             * segment slot; loop until the stack is full or the local
+             * socket drains */
+            for (;;) {
+                size_t room = 0;
+                uint8_t *dst = ns_send_reserve(&g_ns, f->ns_idx, &room);
+                if (!dst || room == 0)
+                    break;             /* stack full: backpressure */
+                ssize_t r2 = read(f->fd, dst, room);
+                if (r2 > 0) {
+                    ns_send_commit(&g_ns, f->ns_idx, (size_t)r2);
+                } else if (r2 == 0) {
+                    f->local_eof = true;
+                    ns_close(&g_ns, f->ns_idx);
+                    set_flow_state(f, ST_CLOSING);
+                    break;
+                } else {
+                    break;             /* EAGAIN or error */
                 }
             }
-        } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            f->local_eof = true;
-            if (f->ns_idx >= 0) {
-                ns_abort(&g_ns, f->ns_idx);
-                set_flow_state(f, ST_CLOSING);
+        } else {
+            /* greeting/request: read into rbuf for the handshake parser */
+            uint8_t rbuf[16 * 1024];
+            ssize_t n = read(f->fd, rbuf, sizeof rbuf);
+            if (n == 0) {
+                f->local_eof = true;
+            } else if (n > 0) {
+                buf_put(&f->input, rbuf, (size_t)n);
+                process_socks_handshake(f);
+            } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                f->local_eof = true;
+                if (f->ns_idx >= 0) {
+                    ns_abort(&g_ns, f->ns_idx);
+                    set_flow_state(f, ST_CLOSING);
+                }
             }
         }
     }
