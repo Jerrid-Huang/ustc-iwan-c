@@ -90,7 +90,10 @@ void accept_connections(int listener) {
 /* ---- VPN framing (mirrors netstack/tunnel.rs) ---- */
 
 #define SOCKS_TX_MAX 65543   /* one GSO unit (65507) + one 8B header */
-#define SOCKS_MAX_PK 48
+#define SOCKS_MAX_PK 64      /* drain the whole tx queue: 48 segments +
+                              * control ACKs must not accumulate (a 48-item
+                              * cap left 1 item/round and drop-oldest
+                              * evicted ACKs under load) */
 
 /* Send one accumulated batch: uniform batches (>=2 packets, total <= 65507)
  * go out as a single GSO sendmsg with a multi-iovec message (the kernel
@@ -202,7 +205,7 @@ static void sock_drain_tx(int sockfd, SocksConfig *cfg)
 
     while (npk < SOCKS_MAX_PK && (it = ns_tx_peek(&g_ns)) != NULL) {
         size_t l = ns_tx_item_len(it);
-        if (npk > 0 && total + l > 65507)
+        if (npk > 0 && total + l > 65507 && uniform)
             break;                     /* GSO unit cap: leave for next */
         if (npk == 0)
             mss = l;
@@ -391,10 +394,13 @@ void run_socks(int sockfd, SocksConfig *cfg) {
             break;
         service_local_inputs(g_flows);
         handle_dns_results();
+        /* consume the rxq BEFORE ns_tick advertises the window: an
+         * unconsumed 16KB rxq would make conn_win() report 0 and the
+         * peer would stop echoing (advertised-window stall) */
+        service_local_outputs();
         int tick_ms = ns_tick(&g_ns, now_mono());
         sock_drain_tx(sockfd, cfg);
         update_tcp_states();
-        service_local_outputs();
         reap_flows();
 
         /* event-driven wait: sleep until the earliest real deadline
