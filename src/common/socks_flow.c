@@ -417,7 +417,6 @@ void service_local_inputs(Flow *fs) {
 }
 
 void service_local_outputs(void) {
-    uint8_t rbuf[TCP_RX_CHUNK];
     for (int i = 0; i < MAX_FLOWS; i++) {
         Flow *f = &g_flows[i];
         if (!f->active)
@@ -439,30 +438,24 @@ void service_local_outputs(void) {
             }
         }
 
-        if (f->ns_idx >= 0) {
+        if (f->ns_idx >= 0 && f->output.len == 0) {
             TcpConn *c = ns_conn(&g_ns, f->ns_idx);
             if (c && c->rxq.len > 0) {
                 size_t want = c->rxq.len > LOCAL_WRITE_LIMIT
                                   ? LOCAL_WRITE_LIMIT
                                   : c->rxq.len;
-                size_t got = ns_recv(&g_ns, f->ns_idx, rbuf, want);
-                if (got > 0)
-                    buf_put(&f->output, rbuf, got);
-            }
-        }
-        while (f->output.len > 0) {
-            ssize_t n = write(f->fd, f->output.data, f->output.len);
-            if (n > 0) {
-                buf_consume(&f->output, (size_t)n);
-            } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                break;
-            } else {
-                f->local_eof = true;
-                if (f->ns_idx >= 0)
+                struct iovec io = { .iov_base = c->rxq.data,
+                                    .iov_len = want };
+                ssize_t n = writev(f->fd, &io, 1);
+                if (n > 0) {
+                    buf_consume(&c->rxq, (size_t)n);
+                } else if (n < 0 && errno != EAGAIN &&
+                           errno != EWOULDBLOCK) {
+                    f->local_eof = true;
                     ns_abort(&g_ns, f->ns_idx);
-                buf_clear(&f->output);
-                set_flow_state(f, ST_CLOSING);
-                break;
+                    set_flow_state(f, ST_CLOSING);
+                    continue;
+                }
             }
         }
 
