@@ -4,6 +4,7 @@
 #include <netinet/udp.h>
 #include <poll.h>
 #include <signal.h>
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -283,7 +284,13 @@ int receive_vpn(int sockfd, SocksConfig *cfg) {
         rx_init = 1;
     }
 
+    int budget = 256;
     for (;;) {
+        /* yield to the other phases once 256 packets have been handled:
+         * with a fast peer the socket never drains, and an unbounded
+         * loop starves local reads and TX (echo-mode livelock) */
+        if (budget <= 0)
+            return 0;
         int v = recvmmsg(sockfd, rx_msgs, RX_VLEN, MSG_DONTWAIT, NULL);
         if (v <= 0) {
             if (v == 0 || errno == EAGAIN || errno == EWOULDBLOCK)
@@ -291,6 +298,7 @@ int receive_vpn(int sockfd, SocksConfig *cfg) {
             log_err("receive_vpn: recvmmsg: %s", strerror(errno));
             return -1;
         }
+        budget -= v;
         for (int i = 0; i < v; i++) {
             ssize_t n = rx_msgs[i].msg_len;
             if (n < 8 || (rx_msgs[i].msg_hdr.msg_flags & MSG_TRUNC))
