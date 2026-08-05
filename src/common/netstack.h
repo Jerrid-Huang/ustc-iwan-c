@@ -95,6 +95,10 @@ NsState ns_state(const TcpConn *c);
  * slot (read() straight into it), then commit what was filled. Returns
  * NULL/0 when the stack is full (backpressure). */
 uint8_t *ns_send_reserve(Netstack *ns, int idx, size_t *room);
+/* reserve up to maxn contiguous fill slots (linear, no wrap) into iov;
+ * returns the number of slots. Pointers stay valid until the matching
+ * ns_send_commit calls seal them. */
+int ns_send_reservev(Netstack *ns, int idx, struct iovec *iov, int maxn);
 void ns_send_commit(Netstack *ns, int idx, size_t n);
 /* read received data into out; returns n bytes (0 = none) */
 size_t ns_recv(Netstack *ns, int idx, uint8_t *out, size_t n);

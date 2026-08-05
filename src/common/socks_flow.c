@@ -7,6 +7,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #include "common.h"
@@ -369,17 +370,23 @@ void service_local_inputs(Flow *fs) {
         }
 
         if (f->ns_idx >= 0 && f->state == ST_ESTABLISHED) {
-            /* zero-copy feed: read() straight into the stack's pending
-             * segment slot; loop until the stack is full or the local
-             * socket drains */
+            /* zero-copy feed: one readv() fills up to 4 pending segment
+             * slots (reserve never commits, so the slot pointers stay
+             * stable across the batch) */
             for (;;) {
-                size_t room = 0;
-                uint8_t *dst = ns_send_reserve(&g_ns, f->ns_idx, &room);
-                if (!dst || room == 0)
+                struct iovec iov[4];
+                int nv = ns_send_reservev(&g_ns, f->ns_idx, iov, 4);
+                if (nv == 0)
                     break;             /* stack full: backpressure */
-                ssize_t r2 = read(f->fd, dst, room);
+                ssize_t r2 = readv(f->fd, iov, nv);
                 if (r2 > 0) {
-                    ns_send_commit(&g_ns, f->ns_idx, (size_t)r2);
+                    size_t left = (size_t)r2;
+                    for (int k = 0; k < nv && left > 0; k++) {
+                        size_t take = left < iov[k].iov_len ? left
+                                                             : iov[k].iov_len;
+                        ns_send_commit(&g_ns, f->ns_idx, take);
+                        left -= take;
+                    }
                 } else if (r2 == 0) {
                     f->local_eof = true;
                     ns_close(&g_ns, f->ns_idx);
@@ -410,25 +417,39 @@ void service_local_inputs(Flow *fs) {
 }
 
 void service_local_outputs(void) {
+    uint8_t rbuf[TCP_RX_CHUNK];
     for (int i = 0; i < MAX_FLOWS; i++) {
         Flow *f = &g_flows[i];
         if (!f->active)
             continue;
 
-        if (f->output.len < LOCAL_WRITE_LIMIT && f->ns_idx >= 0) {
-            for (;;) {
-                size_t room = LOCAL_WRITE_LIMIT - f->output.len;
-                if (room == 0)
-                    break;
-                size_t want = room < TCP_RX_CHUNK ? room : TCP_RX_CHUNK;
-                uint8_t rbuf[TCP_RX_CHUNK];
-                size_t got = ns_recv(&g_ns, f->ns_idx, rbuf, want);
-                if (got == 0)
-                    break;
-                buf_put(&f->output, rbuf, got);
+        while (f->output.len > 0) {
+            ssize_t n = write(f->fd, f->output.data, f->output.len);
+            if (n > 0) {
+                buf_consume(&f->output, (size_t)n);
+            } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                break;
+            } else {
+                f->local_eof = true;
+                if (f->ns_idx >= 0)
+                    ns_abort(&g_ns, f->ns_idx);
+                buf_clear(&f->output);
+                set_flow_state(f, ST_CLOSING);
+                break;
             }
         }
 
+        if (f->ns_idx >= 0) {
+            TcpConn *c = ns_conn(&g_ns, f->ns_idx);
+            if (c && c->rxq.len > 0) {
+                size_t want = c->rxq.len > LOCAL_WRITE_LIMIT
+                                  ? LOCAL_WRITE_LIMIT
+                                  : c->rxq.len;
+                size_t got = ns_recv(&g_ns, f->ns_idx, rbuf, want);
+                if (got > 0)
+                    buf_put(&f->output, rbuf, got);
+            }
+        }
         while (f->output.len > 0) {
             ssize_t n = write(f->fd, f->output.data, f->output.len);
             if (n > 0) {

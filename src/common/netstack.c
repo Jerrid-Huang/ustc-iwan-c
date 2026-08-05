@@ -593,6 +593,36 @@ uint8_t *ns_send_reserve(Netstack *ns, int idx, size_t *room)
     return s->data + s->len;
 }
 
+int ns_send_reservev(Netstack *ns, int idx, struct iovec *iov, int maxn)
+{
+    TcpConn *c;
+    NsPriv *p;
+    int pos, n = 0;
+
+    if (idx < 0 || idx >= NS_MAX_CONN)
+        return 0;
+    c = &ns->conns[idx];
+    if (c->state == NS_CLOSED || c->state == NS_FIN_WAIT)
+        return 0;
+    p = &priv[idx];
+    if (p->nsegs >= NS_MAX_OUTSTANDING)
+        return 0;
+    if (p->seg_head > 0 &&
+        p->seg_head + p->nsegs >= NS_MAX_OUTSTANDING)
+        seg_compact(p);
+    pos = p->seg_head + p->nsegs;
+    while (n < maxn && pos < NS_MAX_OUTSTANDING) {
+        Seg *s = &p->segs[pos];
+        if (s->len >= c->mss)
+            break;                       /* full slot not yet sealed */
+        iov[n].iov_base = s->data + s->len;
+        iov[n].iov_len = c->mss - s->len;
+        pos++;
+        n++;
+    }
+    return n;
+}
+
 void ns_send_commit(Netstack *ns, int idx, size_t n)
 {
     TcpConn *c = &ns->conns[idx];
