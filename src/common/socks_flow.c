@@ -401,7 +401,11 @@ void service_local_inputs(Flow *fs) {
             uint8_t rbuf[16 * 1024];
             ssize_t n = read(f->fd, rbuf, sizeof rbuf);
             if (n == 0) {
+                /* client gone before the handshake finished: close the
+                 * flow so reap_flows collects it (previously the slot
+                 * and fd leaked forever and poll busy-spun on the EOF) */
                 f->local_eof = true;
+                set_flow_state(f, ST_CLOSING);
             } else if (n > 0) {
                 buf_put(&f->input, rbuf, (size_t)n);
             } else if (errno != EAGAIN && errno != EWOULDBLOCK) {

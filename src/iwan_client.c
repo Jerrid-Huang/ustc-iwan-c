@@ -520,6 +520,8 @@ static int cmd_socks(int argc, char **argv, int start)
         log_err("Error: auth failed");
         return 1;
     }
+    if (o.encrypt != 1)
+        log_err("WARN: data-plane only XOR(1), got %d", o.encrypt);
 
     uint8_t sk[16];
     session_key(o.user, o.pass, sk);

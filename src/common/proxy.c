@@ -360,15 +360,23 @@ static void *udp2tun_thread(void *ud) {
             if (n < 8 || (msgs[i].msg_hdr.msg_flags & MSG_TRUNC))
                 continue;
             uint8_t t = m[0];
+            if (t == PT_CLOSE) {
+                eprintf("[UDP->TUN] server sent CLOSE\n");
+                g_stop = 1;
+                break;
+            }
+            if (t != PT_DATA && t != PT_DATA_ENC)
+                continue;
+            uint16_t psid = (uint16_t)((m[2] << 8) | m[3]);
+            uint32_t ptok = ((uint32_t)m[4] << 24) | ((uint32_t)m[5] << 16) |
+                            ((uint32_t)m[6] << 8) | (uint32_t)m[7];
+            if (psid != ctx->sid || ptok != ctx->tok)
+                continue;   /* mirror receive_vpn: sid/token must match */
             if (t == PT_DATA_ENC) {
                 xor_crypt(m + 8, (size_t)(n - 8), ctx->xor_key, 8);
                 tun_write_retry(ctx, m + 8, (size_t)(n - 8));
             } else if (t == PT_DATA) {
                 tun_write_retry(ctx, m + 8, (size_t)(n - 8));
-            } else if (t == PT_CLOSE) {
-                eprintf("[UDP->TUN] server sent CLOSE\n");
-                g_stop = 1;
-                break;
             } else if (t == PT_ECHO_REQ) {
                 if (send_ctrl(ctx->sockfd, PT_ECHO_RES, ctx->enc, ctx->sid,
                               ctx->tok) != 0) {

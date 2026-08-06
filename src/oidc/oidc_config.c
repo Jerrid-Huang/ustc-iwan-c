@@ -63,9 +63,12 @@ void oidc_fetch_config(Config *cf)
     fflush(stdout);
     char *resp = NULL;
     int st = oidc_ctrl_post("/m/auth", dev_body, kp, &resp);
+    if (st != 200) {
+        const char *detail = resp ? resp : "";
+        free(resp);
+        oidc_die("fail HTTP %d: %s", st, detail);
+    }
     free(resp);
-    if (st != 200)
-        oidc_die("fail HTTP %d: %s", st, resp ? resp : "");
     oidc_eprintf("OK\n");
 
     st = oidc_ctrl_post("/m/keepalive", ka_body, kp, &resp);
@@ -142,8 +145,10 @@ void oidc_save_config(const char *path, const Config *cf)
     FILE *f = fopen(path, "wb");
     if (!f)
         oidc_die("cannot write config to %s", path);
-    fputs(cf->pretty, f);
-    fclose(f);
+    /* the file holds decryptable password blobs: never world-readable */
+    (void)fchmod(fileno(f), 0600);
+    if (fputs(cf->pretty, f) == EOF || fclose(f) != 0)
+        oidc_die("cannot write config to %s: %s", path, strerror(errno));
     oidc_eprintf("  Saved %zu server(s) to %s\n", json_arr_len(cf->servers),
                  path);
 }

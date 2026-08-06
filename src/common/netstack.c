@@ -26,7 +26,7 @@
 #define NS_KEEPALIVE_MAX  3
 #define NS_CONNECT_TIMEOUT 30000u
 #define NS_SEND_CAP       (64u * 1024u)
-#define NS_SEG_CAP        1408u
+#define NS_SEG_CAP        1460u
 
 #define TCP_FIN 0x01
 #define TCP_SYN 0x02
@@ -107,6 +107,11 @@ static uint16_t csum_fold(uint32_t sum) {
  * the peer must stop sending when we cannot buffer) */
 static uint16_t conn_win(const TcpConn *c)
 {
+    /* never underflow: once the rxq passes NS_WINDOW the peer must be
+     * told 0 (and receive-side accounting must drop, see handle_rx),
+     * not a wrapped full window */
+    if (c->rxq.len >= NS_WINDOW)
+        return 0;
     uint32_t free = NS_WINDOW - (uint32_t)c->rxq.len;
     return free > 0xFFFF ? 0xFFFF : (uint16_t)free;
 }
@@ -412,7 +417,10 @@ static void handle_rx(Netstack *ns, TcpConn *c, int idx, const uint8_t *t,
         c->retx_cnt = 0;
         c->retx_len = 0;
         if (paylen > 0) {
-            b_put(&c->rxq, payload, paylen);
+            if (c->rxq.len + paylen <= NS_WINDOW)
+                b_put(&c->rxq, payload, paylen);
+            else if (c->state != NS_CLOSE_WAIT)
+                return;   /* window closed: drop, peer retransmits */
             c->rcv_nxt += (uint32_t)paylen;
         }
         emit_tcp(ns, c, TCP_ACK, c->snd_nxt, c->rcv_nxt, NULL, 0, 0);
@@ -496,8 +504,12 @@ static void handle_rx(Netstack *ns, TcpConn *c, int idx, const uint8_t *t,
     }
     if (seq == c->rcv_nxt) {
         if (paylen > 0 && c->state != NS_CLOSE_WAIT) {
-            b_put(&c->rxq, payload, paylen);
-            c->rcv_nxt += (uint32_t)paylen;
+            if (c->rxq.len + paylen <= NS_WINDOW) {
+                b_put(&c->rxq, payload, paylen);
+                c->rcv_nxt += (uint32_t)paylen;
+            }
+            /* else: receive window closed — drop without advancing
+             * rcv_nxt; the peer retransmits once the window reopens */
         }
         if (flags & TCP_FIN) {
             if (c->state != NS_CLOSE_WAIT) {
@@ -1065,11 +1077,14 @@ int ns_tick(Netstack *ns, uint64_t now) {
             }
             d = conn_next_deadline(p, now);
         }
-        d = (int64_t)(c->last_rx_ms + NS_IDLE_TIMEOUT - now);
+        {
+            int64_t idle = (int64_t)(c->last_rx_ms + NS_IDLE_TIMEOUT - now);
+            if (idle < d)
+                d = idle;
+        }
         if (d < next)
             next = d;
-    }
-    if (next < 0)
+    }    if (next < 0)
         next = 0;
     if (next > 10000)
         next = 10000;

@@ -145,8 +145,12 @@ static bool ack_tlv(uint8_t typ, const uint8_t *val, uint8_t vlen, void *ud)
         ip_to_string(val, r->dns);
         break;
     case T_MTU:
-        if (vlen >= 2)
-            r->mtu = (uint16_t)((val[0] << 8) | val[1]);
+        if (vlen >= 2) {
+            uint16_t m = (uint16_t)((val[0] << 8) | val[1]);
+            /* the ACK is only header-signed, so never trust a huge MTU:
+             * clamp to the IPv4-over-UDP sane range */
+            r->mtu = m < 576 ? 576 : (m > 1500 ? 1500 : m);
+        }
         break;
     case T_AUTH_VERIFY:
         if (vlen != 4) {

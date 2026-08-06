@@ -17,13 +17,19 @@ static int utf8_width(const char *s)
         if (*p < 0x80) {
             cp = *p++;
         } else if ((*p & 0xE0) == 0xC0) {
+            if (!p[1])
+                break;
             cp = ((uint32_t)(*p & 0x1F) << 6) | (p[1] & 0x3F);
             p += 2;
         } else if ((*p & 0xF0) == 0xE0) {
+            if (!p[1] || !p[2])
+                break;
             cp = ((uint32_t)(*p & 0x0F) << 12) |
                  ((uint32_t)(p[1] & 0x3F) << 6) | (p[2] & 0x3F);
             p += 3;
         } else {
+            if (!p[1] || !p[2] || !p[3])
+                break;
             cp = ((uint32_t)(*p & 0x07) << 18) |
                  ((uint32_t)(p[1] & 0x3F) << 12) |
                  ((uint32_t)(p[2] & 0x3F) << 6) | (p[3] & 0x3F);
