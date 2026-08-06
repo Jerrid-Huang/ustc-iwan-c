@@ -1,7 +1,12 @@
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
+#include <sys/ioctl.h>
+#include <linux/if_tun.h>
 #include <poll.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -294,6 +299,236 @@ static void setup_nat(const char *subnet, const char *nat_if)
     }
 }
 
+/* ---- dynamic TUN reader pool ----
+ * One IFF_MULTI_QUEUE device, up to TUN_MAXQ queue fds, each drained by
+ * its own thread. A controller in the main loop (qpool_tick, 500ms)
+ * grows/shrinks the pool with TCP-style AIMD on the poll-timeout busy
+ * signal. Reader threads only touch ctx->sess under its lock (downlink
+ * snapshots) and their own atomic counters. */
+#define TUN_MAXQ 8
+#define TUN_QCTL_MS 500
+#define TUN_BUSY_GROW 0.85
+#define TUN_BUSY_SHRINK 0.60
+
+struct tun_reader {
+    struct tun_qpool *pool;
+    int fd;
+    pthread_t th;
+    volatile int stop;
+    atomic_uint_fast64_t count;
+    atomic_uint_fast64_t waits; /* poll timeouts in current window */
+};
+
+struct tun_qpool {
+    struct tun_reader qs[TUN_MAXQ];
+    struct server_ctx *ctx;
+    int udp_fd;
+    int nq;
+    int maxq;
+    char tunname[IFNAMSIZ];
+};
+
+static int open_tun_mq(const char *name)
+{
+    int fd = open("/dev/net/tun", O_RDWR);
+    struct ifreq ifr;
+    if (fd < 0)
+        return -1;
+    memset(&ifr, 0, sizeof ifr);
+    ifr.ifr_flags = IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE;
+    strncpy(ifr.ifr_name, name, IFNAMSIZ - 1);
+    if (ioctl(fd, TUNSETIFF, &ifr) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static void *tun_reader_main(void *ud)
+{
+    struct tun_reader *q = ud;
+    struct tun_qpool *pool = q->pool;
+    struct pollfd pfd = { .fd = q->fd, .events = POLLIN };
+    static _Thread_local uint8_t buf[65536];
+    uint64_t local = 0;
+
+    while (!q->stop) {
+        int pr = poll(&pfd, 1, 100);
+        if (pr < 0 && errno != EINTR)
+            break;
+        if (pr == 0) {
+            if (local) {
+                atomic_fetch_add(&q->count, local);
+                local = 0;
+            }
+            atomic_fetch_add(&q->waits, 1);
+            continue;
+        }
+        if (pfd.revents & POLLIN) {
+            ssize_t r;
+            while ((r = read(q->fd, buf, sizeof buf)) > 0) {
+                handle_tun_downlink(pool->ctx, buf, (size_t)r, q->fd,
+                                    pool->udp_fd);
+                local++;
+            }
+        }
+    }
+    /* drain the ring before exiting: packets already queued on this fd
+     * would otherwise be lost when qpool_del detaches+closes it, stalling
+     * the client flow until TCP RTO retransmits */
+    for (;;) {
+        ssize_t r = read(q->fd, buf, sizeof buf);
+        if (r <= 0)
+            break;
+        handle_tun_downlink(pool->ctx, buf, (size_t)r, q->fd, pool->udp_fd);
+        local++;
+    }
+    if (local)
+        atomic_fetch_add(&q->count, local);
+    return NULL;
+}
+
+static int qpool_add(struct tun_qpool *pool)
+{
+    int fd;
+
+    if (pool->nq >= pool->maxq)
+        return -1;
+    fd = open_tun_mq(pool->tunname);
+    if (fd < 0)
+        return -1;
+    set_nonblock(fd);
+    {
+        struct tun_reader *q = &pool->qs[pool->nq];
+        q->pool = pool;
+        q->fd = fd;
+        q->stop = 0;
+        atomic_store(&q->count, 0);
+        atomic_store(&q->waits, 0);
+        if (pthread_create(&q->th, NULL, tun_reader_main, q) != 0) {
+            close(fd);
+            return -1;
+        }
+    }
+    pool->nq++;
+    return 0;
+}
+
+/* drop the newest queue; queue 0 (the device owner) is never dropped */
+static void qpool_del(struct tun_qpool *pool)
+{
+    int i;
+
+    if (pool->nq <= 1)
+        return;
+    i = pool->nq - 1;
+    pool->qs[i].stop = 1;
+    pthread_join(pool->qs[i].th, NULL);
+    ioctl(pool->qs[i].fd, TUNSETQUEUE, (void *)(long)IFF_DETACH_QUEUE);
+    close(pool->qs[i].fd);
+    pool->nq--;
+}
+
+static struct tun_qpool *qpool_create(struct server_ctx *ctx, int udp_fd,
+                                      const char *tunname, int fd0, int maxq)
+{
+    struct tun_qpool *pool = calloc(1, sizeof *pool);
+    struct tun_reader *q;
+
+    if (!pool)
+        return NULL;
+    pool->ctx = ctx;
+    pool->udp_fd = udp_fd;
+    pool->maxq = maxq > TUN_MAXQ ? TUN_MAXQ : (maxq < 1 ? 1 : maxq);
+    snprintf(pool->tunname, sizeof pool->tunname, "%s", tunname);
+    q = &pool->qs[0];
+    q->pool = pool;
+    q->fd = fd0;
+    q->stop = 0;
+    atomic_store(&q->count, 0);
+    atomic_store(&q->waits, 0);
+    if (pthread_create(&q->th, NULL, tun_reader_main, q) != 0) {
+        free(pool);
+        return NULL;
+    }
+    pool->nq = 1;
+    return pool;
+}
+
+static void qpool_destroy(struct tun_qpool *pool)
+{
+    int i;
+
+    if (!pool)
+        return;
+    for (i = 0; i < pool->nq; i++)
+        pool->qs[i].stop = 1;
+    for (i = 0; i < pool->nq; i++)
+        pthread_join(pool->qs[i].th, NULL);
+    for (i = 1; i < pool->nq; i++) {
+        ioctl(pool->qs[i].fd, TUNSETQUEUE, (void *)(long)IFF_DETACH_QUEUE);
+        close(pool->qs[i].fd);
+    }
+    close(pool->qs[0].fd);
+    free(pool);
+}
+
+/* AIMD controller: poll-timeout busy signal drives queue count */
+static void qpool_tick(struct tun_qpool *pool)
+{
+    static int slow_start = 1;
+    static int idle_cycles = 0;
+    uint64_t wsum = 0;
+    double busy;
+    int target;
+
+    for (int i = 0; i < pool->nq; i++)
+        wsum += atomic_exchange(&pool->qs[i].waits, 0);
+    busy = 1.0 - (double)wsum /
+                  ((double)TUN_QCTL_MS / 100.0 * (double)pool->nq);
+    if (busy < 0)
+        busy = 0;
+    if (busy > 1)
+        busy = 1;
+
+    target = pool->nq;
+    if (busy > TUN_BUSY_GROW) {
+        idle_cycles = 0;
+        if (slow_start) {
+            target = pool->nq * 2;
+            if (target >= 4)
+                slow_start = 0;
+        } else {
+            target = pool->nq + 1;
+        }
+    } else if (busy < TUN_BUSY_SHRINK) {
+        idle_cycles++;
+        if (idle_cycles >= 4 && pool->nq > 1) {
+            /* conservative shrink: only after 2s of sustained idle, so
+             * brief load gaps (test pauses, app think time) do not drop
+             * queued packets of live flows */
+            target = pool->nq / 2;
+            if (target < 1)
+                target = 1;
+            idle_cycles = 0;
+        }
+    } else {
+        idle_cycles = 0;
+    }
+    if (target > pool->maxq)
+        target = pool->maxq;
+
+    while (pool->nq < target) {
+        if (qpool_add(pool) != 0)
+            break;
+        srv_log("tun reader pool: %d queues", pool->nq);
+    }
+    while (pool->nq > target && pool->nq > 1) {
+        qpool_del(pool);
+        srv_log("tun reader pool: %d queues", pool->nq);
+    }
+}
+
 /* remove stale device, open, configure. Exits on failure. */
 static int setup_tun(const char *name, const char *server_ip, int mask)
 {
@@ -301,7 +536,7 @@ static int setup_tun(const char *name, const char *server_ip, int mask)
     char addr[64];
 
     (void)ip_run_quiet((char *[]){"link", "del", (char *)name, NULL});
-    fd = open_tun(name);
+    fd = open_tun_mq(name);
     if (fd < 0) {
         fprintf(stderr, "error: cannot open tun device %s: %s (run as root?)\n",
                 name, strerror(errno));
@@ -352,10 +587,10 @@ int main(int argc, char **argv)
     uint8_t sip[4], dip[4];
     uint32_t subnet_base;
     char subnet_net[64];
-    uint8_t udp_buf[65536], tun_buf[65536];
+    uint8_t udp_buf[65536];
     uint64_t last_purge;
-    int nusers, tun_fd, udp_fd, nfds, pr;
-    uint64_t last_drops = 0;
+    int nusers, tun_fd = -1, udp_fd, nfds, pr;
+    uint64_t last_drops = 0, last_qctl = 0;
 
     memset(&o, 0, sizeof o);
     o.port = 6001;
@@ -401,6 +636,7 @@ int main(int argc, char **argv)
                 o.users);
 
     memset(&ctx, 0, sizeof ctx);
+    server_ctx_init(&ctx);
     memcpy(ctx.server_ip, sip, 4);
     memcpy(ctx.dns, dip, 4);
     ctx.ip_base = subnet_base + 2;                 /* first usable host */
@@ -435,6 +671,14 @@ int main(int argc, char **argv)
     }
 
     udp_fd = setup_udp(o.port);
+    if (!o.no_tun) {
+        ctx.qpool = qpool_create(&ctx, udp_fd, o.tun, tun_fd, TUN_MAXQ);
+        if (!ctx.qpool) {
+            fprintf(stderr, "error: cannot start TUN reader pool\n");
+            return 1;
+        }
+        printf("tun reader pool: 1 queue (dynamic up to %d)\n", TUN_MAXQ);
+    }
     printf("listening UDP 0.0.0.0:%u\n", (unsigned)o.port);
     printf("server ready.\n");
 
@@ -449,13 +693,8 @@ int main(int argc, char **argv)
     fds[0].events = POLLIN;
     fds[0].revents = 0;
     nfds = 1;
-    if (ctx.tun_fd >= 0) {
-        fds[1].fd = ctx.tun_fd;
-        fds[1].events = POLLIN;
-        fds[1].revents = 0;
-        nfds = 2;
-    }
     last_purge = now_ms();
+    last_qctl = now_ms();
 
     while (!g_stop) {
         pr = poll(fds, nfds, 100);
@@ -486,22 +725,15 @@ int main(int argc, char **argv)
             }
         }
 
-        if (nfds == 2 && (fds[1].revents & (POLLIN | POLLERR))) {
-            for (;;) {
-                ptrdiff_t r = tun_read(ctx.tun_fd, tun_buf, sizeof tun_buf);
-                if (r <= 0) {
-                    if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
-                        fprintf(stderr, "tun read: %s\n", strerror(errno));
-                    break; /* EAGAIN: drained */
-                }
-                handle_tun_downlink(&ctx, tun_buf, (size_t)r, ctx.tun_fd,
-                                    udp_fd);
-            }
-        }
-
         uint64_t now = now_ms();
+        if (ctx.qpool && now - last_qctl >= TUN_QCTL_MS) {
+            qpool_tick(ctx.qpool);
+            last_qctl = now;
+        }
         if (now - last_purge >= 1000) {
             purge_expired(&ctx, now);
+            if (debug_enabled())
+                server_up_stats_print();
             uint64_t drops = server_send_drops();
             if (drops != last_drops) {
                 fprintf(stderr, "udp send dropped %llu packets\n",
@@ -512,7 +744,10 @@ int main(int argc, char **argv)
         }
     }
 
-    tun_close(ctx.tun_fd);
+    qpool_destroy(ctx.qpool);   /* stops readers, closes all queue fds */
+    ctx.qpool = NULL;
+    ctx.tun_fd = -1;
     close(udp_fd);
+    server_ctx_destroy(&ctx);
     return 0;
 }

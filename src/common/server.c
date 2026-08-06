@@ -7,6 +7,7 @@
 #include <string.h>
 #include <sys/random.h>
 #include <time.h>
+#include <stdarg.h>
 #include <unistd.h>
 
 #include "common.h"
@@ -14,6 +15,7 @@
 #include "protocol.h"
 #include "server.h"
 #include "tun.h"
+#include "util.h"
 
 #define IDLE_TIMEOUT_MS 120000
 #define REJECT_LOG_MAX 10   /* per second, per source-independent window */
@@ -22,7 +24,70 @@
 #define RATE_OPEN_MAX 20    /* OPENs per source per window */
 #define RATE_ECHO_MAX 60    /* PING/ECHO per source per window */
 
-static uint64_t g_send_drops;
+static atomic_uint_fast64_t g_send_drops;
+static pthread_mutex_t g_log_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void srv_log(const char *fmt, ...)
+{
+    va_list ap;
+
+    pthread_mutex_lock(&g_log_lock);
+    va_start(ap, fmt);
+    vfprintf(stdout, fmt, ap);
+    va_end(ap);
+    fputc('\n', stdout);
+    fflush(stdout);
+    pthread_mutex_unlock(&g_log_lock);
+}
+
+void server_ctx_init(struct server_ctx *ctx)
+{
+    pthread_rwlock_init(&ctx->sess_lock, NULL);
+}
+
+void server_ctx_destroy(struct server_ctx *ctx)
+{
+    pthread_rwlock_destroy(&ctx->sess_lock);
+}
+
+/* ---- uplink per-step timing (IWAN_DEBUG=1, printed once per second) ---- */
+struct up_stats {
+    uint64_t n;
+    uint64_t parse;   /* frame parse + rate_allow + dispatch */
+    uint64_t find;    /* find_session + token + rebind + enc check */
+    uint64_t xor;     /* in-place decryption */
+    uint64_t write;   /* tun_write syscall */
+};
+
+static struct up_stats g_up;
+static uint64_t g_up_win;
+
+static uint64_t now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+void server_up_stats_print(void)
+{
+    uint64_t now;
+
+    if (g_up.n == 0)
+        return;
+    now = now_ns();
+    if (now - g_up_win < 1000000000ull)
+        return;
+    g_up_win = now;
+    fprintf(stderr,
+            "uplink: n=%llu parse=%.0fns find=%.0fns xor=%.0fns write=%.0fns"
+            " total=%.0fns\n",
+            (unsigned long long)g_up.n, (double)g_up.parse / g_up.n,
+            (double)g_up.find / g_up.n, (double)g_up.xor / g_up.n,
+            (double)g_up.write / g_up.n,
+            (double)(g_up.parse + g_up.find + g_up.xor + g_up.write) / g_up.n);
+    g_up.n = g_up.parse = g_up.find = g_up.xor = g_up.write = 0;
+}
 
 /* best-effort scrub of secrets, immune to optimizer elision */
 static void wipe(void *p, size_t n)
@@ -100,7 +165,7 @@ static bool udp_send(int sockfd, const struct sockaddr_in *peer,
 {
     if (sendto(sockfd, data, len, 0, (const struct sockaddr *)peer,
                sizeof *peer) < 0) {
-        g_send_drops++;
+        atomic_fetch_add(&g_send_drops, 1);
         return false;
     }
     return true;
@@ -108,7 +173,7 @@ static bool udp_send(int sockfd, const struct sockaddr_in *peer,
 
 uint64_t server_send_drops(void)
 {
-    return g_send_drops;
+    return atomic_load(&g_send_drops);
 }
 
 /* rate-limited reject logging: at most REJECT_LOG_MAX lines per second,
@@ -128,7 +193,7 @@ static void log_reject(const char *peerstr, const char *user, const char *reason
         return;
     cnt++;
     log_escape(user, u, sizeof u);
-    printf("[%s] OPEN reject: %s (%s)\n", peerstr, reason, u);
+    srv_log("[%s] OPEN reject: %s (%s)", peerstr, reason, u);
 }
 
 static void peer_to_string(const struct sockaddr_in *peer, char out[INET_ADDRSTRLEN + 8])
@@ -138,7 +203,9 @@ static void peer_to_string(const struct sockaddr_in *peer, char out[INET_ADDRSTR
     snprintf(out, INET_ADDRSTRLEN + 8, "%s:%u", ip, (unsigned)ntohs(peer->sin_port));
 }
 
-static struct server_session *find_session(struct server_ctx *ctx, uint16_t sid)
+/* caller must hold ctx->sess_lock (any mode) */
+static struct server_session *find_session_unlocked(struct server_ctx *ctx,
+                                                    uint16_t sid)
 {
     for (int i = 0; i < SERVER_MAX_SESSIONS; i++)
         if (ctx->sess[i].valid && ctx->sess[i].sid == sid)
@@ -146,14 +213,17 @@ static struct server_session *find_session(struct server_ctx *ctx, uint16_t sid)
     return NULL;
 }
 
-static struct server_session *find_session_by_ip(struct server_ctx *ctx,
-                                                 const uint8_t ip[4])
+static struct server_session *find_session_by_ip_unlocked(struct server_ctx *ctx,
+                                                          const uint8_t ip[4])
 {
     for (int i = 0; i < SERVER_MAX_SESSIONS; i++)
         if (ctx->sess[i].valid && memcmp(ctx->sess[i].ip, ip, 4) == 0)
             return &ctx->sess[i];
     return NULL;
 }
+
+/* All session access goes through explicit lock sections (see callers);
+ * find_session_unlocked / find_session_by_ip_unlocked require the lock. */
 
 static void send_reject(int sockfd, const struct sockaddr_in *peer, const char *msg)
 {
@@ -283,6 +353,11 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
         return;
     }
 
+    session_key(a.user, pass, sk);
+
+    /* ---- session-table section: exclusive (write) lock ---- */
+    pthread_rwlock_wrlock(&ctx->sess_lock);
+
     /* one slot per user: a re-OPEN replaces the user's existing session
      * instead of consuming a fresh slot (prevents account-level table
      * exhaustion); fall back to any free slot */
@@ -302,6 +377,7 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
         }
     }
     if (slot < 0) {
+        pthread_rwlock_unlock(&ctx->sess_lock);
         peer_to_string(peer, peerstr);
         log_reject(peerstr, a.user, "server full");
         send_reject(sockfd, peer, "server full");
@@ -325,11 +401,12 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
             if (probe > ctx->ip_end)
                 probe = ctx->ip_base;
             sid = (uint16_t)(probe & 0xFFFF);
-            if (!find_session(ctx, sid))
+            if (!find_session_unlocked(ctx, sid))
                 break;
             probe++;
         }
         if (i == (int)pool || i == 65536) {
+            pthread_rwlock_unlock(&ctx->sess_lock);
             peer_to_string(peer, peerstr);
             log_reject(peerstr, a.user, "server full");
             send_reject(sockfd, peer, "server full");
@@ -340,7 +417,30 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
     }
     tok = random_token();
 
-    session_key(a.user, pass, sk);
+    /* replace any existing session with the same sid */
+    for (i = 0; i < SERVER_MAX_SESSIONS; i++)
+        if (ctx->sess[i].valid && ctx->sess[i].sid == sid) {
+            ctx->sess[i].valid = false;
+            wipe(ctx->sess[i].xor_key, sizeof ctx->sess[i].xor_key);
+            wipe(&ctx->sess[i].token, sizeof ctx->sess[i].token);
+        }
+
+    s = &ctx->sess[slot];
+    memset(s, 0, sizeof *s);
+    s->valid = true;
+    s->sid = sid;
+    s->token = tok;
+    s->peer = *peer;
+    u32_ip4(ipu, s->ip);
+    memcpy(s->xor_key, sk, 8);
+    s->enc = a.enc;
+    atomic_store(&s->last_active_ms, now_ms());
+    snprintf(s->user, sizeof s->user, "%s", a.user);
+
+    pthread_rwlock_unlock(&ctx->sess_lock);
+
+    wipe(sk, sizeof sk);
+    wipe(expect, sizeof expect);
 
     /* echo the client's nonce verbatim; this repo's client rejects ACKs
      * without a matching T_AUTH_VERIFY */
@@ -367,31 +467,14 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
     udp_send(sockfd, peer, b.data, b.len);
     buf_free(&b);
 
-    /* replace any existing session with the same sid */
-    for (i = 0; i < SERVER_MAX_SESSIONS; i++)
-        if (ctx->sess[i].valid && ctx->sess[i].sid == sid) {
-            ctx->sess[i].valid = false;
-            wipe(ctx->sess[i].xor_key, sizeof ctx->sess[i].xor_key);
-            wipe(&ctx->sess[i].token, sizeof ctx->sess[i].token);
-        }
-
-    s = &ctx->sess[slot];
-    memset(s, 0, sizeof *s);
-    s->valid = true;
-    s->sid = sid;
-    s->token = tok;
-    s->peer = *peer;
-    u32_ip4(ipu, s->ip);
-    memcpy(s->xor_key, sk, 8);
-    s->enc = a.enc;
-    s->last_active_ms = now_ms();
-    snprintf(s->user, sizeof s->user, "%s", a.user);
-    wipe(sk, sizeof sk);
-    wipe(expect, sizeof expect);
-
     peer_to_string(peer, peerstr);
-    printf("[%s] OPEN_ACK -> %s sid=0x%04x ip=%u.%u.%u.%u enc=%u\n",
-           peerstr, a.user, sid, s->ip[0], s->ip[1], s->ip[2], s->ip[3], s->enc);
+    {
+        uint8_t ipb2[4];
+        u32_ip4(ipu, ipb2);
+        srv_log("[%s] OPEN_ACK -> %s sid=0x%04x ip=%u.%u.%u.%u enc=%u",
+                peerstr, a.user, sid, ipb2[0], ipb2[1], ipb2[2], ipb2[3],
+                a.enc);
+    }
 }
 
 void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nusers,
@@ -411,64 +494,107 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
     sid = (uint16_t)((raw[2] << 8) | raw[3]);
     tok = ((uint32_t)raw[4] << 24) | ((uint32_t)raw[5] << 16) |
           ((uint32_t)raw[6] << 8) | (uint32_t)raw[7];
-    if (!rate_allow(peer, typ, now_ms()))
-        return; /* unauthenticated flood from this source: silent drop */
+    {
+        uint64_t ta = 0;
+        if (debug_enabled())
+            ta = now_ns();
+        if (!rate_allow(peer, typ, now_ms()))
+            return; /* unauthenticated flood from this source: silent drop */
 
-    switch (typ) {
-    case PT_OPEN:
-        handle_open(ctx, users, nusers, raw, len, peer, sockfd);
-        break;
+        switch (typ) {
+        case PT_OPEN:
+            handle_open(ctx, users, nusers, raw, len, peer, sockfd);
+            break;
 
-    case PT_DATA:
-    case PT_DATA_ENC:
-        s = find_session(ctx, sid);
-        if (!s || s->token != tok)
-            return; /* unknown session or bad token: drop */
-        /* source binding: only the session's peer may drive the session;
-         * first valid-token packet from a new source rebinds it (NAT or
-         * port rebinding tolerance) */
-        s->peer = *peer;
-        if (s->enc) {
-            if (typ != PT_DATA_ENC)
-                return; /* enc session accepts only encrypted data */
-            xor_crypt((uint8_t *)raw + 8, len - 8, s->xor_key, 8);
-        } else {
-            if (typ != PT_DATA)
-                return; /* plain session accepts only plaintext data */
+        case PT_DATA:
+        case PT_DATA_ENC: {
+            uint64_t tb = 0, tx0 = 0, tx1 = 0, tc = 0;
+            uint8_t enc, xk[8];
+            if (debug_enabled())
+                tb = now_ns();
+            pthread_rwlock_rdlock(&ctx->sess_lock);
+            s = find_session_unlocked(ctx, sid);
+            if (!s || s->token != tok) {
+                pthread_rwlock_unlock(&ctx->sess_lock);
+                return; /* unknown session or bad token: drop */
+            }
+            /* source binding: only the session's peer may drive the
+             * session; first valid-token packet from a new source rebinds
+             * it (NAT or port rebinding tolerance). Rebinds are rare, so
+             * the common path holds only the read lock. */
+            if (memcmp(&s->peer, peer, sizeof *peer) != 0) {
+                pthread_rwlock_unlock(&ctx->sess_lock);
+                pthread_rwlock_wrlock(&ctx->sess_lock);
+                s = find_session_unlocked(ctx, sid);
+                if (!s || s->token != tok) {
+                    pthread_rwlock_unlock(&ctx->sess_lock);
+                    return;
+                }
+                s->peer = *peer;
+            }
+            enc = s->enc;
+            memcpy(xk, s->xor_key, sizeof xk);
+            atomic_store(&s->last_active_ms, now_ms());
+            pthread_rwlock_unlock(&ctx->sess_lock);
+            if (debug_enabled())
+                tx0 = now_ns();
+            if (enc) {
+                if (typ != PT_DATA_ENC)
+                    return; /* enc session accepts only encrypted data */
+                xor_crypt((uint8_t *)raw + 8, len - 8, xk, 8);
+            } else {
+                if (typ != PT_DATA)
+                    return; /* plain session accepts only plaintext data */
+            }
+            if (debug_enabled())
+                tx1 = now_ns();
+            if (ctx->tun_fd >= 0 && len > 8)
+                tun_write(ctx->tun_fd, raw + 8, len - 8);
+            if (debug_enabled()) {
+                tc = now_ns();
+                g_up.parse += tb - ta;
+                g_up.find += tx0 - tb;
+                g_up.xor += tx1 - tx0;
+                g_up.write += tc - tx1;
+                g_up.n++;
+            }
+            break;
         }
-        if (ctx->tun_fd >= 0 && len > 8)
-            tun_write(ctx->tun_fd, raw + 8, len - 8);
-        s->last_active_ms = now_ms();
-        break;
 
     case PT_CLOSE:
         if (!verify_sig(raw, len))
             return;
-        s = find_session(ctx, sid);
+        pthread_rwlock_wrlock(&ctx->sess_lock);
+        s = find_session_unlocked(ctx, sid);
         if (s && s->token == tok) {
             /* CLOSE is terminal: never rebind to a new source, or a
              * token-holding attacker could kill the session from any
              * address */
             if (s->peer.sin_addr.s_addr != peer->sin_addr.s_addr ||
-                s->peer.sin_port != peer->sin_port)
+                s->peer.sin_port != peer->sin_port) {
+                pthread_rwlock_unlock(&ctx->sess_lock);
                 return;
+            }
             peer_to_string(peer, peerstr);
-            printf("[%s] session 0x%04x (ip %u.%u.%u.%u) closed\n",
-                   peerstr, s->sid, s->ip[0], s->ip[1], s->ip[2], s->ip[3]);
+            srv_log("[%s] session 0x%04x (ip %u.%u.%u.%u) closed",
+                    peerstr, s->sid, s->ip[0], s->ip[1], s->ip[2], s->ip[3]);
             s->valid = false;
             wipe(s->xor_key, sizeof s->xor_key);
             wipe(&s->token, sizeof s->token);
         }
+        pthread_rwlock_unlock(&ctx->sess_lock);
         break;
 
     case PT_PING_REQ:
         if (!verify_sig(raw, len))
             return;
-        s = find_session(ctx, sid);
+        pthread_rwlock_wrlock(&ctx->sess_lock);
+        s = find_session_unlocked(ctx, sid);
         if (s && s->token == tok) {
             s->peer = *peer;
-            s->last_active_ms = now_ms(); /* keepalive traffic = alive */
+            atomic_store(&s->last_active_ms, now_ms()); /* keepalive */
         }
+        pthread_rwlock_unlock(&ctx->sess_lock);
         buf_init(&b);
         ctrl_hdr(&b, PT_PING_RSP, 0, 0xFFFF, 0xFFFFFFFF);
         udp_send(sockfd, peer, b.data, b.len);
@@ -478,11 +604,13 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
     case PT_ECHO_REQ:
         if (!verify_sig(raw, len))
             return;
-        s = find_session(ctx, sid);
+        pthread_rwlock_wrlock(&ctx->sess_lock);
+        s = find_session_unlocked(ctx, sid);
         if (s && s->token == tok) {
             s->peer = *peer;
-            s->last_active_ms = now_ms(); /* keepalive traffic = alive */
+            atomic_store(&s->last_active_ms, now_ms()); /* keepalive */
         }
+        pthread_rwlock_unlock(&ctx->sess_lock);
         buf_init(&b);
         ctrl_hdr(&b, PT_ECHO_RES, raw[1], sid, tok);
         udp_send(sockfd, peer, b.data, b.len);
@@ -491,13 +619,14 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
 
     default:
         break; /* drop silently */
+        }
     }
 }
 
 void handle_tun_downlink(struct server_ctx *ctx, const uint8_t *ip_pkt, size_t len,
                          int tun_fd, int sockfd)
 {
-    struct server_session *s;
+    struct server_sess_snap snap;
     /* fixed stack buffer: 8B outer header + max TUN datagram; avoids a
      * malloc/realloc cycle per forwarded packet */
     uint8_t out[8 + 65536];
@@ -506,31 +635,52 @@ void handle_tun_downlink(struct server_ctx *ctx, const uint8_t *ip_pkt, size_t l
 
     if (len < 20 || len > 65536)
         return;
-    s = find_session_by_ip(ctx, ip_pkt + 16);
-    if (!s)
-        return;
+    /* snapshot under the read lock; the send happens lock-free */
+    pthread_rwlock_rdlock(&ctx->sess_lock);
+    {
+        struct server_session *s = find_session_by_ip_unlocked(ctx, ip_pkt + 16);
+        if (!s) {
+            pthread_rwlock_unlock(&ctx->sess_lock);
+            return;
+        }
+        snap.peer = s->peer;
+        snap.sid = s->sid;
+        snap.token = s->token;
+        snap.enc = s->enc;
+        memcpy(snap.xor_key, s->xor_key, sizeof snap.xor_key);
+    }
+    pthread_rwlock_unlock(&ctx->sess_lock);
 
-    out[0] = s->enc ? PT_DATA_ENC : PT_DATA;
-    out[1] = s->enc;
-    out[2] = (uint8_t)(s->sid >> 8);
-    out[3] = (uint8_t)s->sid;
-    out[4] = (uint8_t)(s->token >> 24);
-    out[5] = (uint8_t)(s->token >> 16);
-    out[6] = (uint8_t)(s->token >> 8);
-    out[7] = (uint8_t)s->token;
+    out[0] = snap.enc ? PT_DATA_ENC : PT_DATA;
+    out[1] = snap.enc;
+    out[2] = (uint8_t)(snap.sid >> 8);
+    out[3] = (uint8_t)snap.sid;
+    out[4] = (uint8_t)(snap.token >> 24);
+    out[5] = (uint8_t)(snap.token >> 16);
+    out[6] = (uint8_t)(snap.token >> 8);
+    out[7] = (uint8_t)snap.token;
     memcpy(out + 8, ip_pkt, len);
-    if (s->enc)
-        xor_crypt(out + 8, len, s->xor_key, 8);
-    if (!udp_send(sockfd, &s->peer, out, 8 + len) &&
+    if (snap.enc)
+        xor_crypt(out + 8, len, snap.xor_key, 8);
+    if (!udp_send(sockfd, &snap.peer, out, 8 + len) &&
         errno == ECONNREFUSED) {
         /* the client's UDP socket is gone (ICMP port unreachable): stop
          * forwarding to a dead peer — every sendto would keep generating
          * ICMP and the poll loop would spin draining them */
-        printf("session 0x%04x (ip %u.%u.%u.%u) peer unreachable, closing\n",
-               s->sid, s->ip[0], s->ip[1], s->ip[2], s->ip[3]);
-        s->valid = false;
-        wipe(s->xor_key, sizeof s->xor_key);
-        wipe(&s->token, sizeof s->token);
+        pthread_rwlock_wrlock(&ctx->sess_lock);
+        {
+            struct server_session *s =
+                find_session_by_ip_unlocked(ctx, ip_pkt + 16);
+            if (s) {
+                srv_log("session 0x%04x (ip %u.%u.%u.%u) peer unreachable, "
+                        "closing", s->sid, s->ip[0], s->ip[1], s->ip[2],
+                        s->ip[3]);
+                s->valid = false;
+                wipe(s->xor_key, sizeof s->xor_key);
+                wipe(&s->token, sizeof s->token);
+            }
+        }
+        pthread_rwlock_unlock(&ctx->sess_lock);
         return;
     }
     /* deliberately NO last_active refresh here: downlink is triggered by
@@ -540,14 +690,17 @@ void handle_tun_downlink(struct server_ctx *ctx, const uint8_t *ip_pkt, size_t l
 
 void purge_expired(struct server_ctx *ctx, uint64_t now)
 {
+    pthread_rwlock_wrlock(&ctx->sess_lock);
     for (int i = 0; i < SERVER_MAX_SESSIONS; i++) {
         struct server_session *s = &ctx->sess[i];
-        if (s->valid && now - s->last_active_ms > IDLE_TIMEOUT_MS) {
-            printf("session 0x%04x (ip %u.%u.%u.%u) expired after 120s idle\n",
-                   s->sid, s->ip[0], s->ip[1], s->ip[2], s->ip[3]);
+        if (s->valid &&
+            now - atomic_load(&s->last_active_ms) > IDLE_TIMEOUT_MS) {
+            srv_log("session 0x%04x (ip %u.%u.%u.%u) expired after 120s idle",
+                    s->sid, s->ip[0], s->ip[1], s->ip[2], s->ip[3]);
             s->valid = false;
             wipe(s->xor_key, sizeof s->xor_key);
             wipe(&s->token, sizeof s->token);
         }
     }
+    pthread_rwlock_unlock(&ctx->sess_lock);
 }
