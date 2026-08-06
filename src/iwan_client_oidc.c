@@ -9,6 +9,15 @@
 #include "common.h"
 #include "oidc.h"
 
+/* argument-validation failure: report the error, show the usage summary,
+ * and point at --help, matching the CLI framework's own errors */
+static void usage_error(const Cli *usage, const char *msg)
+{
+    fprintf(stderr, "error: %s\n\n%s\n\nFor more information, try '--help'.\n",
+            msg, oidc_usage(usage));
+    exit(2);
+}
+
 int main(int argc, char **argv)
 {
     Opts o;
@@ -26,12 +35,13 @@ int main(int argc, char **argv)
     oidc_parse_cli(argc, argv, &o, &usage);
 
     if (!(o.fetch || o.list || o.connect || o.all))
-        oidc_die("choose one action: --fetch, --list, --connect, or --all");
+        usage_error(&usage,
+                    "no action chosen: pass --fetch, --list, --connect, or --all");
     bool do_fetch = o.fetch || o.all;
     bool do_list = o.list || o.all;
     bool do_connect = o.connect || o.all;
     if (o.socks && !do_connect)
-        oidc_die("--socks requires --connect or --all");
+        usage_error(&usage, "--socks requires --connect or --all");
     if (do_connect && !o.socks && geteuid() != 0)
         oidc_elevate_root(argc, argv);
 
