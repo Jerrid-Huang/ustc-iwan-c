@@ -1,6 +1,6 @@
 # ustc-iwan-c
 
-USTC iWAN 校园网 VPN 客户端,用 C11 从 [yyy1mu/ustc-iwan](https://github.com/yyy1mu/ustc-iwan) 重写并优化。
+USTC iWAN 校园网 VPN 客户端,用 C11 从 [yyy1mu/ustc-iwan](https://github.com/yyy1mu/ustc-iwan) 重写并优化,大幅提升吞吐量并减小延迟。
 
 ## 特性
 
@@ -21,8 +21,6 @@ make -B         # 强制全量重建
 make clean
 ```
 
-要求 `make` 0 error 0 warning。
-
 ## 用法
 
 ```sh
@@ -33,7 +31,7 @@ make clean
 ./bin/iwan-client socks --server <SERVER> --port 6001
 
 # TUN 模式,直连指定服务器并代理全部科大校园网
-sudo ./bin/iwan-client-oidc --connect --ustc --server 202.141.176.3:6001
+sudo ./bin/iwan-client-oidc -c --ustc --server <SERVER>
 ```
 
 OIDC 子命令:
