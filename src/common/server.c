@@ -493,27 +493,30 @@ void handle_tun_downlink(struct server_ctx *ctx, const uint8_t *ip_pkt, size_t l
                          int tun_fd, int sockfd)
 {
     struct server_session *s;
-    buf_t b;
+    /* fixed stack buffer: 8B outer header + max TUN datagram; avoids a
+     * malloc/realloc cycle per forwarded packet */
+    uint8_t out[8 + 65536];
 
     (void)tun_fd;
 
-    if (len < 20)
+    if (len < 20 || len > 65536)
         return;
     s = find_session_by_ip(ctx, ip_pkt + 16);
     if (!s)
         return;
 
-    buf_init(&b);
-    if (s->enc) {
-        data_hdr(&b, PT_DATA_ENC, s->enc, s->sid, s->token);
-        buf_put(&b, ip_pkt, len);
-        xor_crypt(b.data + 8, len, s->xor_key, 8);
-    } else {
-        data_hdr(&b, PT_DATA, 0, s->sid, s->token);
-        buf_put(&b, ip_pkt, len);
-    }
-    udp_send(sockfd, &s->peer, b.data, b.len);
-    buf_free(&b);
+    out[0] = s->enc ? PT_DATA_ENC : PT_DATA;
+    out[1] = s->enc;
+    out[2] = (uint8_t)(s->sid >> 8);
+    out[3] = (uint8_t)s->sid;
+    out[4] = (uint8_t)(s->token >> 24);
+    out[5] = (uint8_t)(s->token >> 16);
+    out[6] = (uint8_t)(s->token >> 8);
+    out[7] = (uint8_t)s->token;
+    memcpy(out + 8, ip_pkt, len);
+    if (s->enc)
+        xor_crypt(out + 8, len, s->xor_key, 8);
+    udp_send(sockfd, &s->peer, out, 8 + len);
     /* deliberately NO last_active refresh here: downlink is triggered by
      * third-party traffic (other clients, inbound routing), so refreshing
      * would let anyone keep a dead session alive past the idle purge */

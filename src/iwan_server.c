@@ -467,20 +467,29 @@ int main(int argc, char **argv)
         }
 
         if (fds[0].revents & (POLLIN | POLLERR)) {
-            struct sockaddr_in peer;
-            socklen_t plen = sizeof peer;
-            ssize_t n = recvfrom(udp_fd, udp_buf, sizeof udp_buf, 0,
-                                 (struct sockaddr *)&peer, &plen);
-            if (n > 0)
-                handle_udp(&ctx, users, nusers, udp_buf, (size_t)n, &peer, udp_fd);
+            for (;;) {
+                struct sockaddr_in peer;
+                socklen_t plen = sizeof peer;
+                ssize_t n = recvfrom(udp_fd, udp_buf, sizeof udp_buf, 0,
+                                     (struct sockaddr *)&peer, &plen);
+                if (n <= 0)
+                    break; /* EAGAIN: drained */
+                handle_udp(&ctx, users, nusers, udp_buf, (size_t)n, &peer,
+                           udp_fd);
+            }
         }
 
         if (nfds == 2 && (fds[1].revents & (POLLIN | POLLERR))) {
-            ptrdiff_t r = tun_read(ctx.tun_fd, tun_buf, sizeof tun_buf);
-            if (r > 0)
-                handle_tun_downlink(&ctx, tun_buf, (size_t)r, ctx.tun_fd, udp_fd);
-            else if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
-                fprintf(stderr, "tun read: %s\n", strerror(errno));
+            for (;;) {
+                ptrdiff_t r = tun_read(ctx.tun_fd, tun_buf, sizeof tun_buf);
+                if (r <= 0) {
+                    if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+                        fprintf(stderr, "tun read: %s\n", strerror(errno));
+                    break; /* EAGAIN: drained */
+                }
+                handle_tun_downlink(&ctx, tun_buf, (size_t)r, ctx.tun_fd,
+                                    udp_fd);
+            }
         }
 
         uint64_t now = now_ms();
