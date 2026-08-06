@@ -78,6 +78,11 @@ static void parse_opts(int argc, char **argv, struct opts *o)
             }
             break;
         case 't':
+            if (strlen(optarg) >= IFNAMSIZ) {
+                fprintf(stderr, "error: tun device name too long (max %d)\n",
+                        IFNAMSIZ - 1);
+                exit(1);
+            }
             snprintf(o->tun, sizeof o->tun, "%s", optarg);
             break;
         case 's':
@@ -144,9 +149,13 @@ static int parse_subnet(const char *s, uint32_t *base, int *mask,
     memcpy(ip_part, s, n);
     ip_part[n] = '\0';
 
-    *mask = atoi(slash + 1);
-    if (*mask < 8 || *mask > 30)
-        return -1;
+    {
+        char *mend;
+        long m = strtol(slash + 1, &mend, 10);
+        if (mend == slash + 1 || *mend != '\0' || m < 8 || m > 30)
+            return -1;
+        *mask = (int)m;
+    }
     if (!s2ip4(ip_part, ip))
         return -1;
 
@@ -192,9 +201,41 @@ static int load_users(const char *path, struct server_user *users, int max)
         char *pass = trim(colon + 1);
         if (*name == '\0')
             continue;
+        if (strlen(name) >= sizeof users[n].name ||
+            strlen(pass) >= sizeof users[n].pass) {
+            fprintf(stderr,
+                    "warning: skipping user '%s': name/pass exceeds %d chars\n",
+                    name, SERVER_USER_MAX);
+            continue;
+        }
+        if (*pass == '\0') {
+            fprintf(stderr, "warning: skipping user '%s': empty password\n",
+                    name);
+            continue;
+        }
+        int dup = 0;
+        for (int k = 0; k < n; k++)
+            if (strcmp(users[k].name, name) == 0)
+                dup = 1;
+        if (dup) {
+            fprintf(stderr, "warning: skipping duplicate user '%s'\n", name);
+            continue;
+        }
         snprintf(users[n].name, sizeof users[n].name, "%s", name);
         snprintf(users[n].pass, sizeof users[n].pass, "%s", pass);
         n++;
+    }
+    if (n >= max) {
+        int ch, extra = 0;
+        while ((ch = fgetc(f)) != EOF)
+            if (ch != '\n' && ch != '\r' && ch != ' ' && ch != '\t') {
+                extra = 1;
+                break;
+            }
+        if (extra)
+            fprintf(stderr,
+                    "warning: users file has more than %d entries; "
+                    "the rest are ignored\n", max);
     }
     fclose(f);
     return n;
@@ -225,6 +266,7 @@ static int run_cmd(char *const argv[])
     if (pid < 0)
         return -1;
     if (pid == 0) {
+        exec_sanitize();
         execvp(argv[0], argv);
         _exit(127);
     }
@@ -286,6 +328,7 @@ static int setup_udp(uint16_t port)
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof sz);
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof sz);
+    set_nonblock(fd); /* never let sendto backpressure stall the loop */
 
     memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET;
@@ -312,6 +355,7 @@ int main(int argc, char **argv)
     uint8_t udp_buf[65536], tun_buf[65536];
     uint64_t last_purge;
     int nusers, tun_fd, udp_fd, nfds, pr;
+    uint64_t last_drops = 0;
 
     memset(&o, 0, sizeof o);
     o.port = 6001;
@@ -364,6 +408,21 @@ int main(int argc, char **argv)
     ctx.next_ip = ctx.ip_base;
     snprintf(ctx.tun_name, sizeof ctx.tun_name, "%s", o.tun);
     ctx.tun_fd = -1;
+
+    {
+        uint32_t sipu = ip4_u32(sip), dipu = ip4_u32(dip);
+        if (sipu >= ctx.ip_base && sipu <= ctx.ip_end) {
+            fprintf(stderr, "error: --server-ip %s falls inside the client "
+                            "pool; pick an address outside [first,last]\n",
+                    o.server_ip);
+            return 1;
+        }
+        if (dipu >= ctx.ip_base && dipu <= ctx.ip_end) {
+            fprintf(stderr, "error: --dns %s falls inside the client pool\n",
+                    o.dns);
+            return 1;
+        }
+    }
 
     if (o.no_tun) {
         printf("no-tun mode: data plane disabled\n");
@@ -427,6 +486,12 @@ int main(int argc, char **argv)
         uint64_t now = now_ms();
         if (now - last_purge >= 1000) {
             purge_expired(&ctx, now);
+            uint64_t drops = server_send_drops();
+            if (drops != last_drops) {
+                fprintf(stderr, "udp send dropped %llu packets\n",
+                        (unsigned long long)drops);
+                last_drops = drops;
+            }
             last_purge = now;
         }
     }

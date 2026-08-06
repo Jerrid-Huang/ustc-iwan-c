@@ -24,6 +24,16 @@ bool debug_enabled(void)
 }
 
 /* argv with "ip" prepended; args[0] is "-4", "route", ... or already "ip" */
+/* Neutralize PATH and loader-injection environment before exec'ing helper
+ * binaries: the daemon may run as root, and a hostile PATH entry (or
+ * LD_PRELOAD) would execute attacker code with root privileges. */
+void exec_sanitize(void)
+{
+    setenv("PATH", "/usr/sbin:/sbin:/usr/bin:/bin", 1);
+    unsetenv("LD_PRELOAD");
+    unsetenv("LD_LIBRARY_PATH");
+}
+
 static char **ip_argv(char *const args[])
 {
     size_t argc = 0;
@@ -46,6 +56,7 @@ static bool run_ip_child(char *const args[], bool quiet)
     if (pid < 0)
         return false;
     if (pid == 0) {
+        exec_sanitize();
         if (quiet) {
             int fd = open("/dev/null", O_RDWR);
             if (fd >= 0) {
@@ -89,6 +100,7 @@ char *cmd_capture(char *const args[])
         return NULL;
     }
     if (pid == 0) {
+        exec_sanitize();
         close(fds[0]);
         dup2(fds[1], STDOUT_FILENO);
         close(fds[1]);

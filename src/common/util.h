@@ -4,6 +4,9 @@
 #include <stdbool.h>
 
 bool debug_enabled(void);
+/* reset PATH to a safe default and clear loader-injection vars; call in
+ * the child before exec of helper binaries (root daemon hardening) */
+void exec_sanitize(void);
 /* run `ip` with argv (NULL-terminated, excluding argv[0]="ip"). Returns exit==0. */
 bool ip_run(char *const args[]);
 bool ip_run_quiet(char *const args[]);

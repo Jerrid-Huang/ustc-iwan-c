@@ -53,4 +53,7 @@ void handle_tun_downlink(struct server_ctx *ctx, const uint8_t *ip_pkt, size_t l
 /* Drop sessions idle for more than 120s; log each. */
 void purge_expired(struct server_ctx *ctx, uint64_t now_ms);
 
+/* Cumulative UDP send failures (nonblocking socket: EAGAIN drops). */
+uint64_t server_send_drops(void);
+
 #endif
