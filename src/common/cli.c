@@ -80,10 +80,23 @@ static const cli_opt *find_opt(const cli_opt *opts, size_t nopts,
 
 static const char *map_short(const cli_ctl *ctl, const char *a)
 {
-    if (!ctl->short_aliases || a[0] != '-' || a[1] != '-' || a[2] != '\0')
+    char ch;
+
+    if (!ctl->short_aliases || a[0] != '-')
         return NULL;
+    if (a[1] == '-') {
+        /* "--c" double-dash single-char form */
+        if (a[2] == '\0' || a[3] != '\0')
+            return NULL;
+        ch = a[2];
+    } else {
+        /* "-c" single-dash single-char form */
+        if (a[2] != '\0')
+            return NULL;
+        ch = a[1];
+    }
     for (const char *const(*p)[2] = ctl->short_aliases; (*p)[0]; p++)
-        if (a[1] == (*p)[0][0])
+        if (ch == (*p)[0][0])
             return (*p)[1];
     return NULL;
 }
