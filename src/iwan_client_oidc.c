@@ -60,7 +60,7 @@ int main(int argc, char **argv)
         oidc_load_config(path, &cf);
     }
 
-    if (do_list || do_connect)
+    if (do_list || (do_connect && !o.server))
         oidc_print_servers(cf.servers);
     if (do_connect && !o.socks) {
         /* TUN routes from <config-dir>/proxy.conf, merged with --proxy-cidr */

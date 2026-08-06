@@ -1,4 +1,9 @@
 build/
 bin/
 *.o
+*.a
 *.log
+core
+core.*
+.cc_tmp/
+compile_commands.json
