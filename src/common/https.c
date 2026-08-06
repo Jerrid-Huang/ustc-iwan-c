@@ -164,7 +164,11 @@ static pid_t https_spawn_client(const char *host, int in_pipe[2],
         }
         snprintf(connect_arg, sizeof connect_arg, "%s:443", host);
         execlp("openssl", "openssl", "s_client", "-quiet", "-connect",
-               connect_arg, "-servername", host, (char *)NULL);
+               connect_arg, "-servername", host,
+               "-verify_hostname", host,
+               "-verify_return_error",
+               "-CAfile", "/etc/ssl/certs/ca-certificates.crt",
+               (char *)NULL);
         _exit(127);
     }
 
