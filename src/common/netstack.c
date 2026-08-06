@@ -974,14 +974,6 @@ static void conn_send_new(Netstack *ns, TcpConn *c, NsPriv *p, uint64_t now) {
             {
                 uint32_t old_ack = rd_be32(t + 8);
                 uint16_t old_win = rd_be16(t + 14);
-                {
-                    static int rfn;
-                    uint32_t sq = s->seq;
-                    if (rfn++ < 2)
-                        fprintf(stderr, "refdbg seq=%u pre=%04x oa=%u na=%u ow=%u nw=%u\n",
-                                sq, rd_be16(t + 16), old_ack,
-                                c->rcv_nxt, old_win, win);
-                }
                 wr_be32(t + 8, c->rcv_nxt);
                 wr_be16(t + 14, win);
                 seg_csum_inc(t + 16, c->rcv_nxt, old_ack, win, old_win);

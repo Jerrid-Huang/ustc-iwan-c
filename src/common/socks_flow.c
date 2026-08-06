@@ -404,7 +404,6 @@ void service_local_inputs(Flow *fs) {
                 f->local_eof = true;
             } else if (n > 0) {
                 buf_put(&f->input, rbuf, (size_t)n);
-                process_socks_handshake(f);
             } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
                 f->local_eof = true;
                 if (f->ns_idx >= 0) {
@@ -412,6 +411,12 @@ void service_local_inputs(Flow *fs) {
                     set_flow_state(f, ST_CLOSING);
                 }
             }
+            /* run the parser whenever bytes are buffered, not only after
+             * a fresh read: a client that sends greeting+CONNECT in one
+             * write (or one segment) leaves CONNECT stranded in input
+             * otherwise and the handshake stalls forever */
+            if (f->input.len > 0)
+                process_socks_handshake(f);
         }
     }
 }
