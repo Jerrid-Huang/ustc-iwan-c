@@ -116,7 +116,7 @@ void oidc_connect_server(const Opts *o, const Config *cf)
     if (!password)
         oidc_die("cannot decrypt password");
 
-    oidc_eprintf("\n  Connecting to %s (%s:%u)...\n", name ? name : "", host,
+    oidc_eprintf("  Connecting to %s (%s:%u)...\n", name ? name : "", host,
                  (unsigned)port);
 
     oidc_check_server_ip(host);
