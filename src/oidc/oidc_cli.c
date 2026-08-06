@@ -14,14 +14,24 @@ static Cli *g_usage;   /* used by ctl->usage_str; set before cli_parse */
 
 const char *oidc_usage(const Cli *c)
 {
-    static char buf[256];
+    static char buf[512];
     if (c->usage_dup || c->nusage == 0) {
         snprintf(buf, sizeof buf, "Usage: iwan-client-oidc [OPTIONS]");
     } else {
         char *p = buf;
-        p += sprintf(p, "Usage: iwan-client-oidc");
-        for (int i = 0; i < c->nusage; i++)
-            p += sprintf(p, " %s", c->usage_args[i]);
+        size_t left = sizeof buf;
+        int n = snprintf(p, left, "Usage: iwan-client-oidc");
+        if (n > 0 && (size_t)n < left) {
+            p += n;
+            left -= (size_t)n;
+        }
+        for (int i = 0; i < c->nusage && left > 16; i++) {
+            int k = snprintf(p, left, " %s", c->usage_args[i]);
+            if (k <= 0 || (size_t)k >= left)
+                break;   /* truncate rather than overflow */
+            p += k;
+            left -= (size_t)k;
+        }
     }
     return buf;
 }

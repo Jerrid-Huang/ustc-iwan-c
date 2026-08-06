@@ -77,7 +77,6 @@ typedef struct {
     uint32_t ip;            /* inner tun IP (host order) */
     uint32_t gw;            /* gateway (host order) */
     uint16_t mtu;
-    uint32_t isn_base;
     uint8_t  outer_hdr[8];  /* VPN outer header, filled after auth */
     uint8_t  xor_key[8];    /* payload cipher, filled after auth */
     TcpConn conns[NS_MAX_CONN];
@@ -87,7 +86,7 @@ typedef struct {
     NsHooks hooks;
 } Netstack;
 
-void ns_init(Netstack *ns, uint32_t inner_ip, uint32_t gw, uint16_t mtu, uint32_t seed);
+void ns_init(Netstack *ns, uint32_t inner_ip, uint32_t gw, uint16_t mtu);
 
 /* auth completed: record the outer VPN header and XOR key; data segments
  * are framed and encrypted in place at seal time */

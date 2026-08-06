@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <net/if.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -161,4 +162,18 @@ void log_debug(const char *fmt, ...)
     vfprintf(stderr, fmt, ap);
     va_end(ap);
     fputc('\n', stderr);
+}
+
+bool valid_tun_name(const char *name)
+{
+    size_t n = strlen(name);
+    if (n == 0 || n > IFNAMSIZ - 1)
+        return false;
+    for (size_t i = 0; i < n; i++) {
+        char c = name[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '_'))
+            return false;
+    }
+    return true;
 }

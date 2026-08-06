@@ -1,10 +1,12 @@
 /* Config file load/save and the /m/config remote fetch. */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "common.h"
 #include "crypto.h"
@@ -142,9 +144,17 @@ void oidc_save_config(const char *path, const Config *cf)
         mkdir_p(dir);
         free(dir);
     }
-    FILE *f = fopen(path, "wb");
-    if (!f)
+    /* O_NOFOLLOW: this runs as root (sudo re-exec) writing into the
+     * invoking user's home; a pre-planted symlink at servers.json must
+     * not become an arbitrary-root-file truncate/overwrite primitive */
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+    if (fd < 0)
         oidc_die("cannot write config to %s", path);
+    FILE *f = fdopen(fd, "wb");
+    if (!f) {
+        close(fd);
+        oidc_die("cannot write config to %s", path);
+    }
     /* the file holds decryptable password blobs: never world-readable */
     (void)fchmod(fileno(f), 0600);
     if (fputs(cf->pretty, f) == EOF || fclose(f) != 0)

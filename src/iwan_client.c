@@ -459,6 +459,12 @@ static int cmd_proxy(int argc, char **argv, int start)
     uint8_t sk[16];
     session_key(o.user, o.pass, sk);
 
+    if (!valid_tun_name(o.tun)) {
+        log_err("invalid TUN device name '%s'", o.tun);
+        close(sockfd);
+        return 1;
+    }
+
     slist_t routes;
     slist_init(&routes);
     collect_routes(&o, &routes);

@@ -372,6 +372,8 @@ static bool drop_acked(TcpConn *c, NsPriv *p) {
     int i = 0;
     while (i < p->nsegs) {
         Seg *s = seg_at(p, i);
+        if (!s->sent)
+            break;   /* ack for never-sent data must not free queued data */
         uint32_t end = s->seq + s->len + (s->fin ? 1u : 0u);
         if ((int32_t)(c->snd_una - end) < 0)
             break;
@@ -405,7 +407,9 @@ static void handle_rx(Netstack *ns, TcpConn *c, int idx, const uint8_t *t,
         if (ack != c->snd_nxt)
             return;
         om = parse_mss(t + 20, thlen - 20);
-        if (om > 0 && om < c->mss)
+        /* RFC 879 floor: an attacker-forged SYN+ACK must not collapse
+         * segmentation below the minimum viable MSS (DoS via mss=1) */
+        if (om >= 536 && om < c->mss)
             c->mss = om;
         c->peer_scale = parse_wscale(t + 20, thlen - 20);
         c->rcv_nxt = seq + 1;
@@ -428,6 +432,11 @@ static void handle_rx(Netstack *ns, TcpConn *c, int idx, const uint8_t *t,
     }
 
     if (flags & TCP_RST) {
+        /* RFC 5961: only accept an RST whose seq is inside the receive
+         * window; a forged RST with the flow's 4-tuple must not kill it */
+        if ((int32_t)(seq - c->rcv_nxt) < 0 ||
+            (int32_t)(seq - c->rcv_nxt) > (int32_t)NS_WINDOW)
+            return;
         conn_clear(c, idx);
         return;
     }
@@ -467,6 +476,12 @@ static void handle_rx(Netstack *ns, TcpConn *c, int idx, const uint8_t *t,
             }
         }
     } else if ((int32_t)(ack - c->snd_una) > 0) {
+        /* a forged ACK beyond the last transmitted byte would make
+         * drop_acked discard never-sent segments and freeze TX
+         * (in_flight = sent_nxt - snd_una underflow); RFC 793 requires
+         * ack <= SND.NXT, so clamp instead of advancing past it */
+        if ((int32_t)(ack - c->sent_nxt) > 0)
+            ack = c->sent_nxt;
         c->dup_acks = 0;
         /* RTT sample: the oldest segment this ACK covers (snd_una moves
          * to the ack'ed frontier; scan for the first covered segment) */
@@ -534,13 +549,11 @@ static void handle_rx(Netstack *ns, TcpConn *c, int idx, const uint8_t *t,
     }
 }
 
-void ns_init(Netstack *ns, uint32_t inner_ip, uint32_t gw, uint16_t mtu,
-             uint32_t seed) {
+void ns_init(Netstack *ns, uint32_t inner_ip, uint32_t gw, uint16_t mtu) {
     memset(ns, 0, sizeof *ns);
     ns->ip = inner_ip;
     ns->gw = gw;
     ns->mtu = mtu;
-    ns->isn_base = seed;
 }
 
 int ns_connect(Netstack *ns, uint16_t lport, uint32_t rip, uint16_t rport) {
@@ -561,7 +574,9 @@ int ns_connect(Netstack *ns, uint16_t lport, uint32_t rip, uint16_t rport) {
 
     c = &ns->conns[idx];
     conn_clear(c, idx);
-    isn = ns->isn_base + (uint32_t)idx * 1000u + (rand_u32() % 1000u);
+    /* full 32-bit random ISN per connection: the old 10-bit jitter on a
+     * fixed base let an observer predict sequence numbers and forge RST */
+    isn = rand_u32();
     c->state = NS_SYN_SENT;
     c->lip = ns->ip;
     c->rip = rip;
@@ -809,7 +824,10 @@ static bool rx_parse_tcp(Netstack *ns, const uint8_t *pkt, const uint8_t *t,
                   (ns->ip >> 8) & 0xff, ns->ip & 0xff);
         return false;
     }
-    if (t[16] != 0 && tcp_checksum(*sip, *dip, t, eff - ihl) != 0) {
+    /* a zero checksum field is illegal for IPv4 TCP (no offload here) and
+     * must not bypass verification — an attacker setting csum=0 would
+     * otherwise skip the only integrity gate on forged segments */
+    if (tcp_checksum(*sip, *dip, t, eff - ihl) != 0) {
         log_debug("NS DROP: tcp csum");
         return false;
     }
@@ -1228,6 +1246,11 @@ uint32_t dns_query_a(const char *domain) {
     if (sa.sin_addr.s_addr != inet_addr(DNS_SERVER_IP))
         return 0;
     if (rd_be16(resp) != id)
+        return 0;
+    /* question echo: a spoofed answer must repeat our exact qname —
+     * otherwise a blind on-path injector with a guessed ID is rejected */
+    if (qn < 16 || (size_t)r < 12 + (size_t)(qn - 12) ||
+        memcmp(resp + 12, q + 12, (size_t)(qn - 12)) != 0)
         return 0;
     flags = rd_be16(resp + 2);
     if (!(flags & 0x8000) || (flags & 0x000f) != 0)

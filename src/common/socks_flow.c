@@ -157,14 +157,13 @@ void flow_free(Flow *f) {
 #define PORT_BASE 49152u
 #define PORT_TOP  65535u
 
-static unsigned next_port = PORT_BASE;
-
 static uint16_t alloc_port(void) {
+    /* random starting point per call: sequential ephemeral ports let an
+     * observer predict the inner 4-tuple and forge RST/ACK segments */
+    unsigned p0 = PORT_BASE + (unsigned)(rand_u32() % (PORT_TOP - PORT_BASE));
     for (int tries = 0; tries < 2048; tries++) {
-        uint16_t p = (uint16_t)next_port;
-        next_port++;
-        if (next_port > PORT_TOP)
-            next_port = PORT_BASE;
+        uint16_t p = (uint16_t)(PORT_BASE + ((p0 - PORT_BASE + (unsigned)tries) %
+                                             (PORT_TOP - PORT_BASE + 1u)));
         int used = 0;
         for (int i = 0; i < MAX_FLOWS; i++) {
             if (g_flows[i].active && g_flows[i].ns_idx >= 0 &&

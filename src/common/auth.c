@@ -125,7 +125,9 @@ void build_open(buf_t *out, const char *user, const uint8_t ct[16],
 struct ack_ctx {
     AuthResult *r;
     uint32_t    expect;
-    int         err;   /* 0 = none, 1 = AV wrong len, 2 = AV echo mismatch */
+    int         err;      /* 0 = none, 1 = AV wrong len, 2 = AV echo mismatch,
+                            * 3 = short IP TLV */
+    int         seen_av;
     uint32_t    echo;
 };
 
@@ -136,12 +138,24 @@ static bool ack_tlv(uint8_t typ, const uint8_t *val, uint8_t vlen, void *ud)
 
     switch (typ) {
     case T_IP:
+        if (vlen < 4) {
+            c->err = 3;
+            return false;
+        }
         ip_to_string(val, r->tun);
         break;
     case T_GATEWAY:
+        if (vlen < 4) {
+            c->err = 3;
+            return false;
+        }
         ip_to_string(val, r->gw);
         break;
     case T_DNS:
+        if (vlen < 4) {
+            c->err = 3;
+            return false;
+        }
         ip_to_string(val, r->dns);
         break;
     case T_MTU:
@@ -153,6 +167,7 @@ static bool ack_tlv(uint8_t typ, const uint8_t *val, uint8_t vlen, void *ud)
         }
         break;
     case T_AUTH_VERIFY:
+        c->seen_av = 1;
         if (vlen != 4) {
             c->err = 1;
             return false;
@@ -213,11 +228,15 @@ bool parse_ack(const uint8_t *buf, size_t len, uint32_t expect_nonce,
     ctx.r = r;
     ctx.expect = expect_nonce;
     parse_tlvs(buf + 24, len - 24, ack_tlv, &ctx);
-    if (ctx.err == 1)
+    if (!ctx.seen_av)
+        set_err(errmsg, errmsg_sz, "missing AV");
+    else if (ctx.err == 1)
         set_err(errmsg, errmsg_sz, "AV wrong len");
     else if (ctx.err == 2)
         set_err(errmsg, errmsg_sz, "AV mismatch %08x", ctx.echo);
-    if (ctx.err)
+    else if (ctx.err == 3)
+        set_err(errmsg, errmsg_sz, "short IP TLV");
+    if (ctx.err || !ctx.seen_av)
         return false;
     return true;
 }

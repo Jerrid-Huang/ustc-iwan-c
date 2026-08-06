@@ -323,10 +323,16 @@ int receive_vpn(int sockfd, SocksConfig *cfg) {
             if (psid != cfg->sid || ptok != cfg->token)
                 continue;
             if (t == PT_CLOSE) {
+                /* control packets carry the 16-byte header sig; never
+                 * let a spoofed sid/tok-only datagram kill the session */
+                if (!verify_sig(b, (size_t)n))
+                    continue;
                 log_err("VPN server closed the session (CLOSE)");
                 return -1;
             }
             if (t == PT_ECHO_REQ) {
+                if (!verify_sig(b, (size_t)n))
+                    continue;
                 buf_t p;
                 buf_init(&p);
                 ctrl_hdr(&p, PT_ECHO_RES, cfg->encryption, cfg->sid,
@@ -340,6 +346,11 @@ int receive_vpn(int sockfd, SocksConfig *cfg) {
             size_t plen = (size_t)(n - 8);
             if (t == PT_DATA_ENC)
                 xor_crypt(b + 8, plen, cfg->xor_key, 8);
+            else if (cfg->encryption) {
+                /* encrypted session must not accept plaintext frames */
+                log_err("VPN plaintext data on encrypted session, drop");
+                continue;
+            }
             if (debug_enabled() && t == PT_DATA_ENC) {
                 char hex[100] = "";
                 int hn = (int)plen < 32 ? (int)plen : 32;
@@ -371,6 +382,10 @@ void run_socks(int sockfd, SocksConfig *cfg) {
         close(listener);
         return;
     }
+    if (laddr.sin_addr.s_addr != htonl(INADDR_LOOPBACK))
+        log_err("WARNING: SOCKS5 proxy bound to a non-loopback address; "
+                "it has no authentication and allows CONNECT to arbitrary "
+                "hosts — anyone reachable can use it as an open proxy");
     if (listen(listener, 64) < 0) {
         log_err("listen SOCKS5: %s", strerror(errno));
         close(listener);
@@ -390,8 +405,7 @@ void run_socks(int sockfd, SocksConfig *cfg) {
     /* Rust prints the configured address (config.listen), not the bound one */
     const char *listen_s = cfg->listen_str ? cfg->listen_str : "?";
 
-    ns_init(&g_ns, cfg->inner_ip, cfg->gateway, (uint16_t)cfg->mtu,
-            (uint32_t)((uint64_t)now_mono() ^ (uint32_t)getpid()));
+    ns_init(&g_ns, cfg->inner_ip, cfg->gateway, (uint16_t)cfg->mtu);
     {
         uint8_t oh[8];
         pkhdr(cfg->encryption ? PT_DATA_ENC : PT_DATA, cfg->encryption,

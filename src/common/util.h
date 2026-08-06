@@ -15,4 +15,8 @@ void log_info(const char *fmt, ...);   /* -> stdout */
 void log_err(const char *fmt, ...);    /* -> stderr */
 void log_debug(const char *fmt, ...);  /* -> stderr if IWAN_DEBUG */
 
+/* tun device names are fed to `ip link del/set` as root: restrict to a
+ * safe Linux ifname charset (IFNAMSIZ-1, [A-Za-z0-9_], not "."/".."). */
+bool valid_tun_name(const char *name);
+
 #endif

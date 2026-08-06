@@ -149,6 +149,11 @@ void oidc_connect_server(const Opts *o, const Config *cf)
         return;
     }
 
+    if (!valid_tun_name(o->tun)) {
+        close(fd);
+        oidc_die("invalid TUN device name '%s'", o->tun);
+    }
+
     char *const del[] = { "link", "del", (char *)o->tun, NULL };
     ip_run_quiet(del);
     int tun_fd = open_tun(o->tun);
