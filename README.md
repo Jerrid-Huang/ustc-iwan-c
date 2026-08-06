@@ -7,6 +7,7 @@ USTC iWAN 校园网 VPN 客户端,用 C11 从 [yyy1mu/ustc-iwan](https://github.
 - 双入口:
   - `iwan-client` — `ping` / `auth` / `proxy`(TUN 模式)/ `socks`(无 root 的用户态 SOCKS5 代理)
   - `iwan-client-oidc` — OIDC 配置获取与服务器选择(`--fetch` / `--list` / `--connect` / `--all`)
+- `iwan-server` — 参考 [yyy1mu/ustc-iwan](https://github.com/yyy1mu/ustc-iwan) 的 Rust 服务器以 C11 实现的轻量 VPN 服务器(单线程轮询、UDP 数据面 ↔ TUN)
 - 自研用户态 TCP/IP 协议栈(零拷贝段槽、64KB 窗口 + WSCALE、delayed ACK、自适应 RTO、快速重传、keepalive 探测、GSO 批发送)
 - 8B 外层头 + XOR 加密内层 IP 包(整包加密)
 - `--ustc` 快捷路由:一条参数展开为 11 条科大校园网 CIDR,配合 `--server` 直接连接
@@ -43,6 +44,22 @@ OIDC 子命令:
 ./bin/iwan-client-oidc --connect --server <NAME|HOST:PORT>
 ./bin/iwan-client-oidc --connect --ustc        # 科大校园网路由(11 条 CIDR)
 ```
+
+## 服务器
+
+```sh
+# 用户文件:每行 user:pass,建议 chmod 600
+printf 'alice:s3cret-pass\n' | sudo tee /etc/iwan/users.txt
+
+sudo ./bin/iwan-server --users /etc/iwan/users.txt \
+    --port 6001 --tun iwan-srv \
+    --server-ip 198.18.0.1 --subnet 198.18.0.0/16 \
+    --dns 114.114.114.114 --nat-if eth0
+```
+
+选项:`--port`(6001)、`--tun`(iwan-srv)、`--server-ip`(198.18.0.1)、`--subnet`(198.18.0.0/16)、`--dns`、`--users`、`--nat-if`(eth0)、`--no-tun`(测试用,跳过 TUN 设备)。
+
+需要 root(创建 TUN、写 `ip_forward`、配置 iptables MASQUERADE;后两项失败仅告警)。客户端直接连接:`./bin/iwan-client socks --server <SERVER_IP> --port 6001`。
 
 ## 实现说明
 

@@ -10,7 +10,7 @@ BIN_DIR    := bin
 
 COMMON_SRCS := $(wildcard $(COMMON_DIR)/*.c)
 OIDC_SRCS   := $(wildcard $(OIDC_DIR)/*.c)
-MAIN_SRCS   := $(SRC_DIR)/iwan_client.c $(SRC_DIR)/iwan_client_oidc.c
+MAIN_SRCS   := $(SRC_DIR)/iwan_client.c $(SRC_DIR)/iwan_client_oidc.c $(SRC_DIR)/iwan_server.c
 
 COMMON_OBJS := $(patsubst $(COMMON_DIR)/%.c,$(BUILD_DIR)/%.o,$(COMMON_SRCS))
 OIDC_OBJS   := $(patsubst $(OIDC_DIR)/%.c,$(BUILD_DIR)/%.o,$(OIDC_SRCS))
@@ -21,7 +21,7 @@ LIBCORE := $(BUILD_DIR)/libiwan_core.a
 LIBOIDC := $(BUILD_DIR)/libiwan_oidc.a
 
 .PHONY: all clean
-all: $(BIN_DIR)/iwan-client $(BIN_DIR)/iwan-client-oidc
+all: $(BIN_DIR)/iwan-client $(BIN_DIR)/iwan-client-oidc $(BIN_DIR)/iwan-server
 
 $(LIBCORE): $(COMMON_OBJS)
 	ar rcs $@ $^
@@ -38,6 +38,10 @@ $(BIN_DIR)/iwan-client-oidc: $(LIBCORE) $(LIBOIDC) $(BUILD_DIR)/iwan_client_oidc
 	$(CC) $(CFLAGS) -o $@ $(BUILD_DIR)/iwan_client_oidc.o \
 		-Wl,--start-group $(LIBCORE) $(LIBOIDC) -Wl,--end-group $(LDLIBS)
 
+$(BIN_DIR)/iwan-server: $(LIBCORE) $(BUILD_DIR)/iwan_server.o
+	@mkdir -p $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $(BUILD_DIR)/iwan_server.o $(LIBCORE) $(LDLIBS)
+
 $(BUILD_DIR)/%.o: $(COMMON_DIR)/%.c $(ALL_HEADERS)
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(CFLAGS) -I$(COMMON_DIR) -c -o $@ $<
@@ -53,6 +57,10 @@ $(BUILD_DIR)/iwan_client.o: $(SRC_DIR)/iwan_client.c $(ALL_HEADERS)
 $(BUILD_DIR)/iwan_client_oidc.o: $(SRC_DIR)/iwan_client_oidc.c $(ALL_HEADERS)
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(CFLAGS) -I$(COMMON_DIR) -I$(OIDC_DIR) -c -o $@ $<
+
+$(BUILD_DIR)/iwan_server.o: $(SRC_DIR)/iwan_server.c $(ALL_HEADERS)
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(CFLAGS) -I$(COMMON_DIR) -c -o $@ $<
 
 clean:
 	rm -rf $(BUILD_DIR) $(BIN_DIR)
