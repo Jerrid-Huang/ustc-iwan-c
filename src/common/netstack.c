@@ -46,7 +46,12 @@ typedef struct {
     uint8_t  fin;
     uint8_t  sent;             uint64_t last_sent_ms;
     uint8_t  hdr[SEG_HDR_LEN];
-    _Alignas(16) uint8_t data[NS_SEG_CAP];
+    _Alignas(8) uint8_t data[NS_SEG_CAP];   /* must sit at hdr+48: the
+                                             * inner packet's payload is
+                                             * ip+40 == hdr+48; 16B
+                                             * alignment pushes data to
+                                             * offset 56 and skews every
+                                             * checksum by 8 bytes */
 } Seg;
 
 typedef struct {
@@ -427,14 +432,17 @@ static void handle_rx(Netstack *ns, TcpConn *c, int idx, const uint8_t *t,
             if (s0->sent) {
                 uint8_t *ip = s0->hdr + 8;
                 uint8_t *t = ip + 20;
-                uint32_t old_ack = rd_be32(t + 8);
-                uint16_t old_win = rd_be16(t + 14);
                 uint16_t win = conn_win_field(c);
                 if (ns->outer_hdr[1])
                     xor_crypt(ip, 40, ns->xor_key, 8);
-                wr_be32(t + 8, c->rcv_nxt);
-                wr_be16(t + 14, win);
-                seg_csum_inc(t + 16, c->rcv_nxt, old_ack, win, old_win);
+                {
+                    uint32_t old_ack = rd_be32(t + 8);
+                    uint16_t old_win = rd_be16(t + 14);
+                    wr_be32(t + 8, c->rcv_nxt);
+                    wr_be16(t + 14, win);
+                    seg_csum_inc(t + 16, c->rcv_nxt, old_ack, win,
+                                 old_win);
+                }
                 if (ns->outer_hdr[1])
                     xor_crypt(ip, 40, ns->xor_key, 8);
                 tx_enqueue(ns, s0, NULL, 0);
@@ -613,8 +621,10 @@ static void seg_seal(Netstack *ns, TcpConn *c, NsPriv *p, uint8_t extra)
     wr_be32(t + 8, c->rcv_nxt);
     t[12] = 0x50;
     t[13] = (uint8_t)(TCP_ACK | extra);
-    wr_be16(t + 14, conn_win(c));                  wr_be16(t + 16, 0);
-    wr_be16(t + 18, 0);
+    wr_be16(t + 14, conn_win(c));
+    wr_be16(t + 16, 0);      /* stale slot reuse would leak into csum */
+    wr_be16(t + 18, 0);      /* and so would stale urg */
+    wr_be16(t + 16, tcp_checksum(c->lip, c->rip, t, 20 + s->len));
     wr_be16(ip + 10, csum_fold(csum_buf(0, ip, 20)));
     if (ns->outer_hdr[1])   /* encrypt the whole inner packet once;
                              * same framing as the old per-packet path */
@@ -899,20 +909,22 @@ static bool conn_retransmit_loop(Netstack *ns, TcpConn *c, NsPriv *p, int idx,
                 {
             uint8_t *ip = s->hdr + 8;
             uint8_t *t = ip + 20;
-            uint32_t old_ack = rd_be32(t + 8);
-            uint16_t old_win = rd_be16(t + 14);
             uint16_t win = conn_win_field(c);
             if (ns->outer_hdr[1])
                 xor_crypt(ip, 40, ns->xor_key, 8);
-            wr_be32(t + 8, c->rcv_nxt);
-            wr_be16(t + 14, win);
-            seg_csum_inc(t + 16, c->rcv_nxt, old_ack, win, old_win);
+            {
+                uint32_t old_ack = rd_be32(t + 8);
+                uint16_t old_win = rd_be16(t + 14);
+                wr_be32(t + 8, c->rcv_nxt);
+                wr_be16(t + 14, win);
+                seg_csum_inc(t + 16, c->rcv_nxt, old_ack, win, old_win);
+            }
             if (ns->outer_hdr[1])
                 xor_crypt(ip, 40, ns->xor_key, 8);
         }
         tx_enqueue(ns, s, NULL, 0);
         s->last_sent_ms = now;
-        s->rto = (uint8_t)((int)s->rto * 2 > NS_RTO_MAX
+        s->rto = (uint16_t)((int)s->rto * 2 > NS_RTO_MAX
                                ? NS_RTO_MAX
                                : (int)s->rto * 2);
         s->cnt++;
@@ -950,14 +962,24 @@ static void conn_send_new(Netstack *ns, TcpConn *c, NsPriv *p, uint64_t now) {
         {
             uint8_t *ip = s->hdr + 8;
             uint8_t *t = ip + 20;
-            uint32_t old_ack = rd_be32(t + 8);
-            uint16_t old_win = rd_be16(t + 14);
             uint16_t win = conn_win_field(c);
             if (ns->outer_hdr[1])
                 xor_crypt(ip, 40, ns->xor_key, 8);
-            wr_be32(t + 8, c->rcv_nxt);
-            wr_be16(t + 14, win);
-            seg_csum_inc(t + 16, c->rcv_nxt, old_ack, win, old_win);
+            {
+                uint32_t old_ack = rd_be32(t + 8);
+                uint16_t old_win = rd_be16(t + 14);
+                {
+                    static int rfn;
+                    uint32_t sq = s->seq;
+                    if (rfn++ < 2)
+                        fprintf(stderr, "refdbg seq=%u pre=%04x oa=%u na=%u ow=%u nw=%u\n",
+                                sq, rd_be16(t + 16), old_ack,
+                                c->rcv_nxt, old_win, win);
+                }
+                wr_be32(t + 8, c->rcv_nxt);
+                wr_be16(t + 14, win);
+                seg_csum_inc(t + 16, c->rcv_nxt, old_ack, win, old_win);
+            }
             if (ns->outer_hdr[1])
                 xor_crypt(ip, 40, ns->xor_key, 8);
         }
