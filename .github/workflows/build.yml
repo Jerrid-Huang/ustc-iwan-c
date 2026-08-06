@@ -1,0 +1,42 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev
+
+      - name: Build (${{ matrix.cc }})
+        run: |
+          make -B CC=${{ matrix.cc }}
+          if make -B CC=${{ matrix.cc }} 2>&1 | grep -E "error|warning"; then
+            echo "::error::build emitted errors or warnings"
+            exit 1
+          fi
+
+      - name: Smoke test
+        run: |
+          ./bin/iwan-client --help >/dev/null
+          ./bin/iwan-client-oidc --help >/dev/null
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: iwan-${{ matrix.cc }}
+          path: |
+            bin/iwan-client
+            bin/iwan-client-oidc
+          if-no-files-found: error

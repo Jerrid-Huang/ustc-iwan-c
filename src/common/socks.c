@@ -208,7 +208,6 @@ static void sock_drain_tx(int sockfd, SocksConfig *cfg)
     const TxItem *items[SOCKS_MAX_PK];
     size_t lens[SOCKS_MAX_PK];
     int npk = 0;
-    size_t total = 0;
     const TxItem *it;
     (void)cfg;
 
@@ -216,7 +215,6 @@ static void sock_drain_tx(int sockfd, SocksConfig *cfg)
         size_t l = ns_tx_item_len(it);
         items[npk] = it;
         lens[npk] = l;
-        total += l;
         npk++;
         ns_tx_pop(&g_ns);
     }

@@ -615,7 +615,7 @@ int main(int argc, char **argv)
         err_usage_exit(usage_full(NULL));
     }
 
-    int rc;
+    int rc = 0;
     if (strcmp(sub, "ping") == 0)
         rc = cmd_ping(argc, argv, 2);
     else if (strcmp(sub, "auth") == 0)

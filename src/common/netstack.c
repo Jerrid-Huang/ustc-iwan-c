@@ -942,8 +942,8 @@ static bool conn_retransmit_loop(Netstack *ns, TcpConn *c, NsPriv *p, int idx,
         }
         tx_enqueue(ns, s, NULL, 0);
         s->last_sent_ms = now;
-        s->rto = (uint16_t)((int)s->rto * 2 > NS_RTO_MAX
-                               ? NS_RTO_MAX
+        s->rto = (uint16_t)((int)s->rto * 2 > (int)NS_RTO_MAX
+                               ? (int)NS_RTO_MAX
                                : (int)s->rto * 2);
         s->cnt++;
         if (s->cnt > 8) {
