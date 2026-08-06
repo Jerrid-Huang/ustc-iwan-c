@@ -42,6 +42,7 @@ static void print_help_short(void)
         "      --server <NAME|HOST:PORT>     Connect directly to a server by name or host:port\n"
         "      --tun <TUN>                    TUN device name [default: iwan0]\n"
         "      --proxy-cidr <PROXY_CIDR>      CIDR ranges to route through the tunnel. Can be repeated or comma-separated (also read from proxy.conf)\n"
+        "      --ustc                         Route USTC campus networks through the tunnel (shortcut for the usual --proxy-cidr list)\n"
         "      --proxy-ip <PROXY_IP>          IPv4 addresses to route through the tunnel. Can be repeated or comma-separated\n"
         "      --proxy-domain <PROXY_DOMAIN>  Domains to resolve and route through the tunnel. Can be repeated or comma-separated\n"
         "      --encrypt <ENCRYPT>            Encryption method: 0=None, 1=XOR, 2=AES [default: 1]\n"
@@ -89,6 +90,9 @@ static void print_help_long(void)
         "\n"
         "      --proxy-cidr <PROXY_CIDR>\n"
         "          CIDR ranges to route through the tunnel. Can be repeated or comma-separated (also read from proxy.conf)\n"
+        "\n"
+        "      --ustc\n"
+        "          Route USTC campus networks through the tunnel (shortcut for the usual --proxy-cidr list)\n"
         "\n"
         "      --proxy-ip <PROXY_IP>\n"
         "          IPv4 addresses to route through the tunnel. Can be repeated or comma-separated\n"
@@ -172,6 +176,7 @@ void oidc_parse_cli(int argc, char **argv, Opts *o, Cli *usage)
         { "server",       CLI_OPT_STR,  &o->server,        "<NAME|HOST:PORT>", NULL },
         { "tun",          CLI_OPT_STR,  &o->tun,           "<TUN>",          NULL },
         { "proxy-cidr",   CLI_OPT_CSV,  &o->proxy_cidr,    "<PROXY_CIDR>",   NULL },
+        { "ustc",         CLI_OPT_BOOL, &o->ustc,          NULL,             NULL },
         { "proxy-ip",     CLI_OPT_CSV,  &o->proxy_ip,      "<PROXY_IP>",     NULL },
         { "proxy-domain", CLI_OPT_CSV,  &o->proxy_domain,  "<PROXY_DOMAIN>", NULL },
         { "encrypt",      CLI_OPT_U8,   &o->encrypt,       "<ENCRYPT>",      NULL },

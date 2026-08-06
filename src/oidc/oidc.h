@@ -41,6 +41,7 @@ typedef struct {
     slist_t     proxy_cidr;
     slist_t     proxy_ip;
     slist_t     proxy_domain;
+    bool        ustc;   /* route USTC campus networks through the tunnel */
     uint8_t     encrypt;
     bool        socks;
     const char *socks_listen;

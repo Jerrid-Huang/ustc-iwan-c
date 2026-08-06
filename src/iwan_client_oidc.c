@@ -64,6 +64,18 @@ int main(int argc, char **argv)
             snprintf(msg, sizeof msg, "read %s", ppath);
             oidc_die_with_cause(msg, strerror(errno));
         }
+        if (o.ustc) {
+            static const char *const ustc_nets[] = {
+                "114.214.160.0/19",   "114.214.192.0/18",
+                "202.38.64.0/19",     "210.45.64.0/20",
+                "210.45.112.0/20",    "211.86.144.0/20",
+                "222.195.64.0/19",    "210.72.22.0/24",
+                "202.141.160.0/19",   "218.22.21.0/27",
+                "218.104.71.160/28",
+            };
+            for (size_t i = 0; i < sizeof ustc_nets / sizeof ustc_nets[0]; i++)
+                slist_push(&o.proxy_cidr, ustc_nets[i]);
+        }
         free(ppath);
     }
     if (do_connect)
