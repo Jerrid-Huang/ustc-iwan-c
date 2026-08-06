@@ -331,7 +331,13 @@ static uint16_t parse_mss(const uint8_t *opts, size_t olen) {
 /* segments are appended in seq order and ACKs are cumulative, so only a
  * prefix of the retransmit table can be acked. Dropping advances the ring
  * head (O(1), no per-ACK memmove of the whole table — the kernel uses a
- * list here); compaction happens when the head has walked far enough. */
+ * list here); compaction happens when the head has walked far enough.
+ *
+ * This memmove is also the structural reason every async/zero-copy send
+ * (io_uring SENDMSG_ZC, SO_ZEROCOPY, splice) is rejected for this code:
+ * an in-flight send referencing a slot goes stale the moment the table
+ * moves, and retransmit re-seals slots in place while completions may
+ * still be outstanding. Sends must stay synchronous with the drain. */
 static void seg_compact(NsPriv *p)
 {
     if (p->seg_head == 0)

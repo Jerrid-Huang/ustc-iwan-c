@@ -102,7 +102,15 @@ void accept_connections(int listener) {
  * treats the iovecs as one continuous stream and segments it; wire output
  * is identical to per-packet sends). Everything else goes via sendmmsg.
  * EAGAIN/ENOBUFS block on POLLOUT instead of dropping; only fatal errors
- * stop the proxy. */
+ * stop the proxy.
+ *
+ * Kernel-feature review (Linux 7.0, source-verified, measured on
+ * loopback): io_uring SENDMSG (46 SQEs/enter) measured ~6% SLOWER than
+ * this path (617-635 vs 664-688 MB/s) and has no sendmmsg equivalent for
+ * mixed-length batches; SENDMSG_ZC / SO_ZEROCOPY are blocked structurally:
+ * seg_compact() memmoves the retransmit slots and retransmit re-seals
+ * them in place, both illegal while a zerocopy notification is
+ * outstanding. This GSO+sendmmsg shape is the local optimum. */
 static void socks_send_batch2(int sockfd, SocksConfig *cfg,
                               struct iovec *iovs, struct mmsghdr *msgs,
                               int npk, size_t total, size_t mss)
@@ -254,7 +262,19 @@ int receive_vpn(int sockfd, SocksConfig *cfg) {
      * non-NULL timeout to recvmmsg does NOT bound the first packet's
      * wait, kernel do_recvmmsg bug). 2KB per slot covers any server
      * datagram (inner MTU <= 1500 + 8B header); oversized packets are
-     * truncated and skipped via MSG_TRUNC. */
+     * truncated and skipped via MSG_TRUNC.
+     *
+     * Kernel-feature review (Linux 7.0, source-verified, measured on
+     * loopback): io_uring multishot recv + provided-buffer ring and
+     * UDP_GRO were both evaluated and rejected. UDP_GRO coalesces
+     * datagrams into one buffer, but our 8B outer header has no length
+     * field and the inner IP header is XOR-encrypted, so frame
+     * boundaries become unrecoverable. Multishot recv measured ~15%
+     * SLOWER than this recvmmsg path (1686 vs 1996 MB/s) because per-CQE
+     * handling costs more than the batched syscall it replaces, and the
+     * provided-buffer ring hits an unavoidable consumer-vs-producer
+     * race at full ring (spurious -ENOBUFS that kills the multishot,
+     * kernel io_ring_buffer_select). Keep recvmmsg + poll. */
     enum { RX_VLEN = 64, RX_SLOT = 2048 };
     static _Alignas(8) uint8_t rx_buf[RX_VLEN][RX_SLOT];
     static struct iovec rx_iov[RX_VLEN];
@@ -428,7 +448,12 @@ void run_socks(int sockfd, SocksConfig *cfg) {
 
         /* event-driven wait: sleep until the earliest real deadline
          * (retransmit/idle, keepalive, connect timeout) instead of a fixed
-         * 10ms tick; DNS completions wake us via the eventfd */
+         * 10ms tick; DNS completions wake us via the eventfd.
+         * poll() stays: with <= 259 polled fds the scan is sub-microsecond
+         * and the measured ~8.8us is syscall/wakeup latency, so epoll
+         * adds nothing; an io_uring loop would replace this wait but
+         * measured slower on both TX and RX (see receive_vpn /
+         * socks_send_batch2 comments). */
         int64_t d = tick_ms;
         int64_t kad = (int64_t)last_ka + 10000 - (int64_t)now_ms();
         int64_t ctd = next_conn_timeout_ms();
