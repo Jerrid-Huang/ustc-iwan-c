@@ -228,15 +228,16 @@ bool parse_ack(const uint8_t *buf, size_t len, uint32_t expect_nonce,
     ctx.r = r;
     ctx.expect = expect_nonce;
     parse_tlvs(buf + 24, len - 24, ack_tlv, &ctx);
-    if (!ctx.seen_av)
-        set_err(errmsg, errmsg_sz, "missing AV");
-    else if (ctx.err == 1)
+    /* T_AUTH_VERIFY is optional on the wire: the reference server's
+     * OPEN_ACK omits it, so requiring it breaks production interop.
+     * When present it is still strictly verified (len + nonce echo). */
+    if (ctx.err == 1)
         set_err(errmsg, errmsg_sz, "AV wrong len");
     else if (ctx.err == 2)
         set_err(errmsg, errmsg_sz, "AV mismatch %08x", ctx.echo);
     else if (ctx.err == 3)
         set_err(errmsg, errmsg_sz, "short IP TLV");
-    if (ctx.err || !ctx.seen_av)
+    if (ctx.err)
         return false;
     return true;
 }

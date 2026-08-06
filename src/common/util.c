@@ -184,7 +184,7 @@ bool valid_tun_name(const char *name)
     for (size_t i = 0; i < n; i++) {
         char c = name[i];
         if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-              (c >= '0' && c <= '9') || c == '_'))
+              (c >= '0' && c <= '9') || c == '_' || c == '-'))
             return false;
     }
     return true;
