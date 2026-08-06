@@ -472,10 +472,17 @@ int main(int argc, char **argv)
                 socklen_t plen = sizeof peer;
                 ssize_t n = recvfrom(udp_fd, udp_buf, sizeof udp_buf, 0,
                                      (struct sockaddr *)&peer, &plen);
-                if (n <= 0)
-                    break; /* EAGAIN: drained */
-                handle_udp(&ctx, users, nusers, udp_buf, (size_t)n, &peer,
-                           udp_fd);
+                if (n > 0) {
+                    handle_udp(&ctx, users, nusers, udp_buf, (size_t)n, &peer,
+                               udp_fd);
+                    continue;
+                }
+                if (n < 0 && errno == EINTR)
+                    continue;
+                if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+                    continue; /* ICMP error (e.g. ECONNREFUSED): drain the
+                               * queued errors before parking in poll */
+                break; /* EAGAIN: drained */
             }
         }
 

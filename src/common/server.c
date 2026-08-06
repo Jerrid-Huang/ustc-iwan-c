@@ -1,4 +1,5 @@
 #include <arpa/inet.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <openssl/crypto.h>
 #include <stdio.h>
@@ -92,13 +93,17 @@ static bool rate_allow(const struct sockaddr_in *peer, uint8_t typ, uint64_t now
 }
 
 /* UDP send that can never block the loop; failures are counted, not
- * logged per packet (the socket is O_NONBLOCK, so EAGAIN drops). */
-static void udp_send(int sockfd, const struct sockaddr_in *peer,
+ * logged per packet (the socket is O_NONBLOCK, so EAGAIN drops).
+ * Returns false when the datagram was not delivered. */
+static bool udp_send(int sockfd, const struct sockaddr_in *peer,
                      const void *data, size_t len)
 {
     if (sendto(sockfd, data, len, 0, (const struct sockaddr *)peer,
-               sizeof *peer) < 0)
+               sizeof *peer) < 0) {
         g_send_drops++;
+        return false;
+    }
+    return true;
 }
 
 uint64_t server_send_drops(void)
@@ -516,7 +521,18 @@ void handle_tun_downlink(struct server_ctx *ctx, const uint8_t *ip_pkt, size_t l
     memcpy(out + 8, ip_pkt, len);
     if (s->enc)
         xor_crypt(out + 8, len, s->xor_key, 8);
-    udp_send(sockfd, &s->peer, out, 8 + len);
+    if (!udp_send(sockfd, &s->peer, out, 8 + len) &&
+        errno == ECONNREFUSED) {
+        /* the client's UDP socket is gone (ICMP port unreachable): stop
+         * forwarding to a dead peer — every sendto would keep generating
+         * ICMP and the poll loop would spin draining them */
+        printf("session 0x%04x (ip %u.%u.%u.%u) peer unreachable, closing\n",
+               s->sid, s->ip[0], s->ip[1], s->ip[2], s->ip[3]);
+        s->valid = false;
+        wipe(s->xor_key, sizeof s->xor_key);
+        wipe(&s->token, sizeof s->token);
+        return;
+    }
     /* deliberately NO last_active refresh here: downlink is triggered by
      * third-party traffic (other clients, inbound routing), so refreshing
      * would let anyone keep a dead session alive past the idle purge */
