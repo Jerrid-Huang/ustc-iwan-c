@@ -442,6 +442,9 @@ void run_socks(int sockfd, SocksConfig *cfg) {
     sa.sa_handler = on_sig;
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+    /* a SOCKS client dying mid-write must surface EPIPE on the next
+     * write, not kill the proxy with the default SIGPIPE disposition */
+    signal(SIGPIPE, SIG_IGN);
 
     log_info("SOCKS5 listening on %s", listen_s);
     if (debug_enabled())
