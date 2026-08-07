@@ -564,22 +564,13 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
             if (debug_enabled())
                 tx1 = now_ns();
             if (ctx->tun_fd >= 0 && len > 8) {
-                ssize_t w = tun_write(ctx->tun_fd, raw + 8, len - 8);
-                if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                    /* device TX queue full: wait briefly for drain
-                     * instead of silently dropping the segment. A
-                     * dropped uplink segment makes the client RTO-retry;
-                     * under a burst that can degrade into a stall. */
-                    struct pollfd pfd = { .fd = ctx->tun_fd,
-                                          .events = POLLOUT };
-                    if (poll(&pfd, 1, 1) > 0 &&
-                        tun_write(ctx->tun_fd, raw + 8, len - 8) >= 0)
-                        ;   /* queued after drain */
-                    else
-                        g_up.drop++;  /* still full: drop, client retransmits */
-                } else if (w < 0) {
-                    g_up.drop++;
-                }
+                /* device TX queue full: wait briefly for drain instead of
+                 * silently dropping the segment. A dropped uplink segment
+                 * makes the client RTO-retry; under a burst that can
+                 * degrade into a stall. */
+                if (tun_write_retry(ctx->tun_fd, raw + 8, len - 8, 1,
+                                    NULL) != 0)
+                    g_up.drop++;  /* still full: drop, client retransmits */
             }
             if (debug_enabled()) {
                 tc = now_ns();

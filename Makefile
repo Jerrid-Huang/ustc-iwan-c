@@ -23,7 +23,7 @@ LIBOIDC := $(BUILD_DIR)/libiwan_oidc.a
 .PHONY: all clean
 all: $(BIN_DIR)/iwan-client $(BIN_DIR)/iwan-client-oidc $(BIN_DIR)/iwan-server
 
-$(LIBCORE): $(COMMON_OBJS)
+$(LIBCORE): $(COMMON_OBJS) $(BUILD_DIR)/steer_bpf_data.o
 	ar rcs $@ $^
 
 $(LIBOIDC): $(OIDC_OBJS)
@@ -41,6 +41,21 @@ $(BIN_DIR)/iwan-client-oidc: $(LIBCORE) $(LIBOIDC) $(BUILD_DIR)/iwan_client_oidc
 $(BIN_DIR)/iwan-server: $(LIBCORE) $(BUILD_DIR)/iwan_server.o
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $(BUILD_DIR)/iwan_server.o $(LIBCORE) $(LDLIBS)
+
+$(BUILD_DIR)/steer_bpf.o: $(COMMON_DIR)/steer_bpf.c
+	@mkdir -p $(BUILD_DIR)
+	clang -O2 -target bpf -Wall -c -o $@ $<
+
+$(BUILD_DIR)/steer_bpf_data.c: $(BUILD_DIR)/steer_bpf.o
+	@echo "generating embedded bpf payload"
+	@(printf '/* generated from steer_bpf.o; do not edit */\n'; \
+	  printf 'const unsigned char steer_bpf_o[] = {\n'; \
+	  od -An -v -tx1 $< | awk '{ for (i = 1; i <= NF; i++) printf "0x%s,", $$i; printf "\n" }'; \
+	  printf '};\nconst unsigned int steer_bpf_o_len = sizeof(steer_bpf_o);\n') > $@
+
+$(BUILD_DIR)/steer_bpf_data.o: $(BUILD_DIR)/steer_bpf_data.c
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c -o $@ $<
 
 $(BUILD_DIR)/%.o: $(COMMON_DIR)/%.c $(ALL_HEADERS)
 	@mkdir -p $(BUILD_DIR)

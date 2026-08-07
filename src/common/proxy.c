@@ -24,7 +24,7 @@
 static volatile sig_atomic_t g_stop = 0;
 
 typedef struct {
-    int      tun_fd;
+    int      tun_fd;   /* downlink write fd (queue 0, device owner) */
     int      sockfd;
     uint8_t  xor_key[8];
     uint16_t sid;
@@ -32,6 +32,8 @@ typedef struct {
     uint8_t  enc;
     size_t   gso_mss;   /* last UDP_SEGMENT value set, 0 = none */
     int      gso_ok;    /* 1 = UDP_SEGMENT usable, 0 = failed, -1 = untried */
+    pthread_mutex_t send_lock; /* serializes GSO/sendmmsg on the shared socket */
+    struct tun_pool *pool;
 } pump_ctx_t;
 
 static void eprintf(const char *fmt, ...) {
@@ -182,117 +184,105 @@ static int send_gso(pump_ctx_t *ctx, struct iovec *iov, unsigned n,
     return 1;
 }
 
-static void *tun2udp_thread(void *ud) {
-    pump_ctx_t *ctx = ud;
-    /* one slot per packet: 8-byte iWAN header followed by the (XOR'd)
-     * payload, contiguous and 8-byte aligned. read() lands on slot+8,
-     * so the final wire packet is a single iovec with no assembly. */
-    const size_t slot = 8 + PUMP_SLOT;
-    uint8_t *batch = malloc((size_t)PUMP_BATCH * slot);
+/* ---- uplink: one pool reader thread per queue, shared TX socket ----
+ * The tun_pool hands each reader its own packet stream (kernel flow-hash
+ * steering); packets are XOR'd into a thread-local batch and flushed to
+ * the shared UDP socket under send_lock (UDP_SEGMENT and sendmmsg on one
+ * socket must not interleave). */
+typedef struct {
+    uint8_t *batch;
     struct iovec iov[PUMP_BATCH];
     struct mmsghdr msgs[PUMP_BATCH];
     uint8_t hdr[8];
-    if (!batch) {
-        log_err("out of memory");
-        return NULL;
+    unsigned n;
+    uint64_t t0;
+} pump_tx_t;
+
+static _Thread_local pump_tx_t g_tx;
+
+/* flush one batch to the socket; GSO fast path when uniform */
+static void pump_flush(pump_ctx_t *ctx, pump_tx_t *q)
+{
+    unsigned n = q->n;
+    if (n == 0)
+        return;
+    q->n = 0;
+    for (unsigned i = 0; i < n; i++) {
+        q->msgs[i].msg_hdr.msg_iov = &q->iov[i];
+        q->msgs[i].msg_hdr.msg_iovlen = 1;
     }
-    memset(msgs, 0, sizeof msgs);
-    pkhdr(PT_DATA_ENC, ctx->enc, ctx->sid, ctx->tok, hdr);
-    while (!g_stop) {
-        int n = 0;
-        uint64_t t0 = 0;
-        while (n < PUMP_BATCH) {
-            uint8_t *s = batch + (size_t)n * slot;
-            ptrdiff_t r = tun_read(ctx->tun_fd, s + 8, PUMP_SLOT);
-            if (r < 0) {
-                if (errno == EAGAIN)
-                    break;
-                if (errno == EINTR)
-                    continue;
-                goto out;
-            }
-            if (r == 0)
-                goto out;
-            if (n == 0)
-                t0 = now_us();   /* first packet of this batch */
-            memcpy(s, hdr, 8);
-            xor_crypt(s + 8, (size_t)r, ctx->xor_key, 8);
-            iov[n].iov_base = s;
-            iov[n].iov_len = (size_t)r + 8;
-            n++;
-            /* latency cap: under sustained load, stop filling this batch
-             * after PUMP_MAX_LAT_US so no packet waits a full batch
-             * (32 x inter-arrival) before being sent */
-            if (now_us() - t0 >= PUMP_MAX_LAT_US)
+    /* GSO fast path: uniform batch -> one sendmsg, kernel segments;
+     * wire output is identical because segment boundaries align with
+     * the (equal) datagram boundaries. Falls back to sendmmsg when
+     * UDP_SEGMENT is unavailable or sizes differ. */
+    int use_gso = 0;
+    if (n >= 2) {
+        size_t l0 = q->iov[0].iov_len;
+        int uniform = 1;
+        for (unsigned i = 1; i < n; i++) {
+            if (q->iov[i].iov_len != l0) {
+                uniform = 0;
                 break;
-        }
-        if (n == 0) {
-            struct pollfd pfd = { .fd = ctx->tun_fd, .events = POLLIN };
-            int pr = poll(&pfd, 1, 1000);
-            if (pr < 0 && errno != EINTR)
-                goto out;
-            continue;
-        }
-        for (int i = 0; i < n; i++) {
-            msgs[i].msg_hdr.msg_iov = &iov[i];
-            msgs[i].msg_hdr.msg_iovlen = 1;
-        }
-        /* GSO fast path: uniform batch -> one sendmsg, kernel segments;
-         * wire output is identical because segment boundaries align with
-         * the (equal) datagram boundaries. Falls back to sendmmsg when
-         * UDP_SEGMENT is unavailable or sizes differ. */
-        int use_gso = 0;
-        if (n >= 2) {
-            size_t l0 = iov[0].iov_len;
-            int uniform = 1;
-            for (int i = 1; i < n; i++) {
-                if (iov[i].iov_len != l0) {
-                    uniform = 0;
-                    break;
-                }
             }
-            /* a GSO unit's total length must fit the 16-bit UDP length
-             * field; oversized (jumbo) batches fall back to sendmmsg */
-            use_gso = uniform && l0 >= 8 &&
-                      (size_t)n * l0 <= 65507;
         }
-        if (use_gso && send_gso(ctx, iov, (unsigned)n, iov[0].iov_len) == 0)
-            use_gso = 0;   /* UDP_SEGMENT unavailable: fall back */
-        if (!use_gso)
-            send_batch(ctx, msgs, (unsigned)n);
+        /* a GSO unit's total length must fit the 16-bit UDP length
+         * field; oversized (jumbo) batches fall back to sendmmsg */
+        use_gso = uniform && l0 >= 8 && (size_t)n * l0 <= 65507;
     }
-out:
-    free(batch);
-    return NULL;
+    pthread_mutex_lock(&ctx->send_lock);
+    if (use_gso && send_gso(ctx, q->iov, n, q->iov[0].iov_len) == 0)
+        use_gso = 0;   /* UDP_SEGMENT unavailable: fall back */
+    if (!use_gso)
+        send_batch(ctx, q->msgs, n);
+    pthread_mutex_unlock(&ctx->send_lock);
 }
 
-/* write one inner packet to the TUN device, waiting for writability
- * (poll) instead of dropping on EAGAIN; silent loss here costs inner TCP
- * retransmits. Fatal errors stop the pump. */
-static void tun_write_retry(pump_ctx_t *ctx, const uint8_t *pkt, size_t n)
+/* tun_pool callback: one thread-local batch per reader thread */
+static void pump_tun_pkt(void *ud, const uint8_t *pkt, size_t len, bool last)
 {
-    while (n > 0 && !g_stop) {
-        ptrdiff_t w = tun_write(ctx->tun_fd, pkt, n);
-        if (w > 0) {
-            pkt += w;
-            n -= (size_t)w;
-            continue;
-        }
-        if (w < 0 && errno == EINTR)
-            continue;
-        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            struct pollfd pfd = { .fd = ctx->tun_fd, .events = POLLOUT };
-            int pr = poll(&pfd, 1, 100);
-            /* if poll claims writable but EAGAIN persists, back off
-             * briefly instead of busy-spinning */
-            if (pr > 0 && (pfd.revents & POLLOUT))
-                usleep(1000);
-            continue;
-        }
-        log_err("tun write: %s", strerror(errno));
-        g_stop = 1;
+    pump_ctx_t *ctx = ud;
+    pump_tx_t *q = &g_tx;
+
+    if (last) {
+        /* queue drained: send the partial batch instead of holding it */
+        if (q->n > 0)
+            pump_flush(ctx, q);
         return;
     }
+    if (q->n == 0) {
+        if (!q->batch) {
+            /* one slot per packet: 8-byte iWAN header followed by the
+             * (XOR'd) payload, contiguous and 8-byte aligned, so the
+             * final wire packet is a single iovec with no assembly */
+            const size_t slot = 8 + PUMP_SLOT;
+            q->batch = malloc((size_t)PUMP_BATCH * slot);
+            if (!q->batch) {
+                log_err("out of memory");
+                g_stop = 1;
+                return;
+            }
+            memset(q->msgs, 0, sizeof q->msgs);
+            pkhdr(PT_DATA_ENC, ctx->enc, ctx->sid, ctx->tok, q->hdr);
+        }
+        q->t0 = now_us();   /* first packet of this batch */
+    }
+    if (g_stop)
+        return;
+    {
+        const size_t slot = 8 + PUMP_SLOT;
+        uint8_t *s = q->batch + (size_t)q->n * slot;
+        memcpy(s, q->hdr, 8);
+        memcpy(s + 8, pkt, len);   /* pool hands over its scratch buffer */
+        xor_crypt(s + 8, len, ctx->xor_key, 8);
+        q->iov[q->n].iov_base = s;
+        q->iov[q->n].iov_len = len + 8;
+        q->n++;
+    }
+    /* latency cap: under sustained load, stop filling this batch after
+     * PUMP_MAX_LAT_US so no packet waits a full batch (32 x
+     * inter-arrival) before being sent */
+    if (q->n == PUMP_BATCH || now_us() - q->t0 >= PUMP_MAX_LAT_US)
+        pump_flush(ctx, q);
 }
 
 static void *udp2tun_thread(void *ud) {
@@ -395,7 +385,15 @@ static void *udp2tun_thread(void *ud) {
             }
             if (t == PT_DATA_ENC)
                 xor_crypt(m + 8, (size_t)(n - 8), ctx->xor_key, 8);
-            tun_write_retry(ctx, m + 8, (size_t)(n - 8));
+            /* write with unbounded EAGAIN retry: silent loss here costs
+             * inner TCP retransmits */
+            if (tun_write_retry(ctx->tun_fd, m + 8, (size_t)(n - 8), 0,
+                                &g_stop) != 0) {
+                if (!g_stop)
+                    log_err("tun write: %s", strerror(errno));
+                g_stop = 1;
+                break;
+            }
         }
     }
     free(batch);
@@ -567,26 +565,55 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
     ctx.gso_mss = 0;
     ctx.gso_ok = -1;
     memcpy(ctx.xor_key, xor_key, 8);
+    pthread_mutex_init(&ctx.send_lock, NULL);
 
-    pthread_t t1, t2;
-    if (pthread_create(&t1, NULL, tun2udp_thread, &ctx) != 0) {
-        teardown_routes(tun_name, server, ogw, odev, &routes, had_routes);
-        slist_free(&routes);
-        return -1;
+    {
+        /* multiqueue uplink: attach min(ncpu, TUN_POOL_MAX) queues up
+         * front. No AIMD here: the bulk uplink load sits between the
+         * single-queue and multi-queue capacities, which makes the
+         * adaptive pool hunt 1<->2 queues instead of scaling.
+         * IWAN_PUMP_QUEUES overrides the count for testing. */
+        long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+        int maxq = TUN_POOL_MAX;
+        if (ncpu > 0 && ncpu < maxq)
+            maxq = (int)ncpu;
+        const char *qv = getenv("IWAN_PUMP_QUEUES");
+        if (qv) {
+            long qn = strtol(qv, NULL, 10);
+            if (qn > 0 && qn <= TUN_POOL_MAX)
+                maxq = (int)qn;
+        }
+        ctx.pool = tun_pool_create(tun_name, tun_fd, maxq, maxq,
+                                   pump_tun_pkt, &ctx, &g_stop);
+        if (!ctx.pool) {
+            log_err("cannot start TUN reader pool");
+            teardown_routes(tun_name, server, ogw, odev, &routes, had_routes);
+            slist_free(&routes);
+            pthread_mutex_destroy(&ctx.send_lock);
+            return -1;
+        }
+        log_info("TUN reader pool: %d queues", maxq);
     }
+    if (tun_steering_attach(tun_fd) == 0)
+        log_info("tun steering: eBPF flow hash attached");
+    else
+        log_debug("tun steering: eBPF unavailable, kernel automq");
+
+    pthread_t t2;
     if (pthread_create(&t2, NULL, udp2tun_thread, &ctx) != 0) {
         g_stop = 1;
-        pthread_join(t1, NULL);
+        tun_pool_destroy(ctx.pool);
         teardown_routes(tun_name, server, ogw, odev, &routes, had_routes);
         slist_free(&routes);
+        pthread_mutex_destroy(&ctx.send_lock);
         return -1;
     }
 
     log_info("TUN proxy running -- press Ctrl-C to stop");
     while (!g_stop)
-        usleep(200 * 1000);
+        usleep(100 * 1000);
 
-    pthread_join(t1, NULL);
+    tun_pool_destroy(ctx.pool);
     pthread_join(t2, NULL);
 
     teardown_routes(tun_name, server, ogw, odev, &routes, had_routes);
@@ -595,6 +622,7 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
     if (debug_enabled())
         eprintf("CLOSE sent\n");
 
+    pthread_mutex_destroy(&ctx.send_lock);
     slist_free(&routes);
     return 0;
 }
