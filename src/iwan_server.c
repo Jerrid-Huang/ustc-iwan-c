@@ -366,10 +366,28 @@ static void *tun_reader_main(void *ud)
         }
         if (pfd.revents & POLLIN) {
             ssize_t r;
+            uint64_t woke = now_ms();
+            int npk = 0;
             while ((r = read(q->fd, buf, sizeof buf)) > 0) {
                 handle_tun_downlink(pool->ctx, buf, (size_t)r, q->fd,
                                     pool->udp_fd);
                 local++;
+                npk++;
+            }
+            /* diagnostic (IWAN_DEBUG=1): reader wake -> drain latency.
+             * A late wake (poll slept far past the packet's arrival) or a
+             * slow drain pinpoints the downlink (ACK) path delay. */
+            if (debug_enabled() && npk > 0) {
+                static _Thread_local uint64_t last_print;
+                if (woke - last_print >= 250) {
+                    last_print = woke;
+                    fprintf(stderr,
+                            "[reader] q=%d wake=%llu pkts=%d "
+                            "last_poll_was_%s\n",
+                            (int)(q - pool->qs),
+                            (unsigned long long)woke, npk,
+                            pr == 0 ? "timeout" : "event");
+                }
             }
         }
     }

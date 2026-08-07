@@ -84,6 +84,9 @@ void purge_expired(struct server_ctx *ctx, uint64_t now_ms);
 /* Cumulative UDP send failures (nonblocking socket: EAGAIN drops). */
 uint64_t server_send_drops(void);
 
+/* Cumulative tun->udp downlink packets forwarded to clients. */
+uint64_t server_dl_pkts(void);
+
 /* IWAN_DEBUG=1: print per-step uplink timing averages once per second. */
 void server_up_stats_print(void);
 

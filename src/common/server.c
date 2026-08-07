@@ -26,6 +26,7 @@
 #define RATE_ECHO_MAX 60    /* PING/ECHO per source per window */
 
 static atomic_uint_fast64_t g_send_drops;
+static atomic_ullong g_dl_pkts;   /* tun->udp downlink packets */
 static pthread_mutex_t g_log_lock = PTHREAD_MUTEX_INITIALIZER;
 
 void srv_log(const char *fmt, ...)
@@ -83,14 +84,17 @@ void server_up_stats_print(void)
     g_up_win = now;
     fprintf(stderr,
             "uplink: n=%llu parse=%.0fns find=%.0fns xor=%.0fns write=%.0fns"
-            " total=%.0fns drop=%llu\n",
+            " total=%.0fns drop=%llu dl=%llu\n",
             (unsigned long long)g_up.n, (double)g_up.parse / g_up.n,
             (double)g_up.find / g_up.n, (double)g_up.xor / g_up.n,
             (double)g_up.write / g_up.n,
             (double)(g_up.parse + g_up.find + g_up.xor + g_up.write) / g_up.n,
-            (unsigned long long)g_up.drop);
+            (unsigned long long)g_up.drop,
+            (unsigned long long)server_dl_pkts());
     g_up.n = g_up.parse = g_up.find = g_up.xor = g_up.write = 0;
     g_up.drop = 0;
+    /* dl counter is cumulative (per-second delta is printed by the
+     * caller's diff of consecutive lines); do not reset here */
 }
 
 /* best-effort scrub of secrets, immune to optimizer elision */
@@ -172,12 +176,19 @@ static bool udp_send(int sockfd, const struct sockaddr_in *peer,
         atomic_fetch_add(&g_send_drops, 1);
         return false;
     }
+    atomic_fetch_add(&g_dl_pkts, 1);
     return true;
 }
 
 uint64_t server_send_drops(void)
 {
     return atomic_load(&g_send_drops);
+}
+
+/* downlink counter: packets forwarded tun->udp (python's ACKs etc.) */
+uint64_t server_dl_pkts(void)
+{
+    return atomic_load(&g_dl_pkts);
 }
 
 /* rate-limited reject logging: at most REJECT_LOG_MAX lines per second,

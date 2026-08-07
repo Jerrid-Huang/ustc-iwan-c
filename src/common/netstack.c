@@ -17,7 +17,11 @@
 
 #define NS_WINDOW         65535u
 #define NS_WSCALE         6u      /* our advertised window shift */
-#define NS_RTO_INIT       1000u
+#define NS_RTO_INIT       250u    /* first-segment recovery: the 1000ms
+                                   * RFC default makes a single dropped
+                                   * segment cost a full second on the
+                                   * tunnel; a premature retransmit only
+                                   * duplicates (peer dedups) */
 #define NS_RTO_MAX        8000u
 #define NS_MAX_OUTSTANDING 128
 #define NS_MAX_SYN_TRIES  6
