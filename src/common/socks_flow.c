@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -14,6 +15,28 @@
 #include "netstack.h"
 #include "protocol.h"
 #include "socks_internal.h"
+
+/* diagnostic (IWAN_FLOWDBG=1): flow close triggers */
+static void flowdbg(const Flow *f, const char *why)
+{
+    static int cached = -1;
+    TcpConn *c;
+    if (cached < 0) {
+        const char *v = getenv("IWAN_FLOWDBG");
+        cached = v && *v && strcmp(v, "0") != 0 &&
+                 strcmp(v, "false") != 0 && strcmp(v, "off") != 0;
+    }
+    if (!cached)
+        return;
+    c = f->ns_idx >= 0 ? ns_conn(&g_ns, f->ns_idx) : NULL;
+    fprintf(stderr, "FLOWDBG: flow=%d fd=%d state=%s ns=%d conn_state=%d "
+            "rxq=%zu out=%zu why=%s\n",
+            (int)(f - g_flows), f->fd,
+            f->state == ST_CLOSING ? "CLOSING" : "?",
+            f->ns_idx, c ? (int)c->state : -1, c ? c->rxq.len : 0,
+            f->output.len, why);
+}
+
 #include "util.h"
 
 #define LOCAL_WRITE_LIMIT 262144
@@ -375,8 +398,19 @@ void service_local_inputs(Flow *fs) {
             for (;;) {
                 struct iovec iov[4];
                 int nv = ns_send_reservev(&g_ns, f->ns_idx, iov, 4);
-                if (nv == 0)
-                    break;             /* stack full: backpressure */
+                if (nv == 0) {
+                    /* backpressure: ring/window full. Dump the conn
+                     * state at most once per second per flow so a stuck
+                     * upload is diagnosable without flooding an upload
+                     * that is merely running at ring capacity */
+                    static uint64_t last_dump[NS_MAX_CONN];
+                    uint64_t nowd = now_ms();
+                    if (nowd - last_dump[f->ns_idx] >= 1000) {
+                        last_dump[f->ns_idx] = nowd;
+                        ns_dump_conn(&g_ns, f->ns_idx);
+                    }
+                    break;       /* stack full: backpressure */
+                }
                 ssize_t r2 = readv(f->fd, iov, nv);
                 if (r2 > 0) {
                     size_t left = (size_t)r2;
@@ -387,7 +421,34 @@ void service_local_inputs(Flow *fs) {
                         left -= take;
                     }
                 } else if (r2 == 0) {
+                    /* diagnostic: why did readv return EOF while the app
+                     * is still connected? dump fd state */
+                    {
+                        static int ev = -1;
+                        if (ev < 0) {
+                            const char *ve = getenv("IWAN_FLOWDBG");
+                            ev = ve && *ve && strcmp(ve, "0") != 0 &&
+                                 strcmp(ve, "false") != 0 &&
+                                 strcmp(ve, "off") != 0;
+                        }
+                        if (ev) {
+                            struct stat st;
+                            int soerr = 0;
+                            socklen_t sl = sizeof soerr;
+                            fprintf(stderr,
+                                    "FLOWDBG: readv EOF fd=%d fstat=%d "
+                                    "mode=%o soerr=", f->fd,
+                                    fstat(f->fd, &st), st.st_mode);
+                            if (getsockopt(f->fd, SOL_SOCKET, SO_ERROR,
+                                           &soerr, &sl) == 0)
+                                fprintf(stderr, "%d (%s)\n", soerr,
+                                        strerror(soerr));
+                            else
+                                fprintf(stderr, "getsockopt fail\n");
+                        }
+                    }
                     f->local_eof = true;
+                    flowdbg(f, "readv EOF -> ns_close");
                     ns_close(&g_ns, f->ns_idx);
                     set_flow_state(f, ST_CLOSING);
                     break;
@@ -471,6 +532,7 @@ void service_local_outputs(void) {
             TcpConn *c = ns_conn(&g_ns, f->ns_idx);
             if (c && c->state == NS_CLOSE_WAIT && c->rxq.len == 0 &&
                 f->output.len == 0) {
+                flowdbg(f, "CLOSE_WAIT rxq-empty -> ns_close");
                 shutdown(f->fd, SHUT_WR);
                 ns_close(&g_ns, f->ns_idx);
                 set_flow_state(f, ST_CLOSING);

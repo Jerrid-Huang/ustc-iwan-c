@@ -146,8 +146,8 @@ static void socks_send_batch2(int sockfd, SocksConfig *cfg,
                     if (errno != EINTR) {
                         struct pollfd pfd = { .fd = sockfd,
                                               .events = POLLOUT };
-                        if (poll(&pfd, 1, 100) > 0)
-                            usleep(1000);
+                        if (poll(&pfd, 1, 1) > 0)
+                            usleep(200);
                     }
                     continue;
                 }
@@ -185,9 +185,15 @@ static void socks_send_batch2(int sockfd, SocksConfig *cfg,
             if (errno == EINTR)
                 continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS) {
+                /* send buffer full: yield briefly instead of blocking
+                 * the single event loop for 100ms — receive_vpn must
+                 * keep draining downlink (ACKs, keepalive replies) or the
+                 * receive buffer overflows and the peer's segments (and
+                 * our own ACK stream) get dropped, which triggers a
+                 * retransmit storm upstream */
                 struct pollfd pfd = { .fd = sockfd, .events = POLLOUT };
-                if (poll(&pfd, 1, 100) > 0)
-                    usleep(1000);
+                if (poll(&pfd, 1, 1) > 0)
+                    usleep(200);
                 continue;
             }
             log_err("SOCKS sendmmsg: %s", strerror(errno));
@@ -313,6 +319,16 @@ int receive_vpn(int sockfd, SocksConfig *cfg) {
             if (n < 8 || (rx_msgs[i].msg_hdr.msg_flags & MSG_TRUNC))
                 continue;
             uint8_t *b = rx_buf[i];
+            {
+                static int vx = -1;
+                if (vx < 0) {
+                    const char *ve = getenv("IWAN_RXDBG");
+                    vx = ve && *ve && strcmp(ve, "0") != 0 &&
+                         strcmp(ve, "false") != 0 && strcmp(ve, "off") != 0;
+                }
+                if (vx)
+                    fprintf(stderr, "VRX: n=%zu t=%u\n", n, b[0]);
+            }
             uint8_t t = b[0];
             uint16_t psid = (uint16_t)((b[2] << 8) | b[3]);
             uint32_t ptok = ((uint32_t)b[4] << 24) | ((uint32_t)b[5] << 16) |
@@ -397,7 +413,7 @@ void run_socks(int sockfd, SocksConfig *cfg) {
         /* high-BDP tunnel: default UDP buffers (~212KB) overflow once
          * the TCP window keeps >~150 segments in flight, silently
          * dropping packets at full rate */
-        int rbuf = 4 * 1024 * 1024;
+        int rbuf = 16 * 1024 * 1024;
         setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &rbuf, sizeof rbuf);
         setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &rbuf, sizeof rbuf);
     }

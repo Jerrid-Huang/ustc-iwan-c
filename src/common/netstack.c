@@ -390,6 +390,18 @@ static bool drop_acked(TcpConn *c, NsPriv *p) {
     return true;
 }
 
+
+static int rxdbg_on(void)
+{
+    static int rxc = -1;
+    if (rxc < 0) {
+        const char *v = getenv("IWAN_RXDBG");
+        rxc = v && *v && strcmp(v, "0") != 0 &&
+              strcmp(v, "false") != 0 && strcmp(v, "off") != 0;
+    }
+    return rxc;
+}
+
 static void handle_rx(Netstack *ns, TcpConn *c, int idx, const uint8_t *t,
                       size_t thlen, uint8_t flags, uint32_t seq, uint32_t ack,
                       const uint8_t *payload, size_t paylen, uint64_t now) {
@@ -442,6 +454,22 @@ static void handle_rx(Netstack *ns, TcpConn *c, int idx, const uint8_t *t,
     }
     if (!(flags & TCP_ACK))
         return;
+    /* diagnostic (IWAN_RXDBG=1): log every data/FIN segment with the
+     * connection state — used to find why a segment is dropped */
+    if (paylen > 0 || (flags & TCP_FIN)) {
+        static int rxc = -1;
+        if (rxc < 0) {
+            const char *v = getenv("IWAN_RXDBG");
+            rxc = v && *v && strcmp(v, "0") != 0 &&
+                  strcmp(v, "false") != 0 && strcmp(v, "off") != 0;
+        }
+        if (rxc)
+            fprintf(stderr,
+                    "RXDBG: conn=%d state=%d seq=%u rcv=%u ack=%u "
+                    "snd_una=%u flags=%02x pay=%zu\n",
+                    idx, c->state, seq, c->rcv_nxt, ack, c->snd_una, flags,
+                    paylen);
+    }
     c->last_rx_ms = now;
     c->keepalive_cnt = 0;
     c->keepalive_ms = 0;
@@ -511,8 +539,13 @@ static void handle_rx(Netstack *ns, TcpConn *c, int idx, const uint8_t *t,
         c->snd_una = ack;
     }
     drop_acked(c, p);
+    /* FIN_WAIT must NOT close on the FIN-ACK alone: the peer's data and
+     * FIN may still be in flight (half-close, e.g. an app that shuts
+     * down its write side while waiting for a reply). Closing here would
+     * free the conn and let the reply be RST'd away. Stay in FIN_WAIT
+     * until the peer's FIN is seen (remote_fin). */
     if (p->fin_sent && (int32_t)(ack - c->snd_nxt) >= 0 &&
-        (c->state == NS_FIN_WAIT ||
+        ((c->state == NS_FIN_WAIT && c->remote_fin) ||
          (c->state == NS_CLOSE_WAIT && c->local_fin))) {
         c->state = NS_CLOSED;
         return;
@@ -522,6 +555,10 @@ static void handle_rx(Netstack *ns, TcpConn *c, int idx, const uint8_t *t,
             if (c->rxq.len + paylen <= NS_WINDOW) {
                 b_put(&c->rxq, payload, paylen);
                 c->rcv_nxt += (uint32_t)paylen;
+                if (rxdbg_on())
+                    fprintf(stderr, "RXDBG: conn=%d data->rxq pay=%zu "
+                            "rxq=%zu state=%d\n", idx, paylen, c->rxq.len,
+                            c->state);
             }
             /* else: receive window closed — drop without advancing
              * rcv_nxt; the peer retransmits once the window reopens */
@@ -613,6 +650,32 @@ TcpConn *ns_conn(Netstack *ns, int idx) {
 
 NsState ns_state(const TcpConn *c) {
     return c->state;
+}
+
+/* diagnostic (IWAN_FLOWDBG=1): dump one conn's full send state, used to
+ * identify backpressure deadlocks (zero remote window, ring full of
+ * sealed-but-unsent segments, tx-queue overflow). Cheap when disabled. */
+void ns_dump_conn(const Netstack *ns, int idx)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("IWAN_FLOWDBG");
+        cached = v && *v && strcmp(v, "0") != 0 &&
+                 strcmp(v, "false") != 0 && strcmp(v, "off") != 0;
+    }
+    if (!cached || idx < 0 || idx >= NS_MAX_CONN)
+        return;
+    const TcpConn *c = &ns->conns[idx];
+    const NsPriv *p = &priv[idx];
+    fprintf(stderr,
+            "NSDUMP: conn=%d state=%d una=%u nxt=%u sent=%u rwin=%u "
+            "scale=%u inflight=%u nsegs=%u txq=%d rxq=%zu rf=%d lf=%d "
+            "fs=%d rto=%u srtt=%u\n",
+            idx, c->state, c->snd_una, c->snd_nxt, c->sent_nxt,
+            c->remote_win, c->peer_scale,
+            (unsigned)(c->sent_nxt - c->snd_una), p->nsegs, ns->tx_count,
+            c->rxq.len, c->remote_fin, c->local_fin, p->fin_sent,
+            c->rto, c->srtt);
 }
 
 void ns_set_outer(Netstack *ns, const uint8_t hdr[8], const uint8_t key[8])
@@ -940,9 +1003,15 @@ static bool conn_retransmit_loop(Netstack *ns, TcpConn *c, NsPriv *p, int idx,
             continue;
         if (now < s->last_sent_ms + s->rto)
             continue;
-        if ((int64_t)(c->snd_nxt - c->snd_una) > (int64_t)c->remote_win)
-            continue;
-                {
+        /* no window check here on purpose: the guard that used
+         * snd_nxt - snd_una > remote_win counted SEALED-but-unsent
+         * bytes, so once the ring filled (128 segs) it blocked every
+         * retransmission forever — a single dropped segment (UDP rcvbuf
+         * overflow, GSO partial delivery) then froze the connection
+         * permanently even though in-flight was well within the window.
+         * Retransmissions are never window-limited in TCP: the data was
+         * already sent within the window when first transmitted. */
+        {
             uint8_t *ip = s->hdr + 8;
             uint8_t *t = ip + 20;
             uint16_t win = conn_win_field(c);
@@ -964,6 +1033,21 @@ static bool conn_retransmit_loop(Netstack *ns, TcpConn *c, NsPriv *p, int idx,
                                ? (int)NS_RTO_MAX
                                : (int)s->rto * 2);
         s->cnt++;
+        /* diagnostic (IWAN_RETX=1, independent of IWAN_DEBUG which slows
+         * the data path): first retransmit of each segment */
+        if (s->cnt == 1) {
+            static int cached = -1;
+            if (cached < 0) {
+                const char *v = getenv("IWAN_RETX");
+                cached = v && *v && strcmp(v, "0") != 0 &&
+                         strcmp(v, "false") != 0 && strcmp(v, "off") != 0;
+            }
+            if (cached)
+                fprintf(stderr, "NS RETX: conn=%d seq=%u len=%u rto=%u "
+                        "win=%u inflight=%u\n", idx, s->seq, s->len, s->rto,
+                        c->remote_win,
+                        (unsigned)(c->sent_nxt - c->snd_una));
+        }
         if (s->cnt > 8) {
             ns_abort(ns, idx);
             return true;
@@ -979,6 +1063,8 @@ static void conn_send_new(Netstack *ns, TcpConn *c, NsPriv *p, uint64_t now) {
      * in snd_nxt; counting sealed-but-unsent would fake a full window) */
     uint32_t in_flight = c->sent_nxt - c->snd_una;
     Seg *s;
+    bool sent_any = false;
+    int idx = (int)(c - ns->conns);   /* for the stuck diagnostic */
 
         if (p->nsegs < NS_MAX_OUTSTANDING && in_flight < c->remote_win) {
         s = &p->segs[p->seg_head + p->nsegs];
@@ -1018,6 +1104,31 @@ static void conn_send_new(Netstack *ns, TcpConn *c, NsPriv *p, uint64_t now) {
         s->cnt = 1;
         c->sent_nxt = s->seq + s->len + (s->fin ? 1u : 0u);
         in_flight = c->sent_nxt - c->snd_una;
+        sent_any = true;
+    }
+    /* diagnostic (IWAN_FLOWDBG=1): nothing sent while data is queued —
+     * either the window is closed (in_flight >= remote_win) or every
+     * slot is marked sent with in-flight 0 (state corruption). Throttled
+     * to 500ms so a stuck upload prints the reason without flooding. */
+    if (!sent_any && p->nsegs > 0) {
+        static int cached = -1;
+        static uint64_t last_print[NS_MAX_CONN];
+        if (cached < 0) {
+            const char *v = getenv("IWAN_FLOWDBG");
+            cached = v && *v && strcmp(v, "0") != 0 &&
+                     strcmp(v, "false") != 0 && strcmp(v, "off") != 0;
+        }
+        if (cached && now - last_print[idx] >= 500) {
+            last_print[idx] = now;
+            Seg *s0 = seg_at(p, 0);
+            fprintf(stderr,
+                    "NSSEND: conn=%d nsegs=%u sent0=%d inflight=%u "
+                    "rwin=%u scale=%u una=%u nxt=%u sent=%u srtt=%u "
+                    "rto=%u\n",
+                    idx, p->nsegs, s0->sent, in_flight, c->remote_win,
+                    c->peer_scale, c->snd_una, c->snd_nxt, c->sent_nxt,
+                    c->srtt, c->rto);
+        }
     }
         if (c->local_fin && !p->fin_sent && p->nsegs < NS_MAX_OUTSTANDING &&
         in_flight < c->remote_win) {
@@ -1078,6 +1189,7 @@ int ns_tick(Netstack *ns, uint64_t now) {
         } else {
             if (c->local_fin && p->fin_sent &&
                 (c->state == NS_FIN_WAIT || c->state == NS_CLOSE_WAIT) &&
+                c->remote_fin &&
                 (int32_t)(c->snd_una - c->snd_nxt) >= 0) {
                 c->state = NS_CLOSED;
                 continue;

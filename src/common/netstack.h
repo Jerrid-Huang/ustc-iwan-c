@@ -96,6 +96,8 @@ void ns_set_outer(Netstack *ns, const uint8_t hdr[8], const uint8_t key[8]);
 int  ns_connect(Netstack *ns, uint16_t lport, uint32_t rip, uint16_t rport);
 TcpConn *ns_conn(Netstack *ns, int idx);
 NsState ns_state(const TcpConn *c);
+/* diagnostic: dump conn send state (IWAN_FLOWDBG=1) */
+void ns_dump_conn(const Netstack *ns, int idx);
 
 /* zero-copy app-data path: reserve writable space in the pending segment
  * slot (read() straight into it), then commit what was filled. Returns

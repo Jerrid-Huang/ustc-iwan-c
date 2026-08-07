@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <openssl/crypto.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -57,6 +58,7 @@ struct up_stats {
     uint64_t find;    /* find_session + token + rebind + enc check */
     uint64_t xor;     /* in-place decryption */
     uint64_t write;   /* tun_write syscall */
+    uint64_t drop;    /* tun_write EAGAIN/failure drops */
 };
 
 static struct up_stats g_up;
@@ -81,12 +83,14 @@ void server_up_stats_print(void)
     g_up_win = now;
     fprintf(stderr,
             "uplink: n=%llu parse=%.0fns find=%.0fns xor=%.0fns write=%.0fns"
-            " total=%.0fns\n",
+            " total=%.0fns drop=%llu\n",
             (unsigned long long)g_up.n, (double)g_up.parse / g_up.n,
             (double)g_up.find / g_up.n, (double)g_up.xor / g_up.n,
             (double)g_up.write / g_up.n,
-            (double)(g_up.parse + g_up.find + g_up.xor + g_up.write) / g_up.n);
+            (double)(g_up.parse + g_up.find + g_up.xor + g_up.write) / g_up.n,
+            (unsigned long long)g_up.drop);
     g_up.n = g_up.parse = g_up.find = g_up.xor = g_up.write = 0;
+    g_up.drop = 0;
 }
 
 /* best-effort scrub of secrets, immune to optimizer elision */
@@ -548,8 +552,24 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
             }
             if (debug_enabled())
                 tx1 = now_ns();
-            if (ctx->tun_fd >= 0 && len > 8)
-                tun_write(ctx->tun_fd, raw + 8, len - 8);
+            if (ctx->tun_fd >= 0 && len > 8) {
+                ssize_t w = tun_write(ctx->tun_fd, raw + 8, len - 8);
+                if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                    /* device TX queue full: wait briefly for drain
+                     * instead of silently dropping the segment. A
+                     * dropped uplink segment makes the client RTO-retry;
+                     * under a burst that can degrade into a stall. */
+                    struct pollfd pfd = { .fd = ctx->tun_fd,
+                                          .events = POLLOUT };
+                    if (poll(&pfd, 1, 1) > 0 &&
+                        tun_write(ctx->tun_fd, raw + 8, len - 8) >= 0)
+                        ;   /* queued after drain */
+                    else
+                        g_up.drop++;  /* still full: drop, client retransmits */
+                } else if (w < 0) {
+                    g_up.drop++;
+                }
+            }
             if (debug_enabled()) {
                 tc = now_ns();
                 g_up.parse += tb - ta;
