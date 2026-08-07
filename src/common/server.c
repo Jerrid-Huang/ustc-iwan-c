@@ -83,11 +83,11 @@ void server_up_stats_print(void)
         return;
     g_up_win = now;
     fprintf(stderr,
-            "uplink: n=%llu parse=%.0fns find=%.0fns xor=%.0fns write=%.0fns"
-            " total=%.0fns drop=%llu dl=%llu\n",
-            (unsigned long long)g_up.n, (double)g_up.parse / g_up.n,
-            (double)g_up.find / g_up.n, (double)g_up.xor / g_up.n,
-            (double)g_up.write / g_up.n,
+            "uplink: [t=%llu] n=%llu parse=%.0fns find=%.0fns xor=%.0fns"
+            " write=%.0fns total=%.0fns drop=%llu dl=%llu\n",
+            (unsigned long long)now_ms(), (unsigned long long)g_up.n,
+            (double)g_up.parse / g_up.n, (double)g_up.find / g_up.n,
+            (double)g_up.xor / g_up.n, (double)g_up.write / g_up.n,
             (double)(g_up.parse + g_up.find + g_up.xor + g_up.write) / g_up.n,
             (unsigned long long)g_up.drop,
             (unsigned long long)server_dl_pkts());
