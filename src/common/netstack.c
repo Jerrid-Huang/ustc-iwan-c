@@ -1034,8 +1034,9 @@ static bool conn_retransmit_loop(Netstack *ns, TcpConn *c, NsPriv *p, int idx,
                                : (int)s->rto * 2);
         s->cnt++;
         /* diagnostic (IWAN_RETX=1, independent of IWAN_DEBUG which slows
-         * the data path): first retransmit of each segment */
-        if (s->cnt == 1) {
+         * the data path): first retransmit of each segment (cnt starts
+         * at 1 on the initial send, so the first retransmit is cnt==2) */
+        if (s->cnt == 2) {
             static int cached = -1;
             if (cached < 0) {
                 const char *v = getenv("IWAN_RETX");
