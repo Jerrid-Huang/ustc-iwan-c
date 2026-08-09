@@ -5,15 +5,30 @@
 #include <stdint.h>
 #include "common.h"
 
+/* Parse "A.B.C.D/n" (0 <= n <= 32) into host-order net + prefix length.
+ * Returns 0 on success, -1 on malformed input. */
+int cidr_parse(const char *s, uint32_t *net, int *prefix);
 /* detect default route. Returns true and fills gw/dev (>=16 bytes each). */
 bool capture_default(char gw[16], char dev[16]);
 /* first IPv4 subnet on dev as "a.b.c.d/plen", or false. */
 bool local_subnet(const char *dev, char out[24]);
 
-void route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
+/* Apply the VPN routes: flush/up/mtu/addr on tun, then install the
+ * proxy routes (default replaced onto tun). Returns true on success;
+ * on failure, rolls back everything applied so far (restoring the
+ * pre-VPN default route) and returns false — the caller must not
+ * start the pump on failure. */
+bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
                  const char *srv, const char *ogw, const char *odev,
                  const slist_t *routes_with_default);
 void route_teardown(const char *tun, const char *srv, const char *ogw,
                     const char *odev, const slist_t *routes);
+
+/* bring the tunnel interface up with an address and MTU (no routes);
+ * shared by route_setup and the no-route-hijack pump path. Returns
+ * false when a step failed (state partially applied). */
+bool route_iface_up(const char *tun, const char *tun_ip, uint16_t mtu);
+/* take the tunnel interface down and flush its addresses (no routes) */
+void route_iface_down(const char *tun);
 
 #endif

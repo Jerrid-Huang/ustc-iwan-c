@@ -5,6 +5,26 @@
 #include <stdint.h>
 #include "common.h"
 
+/* shared "mw" magic used both as the key-derivation prefix (crypto.c) and
+ * the ctrl-signature suffix (protocol.c): keep both in sync via one name */
+#define IWAN_MW "mw"
+
+/* max UDP payload of one datagram: 65535 (16-bit length field) minus the
+ * 20-byte IPv4 header minus the 8-byte UDP header. Shared by the GSO
+ * fast paths in socks.c and proxy.c. */
+#define IWAN_UDP_GSO_UNIT 65507
+
+/* safe ceiling for ONE GSO unit (total payload of a uniform batch).
+ * Linux's software GSO segmentation (loopback, veth, ...) drops units
+ * above ~4-5KB under load on some kernels (measured 28.6% loss at
+ * 5.5KB, 84.8% at 65KB on 7.0.0-28, independent of the rcvbuf size),
+ * while units <= ~4KB deliver losslessly. Real NICs offload GSO in
+ * hardware and have no such limit, but the syscall cost of 2-3 segment
+ * batches is negligible (~8% CPU at 2.6 Gbit/s), so cap every unit at
+ * one page and let oversized batches fall back to sendmmsg (still one
+ * syscall per batch). */
+#define IWAN_GSO_UNIT_SAFE 4096
+
 enum {
     PT_OPEN_REJECT = 0x11,
     PT_OPEN_ACK    = 0x12,
@@ -30,22 +50,22 @@ enum {
     T_ERR_MSG     = 0x10,
 };
 
-void pkhdr(uint8_t typ, uint8_t enc, uint16_t sid, uint32_t tok, uint8_t out[8]);
-/* md5(h8 + "mw") */
-void sig8(const uint8_t h8[8], uint8_t out[16]);
-/* append typ,enc(=1),sid,tok header WITHOUT sig (for data). out grows. */
-void data_hdr(buf_t *out, uint8_t typ, uint8_t enc, uint16_t sid, uint32_t tok);
+void pkt_hdr(uint8_t typ, uint8_t enc, uint16_t sid, uint32_t tok, uint8_t out[8]);
+/* md5(h8 + IWAN_MW) */
+void pkt_sig(const uint8_t h8[8], uint8_t out[16]);
 /* append header WITH sig (for ctrl). out grows. */
 void ctrl_hdr(buf_t *out, uint8_t typ, uint8_t enc, uint16_t sid, uint32_t tok);
 /* append one TLV (len includes the 2 header bytes). */
 void tlv_put(buf_t *out, uint8_t typ, const void *val, uint8_t vlen);
-/* iterate TLVs. cb returns false to stop. */
-void parse_tlvs(const uint8_t *data, size_t len,
-                bool (*cb)(uint8_t typ, const uint8_t *val, uint8_t vlen, void *ud),
-                void *ud);
+/* iterate TLVs. Returns 0 on success, -1 when the frame is truncated or
+ * malformed (a length byte < 2, a TLV overrunning the buffer, or trailing
+ * bytes). cb returning false stops iteration but is not an error. */
+int parse_tlvs(const uint8_t *data, size_t len,
+               bool (*cb)(uint8_t typ, const uint8_t *val, uint8_t vlen, void *ud),
+               void *ud);
 bool verify_sig(const uint8_t *buf, size_t len);
 
-/* "a.b.c.d" from 4 bytes; into out (>=16). "??" if too short. */
+/* "a.b.c.d" from exactly 4 bytes; out must hold >= 16 bytes. */
 void ip_to_string(const uint8_t b[4], char out[16]);
 /* parse dotted-quad into 4 bytes. Returns false on invalid. */
 bool s2ip4(const char *s, uint8_t out[4]);

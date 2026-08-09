@@ -1,10 +1,17 @@
 #include <ctype.h>
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "json.h"
+#include "util.h"
+
+/* recursion guard: nesting deeper than this is rejected at parse time
+ * and abandoned at free time, so hostile input cannot overflow the C
+ * stack (one C frame per nesting level) */
+#define JSON_MAX_DEPTH 256
 
 struct Json {
     int type;
@@ -57,11 +64,21 @@ struct jbuf {
 
 static void jbuf_app(struct jbuf *b, const void *p, size_t n)
 {
-    if (b->len + n + 1 > b->cap) {
+    if (n > SIZE_MAX - b->len - 1)
+        oom_abort();   /* length overflow: no representable buffer */
+    size_t need = b->len + n + 1;
+    if (need > b->cap) {
         size_t nc = b->cap ? b->cap * 2 : 64;
-        while (nc < b->len + n + 1)
+        while (nc < need) {
+            if (nc > SIZE_MAX / 2) {
+                nc = need;
+                break;
+            }
             nc *= 2;
+        }
         b->d = realloc(b->d, nc);
+        if (!b->d)
+            oom_abort();
         b->cap = nc;
     }
     memcpy(b->d + b->len, p, n);
@@ -69,7 +86,7 @@ static void jbuf_app(struct jbuf *b, const void *p, size_t n)
     b->d[b->len] = '\0';
 }
 
-static Json *parse_value(struct P *p);
+static Json *parse_value(struct P *p, int depth);
 
 static void skip_ws(struct P *p)
 {
@@ -212,6 +229,46 @@ static Json *parse_string(struct P *p)
                     return NULL;
                 }
                 hex4(p->s + 2, &cp);
+                /* a high surrogate (U+D800-U+DBFF) must be immediately
+                 * followed by a \uXXXX low surrogate (U+DC00-U+DFFF) to
+                 * spell one supplementary code point; merge the pair into
+                 * a single code point and consume both escapes. An
+                 * isolated high/low surrogate falls through and is
+                 * rendered as '?' by utf8_encode. */
+                if (cp >= 0xD800 && cp <= 0xDBFF &&
+                    p->s[6] == '\\' && p->s[7] == 'u') {
+                    uint32_t lo = 0;
+                    int lbad = 0, leof = 0;
+                    for (int k = 0; k < 4; k++) {
+                        unsigned char h = (unsigned char)p->s[8 + k];
+                        if (h == '\0') {
+                            leof = 1;
+                            break;
+                        }
+                        if (!((h >= '0' && h <= '9') || (h >= 'a' && h <= 'f') ||
+                              (h >= 'A' && h <= 'F')))
+                            lbad = 1;
+                    }
+                    if (leof) {
+                        p_fail(p, 0, 1, "EOF while parsing a string");
+                        free(b.d);
+                        return NULL;
+                    }
+                    if (!lbad) {
+                        hex4(p->s + 8, &lo);
+                        if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                            cp = 0x10000 + ((cp - 0xD800) << 10) +
+                                 (lo - 0xDC00);
+                            elen = utf8_encode(cp, enc);
+                            jbuf_app(&b, enc, elen);
+                            p->s += 12; /* consumed both escapes */
+                            break;
+                        }
+                    }
+                    /* not a low surrogate: leave \uXXXX for the next loop
+                     * iteration, so the pair-decoding only ever goes
+                     * forward */
+                }
                 elen = utf8_encode(cp, enc);
                 jbuf_app(&b, enc, elen);
                 p->s += 6;
@@ -238,8 +295,15 @@ static Json *parse_string(struct P *p)
     }
 
     j = calloc(1, sizeof *j);
+    if (!j)
+        oom_abort();
     j->type = JSON_STR;
-    j->u.str = b.d ? b.d : calloc(1, 1);
+    if (!b.d) {
+        b.d = calloc(1, 1);
+        if (!b.d)
+            oom_abort();
+    }
+    j->u.str = b.d;
     return j;
 }
 
@@ -303,26 +367,38 @@ static Json *parse_number(struct P *p)
      * hex/NaN extensions cannot consume beyond it */
     size_t n = (size_t)(p->s - start);
     if (n >= 128) {
-        p_fail(p, 0, 1, "number out of range");
+        p->s = start;   /* report at the number's start, not at EOF */
+        p_fail(p, 0, 0, "number out of range");
         return NULL;
     }
     char tmp[128];
     memcpy(tmp, start, n);
     tmp[n] = '\0';
+    /* e.g. 1e999 is grammatically legal but overflows a double; reject the
+     * value instead of storing +-inf (or 0 on underflow) */
+    errno = 0;
     d = strtod(tmp, NULL);
+    if (errno == ERANGE) {
+        p_fail(p, 0, 0, "number out of range");
+        return NULL;
+    }
     j = calloc(1, sizeof *j);
+    if (!j)
+        oom_abort();
     j->type = JSON_NUM;
     j->u.num = d;
     return j;
 }
 
-static Json *parse_array(struct P *p)
+static Json *parse_array(struct P *p, int depth)
 {
     Json *arr;
     int after_comma = 0;
 
     p->s++; /* '[' */
     arr = calloc(1, sizeof *arr);
+    if (!arr)
+        oom_abort();
     arr->type = JSON_ARR;
     for (;;) {
         Json *v;
@@ -342,14 +418,22 @@ static Json *parse_array(struct P *p)
             json_free(arr);
             return NULL;
         }
-        v = parse_value(p);
+        v = parse_value(p, depth + 1);
         if (!v) {
             json_free(arr);
             return NULL;
         }
         if (arr->u.a.len == arr->u.a.cap) {
             size_t nc = arr->u.a.cap ? arr->u.a.cap * 2 : 8;
+            /* guard the *2 and the byte-size multiply at the size ceiling */
+            if (nc < arr->u.a.cap || nc > SIZE_MAX / sizeof(Json *)) {
+                if (arr->u.a.len == SIZE_MAX)
+                    oom_abort();
+                nc = arr->u.a.len + 1;
+            }
             arr->u.a.arr = realloc(arr->u.a.arr, nc * sizeof(Json *));
+            if (!arr->u.a.arr)
+                oom_abort();
             arr->u.a.cap = nc;
         }
         arr->u.a.arr[arr->u.a.len++] = v;
@@ -375,13 +459,15 @@ static Json *parse_array(struct P *p)
     }
 }
 
-static Json *parse_object(struct P *p)
+static Json *parse_object(struct P *p, int depth)
 {
     Json *obj;
     int after_comma = 0;
 
     p->s++; /* '{' */
     obj = calloc(1, sizeof *obj);
+    if (!obj)
+        oom_abort();
     obj->type = JSON_OBJ;
     for (;;) {
         Json *ks, *v;
@@ -426,7 +512,7 @@ static Json *parse_object(struct P *p)
             return NULL;
         }
         p->s++;
-        v = parse_value(p);
+        v = parse_value(p, depth + 1);
         if (!v) {
             json_free(ks);
             json_free(obj);
@@ -434,7 +520,16 @@ static Json *parse_object(struct P *p)
         }
         if (obj->u.o.len == obj->u.o.cap) {
             size_t nc = obj->u.o.cap ? obj->u.o.cap * 2 : 8;
+            /* guard the *2 and the byte-size multiply at the size ceiling */
+            if (nc < obj->u.o.cap ||
+                nc > SIZE_MAX / sizeof *obj->u.o.items) {
+                if (obj->u.o.len == SIZE_MAX)
+                    oom_abort();
+                nc = obj->u.o.len + 1;
+            }
             obj->u.o.items = realloc(obj->u.o.items, nc * sizeof *obj->u.o.items);
+            if (!obj->u.o.items)
+                oom_abort();
             obj->u.o.cap = nc;
         }
         obj->u.o.items[obj->u.o.len].key = ks->u.str;
@@ -476,23 +571,29 @@ static Json *parse_lit(struct P *p, const char *lit, int type, int val)
         p->s++;
     }
     Json *j = calloc(1, sizeof *j);
+    if (!j)
+        oom_abort();
     j->type = type;
     if (type == JSON_BOOL)
         j->u.boolean = val;
     return j;
 }
 
-static Json *parse_value(struct P *p)
+static Json *parse_value(struct P *p, int depth)
 {
     skip_ws(p);
+    if (depth > JSON_MAX_DEPTH) {
+        p_fail(p, 0, 0, "maximum depth exceeded");
+        return NULL;
+    }
     if (!p->s[0]) {
         p_fail(p, 0, 1, "EOF while parsing a value");
         return NULL;
     }
     if (p->s[0] == '{')
-        return parse_object(p);
+        return parse_object(p, depth);
     if (p->s[0] == '[')
-        return parse_array(p);
+        return parse_array(p, depth);
     if (p->s[0] == '"')
         return parse_string(p);
     if (p->s[0] == 't')
@@ -516,7 +617,7 @@ Json *json_parse_ex(const char *text, char *err, size_t errsz)
     p.s = text;
     p.end = text + strlen(text);
     p.err[0] = '\0';
-    v = parse_value(&p);
+    v = parse_value(&p, 0);
     if (!v) {
         if (err && errsz)
             snprintf(err, errsz, "%s", p.err);
@@ -538,23 +639,27 @@ Json *json_parse(const char *text)
     return json_parse_ex(text, NULL, 0);
 }
 
-void json_free(Json *j)
+static void json_free_d(Json *j, int depth)
 {
     if (!j)
         return;
+    if (depth > JSON_MAX_DEPTH)
+        return;   /* abandoned subtree: parser never builds this deep, so
+                   * bailing here only guards hand-built trees from a stack
+                   * overflow instead of leaking reachable memory */
     switch (j->type) {
     case JSON_STR:
         free(j->u.str);
         break;
     case JSON_ARR:
         for (size_t i = 0; i < j->u.a.len; i++)
-            json_free(j->u.a.arr[i]);
+            json_free_d(j->u.a.arr[i], depth + 1);
         free(j->u.a.arr);
         break;
     case JSON_OBJ:
         for (size_t i = 0; i < j->u.o.len; i++) {
             free(j->u.o.items[i].key);
-            json_free(j->u.o.items[i].val);
+            json_free_d(j->u.o.items[i].val, depth + 1);
         }
         free(j->u.o.items);
         break;
@@ -562,6 +667,11 @@ void json_free(Json *j)
         break;
     }
     free(j);
+}
+
+void json_free(Json *j)
+{
+    json_free_d(j, 0);
 }
 
 int json_type(const Json *j)
@@ -589,12 +699,12 @@ size_t json_arr_len(const Json *j)
     return (j && j->type == JSON_ARR) ? j->u.a.len : 0;
 }
 
-Json *json_arr_at(Json *j, size_t i)
+Json *json_arr_at(const Json *j, size_t i)
 {
     return (j && j->type == JSON_ARR && i < j->u.a.len) ? j->u.a.arr[i] : NULL;
 }
 
-Json *json_obj_get(Json *j, const char *key)
+Json *json_obj_get(const Json *j, const char *key)
 {
     Json *found = NULL;
     if (!j || j->type != JSON_OBJ)
@@ -606,15 +716,15 @@ Json *json_obj_get(Json *j, const char *key)
     return found;
 }
 
-Json *json_get(Json *root, const char *path)
+Json *json_get(const Json *root, const char *path)
 {
-    Json *cur;
+    const Json *cur;
     const char *a;
 
     if (!root)
         return NULL;
     if (!path || !path[0])
-        return root;
+        return (Json *)root;   /* borrowed view: callers must not free */
     cur = root;
     a = path;
     for (;;) {
@@ -650,10 +760,10 @@ Json *json_get(Json *root, const char *path)
             break;
         a = b + 1;
     }
-    return cur;
+    return (Json *)cur;   /* borrowed view: callers must not free */
 }
 
-const char *json_get_str(Json *root, const char *path)
+const char *json_get_str(const Json *root, const char *path)
 {
     Json *v = json_get(root, path);
     return v ? json_str(v) : NULL;

@@ -34,7 +34,7 @@ typedef struct {
     uint16_t lport;
     bool     local_eof;
     uint64_t state_ms;         /* when state last changed */
-    uint16_t req_port;         /* requested remote port while resolving */
+    bool     auth_pending;     /* RFC1929 auth sub-negotiation in progress */
 } Flow;
 
 /* Result of an async DNS lookup, queued for the event loop. */
@@ -47,9 +47,11 @@ typedef struct {
 
 /* ---- shared state between socks.c (server) and socks_flow.c (flows) ---- */
 extern Netstack g_ns;
-extern Flow *g_flows;          /* NULL-terminated? no: MAX_FLOWS array */
+extern Flow *g_flows;          /* fixed MAX_FLOWS array, never NULL-terminated */
 extern uint64_t g_next_id;
 extern int g_dns_evfd;         /* -1 = disabled; written by DNS workers */
+extern int g_sockfd;           /* session UDP socket; set by run_socks, used by tunnel DNS */
+extern SocksConfig *g_socks_cfg; /* SOCKS5 config (auth_token/allow_remote); set by run_socks */
 extern int g_flow_len;         /* active count */
 extern volatile sig_atomic_t g_stop;
 
@@ -66,6 +68,8 @@ uint64_t now_mono(void);
 void dns_push(int flow_id, bool ok, uint32_t ip, uint16_t port);
 int  dns_drain(DnsResult *out, int max);
 void spawn_dns(int flow_id, const char *domain, uint16_t port);
+void dns_set_server(const char *ip);   /* tunnel DNS resolver (run_socks) */
+bool dns_try_handle_response(const uint8_t *pkt, size_t n); /* consume inner DNS replies */
 void queue_flow_output(Flow *f, const uint8_t *data, size_t n);
 void queue_socks_error(Flow *f, uint8_t rep);
 void set_flow_state(Flow *f, FlowState st);

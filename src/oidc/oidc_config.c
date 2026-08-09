@@ -105,10 +105,12 @@ void oidc_fetch_config(Config *cf)
         buf_put_str(&b, "\",\n      \"host\": \"");
         oidc_esc_put(&b, json_get_str(s, "serverName"));
         buf_put_str(&b, "\",\n");
-        char pbuf[64];
-        snprintf(pbuf, sizeof pbuf, "      \"port\": %ld,\n",
-                 server_port(s));
-        buf_put_str(&b, pbuf);
+        long port = server_port(s);
+        if (port != 0) {
+            char pbuf[64];
+            snprintf(pbuf, sizeof pbuf, "      \"port\": %ld,\n", port);
+            buf_put_str(&b, pbuf);
+        }
         buf_put_str(&b, "      \"username\": \"");
         oidc_esc_put(&b, json_get_str(s, "userName"));
         buf_put_str(&b, "\",\n      \"passWord\": \"");
@@ -136,6 +138,11 @@ void oidc_fetch_config(Config *cf)
 
 void oidc_save_config(const char *path, const Config *cf)
 {
+    if (!cf->servers || json_type(cf->servers) != JSON_ARR ||
+        json_arr_len(cf->servers) == 0)
+        oidc_die("cannot save config: server list is empty "
+                 "(refusing to write an unusable config)");
+
     const char *slash = strrchr(path, '/');
     if (slash && slash != path) {
         char *dir = malloc((size_t)(slash - path) + 1);
@@ -144,21 +151,36 @@ void oidc_save_config(const char *path, const Config *cf)
         mkdir_p(dir);
         free(dir);
     }
-    /* O_NOFOLLOW: this runs as root (sudo re-exec) writing into the
-     * invoking user's home; a pre-planted symlink at servers.json must
+    /* write a sibling temp file, then rename() over the target so the
+     * config is replaced atomically: a concurrent reader never sees a
+     * half-written file. Same directory keeps rename() on one filesystem.
+     * O_NOFOLLOW: this runs as root (sudo re-exec) writing into the
+     * invoking user's home; a pre-planted symlink at the temp path must
      * not become an arbitrary-root-file truncate/overwrite primitive */
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+    size_t tlen = strlen(path) + sizeof ".tmp";
+    char *tmp = malloc(tlen);
+    snprintf(tmp, tlen, "%s.tmp", path);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
     if (fd < 0)
         oidc_die("cannot write config to %s", path);
     FILE *f = fdopen(fd, "wb");
     if (!f) {
         close(fd);
+        unlink(tmp);
         oidc_die("cannot write config to %s", path);
     }
     /* the file holds decryptable password blobs: never world-readable */
     (void)fchmod(fileno(f), 0600);
-    if (fputs(cf->pretty, f) == EOF || fclose(f) != 0)
+    if (fputs(cf->pretty, f) == EOF || fflush(f) != 0 ||
+        fsync(fileno(f)) != 0 || fclose(f) != 0) {
+        unlink(tmp);
         oidc_die("cannot write config to %s: %s", path, strerror(errno));
+    }
+    if (rename(tmp, path) != 0) {
+        unlink(tmp);
+        oidc_die("cannot write config to %s: %s", path, strerror(errno));
+    }
+    free(tmp);
     oidc_eprintf("  Saved %zu server(s) to %s\n", json_arr_len(cf->servers),
                  path);
 }
@@ -167,11 +189,11 @@ void oidc_load_config(const char *path, Config *cf)
 {
     FILE *f = fopen(path, "rb");
     if (!f) {
-        fprintf(stderr,
-                "Error: config file not found or unreadable: %s; run iwan-client-oidc --fetch first\n\n"
-                "Caused by:\n    %s (os error %d)\n",
-                path, strerror(errno), errno);
-        exit(1);
+        char msg[512];
+        snprintf(msg, sizeof msg,
+                 "cannot read config file %s (run iwan-client-oidc --fetch first)",
+                 path);
+        oidc_die_with_cause(msg, strerror(errno));
     }
     buf_t b;
     buf_init(&b);

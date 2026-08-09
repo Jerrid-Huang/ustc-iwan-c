@@ -12,44 +12,48 @@
 #include <unistd.h>
 
 #include "common.h"
+#include "crypto.h"
 #include "netstack.h"
 #include "protocol.h"
 #include "socks_internal.h"
+#include "util.h"
+
+#define LOCAL_WRITE_LIMIT 262144
+#define HANDSHAKE_TIMEOUT_MS 30000u /* ms: greeting/request/resolve/connect */
+#define TCP_RX_CHUNK      16384
+#define DNS_RESULT_Q_LEN  64    /* DNS result ring size (dns_push/dns_drain) */
+#define DNS_DRAIN_MAX     16    /* results handled per event-loop round */
+
+static const char *flow_state_name(FlowState st)
+{
+    /* indexed by the FlowState enum in socks_internal.h */
+    static const char *const names[] = {
+        "GREETING", "REQUEST", "RESOLVING", "CONNECTING",
+        "ESTABLISHED", "CLOSING",
+    };
+    return (size_t)st < sizeof names / sizeof names[0] ? names[st] : "?";
+}
 
 /* diagnostic (IWAN_FLOWDBG=1): flow close triggers */
 static void flowdbg(const Flow *f, const char *why)
 {
-    static int cached = -1;
     TcpConn *c;
-    if (cached < 0) {
-        const char *v = getenv("IWAN_FLOWDBG");
-        cached = v && *v && strcmp(v, "0") != 0 &&
-                 strcmp(v, "false") != 0 && strcmp(v, "off") != 0;
-    }
-    if (!cached)
+    if (!dbg_env("IWAN_FLOWDBG"))
         return;
     c = f->ns_idx >= 0 ? ns_conn(&g_ns, f->ns_idx) : NULL;
     fprintf(stderr, "FLOWDBG: flow=%d fd=%d state=%s ns=%d conn_state=%d "
             "rxq=%zu out=%zu why=%s\n",
-            (int)(f - g_flows), f->fd,
-            f->state == ST_CLOSING ? "CLOSING" : "?",
+            (int)(f - g_flows), f->fd, flow_state_name(f->state),
             f->ns_idx, c ? (int)c->state : -1, c ? c->rxq.len : 0,
             f->output.len, why);
 }
-
-#include "util.h"
-
-#define LOCAL_WRITE_LIMIT 262144
-#define CONNECT_TIMEOUT 30000u          /* ms */
-#define TCP_RX_CHUNK     16384
-#define TCP_TX_CHUNK     8192
 
 uint64_t g_next_id = 1;
 int g_flow_len;         /* active count */
 
 /* ---- DNS result queue ---- */
 static pthread_mutex_t g_dns_mu = PTHREAD_MUTEX_INITIALIZER;
-static DnsResult g_dns_q[64];
+static DnsResult g_dns_q[DNS_RESULT_Q_LEN];
 static int g_dns_hd, g_dns_tl; /* ring */
 
 uint64_t now_mono(void) {
@@ -62,9 +66,9 @@ void dns_push(int flow_id, bool ok, uint32_t ip, uint16_t port) {
     g_dns_q[g_dns_tl].ok = ok;
     g_dns_q[g_dns_tl].ip = ip;
     g_dns_q[g_dns_tl].port = port;
-    g_dns_tl = (g_dns_tl + 1) % 64;
+    g_dns_tl = (g_dns_tl + 1) % DNS_RESULT_Q_LEN;
     if (g_dns_tl == g_dns_hd)
-        g_dns_hd = (g_dns_hd + 1) % 64; /* drop oldest */
+        g_dns_hd = (g_dns_hd + 1) % DNS_RESULT_Q_LEN; /* drop oldest */
     pthread_mutex_unlock(&g_dns_mu);
 }
 
@@ -73,10 +77,58 @@ int dns_drain(DnsResult *out, int max) {
     pthread_mutex_lock(&g_dns_mu);
     while (g_dns_hd != g_dns_tl && n < max) {
         out[n++] = g_dns_q[g_dns_hd];
-        g_dns_hd = (g_dns_hd + 1) % 64;
+        g_dns_hd = (g_dns_hd + 1) % DNS_RESULT_Q_LEN;
     }
     pthread_mutex_unlock(&g_dns_mu);
     return n;
+}
+
+/* ---- M1 tunnel DNS: queries travel inside the VPN as inner UDP/53
+ * packets; the server's kernel routes them (MASQUERADE + conntrack
+ * bring the reply back). The client never emits plaintext DNS, so the
+ * resolver address and every query stay inside the encrypted session. */
+#define DNS_FALLBACK_IP "114.114.114.114"
+#define DNS_WAIT_MAX    16
+#define DNS_POLL_MS     250u
+#define DNS_MAX_RESEND  3
+#define DNS_TIMEOUT_MS  1500u   /* registration + 6 x 250ms polls */
+
+/* one ephemeral-port allocator for both TCP flows and tunnel DNS:
+ * random start in [PORT_BASE, PORT_TOP), up to 2048 tries, collision
+ * scan against the caller's predicate. Randomness matters: a sequential
+ * ephemeral port would let an observer predict the inner 4-tuple and
+ * forge RST/ACK segments. */
+#define PORT_BASE 49152u
+#define PORT_TOP  65535u
+
+static uint16_t alloc_ephemeral(int (*in_use)(uint16_t p))
+{
+    unsigned p0 = PORT_BASE +
+                  (unsigned)(rand_u32() % (PORT_TOP - PORT_BASE));
+    for (int tries = 0; tries < 2048; tries++) {
+        uint16_t p = (uint16_t)(PORT_BASE +
+                                ((p0 - PORT_BASE + (unsigned)tries) %
+                                 (PORT_TOP - PORT_BASE + 1u)));
+        if (!in_use(p))
+            return p;
+    }
+    return 0;
+}
+
+/* TCP-flow variant: collision scan over the active flows' local ports */
+static int tcp_port_in_use(uint16_t p)
+{
+    for (int i = 0; i < MAX_FLOWS; i++) {
+        if (g_flows[i].active && g_flows[i].ns_idx >= 0 &&
+            g_flows[i].lport == p)
+            return 1;
+    }
+    return 0;
+}
+
+static uint16_t alloc_port(void)
+{
+    return alloc_ephemeral(tcp_port_in_use);
 }
 
 typedef struct {
@@ -85,10 +137,505 @@ typedef struct {
     char    *domain;
 } DnsJob;
 
+/* Process-level singletons: g_dns_server_ip4 here and g_sockfd (declared
+ * in socks.c, consumed by the tunnel-DNS workers below) are shared across
+ * all flows. That is a deliberate single-instance design — the process
+ * runs exactly one proxy, so one session socket and one resolver address
+ * suffice and avoid passing them through every flow API. If the proxy is
+ * ever instantiated more than once per process, both must be turned into
+ * explicit parameters instead of globals. */
+static char     g_dns_server_ip[16] = DNS_FALLBACK_IP;
+static uint32_t g_dns_server_ip4;    /* host-order, MSB-first */
+static uint16_t g_dns_ip_id;         /* inner IP ID (bumped under the lock) */
+static uint64_t g_dns_ignored;       /* responses dropped by validation */
+
+/* one pending DNS query: the response handler matches on the inner UDP
+ * dst port (our random source port), then validates id + question echo */
+typedef struct {
+    bool     in_use;
+    uint16_t dns_id;     /* DNS transaction id */
+    uint16_t sport;      /* inner UDP source port (dst port on the reply) */
+    uint16_t ipid;       /* inner IPv4 ID */
+    uint64_t deadline;   /* absolute final timeout (ms) */
+    int      resends;    /* retransmissions still allowed */
+    char     domain[256];
+    int      flow_id;
+    uint16_t port;       /* requested remote port, replayed by dns_push */
+} DnsWait;
+
+static DnsWait g_dns_wait[DNS_WAIT_MAX];
+static pthread_mutex_t g_dns_wait_mu = PTHREAD_MUTEX_INITIALIZER;
+
+/* tunnel-DNS variant of alloc_ephemeral: collision scan over the
+ * pending-query wait table (under its lock) */
+static int dns_sport_in_use(uint16_t p)
+{
+    int used = 0;
+    pthread_mutex_lock(&g_dns_wait_mu);
+    for (int i = 0; i < DNS_WAIT_MAX; i++) {
+        if (g_dns_wait[i].in_use && g_dns_wait[i].sport == p) {
+            used = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_dns_wait_mu);
+    return used;
+}
+
+static uint16_t dns_alloc_sport(void)
+{
+    return alloc_ephemeral(dns_sport_in_use);
+}
+
+/* 16-bit one's-complement checksum helpers (same scheme as netstack.c) */
+static uint32_t csum_buf32(uint32_t sum, const uint8_t *p, size_t n)
+{
+    while (n >= 2) {
+        sum += ((uint32_t)p[0] << 8) | p[1];
+        p += 2;
+        n -= 2;
+    }
+    if (n)
+        sum += (uint32_t)p[0] << 8;
+    return sum;
+}
+
+static uint16_t csum_fold16(uint32_t sum)
+{
+    while (sum >> 16)
+        sum = (sum & 0xffffu) + (sum >> 16);
+    return (uint16_t)~sum;
+}
+
+static uint16_t ip4_csum(const uint8_t *h, size_t n)
+{
+    return csum_fold16(csum_buf32(0, h, n));
+}
+
+/* UDP checksum over the IPv4 pseudo-header + UDP datagram */
+static uint16_t udp4_csum(uint32_t sip, uint32_t dip,
+                          const uint8_t *u, size_t n)
+{
+    uint8_t ph[8];
+    uint32_t sum;
+    ph[0] = (uint8_t)(sip >> 24); ph[1] = (uint8_t)(sip >> 16);
+    ph[2] = (uint8_t)(sip >> 8);  ph[3] = (uint8_t)sip;
+    ph[4] = (uint8_t)(dip >> 24); ph[5] = (uint8_t)(dip >> 16);
+    ph[6] = (uint8_t)(dip >> 8);  ph[7] = (uint8_t)dip;
+    sum = csum_buf32(0, ph, sizeof ph);
+    sum += 17;                  /* zero byte + IPPROTO_UDP as one BE word */
+    sum += (uint32_t)n;         /* UDP length as one BE word */
+    return csum_fold16(csum_buf32(sum, u, n));
+}
+
+/* encode `domain` as a DNS qname; returns length or -1 (invalid name) */
+static int dns_encode_qname(const char *domain, uint8_t *out, size_t outsz)
+{
+    size_t len = strlen(domain);
+    size_t i, o = 0, llen = 0, lstart = 0;
+
+    while (len > 0 && domain[len - 1] == '.')
+        len--;
+    if (len == 0 || len > 253)
+        return -1;
+    for (i = 0; i < len; i++) {
+        if (domain[i] == '.') {
+            if (llen == 0 || llen > 63)
+                return -1;
+            llen = 0;
+        } else {
+            llen++;
+        }
+    }
+    if (llen == 0 || llen > 63)
+        return -1;
+    for (i = 0; i <= len; i++) {
+        if (i == len || domain[i] == '.') {
+            size_t lab = i - lstart;
+            if (o + 1 + lab + 1 > outsz)
+                return -1;
+            if (lab > 0) {
+                out[o++] = (uint8_t)lab;
+                memcpy(out + o, domain + lstart, lab);
+                o += lab;
+            }
+            lstart = i + 1;
+        }
+    }
+    if (o + 1 > outsz)
+        return -1;
+    out[o++] = 0;
+    return (int)o;
+}
+
+/* build a DNS query payload: header + question (qname, type A, class IN) */
+static size_t dns_build_query(uint16_t id, const char *domain,
+                              uint8_t *out, size_t outsz)
+{
+    int qn;
+    if (outsz < 12 + 5)
+        return 0;
+    qn = dns_encode_qname(domain, out + 12, outsz - 12);
+    if (qn < 0)
+        return 0;
+    out[0] = (uint8_t)(id >> 8);
+    out[1] = (uint8_t)id;
+    out[2] = 0x01;               /* RD */
+    out[3] = 0x00;
+    out[4] = 0x00;               /* QDCOUNT = 1 */
+    out[5] = 0x01;
+    out[6] = out[7] = out[8] = out[9] = out[10] = out[11] = 0;
+    out[12 + qn]     = 0x00;     /* QTYPE = A */
+    out[12 + qn + 1] = 0x01;
+    out[12 + qn + 2] = 0x00;     /* QCLASS = IN */
+    out[12 + qn + 3] = 0x01;
+    return 12 + (size_t)qn + 4;
+}
+
+/* build the inner IPv4+UDP datagram (IP and UDP checksums computed).
+ * sip/dip are host-order MSB-first (same convention as netstack.c). */
+static size_t dns_build_inner(uint32_t sip, uint32_t dip, uint16_t sport,
+                              uint16_t ipid, const uint8_t *dnsq,
+                              size_t dnslen, uint8_t *out, size_t outsz)
+{
+    size_t udplen = 8 + dnslen, tot = 20 + udplen;
+    uint16_t ipc, uc;
+    uint8_t *u;
+
+    if (tot > outsz)
+        return 0;
+    memset(out, 0, 20);
+    out[0] = 0x45;               /* version 4, IHL 5 */
+    out[2] = (uint8_t)(tot >> 8);/* total length */
+    out[3] = (uint8_t)tot;
+    out[4] = (uint8_t)(ipid >> 8); /* ID */
+    out[5] = (uint8_t)ipid;
+    out[8] = 64;                 /* TTL */
+    out[9] = 17;                 /* proto UDP */
+    out[12] = (uint8_t)(sip >> 24); out[13] = (uint8_t)(sip >> 16);
+    out[14] = (uint8_t)(sip >> 8);  out[15] = (uint8_t)sip;
+    out[16] = (uint8_t)(dip >> 24); out[17] = (uint8_t)(dip >> 16);
+    out[18] = (uint8_t)(dip >> 8);  out[19] = (uint8_t)dip;
+    ipc = ip4_csum(out, 20);
+    out[10] = (uint8_t)(ipc >> 8);
+    out[11] = (uint8_t)ipc;
+
+    u = out + 20;
+    u[0] = (uint8_t)(sport >> 8);
+    u[1] = (uint8_t)sport;
+    u[2] = 0x00;
+    u[3] = 53;                   /* dst port 53 */
+    u[4] = (uint8_t)(udplen >> 8);
+    u[5] = (uint8_t)udplen;
+    u[6] = 0x00;                 /* checksum (computed over the zeroed field) */
+    u[7] = 0x00;
+    memcpy(u + 8, dnsq, dnslen);
+    uc = udp4_csum(sip, dip, u, udplen);
+    u[6] = (uint8_t)(uc >> 8);
+    u[7] = (uint8_t)uc;
+    return tot;
+}
+
+/* frame the inner packet with the 8-byte outer header + XOR payload */
+static size_t dns_wrap_outer(const uint8_t *inner, size_t inlen,
+                             uint8_t *out, size_t outsz)
+{
+    if (8 + inlen > outsz)
+        return 0;
+    memcpy(out, g_ns.outer_hdr, 8);
+    memcpy(out + 8, inner, inlen);
+    if (g_ns.outer_hdr[0] == PT_DATA_ENC)
+        xor_crypt(out + 8, inlen, g_ns.xor_key, 8);
+    return 8 + inlen;
+}
+
+/* claim a wait-table slot; all fields published under the lock */
+static int dns_register(uint16_t id, uint16_t sport, const DnsJob *j)
+{
+    for (int spin = 0; spin < 200; spin++) {  /* up to 2s for a free slot */
+        pthread_mutex_lock(&g_dns_wait_mu);
+        for (int i = 0; i < DNS_WAIT_MAX; i++) {
+            DnsWait *w = &g_dns_wait[i];
+            if (w->in_use)
+                continue;
+            memset(w, 0, sizeof *w);
+            w->dns_id = id;
+            w->sport = sport;
+            w->ipid = g_dns_ip_id++;
+            w->deadline = now_ms() + DNS_TIMEOUT_MS;
+            w->resends = DNS_MAX_RESEND;
+            w->flow_id = j->flow_id;
+            w->port = j->port;
+            snprintf(w->domain, sizeof w->domain, "%s", j->domain);
+            w->in_use = true;
+            pthread_mutex_unlock(&g_dns_wait_mu);
+            return i;
+        }
+        pthread_mutex_unlock(&g_dns_wait_mu);
+        usleep(10 * 1000);
+    }
+    return -1;
+}
+
+/* resolver configured by run_socks (server-assigned AuthResult.dns) */
+void dns_set_server(const char *ip)
+{
+    uint8_t b[4];
+    if (ip && ip[0] && s2ip4(ip, b)) {
+        snprintf(g_dns_server_ip, sizeof g_dns_server_ip, "%s", ip);
+        g_dns_server_ip4 = ip4_u32(b);
+    } else {
+        snprintf(g_dns_server_ip, sizeof g_dns_server_ip, "%s",
+                 DNS_FALLBACK_IP);
+        s2ip4(DNS_FALLBACK_IP, b);
+        g_dns_server_ip4 = ip4_u32(b);
+    }
+}
+
+/* skip a (possibly compressed) DNS name; returns new offset or -1 */
+static size_t dns_skip_name(const uint8_t *p, size_t n, size_t off)
+{
+    for (;;) {
+        uint8_t l;
+        if (off >= n)
+            return (size_t)-1;
+        l = p[off];
+        if ((l & 0xc0) == 0xc0) {
+            if (off + 2 > n)
+                return (size_t)-1;
+            return off + 2;
+        }
+        if (l & 0xc0)
+            return (size_t)-1;
+        off++;
+        if (l == 0)
+            return off;
+        if (off + l > n)
+            return (size_t)-1;
+        off += l;
+    }
+}
+
+/* receive_vpn hook: consume inner IPv4 packets that are tunnel-DNS
+ * responses. Returns true when the packet was taken (its dst port belongs
+ * to a pending query). Validation failures are ignored and counted, so
+ * spoofed/mismatched traffic can never inject an address — the entry
+ * simply times out and the flow fails with rep=4. */
+bool dns_try_handle_response(const uint8_t *pkt, size_t n)
+{
+    size_t ihl, ulen, dnslen, off;
+    uint16_t dport, an, want_id, fport;
+    int slot = -1, flow_id;
+    char want_domain[256];
+    uint8_t q[300];
+    int qn;
+    const uint8_t *udp, *dns;
+
+    if (n < 20 + 8 + 12 || pkt[9] != 17)
+        return false;
+    ihl = (size_t)(pkt[0] & 0x0f) * 4;
+    if (ihl < 20 || n < ihl + 8 + 12)
+        return false;
+    udp = pkt + ihl;
+    dport = (uint16_t)((udp[2] << 8) | udp[3]);
+    ulen = (size_t)((udp[4] << 8) | udp[5]);
+    if (ulen < 8 + 12 || ihl + ulen > n)
+        return false;
+
+    pthread_mutex_lock(&g_dns_wait_mu);
+    for (int i = 0; i < DNS_WAIT_MAX; i++) {
+        DnsWait *w = &g_dns_wait[i];
+        if (w->in_use && w->sport == dport) {
+            slot = i;
+            want_id = w->dns_id;
+            flow_id = w->flow_id;
+            fport = w->port;
+            memcpy(want_domain, w->domain, sizeof want_domain);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_dns_wait_mu);
+    if (slot < 0)
+        return false;   /* not ours: leave it for the TCP stack */
+
+    /* ---- validation (any failure: ignore + count, never inject) ---- */
+    if (udp[0] != 0 || udp[1] != 53)           /* src port must be 53 */
+        goto bad;
+    if (ip4_u32(pkt + 12) != g_dns_server_ip4) /* from our resolver */
+        goto bad;
+    if (ip4_u32(pkt + 16) != g_ns.ip)          /* addressed to our inner IP */
+        goto bad;
+    dns = udp + 8;
+    dnslen = ulen - 8;
+    if (dnslen < 12)
+        goto bad;
+    if (((dns[0] << 8) | dns[1]) != want_id)   /* transaction id */
+        goto bad;
+    {
+        uint16_t flags = (uint16_t)((dns[2] << 8) | dns[3]);
+        if (!(flags & 0x8000) || (flags & 0x000f) != 0) /* QR + rcode 0 */
+            goto bad;
+    }
+    if (dns[4] != 0 || dns[5] < 1)             /* QDCOUNT >= 1 */
+        goto bad;
+    /* question echo: the response must repeat our exact question bytes
+     * (qname + QTYPE A + QCLASS IN) — a blind injector that guesses the
+     * ID is still rejected */
+    qn = dns_encode_qname(want_domain, q, sizeof q - 4);
+    if (qn < 0)
+        goto bad;
+    q[qn] = 0x00; q[qn + 1] = 0x01;
+    q[qn + 2] = 0x00; q[qn + 3] = 0x01;
+    qn += 4;
+    if (12 + (size_t)qn > dnslen ||
+        memcmp(dns + 12, q, (size_t)qn) != 0)
+        goto bad;
+    off = 12 + (size_t)qn;
+    /* skip any extra question records (we always send exactly one) */
+    for (uint16_t qd = (uint16_t)((dns[4] << 8) | dns[5]); qd > 1; qd--) {
+        off = dns_skip_name(dns, dnslen, off);
+        if (off == (size_t)-1 || off + 4 > dnslen)
+            goto bad;
+        off += 4;
+    }
+    an = (uint16_t)((dns[6] << 8) | dns[7]);
+    for (uint16_t k = 0; k < an; k++) {
+        uint16_t typ, cls, rdlen;
+        off = dns_skip_name(dns, dnslen, off);
+        if (off == (size_t)-1)
+            goto bad;
+        if (off + 10 > dnslen)
+            goto bad;
+        typ = (uint16_t)((dns[off] << 8) | dns[off + 1]);
+        cls = (uint16_t)((dns[off + 2] << 8) | dns[off + 3]);
+        rdlen = (uint16_t)((dns[off + 8] << 8) | dns[off + 9]);
+        off += 10;
+        if (off + rdlen > dnslen)
+            goto bad;
+        if (typ == 1 && cls == 1 && rdlen == 4) {
+            uint32_t ip = ip4_u32(dns + off);
+            /* slot may have been recycled by the timed-out worker: only
+             * consume (and push) when it is still OUR transaction */
+            pthread_mutex_lock(&g_dns_wait_mu);
+            {
+                DnsWait *w = &g_dns_wait[slot];
+                if (w->in_use && w->sport == dport &&
+                    w->dns_id == want_id) {
+                    w->in_use = false;
+                    pthread_mutex_unlock(&g_dns_wait_mu);
+                    dns_push(flow_id, true, ip, fport);
+                } else {
+                    pthread_mutex_unlock(&g_dns_wait_mu);
+                }
+            }
+            return true;
+        }
+        off += rdlen;
+    }
+bad:
+    g_dns_ignored++;
+    if (debug_enabled())
+        log_debug("tunnel DNS: dropped invalid response (total %llu)",
+                  (unsigned long long)g_dns_ignored);
+    return true;   /* consumed: dst port belongs to a pending query */
+}
+
 static void *dns_worker(void *arg) {
     DnsJob *j = (DnsJob *)arg;
-    uint32_t ip = dns_query_a(j->domain);
-    dns_push(j->flow_id, ip != 0, ip, j->port);
+    uint8_t q[512];
+    uint8_t inner[20 + 8 + 512];
+    uint8_t out[8 + 20 + 8 + 512];
+    uint16_t id, sport, ipid;
+    size_t qlen, inlen, outlen;
+    uint64_t last_send;
+    int slot = -1;
+
+    if (g_sockfd < 0 || g_dns_server_ip4 == 0)
+        goto fail;
+    id = (uint16_t)rand_u32();
+    qlen = dns_build_query(id, j->domain, q, sizeof q);
+    if (qlen == 0)
+        goto fail;                       /* invalid domain */
+    sport = dns_alloc_sport();
+    if (sport == 0)
+        goto fail;
+    slot = dns_register(id, sport, j);
+    if (slot < 0)
+        goto fail;
+
+    /* registered BEFORE the first send: a reply that races the send can
+     * never be dropped as unclaimed (the handler matches the dst port) */
+    pthread_mutex_lock(&g_dns_wait_mu);
+    {
+        DnsWait *w = &g_dns_wait[slot];
+        if (!w->in_use || w->sport != sport || w->dns_id != id) {
+            pthread_mutex_unlock(&g_dns_wait_mu);
+            slot = -1;                   /* consumed before our first send */
+            goto done;
+        }
+        ipid = w->ipid;
+    }
+    pthread_mutex_unlock(&g_dns_wait_mu);
+
+    inlen = dns_build_inner(g_ns.ip, g_dns_server_ip4, sport, ipid, q,
+                            qlen, inner, sizeof inner);
+    if (inlen == 0)
+        goto fail;
+    outlen = dns_wrap_outer(inner, inlen, out, sizeof out);
+    if (outlen == 0)
+        goto fail;
+    last_send = now_ms();
+    if (send(g_sockfd, out, (int)outlen, 0) < 0 && errno != EAGAIN &&
+        errno != EWOULDBLOCK) {
+        /* hard send error (ENETUNREACH, EPERM, ...): fail fast — a
+         * retry loop cannot succeed, and the flow would only see its
+         * rep=4 after the full 1.5s deadline */
+        log_err("tunnel DNS send failed: %s", strerror(errno));
+        goto fail;
+    }
+
+    for (;;) {
+        int act = 0;             /* 0 wait, 1 resend, 2 fail, 3 done */
+        uint64_t now;
+        usleep(DNS_POLL_MS * 1000);
+        now = now_ms();
+        pthread_mutex_lock(&g_dns_wait_mu);
+        {
+            DnsWait *w = &g_dns_wait[slot];
+            /* a recycled slot (consumed + re-registered) is not ours */
+            if (!w->in_use || w->sport != sport || w->dns_id != id)
+                act = 3;         /* response already handled */
+            else if (now >= w->deadline) {
+                w->in_use = false;
+                act = 2;
+            } else if (now - last_send >= DNS_POLL_MS && w->resends > 0) {
+                w->resends--;
+                act = 1;
+            }
+        }
+        pthread_mutex_unlock(&g_dns_wait_mu);
+        if (act == 3)
+            break;
+        if (act == 2) {
+            dns_push(j->flow_id, false, 0, j->port);
+            break;
+        }
+        if (act == 1 && send(g_sockfd, out, (int)outlen, 0) >= 0)
+            last_send = now;
+        /* EAGAIN/short send: last_send stays, the next 250ms tick retries */
+    }
+    goto done;
+
+fail:
+    if (slot >= 0) {
+        pthread_mutex_lock(&g_dns_wait_mu);
+        if (g_dns_wait[slot].in_use && g_dns_wait[slot].sport == sport &&
+            g_dns_wait[slot].dns_id == id)
+            g_dns_wait[slot].in_use = false;
+        pthread_mutex_unlock(&g_dns_wait_mu);
+    }
+    dns_push(j->flow_id, false, 0, j->port);
+done:
     if (g_dns_evfd >= 0) {
         uint64_t one = 1;
         ssize_t w = write(g_dns_evfd, &one, sizeof one);   /* wake loop */
@@ -142,8 +689,13 @@ Flow *flow_alloc(struct sockaddr_in *peer) {
             break;
         }
     }
-    if (!f)
+    if (!f) {
+        /* accept_connections closes the new socket silently on NULL; make
+         * the exhausted table visible instead of dropping in silence */
+        log_err("flow table full (%d active): dropping new SOCKS5 client",
+                g_flow_len);
         return NULL;
+    }
     memset(f, 0, sizeof *f);
     f->active = 1;
     f->id = g_next_id++;
@@ -176,30 +728,7 @@ void flow_free(Flow *f) {
         log_debug("[flow %lu] closed", (unsigned long)f->id);
 }
 
-/* ---- port allocation ---- */
-#define PORT_BASE 49152u
-#define PORT_TOP  65535u
-
-static uint16_t alloc_port(void) {
-    /* random starting point per call: sequential ephemeral ports let an
-     * observer predict the inner 4-tuple and forge RST/ACK segments */
-    unsigned p0 = PORT_BASE + (unsigned)(rand_u32() % (PORT_TOP - PORT_BASE));
-    for (int tries = 0; tries < 2048; tries++) {
-        uint16_t p = (uint16_t)(PORT_BASE + ((p0 - PORT_BASE + (unsigned)tries) %
-                                             (PORT_TOP - PORT_BASE + 1u)));
-        int used = 0;
-        for (int i = 0; i < MAX_FLOWS; i++) {
-            if (g_flows[i].active && g_flows[i].ns_idx >= 0 &&
-                g_flows[i].lport == p) {
-                used = 1;
-                break;
-            }
-        }
-        if (!used)
-            return p;
-    }
-    return 0;
-}
+/* ---- port allocation (shared alloc_ephemeral above) ---- */
 
 void open_tcp_connection(Flow *f, uint32_t rip, uint16_t rport) {
     uint16_t lport = alloc_port();
@@ -225,31 +754,112 @@ void open_tcp_connection(Flow *f, uint32_t rip, uint16_t rport) {
     }
 }
 
-void process_socks_handshake(Flow *f) {
-    if (f->state == ST_GREETING) {
+/* constant-time equality: both buffers are exactly n bytes (the caller
+ * rejects length mismatches first), so the loop hides the comparison
+ * shape from timing */
+static int ct_eq(const uint8_t *a, const uint8_t *b, size_t n)
+{
+    uint8_t d = 0;
+    for (size_t i = 0; i < n; i++)
+        d |= a[i] ^ b[i];
+    return d == 0;
+}
+
+/* RFC 1929 sub-negotiation failure: reply (ver=1, status=1) and close */
+static void auth_reject(Flow *f)
+{
+    uint8_t r[2] = {1, 1};
+    queue_flow_output(f, r, 2);
+    set_flow_state(f, ST_CLOSING);
+}
+
+/* SOCKS5 greeting failure: reply (ver=5, method=0xff) and close */
+static void greet_reject(Flow *f)
+{
+    uint8_t r[2] = {5, 0xff};
+    queue_flow_output(f, r, 2);
+    set_flow_state(f, ST_CLOSING);
+}
+
+/* ST_GREETING: version/method negotiation plus the RFC1929 sub-
+ * negotiation when a token is configured; returns true when a CONNECT
+ * request may already be buffered and should be parsed this round */
+static bool handshake_greeting(Flow *f)
+{
+    if (!f->auth_pending) {
+        const char *tok = g_socks_cfg ? g_socks_cfg->auth_token : NULL;
         if (f->input.len < 2)
-            return;
+            return false;
         size_t nmethods = f->input.data[1];
         if (f->input.len < 2 + nmethods)
-            return;
-        int has0 = 0;
+            return false;
+        int want = tok ? 2 : 0;   /* RFC1929 when a token is set */
+        int has = 0;
         for (size_t i = 0; i < nmethods; i++) {
-            if (f->input.data[2 + i] == 0)
-                has0 = 1;
+            if (f->input.data[2 + i] == want)
+                has = 1;
         }
-        if (f->input.data[0] != 5 || !has0) {
-            uint8_t r[2] = {5, 0xff};
-            queue_flow_output(f, r, 2);
-            set_flow_state(f, ST_CLOSING);
-            return;
+        if (f->input.data[0] != 5 || !has) {
+            greet_reject(f);
+            return false;
         }
         buf_consume(&f->input, 2 + nmethods);
+        if (tok) {
+            uint8_t ok[2] = {5, 2};
+            queue_flow_output(f, ok, 2);
+            f->auth_pending = true;
+            return false;   /* the next round is RFC1929 */
+        }
         uint8_t ok[2] = {5, 0};
         queue_flow_output(f, ok, 2);
         set_flow_state(f, ST_REQUEST);
+        return true;
     }
 
-    if (f->state != ST_REQUEST || f->input.len < 4)
+    /* RFC1929 user/password sub-negotiation, frame
+     * [0x01, ulen, user..., plen, pass...]. Zero-length fields,
+     * declared lengths past the buffered input, or a wrong
+     * version are rejected; a frame that has not even delivered
+     * ulen yet waits for the next read. */
+    if (f->input.len < 2)
+        return false;
+    size_t ulen = f->input.data[1];
+    if (ulen == 0 || f->input.len < 2 + ulen + 1) {
+        auth_reject(f);
+        return false;
+    }
+    size_t plen = f->input.data[2 + ulen];
+    if (plen == 0 || f->input.len < 2 + ulen + 1 + plen) {
+        auth_reject(f);
+        return false;
+    }
+    if (f->input.data[0] != 1) {
+        auth_reject(f);
+        return false;
+    }
+    const char *tok = g_socks_cfg ? g_socks_cfg->auth_token : NULL;
+    size_t tlen = tok ? strlen(tok) : 0;
+    const uint8_t *pass = f->input.data + 2 + ulen + 1;
+    int ok = tok && plen == tlen &&
+             ct_eq(pass, (const uint8_t *)tok, tlen);
+    buf_consume(&f->input, 2 + ulen + 1 + plen);
+    f->auth_pending = false;
+    if (!ok) {
+        auth_reject(f);
+        return false;
+    }
+    uint8_t okr[2] = {1, 0};
+    queue_flow_output(f, okr, 2);
+    set_flow_state(f, ST_REQUEST);
+    /* a CONNECT request may already be buffered in the same write */
+    return true;
+}
+
+/* ST_REQUEST: parse the CONNECT frame (IPv4 or domain); domains go
+ * through the async tunnel-DNS path */
+static void handshake_request(Flow *f)
+{
+    if (f->input.len < 4)
         return;
     if (f->input.data[0] != 5 || f->input.data[1] != 1) {
         queue_socks_error(f, 7);
@@ -285,7 +895,6 @@ void process_socks_handshake(Flow *f) {
         uint16_t rport = (uint16_t)((f->input.data[5 + dlen] << 8) |
                                     f->input.data[6 + dlen]);
         buf_consume(&f->input, req_len);
-        f->req_port = rport;
         set_flow_state(f, ST_RESOLVING);
         spawn_dns((int)f->id, domain, rport);
         return;
@@ -296,9 +905,19 @@ void process_socks_handshake(Flow *f) {
     }
 }
 
+void process_socks_handshake(Flow *f)
+{
+    if (f->state == ST_GREETING) {
+        if (!handshake_greeting(f))
+            return;
+    }
+    if (f->state == ST_REQUEST)
+        handshake_request(f);
+}
+
 void handle_dns_results(void) {
-    DnsResult q[16];
-    int n = dns_drain(q, 16);
+    DnsResult q[DNS_DRAIN_MAX];
+    int n = dns_drain(q, DNS_DRAIN_MAX);
     for (int k = 0; k < n; k++) {
         for (int i = 0; i < MAX_FLOWS; i++) {
             Flow *f = &g_flows[i];
@@ -315,7 +934,7 @@ void handle_dns_results(void) {
                 open_tcp_connection(f, q[k].ip, q[k].port);
             } else {
                 log_err("[flow %lu] DNS failed via %s", (unsigned long)f->id,
-                        DNS_SERVER_IP);
+                        g_dns_server_ip);
                 queue_socks_error(f, 4);
             }
             break;
@@ -323,15 +942,18 @@ void handle_dns_results(void) {
     }
 }
 
-/* ms until the earliest ST_CONNECTING flow times out, INT64_MAX if none */
+/* ms until the earliest handshake/connect flow times out, INT64_MAX if none */
 int64_t next_conn_timeout_ms(void)
 {
     int64_t d = INT64_MAX;
     uint64_t now = now_ms();
     for (int i = 0; i < MAX_FLOWS; i++) {
         Flow *f = &g_flows[i];
-        if (f->active && f->state == ST_CONNECTING) {
-            int64_t dd = (int64_t)(f->state_ms + CONNECT_TIMEOUT - now);
+        if (f->active && (f->state == ST_GREETING ||
+                          f->state == ST_REQUEST ||
+                          f->state == ST_RESOLVING ||
+                          f->state == ST_CONNECTING)) {
+            int64_t dd = (int64_t)(f->state_ms + HANDSHAKE_TIMEOUT_MS - now);
             if (dd < d)
                 d = dd;
         }
@@ -342,7 +964,22 @@ int64_t next_conn_timeout_ms(void)
 void update_tcp_states(void) {
     for (int i = 0; i < MAX_FLOWS; i++) {
         Flow *f = &g_flows[i];
-        if (!f->active || f->state != ST_CONNECTING)
+        if (!f->active)
+            continue;
+        /* handshake states (greeting/request/DNS-resolve) time out exactly
+         * like ST_CONNECTING: same window, same cleanup path (error reply
+         * queued, ST_CLOSING, reaped once the output drains) */
+        if (f->state == ST_GREETING || f->state == ST_REQUEST ||
+            f->state == ST_RESOLVING) {
+            if (now_mono() - f->state_ms >= HANDSHAKE_TIMEOUT_MS) {
+                if (debug_enabled())
+                    log_debug("[flow %lu] handshake timed out",
+                              (unsigned long)f->id);
+                queue_socks_error(f, 4);
+            }
+            continue;
+        }
+        if (f->state != ST_CONNECTING)
             continue;
         TcpConn *c = ns_conn(&g_ns, f->ns_idx);
         NsState st = c ? c->state : NS_CLOSED;
@@ -362,7 +999,7 @@ void update_tcp_states(void) {
             if (debug_enabled())
                 log_debug("[flow %lu] TCP connect failed", (unsigned long)f->id);
             queue_socks_error(f, 5);
-        } else if (now_mono() - f->state_ms >= CONNECT_TIMEOUT) {
+        } else if (now_mono() - f->state_ms >= HANDSHAKE_TIMEOUT_MS) {
             if (debug_enabled())
                 log_debug("[flow %lu] TCP connect timed out",
                           (unsigned long)f->id);
@@ -423,29 +1060,20 @@ void service_local_inputs(Flow *fs) {
                 } else if (r2 == 0) {
                     /* diagnostic: why did readv return EOF while the app
                      * is still connected? dump fd state */
-                    {
-                        static int ev = -1;
-                        if (ev < 0) {
-                            const char *ve = getenv("IWAN_FLOWDBG");
-                            ev = ve && *ve && strcmp(ve, "0") != 0 &&
-                                 strcmp(ve, "false") != 0 &&
-                                 strcmp(ve, "off") != 0;
-                        }
-                        if (ev) {
-                            struct stat st;
-                            int soerr = 0;
-                            socklen_t sl = sizeof soerr;
-                            fprintf(stderr,
-                                    "FLOWDBG: readv EOF fd=%d fstat=%d "
-                                    "mode=%o soerr=", f->fd,
-                                    fstat(f->fd, &st), st.st_mode);
-                            if (getsockopt(f->fd, SOL_SOCKET, SO_ERROR,
-                                           &soerr, &sl) == 0)
-                                fprintf(stderr, "%d (%s)\n", soerr,
-                                        strerror(soerr));
-                            else
-                                fprintf(stderr, "getsockopt fail\n");
-                        }
+                    if (dbg_env("IWAN_FLOWDBG")) {
+                        struct stat st;
+                        int soerr = 0;
+                        socklen_t sl = sizeof soerr;
+                        fprintf(stderr,
+                                "FLOWDBG: readv EOF fd=%d fstat=%d "
+                                "mode=%o soerr=", f->fd,
+                                fstat(f->fd, &st), st.st_mode);
+                        if (getsockopt(f->fd, SOL_SOCKET, SO_ERROR,
+                                       &soerr, &sl) == 0)
+                            fprintf(stderr, "%d (%s)\n", soerr,
+                                    strerror(soerr));
+                        else
+                            fprintf(stderr, "getsockopt fail\n");
                     }
                     f->local_eof = true;
                     flowdbg(f, "readv EOF -> ns_close");
@@ -458,7 +1086,7 @@ void service_local_inputs(Flow *fs) {
             }
         } else {
             /* greeting/request: read into rbuf for the handshake parser */
-            uint8_t rbuf[16 * 1024];
+            uint8_t rbuf[TCP_RX_CHUNK];
             ssize_t n = read(f->fd, rbuf, sizeof rbuf);
             if (n == 0) {
                 /* client gone before the handshake finished: close the
@@ -468,12 +1096,22 @@ void service_local_inputs(Flow *fs) {
                 set_flow_state(f, ST_CLOSING);
             } else if (n > 0) {
                 buf_put(&f->input, rbuf, (size_t)n);
-            } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                f->local_eof = true;
-                if (f->ns_idx >= 0) {
-                    ns_abort(&g_ns, f->ns_idx);
+                if (f->input.len > 64 * 1024) {
+                    /* handshake-phase unbounded-input guard: a local
+                     * process flooding data would grow input forever;
+                     * reap_flows closes the fd and reclaims the slot */
+                    f->local_eof = true;
                     set_flow_state(f, ST_CLOSING);
                 }
+            } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                /* hard read error during the handshake: the flow has no
+                 * netstack conn, so close it unconditionally — leaving
+                 * ST_GREETING would hold the fd/slot until the 30s
+                 * timeout while poll busy-spins on the dead fd */
+                f->local_eof = true;
+                if (f->ns_idx >= 0)
+                    ns_abort(&g_ns, f->ns_idx);
+                set_flow_state(f, ST_CLOSING);
             }
             /* run the parser whenever bytes are buffered, not only after
              * a fresh read: a client that sends greeting+CONNECT in one
@@ -549,7 +1187,12 @@ void reap_flows(void) {
         int removable;
         if (f->ns_idx >= 0) {
             TcpConn *c = ns_conn(&g_ns, f->ns_idx);
-            removable = c && c->state == NS_CLOSED && f->output.len == 0;
+            /* the netstack rxq is the flow's receive buffer: a flow must
+             * not be freed while it still holds undelivered data — the
+             * close(fd) would reset the client socket (RST on unread
+             * data) and the rxq payload would be lost */
+            removable = c && c->state == NS_CLOSED && c->rxq.len == 0 &&
+                        f->output.len == 0;
         } else {
             removable = f->state == ST_CLOSING && f->output.len == 0;
         }

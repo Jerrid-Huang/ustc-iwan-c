@@ -14,9 +14,10 @@ typedef struct {
     uint16_t mtu;
 } AuthResult;
 
-/* build OPEN packet (appends to out). */
-void build_open(buf_t *out, const char *user, const uint8_t ct[16],
-                uint16_t mtu, uint8_t enc, uint32_t nonce);
+/* build OPEN packet (appends to out). Returns 0 on success, -1 when the
+ * username exceeds 255 bytes (it would corrupt the TLV framing). */
+int build_open(buf_t *out, const char *user, const uint8_t ct[16],
+               uint16_t mtu, uint8_t enc, uint32_t nonce);
 
 /* parse OPEN_ACK. On success fills r and returns true; errmsg (if set) on failure. */
 bool parse_ack(const uint8_t *buf, size_t len, uint32_t expect_nonce,
@@ -25,9 +26,11 @@ bool parse_ack(const uint8_t *buf, size_t len, uint32_t expect_nonce,
 /* connected IPv4 UDP socket with recv timeout. Returns fd or -1. */
 int udp_connect(const char *host, uint16_t port, int timeout_ms);
 
-/* derive the 16-byte encrypted password (uses ct_pass_hex if given). */
-void get_ct(const char *user, const char *pass, const char *ct_pass_hex,
-            uint8_t out[16]);
+/* derive the 16-byte encrypted password (uses ct_pass_hex if given).
+ * Returns 0 on success, -1 when ct_pass_hex is malformed (not exactly
+ * 32 hex digits after an optional 0x prefix). */
+int get_ct(const char *user, const char *pass, const char *ct_pass_hex,
+           uint8_t out[16]);
 
 /* full OPEN/ACK handshake with retries. Returns fd (>=0) and fills r, or -1. */
 enum do_auth_style {

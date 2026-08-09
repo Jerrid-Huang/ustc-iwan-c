@@ -15,6 +15,7 @@
 
 #include "common.h"
 #include "crypto.h"
+#include "ipv4.h"
 #include "protocol.h"
 #include "proxy.h"
 #include "route.h"
@@ -43,13 +44,25 @@ static void eprintf(const char *fmt, ...) {
     va_end(ap);
 }
 
-static int send_ctrl(int sockfd, uint8_t typ, uint8_t enc, uint16_t sid,
+/* send one control frame on the shared socket. Must hold send_lock and
+ * clear any lingering UDP_SEGMENT first: with GSO active and an mss
+ * smaller than the frame, the kernel would split the 24-byte control
+ * packet into several datagrams and the server would drop the corrupt
+ * frame (same hazard send_batch documents for the per-message path). */
+static int send_ctrl(pump_ctx_t *ctx, uint8_t typ, uint8_t enc, uint16_t sid,
                      uint32_t tok) {
     buf_t pkt;
     buf_init(&pkt);
     ctrl_hdr(&pkt, typ, enc, sid, tok);
     size_t want = pkt.len;
-    ssize_t r = send(sockfd, pkt.data, want, 0);
+    pthread_mutex_lock(&ctx->send_lock);
+    if (ctx->gso_mss != 0) {
+        int z = 0;
+        setsockopt(ctx->sockfd, SOL_UDP, UDP_SEGMENT, &z, sizeof z);
+        ctx->gso_mss = 0;
+    }
+    ssize_t r = send(ctx->sockfd, pkt.data, want, 0);
+    pthread_mutex_unlock(&ctx->send_lock);
     buf_free(&pkt);
     if (r < 0 || (size_t)r != want)
         return -1;
@@ -58,6 +71,21 @@ static int send_ctrl(int sockfd, uint8_t typ, uint8_t enc, uint16_t sid,
 
 #define PUMP_BATCH 32
 #define PUMP_SLOT  2048
+#define PUMP_KEEPALIVE_MS 10000u
+#define PUMP_POLL_CEIL_MS 1000  /* cap on the recvmmsg park timeout */
+#define RX_BATCH 64             /* recvmmsg batch size (iov/msgs arrays) */
+#define PUMP_SEND_RETRY_MS  5    /* EAGAIN/ENOBUFS retry budget per flush:
+                                  * beyond it, yield to the receive path */
+
+/* aggregate send-rate pacing (token bucket) — same rationale as
+ * socks.c: the server's single-threaded drain (~360k pps) silently
+ * drops (UdpRcvbufErrors) anything burst past it, and the inner TCP
+ * collapses into an RTO storm. The kernel TCP on the client side
+ * self-paces via slow-start; keep the pump under the ceiling anyway. */
+#define IWAN_SEND_PACING_PPS 300000u
+
+static uint64_t g_pace_us;
+static uint64_t g_pace_last;
 
 /* flush a TX batch after this much time instead of always waiting for it
  * to fill: bounds the added latency under sustained load (batch fill) */
@@ -72,12 +100,35 @@ static uint64_t now_us(void)
     return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
 }
 
+static void pace_send(int npk)
+{
+    uint64_t now = now_us();
+    uint64_t budget;
+    if (!g_pace_last)
+        g_pace_last = now;
+    budget = g_pace_us +
+             (now - g_pace_last) * IWAN_SEND_PACING_PPS / 1000000u;
+    if (budget > IWAN_SEND_PACING_PPS / 10u)
+        budget = IWAN_SEND_PACING_PPS / 10u;
+    g_pace_last = now;
+    if ((uint64_t)npk > budget) {
+        uint64_t need = ((uint64_t)npk - budget) * 1000000u /
+                        IWAN_SEND_PACING_PPS;
+        g_pace_us = 0;
+        if (need > 0)
+            usleep(need);
+    } else {
+        g_pace_us = budget - (uint64_t)npk;
+    }
+}
+
 /* send a packet batch; retry partial sends and EAGAIN instead of dropping.
  * A full socket buffer backpressures the TUN read loop (kernel TCP then
  * throttles the app); only fatal errors stop the pump. */
 static void send_batch(pump_ctx_t *ctx, struct mmsghdr *msgs, unsigned n)
 {
     unsigned sent = 0;
+    uint64_t retry_t0 = now_ms();
 
     /* a lingering UDP_SEGMENT value would silently split any datagram
      * longer than the mss, so disable it before the per-message path */
@@ -104,6 +155,11 @@ static void send_batch(pump_ctx_t *ctx, struct mmsghdr *msgs, unsigned n)
              * briefly instead of busy-spinning */
             if (pr > 0 && (pfd.revents & POLLOUT))
                 usleep(1000);
+            /* bounded: an unbounded retry here wedges the pump — the
+             * receive thread (udp2tun) keeps draining the socket so the
+             * backpressure actually clears once we stop hammering it */
+            if (now_ms() - retry_t0 >= PUMP_SEND_RETRY_MS)
+                return;
             continue;
         }
         eprintf("[TUN->UDP] sendmmsg: %s\n", strerror(errno));
@@ -121,6 +177,7 @@ static int send_gso(pump_ctx_t *ctx, struct iovec *iov, unsigned n,
                     size_t mss)
 {
     size_t total = 0;
+    uint64_t retry_t0 = now_ms();
     for (unsigned i = 0; i < n; i++)
         total += iov[i].iov_len;
 
@@ -175,6 +232,8 @@ static int send_gso(pump_ctx_t *ctx, struct iovec *iov, unsigned n,
             int pr = poll(&pfd, 1, 100);
             if (pr > 0 && (pfd.revents & POLLOUT))
                 usleep(1000);
+            if (now_ms() - retry_t0 >= PUMP_SEND_RETRY_MS)
+                return 1;   /* bounded: let the receive path drain */
             continue;
         }
         eprintf("[TUN->UDP] sendmsg: %s\n", strerror(errno));
@@ -226,8 +285,11 @@ static void pump_flush(pump_ctx_t *ctx, pump_tx_t *q)
             }
         }
         /* a GSO unit's total length must fit the 16-bit UDP length
-         * field; oversized (jumbo) batches fall back to sendmmsg */
-        use_gso = uniform && l0 >= 8 && (size_t)n * l0 <= 65507;
+         * field AND stay under the loopback-safe ceiling (software GSO
+         * drops larger units on some kernels); oversized (jumbo) batches
+         * fall back to sendmmsg */
+        use_gso = uniform && (size_t)n * l0 <= IWAN_UDP_GSO_UNIT &&
+                  (size_t)n * l0 <= IWAN_GSO_UNIT_SAFE;
     }
     pthread_mutex_lock(&ctx->send_lock);
     if (use_gso && send_gso(ctx, q->iov, n, q->iov[0].iov_len) == 0)
@@ -235,6 +297,7 @@ static void pump_flush(pump_ctx_t *ctx, pump_tx_t *q)
     if (!use_gso)
         send_batch(ctx, q->msgs, n);
     pthread_mutex_unlock(&ctx->send_lock);
+    pace_send((int)n);   /* aggregate send-rate pacing (see above) */
 }
 
 /* tun_pool callback: one thread-local batch per reader thread */
@@ -247,6 +310,16 @@ static void pump_tun_pkt(void *ud, const uint8_t *pkt, size_t len, bool last)
         /* queue drained: send the partial batch instead of holding it */
         if (q->n > 0)
             pump_flush(ctx, q);
+        return;
+    }
+    /* slot size 8+PUMP_SLOT is a hard boundary: a zero-length or
+     * oversized inner packet must never be copied into the batch
+     * buffer, or it would clobber the adjacent slot (heap overflow).
+     * The pool's last=true flush signal carries len==0, so this check
+     * lives after the drain path above. */
+    if (len == 0 || len > PUMP_SLOT) {
+        log_debug("pump: drop packet, len %zu out of [1, %d]", len,
+                  PUMP_SLOT);
         return;
     }
     if (q->n == 0) {
@@ -262,7 +335,8 @@ static void pump_tun_pkt(void *ud, const uint8_t *pkt, size_t len, bool last)
                 return;
             }
             memset(q->msgs, 0, sizeof q->msgs);
-            pkhdr(PT_DATA_ENC, ctx->enc, ctx->sid, ctx->tok, q->hdr);
+            pkt_hdr(ctx->enc ? PT_DATA_ENC : PT_DATA, ctx->enc, ctx->sid,
+                    ctx->tok, q->hdr);
         }
         q->t0 = now_us();   /* first packet of this batch */
     }
@@ -293,15 +367,18 @@ static void *udp2tun_thread(void *ud) {
      * kernel checks it only after the first datagram and it never bounds
      * the first-message wait (documented bug). */
     const size_t slot = 8 + PUMP_SLOT;
-    const int rxbatch = 64;
+    const int rxbatch = RX_BATCH;
     uint8_t *batch = malloc((size_t)rxbatch * slot);
-    struct iovec iov[64];
-    struct mmsghdr msgs[64];
-    uint64_t last_ka = now_ms() > 10000 ? now_ms() - 10000 : 0;
+    struct iovec iov[RX_BATCH];
+    struct mmsghdr msgs[RX_BATCH];
+    uint64_t last_ka = now_ms() > PUMP_KEEPALIVE_MS
+                           ? now_ms() - PUMP_KEEPALIVE_MS
+                           : 0;
     int i;
 
     if (!batch) {
         log_err("out of memory");
+        g_stop = 1;   /* the downlink thread is dead: stop the pump */
         return NULL;
     }
     memset(msgs, 0, sizeof msgs);   /* msg_name/msg_control must be NULL */
@@ -313,10 +390,11 @@ static void *udp2tun_thread(void *ud) {
     }
     while (!g_stop) {
         uint64_t now = now_ms();
-        if (now >= last_ka + 10000) {
-            if (send_ctrl(ctx->sockfd, PT_ECHO_REQ, ctx->enc, ctx->sid,
+        if (now >= last_ka + PUMP_KEEPALIVE_MS) {
+            if (send_ctrl(ctx, PT_ECHO_REQ, ctx->enc, ctx->sid,
                           ctx->tok) != 0) {
                 eprintf("[UDP->TUN] keepalive send err\n");
+                g_stop = 1;   /* any pump-fatal error stops the tunnel */
                 break;
             }
             last_ka = now_ms();
@@ -326,15 +404,16 @@ static void *udp2tun_thread(void *ud) {
         if (v < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 /* park until data arrives or the next keepalive is due */
-                uint64_t ka_ms = last_ka + 10000;
+                uint64_t ka_ms = last_ka + PUMP_KEEPALIVE_MS;
                 uint64_t now_msv = now_ms();
                 int to = ka_ms > now_msv ? (int)(ka_ms - now_msv) : 1;
-                if (to > 1000)
-                    to = 1000;
+                if (to > PUMP_POLL_CEIL_MS)
+                    to = PUMP_POLL_CEIL_MS;
                 struct pollfd pfd = { .fd = ctx->sockfd, .events = POLLIN };
                 int pr = poll(&pfd, 1, to);
                 if (pr < 0 && errno != EINTR) {
                     eprintf("[UDP->TUN] poll err\n");
+                    g_stop = 1;   /* any pump-fatal error stops the tunnel */
                     break;
                 }
                 continue;
@@ -342,6 +421,7 @@ static void *udp2tun_thread(void *ud) {
             if (errno == EINTR)
                 continue;
             eprintf("[UDP->TUN] recv err\n");
+            g_stop = 1;   /* any pump-fatal error stops the tunnel */
             break;
         }
         for (i = 0; i < v; i++) {
@@ -369,7 +449,7 @@ static void *udp2tun_thread(void *ud) {
             if (t == PT_ECHO_REQ) {
                 if (!verify_sig(m, (size_t)n))
                     continue;
-                if (send_ctrl(ctx->sockfd, PT_ECHO_RES, ctx->enc, ctx->sid,
+                if (send_ctrl(ctx, PT_ECHO_RES, ctx->enc, ctx->sid,
                               ctx->tok) != 0) {
                     eprintf("[UDP->TUN] keepalive response err\n");
                     g_stop = 1;
@@ -385,6 +465,15 @@ static void *udp2tun_thread(void *ud) {
             }
             if (t == PT_DATA_ENC)
                 xor_crypt(m + 8, (size_t)(n - 8), ctx->xor_key, 8);
+            /* validate the inner IPv4 packet before injecting it into the
+             * TUN device (same gate as the SOCKS path): a malformed frame
+             * must not reach the kernel stack */
+            uint32_t saddr, daddr;
+            if (ipv4_pkt_ok(m + 8, (size_t)(n - 8), &saddr, &daddr) != 0) {
+                log_debug("drop inner packet: bad IPv4 header (%zu bytes)",
+                          (size_t)(n - 8));
+                continue;
+            }
             /* write with unbounded EAGAIN retry: silent loss here costs
              * inner TCP retransmits */
             if (tun_write_retry(ctx->tun_fd, m + 8, (size_t)(n - 8), 0,
@@ -446,7 +535,19 @@ static int expand_route_targets(const slist_t *targets, slist_t *out) {
             free(t);
             continue;
         }
-        if (strcmp(p, "default") == 0 || strchr(p, '/') != NULL) {
+        if (strcmp(p, "default") == 0) {
+            push_unique(out, p);
+        } else if (strchr(p, '/') != NULL) {
+            /* --proxy-cidr entries must be well-formed A.B.C.D/n; a bad
+             * prefix used to reach `ip route` verbatim and fail silently,
+             * so reject it here instead */
+            uint32_t net;
+            int prefix;
+            if (cidr_parse(p, &net, &prefix) != 0) {
+                log_err("invalid CIDR route target '%s'", p);
+                free(t);
+                return -1;
+            }
             push_unique(out, p);
         } else {
             struct in_addr a4;
@@ -498,10 +599,7 @@ static void teardown_routes(const char *tun, const char *srv, const char *ogw,
     if (had_routes) {
         route_teardown(tun, srv, ogw, odev, routes);
     } else {
-        char *f1[] = { "addr", "flush", "dev", (char *)tun, NULL };
-        char *f2[] = { "link", "set", (char *)tun, "down", NULL };
-        ip_run(f1);
-        ip_run(f2);
+        route_iface_down(tun);
     }
 }
 
@@ -509,12 +607,7 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
              const uint8_t xor_key[8], uint16_t sid, uint32_t tok, uint8_t enc,
              const char *server, const slist_t *route_targets,
              const char *auth_tun_ip, uint16_t auth_mtu) {
-    char ogw[16], odev[16];
-    if (!capture_default(ogw, odev)) {
-        log_err("cannot detect default route");
-        return -1;
-    }
-    log_debug("default route: via %s dev %s", ogw, odev);
+    char ogw[16] = "", odev[16] = "";
 
     slist_t routes;
     slist_init(&routes);
@@ -525,33 +618,36 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
 
     bool had_routes = routes.n > 0;
     if (had_routes) {
-        route_setup(tun_name, auth_tun_ip, auth_mtu, server, ogw, odev,
-                    &routes);
+        /* the default route is only needed when the tunnel hijacks it;
+         * a pure-TUN run (no route targets) must not require one */
+        if (!capture_default(ogw, odev)) {
+            log_err("cannot detect default route");
+            slist_free(&routes);
+            return -1;
+        }
+        log_debug("default route: via %s dev %s", ogw, odev);
+        if (!route_setup(tun_name, auth_tun_ip, auth_mtu, server, ogw, odev,
+                         &routes)) {
+            /* route_setup already rolled back and logged; a half-configured
+             * tunnel must not start pumping */
+            slist_free(&routes);
+            return -1;
+        }
         log_info("tun %s ready: %zu route%s", tun_name, routes.n,
                  routes.n == 1 ? "" : "s");
         for (size_t i = 0; i < routes.n; i++)
             log_debug("route %s -> dev %s", routes.v[i], tun_name);
     } else {
-        char mtu_s[8], ip24[64];
-        snprintf(mtu_s, sizeof mtu_s, "%u", (unsigned)auth_mtu);
-        snprintf(ip24, sizeof ip24, "%s/24", auth_tun_ip);
-        char *f1[] = { "addr", "flush", "dev", (char *)tun_name, NULL };
-        char *f2[] = { "link", "set", (char *)tun_name, "up", NULL };
-        char *f3[] = { "link", "set", "dev", (char *)tun_name, "mtu", mtu_s,
-                       NULL };
-        char *f4[] = { "addr", "add", ip24, "dev", (char *)tun_name, NULL };
-        ip_run(f1);
-        ip_run(f2);
-        ip_run(f3);
-        ip_run(f4);
+        if (!route_iface_up(tun_name, auth_tun_ip, auth_mtu)) {
+            /* address/MTU assignment failed: undo the partial bring-up
+             * instead of claiming the tunnel is up */
+            route_iface_down(tun_name);
+            slist_free(&routes);
+            return -1;
+        }
         log_info("tun %s up with IP %s/24 (no route hijack)", tun_name,
                  auth_tun_ip);
     }
-
-    struct timeval tv;
-    tv.tv_sec = 0;
-    tv.tv_usec = 300000;
-    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
 
     g_stop = 0;
     install_signals();
@@ -618,7 +714,7 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
 
     teardown_routes(tun_name, server, ogw, odev, &routes, had_routes);
 
-    send_ctrl(sockfd, PT_CLOSE, enc, sid, tok);
+    send_ctrl(&ctx, PT_CLOSE, enc, sid, tok);
     if (debug_enabled())
         eprintf("CLOSE sent\n");
 

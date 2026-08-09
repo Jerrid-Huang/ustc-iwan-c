@@ -7,36 +7,54 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    concurrency:
+      group: build-${{ github.ref }}
+      cancel-in-progress: true
     strategy:
       fail-fast: false
       matrix:
         cc: [gcc, clang]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
 
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libssl-dev
+          sudo apt-get install -y clang libssl-dev
 
       - name: Build (${{ matrix.cc }})
         run: |
-          make -B CC=${{ matrix.cc }}
-          if make -B CC=${{ matrix.cc }} 2>&1 | grep -E "error|warning"; then
+          set -o pipefail
+          make -B CC=${{ matrix.cc }} 2>&1 | tee build-${{ matrix.cc }}.log
+          if grep -Ei 'error|warning' build-${{ matrix.cc }}.log; then
             echo "::error::build emitted errors or warnings"
             exit 1
           fi
+
+      - name: Incremental parallel build smoke
+        run: |
+          make clean
+          make -j$(nproc) CC=${{ matrix.cc }}
 
       - name: Smoke test
         run: |
           ./bin/iwan-client --help >/dev/null
           ./bin/iwan-client-oidc --help >/dev/null
+          ./bin/iwan-server --help >/dev/null
+
+      - name: Checksums
+        run: sha256sum bin/iwan-client bin/iwan-client-oidc bin/iwan-server > SHASUMS.txt
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: iwan-${{ matrix.cc }}
           path: |
             bin/iwan-client
             bin/iwan-client-oidc
+            bin/iwan-server
+            build-${{ matrix.cc }}.log
+            SHASUMS.txt
           if-no-files-found: error

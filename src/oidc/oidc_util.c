@@ -56,15 +56,11 @@ void oidc_check_server_ip(const char *server)
     if (ip[0] == '[') {
         ip = unbracket_ipv6(server, buf, sizeof buf);
     } else if (strchr(ip, ':') != NULL) {
-        fprintf(stderr,
-                "Error: invalid address\n\nCaused by:\n    invalid socket address syntax\n");
-        exit(1);
+        oidc_die_with_cause("invalid address", "invalid socket address syntax");
     }
     if (inet_pton(AF_INET, ip, &a4) != 1 &&
         inet_pton(AF_INET6, ip, &a6) != 1) {
-        fprintf(stderr,
-                "Error: invalid address\n\nCaused by:\n    invalid socket address syntax\n");
-        exit(1);
+        oidc_die_with_cause("invalid address", "invalid socket address syntax");
     }
 }
 
@@ -149,22 +145,21 @@ void oidc_esc_put(buf_t *b, const char *s)
     free(e);
 }
 
-/* pull "code=..." out of an OAuth redirect URL/query string */
-char *oidc_extract_code(const char *s)
+/* pull a named query parameter out of a URL/query string; returns a
+ * newly allocated URL-decoded value or NULL when absent */
+const char *oidc_url_param(const char *s, const char *name)
 {
     const char *q = strchr(s, '?');
     if (!q)
         return NULL;
+    size_t nlen = strlen(name);
     const char *p = q + 1;
     while (*p) {
         const char *amp = strchr(p, '&');
         size_t seg = amp ? (size_t)(amp - p) : strlen(p);
         const char *kv = memchr(p, '=', seg);
-        if (kv) {
-            size_t kl = (size_t)(kv - p);
-            if (kl == 4 && strncmp(p, "code", 4) == 0)
-                return oidc_urldec(kv + 1, seg - kl - 1);
-        }
+        if (kv && (size_t)(kv - p) == nlen && strncmp(p, name, nlen) == 0)
+            return oidc_urldec(kv + 1, seg - nlen - 1);
         if (!amp)
             break;
         p = amp + 1;
@@ -172,41 +167,35 @@ char *oidc_extract_code(const char *s)
     return NULL;
 }
 
+/* pull "code=..." out of an OAuth redirect URL/query string */
+char *oidc_extract_code(const char *s)
+{
+    return (char *)oidc_url_param(s, "code");
+}
+
 /* decode the "name"/"preferred_username"/"sub" claim from the id_token JWT */
 char *oidc_id_token_username(Json *tok)
 {
     const char *jwt = json_get_str(tok, "id_token");
+    char *txt, *out;
+    Json *claims;
+    const char *nm;
+
     if (!jwt)
         return NULL;
-    const char *d1 = strchr(jwt, '.');
-    if (!d1)
+    txt = oidc_jwt_segment(jwt, 1);
+    if (!txt)
         return NULL;
-    const char *d2 = strchr(d1 + 1, '.');
-    if (!d2 || d2 == d1 + 1)
-        return NULL;
-    size_t seglen = (size_t)(d2 - d1 - 1);
-    char *seg = malloc(seglen + 1);
-    memcpy(seg, d1 + 1, seglen);
-    seg[seglen] = '\0';
-    size_t plen = 0;
-    uint8_t *raw = b64url_decode(seg, &plen);
-    free(seg);
-    if (!raw)
-        return NULL;
-    char *txt = malloc(plen + 1);
-    memcpy(txt, raw, plen);
-    txt[plen] = '\0';
-    free(raw);
-    Json *claims = json_parse(txt);
+    claims = json_parse(txt);
     free(txt);
     if (!claims)
         return NULL;
-    const char *nm = json_get_str(claims, "name");
+    nm = json_get_str(claims, "name");
     if (!nm)
         nm = json_get_str(claims, "preferred_username");
     if (!nm)
         nm = json_get_str(claims, "sub");
-    char *out = nm ? xstrdup(nm) : NULL;
+    out = nm ? xstrdup(nm) : NULL;
     json_free(claims);
     return out;
 }

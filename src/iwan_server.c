@@ -2,12 +2,16 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <grp.h>
+#include <pwd.h>
+#include <strings.h>
 #include <sys/ioctl.h>
 #include <linux/if_tun.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,6 +30,17 @@
 #include "util.h"
 
 static volatile sig_atomic_t g_stop;
+static pid_t g_child_pid = -1; /* root parent: the forked server process */
+
+/* root parent: forward termination signals to the child. The child owns
+ * the graceful shutdown (and the cleanup after it); forwarding makes
+ * kill <parent-pid>, SIGHUP from a dropped SSH session and systemd
+ * KillMode=process all stop the server instead of being swallowed. */
+static void parent_fwd_signal(int sig)
+{
+    if (g_child_pid > 0)
+        kill(g_child_pid, sig);
+}
 
 struct opts {
     uint16_t port;
@@ -36,6 +51,7 @@ struct opts {
     char dns[16];
     char users[256];
     char nat_if[64];
+    char user[64];   /* drop root privileges to this account (A1) */
     bool no_tun;
 };
 
@@ -48,6 +64,7 @@ static const struct option long_opts[] = {
     { "users",     required_argument, NULL, 'u' },
     { "nat-if",    required_argument, NULL, 'n' },
     { "no-tun",    no_argument,       NULL, 'T' },
+    { "user",      required_argument, NULL, 'U' },
     { "help",      no_argument,       NULL, 'h' },
     { NULL, 0, NULL, 0 },
 };
@@ -58,18 +75,32 @@ static void on_signal(int sig)
     g_stop = 1;
 }
 
-static void usage(const char *prog)
+static void usage(const char *prog, FILE *out)
 {
-    printf("usage: %s [options]\n", prog);
-    printf("  -p, --port <P>         UDP port to listen on (default 6001)\n");
-    printf("  -t, --tun <NAME>       TUN device name (default iwan-srv)\n");
-    printf("  -s, --server-ip <IP>   server/gateway IP on the TUN (default 198.18.0.1)\n");
-    printf("  -S, --subnet <IP/MASK> client subnet, mask 8-30 (default 198.18.0.0/16)\n");
-    printf("  -d, --dns <IP>         DNS server advertised to clients (default 114.114.114.114)\n");
-    printf("  -u, --users <FILE>     users file, one user:pass per line (default /etc/iwan/users.txt)\n");
-    printf("  -n, --nat-if <IF>      outbound interface for MASQUERADE (default eth0)\n");
-    printf("      --no-tun           (testing) skip TUN device\n");
-    printf("  -h, --help             show this help\n");
+    fprintf(out, "usage: %s [options]\n", prog);
+    fprintf(out, "  -p, --port <P>         UDP port to listen on (default 6001)\n");
+    fprintf(out, "  -t, --tun <NAME>       TUN device name (default iwan-srv)\n");
+    fprintf(out, "  -s, --server-ip <IP>   server/gateway IP on the TUN (default 198.18.0.1)\n");
+    fprintf(out, "  -S, --subnet <IP/MASK> client subnet, mask 8-30 (default 198.18.0.0/16)\n");
+    fprintf(out, "  -d, --dns <IP>         DNS server advertised to clients (default 114.114.114.114)\n");
+    fprintf(out, "  -u, --users <FILE>     users file, one user:pass per line (default /etc/iwan/users.txt)\n");
+    fprintf(out, "  -n, --nat-if <IF>      outbound interface for MASQUERADE (default eth0)\n");
+    fprintf(out, "      --no-tun           (testing) skip TUN device\n");
+    fprintf(out, "      --user <NAME>      drop root privileges to this user after setup (default nobody)\n");
+    fprintf(out, "  -h, --help             show this help\n");
+}
+
+/* exit-code convention (matches iwan-client): usage errors exit 2 with
+ * the usage text on stderr; runtime errors exit 1 */
+static void usage_error(const char *prog, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+    usage(prog, stderr);
+    exit(2);
 }
 
 static void parse_opts(int argc, char **argv, struct opts *o)
@@ -79,17 +110,14 @@ static void parse_opts(int argc, char **argv, struct opts *o)
     while ((c = getopt_long(argc, argv, "p:t:s:S:d:u:n:Th", long_opts, NULL)) != -1) {
         switch (c) {
         case 'p':
-            if (str_to_u16(optarg, &o->port) != 0) {
-                fprintf(stderr, "error: invalid port '%s'\n", optarg);
-                exit(1);
-            }
+            if (str_to_u16(optarg, &o->port) != 0)
+                usage_error(argv[0], "error: invalid port '%s'", optarg);
             break;
         case 't':
-            if (strlen(optarg) >= IFNAMSIZ) {
-                fprintf(stderr, "error: tun device name too long (max %d)\n",
-                        IFNAMSIZ - 1);
-                exit(1);
-            }
+            if (strlen(optarg) >= IFNAMSIZ)
+                usage_error(argv[0],
+                            "error: tun device name too long (max %d)",
+                            IFNAMSIZ - 1);
             snprintf(o->tun, sizeof o->tun, "%s", optarg);
             break;
         case 's':
@@ -110,19 +138,18 @@ static void parse_opts(int argc, char **argv, struct opts *o)
         case 'T':
             o->no_tun = true;
             break;
+        case 'U':
+            snprintf(o->user, sizeof o->user, "%s", optarg);
+            break;
         case 'h':
-            usage(argv[0]);
+            usage(argv[0], stdout);
             exit(0);
         default:
-            usage(argv[0]);
-            exit(1);
+            usage_error(argv[0], "error: unknown option");
         }
     }
-    if (optind < argc) {
-        fprintf(stderr, "error: unexpected argument '%s'\n", argv[optind]);
-        usage(argv[0]);
-        exit(1);
-    }
+    if (optind < argc)
+        usage_error(argv[0], "error: unexpected argument '%s'", argv[optind]);
 }
 
 /* trim spaces/tabs/CR/LF at both ends, in place. */
@@ -245,14 +272,31 @@ static int load_users(const char *path, struct server_user *users, int max)
                     "the rest are ignored\n", max);
     }
     fclose(f);
+    memset(line, 0, sizeof line); /* scrub raw lines (passwords) from the stack */
     return n;
 }
 
+/* host state saved for exit cleanup (C3): original ip_forward value and
+ * the MASQUERADE rule this instance actually added, so shutdown can undo
+ * exactly what we changed. */
+static int saved_ip_forward = -1; /* -1: not captured */
+static char nat_subnet_saved[64];
+static char nat_if_saved[64];
+static bool nat_rule_added;
+
 static void enable_ip_forward(void)
 {
-    FILE *f = fopen("/proc/sys/net/ipv4/ip_forward", "w");
+    FILE *f = fopen("/proc/sys/net/ipv4/ip_forward", "r");
     bool ok;
 
+    /* capture the original value before overwriting, so exit cleanup can
+     * restore it (C3) */
+    if (f) {
+        if (fscanf(f, "%d", &saved_ip_forward) != 1)
+            saved_ip_forward = -1;
+        fclose(f);
+    }
+    f = fopen("/proc/sys/net/ipv4/ip_forward", "w");
     if (!f) {
         fprintf(stderr, "warning: cannot enable ip_forward: %s\n", strerror(errno));
         return;
@@ -293,11 +337,50 @@ static void setup_nat(const char *subnet, const char *nat_if)
 
     /* -C first: rule already present -> nothing to do */
     if (run_cmd(chk) != 0) {
-        if (run_cmd(add) == 0)
+        if (run_cmd(add) == 0) {
+            /* remember what we added so exit cleanup can remove exactly
+             * this rule (C3); a rule that was already present is not ours
+             * to remove */
+            snprintf(nat_subnet_saved, sizeof nat_subnet_saved, "%s", subnet);
+            snprintf(nat_if_saved, sizeof nat_if_saved, "%s", nat_if);
+            nat_rule_added = true;
             printf("iptables: MASQUERADE %s -> %s\n", subnet, nat_if);
-        else
+        } else {
             fprintf(stderr,
                     "warning: iptables MASQUERADE failed (need root and iptables?)\n");
+        }
+    }
+}
+
+/* Best-effort exit cleanup: restore ip_forward and drop the MASQUERADE rule
+ * we added.  Failures are logged, never fatal.  A resident daemon that is
+ * restarted is unaffected: setup_nat()'s -C guard skips re-adding a rule
+ * that is still present, so this only ever removes what we added. */
+static void server_cleanup_nat(void)
+{
+    if (saved_ip_forward >= 0) {
+        FILE *f = fopen("/proc/sys/net/ipv4/ip_forward", "w");
+        bool ok;
+
+        if (!f) {
+            fprintf(stderr, "warning: cannot restore ip_forward: %s\n",
+                    strerror(errno));
+        } else {
+            ok = fputs(saved_ip_forward ? "1" : "0", f) != EOF;
+            if (fclose(f) != 0)
+                ok = false;
+            if (!ok)
+                fprintf(stderr, "warning: cannot restore ip_forward: %s\n",
+                        strerror(errno));
+        }
+    }
+
+    if (nat_rule_added) {
+        char *del[] = { "iptables", "-t", "nat", "-D", "POSTROUTING", "-s",
+                        nat_subnet_saved, "-o", nat_if_saved, "-j",
+                        "MASQUERADE", NULL };
+        if (run_cmd(del) != 0)
+            fprintf(stderr, "warning: iptables -D MASQUERADE failed\n");
     }
 }
 
@@ -320,18 +403,33 @@ static int setup_tun(const char *name, const char *server_ip, int mask)
     int fd;
     char addr[64];
 
+    if (!tun_name_valid(name)) {
+        fprintf(stderr, "error: invalid tun device name '%s'\n", name);
+        server_cleanup_nat();
+        exit(1);
+    }
     (void)ip_run_quiet((char *[]){"link", "del", (char *)name, NULL});
     fd = open_tun(name);
     if (fd < 0) {
         fprintf(stderr, "error: cannot open tun device %s: %s (run as root?)\n",
                 name, strerror(errno));
+        server_cleanup_nat();
         exit(1);
     }
     set_nonblock(fd);
     (void)ip_run((char *[]){"addr", "flush", "dev", (char *)name, NULL});
     (void)ip_run((char *[]){"link", "set", (char *)name, "up", NULL});
     snprintf(addr, sizeof addr, "%s/%d", server_ip, mask);
-    (void)ip_run((char *[]){"addr", "add", addr, "dev", (char *)name, NULL});
+    /* the address assignment is load-bearing: without it the TUN has no
+     * gateway and no client can reach the server, so fail startup (the
+     * flush/link-up steps above are best-effort) */
+    if (!ip_run((char *[]){"addr", "add", addr, "dev", (char *)name, NULL})) {
+        fprintf(stderr, "error: cannot assign %s to tun device %s\n", addr,
+                name);
+        tun_close(fd);
+        server_cleanup_nat();
+        exit(1);
+    }
     return fd;
 }
 
@@ -343,11 +441,31 @@ static int setup_udp(uint16_t port)
 
     if (fd < 0) {
         perror("socket");
+        server_cleanup_nat();
         exit(1);
     }
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof sz);
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof sz);
+    {
+        /* the kernel silently caps SO_RCVBUF at net.core.rmem_max; with
+         * the default (212KB) the session buffer is far smaller than the
+         * clients' aggregate in-flight window, so a burst overflows it
+         * and the kernel drops UDP silently (UdpRcvbufErrors) — the
+         * inner TCP then collapses into an RTO storm. Warn loudly so the
+         * operator raises it. */
+        int actual = 0;
+        socklen_t alen = sizeof actual;
+        if (getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &actual, &alen) == 0 &&
+            actual < sz / 2)
+            fprintf(stderr,
+                    "warning: UDP rcvbuf capped at %d bytes by "
+                    "net.core.rmem_max (%d requested); bursts past the "
+                    "server's drain will drop. Raise it:\n"
+                    "  sysctl -w net.core.rmem_max=16777216 "
+                    "net.core.wmem_max=16777216\n",
+                    actual, sz);
+    }
     set_nonblock(fd); /* never let sendto backpressure stall the loop */
 
     memset(&addr, 0, sizeof addr);
@@ -356,9 +474,44 @@ static int setup_udp(uint16_t port)
     addr.sin_port = htons(port);
     if (bind(fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
         perror("bind");
+        server_cleanup_nat();
         exit(1);
     }
     return fd;
+}
+
+/* wire the recvmmsg batch: one 64KiB iovec per slot plus peer storage */
+static void setup_rx_batch(uint8_t *udp_buf, struct iovec *udp_iov,
+                           struct mmsghdr *msgs,
+                           struct sockaddr_in *peers)
+{
+    memset(msgs, 0, (size_t)UDP_RXBATCH * sizeof *msgs);
+    for (int i = 0; i < UDP_RXBATCH; i++) {
+        udp_iov[i].iov_base = udp_buf + (size_t)i * 65536;
+        udp_iov[i].iov_len = 65536;
+        msgs[i].msg_hdr.msg_iov = &udp_iov[i];
+        msgs[i].msg_hdr.msg_iovlen = 1;
+        msgs[i].msg_hdr.msg_name = &peers[i];
+        msgs[i].msg_hdr.msg_namelen = sizeof peers[i];
+    }
+}
+
+/* orderly shutdown: stop the TUN reader pool, close fds, and — in the
+ * original root process — undo the NAT changes; returns the process
+ * exit status (poll_err surfaces fatal runtime failures) */
+static int server_shutdown(struct server_ctx *ctx, int tun_fd, int udp_fd,
+                           bool drop_child, uint8_t *udp_buf, int poll_err)
+{
+    tun_pool_destroy(ctx->qpool); /* stops readers, detaches extra queues */
+    ctx->qpool = NULL;
+    tun_close(tun_fd);
+    ctx->tun_fd = -1;
+    close(udp_fd);
+    if (!drop_child)
+        server_cleanup_nat(); /* root process restores ip_forward + MASQUERADE */
+    server_ctx_destroy(ctx);
+    free(udp_buf);
+    return poll_err ? 1 : 0;
 }
 
 int main(int argc, char **argv)
@@ -378,7 +531,9 @@ int main(int argc, char **argv)
     struct sockaddr_in peers[UDP_RXBATCH];
     uint64_t last_purge;
     int nusers, tun_fd = -1, udp_fd, nfds, pr;
+    int poll_err = 0;   /* fatal poll failure: report exit != 0 */
     uint64_t last_drops = 0, last_qctl = 0;
+    bool drop_child = false; /* A1: this process is the forked, de-privileged server */
 
     /* recvmmsg batch buffers (heap: 64 x 64KiB = 4MiB) */
     udp_buf = malloc((size_t)UDP_RXBATCH * 65536);
@@ -386,15 +541,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "error: out of memory\n");
         return 1;
     }
-    memset(msgs, 0, sizeof msgs);
-    for (int i = 0; i < UDP_RXBATCH; i++) {
-        udp_iov[i].iov_base = udp_buf + (size_t)i * 65536;
-        udp_iov[i].iov_len = 65536;
-        msgs[i].msg_hdr.msg_iov = &udp_iov[i];
-        msgs[i].msg_hdr.msg_iovlen = 1;
-        msgs[i].msg_hdr.msg_name = &peers[i];
-        msgs[i].msg_hdr.msg_namelen = sizeof peers[i];
-    }
+    setup_rx_batch(udp_buf, udp_iov, msgs, peers);
 
     memset(&o, 0, sizeof o);
     o.port = 6001;
@@ -404,10 +551,11 @@ int main(int argc, char **argv)
     strcpy(o.dns, "114.114.114.114");
     strcpy(o.users, "/etc/iwan/users.txt");
     strcpy(o.nat_if, "eth0");
+    strcpy(o.user, "nobody");
 
     parse_opts(argc, argv, &o);
 
-    if (!o.no_tun && !valid_tun_name(o.tun)) {
+    if (!o.no_tun && !tun_name_valid(o.tun)) {
         fprintf(stderr, "error: invalid tun device name '%s'\n", o.tun);
         return 1;
     }
@@ -435,9 +583,26 @@ int main(int argc, char **argv)
         return 1;
     }
     printf("loaded %d users\n", nusers);
-    if (stat(o.users, &st) == 0 && (st.st_mode & (S_IRWXG | S_IRWXO)))
+    if (stat(o.users, &st) == 0 && (st.st_mode & (S_IRWXG | S_IRWXO))) {
+        /* R2: a group/world-readable users file leaks credentials; refuse
+         * to run unless the operator explicitly opts out with one of the
+         * positive values (1/true/yes/on, case-insensitive) — anything
+         * else, including "no", must NOT enable the override */
+        const char *env = getenv("IWAN_ALLOW_INSECURE_USERS");
+        bool allow = env && (strcasecmp(env, "1") == 0 ||
+                             strcasecmp(env, "true") == 0 ||
+                             strcasecmp(env, "yes") == 0 ||
+                             strcasecmp(env, "on") == 0);
+        if (!allow) {
+            fprintf(stderr,
+                    "error: %s is group/world readable (it contains "
+                    "passwords); chmod 600 it, or set "
+                    "IWAN_ALLOW_INSECURE_USERS=1 to override\n", o.users);
+            return 1;
+        }
         fprintf(stderr, "warning: %s is group/world readable; chmod 600 recommended\n",
                 o.users);
+    }
 
     memset(&ctx, 0, sizeof ctx);
     server_ctx_init(&ctx);
@@ -475,29 +640,104 @@ int main(int argc, char **argv)
     }
 
     udp_fd = setup_udp(o.port);
-    if (!o.no_tun) {
-        static struct srv_pool_ud pu; /* readers reference this for life */
-        pu.ctx = &ctx;
-        pu.udp_fd = udp_fd;
-        ctx.qpool = tun_pool_create(o.tun, tun_fd, TUN_POOL_MAX, 1,
-                                    srv_tun_pkt, &pu, &g_stop);
-        if (!ctx.qpool) {
-            fprintf(stderr, "error: cannot start TUN reader pool\n");
+
+    /* A1: drop root.  All root-only work (TUN setup, NAT rules, socket
+     * bind) is done; from here on the server loop runs unprivileged.
+     * The parent keeps root only long enough to undo the NAT changes
+     * after the child exits.  Non-root deployments never fork and run
+     * exactly as before. */
+    if (geteuid() == 0) {
+        fflush(NULL); /* never let the child duplicate buffered output */
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("fork");
+            server_cleanup_nat();
             return 1;
         }
-        printf("tun reader pool: 1 queue (dynamic up to %d)\n", TUN_POOL_MAX);
-        if (tun_steering_attach(tun_fd) == 0)
-            printf("tun steering: eBPF flow hash attached\n");
-    }
-    printf("listening UDP 0.0.0.0:%u\n", (unsigned)o.port);
-    printf("server ready.\n");
+        if (pid > 0) {
+            /* parent: the child owns the server loop; wait for it, then
+             * restore ip_forward and drop the MASQUERADE rule we added
+             * (both need root). SIGINT/SIGTERM/SIGHUP/SIGQUIT are
+             * forwarded to the child so any stop path reaches the
+             * cleanup — ignoring them (as before) let kill <parent-pid>
+             * or an SSH hangup strand the NAT state forever. */
+            struct sigaction fw;
+            memset(&fw, 0, sizeof fw);
+            fw.sa_handler = parent_fwd_signal;
+            sigemptyset(&fw.sa_mask);
+            sigaction(SIGINT, &fw, NULL);
+            sigaction(SIGTERM, &fw, NULL);
+            sigaction(SIGHUP, &fw, NULL);
+            sigaction(SIGQUIT, &fw, NULL);
+            g_child_pid = pid;
+            for (;;) {
+                int st;
+                if (waitpid(pid, &st, 0) < 0) {
+                    if (errno == EINTR)
+                        continue;
+                    server_cleanup_nat();
+                    return 1;
+                }
+                server_cleanup_nat();
+                return WIFEXITED(st) ? WEXITSTATUS(st) : 1;
+            }
+        }
+        /* child: continue as the unprivileged server process */
+        drop_child = true;
+        {
+            struct passwd pwb, *pw = NULL;
+            char pwbuf[4096];
 
+            if (getpwnam_r(o.user, &pwb, pwbuf, sizeof pwbuf, &pw) != 0 ||
+                pw == NULL) {
+                fprintf(stderr, "error: cannot resolve user '%s'\n", o.user);
+                _exit(1);
+            }
+            if (setgroups(0, NULL) != 0 || setgid(pw->pw_gid) != 0 ||
+                setuid(pw->pw_uid) != 0) {
+                fprintf(stderr, "error: cannot drop privileges to user "
+                        "'%s': %s\n", o.user, strerror(errno));
+                _exit(1);
+            }
+            printf("dropped privileges to user %s (uid=%u gid=%u)\n",
+                   o.user, (unsigned)pw->pw_uid, (unsigned)pw->pw_gid);
+        }
+    }
+    /* signal handlers: installed after the fork so the root parent (which
+     * forwards SIGINT/SIGTERM/SIGHUP/SIGQUIT while waiting) never takes
+     * them; the server process — forked child or non-root deployment —
+     * exits gracefully. SIGHUP (terminal hangup) stops the server the
+     * same way SIGINT/SIGTERM do, so the parent's cleanup always runs. */
     memset(&sa, 0, sizeof sa);
     sa.sa_handler = on_signal;
     sa.sa_flags = SA_RESTART;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
+
+    if (!o.no_tun) {
+        static struct srv_pool_ud pu; /* readers reference this for life */
+        long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+        int maxq = TUN_POOL_MAX;
+        if (ncpu > 0 && ncpu < maxq)
+            maxq = (int)ncpu;
+        pu.ctx = &ctx;
+        pu.udp_fd = udp_fd;
+        ctx.qpool = tun_pool_create(o.tun, tun_fd, maxq, 1,
+                                    srv_tun_pkt, &pu, &g_stop);
+        if (!ctx.qpool) {
+            fprintf(stderr, "error: cannot start TUN reader pool\n");
+            if (!drop_child)
+                server_cleanup_nat(); /* parent (root) undoes NAT */
+            return 1;
+        }
+        printf("tun reader pool: 1 queue (dynamic up to %d)\n", maxq);
+        if (tun_steering_attach(tun_fd) == 0)
+            printf("tun steering: eBPF flow hash attached\n");
+    }
+    printf("listening UDP 0.0.0.0:%u\n", (unsigned)o.port);
+    printf("server ready.\n");
 
     fds[0].fd = udp_fd;
     fds[0].events = POLLIN;
@@ -512,6 +752,8 @@ int main(int argc, char **argv)
             if (errno == EINTR)
                 continue;
             perror("poll");
+            poll_err = 1;   /* fatal runtime error: exit non-zero so
+                             * service managers do not see a clean stop */
             break;
         }
 
@@ -560,11 +802,6 @@ int main(int argc, char **argv)
         }
     }
 
-    tun_pool_destroy(ctx.qpool); /* stops readers, detaches extra queues */
-    ctx.qpool = NULL;
-    tun_close(tun_fd);
-    ctx.tun_fd = -1;
-    close(udp_fd);
-    server_ctx_destroy(&ctx);
-    return 0;
+    return server_shutdown(&ctx, tun_fd, udp_fd, drop_child, udp_buf,
+                           poll_err);
 }

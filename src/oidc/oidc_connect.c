@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <openssl/crypto.h>
 
 #include "addr.h"
 #include "auth.h"
@@ -48,6 +49,7 @@ static int run_socks_mode(const Opts *o, int fd, const uint8_t sk[16],
     cfg.sid = res->sid;
     cfg.token = res->tok;
     cfg.encryption = o->encrypt;
+    snprintf(cfg.dns, sizeof cfg.dns, "%s", res->dns);
 
     run_socks(fd, &cfg);
     return 0;
@@ -72,7 +74,10 @@ void oidc_elevate_root(int argc, char **argv)
         args[i + 1] = argv[i];
     args[argc + 1] = NULL;
     oidc_eprintf("TUN mode requires root; re-running via sudo...\n");
-    execvp("sudo", args);
+    exec_sanitize();
+    execve("/usr/bin/sudo", args, environ);
+    if (errno == ENOENT)
+        execve("/bin/sudo", args, environ);
     fprintf(stderr, "Error: cannot run sudo: %s\n", strerror(errno));
     exit(1);
 }
@@ -85,6 +90,24 @@ static void collect_routes(const Opts *o, slist_t *routes)
         slist_push(routes, o->proxy_ip.v[i]);
     for (size_t i = 0; i < o->proxy_domain.n; i++)
         slist_push(routes, o->proxy_domain.v[i]);
+}
+
+/* server "port" value from a server entry: 1 = valid (out set),
+ * 0 = absent (caller uses OIDC_DEFAULT_PORT), -1 = not an integer in
+ * 1..65535 (raw receives the offending value). */
+int oidc_server_port(const Json *srv, uint16_t *out, double *raw)
+{
+    Json *p = json_get((Json *)srv, "port");
+    if (!p)
+        return 0;
+    double v = json_num(p);
+    if (raw)
+        *raw = v;
+    if (json_type(p) != JSON_NUM || v != v || v < 1.0 || v > 65535.0 ||
+        (double)(long)v != v)
+        return -1;
+    *out = (uint16_t)v;
+    return 1;
 }
 
 void oidc_connect_server(const Opts *o, const Config *cf)
@@ -105,8 +128,15 @@ void oidc_connect_server(const Opts *o, const Config *cf)
     const char *host = json_get_str(srv, "host");
     if (!host || !*host)
         oidc_die("missing host");
-    Json *portj = json_get(srv, "port");
-    uint16_t port = portj ? (uint16_t)json_num(portj) : 6001;
+    uint16_t port;
+    double pv;
+    int pr = oidc_server_port(srv, &port, &pv);
+    if (pr < 0)
+        oidc_die("invalid port %g for server \"%s\" "
+                 "(must be an integer in 1..65535)",
+                 pv, name ? name : host);
+    if (pr == 0)
+        port = OIDC_DEFAULT_PORT;
     const char *srv_user = json_get_str(srv, "username");
     const char *encrypted_pw = json_get_str(srv, "passWord");
 
@@ -123,11 +153,15 @@ void oidc_connect_server(const Opts *o, const Config *cf)
 
     const char *user = srv_user ? srv_user : "";
     uint8_t ct[16];
-    get_ct(user, password, NULL, ct);
+    if (get_ct(user, password, NULL, ct) != 0)
+        oidc_die("cannot derive password");
     uint32_t nonce = rand_u32();
     buf_t open;
     buf_init(&open);
-    build_open(&open, user, ct, 1400, o->encrypt, nonce);
+    if (build_open(&open, user, ct, 1400, o->encrypt, nonce) != 0) {
+        buf_free(&open);
+        oidc_die("username too long (max 255 bytes)");
+    }
     AuthResult res;
     int fd = do_auth(host, port, open.data, open.len, nonce, DO_AUTH_OIDC,
                      &res);
@@ -139,6 +173,7 @@ void oidc_connect_server(const Opts *o, const Config *cf)
 
     uint8_t sk[16];
     session_key(user, password, sk);
+    OPENSSL_cleanse(password, strlen(password)); /* plaintext credential */
     free(password);
 
     if (o->socks) {
@@ -149,7 +184,7 @@ void oidc_connect_server(const Opts *o, const Config *cf)
         return;
     }
 
-    if (!valid_tun_name(o->tun)) {
+    if (!tun_name_valid(o->tun)) {
         close(fd);
         oidc_die("invalid TUN device name '%s'", o->tun);
     }

@@ -19,7 +19,46 @@
 #include "tun.h"
 #include "util.h"
 
+/* ifname families owned by the OS / physical NICs: never create one, and
+ * never feed one to `ip link del`. "iw" is deliberately absent: the
+ * project's own default devices (iwan0, iwan-srv) share that prefix. */
+static bool tun_name_reserved(const char *name)
+{
+    static const char *const reserved[] = {
+        "eth", "enp", "eno", "ens", "wlp", "wlo", "wwan", "docker",
+        "br-", "veth", "tailscale",
+        "br0", "virbr", "vmbr", "bond", "team", "ovs", "tap", "tun",
+        "vxlan", "vlan", "dummy", "wg", "ppp", "gre", "sit",
+    };
+    if (strcmp(name, "lo") == 0)
+        return true;
+    for (size_t i = 0; i < sizeof reserved / sizeof reserved[0]; i++) {
+        const char *r = reserved[i];
+        if (strncmp(name, r, strlen(r)) == 0)
+            return true;
+    }
+    return false;
+}
+
+bool tun_name_valid(const char *name)
+{
+    size_t n = strlen(name);
+    if (n == 0 || n > IFNAMSIZ - 1)
+        return false;
+    if (!(name[0] >= 'a' && name[0] <= 'z'))
+        return false;
+    for (size_t i = 0; i < n; i++) {
+        char c = name[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+              c == '-' || c == '_'))
+            return false;
+    }
+    return !tun_name_reserved(name);
+}
+
 int open_tun(const char *name) {
+    if (!tun_name_valid(name))
+        return -1;
     int fd = open("/dev/net/tun", O_RDWR);
     struct ifreq ifr;
     if (fd < 0)
@@ -33,6 +72,14 @@ int open_tun(const char *name) {
         errno = e;
         return -1;
     }
+    /* the TUN receive queue carries the peer kernel's ACK stream: the
+     * default rcvbuf (~212KB) overflows in ~2ms under a high-rate
+     * upload burst and TCP ACKs are never retransmitted, so every
+     * overflowed ACK forces a full RTO recovery on the far side.
+     * Match the UDP session buffers (4MiB) so the reader pool can
+     * drain bursts instead of the kernel dropping them. */
+    int sz = 4 * 1024 * 1024;
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof sz);
     return fd;
 }
 
@@ -91,7 +138,7 @@ int tun_steering_attach(int tun_fd)
     const char *shstrtab;
     const struct bpf_insn *insns = NULL;
     unsigned int insn_cnt = 0;
-    const char *license = "GPL";
+    const char *license = "Dual MIT/GPL";
     int prog_fd, rc;
 
     if (olen < sizeof(Elf64_Ehdr))
@@ -111,8 +158,17 @@ int tun_steering_attach(int tun_fd)
     shstrtab = (const char *)(o + shstr->sh_offset);
 
     for (int i = 0; i < eh->e_shnum; i++) {
-        const char *name = shstrtab + sh[i].sh_name;
+        const char *name;
+
         if (sh[i].sh_offset + sh[i].sh_size > olen)
+            continue;
+        /* R21b: sh_name is an offset into the string table — bound it to
+         * the table and require a NUL within it before strcmp can read
+         * past the embedded blob */
+        if (sh[i].sh_name >= shstr->sh_size)
+            continue;
+        name = shstrtab + sh[i].sh_name;
+        if (!memchr(name, '\0', shstr->sh_size - sh[i].sh_name))
             continue;
         if (strcmp(name, "classifier") == 0) {
             insns = (const struct bpf_insn *)(o + sh[i].sh_offset);
@@ -145,10 +201,6 @@ void set_nonblock(int fd) {
         fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-ptrdiff_t tun_read(int fd, void *buf, size_t len) {
-    return (ptrdiff_t)read(fd, buf, len);
-}
-
 ptrdiff_t tun_write(int fd, const void *buf, size_t len) {
     return (ptrdiff_t)write(fd, buf, len);
 }
@@ -176,10 +228,14 @@ int tun_write_retry(int fd, const uint8_t *pkt, size_t len, int max_ms,
                 to = 1;
             struct pollfd pfd = { .fd = fd, .events = POLLOUT };
             int pr = poll(&pfd, 1, to);
-            /* if poll claims writable but EAGAIN persists, back off
-             * briefly instead of busy-spinning */
-            if (pr > 0 && (pfd.revents & POLLOUT))
-                usleep(1000);
+            /* NOTE: no usleep after a writable poll. The original
+             * 1ms sleep per EAGAIN cost the single-threaded server
+             * main loop 1-3ms per congested packet (three orders of
+             * magnitude off its ~360k pps drain), turning a transient
+             * TUN backlog into guaranteed UDP rcvbuf overflow and an
+             * RTO storm on the far side. poll() already waited; just
+             * retry the write. */
+            (void)pr;
             continue;
         }
         return -1; /* fatal; errno preserved */
@@ -194,6 +250,9 @@ int tun_write_retry(int fd, const uint8_t *pkt, size_t len, int max_ms,
  * on different queues; per-queue ordering is preserved by the kernel's
  * flow-hash steering. */
 #define TUN_QCTL_MS TUN_POOL_TICK_MS
+#define TUN_POLL_MS 100   /* tun reader poll timeout; the AIMD busy ratio
+                           * below divides by it, so the two stay in
+                           * lockstep */
 #define TUN_BUSY_GROW 0.85
 #define TUN_BUSY_SHRINK 0.60
 
@@ -212,6 +271,8 @@ struct tun_pool {
     volatile sig_atomic_t *abort;
     int nq;
     int maxq;
+    int slow_start;   /* AIMD state: slow-start phase flag */
+    int idle_cycles;  /* consecutive idle ticks before shrink */
     char tunname[IFNAMSIZ];
 };
 
@@ -223,7 +284,7 @@ static void *tun_reader_main(void *ud)
     static _Thread_local uint8_t buf[65536];
 
     while (!q->stop && (pool->abort == NULL || !*pool->abort)) {
-        int pr = poll(&pfd, 1, 100);
+        int pr = poll(&pfd, 1, TUN_POLL_MS);
         if (pr < 0 && errno != EINTR)
             break;
         if (pr == 0) {
@@ -256,6 +317,20 @@ static void *tun_reader_main(void *ud)
                             pr == 0 ? "timeout" : "event");
                 }
             }
+        }
+        /* Device deleted (e.g. `ip link del`): poll then reports
+         * POLLHUP|POLLERR immediately on every call, so without this
+         * the reader would busy-spin forever. POLLIN is drained first
+         * above, so any data queued before deletion is still delivered
+         * (on deletion the kernel sets POLLIN|POLLHUP together); the
+         * read below then confirms the end of the fd (0 = EOF, < 0 =
+         * error) before exiting. */
+        if (pfd.revents & (POLLERR | POLLHUP)) {
+            ssize_t r = read(q->fd, buf, sizeof buf);
+            if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+                log_debug("tun reader q=%ld: fd gone (%s)",
+                          (long)(q - pool->qs), strerror(errno));
+            break;
         }
     }
     /* drain the ring before exiting: packets already queued on this fd
@@ -336,6 +411,8 @@ struct tun_pool *tun_pool_create(const char *name, int fd0, int maxq,
         return NULL;
     }
     pool->nq = 1;
+    pool->slow_start = 1;
+    pool->idle_cycles = 0;
     /* eager start: attach initq-1 extra queues up front (used by the
      * client pump, whose bulk uplink would otherwise make the AIMD hunt
      * between the single-queue and multi-queue capacities) */
@@ -368,8 +445,6 @@ void tun_pool_destroy(struct tun_pool *pool)
 /* AIMD controller: poll-timeout busy signal drives queue count */
 void tun_pool_tick(struct tun_pool *pool)
 {
-    static int slow_start = 1;
-    static int idle_cycles = 0;
     uint64_t wsum = 0;
     double busy;
     int target;
@@ -377,7 +452,8 @@ void tun_pool_tick(struct tun_pool *pool)
     for (int i = 0; i < pool->nq; i++)
         wsum += atomic_exchange(&pool->qs[i].waits, 0);
     busy = 1.0 - (double)wsum /
-                  ((double)TUN_QCTL_MS / 100.0 * (double)pool->nq);
+                  ((double)TUN_QCTL_MS / (double)TUN_POLL_MS *
+                   (double)pool->nq);
     if (busy < 0)
         busy = 0;
     if (busy > 1)
@@ -385,27 +461,27 @@ void tun_pool_tick(struct tun_pool *pool)
 
     target = pool->nq;
     if (busy > TUN_BUSY_GROW) {
-        idle_cycles = 0;
-        if (slow_start) {
+        pool->idle_cycles = 0;
+        if (pool->slow_start) {
             target = pool->nq * 2;
             if (target >= 4)
-                slow_start = 0;
+                pool->slow_start = 0;
         } else {
             target = pool->nq + 1;
         }
     } else if (busy < TUN_BUSY_SHRINK) {
-        idle_cycles++;
-        if (idle_cycles >= 4 && pool->nq > 1) {
+        pool->idle_cycles++;
+        if (pool->idle_cycles >= 4 && pool->nq > 1) {
             /* conservative shrink: only after 2s of sustained idle, so
              * brief load gaps (test pauses, app think time) do not drop
              * queued packets of live flows */
             target = pool->nq / 2;
             if (target < 1)
                 target = 1;
-            idle_cycles = 0;
+            pool->idle_cycles = 0;
         }
     } else {
-        idle_cycles = 0;
+        pool->idle_cycles = 0;
     }
     if (target > pool->maxq)
         target = pool->maxq;

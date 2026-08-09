@@ -46,25 +46,25 @@ static void err_bool_value(const cli_ctl *ctl, const char *name,
     usage_exit(ctl);
 }
 
-static void check_uint(const char *name, const char *valname, const char *val,
-                       uint64_t max, const char *maxstr)
+/* validate and parse an unsigned value; returns it, or exits with a
+ * clap-style error. The actual parsing lives in the shared parse_uint
+ * (common.h); here we only classify the failure into a message. */
+static uint64_t check_uint(const char *name, const char *valname, const char *val,
+                           uint64_t max, const char *maxstr)
 {
-    if (*val == '\0')
-        err_bad_value(name, valname, val,
-                      "cannot parse integer from empty string");
-    for (const char *p = val; *p; p++)
-        if (*p < '0' || *p > '9')
-            err_bad_value(name, valname, val, "invalid digit found in string");
-    uint64_t v = 0;
-    for (const char *p = val; *p; p++) {
-        uint64_t d = (uint64_t)(*p - '0');
-        if (v > (max - d) / 10) {
-            char msg[96];
-            snprintf(msg, sizeof msg, "%s is not in 0..=%s", val, maxstr);
-            err_bad_value(name, valname, val, msg);
-        }
-        v = v * 10 + d;
+    uint64_t v;
+    if (parse_uint(val, max, &v) != 0) {
+        if (*val == '\0')
+            err_bad_value(name, valname, val,
+                          "cannot parse integer from empty string");
+        for (const char *p = val; *p; p++)
+            if (*p < '0' || *p > '9')
+                err_bad_value(name, valname, val, "invalid digit found in string");
+        char msg[96];
+        snprintf(msg, sizeof msg, "%s is not in 0..=%s", val, maxstr);
+        err_bad_value(name, valname, val, msg);
     }
+    return v;
 }
 
 static const cli_opt *find_opt(const cli_opt *opts, size_t nopts,
@@ -137,24 +137,18 @@ static void track_flag(Cli *c, const cli_opt *o, const cli_ctl *ctl)
     }
 }
 
-static void store_value(const cli_opt *o, const char *val)
+static void store_value(const cli_opt *o, const char *val, uint64_t parsed)
 {
     switch (o->kind) {
     case CLI_OPT_STR:
         *(const char **)o->dst = val;
         break;
-    case CLI_OPT_U8: {
-        uint8_t v;
-        str_to_u8(val, &v);
-        *(uint8_t *)o->dst = v;
+    case CLI_OPT_U8:
+        *(uint8_t *)o->dst = (uint8_t)parsed;
         break;
-    }
-    case CLI_OPT_U16: {
-        uint16_t v;
-        str_to_u16(val, &v);
-        *(uint16_t *)o->dst = v;
+    case CLI_OPT_U16:
+        *(uint16_t *)o->dst = (uint16_t)parsed;
         break;
-    }
     case CLI_OPT_CSV:
         slist_push_csv((slist_t *)o->dst, val);
         break;
@@ -215,12 +209,13 @@ void cli_parse(Cli *c, int argc, char **argv, int start,
                 err_need_value(o->name, o->valname);
             val = argv[++i];
         }
+        uint64_t parsed = 0;
         switch (o->kind) {
         case CLI_OPT_U8:
-            check_uint(o->name, o->valname, val, UINT8_MAX, "255");
+            parsed = check_uint(o->name, o->valname, val, UINT8_MAX, "255");
             break;
         case CLI_OPT_U16:
-            check_uint(o->name, o->valname, val, UINT16_MAX, "65535");
+            parsed = check_uint(o->name, o->valname, val, UINT16_MAX, "65535");
             break;
         default:
             break;
@@ -230,7 +225,7 @@ void cli_parse(Cli *c, int argc, char **argv, int start,
             if (!o->validate(val, err, sizeof err))
                 err_bad_value(o->name, o->valname, val, err);
         }
-        store_value(o, val);
+        store_value(o, val, parsed);
     }
 
     /* clap validates value-arg duplicates after the full parse */

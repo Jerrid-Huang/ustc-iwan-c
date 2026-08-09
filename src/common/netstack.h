@@ -14,7 +14,6 @@ typedef struct TxItem {
     uint8_t     ctl[64];
 } TxItem;
 
-#define DNS_SERVER_IP "114.114.114.114"
 #define NS_TX_MAX     128      /* device queue slots */
 
 /* ---------------- userspace TCP connection ---------------- */
@@ -28,13 +27,6 @@ typedef enum {
     NS_FIN_WAIT,       /* we called close(); draining */
 } NsState;
 
-/* callbacks filled by socks.c */
-typedef struct {
-    /* stack wants to emit an IP packet -> enqueue to device.tx */
-    void (*on_tx_pkt)(void *ud, const uint8_t *pkt, size_t n);
-    void *on_tx_pkt_ud;
-} NsHooks;
-
 /* one TCP connection (indexed 0..NS_MAX_CONN-1) */
 struct TcpConn {
     NsState  state;
@@ -46,12 +38,11 @@ struct TcpConn {
     bool     remote_fin;
     bool     local_fin;     /* we sent our FIN */
     buf_t    rxq;           /* received data (for app) */
-    /* retransmit of a single data segment */
-    uint8_t  retx_buf[2048];
-    uint16_t retx_len;      /* 0 = none */
-    uint32_t retx_seq;
-    uint64_t retx_ms;
-    uint8_t  retx_cnt;
+    /* SYN retransmit state (the data retransmit path uses the segment
+     * ring in NsPriv, not this) */
+    uint32_t syn_retx_seq;
+    uint64_t syn_retx_ms;
+    uint8_t  syn_retx_cnt;
     uint64_t state_ms;      /* when state last changed */
     uint64_t last_rx_ms;
     uint16_t mss;
@@ -83,7 +74,6 @@ typedef struct {
     /* device queue: ready packets (segment-slot pointers or control) */
     struct TxItem tx_queue[NS_TX_MAX];
     int tx_head, tx_count;
-    NsHooks hooks;
 } Netstack;
 
 void ns_init(Netstack *ns, uint32_t inner_ip, uint32_t gw, uint16_t mtu);
@@ -108,8 +98,6 @@ uint8_t *ns_send_reserve(Netstack *ns, int idx, size_t *room);
  * ns_send_commit calls seal them. */
 int ns_send_reservev(Netstack *ns, int idx, struct iovec *iov, int maxn);
 void ns_send_commit(Netstack *ns, int idx, size_t n);
-/* read received data into out; returns n bytes (0 = none) */
-size_t ns_recv(Netstack *ns, int idx, uint8_t *out, size_t n);
 /* graceful close (FIN). */
 void ns_close(Netstack *ns, int idx);
 /* hard close / free slot */
@@ -126,14 +114,18 @@ int  ns_tick(Netstack *ns, uint64_t now);
  * Returns a pointer (segment slot or inline control) or NULL. */
 const struct TxItem *ns_tx_peek(Netstack *ns);
 const struct TxItem *ns_tx_pop(Netstack *ns);
+/* re-arm a segment-slot item at the tail of the device queue: used by
+ * the device drain when a blocked send (ENOBUFS) must not drop the
+ * segment into RTO recovery. The segment itself stays in the retransmit
+ * ring, so this only re-queues the reference; if the ring compacts
+ * before the next drain, the stale reference still delivers one of the
+ * ring's genuine (seq, payload) pairs (payloads are immutable once
+ * sealed), which the peer dedups by seq. */
+void ns_tx_rearm_seg(Netstack *ns, const void *seg);
 /* TX item helpers: total packet length and send buffer (segment slot or
  * inline control) */
 size_t ns_tx_item_len(const struct TxItem *it);
 const uint8_t *ns_tx_item_buf(const struct TxItem *it);
 #define NS_SEG_HDR_LEN 48    /* [8B outer][40B inner] before payload */
-
-/* ---------------- DNS (hardcoded 114.114.114.114) ---------------- */
-/* resolve domain to IPv4 via 114.114.114.114:53. Returns sock-order IP or 0. */
-uint32_t dns_query_a(const char *domain);
 
 #endif

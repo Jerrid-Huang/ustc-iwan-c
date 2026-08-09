@@ -1,3 +1,4 @@
+#include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -15,6 +16,7 @@
 
 #include "common.h"
 #include "crypto.h"
+#include "ipv4.h"
 #include "netstack.h"
 
 
@@ -33,7 +35,15 @@ void on_sig(int sig) {
 }
 
 int g_dns_evfd = -1;      /* DNS workers write here to wake the loop */
-Flow *g_flows;          /* NULL-terminated? no: MAX_FLOWS array */
+int g_sockfd = -1;        /* session UDP socket; set by run_socks, used by tunnel DNS */
+SocksConfig *g_socks_cfg; /* SOCKS5 config; set by run_socks, read by flow handshake */
+Flow *g_flows;            /* fixed MAX_FLOWS array, never NULL-terminated */
+
+/* one GSO unit: max UDP payload (65535 - 20B IP - 8B UDP) */
+#define SOCKS_KEEPALIVE_MS 10000u
+#define LISTEN_BACKLOG   64
+#define SOCK_BUF_BYTES   (16 * 1024 * 1024)
+#define POLL_CEIL_MS     1000   /* safety ceiling for the event wait */
 
 /* event-driven wait: listener, VPN socket, and client flows; wakes on any
  * readable fd or the next netstack tick. Replaces fixed sleep polling. */
@@ -77,6 +87,26 @@ void accept_connections(int listener) {
             log_err("accept SOCKS5 client: %s", strerror(errno));
             return;
         }
+        /* Serve only loopback peers by default: an unauthenticated
+         * remote peer would turn the host into an open proxy. The only
+         * exception is an explicit --allow-remote bind WITH RFC 1929
+         * credentials configured — remote use then requires the token
+         * password. The non-loopback bind warning stays as a config-time
+         * hint; this check is the enforcement. */
+        if (!(g_socks_cfg && g_socks_cfg->allow_remote &&
+              g_socks_cfg->auth_token)) {
+            struct sockaddr_in cpeer;
+            socklen_t cpeer_len = sizeof cpeer;
+            if (getpeername(cfd, (struct sockaddr *)&cpeer, &cpeer_len) != 0 ||
+                (cpeer.sin_addr.s_addr & htonl(0xFF000000u)) !=
+                    htonl(0x7F000000u)) {
+                char cip[INET_ADDRSTRLEN] = "";
+                inet_ntop(AF_INET, &peer.sin_addr, cip, sizeof cip);
+                log_debug("SOCKS5: closing non-loopback peer %s", cip);
+                close(cfd);
+                continue;
+            }
+        }
         int nodelay = 1;
         setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof nodelay);
         set_nonblock(cfd);
@@ -91,18 +121,70 @@ void accept_connections(int listener) {
 
 /* ---- VPN framing (mirrors netstack/tunnel.rs) ---- */
 
-#define SOCKS_TX_MAX 65543   /* one GSO unit (65507) + one 8B header */
 #define SOCKS_MAX_PK 128     /* drain the whole tx queue: 48 segments +
                               * control ACKs must not accumulate (a 48-item
                               * cap left 1 item/round and drop-oldest
                               * evicted ACKs under load) */
+#define SOCKS_SEND_RETRY_MS 5  /* EAGAIN/ENOBUFS retry budget per drain:
+                                * beyond it, give the event loop its
+                                * receive turn instead of wedging it */
+
+/* aggregate send-rate pacing (token bucket): the server's single-threaded
+ * drain caps at roughly 360k pps, and bursting past it overflows its UDP
+ * rcvbuf — the kernel drops silently (UdpRcvbufErrors) and the inner TCP
+ * collapses into an RTO storm (window freeze + 8x retransmit abort,
+ * ~29s). A kernel TCP client self-paces via slow-start; this userspace
+ * stack has none, so 4 concurrent uploads burst the full 128-segment
+ * ring per round. Cap the aggregate at 300k pps (~416MB/s): above the
+ * measured single-conn peak (2.6Gbit/s = 234k pps), below the server's
+ * drain ceiling, and high enough that pacing never engages for a single
+ * connection. */
+#define IWAN_SEND_PACING_PPS 300000u
+
+static uint64_t g_pace_us;      /* unused send budget, microseconds */
+static uint64_t g_pace_last;    /* last refill timestamp (us) */
+
+static uint64_t now_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+}
+
+static void pace_send(int npk)
+{
+    uint64_t now = now_us();
+    uint64_t budget;
+    if (!g_pace_last)
+        g_pace_last = now;
+    budget = g_pace_us +
+             (now - g_pace_last) * IWAN_SEND_PACING_PPS / 1000000u;
+    if (budget > IWAN_SEND_PACING_PPS / 10u)
+        budget = IWAN_SEND_PACING_PPS / 10u;  /* cap the burst */
+    g_pace_last = now;
+    if ((uint64_t)npk > budget) {
+        uint64_t need = ((uint64_t)npk - budget) * 1000000u /
+                        IWAN_SEND_PACING_PPS;
+        g_pace_us = 0;
+        if (need > 0)
+            usleep(need);
+    } else {
+        g_pace_us = budget - (uint64_t)npk;
+    }
+}
 
 /* Send one accumulated batch: uniform batches (>=2 packets, total <= 65507)
  * go out as a single GSO sendmsg with a multi-iovec message (the kernel
  * treats the iovecs as one continuous stream and segments it; wire output
  * is identical to per-packet sends). Everything else goes via sendmmsg.
- * EAGAIN/ENOBUFS block on POLLOUT instead of dropping; only fatal errors
- * stop the proxy.
+ * EAGAIN/ENOBUFS block on POLLOUT for a bounded budget instead of
+ * dropping; only fatal errors stop the proxy. The bound matters: this
+ * drain runs at the TOP of the event loop, and an unbounded retry would
+ * starve receive_vpn — the ACK rcvbuf would overflow while we spin on a
+ * full send buffer, and the livelock (no ACKs -> RTO -> more retries)
+ * stalls the tunnel for seconds. Items left unsent are safe to lose:
+ * the tx queue's eviction contract recovers data segments by RTO and
+ * regenerates pure ACKs.
  *
  * Kernel-feature review (Linux 7.0, source-verified, measured on
  * loopback): io_uring SENDMSG (46 SQEs/enter) measured ~6% SLOWER than
@@ -111,11 +193,13 @@ void accept_connections(int listener) {
  * seg_compact() memmoves the retransmit slots and retransmit re-seals
  * them in place, both illegal while a zerocopy notification is
  * outstanding. This GSO+sendmmsg shape is the local optimum. */
-static void socks_send_batch2(int sockfd, SocksConfig *cfg,
-                              struct iovec *iovs, struct mmsghdr *msgs,
-                              int npk, size_t total, size_t mss)
+static int socks_send_batch2(int sockfd, SocksConfig *cfg,
+                             struct iovec *iovs, struct mmsghdr *msgs,
+                             int npk, size_t total, size_t mss)
 {
-    if (npk >= 2 && total <= 65507) {
+    uint64_t retry_t0 = now_ms();
+    if (npk >= 2 && total <= IWAN_UDP_GSO_UNIT &&
+        total <= IWAN_GSO_UNIT_SAFE) {
         if (cfg->gso_ok == 0) {
             int m = (int)mss;
             cfg->gso_ok = setsockopt(sockfd, SOL_UDP, UDP_SEGMENT,
@@ -139,7 +223,7 @@ static void socks_send_batch2(int sockfd, SocksConfig *cfg,
             while (!g_stop) {
                 ssize_t r = sendmsg(sockfd, &mh, 0);
                 if (r == (ssize_t)total)
-                    return;
+                    return npk;
                 if (r < 0 &&
                     (errno == EAGAIN || errno == EWOULDBLOCK ||
                      errno == ENOBUFS || errno == EINTR)) {
@@ -148,14 +232,19 @@ static void socks_send_batch2(int sockfd, SocksConfig *cfg,
                                               .events = POLLOUT };
                         if (poll(&pfd, 1, 1) > 0)
                             usleep(200);
+                        /* bounded: give the event loop its receive turn
+                         * (see the function comment). The items stay
+                         * queued — the caller only pops what was sent */
+                        if (now_ms() - retry_t0 >= SOCKS_SEND_RETRY_MS)
+                            return 0;
                     }
                     continue;
                 }
                 log_err("SOCKS GSO send failed: %s", strerror(errno));
                 g_stop = 1;
-                return;
+                return 0;
             }
-            return;
+            return 0;
         }
     }
 
@@ -181,32 +270,46 @@ static void socks_send_batch2(int sockfd, SocksConfig *cfg,
                 continue;
             }
             if (sm == 0)
-                return;
+                return (int)sent;
             if (errno == EINTR)
                 continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS) {
                 /* send buffer full: yield briefly instead of blocking
-                 * the single event loop for 100ms — receive_vpn must
-                 * keep draining downlink (ACKs, keepalive replies) or the
-                 * receive buffer overflows and the peer's segments (and
-                 * our own ACK stream) get dropped, which triggers a
-                 * retransmit storm upstream */
+                 * the single event loop — receive_vpn must keep draining
+                 * downlink (ACKs, keepalive replies) or the receive
+                 * buffer overflows and the peer's segments (and our own
+                 * ACK stream) get dropped, which triggers a retransmit
+                 * storm upstream. Bounded: beyond the budget, return and
+                 * let the main loop cycle (see the function comment). */
                 struct pollfd pfd = { .fd = sockfd, .events = POLLOUT };
                 if (poll(&pfd, 1, 1) > 0)
                     usleep(200);
+                if (now_ms() - retry_t0 >= SOCKS_SEND_RETRY_MS)
+                    return (int)sent;
                 continue;
             }
             log_err("SOCKS sendmmsg: %s", strerror(errno));
             g_stop = 1;
-            return;
+            return (int)sent;
         }
+        return (int)sent;
     }
 }
 
 /* drain the netstack device queue: ready packets are referenced by
  * pointer (zero-copy segment slots / inline control), batched, and sent
  * via GSO (uniform lengths) or sendmmsg. Framing + XOR were done at seal
- * time inside the stack. */
+ * time inside the stack.
+ *
+ * When the send path is blocked (ENOBUFS budget expired), the unsent
+ * DATA segments are re-enqueued at the tail instead of being dropped
+ * into RTO recovery: a dropped segment re-enters the still-full send
+ * buffer on retransmit and the RTO doubling escalates into a 30s storm
+ * under sustained backpressure. Pure-ACK control items are dropped —
+ * the stack regenerates them. A re-enqueued segment whose slot moved in
+ * a later compaction still delivers one of the ring's genuine
+ * (seq, payload) pairs (payloads are immutable once sealed), so the peer
+ * assembles a correct stream — at worst a duplicate it dedups by seq. */
 static void sock_drain_tx(int sockfd, SocksConfig *cfg)
 {
     struct iovec iovs[SOCKS_MAX_PK];
@@ -215,7 +318,6 @@ static void sock_drain_tx(int sockfd, SocksConfig *cfg)
     size_t lens[SOCKS_MAX_PK];
     int npk = 0;
     const TxItem *it;
-    (void)cfg;
 
     while (npk < SOCKS_MAX_PK && (it = ns_tx_peek(&g_ns)) != NULL) {
         size_t l = ns_tx_item_len(it);
@@ -226,31 +328,42 @@ static void sock_drain_tx(int sockfd, SocksConfig *cfg)
     }
     if (npk == 0)
         return;
-    for (int k = 0; k < npk; k++) {
-        iovs[k].iov_base = (void *)ns_tx_item_buf(items[k]);
-        iovs[k].iov_len = lens[k];
-    }
-    /* drain the whole queue in uniform runs: a GSO cap of 65507 must not
-     * leave items behind, because their segment pointers go stale once
-     * receive_vpn/ns_tick drop+compact the retransmit table */
     for (int k = 0; k < npk;) {
         size_t run_total = lens[k];
         int j = k;
         while (j + 1 < npk && lens[j + 1] == lens[k]) {
-            if (run_total + lens[k] > 65507)
-                break;                 /* split oversized uniform run */
+            if (run_total + lens[k] > IWAN_UDP_GSO_UNIT ||
+                run_total + lens[k] > IWAN_GSO_UNIT_SAFE)
+                break;   /* split oversized uniform run (also keeps GSO
+                          * units under the loopback-safe ceiling) */
             run_total += lens[k];
             j++;
         }
-        socks_send_batch2(sockfd, cfg, iovs + k, msgs + k, j - k + 1,
-                          run_total, lens[k]);
+        for (int m = k; m <= j; m++) {
+            iovs[m].iov_base = (void *)ns_tx_item_buf(items[m]);
+            iovs[m].iov_len = lens[m];
+        }
+        int sent = socks_send_batch2(sockfd, cfg, iovs + k, msgs + k,
+                                     j - k + 1, run_total, lens[k]);
+        /* pace the aggregate send rate: see IWAN_SEND_PACING_PPS */
+        if (sent > 0)
+            pace_send(sent);
+        if (sent < j - k + 1) {
+            /* blocked: re-enqueue the unsent data segments (see above);
+             * the already-sent items of this run were sent in order and
+             * are gone — re-enqueue from the first unsent one on */
+            for (int m = k + sent; m < npk; m++)
+                if (items[m]->seg)
+                    ns_tx_rearm_seg(&g_ns, items[m]->seg);
+            return;
+        }
         k = j + 1;
     }
 }
 
 void send_vpn_keepalive(int sockfd, const SocksConfig *cfg,
                                uint64_t *last_ka) {
-    if (now_mono() - *last_ka < 10000)
+    if (now_mono() - *last_ka < SOCKS_KEEPALIVE_MS)
         return;
     buf_t p;
     buf_init(&p);
@@ -319,23 +432,18 @@ int receive_vpn(int sockfd, SocksConfig *cfg) {
             if (n < 8 || (rx_msgs[i].msg_hdr.msg_flags & MSG_TRUNC))
                 continue;
             uint8_t *b = rx_buf[i];
-            {
-                static int vx = -1;
-                if (vx < 0) {
-                    const char *ve = getenv("IWAN_RXDBG");
-                    vx = ve && *ve && strcmp(ve, "0") != 0 &&
-                         strcmp(ve, "false") != 0 && strcmp(ve, "off") != 0;
-                }
-                if (vx)
-                    fprintf(stderr, "VRX: n=%zu t=%u\n", n, b[0]);
-            }
+            if (dbg_env("IWAN_RXDBG"))
+                fprintf(stderr, "VRX: n=%zu t=%u\n", (size_t)rx_msgs[i].msg_len,
+                        b[0]);
             uint8_t t = b[0];
             uint16_t psid = (uint16_t)((b[2] << 8) | b[3]);
             uint32_t ptok = ((uint32_t)b[4] << 24) | ((uint32_t)b[5] << 16) |
                             ((uint32_t)b[6] << 8) | b[7];
             if (debug_enabled())
-                log_debug("VPN RX type=%u n=%zu sid=%u tok=%u (cfg sid=%u tok=%u)",
-                          t, n, psid, ptok, cfg->sid, cfg->token);
+                log_debug("VPN RX type=%u n=%zu sid=%u tok=****%04x "
+                          "(cfg sid=%u tok=****%04x)",
+                          t, n, psid, ptok & 0xFFFFu, cfg->sid,
+                          cfg->token & 0xFFFFu);
             if (psid != cfg->sid || ptok != cfg->token)
                 continue;
             if (t == PT_CLOSE) {
@@ -374,8 +482,14 @@ int receive_vpn(int sockfd, SocksConfig *cfg) {
                     sprintf(hex + i * 3, "%02x ", b[8 + i]);
                 log_debug("DATA decrypted (%zuB): %s...", plen, hex);
             }
-            if (!(plen != 0 && plen <= (size_t)cfg->mtu && (b[8] >> 4) == 4 &&
-                  plen >= 20))
+            uint32_t saddr, daddr;
+            if (plen < 20 || plen > (size_t)cfg->mtu ||
+                ipv4_pkt_ok(b + 8, plen, &saddr, &daddr) != 0)
+                continue;
+            /* M1: inner UDP packets whose dst port belongs to a pending
+             * tunnel DNS query are responses — consume them here, never
+             * hand them to the TCP stack */
+            if (dns_try_handle_response(b + 8, plen))
                 continue;
             ns_rx_packet(&g_ns, b + 8, plen);
         }
@@ -385,6 +499,8 @@ int receive_vpn(int sockfd, SocksConfig *cfg) {
 void run_socks(int sockfd, SocksConfig *cfg) {
     int listener;
     struct sockaddr_in laddr = cfg->listen_addr;
+
+    g_socks_cfg = cfg;
 
     listener = socket(AF_INET, SOCK_STREAM, 0);
     if (listener < 0) {
@@ -398,11 +514,26 @@ void run_socks(int sockfd, SocksConfig *cfg) {
         close(listener);
         return;
     }
-    if (laddr.sin_addr.s_addr != htonl(INADDR_LOOPBACK))
-        log_err("WARNING: SOCKS5 proxy bound to a non-loopback address; "
-                "it has no authentication and allows CONNECT to arbitrary "
-                "hosts — anyone reachable can use it as an open proxy");
-    if (listen(listener, 64) < 0) {
+    if (laddr.sin_addr.s_addr != htonl(INADDR_LOOPBACK)) {
+        if (cfg->allow_remote) {
+            if (cfg->auth_token)
+                log_err("WARNING: SOCKS5 proxy bound to a non-loopback "
+                        "address; remote clients are served only with the "
+                        "--socks-token password");
+            else
+                log_err("WARNING: SOCKS5 proxy bound to a non-loopback "
+                        "address but remote peers will still be rejected "
+                        "(no --socks-token set: an open proxy would be "
+                        "dangerous)");
+        } else {
+            log_err("error: refusing to bind SOCKS5 to non-loopback %s; "
+                    "pass --allow-remote to override",
+                    cfg->listen_str ? cfg->listen_str : "?");
+            close(listener);
+            return;
+        }
+    }
+    if (listen(listener, LISTEN_BACKLOG) < 0) {
         log_err("listen SOCKS5: %s", strerror(errno));
         close(listener);
         return;
@@ -413,10 +544,17 @@ void run_socks(int sockfd, SocksConfig *cfg) {
         /* high-BDP tunnel: default UDP buffers (~212KB) overflow once
          * the TCP window keeps >~150 segments in flight, silently
          * dropping packets at full rate */
-        int rbuf = 16 * 1024 * 1024;
+        int rbuf = SOCK_BUF_BYTES;
         setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &rbuf, sizeof rbuf);
         setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &rbuf, sizeof rbuf);
     }
+
+    /* M1: tunnel DNS shares the session socket and the server-assigned
+     * resolver (fallback 114.114.114.114 when the server sent none).
+     * Both are fixed before any DNS worker can spawn (workers are only
+     * created inside the event loop below). */
+    g_sockfd = sockfd;
+    dns_set_server(cfg->dns);
 
     /* Rust prints the configured address (config.listen), not the bound one */
     const char *listen_s = cfg->listen_str ? cfg->listen_str : "?";
@@ -424,8 +562,8 @@ void run_socks(int sockfd, SocksConfig *cfg) {
     ns_init(&g_ns, cfg->inner_ip, cfg->gateway, (uint16_t)cfg->mtu);
     {
         uint8_t oh[8];
-        pkhdr(cfg->encryption ? PT_DATA_ENC : PT_DATA, cfg->encryption,
-              cfg->sid, cfg->token, oh);
+        pkt_hdr(cfg->encryption ? PT_DATA_ENC : PT_DATA, cfg->encryption,
+                cfg->sid, cfg->token, oh);
         ns_set_outer(&g_ns, oh, cfg->xor_key);
     }
 
@@ -437,14 +575,17 @@ void run_socks(int sockfd, SocksConfig *cfg) {
     g_next_id = 1;
     g_dns_evfd = eventfd(0, EFD_NONBLOCK);
 
-    struct sigaction sa;
+    struct sigaction sa, old_int, old_term, old_pipe;
     memset(&sa, 0, sizeof sa);
     sa.sa_handler = on_sig;
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT, &sa, &old_int);
+    sigaction(SIGTERM, &sa, &old_term);
     /* a SOCKS client dying mid-write must surface EPIPE on the next
-     * write, not kill the proxy with the default SIGPIPE disposition */
+     * write, not kill the proxy with the default SIGPIPE disposition;
+     * save the previous disposition first so exit can restore it */
+    sigaction(SIGPIPE, NULL, &old_pipe);
     signal(SIGPIPE, SIG_IGN);
+    g_stop = 0;   /* run_socks must be re-entrant: clear any stale stop */
 
     log_info("SOCKS5 listening on %s", listen_s);
     if (debug_enabled())
@@ -454,7 +595,7 @@ void run_socks(int sockfd, SocksConfig *cfg) {
                   (cfg->gateway >> 24) & 0xff, (cfg->gateway >> 16) & 0xff,
                   (cfg->gateway >> 8) & 0xff, cfg->gateway & 0xff, cfg->mtu);
 
-    uint64_t last_ka = now_mono() - 10000;
+    uint64_t last_ka = now_mono() - SOCKS_KEEPALIVE_MS;
 
     while (!g_stop) {
         /* flush leftover tx items first: their segment pointers stay
@@ -486,7 +627,7 @@ void run_socks(int sockfd, SocksConfig *cfg) {
          * measured slower on both TX and RX (see receive_vpn /
          * socks_send_batch2 comments). */
         int64_t d = tick_ms;
-        int64_t kad = (int64_t)last_ka + 10000 - (int64_t)now_ms();
+        int64_t kad = (int64_t)last_ka + SOCKS_KEEPALIVE_MS - (int64_t)now_ms();
         int64_t ctd = next_conn_timeout_ms();
         if (kad < d)
             d = kad;
@@ -495,8 +636,8 @@ void run_socks(int sockfd, SocksConfig *cfg) {
         if (d < 1)
             d = 1;      /* never busy-poll: an expired RTO would otherwise
                          * make ns_tick return 0 and burn a core */
-        if (d > 1000)
-            d = 1000;   /* safety ceiling, not a polling tick */
+        if (d > POLL_CEIL_MS)
+            d = POLL_CEIL_MS;   /* safety ceiling, not a polling tick */
         wait_events(listener, sockfd, g_dns_evfd, (int)d);
         if (g_dns_evfd >= 0) {
             uint64_t ev;
@@ -504,6 +645,9 @@ void run_socks(int sockfd, SocksConfig *cfg) {
             (void)r;   /* EFD_NONBLOCK: drain the counter */
         }
     }
+
+    /* stop tunnel DNS: late workers must not send on the closing socket */
+    g_sockfd = -1;
 
     for (int i = 0; i < MAX_FLOWS; i++) {
         if (g_flows[i].active)
@@ -528,5 +672,11 @@ void run_socks(int sockfd, SocksConfig *cfg) {
         flow_free(&g_flows[i]);
     free(g_flows);
     g_flows = NULL;
+    /* restore the previous signal dispositions (single-call users see
+     * no difference; a second run_socks in the same process must not
+     * inherit stale handlers) */
+    sigaction(SIGINT, &old_int, NULL);
+    sigaction(SIGTERM, &old_term, NULL);
+    sigaction(SIGPIPE, &old_pipe, NULL);
     log_info("SOCKS5 stopped");
 }

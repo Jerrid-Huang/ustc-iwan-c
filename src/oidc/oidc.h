@@ -21,6 +21,7 @@
 #define OIDC_REDIRECT        "com.panabit.mobile://oauth2redirect"
 #define OIDC_SCOPE           "openid profile email offline_access"
 #define OIDC_APP_ID          "controller-ustc"
+#define OIDC_DEFAULT_PORT    6001
 
 typedef struct {
     char *domain;   /* owned */
@@ -60,6 +61,9 @@ char *oidc_urldec(const char *s, size_t n);
 void oidc_buf_cstr(buf_t *b);
 char *oidc_buf_to_cstr(buf_t *b);
 void oidc_esc_put(buf_t *b, const char *s);
+/* pull a named query parameter out of a URL/query string; returns a
+ * newly allocated URL-decoded value or NULL when absent */
+const char *oidc_url_param(const char *s, const char *name);
 char *oidc_extract_code(const char *s);
 char *oidc_id_token_username(Json *tok);
 
@@ -80,6 +84,16 @@ int  oidc_ctrl_post(const char *path, const char *body, const char *kp,
 char *oidc_build_dev_body(const char *type, const char *device_id,
                           const char *username);
 
+/* oidc_jwt.c */
+/* verify an id_token JWT (signature against the issuer's JWKS plus
+ * aud/iss/exp); returns 0 when valid, non-zero otherwise (reason on
+ * stderr). Fail-closed on network/parse errors. */
+int oidc_jwt_verify(const char *jwt, const char *aud, const char *iss);
+/* extract one base64url segment of a JWT (0=header, 1=payload, 2=sig),
+ * decoded to a NUL-terminated string; NULL on malformed input or
+ * allocation failure */
+char *oidc_jwt_segment(const char *jwt, int idx);
+
 /* oidc_select.c */
 void oidc_print_servers(Json *servers);
 Json *oidc_find_server(Json *servers, const char *spec);
@@ -88,5 +102,9 @@ Json *oidc_select_server(Json *servers);
 /* oidc_connect.c */
 void oidc_connect_server(const Opts *o, const Config *cf);
 void oidc_elevate_root(int argc, char **argv);
+/* server "port" value from a server entry: 1 = valid (out set),
+ * 0 = absent (caller uses OIDC_DEFAULT_PORT), -1 = not an integer in
+ * 1..65535 (raw receives the offending value). */
+int oidc_server_port(const Json *srv, uint16_t *out, double *raw);
 
 #endif

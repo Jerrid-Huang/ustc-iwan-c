@@ -1,3 +1,4 @@
+#include <arpa/inet.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -5,6 +6,73 @@
 #include "protocol.h"
 #include "route.h"
 #include "util.h"
+
+/* bring the tunnel interface up with an address and MTU (no routes):
+ * addr flush / link up / mtu / addr add. Shared by route_setup (which
+ * then installs routes) and the no-route-hijack pump path in proxy.c.
+ * Returns false when a step failed (state partially applied). */
+bool route_iface_up(const char *tun, const char *tun_ip, uint16_t mtu)
+{
+    char mtu_s[8], ip24[64];
+    snprintf(mtu_s, sizeof mtu_s, "%u", (unsigned)mtu);
+    snprintf(ip24, sizeof ip24, "%s/24", tun_ip);
+    char *a1[] = { "addr", "flush", "dev", (char *)tun, NULL };
+    if (!ip_run(a1)) {
+        log_err("iface up: addr flush dev %s failed", tun);
+        return false;
+    }
+    char *a2[] = { "link", "set", (char *)tun, "up", NULL };
+    if (!ip_run(a2)) {
+        log_err("iface up: link set %s up failed", tun);
+        return false;
+    }
+    char *a3[] = { "link", "set", "dev", (char *)tun, "mtu", mtu_s, NULL };
+    if (!ip_run(a3)) {
+        log_err("iface up: mtu %s on %s failed", mtu_s, tun);
+        return false;
+    }
+    char *a4[] = { "addr", "add", ip24, "dev", (char *)tun, NULL };
+    if (!ip_run(a4)) {
+        log_err("iface up: addr add %s dev %s failed", ip24, tun);
+        return false;
+    }
+    return true;
+}
+
+/* take the tunnel interface down and flush its addresses (no routes).
+ * Shared by route_teardown's tail and the no-route-hijack pump path. */
+void route_iface_down(const char *tun)
+{
+    char *d5[] = { "addr", "flush", "dev", (char *)tun, NULL };
+    ip_run(d5);
+    char *d6[] = { "link", "set", (char *)tun, "down", NULL };
+    ip_run(d6);
+}
+
+/* strict "A.B.C.D/n" parser: exact dotted-quad, 0 <= n <= 32, no
+ * trailing garbage. net is filled in host byte order (unmasked). */
+int cidr_parse(const char *s, uint32_t *net, int *prefix)
+{
+    const char *slash = strchr(s, '/');
+    if (slash == NULL || slash == s || strchr(slash + 1, '/') != NULL)
+        return -1;
+    size_t ilen = (size_t)(slash - s);
+    if (ilen == 0 || ilen >= 16)
+        return -1;
+    char ip[16];
+    memcpy(ip, s, ilen);
+    ip[ilen] = '\0';
+    uint8_t b[4];
+    if (!s2ip4(ip, b))
+        return -1;
+    char *pend;
+    long p = strtol(slash + 1, &pend, 10);
+    if (pend == slash + 1 || *pend != '\0' || p < 0 || p > 32)
+        return -1;
+    *net = ip4_u32(b);
+    *prefix = (int)p;
+    return 0;
+}
 
 static void copy_token(char *dst, size_t cap, const char *tok) {
     size_t n = strlen(tok);
@@ -97,26 +165,41 @@ done:
     return ok;
 }
 
-void route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
+bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
                  const char *srv, const char *ogw, const char *odev,
                  const slist_t *routes_with_default) {
-    char mtu_s[8], ip24[64], srv32[64];
-    snprintf(mtu_s, sizeof mtu_s, "%u", (unsigned)mtu);
-    snprintf(ip24, sizeof ip24, "%s/24", tun_ip);
+    char srv32[64];
+    struct in_addr s4;
+    bool srv_v4 = inet_pton(AF_INET, srv, &s4) == 1;
+    /* loopback servers (e.g. --server 127.0.0.1 when client and server
+     * share a host) are local: no /32 pin is needed, and the kernel
+     * rejects `ip route add 127.0.0.1/32 via <gw>` (EEXIST against the
+     * local table), which would roll back the whole setup */
+    bool srv_lo = srv_v4 && (ntohl(s4.s_addr) >> 24) == 127;
     snprintf(srv32, sizeof srv32, "%s/32", srv);
-
-    char *a1[] = { "addr", "flush", "dev", (char *)tun, NULL };
-    ip_run(a1);
-    char *a2[] = { "link", "set", (char *)tun, "up", NULL };
-    ip_run(a2);
-    char *a3[] = { "link", "set", "dev", (char *)tun, "mtu", mtu_s, NULL };
-    ip_run(a3);
-    char *a4[] = { "addr", "add", ip24, "dev", (char *)tun, NULL };
-    ip_run(a4);
-    char *a5[] = { "route", "add", srv32, "via", (char *)ogw, "dev",
-                   (char *)odev, NULL };
-    ip_run(a5);
     char *fc[] = { "route", "flush", "cache", NULL };
+
+    /* every step mutates system state, so a failure must stop the
+     * sequence and undo what was applied; a half-configured tunnel
+     * (e.g. routes replaced but no srv route) would otherwise claim to
+     * be up while the machine has no working path to the server */
+    if (!route_iface_up(tun, tun_ip, mtu)) {
+        route_iface_down(tun);   /* undo any partial bring-up */
+        return false;            /* nothing applied yet */
+    }
+    /* the server-pinned /32 only exists in the IPv4 table; an IPv6
+     * server address cannot be routed via the (IPv4) default gateway
+     * and would fail every `ip route add` attempt, so skip it */
+    if (srv_v4 && !srv_lo) {
+        char *a5[] = { "route", "add", srv32, "via", (char *)ogw, "dev",
+                       (char *)odev, NULL };
+        if (!ip_run(a5)) {
+            log_err("route_setup: route add %s via %s dev %s failed",
+                    srv32, ogw, odev);
+            route_iface_down(tun);
+            return false;
+        }
+    }
     ip_run(fc);
 
     for (size_t i = 0; i < routes_with_default->n; i++) {
@@ -126,19 +209,45 @@ void route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
             if (local_subnet(odev, loc)) {
                 char *r1[] = { "route", "replace", loc, "dev", (char *)odev,
                                NULL };
-                ip_run(r1);
+                if (!ip_run(r1)) {
+                    log_err("route_setup: route replace %s dev %s failed "
+                            "(local subnet must not route via the tunnel)",
+                            loc, odev);
+                    goto rollback_routes;
+                }
                 log_info("preserved local subnet %s", loc);
+            } else {
+                log_debug("route_setup: no local subnet on %s to preserve",
+                          odev);
             }
-            char *r2[] = { "route", "replace", "default", "dev", (char *)tun,
-                           NULL };
-            ip_run(r2);
+            char *r2[] = { "route", "replace", "default", "dev",
+                           (char *)tun, NULL };
+            if (!ip_run(r2)) {
+                log_err("route_setup: route replace default dev %s failed",
+                        tun);
+                goto rollback_routes;
+            }
         } else {
-            char *r3[] = { "route", "replace", (char *)c, "dev", (char *)tun,
-                           NULL };
-            ip_run(r3);
+            char *r3[] = { "route", "replace", (char *)c, "dev",
+                           (char *)tun, NULL };
+            if (!ip_run(r3)) {
+                log_err("route_setup: route replace %s dev %s failed", c,
+                        tun);
+                goto rollback_routes;
+            }
         }
         ip_run(fc);
     }
+    return true;
+
+rollback_routes:
+    /* the loop replaced at least one route: restore the pre-VPN default
+     * and drop every entry the loop may have installed (route_teardown
+     * tolerates entries that were never applied), then tear the device
+     * down below */
+    log_err("route_setup: rolling back applied routes");
+    route_teardown(tun, srv, ogw, odev, routes_with_default);
+    return false;
 }
 
 void route_teardown(const char *tun, const char *srv, const char *ogw,
@@ -147,23 +256,46 @@ void route_teardown(const char *tun, const char *srv, const char *ogw,
         const char *c = routes->v[i];
         if (strcmp(c, "default") == 0 || strcmp(c, "0.0.0.0/0") == 0) {
             char *d1[] = { "route", "del", "default", NULL };
-            ip_run(d1);
+            if (!ip_run(d1)) {
+                /* the default route was not ours to remove (never
+                 * replaced, or already gone): leave whatever is there
+                 * alone — deleting it here would strand the machine */
+                continue;
+            }
+            /* we removed it: restore the original via-gateway route */
             char *d2[] = { "route", "add", "default", "via", (char *)ogw,
                            "dev", (char *)odev, NULL };
-            ip_run(d2);
+            if (!ip_run(d2)) {
+                /* the original gateway may have vanished while the VPN
+                 * was up (wifi switch, NIC down): fall back to a
+                 * device-only default route so the machine is never
+                 * left with NO default route at all */
+                log_err("route_teardown: restore default via %s dev %s "
+                        "failed — trying device-only default",
+                        ogw, odev);
+                char *d2b[] = { "route", "replace", "default", "dev",
+                                (char *)odev, NULL };
+                if (!ip_run(d2b))
+                    log_err("route_teardown: NO default route after "
+                            "teardown; fix manually: ip route add "
+                            "default via %s dev %s", ogw, odev);
+            }
         } else {
             char *d3[] = { "route", "del", (char *)c, NULL };
-            ip_run(d3);
+            if (!ip_run(d3))
+                log_debug("route_teardown: route del %s: not present", c);
         }
     }
     char srv32[64];
+    struct in_addr s4;
     snprintf(srv32, sizeof srv32, "%s/32", srv);
-    char *d4[] = { "route", "del", srv32, NULL };
-    ip_run(d4);
-    char *d5[] = { "addr", "flush", "dev", (char *)tun, NULL };
-    ip_run(d5);
-    char *d6[] = { "link", "set", (char *)tun, "down", NULL };
-    ip_run(d6);
+    if (inet_pton(AF_INET, srv, &s4) == 1 &&
+        (ntohl(s4.s_addr) >> 24) != 127) {
+        char *d4[] = { "route", "del", srv32, NULL };
+        if (!ip_run(d4))
+            log_debug("route_teardown: route del %s: not present", srv32);
+    }
+    route_iface_down(tun);
     char *fc[] = { "route", "flush", "cache", NULL };
     ip_run(fc);
 }

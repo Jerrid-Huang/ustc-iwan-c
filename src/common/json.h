@@ -17,12 +17,14 @@ const char *json_str(const Json *j);    /* JSON_STR -> string, else NULL */
 double      json_num(const Json *j);    /* JSON_NUM -> value, else 0 */
 int         json_bool(const Json *j);   /* JSON_BOOL -> 1/0 */
 size_t      json_arr_len(const Json *j);
-Json       *json_arr_at(Json *j, size_t i);
-Json       *json_obj_get(Json *j, const char *key); /* NULL if missing */
+Json       *json_arr_at(const Json *j, size_t i);
+/* NULL if missing; duplicate keys: last occurrence wins (serde_json Map
+ * semantics) */
+Json       *json_obj_get(const Json *j, const char *key);
 /* deep lookup path "a.b.0.c": numeric segments index arrays */
-Json       *json_get(Json *root, const char *path);
+Json       *json_get(const Json *root, const char *path);
 /* convenience: string at path or NULL */
-const char *json_get_str(Json *root, const char *path);
+const char *json_get_str(const Json *root, const char *path);
 /* escape a string for embedding in JSON output. Caller frees. */
 char       *json_escape(const char *s);
 

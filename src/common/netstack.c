@@ -22,15 +22,24 @@
                                    * segment cost a full second on the
                                    * tunnel; a premature retransmit only
                                    * duplicates (peer dedups) */
+#define NS_RTO_MIN        200u
 #define NS_RTO_MAX        8000u
 #define NS_MAX_OUTSTANDING 128
 #define NS_MAX_SYN_TRIES  6
+#define NS_MAX_DATA_RETX  8       /* abort a conn after 8 retransmits of
+                                   * one data segment */
 #define NS_IDLE_TIMEOUT   120000u
 #define NS_KEEPALIVE_MS   30000u
 #define NS_KEEPALIVE_MAX  3
 #define NS_CONNECT_TIMEOUT 30000u
-#define NS_SEND_CAP       (64u * 1024u)
 #define NS_SEG_CAP        1460u
+#define NS_DELAYED_ACK_MS 40u     /* RFC 1122 delayed-ACK flush budget */
+#define NS_SYN_RETX_MS    1000u   /* SYN retransmit interval */
+#define NS_DUP_ACK_THRESH 3       /* dup ACKs before fast retransmit */
+#define NS_RTT_MAX_MS     10000u  /* RTT sample clamp (bogus samples) */
+#define NS_FLOWDBG_THROTTLE_MS 500u /* min gap between NSSEND dumps */
+#define NS_TICK_DEFAULT_MS 100    /* ns_tick: poll interval when idle */
+#define NS_TICK_MAX_MS    10000   /* ns_tick: cap on the next-tick value */
 
 #define TCP_FIN 0x01
 #define TCP_SYN 0x02
@@ -38,29 +47,40 @@
 #define TCP_PSH 0x08
 #define TCP_ACK 0x10
 
+/* offset of the inner TCP flags byte in an inline control packet:
+ * [8B outer VPN header][20B inner IP header][TCP flags at byte 13] */
+#define TX_CTL_FLAGS_OFF 41
+
 /* one TCP segment. The payload lives here from the moment the app data
  * is read (ns_send_reserve) until it is ACKed — it is never copied.
  * hdr = [8B outer VPN header][40B inner IP+TCP header]; the inner TCP
  * header's ack/win/checksum are refreshed on every (re)transmission. */
-#define SEG_HDR_LEN 48
 typedef struct {
     uint32_t seq;
     uint16_t len;              uint16_t rto;
     uint8_t  cnt;
     uint8_t  fin;
     uint8_t  sent;             uint64_t last_sent_ms;
-    uint8_t  hdr[SEG_HDR_LEN];
+    uint8_t  hdr[NS_SEG_HDR_LEN];
     _Alignas(8) uint8_t data[NS_SEG_CAP];   /* must sit at hdr+48: the
                                              * inner packet's payload is
-                                             * ip+40 == hdr+48; 16B
-                                             * alignment pushes data to
-                                             * offset 56 and skews every
-                                             * checksum by 8 bytes */
+                                             * ip+40 == hdr+48. The fields
+                                             * before hdr total 24 bytes,
+                                             * so data lands at 72;
+                                             * _Alignas(8) keeps it there,
+                                             * while 16B alignment would
+                                             * push it to 80 and skew
+                                             * every checksum by 8 bytes */
 } Seg;
 
 typedef struct {
-    Seg      segs[NS_MAX_OUTSTANDING];
-    Seg      fill;            int      nsegs;
+    /* ring of sealed segments plus the fill slot (ring tail, where app
+     * data accumulates) at segs[seg_head + nsegs]; that index reaches
+     * NS_MAX_OUTSTANDING (128) when the ring is full, so the array is
+     * sized +1 to keep it in-bounds — a separate `fill` field used to
+     * silently alias segs[128] */
+    Seg      segs[NS_MAX_OUTSTANDING + 1];
+    int      nsegs;
     int      seg_head;       uint8_t  fin_sent;
 } NsPriv;
 
@@ -113,11 +133,11 @@ static uint16_t conn_win(const TcpConn *c)
 {
     /* never underflow: once the rxq passes NS_WINDOW the peer must be
      * told 0 (and receive-side accounting must drop, see handle_rx),
-     * not a wrapped full window */
+     * not a wrapped full window. NS_WINDOW is 65535, so the free space
+     * can never exceed 0xFFFF — no clamp needed */
     if (c->rxq.len >= NS_WINDOW)
         return 0;
-    uint32_t free = NS_WINDOW - (uint32_t)c->rxq.len;
-    return free > 0xFFFF ? 0xFFFF : (uint16_t)free;
+    return (uint16_t)(NS_WINDOW - (uint32_t)c->rxq.len);
 }
 
 /* window field on the wire: actual bytes >> our shift */
@@ -169,7 +189,8 @@ static void b_reserve(buf_t *b, size_t extra) {
         ncap *= 2;
     nd = realloc(b->data, ncap);
     if (!nd)
-        return;
+        oom_abort();   /* same policy as buffer.c buf_ensure: an rxq that
+                        * cannot grow would silently lose ACKed data */
     b->data = nd;
     b->cap = ncap;
 }
@@ -178,19 +199,8 @@ static void b_put(buf_t *b, const void *p, size_t n) {
     if (n == 0)
         return;
     b_reserve(b, n);
-    if (b->cap - b->len < n)
-        return;
     memcpy(b->data + b->len, p, n);
     b->len += n;
-}
-
-static void b_consume(buf_t *b, size_t n) {
-    if (n >= b->len) {
-        b->len = 0;
-        return;
-    }
-    memmove(b->data, b->data + n, b->len - n);
-    b->len -= n;
 }
 
 static void b_reset(buf_t *b) {
@@ -213,15 +223,39 @@ static void conn_clear(TcpConn *c, int idx) {
     memset(p, 0, sizeof *p);
 }
 
-static void tx_enqueue(Netstack *ns, const Seg *seg, const uint8_t *pkt,
-                       size_t n) {
+/* Enqueue one TX item. Returns 1 when queued, 0 when the device queue is
+ * full of un-droppable control packets. Callers that ignore the value:
+ * a dropped segment-slot reference is recovered by the RTO retransmit
+ * loop and a dropped ACK is re-generated by the next event. The send
+ * paths (conn_send_new / conn_retransmit_loop) treat 0 as "not
+ * transmitted": they leave the segment unsent (sent=0, no backoff) and
+ * retry on the next tick. When full, the oldest pure-ACK control item
+ * (seg==NULL, flags byte at ctl[8+20+13]) is overwritten instead of
+ * evicting the head: ACKs are idempotent and re-issued constantly, so
+ * losing one is harmless, while a FIN/RST/SYN is emitted exactly once
+ * and evicting it would lose it forever (data segments live in the
+ * retransmit table, so their slot references are never touched here). */
+static int tx_enqueue(Netstack *ns, const Seg *seg, const uint8_t *pkt,
+                      size_t n) {
     int pos;
     TxItem *it;
     if (ns->tx_count >= NS_TX_MAX) {
-        ns->tx_head = (ns->tx_head + 1) % NS_TX_MAX;
-    } else
+        pos = -1;
+        for (int i = 0; i < NS_TX_MAX; i++) {
+            int p2 = (ns->tx_head + i) % NS_TX_MAX;
+            it = &ns->tx_queue[p2];
+            if (!it->seg &&
+                !(it->ctl[TX_CTL_FLAGS_OFF] & (TCP_FIN | TCP_RST | TCP_SYN))) {
+                pos = p2;          /* oldest pure-ACK control: droppable */
+                break;
+            }
+        }
+        if (pos < 0)
+            return 0;              /* nothing droppable: drop the new pkt */
+    } else {
         ns->tx_count++;
-    pos = (ns->tx_head + ns->tx_count - 1) % NS_TX_MAX;
+        pos = (ns->tx_head + ns->tx_count - 1) % NS_TX_MAX;
+    }
     it = &ns->tx_queue[pos];
     it->seg = seg;
     it->clen = 0;
@@ -229,17 +263,20 @@ static void tx_enqueue(Netstack *ns, const Seg *seg, const uint8_t *pkt,
         it->clen = (uint16_t)n;
         memcpy(it->ctl, pkt, n);
     }
+    return 1;
 }
 
 static void emit_tcp(Netstack *ns, TcpConn *c, uint8_t flags, uint32_t seq,
-                     uint32_t ack, const uint8_t *data, uint16_t dlen,
-                     uint16_t mss_opt) {
-    /* control packet: [8B outer VPN header][IP hdr][TCP hdr][opt/data].
-     * No payload on control packets, so no XOR needed. */
+                     uint32_t ack, uint16_t mss_opt) {
+    /* control packet: [8B outer VPN header][IP hdr][TCP hdr][opt].
+     * No app payload ever travels on this path (data segments use the
+     * zero-copy slot ring), but the packet IS XOR-encrypted whenever the
+     * outer header marks the session encrypted — same framing as data
+     * segments (see seg_seal). */
     uint8_t pkt[64];
     size_t olen = mss_opt ? (4 + 3 + 1) : 0;   /* MSS + WSCALE + NOP pad */
     size_t thlen = 20 + olen;
-    size_t iplen = 20 + thlen + dlen;
+    size_t iplen = 20 + thlen;
     uint8_t *ip = pkt + 8;
     uint8_t *t = ip + 20;
 
@@ -274,11 +311,9 @@ static void emit_tcp(Netstack *ns, TcpConn *c, uint8_t flags, uint32_t seq,
         t[26] = (uint8_t)NS_WSCALE;
         t[27] = 1;          /* NOP pad to 4-byte alignment */
     }
-    if (dlen)
-        memcpy(t + thlen, data, dlen);
 
     wr_be16(ip + 10, csum_fold(csum_buf(0, ip, 20)));
-    wr_be16(t + 16, tcp_checksum(c->lip, c->rip, t, thlen + dlen));
+    wr_be16(t + 16, tcp_checksum(c->lip, c->rip, t, thlen));
     if (ns->outer_hdr[1])          /* same framing as data segments:
                                     * outer header says encrypted */
         xor_crypt(ip, iplen, ns->xor_key, 8);
@@ -290,7 +325,11 @@ static bool validate_inner_ipv4(const uint8_t *pkt, size_t len, size_t mtu) {
     return len != 0 && len <= mtu && (pkt[0] >> 4) == 4 && len >= 20;
 }
 
-static uint8_t parse_wscale(const uint8_t *opts, size_t olen)
+/* walk the TCP option list; return the offset of the first option with
+ * kind `kind` and length `klen`, or -1 when absent or malformed. One
+ * boundary-checking implementation for all option kinds. */
+static long parse_tcp_opt(const uint8_t *opts, size_t olen, uint8_t kind,
+                          uint8_t klen)
 {
     size_t i = 0;
     while (i < olen) {
@@ -307,34 +346,22 @@ static uint8_t parse_wscale(const uint8_t *opts, size_t olen)
         l = opts[i + 1];
         if (i + l > olen)
             break;
-        if (k == 3 && l == 3)
-            return opts[i + 2] > 14 ? 14 : opts[i + 2];
+        if (k == kind && l == klen)
+            return (long)i;
         i += l;
     }
-    return 0;
+    return -1;
+}
+
+static uint8_t parse_wscale(const uint8_t *opts, size_t olen) {
+    long off = parse_tcp_opt(opts, olen, 3, 3);
+    uint8_t v = off < 0 ? 0 : opts[off + 2];
+    return v > 14 ? 14 : v;
 }
 
 static uint16_t parse_mss(const uint8_t *opts, size_t olen) {
-    size_t i = 0;
-    while (i < olen) {
-        uint8_t k = opts[i];
-        uint8_t l;
-        if (k == 0)
-            break;
-        if (k == 1) {
-            i++;
-            continue;
-        }
-        if (i + 1 >= olen || opts[i + 1] < 2)
-            break;
-        l = opts[i + 1];
-        if (i + l > olen)
-            break;
-        if (k == 2 && l == 4)
-            return rd_be16(opts + i + 2);
-        i += l;
-    }
-    return 0;
+    long off = parse_tcp_opt(opts, olen, 2, 4);
+    return off < 0 ? 0 : rd_be16(opts + off + 2);
 }
 
 /* segments are appended in seq order and ACKs are cumulative, so only a
@@ -358,8 +385,9 @@ static void seg_compact(NsPriv *p)
     memmove(p->segs, p->segs + p->seg_head,
             (size_t)(p->nsegs + 1) * sizeof *p->segs);
     /* stale slots behind the fill would otherwise be mistaken for fill
-     * data and re-sealed forever (duplicate transmission storm) */
-    for (int k = p->nsegs + 1; k < NS_MAX_OUTSTANDING; k++)
+     * data and re-sealed forever (duplicate transmission storm); the
+     * +1 bound also clears the tail slot segs[NS_MAX_OUTSTANDING] */
+    for (int k = p->nsegs + 1; k < NS_MAX_OUTSTANDING + 1; k++)
         p->segs[k].len = 0;
     p->seg_head = 0;
 }
@@ -372,7 +400,7 @@ static Seg *seg_at(NsPriv *p, int j)
     return &p->segs[pos];
 }
 
-static bool drop_acked(TcpConn *c, NsPriv *p) {
+static void drop_acked(TcpConn *c, NsPriv *p) {
     int i = 0;
     while (i < p->nsegs) {
         Seg *s = seg_at(p, i);
@@ -391,115 +419,104 @@ static bool drop_acked(TcpConn *c, NsPriv *p) {
         if (p->seg_head >= (NS_MAX_OUTSTANDING >> 1))
             seg_compact(p);
     }
-    return true;
 }
 
 
-static int rxdbg_on(void)
+/* refresh the dynamic TCP header fields (ack/win + incremental checksum)
+ * of a sealed segment before (re)transmission; the slot is encrypted, so
+ * the 40-byte inner header is decrypted, patched and re-encrypted */
+static void seg_refresh_hdr(Netstack *ns, TcpConn *c, Seg *s)
 {
-    static int rxc = -1;
-    if (rxc < 0) {
-        const char *v = getenv("IWAN_RXDBG");
-        rxc = v && *v && strcmp(v, "0") != 0 &&
-              strcmp(v, "false") != 0 && strcmp(v, "off") != 0;
+    uint8_t *ip = s->hdr + 8;
+    uint8_t *t = ip + 20;
+    uint16_t win = conn_win_field(c);
+    if (ns->outer_hdr[1])
+        xor_crypt(ip, 40, ns->xor_key, 8);
+    {
+        uint32_t old_ack = rd_be32(t + 8);
+        uint16_t old_win = rd_be16(t + 14);
+        wr_be32(t + 8, c->rcv_nxt);
+        wr_be16(t + 14, win);
+        seg_csum_inc(t + 16, c->rcv_nxt, old_ack, win, old_win);
     }
-    return rxc;
+    if (ns->outer_hdr[1])
+        xor_crypt(ip, 40, ns->xor_key, 8);
 }
 
-static void handle_rx(Netstack *ns, TcpConn *c, int idx, const uint8_t *t,
-                      size_t thlen, uint8_t flags, uint32_t seq, uint32_t ack,
-                      const uint8_t *payload, size_t paylen, uint64_t now) {
-    NsPriv *p = &priv[idx];
-    uint16_t win = rd_be16(t + 14);
+/* close when our FIN is ACKed and the peer's FIN is seen; `acked` is the
+ * ACK of the segment being processed (handle_rx) or snd_una (ns_tick) —
+ * they are equal at the respective decision points. local_fin is always
+ * set in FIN_WAIT (ns_close) and remote_fin always set in CLOSE_WAIT
+ * (handle_rx), so one predicate covers both sides of the close. */
+static bool conn_fin_done(const TcpConn *c, const NsPriv *p, uint32_t acked)
+{
+    return p->fin_sent && c->local_fin && c->remote_fin &&
+           (c->state == NS_FIN_WAIT || c->state == NS_CLOSE_WAIT) &&
+           (int32_t)(acked - c->snd_nxt) >= 0;
+}
 
-    if (c->state == NS_SYN_SENT) {
-        uint16_t om;
-        if (flags & TCP_RST) {
-            conn_clear(c, idx);
-            return;
-        }
-        if ((flags & (TCP_SYN | TCP_ACK)) != (TCP_SYN | TCP_ACK))
-            return;
-        if (ack != c->snd_nxt)
-            return;
-        om = parse_mss(t + 20, thlen - 20);
-        /* RFC 879 floor: an attacker-forged SYN+ACK must not collapse
-         * segmentation below the minimum viable MSS (DoS via mss=1) */
-        if (om >= 536 && om < c->mss)
-            c->mss = om;
-        c->peer_scale = parse_wscale(t + 20, thlen - 20);
-        c->rcv_nxt = seq + 1;
-        c->snd_una = ack;
-        c->remote_win = (uint32_t)win << c->peer_scale;
-        c->state = NS_ESTABLISHED;
-        c->state_ms = now;
-        c->last_rx_ms = now;
-        c->retx_cnt = 0;
-        c->retx_len = 0;
-        if (paylen > 0) {
-            if (c->rxq.len + paylen <= NS_WINDOW)
-                b_put(&c->rxq, payload, paylen);
-            else if (c->state != NS_CLOSE_WAIT)
-                return;   /* window closed: drop, peer retransmits */
-            c->rcv_nxt += (uint32_t)paylen;
-        }
-        emit_tcp(ns, c, TCP_ACK, c->snd_nxt, c->rcv_nxt, NULL, 0, 0);
-        return;
-    }
-
+/* SYN-SENT: accept the peer's SYN+ACK (RFC 793 rules), enter the
+ * established state and deliver any piggybacked payload */
+static void handle_rx_syn_sent(Netstack *ns, TcpConn *c, int idx,
+                               const uint8_t *t, size_t thlen, uint8_t flags,
+                               uint32_t seq, uint32_t ack,
+                               const uint8_t *payload, size_t paylen,
+                               uint64_t now)
+{
+    uint16_t om;
     if (flags & TCP_RST) {
-        /* RFC 5961: only accept an RST whose seq is inside the receive
-         * window; a forged RST with the flow's 4-tuple must not kill it */
-        if ((int32_t)(seq - c->rcv_nxt) < 0 ||
-            (int32_t)(seq - c->rcv_nxt) > (int32_t)NS_WINDOW)
+        /* RFC 793: in SYN-SENT an RST is acceptable only when its
+         * ACK echoes our SYN (ack == snd_nxt == ISS+1); a forged
+         * RST carrying the flow's 4-tuple must not abort the
+         * handshake */
+        if (ack != c->snd_nxt)
             return;
         conn_clear(c, idx);
         return;
     }
-    if (!(flags & TCP_ACK))
+    if ((flags & (TCP_SYN | TCP_ACK)) != (TCP_SYN | TCP_ACK))
         return;
-    /* diagnostic (IWAN_RXDBG=1): log every data/FIN segment with the
-     * connection state — used to find why a segment is dropped */
-    if (paylen > 0 || (flags & TCP_FIN)) {
-        static int rxc = -1;
-        if (rxc < 0) {
-            const char *v = getenv("IWAN_RXDBG");
-            rxc = v && *v && strcmp(v, "0") != 0 &&
-                  strcmp(v, "false") != 0 && strcmp(v, "off") != 0;
-        }
-        if (rxc)
-            fprintf(stderr,
-                    "RXDBG: conn=%d state=%d seq=%u rcv=%u ack=%u "
-                    "snd_una=%u flags=%02x pay=%zu\n",
-                    idx, c->state, seq, c->rcv_nxt, ack, c->snd_una, flags,
-                    paylen);
-    }
+    if (ack != c->snd_nxt)
+        return;
+    om = parse_mss(t + 20, thlen - 20);
+    /* RFC 879 floor: an attacker-forged SYN+ACK must not collapse
+     * segmentation below the minimum viable MSS (DoS via mss=1) */
+    if (om >= 536 && om < c->mss)
+        c->mss = om;
+    c->peer_scale = parse_wscale(t + 20, thlen - 20);
+    c->rcv_nxt = seq + 1;
+    c->snd_una = ack;
+    c->remote_win = (uint32_t)rd_be16(t + 14) << c->peer_scale;
+    c->state = NS_ESTABLISHED;
+    c->state_ms = now;
     c->last_rx_ms = now;
-    c->keepalive_cnt = 0;
-    c->keepalive_ms = 0;
-    c->remote_win = (uint32_t)win << c->peer_scale;
-    if (paylen == 0 && ack == c->snd_una && !(flags & (TCP_SYN | TCP_FIN)) &&
-        c->state != NS_SYN_SENT && c->snd_una != 0) {
-        /* fast retransmit: 3 duplicate ACKs -> resend the oldest
-         * unacked segment now instead of waiting for its RTO */
-        if (++c->dup_acks >= 3 && p->nsegs > 0) {
+    c->syn_retx_cnt = 0;
+    if (paylen > 0) {
+        if (c->rxq.len + paylen <= NS_WINDOW)
+            b_put(&c->rxq, payload, paylen);
+        else
+            return;   /* window closed: drop, peer retransmits */
+        c->rcv_nxt += (uint32_t)paylen;
+    }
+    emit_tcp(ns, c, TCP_ACK, c->snd_nxt, c->rcv_nxt, 0);
+}
+
+/* process the ACK of an established connection: fast retransmit on
+ * NS_DUP_ACK_THRESH duplicate ACKs, otherwise advance snd_una with RTT
+ * sampling; returns the effective ACK (clamped to the last transmitted
+ * byte) */
+static uint32_t handle_rx_ack(Netstack *ns, TcpConn *c, NsPriv *p,
+                              uint8_t flags, uint32_t seq, uint32_t ack,
+                              size_t paylen, uint64_t now)
+{
+    if (paylen == 0 && ack == c->snd_una &&
+        !(flags & (TCP_SYN | TCP_FIN)) && c->snd_una != 0) {
+        /* fast retransmit: NS_DUP_ACK_THRESH duplicate ACKs -> resend
+         * the oldest unacked segment now instead of waiting for its RTO */
+        if (++c->dup_acks >= NS_DUP_ACK_THRESH && p->nsegs > 0) {
             Seg *s0 = seg_at(p, 0);
             if (s0->sent) {
-                uint8_t *ip = s0->hdr + 8;
-                uint8_t *t = ip + 20;
-                uint16_t win = conn_win_field(c);
-                if (ns->outer_hdr[1])
-                    xor_crypt(ip, 40, ns->xor_key, 8);
-                {
-                    uint32_t old_ack = rd_be32(t + 8);
-                    uint16_t old_win = rd_be16(t + 14);
-                    wr_be32(t + 8, c->rcv_nxt);
-                    wr_be16(t + 14, win);
-                    seg_csum_inc(t + 16, c->rcv_nxt, old_ack, win,
-                                 old_win);
-                }
-                if (ns->outer_hdr[1])
-                    xor_crypt(ip, 40, ns->xor_key, 8);
+                seg_refresh_hdr(ns, c, s0);
                 tx_enqueue(ns, s0, NULL, 0);
                 s0->last_sent_ms = now;
                 s0->rto = c->rto;
@@ -507,7 +524,9 @@ static void handle_rx(Netstack *ns, TcpConn *c, int idx, const uint8_t *t,
                 c->dup_acks = 0;
             }
         }
-    } else if ((int32_t)(ack - c->snd_una) > 0) {
+        return ack;
+    }
+    if ((int32_t)(ack - c->snd_una) > 0) {
         /* a forged ACK beyond the last transmitted byte would make
          * drop_acked discard never-sent segments and freeze TX
          * (in_flight = sent_nxt - snd_una underflow); RFC 793 requires
@@ -525,7 +544,7 @@ static void handle_rx(Netstack *ns, TcpConn *c, int idx, const uint8_t *t,
             if (s2->sent && s2->last_sent_ms > 0 &&
                 (int32_t)(ack - c->snd_una) >= 0) {
                 uint32_t rtt = (uint32_t)(now - s2->last_sent_ms);
-                if (rtt < 10000) {
+                if (rtt < NS_RTT_MAX_MS) {
                     uint32_t sr = c->srtt ? c->srtt : rtt;
                     uint32_t var = c->rttvar ? c->rttvar : sr / 2;
                     c->srtt = (uint16_t)((sr * 7 + rtt) / 8);
@@ -533,7 +552,7 @@ static void handle_rx(Netstack *ns, TcpConn *c, int idx, const uint8_t *t,
                            (sr > rtt ? sr - rtt : rtt - sr)) / 4;
                     c->rttvar = (uint16_t)var;
                     uint32_t rto = c->srtt + 4u * var;
-                    c->rto = (uint16_t)(rto < 200 ? 200
+                    c->rto = (uint16_t)(rto < NS_RTO_MIN ? NS_RTO_MIN
                                         : (rto > NS_RTO_MAX ? NS_RTO_MAX
                                                             : rto));
                 }
@@ -542,24 +561,21 @@ static void handle_rx(Netstack *ns, TcpConn *c, int idx, const uint8_t *t,
         }
         c->snd_una = ack;
     }
-    drop_acked(c, p);
-    /* FIN_WAIT must NOT close on the FIN-ACK alone: the peer's data and
-     * FIN may still be in flight (half-close, e.g. an app that shuts
-     * down its write side while waiting for a reply). Closing here would
-     * free the conn and let the reply be RST'd away. Stay in FIN_WAIT
-     * until the peer's FIN is seen (remote_fin). */
-    if (p->fin_sent && (int32_t)(ack - c->snd_nxt) >= 0 &&
-        ((c->state == NS_FIN_WAIT && c->remote_fin) ||
-         (c->state == NS_CLOSE_WAIT && c->local_fin))) {
-        c->state = NS_CLOSED;
-        return;
-    }
+    return ack;
+}
+
+/* deliver in-order payload to the rxq, handle FIN, and schedule the
+ * delayed ACK; out-of-order segments get an immediate ACK */
+static void handle_rx_data(Netstack *ns, TcpConn *c, int idx, uint8_t flags,
+                           uint32_t seq, const uint8_t *payload,
+                           size_t paylen, uint64_t now)
+{
     if (seq == c->rcv_nxt) {
         if (paylen > 0 && c->state != NS_CLOSE_WAIT) {
             if (c->rxq.len + paylen <= NS_WINDOW) {
                 b_put(&c->rxq, payload, paylen);
                 c->rcv_nxt += (uint32_t)paylen;
-                if (rxdbg_on())
+                if (dbg_env("IWAN_RXDBG"))
                     fprintf(stderr, "RXDBG: conn=%d data->rxq pay=%zu "
                             "rxq=%zu state=%d\n", idx, paylen, c->rxq.len,
                             c->state);
@@ -573,21 +589,77 @@ static void handle_rx(Netstack *ns, TcpConn *c, int idx, const uint8_t *t,
                     c->state = NS_CLOSE_WAIT;
                 c->remote_fin = true;
                 c->rcv_nxt += 1;
-                emit_tcp(ns, c, TCP_ACK, c->snd_nxt, c->rcv_nxt, NULL, 0, 0);
+                emit_tcp(ns, c, TCP_ACK, c->snd_nxt, c->rcv_nxt, 0);
             }
         } else if (paylen > 0) {
             if (!c->ack_pending)
                 c->ack_ms = now;
             c->ack_pending = 1;
-            if (++c->rx_segs >= 2) {     /* RFC 1122: ACK every 2nd seg */
+            /* ACK EVERY segment immediately: RFC 1122's every-2nd
+             * delayed ACK is a bulk-transfer bandwidth optimization, but
+             * on a ~2ms-RTT tunnel it is pure latency — after an RTO the
+             * peer's cwnd is 1, so every single-segment burst would wait
+             * the full delayed-ACK window (40ms) per segment, crawling
+             * at ~35KB/s instead of recovering. The extra ACK packets
+             * are negligible on the tunnel. The delayed-ACK flush in
+             * ns_tick stays as a safety net (e.g. a burst ending on an
+             * odd segment). */
+            if (++c->rx_segs >= 1) {     /* immediate ACK, every segment */
                 c->rx_segs = 0;
-                emit_tcp(ns, c, TCP_ACK, c->snd_nxt, c->rcv_nxt, NULL, 0, 0);
+                emit_tcp(ns, c, TCP_ACK, c->snd_nxt, c->rcv_nxt, 0);
                 c->ack_pending = 0;
             }
         }
     } else {
-        emit_tcp(ns, c, TCP_ACK, c->snd_nxt, c->rcv_nxt, NULL, 0, 0);
+        emit_tcp(ns, c, TCP_ACK, c->snd_nxt, c->rcv_nxt, 0);
     }
+}
+
+static void handle_rx(Netstack *ns, TcpConn *c, int idx, const uint8_t *t,
+                      size_t thlen, uint8_t flags, uint32_t seq, uint32_t ack,
+                      const uint8_t *payload, size_t paylen, uint64_t now) {
+    NsPriv *p = &priv[idx];
+
+    if (c->state == NS_SYN_SENT) {
+        handle_rx_syn_sent(ns, c, idx, t, thlen, flags, seq, ack,
+                           payload, paylen, now);
+        return;
+    }
+    if (flags & TCP_RST) {
+        /* RFC 5961: only accept an RST whose seq is inside the receive
+         * window; a forged RST with the flow's 4-tuple must not kill it */
+        if ((int32_t)(seq - c->rcv_nxt) < 0 ||
+            (int32_t)(seq - c->rcv_nxt) > (int32_t)NS_WINDOW)
+            return;
+        conn_clear(c, idx);
+        return;
+    }
+    if (!(flags & TCP_ACK))
+        return;
+    /* diagnostic (IWAN_RXDBG=1): log every data/FIN segment with the
+     * connection state — used to find why a segment is dropped */
+    if ((paylen > 0 || (flags & TCP_FIN)) && dbg_env("IWAN_RXDBG"))
+        fprintf(stderr,
+                "RXDBG: conn=%d state=%d seq=%u rcv=%u ack=%u "
+                "snd_una=%u flags=%02x pay=%zu\n",
+                idx, c->state, seq, c->rcv_nxt, ack, c->snd_una, flags,
+                paylen);
+    c->last_rx_ms = now;
+    c->keepalive_cnt = 0;
+    c->keepalive_ms = 0;
+    c->remote_win = (uint32_t)rd_be16(t + 14) << c->peer_scale;
+    ack = handle_rx_ack(ns, c, p, flags, seq, ack, paylen, now);
+    drop_acked(c, p);
+    /* FIN_WAIT must NOT close on the FIN-ACK alone: the peer's data and
+     * FIN may still be in flight (half-close, e.g. an app that shuts
+     * down its write side while waiting for a reply). Closing here would
+     * free the conn and let the reply be RST'd away. Stay in FIN_WAIT
+     * until the peer's FIN is seen (remote_fin). */
+    if (conn_fin_done(c, p, ack)) {
+        c->state = NS_CLOSED;
+        return;
+    }
+    handle_rx_data(ns, c, idx, flags, seq, payload, paylen, now);
 }
 
 void ns_init(Netstack *ns, uint32_t inner_ip, uint32_t gw, uint16_t mtu) {
@@ -630,10 +702,9 @@ int ns_connect(Netstack *ns, uint16_t lport, uint32_t rip, uint16_t rport) {
     c->rcv_nxt = 0;
     c->remote_fin = false;
     c->local_fin = false;
-    c->retx_seq = isn;
-    c->retx_len = 0;
-    c->retx_ms = now;
-    c->retx_cnt = 1;
+    c->syn_retx_seq = isn;
+    c->syn_retx_ms = now;
+    c->syn_retx_cnt = 1;
     c->state_ms = now;
     c->last_rx_ms = now;
     c->remote_win = NS_WINDOW;
@@ -641,7 +712,7 @@ int ns_connect(Netstack *ns, uint16_t lport, uint32_t rip, uint16_t rport) {
     mss = (int)ns->mtu - 40;
     c->mss = (uint16_t)(mss < 536 ? 536 : (mss > 1460 ? 1460 : mss));
 
-    emit_tcp(ns, c, TCP_SYN, isn, 0, NULL, 0, c->mss);
+    emit_tcp(ns, c, TCP_SYN, isn, 0, c->mss);
     c->snd_nxt = isn + 1u;
     c->sent_nxt = isn + 1u;       return idx;
 }
@@ -661,13 +732,7 @@ NsState ns_state(const TcpConn *c) {
  * sealed-but-unsent segments, tx-queue overflow). Cheap when disabled. */
 void ns_dump_conn(const Netstack *ns, int idx)
 {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *v = getenv("IWAN_FLOWDBG");
-        cached = v && *v && strcmp(v, "0") != 0 &&
-                 strcmp(v, "false") != 0 && strcmp(v, "off") != 0;
-    }
-    if (!cached || idx < 0 || idx >= NS_MAX_CONN)
+    if (!dbg_env("IWAN_FLOWDBG") || idx < 0 || idx >= NS_MAX_CONN)
         return;
     const TcpConn *c = &ns->conns[idx];
     const NsPriv *p = &priv[idx];
@@ -721,7 +786,10 @@ static void seg_seal(Netstack *ns, TcpConn *c, NsPriv *p, uint8_t extra)
     wr_be32(t + 8, c->rcv_nxt);
     t[12] = 0x50;
     t[13] = (uint8_t)(TCP_ACK | extra);
-    wr_be16(t + 14, conn_win(c));
+    wr_be16(t + 14, conn_win_field(c));   /* scaled, like every other
+                                           * transmit path — the raw
+                                           * window would overstate by
+                                           * up to 64x with WSCALE=6 */
     wr_be16(t + 16, 0);      /* stale slot reuse would leak into csum */
     wr_be16(t + 18, 0);      /* and so would stale urg */
     wr_be16(t + 16, tcp_checksum(c->lip, c->rip, t, 20 + s->len));
@@ -793,25 +861,28 @@ int ns_send_reservev(Netstack *ns, int idx, struct iovec *iov, int maxn)
 
 void ns_send_commit(Netstack *ns, int idx, size_t n)
 {
-    TcpConn *c = &ns->conns[idx];
-    NsPriv *p = &priv[idx];
-    Seg *s = &p->segs[p->seg_head + p->nsegs];
+    TcpConn *c;
+    NsPriv *p;
+    Seg *s;
+    size_t room;
+
+    /* same bounds/state guards as every sibling entry point: a stale idx
+     * after ns_abort/slot reuse must not land on an unrelated conn */
+    if (idx < 0 || idx >= NS_MAX_CONN)
+        return;
+    c = &ns->conns[idx];
+    if (c->state == NS_CLOSED || c->state == NS_FIN_WAIT)
+        return;
+    p = &priv[idx];
+    if (p->nsegs >= NS_MAX_OUTSTANDING)
+        return;
+    s = &p->segs[p->seg_head + p->nsegs];
+    room = c->mss - s->len;
+    if (n > room)            /* commit must never exceed the reserved room */
+        n = room;
     s->len += (uint16_t)n;
     if (s->len >= c->mss)
-        seg_seal(ns, c, p, 0);             }
-
-size_t ns_recv(Netstack *ns, int idx, uint8_t *out, size_t n) {
-    buf_t *b;
-    if (idx < 0 || idx >= NS_MAX_CONN)
-        return 0;
-    b = &ns->conns[idx].rxq;
-    if (b->len == 0 || n == 0)
-        return 0;
-    if (n > b->len)
-        n = b->len;
-    memcpy(out, b->data, n);
-    b_consume(b, n);
-    return n;
+        seg_seal(ns, c, p, 0);
 }
 
 void ns_close(Netstack *ns, int idx) {
@@ -836,7 +907,7 @@ void ns_abort(Netstack *ns, int idx) {
         return;
     }
     if (c->state != NS_SYN_SENT)
-        emit_tcp(ns, c, TCP_RST | TCP_ACK, c->snd_nxt, c->rcv_nxt, NULL, 0, 0);
+        emit_tcp(ns, c, TCP_RST | TCP_ACK, c->snd_nxt, c->rcv_nxt, 0);
     conn_clear(c, idx);
 }
 
@@ -856,6 +927,10 @@ static bool rx_validate_ipv4(Netstack *ns, const uint8_t *pkt, size_t n,
     total = rd_be16(pkt + 2);
     if (total < 20 || total > n)
         return false;
+    /* a header longer than the whole datagram is bogus; reject it before
+     * spending a checksum pass over the (claimed) header bytes */
+    if (total < *ihl + 20)
+        return false;
     if ((pkt[6] & 0x20) || (((pkt[6] & 0x1f) << 8) | pkt[7]) != 0)
         return false;
     if (csum_fold(csum_buf(0, pkt, *ihl)) != 0) {
@@ -863,8 +938,6 @@ static bool rx_validate_ipv4(Netstack *ns, const uint8_t *pkt, size_t n,
         return false;
     }
     *eff = total;
-    if (*eff < *ihl + 20)
-        return false;
     *t = pkt + *ihl;
     *thlen = (size_t)((*t)[12] >> 4) * 4;
     if (*thlen < 20 || *ihl + *thlen > *eff)
@@ -945,7 +1018,7 @@ static void rx_reject_unknown(Netstack *ns, uint32_t dip, uint32_t sip,
     tmp.rip = sip;
     tmp.lport = dport;
     tmp.rport = sport;
-    emit_tcp(ns, &tmp, TCP_RST | TCP_ACK, 0, consumed, NULL, 0, 0);
+    emit_tcp(ns, &tmp, TCP_RST | TCP_ACK, 0, consumed, 0);
 }
 
 void ns_rx_packet(Netstack *ns, const uint8_t *pkt, size_t n) {
@@ -977,23 +1050,23 @@ void ns_rx_packet(Netstack *ns, const uint8_t *pkt, size_t n) {
               paylen, now);
 }
 
-/* retransmit the SYN on its 1s timer; return ms until this conn needs a tick
- * again, or -1 when it was aborted (tries exhausted) */
+/* retransmit the SYN on its NS_SYN_RETX_MS timer; return ms until this
+ * conn needs a tick again, or -1 when it was aborted (tries exhausted) */
 static int64_t conn_syn_retransmit(Netstack *ns, TcpConn *c, int idx,
                                    uint64_t now) {
-    uint64_t deadline = c->retx_ms + 1000;
+    uint64_t deadline = c->syn_retx_ms + NS_SYN_RETX_MS;
     int64_t conn_d = (int64_t)(c->state_ms + NS_CONNECT_TIMEOUT - now);
 
     if (now < deadline)
         return conn_d < (int64_t)(deadline - now) ? conn_d
                                                   : (int64_t)(deadline - now);
-    c->retx_cnt++;
-    if (c->retx_cnt > NS_MAX_SYN_TRIES) {
+    c->syn_retx_cnt++;
+    if (c->syn_retx_cnt > NS_MAX_SYN_TRIES) {
         ns_abort(ns, idx);
         return -1;
     }
-    emit_tcp(ns, c, TCP_SYN, c->retx_seq, 0, NULL, 0, c->mss);
-    c->retx_ms = now;
+    emit_tcp(ns, c, TCP_SYN, c->syn_retx_seq, 0, c->mss);
+    c->syn_retx_ms = now;
     return conn_d;
 }
 
@@ -1015,23 +1088,13 @@ static bool conn_retransmit_loop(Netstack *ns, TcpConn *c, NsPriv *p, int idx,
          * permanently even though in-flight was well within the window.
          * Retransmissions are never window-limited in TCP: the data was
          * already sent within the window when first transmitted. */
-        {
-            uint8_t *ip = s->hdr + 8;
-            uint8_t *t = ip + 20;
-            uint16_t win = conn_win_field(c);
-            if (ns->outer_hdr[1])
-                xor_crypt(ip, 40, ns->xor_key, 8);
-            {
-                uint32_t old_ack = rd_be32(t + 8);
-                uint16_t old_win = rd_be16(t + 14);
-                wr_be32(t + 8, c->rcv_nxt);
-                wr_be16(t + 14, win);
-                seg_csum_inc(t + 16, c->rcv_nxt, old_ack, win, old_win);
-            }
-            if (ns->outer_hdr[1])
-                xor_crypt(ip, 40, ns->xor_key, 8);
-        }
-        tx_enqueue(ns, s, NULL, 0);
+        seg_refresh_hdr(ns, c, s);
+        /* queue full: defer the retransmit without advancing the
+         * backoff or retransmit count — nothing was transmitted this
+         * tick, so counting it would double the RTO for a segment the
+         * peer never even saw repeated */
+        if (!tx_enqueue(ns, s, NULL, 0))
+            continue;
         s->last_sent_ms = now;
         s->rto = (uint16_t)((int)s->rto * 2 > (int)NS_RTO_MAX
                                ? (int)NS_RTO_MAX
@@ -1040,20 +1103,12 @@ static bool conn_retransmit_loop(Netstack *ns, TcpConn *c, NsPriv *p, int idx,
         /* diagnostic (IWAN_RETX=1, independent of IWAN_DEBUG which slows
          * the data path): first retransmit of each segment (cnt starts
          * at 1 on the initial send, so the first retransmit is cnt==2) */
-        if (s->cnt == 2) {
-            static int cached = -1;
-            if (cached < 0) {
-                const char *v = getenv("IWAN_RETX");
-                cached = v && *v && strcmp(v, "0") != 0 &&
-                         strcmp(v, "false") != 0 && strcmp(v, "off") != 0;
-            }
-            if (cached)
-                fprintf(stderr, "NS RETX: conn=%d seq=%u len=%u rto=%u "
-                        "win=%u inflight=%u\n", idx, s->seq, s->len, s->rto,
-                        c->remote_win,
-                        (unsigned)(c->sent_nxt - c->snd_una));
-        }
-        if (s->cnt > 8) {
+        if (s->cnt == 2 && dbg_env("IWAN_RETX"))
+            fprintf(stderr, "NS RETX: conn=%d seq=%u len=%u rto=%u "
+                    "win=%u inflight=%u\n", idx, s->seq, s->len, s->rto,
+                    c->remote_win,
+                    (unsigned)(c->sent_nxt - c->snd_una));
+        if (s->cnt > NS_MAX_DATA_RETX) {
             ns_abort(ns, idx);
             return true;
         }
@@ -1062,7 +1117,7 @@ static bool conn_retransmit_loop(Netstack *ns, TcpConn *c, NsPriv *p, int idx,
 }
 
 /* build and send fresh segments (pending data, then FIN) up to the
- * outstanding/window limits */
+ * outstanding/window limits; a pending FIN goes out even at zero window */
 static void conn_send_new(Netstack *ns, TcpConn *c, NsPriv *p, uint64_t now) {
     /* in-flight = TRANSMITTED-but-unacked bytes (seal reserves seq space
      * in snd_nxt; counting sealed-but-unsent would fake a full window) */
@@ -1082,27 +1137,25 @@ static void conn_send_new(Netstack *ns, TcpConn *c, NsPriv *p, uint64_t now) {
         s = seg_at(p, j);
         if (s->sent)
             continue;
-        if (in_flight >= c->remote_win)
-            break;
-        /* refresh dynamic TCP fields (ack/win) + checksum; the slot is
-         * encrypted, so decrypt the header, patch, re-encrypt */
-        {
-            uint8_t *ip = s->hdr + 8;
-            uint8_t *t = ip + 20;
-            uint16_t win = conn_win_field(c);
-            if (ns->outer_hdr[1])
-                xor_crypt(ip, 40, ns->xor_key, 8);
-            {
-                uint32_t old_ack = rd_be32(t + 8);
-                uint16_t old_win = rd_be16(t + 14);
-                wr_be32(t + 8, c->rcv_nxt);
-                wr_be16(t + 14, win);
-                seg_csum_inc(t + 16, c->rcv_nxt, old_ack, win, old_win);
-            }
-            if (ns->outer_hdr[1])
-                xor_crypt(ip, 40, ns->xor_key, 8);
-        }
-        tx_enqueue(ns, s, NULL, 0);
+        if (in_flight >= c->remote_win && !s->fin)
+            continue;   /* zero window: hold data, but a FIN still goes
+                         * out — RFC 9293 permits the FIN even when the
+                         * advertised window is exhausted (it consumes
+                         * one byte of sequence space beyond the window);
+                         * scanning on lets a trailing FIN past queued
+                         * data that must wait for the window */
+        seg_refresh_hdr(ns, c, s);
+        /* device queue full: leave the segment unsent (sent stays 0) and
+         * retry on the next tick. Marking it sent unconditionally was
+         * the ul-4 stall: with 4 conns x 128 segments against a
+         * 128-slot device queue, conns 2..4 lost their enqueue (the
+         * first conn had filled the queue), yet the loop still set
+         * sent=1 and advanced sent_nxt — the send loop then skipped the
+         * segment forever (sent is sticky) and only the initial-RTO
+         * retransmit (250ms per ring) flushed it, serializing the four
+         * flows and capping the upload at ~170 Mbit/s. */
+        if (!tx_enqueue(ns, s, NULL, 0))
+            continue;
         s->sent = 1;
         s->last_sent_ms = now;
         s->rto = c->rto;
@@ -1114,32 +1167,38 @@ static void conn_send_new(Netstack *ns, TcpConn *c, NsPriv *p, uint64_t now) {
     /* diagnostic (IWAN_FLOWDBG=1): nothing sent while data is queued —
      * either the window is closed (in_flight >= remote_win) or every
      * slot is marked sent with in-flight 0 (state corruption). Throttled
-     * to 500ms so a stuck upload prints the reason without flooding. */
-    if (!sent_any && p->nsegs > 0) {
-        static int cached = -1;
-        static uint64_t last_print[NS_MAX_CONN];
-        if (cached < 0) {
-            const char *v = getenv("IWAN_FLOWDBG");
-            cached = v && *v && strcmp(v, "0") != 0 &&
-                     strcmp(v, "false") != 0 && strcmp(v, "off") != 0;
-        }
-        if (cached && now - last_print[idx] >= 500) {
-            last_print[idx] = now;
-            Seg *s0 = seg_at(p, 0);
-            fprintf(stderr,
-                    "NSSEND: conn=%d nsegs=%u sent0=%d inflight=%u "
-                    "rwin=%u scale=%u una=%u nxt=%u sent=%u srtt=%u "
-                    "rto=%u\n",
-                    idx, p->nsegs, s0->sent, in_flight, c->remote_win,
-                    c->peer_scale, c->snd_una, c->snd_nxt, c->sent_nxt,
-                    c->srtt, c->rto);
-        }
+     * to NS_FLOWDBG_THROTTLE_MS so a stuck upload prints the reason
+     * without flooding. */
+    static uint64_t last_print[NS_MAX_CONN];
+    if (!sent_any && p->nsegs > 0 && dbg_env("IWAN_FLOWDBG") &&
+        now - last_print[idx] >= NS_FLOWDBG_THROTTLE_MS) {
+        last_print[idx] = now;
+        Seg *s0 = seg_at(p, 0);
+        fprintf(stderr,
+                "NSSEND: conn=%d nsegs=%u sent0=%d inflight=%u "
+                "rwin=%u scale=%u una=%u nxt=%u sent=%u srtt=%u "
+                "rto=%u\n",
+                idx, p->nsegs, s0->sent, in_flight, c->remote_win,
+                c->peer_scale, c->snd_una, c->snd_nxt, c->sent_nxt,
+                c->srtt, c->rto);
     }
-        if (c->local_fin && !p->fin_sent && p->nsegs < NS_MAX_OUTSTANDING &&
-        in_flight < c->remote_win) {
-        emit_tcp(ns, c, TCP_ACK | TCP_FIN, c->snd_nxt, c->rcv_nxt, NULL, 0, 0);
-        p->fin_sent = 1;
-        c->snd_nxt += 1;
+    /* independent FIN: enter it into the retransmit table as a zero-length
+     * segment (seg_seal) instead of a fire-and-forget control packet, so a
+     * lost FIN is retransmitted on RTO and a zero advertised window
+     * cannot strand it. fin_sent is set at seal time — safe because
+     * the segment is retried until ACKed or the conn aborts. If the fill
+     * slot still holds data the FIN must not overtake it in seq space;
+     * that data seals (carrying the FIN) once the window reopens. */
+    if (c->local_fin && !p->fin_sent && p->nsegs < NS_MAX_OUTSTANDING) {
+        /* ACKs may have advanced seg_head without triggering compaction
+         * (seg_head < 64), making the ring tail alias the out-of-ring
+         * fill slot (seg_head + nsegs == 128); compact so the FIN lands
+         * in a slot seg_at can actually reach */
+        if (p->seg_head > 0 && p->seg_head + p->nsegs >= NS_MAX_OUTSTANDING)
+            seg_compact(p);
+        Seg *fs = &p->segs[p->seg_head + p->nsegs];
+        if (fs->len == 0)
+            seg_seal(ns, c, p, TCP_FIN);
     }
 }
 
@@ -1155,7 +1214,7 @@ static int64_t conn_next_deadline(const NsPriv *p, uint64_t now) {
 }
 
 int ns_tick(Netstack *ns, uint64_t now) {
-    int64_t next = 100;
+    int64_t next = NS_TICK_DEFAULT_MS;
     for (int i = 0; i < NS_MAX_CONN; i++) {
         TcpConn *c = &ns->conns[i];
         NsPriv *p;
@@ -1172,8 +1231,7 @@ int ns_tick(Netstack *ns, uint64_t now) {
                 continue;
             }
             if (now >= c->keepalive_ms) {
-                emit_tcp(ns, c, TCP_ACK, c->snd_nxt - 1u, c->rcv_nxt,
-                         NULL, 0, 0);
+                emit_tcp(ns, c, TCP_ACK, c->snd_nxt - 1u, c->rcv_nxt, 0);
                 c->keepalive_ms = now + NS_KEEPALIVE_MS;
                 if (++c->keepalive_cnt > NS_KEEPALIVE_MAX) {
                     ns_abort(ns, i);
@@ -1192,10 +1250,7 @@ int ns_tick(Netstack *ns, uint64_t now) {
             if (d < 0)
                 continue;
         } else {
-            if (c->local_fin && p->fin_sent &&
-                (c->state == NS_FIN_WAIT || c->state == NS_CLOSE_WAIT) &&
-                c->remote_fin &&
-                (int32_t)(c->snd_una - c->snd_nxt) >= 0) {
+            if (conn_fin_done(c, p, c->snd_una)) {
                 c->state = NS_CLOSED;
                 continue;
             }
@@ -1203,14 +1258,28 @@ int ns_tick(Netstack *ns, uint64_t now) {
             if (conn_retransmit_loop(ns, c, p, i, now))
                 continue;
             conn_send_new(ns, c, p, now);
-            /* delayed ACK: flush pending at 40ms so the peer's window
-             * advances even under low/irregular traffic */
-            if (c->ack_pending && now - c->ack_ms >= 40) {
+            /* delayed ACK: flush pending at NS_DELAYED_ACK_MS so the
+             * peer's window advances even under low/irregular traffic */
+            if (c->ack_pending && now - c->ack_ms >= NS_DELAYED_ACK_MS) {
                 c->ack_pending = 0;
                 c->rx_segs = 0;
-                emit_tcp(ns, c, TCP_ACK, c->snd_nxt, c->rcv_nxt, NULL, 0, 0);
+                emit_tcp(ns, c, TCP_ACK, c->snd_nxt, c->rcv_nxt, 0);
             }
             d = conn_next_deadline(p, now);
+            /* honor the pending delayed-ACK flush deadline: without it a
+             * flush would wait for the default poll interval, stretching
+             * the documented NS_DELAYED_ACK_MS budget under low traffic */
+            if (c->ack_pending) {
+                int64_t da = (int64_t)(c->ack_ms + NS_DELAYED_ACK_MS - now);
+                if (da < d)
+                    d = da;
+            }
+            /* a scheduled keepalive probe deserves a precise deadline */
+            if (c->keepalive_ms) {
+                int64_t ka = (int64_t)(c->keepalive_ms - now);
+                if (ka < d)
+                    d = ka;
+            }
         }
         {
             int64_t idle = (int64_t)(c->last_rx_ms + NS_IDLE_TIMEOUT - now);
@@ -1221,8 +1290,8 @@ int ns_tick(Netstack *ns, uint64_t now) {
             next = d;
     }    if (next < 0)
         next = 0;
-    if (next > 10000)
-        next = 10000;
+    if (next > NS_TICK_MAX_MS)
+        next = NS_TICK_MAX_MS;
     return (int)next;
 }
 
@@ -1231,16 +1300,6 @@ const TxItem *ns_tx_peek(Netstack *ns)
     if (ns->tx_count == 0)
         return NULL;
     return &ns->tx_queue[ns->tx_head];
-}
-
-size_t ns_tx_item_len(const TxItem *it)
-{
-    return it->seg ? SEG_HDR_LEN + ((const Seg *)it->seg)->len : it->clen;
-}
-
-const uint8_t *ns_tx_item_buf(const TxItem *it)
-{
-    return it->seg ? ((const Seg *)it->seg)->hdr : it->ctl;
 }
 
 const TxItem *ns_tx_pop(Netstack *ns)
@@ -1254,151 +1313,19 @@ const TxItem *ns_tx_pop(Netstack *ns)
     return it;
 }
 
-static size_t skip_name(const uint8_t *p, size_t n, size_t off) {
-    for (;;) {
-        uint8_t l;
-        if (off >= n)
-            return (size_t)-1;
-        l = p[off];
-        if ((l & 0xc0) == 0xc0) {
-            if (off + 2 > n)
-                return (size_t)-1;
-            return off + 2;
-        }
-        if (l & 0xc0)
-            return (size_t)-1;
-        off++;
-        if (l == 0)
-            return off;
-        if (off + l > n)
-            return (size_t)-1;
-        off += l;
-    }
+void ns_tx_rearm_seg(Netstack *ns, const void *seg)
+{
+    tx_enqueue(ns, (const Seg *)seg, NULL, 0);
 }
 
-uint32_t dns_query_a(const char *domain) {
-    size_t len = strlen(domain);
-    size_t i, qn = 0;
-    size_t llen = 0, lstart = 0;
-    uint16_t id;
-    uint8_t q[512];
-    int fd;
-    struct timeval tv;
-    struct sockaddr_in sa;
-    socklen_t sl;
-    ssize_t r;
-    uint8_t resp[4096];
-    uint16_t flags, qd, an;
-    size_t off;
-
-    while (len > 0 && domain[len - 1] == '.')
-        len--;
-    if (len == 0 || len > 253)
-        return 0;
-    for (i = 0; i < len; i++) {
-        if (domain[i] == '.') {
-            if (llen == 0 || llen > 63)
-                return 0;
-            llen = 0;
-        } else {
-            llen++;
-        }
-    }
-    if (llen == 0 || llen > 63)
-        return 0;
-
-    id = (uint16_t)rand_u32();
-    q[qn++] = (uint8_t)(id >> 8);
-    q[qn++] = (uint8_t)id;
-    q[qn++] = 0x01;
-    q[qn++] = 0x00;
-    q[qn++] = 0x00;
-    q[qn++] = 0x01;
-    q[qn++] = 0x00;
-    q[qn++] = 0x00;
-    q[qn++] = 0x00;
-    q[qn++] = 0x00;
-    q[qn++] = 0x00;
-    q[qn++] = 0x00;
-    llen = 0;
-    lstart = 0;
-    for (i = 0; i <= len; i++) {
-        if (i == len || domain[i] == '.') {
-            if (i < len || i > 0) {
-                q[qn++] = (uint8_t)llen;
-                memcpy(q + qn, domain + lstart, llen);
-                qn += llen;
-            }
-            lstart = i + 1;
-            llen = 0;
-        } else {
-            llen++;
-        }
-    }
-    q[qn++] = 0x00;
-    q[qn++] = 0x00;
-    q[qn++] = 0x01;
-    q[qn++] = 0x00;
-    q[qn++] = 0x01;
-
-    fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0)
-        return 0;
-    memset(&tv, 0, sizeof tv);
-    tv.tv_sec = 3;
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-    memset(&sa, 0, sizeof sa);
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons(53);
-    inet_pton(AF_INET, DNS_SERVER_IP, &sa.sin_addr);
-    if (sendto(fd, q, qn, 0, (struct sockaddr *)&sa, sizeof sa) < 0) {
-        close(fd);
-        return 0;
-    }
-    sl = sizeof sa;
-    r = recvfrom(fd, resp, sizeof resp, 0, (struct sockaddr *)&sa, &sl);
-    close(fd);
-    if (r < 12)
-        return 0;
-    if (sa.sin_addr.s_addr != inet_addr(DNS_SERVER_IP))
-        return 0;
-    if (rd_be16(resp) != id)
-        return 0;
-    /* question echo: a spoofed answer must repeat our exact qname —
-     * otherwise a blind on-path injector with a guessed ID is rejected */
-    if (qn < 16 || (size_t)r < 12 + (size_t)(qn - 12) ||
-        memcmp(resp + 12, q + 12, (size_t)(qn - 12)) != 0)
-        return 0;
-    flags = rd_be16(resp + 2);
-    if (!(flags & 0x8000) || (flags & 0x000f) != 0)
-        return 0;
-    qd = rd_be16(resp + 4);
-    an = rd_be16(resp + 6);
-    off = 12;
-    for (i = 0; i < qd; i++) {
-        off = skip_name(resp, (size_t)r, off);
-        if (off == (size_t)-1)
-            return 0;
-        off += 4;
-        if (off > (size_t)r)
-            return 0;
-    }
-    for (i = 0; i < an; i++) {
-        uint16_t typ, cls, rdlen;
-        off = skip_name(resp, (size_t)r, off);
-        if (off == (size_t)-1)
-            return 0;
-        if (off + 10 > (size_t)r)
-            return 0;
-        typ = rd_be16(resp + off);
-        cls = rd_be16(resp + off + 2);
-        rdlen = rd_be16(resp + off + 8);
-        off += 10;
-        if (off + rdlen > (size_t)r)
-            return 0;
-        if (typ == 1 && cls == 1 && rdlen == 4)
-            return ip4_u32(resp + off);
-        off += rdlen;
-    }
-    return 0;
+size_t ns_tx_item_len(const TxItem *it)
+{
+    return it->seg ? NS_SEG_HDR_LEN + ((const Seg *)it->seg)->len : it->clen;
 }
+
+const uint8_t *ns_tx_item_buf(const TxItem *it)
+{
+    return it->seg ? ((const Seg *)it->seg)->hdr : it->ctl;
+}
+
+

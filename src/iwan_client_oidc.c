@@ -8,6 +8,7 @@
 
 #include "common.h"
 #include "oidc.h"
+#include "util.h"
 
 /* argument-validation failure: report the error, show the usage summary,
  * and point at --help, matching the CLI framework's own errors */
@@ -46,8 +47,12 @@ int main(int argc, char **argv)
         oidc_elevate_root(argc, argv);
 
     char *dir = resolve_config_dir(o.config_dir);
+    if (!dir)
+        oidc_die("cannot determine home directory; set HOME or run via sudo");
     size_t plen = strlen(dir) + strlen("/servers.json") + 1;
     char *path = malloc(plen);
+    if (!path)
+        oom_abort();
     snprintf(path, plen, "%s/servers.json", dir);
     free(dir);
 
@@ -67,6 +72,8 @@ int main(int argc, char **argv)
         char *slash = strrchr(path, '/');
         size_t dlen = slash ? (size_t)(slash - path) : strlen(path);
         char *ppath = malloc(dlen + sizeof "/proxy.conf");
+        if (!ppath)
+            oom_abort();
         memcpy(ppath, path, dlen);
         memcpy(ppath + dlen, "/proxy.conf", sizeof "/proxy.conf");
         if (load_cidr_file(ppath, &o.proxy_cidr) != 0) {

@@ -11,10 +11,15 @@
  * (tun_attach) enable parallel user-space readers. */
 int  open_tun(const char *name);     /* device owner fd or -1 */
 int  tun_attach(const char *name);   /* extra queue fd or -1 */
+
+/* Validate a TUN device name before it is handed to open_tun or fed to
+ * `ip link del` as root: non-empty, at most IFNAMSIZ-1 chars, lowercase
+ * alnum/'-'/'_' with a leading letter, and not a typical physical/system
+ * interface name (eth*, enp*, lo, docker*, ...) this VPN must never own. */
+bool tun_name_valid(const char *name);
 void tun_detach(int fd);             /* TUNSETQUEUE detach; extra queues only */
 void tun_close(int fd);
 void set_nonblock(int fd);
-ptrdiff_t tun_read(int fd, void *buf, size_t len);
 ptrdiff_t tun_write(int fd, const void *buf, size_t len);
 
 /* Attach the embedded flow-hash steering program (TUNSETSTEERINGEBPF).

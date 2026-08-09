@@ -1,9 +1,13 @@
 /* OIDC device login (PKCE) and HMAC-signed config-server POSTs. */
 
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "common.h"
 #include "crypto.h"
@@ -29,6 +33,63 @@ char *oidc_build_dev_body(const char *type, const char *device_id,
     return oidc_buf_to_cstr(&b);
 }
 
+/* Where the OAuth state is persisted between issuing the authorize URL
+ * and validating the pasted redirect URL: a per-user temp file, 0600.
+ * (oidc_login has no config-dir handle -- the CLI resolves it in main --
+ * so a standard per-user temp location is used.) */
+static char *state_file_path(void)
+{
+    const char *dir = getenv("XDG_RUNTIME_DIR");
+    if (!dir || !*dir)
+        dir = getenv("TMPDIR");
+    if (!dir || !*dir)
+        dir = "/tmp";
+    size_t n = strlen(dir) + 64;
+    char *p = malloc(n);
+    snprintf(p, n, "%s/iwan-oidc-state-%ld-%08lx", dir, (long)getuid(),
+             (unsigned long)rand_u32());
+    return p;
+}
+
+static void save_state_file(const char *path, const char *state)
+{
+    /* O_EXCL|O_NOFOLLOW: never follow a pre-planted symlink, never
+     * overwrite someone else's file. The randomized name makes a
+     * collision negligible, so EEXIST is a hard failure. */
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+    if (fd < 0)
+        oidc_die("cannot create OAuth state file %s: %s", path,
+                 strerror(errno));
+    FILE *f = fdopen(fd, "wb");
+    if (!f) {
+        close(fd);
+        unlink(path);
+        oidc_die("cannot create OAuth state file %s", path);
+    }
+    if (fputs(state, f) == EOF || fputc('\n', f) == EOF ||
+        fflush(f) != 0 || fclose(f) != 0) {
+        unlink(path);
+        oidc_die("cannot create OAuth state file %s", path);
+    }
+}
+
+/* read the persisted state back; 0 on success, -1 on any failure */
+static int load_state_file(const char *path, char *out, size_t outsz)
+{
+    int fd = open(path, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0)
+        return -1;
+    ssize_t n = read(fd, out, outsz - 1);
+    if (close(fd) != 0)
+        return -1;
+    if (n <= 0)
+        return -1;
+    out[n] = '\0';
+    if (out[n - 1] == '\n')   /* tolerate our own trailing newline */
+        out[n - 1] = '\0';
+    return 0;
+}
+
 void oidc_login(char **kp_out, char **user_out)
 {
     uint8_t vb[64];
@@ -44,6 +105,11 @@ void oidc_login(char **kp_out, char **user_out)
     for (int i = 0; i < 32; i++)
         state[i] = ALPH[rand_u32() % 62];
     state[32] = '\0';
+
+    /* persist the state before issuing the request: the authorization
+     * response must echo it back or the flow is rejected (see below) */
+    char *state_path = state_file_path();
+    save_state_file(state_path, state);
 
     buf_t url;
     buf_init(&url);
@@ -63,6 +129,16 @@ void oidc_login(char **kp_out, char **user_out)
 
     oidc_eprintf("  Open in browser:\n  %s\n\n", (char *)url.data);
     buf_free(&url);
+    free(code_challenge);
+
+    /* the persisted state file has served its purpose once read back:
+     * remove it now, before the interactive input, so no random-named
+     * 0600 file is left behind on any error path below. */
+    char saved[64];
+    int have_state = load_state_file(state_path, saved, sizeof saved) == 0;
+    unlink(state_path);
+    free(state_path);
+
     fprintf(stderr, "  Paste redirect URL: ");
     fflush(stderr);
 
@@ -73,7 +149,36 @@ void oidc_login(char **kp_out, char **user_out)
     if (nl)
         *nl = '\0';
 
+    /* refuse URLs that do not carry our private-use scheme: pasting an
+     * arbitrary http(s) URL here would otherwise make the client parse
+     * (and trust) code/state from any site the user was redirected to */
+    char *rp = rline;
+    while (*rp == ' ' || *rp == '\t')
+        rp++;
+    if (strncmp(rp, OIDC_REDIRECT, strlen(OIDC_REDIRECT)) != 0)
+        oidc_die("redirect URL must start with "
+                 "com.panabit.mobile://oauth2redirect");
+
     char *code = oidc_extract_code(rline);
+    char *cb_state = (char *)oidc_url_param(rline, "state");
+
+    /* OIDC Core 3.1.2.1 (CSRF): the client MUST compare the state value
+     * in the authorization response with the one it saved when starting
+     * the request; otherwise an attacker can substitute their own
+     * authorization code for the user's (login CSRF). The saved state
+     * was read back (and the state file removed) above. */
+    if (!cb_state) {
+        free(code);
+        oidc_die("authorization response missing state parameter "
+                 "(OIDC Core 3.1.2.1 CSRF check failed)");
+    }
+    if (!have_state || strcmp(cb_state, saved) != 0) {
+        free(cb_state);
+        free(code);
+        oidc_die("authorization response state does not match the saved "
+                 "state (OIDC Core 3.1.2.1 CSRF check failed)");
+    }
+    free(cb_state);
     if (!code)
         oidc_die("no authorization code in redirect URL");
 
@@ -111,13 +216,24 @@ void oidc_login(char **kp_out, char **user_out)
         oidc_die("no access_token");
     }
     char *kp = xstrdup(at);
+
+    /* the id_token is the client's proof of authentication: verify its
+     * signature against the issuer's JWKS and its aud/iss/exp claims
+     * before trusting any of its contents (fail-closed) */
+    const char *id_token = json_get_str(tok, "id_token");
+    if (id_token &&
+        oidc_jwt_verify(id_token, OIDC_CLIENT_ID,
+                        "https://" OIDC_AUTH_HOST) != 0) {
+        json_free(tok);
+        oidc_die("id_token verification failed");
+    }
+
     char *username = oidc_id_token_username(tok);
     json_free(tok);
     if (!username)
         username = xstrdup("unknown");
     oidc_eprintf("  Authenticated as %s\n", username);
 
-    free(code_challenge);
     *kp_out = kp;
     *user_out = username;
 }

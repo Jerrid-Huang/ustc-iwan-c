@@ -14,12 +14,16 @@ bool ip_run_quiet(char *const args[]);
  * Returns malloc'd string or NULL. */
 char *cmd_capture(char *const args[]);
 
+/* allocation failure is fatal: growable buffers and string helpers have no
+ * error path, so report and abort instead of dereferencing NULL */
+void oom_abort(void);
+
 void log_info(const char *fmt, ...);   /* -> stdout */
 void log_err(const char *fmt, ...);    /* -> stderr */
 void log_debug(const char *fmt, ...);  /* -> stderr if IWAN_DEBUG */
 
-/* tun device names are fed to `ip link del/set` as root: restrict to a
- * safe Linux ifname charset (IFNAMSIZ-1, [A-Za-z0-9_], not "."/".."). */
-bool valid_tun_name(const char *name);
+/* diagnostic env flags (IWAN_RXDBG / IWAN_RETX / IWAN_FLOWDBG): parsed
+ * once per name and cached; any value other than 0/false/off enables */
+bool dbg_env(const char *name);
 
 #endif

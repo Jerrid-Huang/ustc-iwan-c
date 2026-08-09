@@ -86,22 +86,20 @@ static size_t utf8_lossy(const uint8_t *in, size_t n, char *out)
     return o;
 }
 
-static void hexl(const uint8_t *b, size_t n, char *out)
-{
-    static const char d[] = "0123456789abcdef";
-    for (size_t i = 0; i < n; i++) {
-        out[i * 2] = d[b[i] >> 4];
-        out[i * 2 + 1] = d[b[i] & 0xF];
-    }
-    out[n * 2] = '\0';
-}
-
-void build_open(buf_t *out, const char *user, const uint8_t ct[16],
-                uint16_t mtu, uint8_t enc, uint32_t nonce)
+int build_open(buf_t *out, const char *user, const uint8_t ct[16],
+               uint16_t mtu, uint8_t enc, uint32_t nonce)
 {
     buf_t pl;
     uint8_t mb[2];
     uint8_t nb[4];
+    size_t ulen;
+
+    /* the username rides in a single TLV whose length field is one byte
+     * (max 255); a longer string would be truncated and shift every
+     * subsequent TLV out of alignment, so refuse to build the frame */
+    ulen = strlen(user);
+    if (ulen > 255)
+        return -1;
 
     mb[0] = (uint8_t)(mtu >> 8);
     mb[1] = (uint8_t)(mtu & 0xFF);
@@ -112,7 +110,7 @@ void build_open(buf_t *out, const char *user, const uint8_t ct[16],
 
     buf_init(&pl);
     tlv_put(&pl, T_MTU, mb, sizeof mb);
-    tlv_put(&pl, T_USERNAME, user, (uint8_t)strlen(user));
+    tlv_put(&pl, T_USERNAME, user, (uint8_t)ulen);
     tlv_put(&pl, T_PASSWORD, ct, 16);
     tlv_put(&pl, T_ENCRYPT, &enc, 1);
     tlv_put(&pl, T_AUTH_VERIFY, nb, sizeof nb);
@@ -120,14 +118,14 @@ void build_open(buf_t *out, const char *user, const uint8_t ct[16],
     ctrl_hdr(out, PT_OPEN, enc, 0, 0);
     buf_put(out, pl.data, pl.len);
     buf_free(&pl);
+    return 0;
 }
 
 struct ack_ctx {
     AuthResult *r;
     uint32_t    expect;
     int         err;      /* 0 = none, 1 = AV wrong len, 2 = AV echo mismatch,
-                            * 3 = short IP TLV */
-    int         seen_av;
+                            * 3 = short TLV */
     uint32_t    echo;
 };
 
@@ -159,7 +157,11 @@ static bool ack_tlv(uint8_t typ, const uint8_t *val, uint8_t vlen, void *ud)
         ip_to_string(val, r->dns);
         break;
     case T_MTU:
-        if (vlen >= 2) {
+        if (vlen < 2) {
+            c->err = 3;
+            return false;
+        }
+        {
             uint16_t m = (uint16_t)((val[0] << 8) | val[1]);
             /* the ACK is only header-signed, so never trust a huge MTU:
              * clamp to the IPv4-over-UDP sane range */
@@ -167,7 +169,6 @@ static bool ack_tlv(uint8_t typ, const uint8_t *val, uint8_t vlen, void *ud)
         }
         break;
     case T_AUTH_VERIFY:
-        c->seen_av = 1;
         if (vlen != 4) {
             c->err = 1;
             return false;
@@ -209,7 +210,7 @@ bool parse_ack(const uint8_t *buf, size_t len, uint32_t expect_nonce,
     }
     if (t != PT_OPEN_ACK) {
         char *hex = malloc(2 * (len - 24) + 1);
-        hexl(buf + 24, len - 24, hex);
+        hex_encode(buf + 24, len - 24, hex);
         set_err(errmsg, errmsg_sz, "unexpected type 0x%02x tlvs=%s", t, hex);
         free(hex);
         return false;
@@ -227,7 +228,10 @@ bool parse_ack(const uint8_t *buf, size_t len, uint32_t expect_nonce,
     memset(&ctx, 0, sizeof ctx);
     ctx.r = r;
     ctx.expect = expect_nonce;
-    parse_tlvs(buf + 24, len - 24, ack_tlv, &ctx);
+    if (parse_tlvs(buf + 24, len - 24, ack_tlv, &ctx) != 0) {
+        set_err(errmsg, errmsg_sz, "malformed TLVs");
+        return false;
+    }
     /* T_AUTH_VERIFY is optional on the wire: the reference server's
      * OPEN_ACK omits it, so requiring it breaks production interop.
      * When present it is still strictly verified (len + nonce echo). */
@@ -236,7 +240,7 @@ bool parse_ack(const uint8_t *buf, size_t len, uint32_t expect_nonce,
     else if (ctx.err == 2)
         set_err(errmsg, errmsg_sz, "AV mismatch %08x", ctx.echo);
     else if (ctx.err == 3)
-        set_err(errmsg, errmsg_sz, "short IP TLV");
+        set_err(errmsg, errmsg_sz, "short TLV");
     if (ctx.err)
         return false;
     return true;
@@ -305,50 +309,42 @@ int udp_connect(const char *host, uint16_t port, int timeout_ms)
     return fd;
 }
 
-static int hexnib(int c)
-{
-    if (c >= '0' && c <= '9')
-        return c - '0';
-    if (c >= 'a' && c <= 'f')
-        return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F')
-        return c - 'A' + 10;
-    return -1;
-}
-
-void get_ct(const char *user, const char *pass, const char *ct_pass_hex,
-            uint8_t out[16])
+int get_ct(const char *user, const char *pass, const char *ct_pass_hex,
+           uint8_t out[16])
 {
     if (ct_pass_hex && ct_pass_hex[0]) {
         const char *h = ct_pass_hex;
-        uint8_t tmp[16] = {0};
-        size_t i;
 
         if (h[0] == '0' && (h[1] == 'x' || h[1] == 'X'))
             h += 2;
-        for (i = 0; i < 16; i++) {
-            int hi = hexnib((unsigned char)h[2 * i]);
-            int lo = hexnib((unsigned char)h[2 * i + 1]);
-            if (hi < 0 || lo < 0)
-                break;
-            tmp[i] = (uint8_t)((hi << 4) | lo);
-        }
-        memcpy(out, tmp, 16);
-    } else {
-        encrypt_password(pass, user, out);
+        /* an optional 0x prefix followed by exactly 32 hex digits */
+        if (strlen(h) != 32)
+            return -1;
+        if (hex_decode(h, 32, out, 16) != 16)
+            return -1;
+        return 0;
     }
+    encrypt_password(pass, user, out);
+    return 0;
 }
+
+/* OPEN retry policy: the reference server answers within ~1s, so the 3s
+ * recv timeout covers one round trip plus jitter; up to 4 sends spaced
+ * 1s apart survive a lost or dropped OPEN without flooding the server. */
+#define AUTH_TIMEOUT_MS     3000
+#define AUTH_SEND_MAX       4
+#define AUTH_RETRY_DELAY_US 1000000
 
 int do_auth(const char *server, uint16_t port, const uint8_t *open_pkt, size_t open_len,
             uint32_t nonce, int style, AuthResult *r)
 {
-    int fd = udp_connect(server, port, 3000);
+    int fd = udp_connect(server, port, AUTH_TIMEOUT_MS);
     uint8_t buf[4096];
 
     if (fd < 0)
         return -1;
 
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < AUTH_SEND_MAX; i++) {
         if (send(fd, open_pkt, open_len, 0) < 0) {
             fprintf(stderr,
                     "Error: send OPEN\n\nCaused by:\n    %s (os error %d)\n",
@@ -379,8 +375,8 @@ int do_auth(const char *server, uint16_t port, const uint8_t *open_pkt, size_t o
                 eprintf("  [%d] timeout: %s (os error %d)\n", i, strerror(errno),
                         errno);
         }
-        if (i < 3)
-            usleep(1000000);
+        if (i < AUTH_SEND_MAX - 1)
+            usleep(AUTH_RETRY_DELAY_US);
     }
 
     close(fd);

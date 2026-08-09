@@ -1,6 +1,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <openssl/crypto.h>
 #include <openssl/evp.h>
 
 #include "crypto.h"
@@ -51,9 +52,9 @@ char *decrypt_password(const char *encrypted_b64, const char *app_secret,
     size_t label_len = strlen(app_secret) + 1 + aad_len;
     char *aad, *label;
     uint8_t key[32];
-    uint8_t *data, *plain;
-    size_t data_len, plain_len;
-    char *result;
+    uint8_t *data = NULL, *plain = NULL;
+    size_t data_len = 0, plain_len = 0;
+    char *result = NULL;
 
     aad = malloc(aad_len + 1);
     if (!aad)
@@ -71,36 +72,32 @@ char *decrypt_password(const char *encrypted_b64, const char *app_secret,
     free(label);
 
     data = b64url_decode(encrypted_b64, &data_len);
-    if (!data || data_len < 28) {
-        free(data);
-        free(aad);
-        return NULL;
-    }
+    if (!data || data_len < 28)
+        goto out;
 
     plain = malloc(data_len - 12);
-    if (!plain) {
-        free(data);
-        free(aad);
-        return NULL;
-    }
+    if (!plain)
+        goto out;
 
     if (!gcm_decrypt(key, data, data + 12, data_len - 12,
-                     (const uint8_t *)aad, aad_len, plain, &plain_len)) {
-        free(plain);
-        free(data);
-        free(aad);
-        return NULL;
-    }
-    free(data);
-    free(aad);
+                     (const uint8_t *)aad, aad_len, plain, &plain_len))
+        goto out;
 
     result = malloc(plain_len + 1);
-    if (!result) {
-        free(plain);
-        return NULL;
-    }
+    if (!result)
+        goto out;
     memcpy(result, plain, plain_len);
     result[plain_len] = '\0';
+
+out:
+    /* wipe the derived key and the decrypted plaintext buffer before
+     * releasing them (OPENSSL_cleanse is the one scrubber the compiler
+     * cannot optimize away) */
+    OPENSSL_cleanse(key, sizeof key);
+    if (plain)
+        OPENSSL_cleanse(plain, data_len - 12);
     free(plain);
+    free(data);
+    free(aad);
     return result;
 }

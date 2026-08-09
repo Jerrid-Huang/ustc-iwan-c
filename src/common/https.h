@@ -10,4 +10,8 @@ bool https_post_json(const char *host, const char *path,
                      const char *const *headers /* NULL-terminated "Name: value" */,
                      int *status_out, char **body_out);
 
+/* GET without a body; same semantics otherwise. */
+bool https_get_json(const char *host, const char *path,
+                    int *status_out, char **body_out);
+
 #endif

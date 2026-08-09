@@ -33,4 +33,4 @@ int steer(struct __sk_buff *skb)
     return saddr ^ daddr ^ sport ^ dport;
 }
 
-char _license[] SEC("license") = "GPL";
+char _license[] SEC("license") = "Dual MIT/GPL";

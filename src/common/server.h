@@ -43,13 +43,21 @@ struct server_sess_snap {
 struct server_ctx {
     struct server_session sess[SERVER_MAX_SESSIONS];
     pthread_rwlock_t sess_lock;  /* guards sess[] (see above) */
+    /* O(1) sid -> slot index (M-8); -1 = no live session with that sid.
+     * A session's sid is unique: sid = low 16 bits of its assigned IP
+     * (see handle_open), so the map is exact.  All writes happen under
+     * the WRITE lock (handle_open/sess_wipe); readers take a snapshot
+     * under the read lock and never mutate the map (a heal write would
+     * race concurrent readers). The sess[] scan stays authoritative as a
+     * read-side fallback. */
+    int16_t sid_map[65536];
     uint8_t server_ip[4], dns[4];
     uint32_t next_ip;        /* BE u32; next client IP to hand out */
     uint32_t ip_base;        /* BE u32; first usable host address */
     uint32_t ip_end;         /* BE u32; last usable host address (pre-broadcast) */
     char tun_name[IFNAMSIZ];
     int tun_fd;              /* -1 when running in --no-tun mode */
-    void *qpool;             /* struct tun_qpool *, owned by main() */
+    void *qpool;             /* struct tun_pool *, owned by main() */
 };
 
 /* One "user:pass" line from the users file. */
@@ -84,7 +92,8 @@ void purge_expired(struct server_ctx *ctx, uint64_t now_ms);
 /* Cumulative UDP send failures (nonblocking socket: EAGAIN drops). */
 uint64_t server_send_drops(void);
 
-/* Cumulative tun->udp downlink packets forwarded to clients. */
+/* Cumulative UDP datagrams sent to clients (includes control frames
+ * such as OPEN_ACK/PING_RSP, not only tunnel data). */
 uint64_t server_dl_pkts(void);
 
 /* IWAN_DEBUG=1: print per-step uplink timing averages once per second. */

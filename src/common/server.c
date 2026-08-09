@@ -13,6 +13,7 @@
 
 #include "common.h"
 #include "crypto.h"
+#include "ipv4.h"
 #include "protocol.h"
 #include "server.h"
 #include "tun.h"
@@ -24,9 +25,25 @@
 #define RATE_WINDOW_MS 1000
 #define RATE_OPEN_MAX 20    /* OPENs per source per window */
 #define RATE_ECHO_MAX 60    /* PING/ECHO per source per window */
+/* Rate-table hashing: Knuth's multiplicative hash. The constant is
+ * 2^32 / golden ratio (~2654435761); multiplying by this odd number
+ * scrambles the low bits of the key across the full 32-bit range, and
+ * keeping the TOP bits afterwards spreads sequential client IPs evenly
+ * over the table — a plain "ip % 1024" would keep only the low 10 bits,
+ * so e.g. 10.0.0.1 and 10.0.4.1 would land in the same bucket. 1024
+ * buckets (1<<10, so the index is a cheap shift, 32 KB of state) is the
+ * tradeoff: large enough that a few hostile sources rarely collide,
+ * small enough that the worst-case 8-slot probe below stays within a
+ * handful of cache lines on every packet. */
+#define RATE_HASH_MUL 2654435761u
+#define RATE_HASH_SHIFT 22          /* keep top 10 hashed bits -> 1024 buckets */
+#define RATE_PROBE_MAX 8            /* linear-probe depth before eviction */
 
 static atomic_uint_fast64_t g_send_drops;
-static atomic_ullong g_dl_pkts;   /* tun->udp downlink packets */
+static atomic_ullong g_dl_pkts;   /* UDP datagrams sent (incl. control
+                                   * frames like OPEN_ACK/PING_RSP — the
+                                   * counter is not a pure data metric) */
+static atomic_ullong g_dl_drops;  /* downlink inner-IPv4 gate drops (H1) */
 static pthread_mutex_t g_log_lock = PTHREAD_MUTEX_INITIALIZER;
 
 void srv_log(const char *fmt, ...)
@@ -45,6 +62,7 @@ void srv_log(const char *fmt, ...)
 void server_ctx_init(struct server_ctx *ctx)
 {
     pthread_rwlock_init(&ctx->sess_lock, NULL);
+    memset(ctx->sid_map, 0xFF, sizeof ctx->sid_map); /* all -1: no sessions */
 }
 
 void server_ctx_destroy(struct server_ctx *ctx)
@@ -60,6 +78,7 @@ struct up_stats {
     uint64_t xor;     /* in-place decryption */
     uint64_t write;   /* tun_write syscall */
     uint64_t drop;    /* tun_write EAGAIN/failure drops */
+    uint64_t h1;      /* inner-IPv4 gate drops (malformed/spoofed) */
 };
 
 static struct up_stats g_up;
@@ -84,15 +103,19 @@ void server_up_stats_print(void)
     g_up_win = now;
     fprintf(stderr,
             "uplink: [t=%llu] n=%llu parse=%.0fns find=%.0fns xor=%.0fns"
-            " write=%.0fns total=%.0fns drop=%llu dl=%llu\n",
+            " write=%.0fns total=%.0fns drop=%llu h1=%llu dl=%llu"
+            " dldrop=%llu\n",
             (unsigned long long)now_ms(), (unsigned long long)g_up.n,
             (double)g_up.parse / g_up.n, (double)g_up.find / g_up.n,
             (double)g_up.xor / g_up.n, (double)g_up.write / g_up.n,
             (double)(g_up.parse + g_up.find + g_up.xor + g_up.write) / g_up.n,
             (unsigned long long)g_up.drop,
-            (unsigned long long)server_dl_pkts());
+            (unsigned long long)g_up.h1,
+            (unsigned long long)server_dl_pkts(),
+            (unsigned long long)atomic_load(&g_dl_drops));
     g_up.n = g_up.parse = g_up.find = g_up.xor = g_up.write = 0;
     g_up.drop = 0;
+    g_up.h1 = 0;
     /* dl counter is cumulative (per-second delta is printed by the
      * caller's diff of consecutive lines); do not reset here */
 }
@@ -146,8 +169,31 @@ static bool rate_allow(const struct sockaddr_in *peer, uint8_t typ, uint64_t now
     default:
         return true; /* authenticated or negligible-cost paths */
     }
-    h = (unsigned)((ip * 2654435761u) >> 22); /* top 10 bits of hash */
-    b = &g_rates[h];
+    h = (unsigned)((ip * RATE_HASH_MUL) >> RATE_HASH_SHIFT); /* top 10 bits */
+    /* Linear probing: the hashed slot may belong to another source, so
+     * scan up to RATE_PROBE_MAX slots for a bucket of this IP or a
+     * never-used one instead of clobbering a neighbour's counters (that
+     * would let one source reset another's window or dodge the limit by
+     * rehashing). Only when the whole probe window is occupied by other
+     * sources do we evict the slot whose window started longest ago. */
+    b = NULL;
+    {
+        unsigned evict = 0;
+        uint64_t oldest = UINT64_MAX;
+        for (unsigned i = 0; i < RATE_PROBE_MAX; i++) {
+            struct rate_bucket *c = &g_rates[(h + i) % RATE_BUCKETS];
+            if (c->win < oldest) {
+                oldest = c->win;
+                evict = i;
+            }
+            if (c->ip == ip || (c->ip == 0 && c->win == 0)) {
+                b = c;
+                break;
+            }
+        }
+        if (!b)
+            b = &g_rates[(h + evict) % RATE_BUCKETS];
+    }
     if (b->ip != ip || now - b->win >= RATE_WINDOW_MS) {
         b->ip = ip;
         b->win = now;
@@ -222,6 +268,15 @@ static void peer_to_string(const struct sockaddr_in *peer, char out[INET_ADDRSTR
 static struct server_session *find_session_unlocked(struct server_ctx *ctx,
                                                     uint16_t sid)
 {
+    int slot = ctx->sid_map[sid];
+
+    if (slot >= 0 && slot < SERVER_MAX_SESSIONS &&
+        ctx->sess[slot].valid && ctx->sess[slot].sid == sid)
+        return &ctx->sess[slot];
+    /* stale/absent map entry: the linear scan is authoritative. The map
+     * is only written under the WRITE lock (handle_open/sess_wipe), so
+     * this read-side fallback deliberately does NOT heal it — a write
+     * here would race other read-lock holders (C11 data race). */
     for (int i = 0; i < SERVER_MAX_SESSIONS; i++)
         if (ctx->sess[i].valid && ctx->sess[i].sid == sid)
             return &ctx->sess[i];
@@ -231,10 +286,33 @@ static struct server_session *find_session_unlocked(struct server_ctx *ctx,
 static struct server_session *find_session_by_ip_unlocked(struct server_ctx *ctx,
                                                           const uint8_t ip[4])
 {
+    /* sid = low 16 bits of the session IP (see handle_open), so the map
+     * finds the slot without scanning; the full IP is still verified
+     * because the map is only an index. */
+    uint16_t sid = (uint16_t)(((uint32_t)ip[2] << 8) | ip[3]);
+    int slot = ctx->sid_map[sid];
+
+    if (slot >= 0 && slot < SERVER_MAX_SESSIONS &&
+        ctx->sess[slot].valid && ctx->sess[slot].sid == sid &&
+        memcmp(ctx->sess[slot].ip, ip, 4) == 0)
+        return &ctx->sess[slot];
+    /* no map write here either: see find_session_unlocked */
     for (int i = 0; i < SERVER_MAX_SESSIONS; i++)
         if (ctx->sess[i].valid && memcmp(ctx->sess[i].ip, ip, 4) == 0)
             return &ctx->sess[i];
     return NULL;
+}
+
+/* invalidate a session and scrub its secrets; caller must hold
+ * ctx->sess_lock (write mode) */
+static void sess_wipe(struct server_ctx *ctx, struct server_session *s)
+{
+    uint16_t sid = s->sid; /* still valid here: read before clearing */
+
+    s->valid = false;
+    wipe(s->xor_key, sizeof s->xor_key);
+    wipe(&s->token, sizeof s->token);
+    ctx->sid_map[sid] = -1; /* slot now free; map entry is stale */
 }
 
 /* All session access goes through explicit lock sections (see callers);
@@ -338,7 +416,12 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
 
     memset(&a, 0, sizeof a);
     a.mtu = 1400;
-    parse_tlvs(raw + 24, len - 24, open_tlv, &a);
+    if (parse_tlvs(raw + 24, len - 24, open_tlv, &a) != 0) {
+        peer_to_string(peer, peerstr);
+        log_reject(peerstr, a.user, "malformed TLVs");
+        send_reject(sockfd, peer, "malformed TLVs");
+        return;
+    }
 
     if (!a.have_av) {
         peer_to_string(peer, peerstr);
@@ -355,16 +438,16 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
     }
     if (!pass) {
         peer_to_string(peer, peerstr);
-        log_reject(peerstr, a.user, "unknown user");
-        send_reject(sockfd, peer, "unknown user");
+        log_reject(peerstr, a.user, "invalid credentials");
+        send_reject(sockfd, peer, "invalid credentials");
         return;
     }
 
     encrypt_password(pass, a.user, expect);
     if (CRYPTO_memcmp(expect, a.ct, 16) != 0) {
         peer_to_string(peer, peerstr);
-        log_reject(peerstr, a.user, "bad password");
-        send_reject(sockfd, peer, "bad password");
+        log_reject(peerstr, a.user, "invalid credentials");
+        send_reject(sockfd, peer, "invalid credentials");
         return;
     }
 
@@ -434,11 +517,8 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
 
     /* replace any existing session with the same sid */
     for (i = 0; i < SERVER_MAX_SESSIONS; i++)
-        if (ctx->sess[i].valid && ctx->sess[i].sid == sid) {
-            ctx->sess[i].valid = false;
-            wipe(ctx->sess[i].xor_key, sizeof ctx->sess[i].xor_key);
-            wipe(&ctx->sess[i].token, sizeof ctx->sess[i].token);
-        }
+        if (ctx->sess[i].valid && ctx->sess[i].sid == sid)
+            sess_wipe(ctx, &ctx->sess[i]);
 
     s = &ctx->sess[slot];
     memset(s, 0, sizeof *s);
@@ -451,6 +531,7 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
     s->enc = a.enc;
     atomic_store(&s->last_active_ms, now_ms());
     snprintf(s->user, sizeof s->user, "%s", a.user);
+    ctx->sid_map[sid] = (int16_t)slot; /* O(1) lookup index (M-8) */
 
     pthread_rwlock_unlock(&ctx->sess_lock);
 
@@ -485,10 +566,11 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
     peer_to_string(peer, peerstr);
     {
         uint8_t ipb2[4];
+        char u[64];
         u32_ip4(ipu, ipb2);
+        log_escape(a.user, u, sizeof u);
         srv_log("[%s] OPEN_ACK -> %s sid=0x%04x ip=%u.%u.%u.%u enc=%u",
-                peerstr, a.user, sid, ipb2[0], ipb2[1], ipb2[2], ipb2[3],
-                a.enc);
+                peerstr, u, sid, ipb2[0], ipb2[1], ipb2[2], ipb2[3], a.enc);
     }
 }
 
@@ -525,6 +607,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
         case PT_DATA_ENC: {
             uint64_t tb = 0, tx0 = 0, tx1 = 0, tc = 0;
             uint8_t enc, xk[8];
+            uint32_t s_ip, saddr, daddr; /* session addr + inner header */
             if (debug_enabled())
                 tb = now_ns();
             pthread_rwlock_rdlock(&ctx->sess_lock);
@@ -549,6 +632,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
             }
             enc = s->enc;
             memcpy(xk, s->xor_key, sizeof xk);
+            s_ip = ip4_u32(s->ip); /* BE-value order, same as the header */
             atomic_store(&s->last_active_ms, now_ms());
             pthread_rwlock_unlock(&ctx->sess_lock);
             if (debug_enabled())
@@ -563,6 +647,20 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
             }
             if (debug_enabled())
                 tx1 = now_ns();
+            /* H1: the decrypted payload must be a sane IPv4 packet whose
+             * source is the session's assigned address. Anything else is
+             * a malformed or spoofed frame — drop it before it reaches
+             * the TUN (counted; logged only under IWAN_DEBUG). The inner
+             * header sits at raw+8, behind the 8-byte outer header. */
+            if (len <= 8 ||
+                ipv4_pkt_ok(raw + 8, len - 8, &saddr, &daddr) != 0 ||
+                saddr != s_ip) {
+                g_up.h1++;
+                if (debug_enabled())
+                    log_debug("uplink drop: bad inner IPv4 (sid 0x%04x)",
+                              sid);
+                break;
+            }
             if (ctx->tun_fd >= 0 && len > 8) {
                 /* device TX queue full: wait briefly for drain instead of
                  * silently dropping the segment. A dropped uplink segment
@@ -600,9 +698,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
             peer_to_string(peer, peerstr);
             srv_log("[%s] session 0x%04x (ip %u.%u.%u.%u) closed",
                     peerstr, s->sid, s->ip[0], s->ip[1], s->ip[2], s->ip[3]);
-            s->valid = false;
-            wipe(s->xor_key, sizeof s->xor_key);
-            wipe(&s->token, sizeof s->token);
+            sess_wipe(ctx, s);
         }
         pthread_rwlock_unlock(&ctx->sess_lock);
         break;
@@ -652,11 +748,34 @@ void handle_tun_downlink(struct server_ctx *ctx, const uint8_t *ip_pkt, size_t l
     /* fixed stack buffer: 8B outer header + max TUN datagram; avoids a
      * malloc/realloc cycle per forwarded packet */
     uint8_t out[8 + 65536];
+    uint32_t saddr, daddr;
 
     (void)tun_fd;
 
     if (len < 20 || len > 65536)
         return;
+    /* H1: gate the inner IPv4 header before any session lookup. dst
+     * must be a client address or the server's own address; the latter
+     * is the SOCKS-mode local-delivery case and must never be rejected
+     * here (a session can never own it: server_ip is validated outside
+     * the client pool at startup). */
+    if (ipv4_pkt_ok(ip_pkt, len, &saddr, &daddr) != 0) {
+        atomic_fetch_add(&g_dl_drops, 1);
+        if (debug_enabled()) {
+            /* len<20 already filtered above, so src/dst bytes are safe */
+            log_debug("downlink drop: bad inner IPv4 (%zuB) %u.%u.%u.%u->%u.%u.%u.%u v=%u ihl=%u tot=%u",
+                      len, ip_pkt[12], ip_pkt[13], ip_pkt[14], ip_pkt[15],
+                      ip_pkt[16], ip_pkt[17], ip_pkt[18], ip_pkt[19],
+                      ip_pkt[0] >> 4, ip_pkt[0] & 0x0F,
+                      ((unsigned)ip_pkt[2] << 8) | ip_pkt[3]);
+        }
+        return;
+    }
+    if (daddr == ip4_u32(ctx->server_ip)) {
+        /* server-bound packet: the gate allows it, but no client owns
+         * this address — the server machine consumes it locally */
+        return;
+    }
     /* snapshot under the read lock; the send happens lock-free */
     pthread_rwlock_rdlock(&ctx->sess_lock);
     {
@@ -684,27 +803,14 @@ void handle_tun_downlink(struct server_ctx *ctx, const uint8_t *ip_pkt, size_t l
     memcpy(out + 8, ip_pkt, len);
     if (snap.enc)
         xor_crypt(out + 8, len, snap.xor_key, 8);
-    if (!udp_send(sockfd, &snap.peer, out, 8 + len) &&
-        errno == ECONNREFUSED) {
-        /* the client's UDP socket is gone (ICMP port unreachable): stop
-         * forwarding to a dead peer — every sendto would keep generating
-         * ICMP and the poll loop would spin draining them */
-        pthread_rwlock_wrlock(&ctx->sess_lock);
-        {
-            struct server_session *s =
-                find_session_by_ip_unlocked(ctx, ip_pkt + 16);
-            if (s) {
-                srv_log("session 0x%04x (ip %u.%u.%u.%u) peer unreachable, "
-                        "closing", s->sid, s->ip[0], s->ip[1], s->ip[2],
-                        s->ip[3]);
-                s->valid = false;
-                wipe(s->xor_key, sizeof s->xor_key);
-                wipe(&s->token, sizeof s->token);
-            }
-        }
-        pthread_rwlock_unlock(&ctx->sess_lock);
-        return;
-    }
+    /* Deliberately NO sendto(ECONNREFUSED) teardown here: this socket is
+     * unconnected, so on Linux sendto never returns ECONNREFUSED — an
+     * ICMP port-unreachable is queued and surfaces on the NEXT receive
+     * (which the main loop treats as EAGAIN/drained). Identifying the
+     * dead peer from the error queue would need MSG_ERRQUEUE plumbing;
+     * sessions of dead peers are instead reaped by purge_expired (120s
+     * idle timeout) or by the client's own CLOSE. */
+    (void)udp_send(sockfd, &snap.peer, out, 8 + len);
     /* deliberately NO last_active refresh here: downlink is triggered by
      * third-party traffic (other clients, inbound routing), so refreshing
      * would let anyone keep a dead session alive past the idle purge */
@@ -717,11 +823,10 @@ void purge_expired(struct server_ctx *ctx, uint64_t now)
         struct server_session *s = &ctx->sess[i];
         if (s->valid &&
             now - atomic_load(&s->last_active_ms) > IDLE_TIMEOUT_MS) {
-            srv_log("session 0x%04x (ip %u.%u.%u.%u) expired after 120s idle",
-                    s->sid, s->ip[0], s->ip[1], s->ip[2], s->ip[3]);
-            s->valid = false;
-            wipe(s->xor_key, sizeof s->xor_key);
-            wipe(&s->token, sizeof s->token);
+            srv_log("session 0x%04x (ip %u.%u.%u.%u) expired after %u s idle",
+                    s->sid, s->ip[0], s->ip[1], s->ip[2], s->ip[3],
+                    (unsigned)(IDLE_TIMEOUT_MS / 1000));
+            sess_wipe(ctx, s);
         }
     }
     pthread_rwlock_unlock(&ctx->sess_lock);

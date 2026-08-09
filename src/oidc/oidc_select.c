@@ -88,8 +88,20 @@ Json *oidc_find_server(Json *servers, const char *spec)
             sb[hlen] = '\0';
             const char *shost = unbracket_ipv6(sb, s2, sizeof s2);
             const char *hhost = unbracket_ipv6(host, hb, sizeof hb);
-            Json *portj = json_get(s, "port");
-            uint16_t hport = portj ? (uint16_t)json_num(portj) : 6001;
+            uint16_t hport;
+            double pv;
+            int pr = oidc_server_port(s, &hport, &pv);
+            if (pr < 0) {
+                /* a broken port only matters if this entry is the one
+                 * the spec addresses by host */
+                if (strcasecmp(shost, hhost) == 0)
+                    oidc_die("invalid port %g for server \"%s\" "
+                             "(must be an integer in 1..65535)",
+                             pv, name ? name : host);
+                continue;
+            }
+            if (pr == 0)
+                hport = OIDC_DEFAULT_PORT;
             if (sport == hport && strcasecmp(shost, hhost) == 0)
                 return s;
         }

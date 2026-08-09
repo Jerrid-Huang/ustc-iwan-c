@@ -1,4 +1,5 @@
 #include "common.h"
+#include "util.h"
 
 #include <errno.h>
 #include <pwd.h>
@@ -38,32 +39,26 @@ int load_cidr_file(const char *path, slist_t *out)
     return 0;
 }
 
+/* Home directory for "~/" config resolution. Under sudo the passwd
+ * entry of the invoking user (SUDO_USER) is used, else the passwd entry
+ * of our own uid, else $HOME (absolute only), else NULL. Never guesses
+ * "/" or "/home/<name>": a wrong guess could point at a writable path
+ * an attacker controls. Returns NULL when undeterminable. */
 static char *home_dir(void)
 {
     const char *su = getenv("SUDO_USER");
     if (su && *su && strcmp(su, "root") != 0) {
-        long bufsz = sysconf(_SC_GETPW_R_SIZE_MAX);
-        if (bufsz <= 0)
-            bufsz = 16384;
-        char *buf = malloc((size_t)bufsz);
-        struct passwd pw;
-        struct passwd *res = NULL;
-        int rc = getpwnam_r(su, &pw, buf, (size_t)bufsz, &res);
-        if (rc == 0 && res && pw.pw_dir) {
-            char *home = xstrdup(pw.pw_dir);
-            free(buf);
-            return home;
-        }
-        free(buf);
-        size_t n = strlen("/home/") + strlen(su) + 1;
-        char *fallback = malloc(n);
-        snprintf(fallback, n, "/home/%s", su);
-        return fallback;
+        struct passwd *pw = getpwnam(su);
+        if (pw && pw->pw_dir)
+            return xstrdup(pw->pw_dir);
     }
+    struct passwd *pw = getpwuid(getuid());
+    if (pw && pw->pw_dir)
+        return xstrdup(pw->pw_dir);
     const char *home = getenv("HOME");
-    if (home && *home)
+    if (home && *home && home[0] == '/')
         return xstrdup(home);
-    return xstrdup("/");
+    return NULL;
 }
 
 char *resolve_config_dir(const char *dir)
@@ -71,10 +66,14 @@ char *resolve_config_dir(const char *dir)
     if (strncmp(dir, "~/", 2) != 0)
         return xstrdup(dir);
     char *home = home_dir();
+    if (!home)
+        return NULL;
     const char *rest = dir + 2;
     size_t hlen = strlen(home);
     size_t rlen = strlen(rest);
     char *out = malloc(hlen + 1 + rlen + 1);
+    if (!out)
+        oom_abort();
     memcpy(out, home, hlen);
     out[hlen] = '/';
     memcpy(out + hlen + 1, rest, rlen + 1);

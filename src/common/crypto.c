@@ -1,6 +1,9 @@
 #include "crypto.h"
+#include "protocol.h"
+#include "util.h"
 
 #include <limits.h>
+#include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <stdint.h>
@@ -29,32 +32,53 @@ void hmac_sha256(const uint8_t *key, size_t klen,
     HMAC(EVP_sha256(), key, (int)klen, msg, mlen, out, &n);
 }
 
-void encrypt_password(const char *plain, const char *username, uint8_t out[16])
+int encrypt_password(const char *plain, const char *username, uint8_t out[16])
 {
     size_t ulen = strlen(username);
     uint8_t *keymat = malloc(2 + ulen);
-    keymat[0] = 'm';
-    keymat[1] = 'w';
-    memcpy(keymat + 2, username, ulen);
     uint8_t key[16];
+    uint8_t pt[16];
+    EVP_CIPHER_CTX *ctx = NULL;
+    int ok = -1;
+    int outl = 0;
+    int finl = 0;
+
+    if (!keymat)
+        return -1;
+    memcpy(keymat, IWAN_MW, 2);
+    memcpy(keymat + 2, username, ulen);
     md5(keymat, 2 + ulen, key);
+    /* scrub the derivation input: OPENSSL_cleanse is the one scrubber
+     * the compiler cannot optimize away */
+    OPENSSL_cleanse(keymat, 2 + ulen);
     free(keymat);
 
-    uint8_t pt[16];
     memset(pt, 0, sizeof(pt));
     size_t plen = strlen(plain);
     if (plen > sizeof(pt))
         plen = sizeof(pt);
     memcpy(pt, plain, plen);
 
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    EVP_EncryptInit_ex(ctx, EVP_aes_128_ecb(), NULL, key, NULL);
-    EVP_CIPHER_CTX_set_padding(ctx, 0);
-    int outl = 0;
-    int finl = 0;
-    EVP_EncryptUpdate(ctx, out, &outl, pt, (int)sizeof(pt));
-    EVP_EncryptFinal_ex(ctx, out + outl, &finl);
-    EVP_CIPHER_CTX_free(ctx);
+    ctx = EVP_CIPHER_CTX_new();
+    if (!ctx)
+        goto done;
+    if (EVP_EncryptInit_ex(ctx, EVP_aes_128_ecb(), NULL, key, NULL) != 1 ||
+        EVP_CIPHER_CTX_set_padding(ctx, 0) != 1 ||
+        EVP_EncryptUpdate(ctx, out, &outl, pt, (int)sizeof(pt)) != 1 ||
+        EVP_EncryptFinal_ex(ctx, out + outl, &finl) != 1)
+        goto done;
+    ok = 0;
+
+done:
+    if (ctx)
+        EVP_CIPHER_CTX_free(ctx);
+    /* key is derived from the username and pt holds the zero-padded
+     * plaintext password: both must not survive the return */
+    OPENSSL_cleanse(key, sizeof key);
+    OPENSSL_cleanse(pt, sizeof pt);
+    if (ok != 0)
+        memset(out, 0, 16); /* deterministic output on failure */
+    return ok;
 }
 
 void session_key(const char *username, const char *password, uint8_t out[16])
@@ -62,9 +86,15 @@ void session_key(const char *username, const char *password, uint8_t out[16])
     size_t ulen = strlen(username);
     size_t plen = strlen(password);
     uint8_t *mat = malloc(ulen + plen);
+    if (!mat) {
+        memset(out, 0, 16);
+        return;
+    }
     memcpy(mat, username, ulen);
     memcpy(mat + ulen, password, plen);
     md5(mat, ulen + plen, out);
+    /* mat concatenates the plaintext password: scrub before free */
+    OPENSSL_cleanse(mat, ulen + plen);
     free(mat);
 }
 
@@ -113,6 +143,35 @@ void hex_encode(const uint8_t *bytes, size_t n, char *out)
     out[2 * n] = '\0';
 }
 
+static int hex_nibble(int c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+int hex_decode(const char *hex, size_t hexlen, uint8_t *out, size_t outcap)
+{
+    size_t n;
+    if (hexlen % 2 != 0)
+        return -1;
+    n = hexlen / 2;
+    if (n > outcap)
+        return -1;
+    for (size_t i = 0; i < n; i++) {
+        int hi = hex_nibble((unsigned char)hex[2 * i]);
+        int lo = hex_nibble((unsigned char)hex[2 * i + 1]);
+        if (hi < 0 || lo < 0)
+            return -1;
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return (int)n;
+}
+
 void buf_put_hex(buf_t *out, const uint8_t *bytes, size_t n)
 {
     buf_ensure(out, 2 * n);
@@ -153,6 +212,8 @@ static uint8_t *b64_decode_raw(const char *s, size_t n, size_t *out_len)
     else if (rem == 3)
         nbytes += 2;
     uint8_t *out = malloc(nbytes + 1);
+    if (!out)
+        oom_abort();
     size_t o = 0;
     for (size_t i = 0; i < full; i++) {
         int a = b64_char_val((unsigned char)s[i * 4]);
@@ -195,18 +256,9 @@ uint8_t *b64url_decode(const char *s, size_t *out_len)
     size_t n = strlen(s);
     if (n == 0)
         return NULL;
-    char *tmp = malloc(n + 1);
-    memcpy(tmp, s, n + 1);
-    for (size_t i = 0; i < n; i++) {
-        if (tmp[i] == '-')
-            tmp[i] = '+';
-        else if (tmp[i] == '_')
-            tmp[i] = '/';
-    }
-    uint8_t *out = b64_decode_raw(tmp, n, out_len);
-    free(tmp);
-    if (out)
-        return out;
+    /* b64_char_val already accepts '-'/'_' as aliases of '+'/'/', so the
+     * old tmp translation was a no-op and its fallback could never
+     * succeed where the first pass failed: decode once, directly */
     return b64_decode_raw(s, n, out_len);
 }
 
