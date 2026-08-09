@@ -62,8 +62,8 @@ void oidc_buf_cstr(buf_t *b);
 char *oidc_buf_to_cstr(buf_t *b);
 void oidc_esc_put(buf_t *b, const char *s);
 /* pull a named query parameter out of a URL/query string; returns a
- * newly allocated URL-decoded value or NULL when absent */
-const char *oidc_url_param(const char *s, const char *name);
+ * newly allocated URL-decoded value (caller frees) or NULL when absent */
+char *oidc_url_param(const char *s, const char *name);
 char *oidc_extract_code(const char *s);
 char *oidc_id_token_username(Json *tok);
 

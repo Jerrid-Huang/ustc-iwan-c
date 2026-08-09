@@ -8,7 +8,7 @@ USTC iWAN 校园网 VPN 客户端,用 C11 从 [yyy1mu/ustc-iwan](https://github.
   - `iwan-client` — `ping` / `auth` / `proxy`(TUN 模式)/ `socks`(无 root 的用户态 SOCKS5 代理)
   - `iwan-client-oidc` — OIDC 配置获取与服务器选择(`--fetch` / `--list` / `--connect` / `--all`)
 - `iwan-server` — 参考 [yyy1mu/ustc-iwan](https://github.com/yyy1mu/ustc-iwan) 的 Rust 服务器以 C11 实现的轻量 VPN 服务器(单线程轮询、UDP 数据面 ↔ TUN)
-- 自研用户态 TCP/IP 协议栈(零拷贝段槽、64KB 窗口 + WSCALE、delayed ACK、自适应 RTO、快速重传、keepalive 探测、GSO 批发送)
+- 自研用户态 TCP/IP 协议栈(零拷贝段槽、64KB 窗口 + WSCALE、逐段立即 ACK、自适应 RTO、快速重传、keepalive 探测、GSO 批发送)
 - 8B 外层头 + XOR 加密内层 IP 包(整包加密)
 - `--ustc` 快捷路由:一条参数展开为 11 条科大校园网 CIDR,配合 `--server` 直接连接(仅 `iwan-client-oidc`)
 
@@ -81,14 +81,16 @@ sudo ./bin/iwan-server --users /etc/iwan/users.txt \
 
 目录结构:`src/common/` 为共享核心(协议、加密、用户态 TCP 栈、SOCKS 层、TUN、路由、CLI/JSON/HTTPS 工具,全部打进 `libiwan_core.a`);`src/oidc/` 为 OIDC 登录流(仅 `iwan-client-oidc` 使用,单向依赖 common);三个可执行入口在 `src/` 顶层。构建系统在 `Makefile`(`build/` 下按 `common/`、`oidc/`、`main/` 分桶存放对象;`steer_bpf_data.c` 由 clang 交叉编译的 BPF 目标生成,运行时按 `classifier`/`license` 节名加载)。
 
-- 用户态 TCP 栈支持重传(RTO 自适应 SRTT/RTTVAR)、快速重传(3 个重复 ACK)、delayed ACK(40ms flush)、keepalive(120s 探测)、64KB 窗口 + WSCALE=6、FIN 进重传表。
-- 发送路径:等长批走 UDP GSO(单 sendmsg 最多 44 段),混合批走 sendmmsg;接收路径 recvmmsg(64 槽)+ poll 事件驱动。
+- 用户态 TCP 栈支持重传(RTO 自适应 SRTT/RTTVAR)、快速重传(3 个重复 ACK)、逐段立即 ACK(RFC 1122 的每 2 段 delayed ACK 在 ~2ms RTT 隧道上是纯延迟:重传后 cwnd=1 时每段都要等满窗口,见 netstack.c;早期实现的 delayed-ACK 机制已删除,仅保留立即 ACK)、keepalive(空闲 120s 后开始探测,间隔 30s,连续 3 次无响应即断开;`NS_IDLE_TIMEOUT` / `NS_KEEPALIVE_MS`)、64KB 窗口 + WSCALE=6、FIN 进重传表。
+- 发送路径:等长批走 UDP GSO(单 sendmsg 最多 3 段,GSO 单元上限 4096B,见 protocol.h `IWAN_GSO_UNIT_SAFE`),混合批走 sendmmsg;接收路径 recvmmsg(64 槽)+ poll 事件驱动。
 - 经源码级审查与本地基准验证,io_uring(multishot / SEND_ZC / provided buffers)、UDP_GRO、SO_ZEROCOPY 均不采用(实测更慢或与段槽存活期冲突,决策注释见 `socks.c` 与 `netstack.c`)。
-- 消融测试确认所有协议优化均有贡献,无冗余可删。
+- 发送限速:客户端 `IWAN_SEND_PACING_PPS` 环境变量控制发送节奏,默认 0 = 关闭(见 util.h);Rust 参考服务器单线程排水有上限,连接它时建议设 300000。
+- 服务端对未认证控制面(OPEN/PING/ECHO)按源地址限速,默认 `RATE_OPEN_MAX` 20/s(OPEN)、`RATE_ECHO_MAX` 60/s(PING 与 ECHO 各计各的),可用环境变量 `IWAN_RATE_OPEN_MAX` / `IWAN_RATE_ECHO_MAX` 在启动时覆盖(0-65535,非法值回退默认);超限静默丢弃(仅计数,计入每秒统计行 `ratedrop=`);基准 ping 循环若超过 60/s 会丢包。
+- 协议优化均经本地对照基准验证有效(仓库内无消融测试记录,结论来自当时的本地测量,可自行复测)。
 
 ## 性能基准
 
-4 组合矩阵实测(本机双服务器 + 客户端,单位 Mbit/s;每格为「1 连接 / 16 连接」聚合吞吐)。测试脚本 `/tmp/r16_test.sh`(`SRV=C|R` 参数化)与 `/tmp/updown_multi.py`。
+4 组合矩阵实测(本机双服务器 + 客户端,单位 Mbit/s;每格为「1 连接 / 16 连接」聚合吞吐)。测试脚本 `/tmp/r16_test.sh`(`SRV=C|R` 参数化)与 `/tmp/updown_multi.py` 位于 /tmp,属临时文件、不随仓库保存(`updown_multi.py` 已随系统清理丢失,`r16_test.sh` 亦可能随时消失);如需复测请自行重建脚本。
 
 | 客户端 \\ 服务器 | C 服务器 | R 服务器(Rust 原版) |
 |---|---|---|

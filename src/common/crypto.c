@@ -2,7 +2,6 @@
 #include "protocol.h"
 #include "util.h"
 
-#include <limits.h>
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
@@ -16,20 +15,29 @@ typedef uint64_t u64_may_alias __attribute__((may_alias));
 void md5(const void *data, size_t len, uint8_t out[16])
 {
     unsigned int n = 0;
-    EVP_Digest(data, len, out, &n, EVP_md5(), NULL);
+    if (EVP_Digest(data, len, out, &n, EVP_md5(), NULL) != 1) {
+        log_err("md5: EVP_Digest failed");
+        abort();
+    }
 }
 
 void sha256(const void *data, size_t len, uint8_t out[32])
 {
     unsigned int n = 0;
-    EVP_Digest(data, len, out, &n, EVP_sha256(), NULL);
+    if (EVP_Digest(data, len, out, &n, EVP_sha256(), NULL) != 1) {
+        log_err("sha256: EVP_Digest failed");
+        abort();
+    }
 }
 
 void hmac_sha256(const uint8_t *key, size_t klen,
                  const uint8_t *msg, size_t mlen, uint8_t out[32])
 {
     unsigned int n = 0;
-    HMAC(EVP_sha256(), key, (int)klen, msg, mlen, out, &n);
+    if (HMAC(EVP_sha256(), key, (int)klen, msg, mlen, out, &n) == NULL) {
+        log_err("hmac_sha256: HMAC failed");
+        abort();
+    }
 }
 
 int encrypt_password(const char *plain, const char *username, uint8_t out[16])
@@ -53,6 +61,10 @@ int encrypt_password(const char *plain, const char *username, uint8_t out[16])
     OPENSSL_cleanse(keymat, 2 + ulen);
     free(keymat);
 
+    /* Passwords longer than the 16-byte block are silently truncated to
+     * the first 16 bytes: zero-padded truncation, matching the reference
+     * implementation. Client and server share this same function, so the
+     * truncation is consistent on both ends. */
     memset(pt, 0, sizeof(pt));
     size_t plen = strlen(plain);
     if (plen > sizeof(pt))
@@ -170,15 +182,6 @@ int hex_decode(const char *hex, size_t hexlen, uint8_t *out, size_t outcap)
         out[i] = (uint8_t)((hi << 4) | lo);
     }
     return (int)n;
-}
-
-void buf_put_hex(buf_t *out, const uint8_t *bytes, size_t n)
-{
-    buf_ensure(out, 2 * n);
-    for (size_t i = 0; i < n; i++) {
-        out->data[out->len++] = HEX_DIGITS[bytes[i] >> 4];
-        out->data[out->len++] = HEX_DIGITS[bytes[i] & 0x0F];
-    }
 }
 
 static int b64_char_val(unsigned char c)

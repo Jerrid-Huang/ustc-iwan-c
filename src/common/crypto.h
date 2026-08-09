@@ -20,7 +20,6 @@ void xor_crypt(uint8_t *data, size_t len, const uint8_t *key, size_t klen);
 
 /* hex encode (lowercase) into out (>= 2*n+1), NUL-terminated */
 void hex_encode(const uint8_t *bytes, size_t n, char *out);
-void buf_put_hex(buf_t *out, const uint8_t *bytes, size_t n);
 
 /* hex decode (no 0x prefix) into out (outcap bytes max). Returns the
  * number of bytes written, or -1 on malformed input (odd length,

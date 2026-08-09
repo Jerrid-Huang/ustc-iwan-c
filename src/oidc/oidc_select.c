@@ -55,7 +55,8 @@ void oidc_print_servers(Json *servers)
         const char *name = json_get_str(s, "name");
         const char *host = json_get_str(s, "host");
         Json *portj = json_get(s, "port");
-        unsigned long port = portj ? (unsigned long)json_num(portj) : 0;
+        unsigned long port = portj ? (unsigned long)json_num(portj)
+                                   : (unsigned long)OIDC_DEFAULT_PORT;
         const char *nm = name ? name : "";
         int w = utf8_width(nm);
         int pad = w < 30 ? 30 - w : 0;
@@ -64,8 +65,44 @@ void oidc_print_servers(Json *servers)
     }
 }
 
-/* match a line by exact name, or structurally by host:port
- * (unbracketed, case-insensitive host, numeric port) */
+/* structured match of one server entry against a "host:port" spec
+ * (unbracketed, case-insensitive host, numeric port); the entry on
+ * match, NULL otherwise. A broken port value dies only when the spec
+ * actually addresses this entry by host. */
+static Json *match_host_port(Json *s, const char *spec, const char *last,
+                             const char *name, const char *host)
+{
+    char sb[64], s2[64], hb[64];
+    uint16_t sport;
+    size_t hlen = (size_t)(last - spec);
+    if (hlen >= sizeof sb)
+        return NULL;
+    if (str_to_u16(last + 1, &sport) != 0)
+        return NULL;   /* non-numeric port: no structured match */
+    memcpy(sb, spec, hlen);
+    sb[hlen] = '\0';
+    const char *shost = unbracket_ipv6(sb, s2, sizeof s2);
+    const char *hhost = unbracket_ipv6(host, hb, sizeof hb);
+    uint16_t hport;
+    double pv;
+    int pr = oidc_server_port(s, &hport, &pv);
+    if (pr < 0) {
+        /* a broken port only matters if this entry is the one
+         * the spec addresses by host */
+        if (strcasecmp(shost, hhost) == 0)
+            oidc_die("invalid port %g for server \"%s\" "
+                     "(must be an integer in 1..65535)",
+                     pv, name ? name : host);
+        return NULL;
+    }
+    if (pr == 0)
+        hport = OIDC_DEFAULT_PORT;
+    if (sport == hport && strcasecmp(shost, hhost) == 0)
+        return s;
+    return NULL;
+}
+
+/* match a line by exact name, or structurally by host:port */
 Json *oidc_find_server(Json *servers, const char *spec)
 {
     size_t n = json_arr_len(servers);
@@ -77,33 +114,9 @@ Json *oidc_find_server(Json *servers, const char *spec)
         if (name && strcmp(name, spec) == 0)
             return s;
         if (last && host) {
-            char sb[64], s2[64], hb[64];
-            uint16_t sport;
-            size_t hlen = (size_t)(last - spec);
-            if (hlen >= sizeof sb)
-                continue;
-            if (str_to_u16(last + 1, &sport) != 0)
-                continue;   /* non-numeric port: no structured match */
-            memcpy(sb, spec, hlen);
-            sb[hlen] = '\0';
-            const char *shost = unbracket_ipv6(sb, s2, sizeof s2);
-            const char *hhost = unbracket_ipv6(host, hb, sizeof hb);
-            uint16_t hport;
-            double pv;
-            int pr = oidc_server_port(s, &hport, &pv);
-            if (pr < 0) {
-                /* a broken port only matters if this entry is the one
-                 * the spec addresses by host */
-                if (strcasecmp(shost, hhost) == 0)
-                    oidc_die("invalid port %g for server \"%s\" "
-                             "(must be an integer in 1..65535)",
-                             pv, name ? name : host);
-                continue;
-            }
-            if (pr == 0)
-                hport = OIDC_DEFAULT_PORT;
-            if (sport == hport && strcasecmp(shost, hhost) == 0)
-                return s;
+            Json *m = match_host_port(s, spec, last, name, host);
+            if (m)
+                return m;
         }
     }
     return NULL;

@@ -9,6 +9,7 @@
 #include "cli.h"
 #include "common.h"
 #include "oidc.h"
+#include "util.h"
 
 static Cli *g_usage;   /* used by ctl->usage_str; set before cli_parse */
 
@@ -55,7 +56,7 @@ static void print_help_short(void)
         "      --ustc                         Route USTC campus networks through the tunnel (shortcut for the usual --proxy-cidr list)\n"
         "      --proxy-ip <PROXY_IP>          IPv4 addresses to route through the tunnel. Can be repeated or comma-separated\n"
         "      --proxy-domain <PROXY_DOMAIN>  Domains to resolve and route through the tunnel. Can be repeated or comma-separated\n"
-        "      --encrypt <ENCRYPT>            Encryption method: 0=None, 1=XOR, 2=AES [default: 1]\n"
+        "      --encrypt <ENCRYPT>            Encryption method: 0=None, 1=XOR [default: 1]\n"
         "      --socks                        Use a rootless userspace SOCKS5 proxy instead of a TUN device\n"
         "      --socks-listen <SOCKS_LISTEN>  Local SOCKS5 listen address [default: 127.0.0.1:1080]\n"
         "      --socks-mtu <SOCKS_MTU>        Maximum userspace inner IP MTU [default: 1380]\n"
@@ -111,7 +112,7 @@ static void print_help_long(void)
         "          Domains to resolve and route through the tunnel. Can be repeated or comma-separated\n"
         "\n"
         "      --encrypt <ENCRYPT>\n"
-        "          Encryption method: 0=None, 1=XOR, 2=AES\n"
+        "          Encryption method: 0=None, 1=XOR\n"
         "          \n"
         "          [default: 1]\n"
         "\n"
@@ -174,6 +175,10 @@ static const char *const short_aliases[][2] = {
 
 void oidc_parse_cli(int argc, char **argv, Opts *o, Cli *usage)
 {
+    /* called first thing from main: cover the whole process before any
+     * network I/O (https.c depends on EPIPE, not SIGPIPE, killing us) */
+    util_ignore_sigpipe();
+
     cli_init(usage);
     g_usage = usage;
 

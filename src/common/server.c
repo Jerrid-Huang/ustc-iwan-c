@@ -23,8 +23,8 @@
 #define REJECT_LOG_MAX 10   /* per second, per source-independent window */
 #define RATE_BUCKETS 1024   /* per-source limit table for OPEN/PING/ECHO */
 #define RATE_WINDOW_MS 1000
-#define RATE_OPEN_MAX 20    /* OPENs per source per window */
-#define RATE_ECHO_MAX 60    /* PING/ECHO per source per window */
+#define RATE_OPEN_MAX_DEFAULT 20    /* OPENs per source per window */
+#define RATE_ECHO_MAX_DEFAULT 60    /* PING and ECHO, each per window */
 /* Rate-table hashing: Knuth's multiplicative hash. The constant is
  * 2^32 / golden ratio (~2654435761); multiplying by this odd number
  * scrambles the low bits of the key across the full 32-bit range, and
@@ -44,6 +44,9 @@ static atomic_ullong g_dl_pkts;   /* UDP datagrams sent (incl. control
                                    * frames like OPEN_ACK/PING_RSP — the
                                    * counter is not a pure data metric) */
 static atomic_ullong g_dl_drops;  /* downlink inner-IPv4 gate drops (H1) */
+static atomic_ullong g_rate_drops; /* per-source rate-limit drops (silent) */
+static unsigned g_rate_open_max = RATE_OPEN_MAX_DEFAULT;
+static unsigned g_rate_echo_max = RATE_ECHO_MAX_DEFAULT;
 static pthread_mutex_t g_log_lock = PTHREAD_MUTEX_INITIALIZER;
 
 void srv_log(const char *fmt, ...)
@@ -104,7 +107,7 @@ void server_up_stats_print(void)
     fprintf(stderr,
             "uplink: [t=%llu] n=%llu parse=%.0fns find=%.0fns xor=%.0fns"
             " write=%.0fns total=%.0fns drop=%llu h1=%llu dl=%llu"
-            " dldrop=%llu\n",
+            " dldrop=%llu ratedrop=%llu\n",
             (unsigned long long)now_ms(), (unsigned long long)g_up.n,
             (double)g_up.parse / g_up.n, (double)g_up.find / g_up.n,
             (double)g_up.xor / g_up.n, (double)g_up.write / g_up.n,
@@ -112,7 +115,8 @@ void server_up_stats_print(void)
             (unsigned long long)g_up.drop,
             (unsigned long long)g_up.h1,
             (unsigned long long)server_dl_pkts(),
-            (unsigned long long)atomic_load(&g_dl_drops));
+            (unsigned long long)atomic_load(&g_dl_drops),
+            (unsigned long long)atomic_load(&g_rate_drops));
     g_up.n = g_up.parse = g_up.find = g_up.xor = g_up.write = 0;
     g_up.drop = 0;
     g_up.h1 = 0;
@@ -147,25 +151,64 @@ static void log_escape(const char *in, char out[], size_t outsz)
 struct rate_bucket {
     uint32_t ip;       /* network-order source address */
     uint64_t win;      /* window start (monotonic ms) */
-    uint8_t open_cnt, echo_cnt;
+    /* per-type counts in the current window. OPEN, PING and ECHO are
+     * limited independently (a PING flood no longer eats the ECHO
+     * budget); uint32_t so env-configured limits above 255 stay
+     * representable. */
+    uint32_t open_cnt, ping_cnt, echo_cnt;
 };
 
 static struct rate_bucket g_rates[RATE_BUCKETS];
 
+/* IWAN_RATE_* limits are read once at startup (server_rate_limits_init);
+ * malformed or out-of-range values fall back to the defaults with a
+ * logged warning. The 65535 ceiling keeps one source from claiming an
+ * unbounded per-window allowance. */
+static unsigned rate_limit_env(const char *name, unsigned dflt)
+{
+    const char *v = getenv(name);
+    char *end;
+    unsigned long n;
+
+    if (!v || !*v)
+        return dflt;
+    errno = 0;
+    n = strtoul(v, &end, 10);
+    if (errno != 0 || end == v || *end != '\0' || n == 0 || n > 65535) {
+        log_err("invalid %s='%s': using default %u", name, v, dflt);
+        return dflt;
+    }
+    return (unsigned)n;
+}
+
+void server_rate_limits_init(void)
+{
+    g_rate_open_max = rate_limit_env("IWAN_RATE_OPEN_MAX",
+                                     RATE_OPEN_MAX_DEFAULT);
+    g_rate_echo_max = rate_limit_env("IWAN_RATE_ECHO_MAX",
+                                     RATE_ECHO_MAX_DEFAULT);
+}
+
 /* Per-source token limits on unauthenticated control paths. Over-limit
- * sources are silently dropped (no reject, no log) so a single host
+ * sources are silently dropped (no reject, no log; each drop is counted
+ * in g_rate_drops for the per-second stats line) so a single host
  * cannot saturate the single-threaded loop with cheap forged packets. */
 static bool rate_allow(const struct sockaddr_in *peer, uint8_t typ, uint64_t now)
 {
     uint32_t ip = (uint32_t)peer->sin_addr.s_addr;
     struct rate_bucket *b;
+    uint32_t *cnt;
+    unsigned limit;
     unsigned h;
 
     switch (typ) {
     case PT_OPEN:
+        limit = g_rate_open_max;
+        break;
     case PT_PING_REQ:
     case PT_ECHO_REQ:
-        break; /* rate-limited below */
+        limit = g_rate_echo_max;
+        break;
     default:
         return true; /* authenticated or negligible-cost paths */
     }
@@ -197,17 +240,17 @@ static bool rate_allow(const struct sockaddr_in *peer, uint8_t typ, uint64_t now
     if (b->ip != ip || now - b->win >= RATE_WINDOW_MS) {
         b->ip = ip;
         b->win = now;
-        b->open_cnt = b->echo_cnt = 0;
+        b->open_cnt = b->ping_cnt = b->echo_cnt = 0;
     }
-    if (typ == PT_OPEN) {
-        if (b->open_cnt >= RATE_OPEN_MAX)
-            return false;
-        b->open_cnt++;
-    } else {
-        if (b->echo_cnt >= RATE_ECHO_MAX)
-            return false;
-        b->echo_cnt++;
+    /* independent per-type counters: a PING flood cannot eat the ECHO
+     * budget (or vice versa); OPEN keeps its own, tighter limit */
+    cnt = (typ == PT_OPEN) ? &b->open_cnt :
+          (typ == PT_PING_REQ) ? &b->ping_cnt : &b->echo_cnt;
+    if (*cnt >= limit) {
+        atomic_fetch_add(&g_rate_drops, 1);
+        return false;
     }
+    (*cnt)++;
     return true;
 }
 
@@ -350,11 +393,12 @@ static uint32_t random_token(void)
 
 struct open_ctx {
     char user[SERVER_USER_MAX + 1];
-    uint8_t ct[16];
+    uint8_t ct[16];      /* 16-byte md5 digest of the encrypted password */
     uint16_t mtu;
     uint8_t enc;
     uint32_t nonce;
     bool have_av;
+    bool user_too_long;  /* T_USERNAME value exceeded SERVER_USER_MAX */
 };
 
 static bool open_tlv(uint8_t typ, const uint8_t *val, uint8_t vlen, void *ud)
@@ -367,13 +411,17 @@ static bool open_tlv(uint8_t typ, const uint8_t *val, uint8_t vlen, void *ud)
             size_t n = vlen < SERVER_USER_MAX ? vlen : SERVER_USER_MAX;
             memcpy(a->user, val, n);
             a->user[n] = '\0';
+            if (vlen > SERVER_USER_MAX)
+                a->user_too_long = true; /* keep the truncated copy for
+                                          * safe logging; rejected by
+                                          * handle_open */
         } else {
             a->user[0] = '\0';
         }
         break;
     case T_PASSWORD:
-        if (vlen >= 16)
-            memcpy(a->ct, val, 16);
+        if (vlen >= sizeof a->ct)
+            memcpy(a->ct, val, sizeof a->ct);
         break;
     case T_MTU:
         if (vlen >= 2)
@@ -411,15 +459,25 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
     struct server_session *s;
     int slot, i;
 
-    if (len < 24 || !verify_sig(raw, len))
+    if (len < IWAN_CTRL_LEN || !verify_sig(raw, len))
         return;
 
     memset(&a, 0, sizeof a);
-    a.mtu = 1400;
-    if (parse_tlvs(raw + 24, len - 24, open_tlv, &a) != 0) {
+    a.mtu = IWAN_DEFAULT_MTU;
+    if (parse_tlvs(raw + IWAN_CTRL_LEN, len - IWAN_CTRL_LEN, open_tlv,
+                   &a) != 0) {
         peer_to_string(peer, peerstr);
         log_reject(peerstr, a.user, "malformed TLVs");
         send_reject(sockfd, peer, "malformed TLVs");
+        return;
+    }
+
+    if (a.user_too_long) {
+        /* an over-long name can never match a users-file entry; reject
+         * loudly instead of silently truncating to 63 bytes */
+        peer_to_string(peer, peerstr);
+        log_reject(peerstr, a.user, "username too long");
+        send_reject(sockfd, peer, "username too long");
         return;
     }
 
@@ -444,7 +502,7 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
     }
 
     encrypt_password(pass, a.user, expect);
-    if (CRYPTO_memcmp(expect, a.ct, 16) != 0) {
+    if (CRYPTO_memcmp(expect, a.ct, sizeof a.ct) != 0) {
         peer_to_string(peer, peerstr);
         log_reject(peerstr, a.user, "invalid credentials");
         send_reject(sockfd, peer, "invalid credentials");
@@ -498,7 +556,7 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
         for (i = 0; i < (int)pool && i < 65536; i++) {
             if (probe > ctx->ip_end)
                 probe = ctx->ip_base;
-            sid = (uint16_t)(probe & 0xFFFF);
+            sid = (uint16_t)probe; /* sid = low 16 bits of the IP */
             if (!find_session_unlocked(ctx, sid))
                 break;
             probe++;
@@ -527,7 +585,7 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
     s->token = tok;
     s->peer = *peer;
     u32_ip4(ipu, s->ip);
-    memcpy(s->xor_key, sk, 8);
+    memcpy(s->xor_key, sk, sizeof s->xor_key);
     s->enc = a.enc;
     atomic_store(&s->last_active_ms, now_ms());
     snprintf(s->user, sizeof s->user, "%s", a.user);
@@ -544,7 +602,8 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
     nb[1] = (uint8_t)(a.nonce >> 16);
     nb[2] = (uint8_t)(a.nonce >> 8);
     nb[3] = (uint8_t)a.nonce;
-    mtu = a.mtu < 576 ? 576 : (a.mtu > 1500 ? 1500 : a.mtu);
+    mtu = a.mtu < IWAN_MTU_MIN ? IWAN_MTU_MIN
+                               : (a.mtu > IWAN_MTU_MAX ? IWAN_MTU_MAX : a.mtu);
     mb[0] = (uint8_t)(mtu >> 8);
     mb[1] = (uint8_t)mtu;
 
@@ -585,7 +644,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
     uint16_t sid;
     uint32_t tok;
 
-    if (len < 8)
+    if (len < IWAN_HDR_LEN)
         return;
     typ = raw[0];
     sid = (uint16_t)((raw[2] << 8) | raw[3]);
@@ -640,7 +699,8 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
             if (enc) {
                 if (typ != PT_DATA_ENC)
                     return; /* enc session accepts only encrypted data */
-                xor_crypt((uint8_t *)raw + 8, len - 8, xk, 8);
+                xor_crypt((uint8_t *)raw + IWAN_HDR_LEN,
+                          len - IWAN_HDR_LEN, xk, sizeof xk);
             } else {
                 if (typ != PT_DATA)
                     return; /* plain session accepts only plaintext data */
@@ -651,9 +711,11 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
              * source is the session's assigned address. Anything else is
              * a malformed or spoofed frame — drop it before it reaches
              * the TUN (counted; logged only under IWAN_DEBUG). The inner
-             * header sits at raw+8, behind the 8-byte outer header. */
-            if (len <= 8 ||
-                ipv4_pkt_ok(raw + 8, len - 8, &saddr, &daddr) != 0 ||
+             * header sits at raw+IWAN_HDR_LEN, behind the outer
+             * header. */
+            if (len <= IWAN_HDR_LEN ||
+                ipv4_pkt_ok(raw + IWAN_HDR_LEN, len - IWAN_HDR_LEN,
+                            &saddr, &daddr) != 0 ||
                 saddr != s_ip) {
                 g_up.h1++;
                 if (debug_enabled())
@@ -661,13 +723,13 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                               sid);
                 break;
             }
-            if (ctx->tun_fd >= 0 && len > 8) {
+            if (ctx->tun_fd >= 0 && len > IWAN_HDR_LEN) {
                 /* device TX queue full: wait briefly for drain instead of
                  * silently dropping the segment. A dropped uplink segment
                  * makes the client RTO-retry; under a burst that can
                  * degrade into a stall. */
-                if (tun_write_retry(ctx->tun_fd, raw + 8, len - 8, 1,
-                                    NULL) != 0)
+                if (tun_write_retry(ctx->tun_fd, raw + IWAN_HDR_LEN,
+                                    len - IWAN_HDR_LEN, 1, NULL) != 0)
                     g_up.drop++;  /* still full: drop, client retransmits */
             }
             if (debug_enabled()) {
@@ -714,7 +776,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
         }
         pthread_rwlock_unlock(&ctx->sess_lock);
         buf_init(&b);
-        ctrl_hdr(&b, PT_PING_RSP, 0, 0xFFFF, 0xFFFFFFFF);
+        ctrl_hdr(&b, PT_PING_RSP, 0, IWAN_PING_SID, IWAN_PING_TOK);
         udp_send(sockfd, peer, b.data, b.len);
         buf_free(&b);
         break;
@@ -742,15 +804,13 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
 }
 
 void handle_tun_downlink(struct server_ctx *ctx, const uint8_t *ip_pkt, size_t len,
-                         int tun_fd, int sockfd)
+                         int sockfd)
 {
     struct server_sess_snap snap;
-    /* fixed stack buffer: 8B outer header + max TUN datagram; avoids a
+    /* fixed stack buffer: outer header + max TUN datagram; avoids a
      * malloc/realloc cycle per forwarded packet */
-    uint8_t out[8 + 65536];
+    uint8_t out[IWAN_HDR_LEN + 65536];
     uint32_t saddr, daddr;
-
-    (void)tun_fd;
 
     if (len < 20 || len > 65536)
         return;
@@ -792,17 +852,12 @@ void handle_tun_downlink(struct server_ctx *ctx, const uint8_t *ip_pkt, size_t l
     }
     pthread_rwlock_unlock(&ctx->sess_lock);
 
-    out[0] = snap.enc ? PT_DATA_ENC : PT_DATA;
-    out[1] = snap.enc;
-    out[2] = (uint8_t)(snap.sid >> 8);
-    out[3] = (uint8_t)snap.sid;
-    out[4] = (uint8_t)(snap.token >> 24);
-    out[5] = (uint8_t)(snap.token >> 16);
-    out[6] = (uint8_t)(snap.token >> 8);
-    out[7] = (uint8_t)snap.token;
-    memcpy(out + 8, ip_pkt, len);
+    pkt_hdr(snap.enc ? PT_DATA_ENC : PT_DATA, snap.enc, snap.sid,
+            snap.token, out);
+    memcpy(out + IWAN_HDR_LEN, ip_pkt, len);
     if (snap.enc)
-        xor_crypt(out + 8, len, snap.xor_key, 8);
+        xor_crypt(out + IWAN_HDR_LEN, len, snap.xor_key,
+                  sizeof snap.xor_key);
     /* Deliberately NO sendto(ECONNREFUSED) teardown here: this socket is
      * unconnected, so on Linux sendto never returns ECONNREFUSED — an
      * ICMP port-unreachable is queued and surfaces on the NEXT receive
@@ -810,7 +865,7 @@ void handle_tun_downlink(struct server_ctx *ctx, const uint8_t *ip_pkt, size_t l
      * dead peer from the error queue would need MSG_ERRQUEUE plumbing;
      * sessions of dead peers are instead reaped by purge_expired (120s
      * idle timeout) or by the client's own CLOSE. */
-    (void)udp_send(sockfd, &snap.peer, out, 8 + len);
+    (void)udp_send(sockfd, &snap.peer, out, IWAN_HDR_LEN + len);
     /* deliberately NO last_active refresh here: downlink is triggered by
      * third-party traffic (other clients, inbound routing), so refreshing
      * would let anyone keep a dead session alive past the idle purge */

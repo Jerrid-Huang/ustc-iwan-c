@@ -21,6 +21,7 @@ static void usage_error(const Cli *usage, const char *msg)
 
 int main(int argc, char **argv)
 {
+    util_ignore_sigpipe();
     Opts o;
     memset(&o, 0, sizeof o);
     o.config_dir = "~/.config/iwan";

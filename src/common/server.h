@@ -70,6 +70,11 @@ struct server_user {
 void server_ctx_init(struct server_ctx *ctx);
 void server_ctx_destroy(struct server_ctx *ctx);
 
+/* Read IWAN_RATE_OPEN_MAX / IWAN_RATE_ECHO_MAX once at startup
+ * (malformed values fall back to the defaults with a logged warning).
+ * Call once from main before the packet loop starts. */
+void server_rate_limits_init(void);
+
 /* Multithread-safe printf (server log lines). */
 void srv_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
@@ -84,7 +89,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
  * Thread-safe: called from TUN reader threads. Takes a session snapshot
  * under the read lock and sends without holding the lock. */
 void handle_tun_downlink(struct server_ctx *ctx, const uint8_t *ip_pkt, size_t len,
-                         int tun_fd, int sockfd);
+                         int sockfd);
 
 /* Drop sessions idle for more than 120s; log each. Main thread only. */
 void purge_expired(struct server_ctx *ctx, uint64_t now_ms);

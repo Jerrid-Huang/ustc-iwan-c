@@ -2,7 +2,7 @@
 #define IWAN_SOCKS_INTERNAL_H
 
 #include <netinet/in.h>
-#include <signal.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -11,6 +11,13 @@
 #include "socks.h"
 
 #define MAX_FLOWS       256
+
+/* ---- tunnel DNS (socks_flow.c) ---- */
+#define DNS_RESULT_Q_LEN 64     /* DNS result ring size (dns_push/dns_drain) */
+#define DNS_DRAIN_MAX    16     /* results handled per event-loop round */
+#define DNS_WAIT_MAX     16     /* concurrent pending queries */
+#define DNS_POLL_MS      250u   /* worker retry/poll interval */
+#define DNS_TIMEOUT_MS   1500u  /* query lifetime (registration + 6 x 250ms) */
 
 /* ---- SOCKS5 client flow state machine ---- */
 typedef enum {
@@ -53,7 +60,7 @@ extern int g_dns_evfd;         /* -1 = disabled; written by DNS workers */
 extern int g_sockfd;           /* session UDP socket; set by run_socks, used by tunnel DNS */
 extern SocksConfig *g_socks_cfg; /* SOCKS5 config (auth_token/allow_remote); set by run_socks */
 extern int g_flow_len;         /* active count */
-extern volatile sig_atomic_t g_stop;
+extern atomic_bool g_stop;     /* shared stop flag (util.h): SIGINT/SIGTERM */
 
 /* ---- server lifecycle / event loop / VPN framing (socks.c) ---- */
 void on_sig(int sig);
@@ -64,12 +71,16 @@ void send_vpn_keepalive(int sockfd, const SocksConfig *cfg,
 int  receive_vpn(int sockfd, SocksConfig *cfg);
 
 /* ---- flow lifecycle / SOCKS5 handshake / DNS / port alloc / I/O (socks_flow.c) ---- */
-uint64_t now_mono(void);
 void dns_push(int flow_id, bool ok, uint32_t ip, uint16_t port);
 int  dns_drain(DnsResult *out, int max);
 void spawn_dns(int flow_id, const char *domain, uint16_t port);
 void dns_set_server(const char *ip);   /* tunnel DNS resolver (run_socks) */
 bool dns_try_handle_response(const uint8_t *pkt, size_t n); /* consume inner DNS replies */
+/* DNS worker lifecycle (run_socks): dns_reset() clears state left by a
+ * previous session and retires stale workers; dns_stop() makes in-flight
+ * workers stop sending before the session socket is closed. */
+void dns_reset(void);
+void dns_stop(void);
 void queue_flow_output(Flow *f, const uint8_t *data, size_t n);
 void queue_socks_error(Flow *f, uint8_t rep);
 void set_flow_state(Flow *f, FlowState st);

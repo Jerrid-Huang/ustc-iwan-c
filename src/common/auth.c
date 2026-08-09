@@ -14,6 +14,7 @@
 #include "common.h"
 #include "crypto.h"
 #include "protocol.h"
+#include "util.h"
 
 static void eprintf(const char *fmt, ...)
 {
@@ -33,59 +34,6 @@ static void set_err(char *errmsg, size_t sz, const char *fmt, ...)
     va_end(ap);
 }
 
-static size_t utf8_seq(const uint8_t *s, size_t remain, size_t *seq_len)
-{
-    size_t need;
-    if (s[0] < 0x80)
-        need = 1;
-    else if ((s[0] & 0xE0) == 0xC0)
-        need = 2;
-    else if ((s[0] & 0xF0) == 0xE0)
-        need = 3;
-    else if ((s[0] & 0xF8) == 0xF0)
-        need = 4;
-    else
-        return 0;
-
-    if (need > remain)
-        return 0;
-    for (size_t i = 1; i < need; i++)
-        if ((s[i] & 0xC0) != 0x80)
-            return 0;
-    if (need == 2 && s[0] < 0xC2)
-        return 0;
-    if (need == 3 && s[0] == 0xE0 && s[1] < 0xA0)
-        return 0;
-    if (need == 3 && s[0] == 0xED && s[1] >= 0xA0)
-        return 0;
-    if (need == 4 && s[0] == 0xF0 && s[1] < 0x90)
-        return 0;
-    if (need == 4 && s[0] == 0xF4 && s[1] >= 0x90)
-        return 0;
-    *seq_len = need;
-    return need;
-}
-
-static size_t utf8_lossy(const uint8_t *in, size_t n, char *out)
-{
-    size_t o = 0;
-    size_t i = 0;
-    while (i < n) {
-        size_t seq = 0;
-        if (utf8_seq(in + i, n - i, &seq)) {
-            memcpy(out + o, in + i, seq);
-            i += seq;
-            o += seq;
-        } else {
-            memcpy(out + o, "\xEF\xBF\xBD", 3);
-            i += 1;
-            o += 3;
-        }
-    }
-    out[o] = '\0';
-    return o;
-}
-
 int build_open(buf_t *out, const char *user, const uint8_t ct[16],
                uint16_t mtu, uint8_t enc, uint32_t nonce)
 {
@@ -94,11 +42,12 @@ int build_open(buf_t *out, const char *user, const uint8_t ct[16],
     uint8_t nb[4];
     size_t ulen;
 
-    /* the username rides in a single TLV whose length field is one byte
-     * (max 255); a longer string would be truncated and shift every
-     * subsequent TLV out of alignment, so refuse to build the frame */
+    /* the username rides in a single TLV whose length byte stores
+     * vlen+2, so the value is capped at 253 bytes (254/255 would wrap
+     * the length byte to 0/1 and shift every subsequent TLV out of
+     * alignment); refuse to build the frame for longer strings */
     ulen = strlen(user);
-    if (ulen > 255)
+    if (ulen > IWAN_TLV_VLEN_MAX)
         return -1;
 
     mb[0] = (uint8_t)(mtu >> 8);
@@ -165,7 +114,8 @@ static bool ack_tlv(uint8_t typ, const uint8_t *val, uint8_t vlen, void *ud)
             uint16_t m = (uint16_t)((val[0] << 8) | val[1]);
             /* the ACK is only header-signed, so never trust a huge MTU:
              * clamp to the IPv4-over-UDP sane range */
-            r->mtu = m < 576 ? 576 : (m > 1500 ? 1500 : m);
+            r->mtu = m < IWAN_MTU_MIN ? IWAN_MTU_MIN
+                                      : (m > IWAN_MTU_MAX ? IWAN_MTU_MAX : m);
         }
         break;
     case T_AUTH_VERIFY:
@@ -192,25 +142,46 @@ bool parse_ack(const uint8_t *buf, size_t len, uint32_t expect_nonce,
     uint8_t t;
     struct ack_ctx ctx;
 
-    if (len < 24) {
+    if (len < IWAN_CTRL_LEN) {
         set_err(errmsg, errmsg_sz, "too short");
         return false;
     }
     t = buf[0];
-    r->sid = (uint16_t)((buf[2] << 8) | buf[3]);
-    r->tok = ((uint32_t)buf[4] << 24) | ((uint32_t)buf[5] << 16) |
-             ((uint32_t)buf[6] << 8) | (uint32_t)buf[7];
-
+    /* sid/tok are only filled after the signature check below: an
+     * attacker-forged frame must not leave half-populated results */
     if (t == PT_OPEN_REJECT) {
-        char *lossy = malloc(3 * (len - 24) + 1);
-        utf8_lossy(buf + 24, len - 24, lossy);
-        set_err(errmsg, errmsg_sz, "OPEN_REJECT: %s", lossy);
-        free(lossy);
+        /* the reason rides in a T_ERR_MSG TLV; render only its value.
+         * (Rendering the raw TLV bytes used to mangle the type/length
+         * prefix into the message.) Sanitize control bytes in place. */
+        const uint8_t *p = buf + IWAN_CTRL_LEN;
+        size_t remain = len - IWAN_CTRL_LEN;
+        char reason[128];
+        size_t rlen = 0;
+
+        while (remain >= 2) {
+            uint8_t lt = p[0], ll = p[1];
+            if (ll < 2 || ll > remain)
+                break;
+            if (lt == T_ERR_MSG && (size_t)(ll - 2) < sizeof reason) {
+                rlen = ll - 2;
+                memcpy(reason, p + 2, rlen);
+            }
+            p += ll;
+            remain -= ll;
+        }
+        reason[rlen] = '\0';
+        for (size_t i = 0; i < rlen; i++)
+            if ((uint8_t)reason[i] < 0x20 || (uint8_t)reason[i] == 0x7f)
+                reason[i] = '?';
+        if (rlen > 0)
+            set_err(errmsg, errmsg_sz, "OPEN_REJECT: %s", reason);
+        else
+            set_err(errmsg, errmsg_sz, "OPEN_REJECT");
         return false;
     }
     if (t != PT_OPEN_ACK) {
-        char *hex = malloc(2 * (len - 24) + 1);
-        hex_encode(buf + 24, len - 24, hex);
+        char *hex = malloc(2 * (len - IWAN_CTRL_LEN) + 1);
+        hex_encode(buf + IWAN_CTRL_LEN, len - IWAN_CTRL_LEN, hex);
         set_err(errmsg, errmsg_sz, "unexpected type 0x%02x tlvs=%s", t, hex);
         free(hex);
         return false;
@@ -219,16 +190,20 @@ bool parse_ack(const uint8_t *buf, size_t len, uint32_t expect_nonce,
         set_err(errmsg, errmsg_sz, "bad sig");
         return false;
     }
+    r->sid = (uint16_t)((buf[2] << 8) | buf[3]);
+    r->tok = ((uint32_t)buf[4] << 24) | ((uint32_t)buf[5] << 16) |
+             ((uint32_t)buf[6] << 8) | (uint32_t)buf[7];
 
     memset(r->tun, 0, sizeof r->tun);
     memset(r->gw, 0, sizeof r->gw);
     memset(r->dns, 0, sizeof r->dns);
-    r->mtu = 1400;
+    r->mtu = IWAN_DEFAULT_MTU;
 
     memset(&ctx, 0, sizeof ctx);
     ctx.r = r;
     ctx.expect = expect_nonce;
-    if (parse_tlvs(buf + 24, len - 24, ack_tlv, &ctx) != 0) {
+    if (parse_tlvs(buf + IWAN_CTRL_LEN, len - IWAN_CTRL_LEN, ack_tlv,
+                   &ctx) != 0) {
         set_err(errmsg, errmsg_sz, "malformed TLVs");
         return false;
     }
@@ -271,29 +246,16 @@ int udp_connect(const char *host, uint16_t port, int timeout_ms)
         return -1;
     }
 
-    struct sockaddr_storage any;
-    socklen_t anylen;
-    memset(&any, 0, sizeof any);
-    if (res->ai_family == AF_INET6) {
-        struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)&any;
-        a6->sin6_family = AF_INET6;
-        anylen = sizeof *a6;
-    } else {
-        struct sockaddr_in *a4 = (struct sockaddr_in *)&any;
-        a4->sin_family = AF_INET;
-        a4->sin_addr.s_addr = htonl(INADDR_ANY);
-        anylen = sizeof *a4;
-    }
-    if (bind(fd, (struct sockaddr *)&any, anylen) < 0) {
-        close(fd);
-        freeaddrinfo(res);
-        return -1;
-    }
     /* large UDP buffers: burst drops on the tunnel path collapse the inner
-     * TCP cwnd; default rcvbuf/sndbuf (~208KB) is too small for a VPN */
+     * TCP cwnd; default rcvbuf/sndbuf (~208KB) is too small for a VPN.
+     * The kernel may clamp SO_RCVBUF to rmem_max — nonfatal, but note it
+     * for diagnostics. (No explicit bind needed: connect() binds the
+     * local address implicitly.) */
     int bufsz = 4 * 1024 * 1024;
-    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bufsz, sizeof bufsz);
-    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufsz, sizeof bufsz);
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bufsz, sizeof bufsz) < 0)
+        log_debug("SO_RCVBUF: %s", strerror(errno));
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufsz, sizeof bufsz) < 0)
+        log_debug("SO_SNDBUF: %s", strerror(errno));
     if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
         close(fd);
         freeaddrinfo(res);
@@ -302,8 +264,10 @@ int udp_connect(const char *host, uint16_t port, int timeout_ms)
 
     tv.tv_sec = timeout_ms / 1000;
     tv.tv_usec = (timeout_ms % 1000) * 1000;
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv) < 0)
+        log_debug("SO_RCVTIMEO: %s", strerror(errno));
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv) < 0)
+        log_debug("SO_SNDTIMEO: %s", strerror(errno));
 
     freeaddrinfo(res);
     return fd;
@@ -330,7 +294,10 @@ int get_ct(const char *user, const char *pass, const char *ct_pass_hex,
 
 /* OPEN retry policy: the reference server answers within ~1s, so the 3s
  * recv timeout covers one round trip plus jitter; up to 4 sends spaced
- * 1s apart survive a lost or dropped OPEN without flooding the server. */
+ * ~4s apart (3s recv timeout + 1s sleep) survive a lost or dropped OPEN
+ * without flooding the server. A received-but-invalid reply (reject,
+ * bad sig, malformed TLVs) is deterministic: the server is up and has
+ * answered, so retrying cannot change the outcome — stop early. */
 #define AUTH_TIMEOUT_MS     3000
 #define AUTH_SEND_MAX       4
 #define AUTH_RETRY_DELAY_US 1000000
@@ -368,6 +335,7 @@ int do_auth(const char *server, uint16_t port, const uint8_t *open_pkt, size_t o
                 eprintf("[%d] invalid reply: %s\n", i, errmsg);
             else
                 eprintf("  [%d] err: %s\n", i, errmsg);
+            break;   /* deterministic reject: do not retry */
         } else {
             if (style == DO_AUTH_AUTH)
                 eprintf("  timeout: %s (os error %d)\n", strerror(errno), errno);

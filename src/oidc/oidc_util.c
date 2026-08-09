@@ -66,12 +66,11 @@ void oidc_check_server_ip(const char *server)
 
 void oidc_hex_upper(const uint8_t *b, size_t n, char *out)
 {
-    static const char d[] = "0123456789ABCDEF";
-    for (size_t i = 0; i < n; i++) {
-        out[i * 2] = d[b[i] >> 4];
-        out[i * 2 + 1] = d[b[i] & 0xF];
+    hex_encode(b, n, out);
+    for (size_t i = 0; i < n * 2; i++) {
+        if (out[i] >= 'a' && out[i] <= 'f')
+            out[i] -= 'a' - 'A';
     }
-    out[n * 2] = '\0';
 }
 
 static int hexval(int c)
@@ -146,8 +145,8 @@ void oidc_esc_put(buf_t *b, const char *s)
 }
 
 /* pull a named query parameter out of a URL/query string; returns a
- * newly allocated URL-decoded value or NULL when absent */
-const char *oidc_url_param(const char *s, const char *name)
+ * newly allocated URL-decoded value (caller frees) or NULL when absent */
+char *oidc_url_param(const char *s, const char *name)
 {
     const char *q = strchr(s, '?');
     if (!q)
@@ -170,7 +169,7 @@ const char *oidc_url_param(const char *s, const char *name)
 /* pull "code=..." out of an OAuth redirect URL/query string */
 char *oidc_extract_code(const char *s)
 {
-    return (char *)oidc_url_param(s, "code");
+    return oidc_url_param(s, "code");
 }
 
 /* decode the "name"/"preferred_username"/"sub" claim from the id_token JWT */

@@ -10,7 +10,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <sys/time.h>
 #include <unistd.h>
 
 #include "common.h"
@@ -21,8 +20,6 @@
 #include "route.h"
 #include "tun.h"
 #include "util.h"
-
-static volatile sig_atomic_t g_stop = 0;
 
 typedef struct {
     int      tun_fd;   /* downlink write fd (queue 0, device owner) */
@@ -35,6 +32,8 @@ typedef struct {
     int      gso_ok;    /* 1 = UDP_SEGMENT usable, 0 = failed, -1 = untried */
     pthread_mutex_t send_lock; /* serializes GSO/sendmmsg on the shared socket */
     struct tun_pool *pool;
+    pace_bucket pace;   /* aggregate send pacing (util.h); serialized by
+                         * send_lock — the bucket is not thread-safe */
 } pump_ctx_t;
 
 static void eprintf(const char *fmt, ...) {
@@ -77,15 +76,9 @@ static int send_ctrl(pump_ctx_t *ctx, uint8_t typ, uint8_t enc, uint16_t sid,
 #define PUMP_SEND_RETRY_MS  5    /* EAGAIN/ENOBUFS retry budget per flush:
                                   * beyond it, yield to the receive path */
 
-/* aggregate send-rate pacing (token bucket) — same rationale as
- * socks.c: the server's single-threaded drain (~360k pps) silently
- * drops (UdpRcvbufErrors) anything burst past it, and the inner TCP
- * collapses into an RTO storm. The kernel TCP on the client side
- * self-paces via slow-start; keep the pump under the ceiling anyway. */
-#define IWAN_SEND_PACING_PPS 300000u
-
-static uint64_t g_pace_us;
-static uint64_t g_pace_last;
+/* aggregate send-rate pacing: shared token bucket from util.h
+ * (pace_bucket / pace_bucket_init / pace_take), same policy as socks.c.
+ * The bucket is not thread-safe, so pace_take runs under send_lock. */
 
 /* flush a TX batch after this much time instead of always waiting for it
  * to fill: bounds the added latency under sustained load (batch fill) */
@@ -93,38 +86,12 @@ static uint64_t g_pace_last;
 #define PUMP_MAX_LAT_US 20
 #endif
 
-static uint64_t now_us(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
-}
-
-static void pace_send(int npk)
-{
-    uint64_t now = now_us();
-    uint64_t budget;
-    if (!g_pace_last)
-        g_pace_last = now;
-    budget = g_pace_us +
-             (now - g_pace_last) * IWAN_SEND_PACING_PPS / 1000000u;
-    if (budget > IWAN_SEND_PACING_PPS / 10u)
-        budget = IWAN_SEND_PACING_PPS / 10u;
-    g_pace_last = now;
-    if ((uint64_t)npk > budget) {
-        uint64_t need = ((uint64_t)npk - budget) * 1000000u /
-                        IWAN_SEND_PACING_PPS;
-        g_pace_us = 0;
-        if (need > 0)
-            usleep(need);
-    } else {
-        g_pace_us = budget - (uint64_t)npk;
-    }
-}
-
 /* send a packet batch; retry partial sends and EAGAIN instead of dropping.
  * A full socket buffer backpressures the TUN read loop (kernel TCP then
- * throttles the app); only fatal errors stop the pump. */
+ * throttles the app); only fatal errors stop the pump.
+ * NOTE: structurally identical to socks.c socks_send_batch2 (GSO +
+ * sendmmsg + EAGAIN budget) — keep the two in sync when changing retry
+ * or pacing semantics. */
 static void send_batch(pump_ctx_t *ctx, struct mmsghdr *msgs, unsigned n)
 {
     unsigned sent = 0;
@@ -149,17 +116,19 @@ static void send_batch(pump_ctx_t *ctx, struct mmsghdr *msgs, unsigned n)
         if (errno == EINTR)
             continue;
         if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS) {
-            struct pollfd pfd = { .fd = ctx->sockfd, .events = POLLOUT };
-            int pr = poll(&pfd, 1, 100);
-            /* if poll claims writable but EAGAIN persists, back off
-             * briefly instead of busy-spinning */
-            if (pr > 0 && (pfd.revents & POLLOUT))
-                usleep(1000);
-            /* bounded: an unbounded retry here wedges the pump — the
-             * receive thread (udp2tun) keeps draining the socket so the
-             * backpressure actually clears once we stop hammering it */
-            if (now_ms() - retry_t0 >= PUMP_SEND_RETRY_MS)
+            /* poll must never outlive the retry budget: cap the wait at
+             * the remaining budget (min(100ms, budget-left); with the
+             * 5ms budget the remaining time always binds) and stop
+             * retrying once it is spent — an unbounded retry here
+             * wedges the pump, while the receive thread (udp2tun) keeps
+             * draining the socket so backpressure clears once we stop
+             * hammering it. poll() already waited for writability, so
+             * no post-poll usleep. */
+            uint64_t el = now_ms() - retry_t0;
+            if (el >= PUMP_SEND_RETRY_MS)
                 return;
+            struct pollfd pfd = { .fd = ctx->sockfd, .events = POLLOUT };
+            poll(&pfd, 1, (int)(PUMP_SEND_RETRY_MS - el));
             continue;
         }
         eprintf("[TUN->UDP] sendmmsg: %s\n", strerror(errno));
@@ -172,7 +141,10 @@ static void send_batch(pump_ctx_t *ctx, struct mmsghdr *msgs, unsigned n)
  * mss-sized UDP datagrams at transmit time. Only used when every packet
  * in the batch has the same length, so segment boundaries coincide with
  * datagram boundaries and the wire output is identical to sendmmsg.
- * Same retry/backpressure semantics as send_batch. */
+ * Same retry/backpressure semantics as send_batch.
+ * NOTE: structurally identical to socks.c socks_send_batch2 (GSO +
+ * sendmmsg + EAGAIN budget) — keep the two in sync when changing retry
+ * or pacing semantics. */
 static int send_gso(pump_ctx_t *ctx, struct iovec *iov, unsigned n,
                     size_t mss)
 {
@@ -228,12 +200,13 @@ static int send_gso(pump_ctx_t *ctx, struct iovec *iov, unsigned n,
         if (errno == EINTR)
             continue;
         if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS) {
-            struct pollfd pfd = { .fd = ctx->sockfd, .events = POLLOUT };
-            int pr = poll(&pfd, 1, 100);
-            if (pr > 0 && (pfd.revents & POLLOUT))
-                usleep(1000);
-            if (now_ms() - retry_t0 >= PUMP_SEND_RETRY_MS)
+            /* same budget-bounded wait as send_batch: poll at most the
+             * remaining retry budget, then yield to the receive path */
+            uint64_t el = now_ms() - retry_t0;
+            if (el >= PUMP_SEND_RETRY_MS)
                 return 1;   /* bounded: let the receive path drain */
+            struct pollfd pfd = { .fd = ctx->sockfd, .events = POLLOUT };
+            poll(&pfd, 1, (int)(PUMP_SEND_RETRY_MS - el));
             continue;
         }
         eprintf("[TUN->UDP] sendmsg: %s\n", strerror(errno));
@@ -296,8 +269,12 @@ static void pump_flush(pump_ctx_t *ctx, pump_tx_t *q)
         use_gso = 0;   /* UDP_SEGMENT unavailable: fall back */
     if (!use_gso)
         send_batch(ctx, q->msgs, n);
+    /* aggregate send pacing (util.h). MUST hold send_lock: multiple
+     * reader threads share the bucket, which is not thread-safe; the
+     * pacing sleep under the lock is exactly the aggregate-pacing
+     * semantic (see util.h pace_bucket). */
+    pace_take(&ctx->pace, (int)n);
     pthread_mutex_unlock(&ctx->send_lock);
-    pace_send((int)n);   /* aggregate send-rate pacing (see above) */
 }
 
 /* tun_pool callback: one thread-local batch per reader thread */
@@ -359,6 +336,20 @@ static void pump_tun_pkt(void *ud, const uint8_t *pkt, size_t len, bool last)
         pump_flush(ctx, q);
 }
 
+/* Free this reader thread's TLS batch on thread exit (registered via
+ * tun_pool_set_exit_cb). Runs on the exiting reader thread itself, so
+ * the g_tx access is genuinely thread-local; tun.c invokes it strictly
+ * after the final flush callback, so no pending pump_flush can touch
+ * the freed buffer. */
+static void pump_reader_exit(void)
+{
+    if (g_tx.batch) {
+        free(g_tx.batch);
+        g_tx.batch = NULL;
+    }
+    g_tx.n = 0;
+}
+
 static void *udp2tun_thread(void *ud) {
     pump_ctx_t *ctx = ud;
     /* recvmmsg with MSG_DONTWAIT drains whatever is queued (zero latency
@@ -394,7 +385,11 @@ static void *udp2tun_thread(void *ud) {
             if (send_ctrl(ctx, PT_ECHO_REQ, ctx->enc, ctx->sid,
                           ctx->tok) != 0) {
                 eprintf("[UDP->TUN] keepalive send err\n");
-                g_stop = 1;   /* any pump-fatal error stops the tunnel */
+                /* pump-fatal, same policy as socks.c: a failed control
+                 * send means the session socket is gone (the server
+                 * will drop us anyway), so stop the pump instead of
+                 * looping on dead keepalives */
+                g_stop = 1;
                 break;
             }
             last_ka = now_ms();
@@ -501,9 +496,12 @@ static void install_signals(void) {
     sa.sa_handler = on_signal;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
-    sigaction(SIGHUP, &sa, NULL);
+    if (sigaction(SIGINT, &sa, NULL) != 0)
+        log_err("install_signals: sigaction(SIGINT): %s", strerror(errno));
+    if (sigaction(SIGTERM, &sa, NULL) != 0)
+        log_err("install_signals: sigaction(SIGTERM): %s", strerror(errno));
+    if (sigaction(SIGHUP, &sa, NULL) != 0)
+        log_err("install_signals: sigaction(SIGHUP): %s", strerror(errno));
 }
 
 static bool slist_has(const slist_t *s, const char *str) {
@@ -594,10 +592,10 @@ static int expand_route_targets(const slist_t *targets, slist_t *out) {
 }
 
 static void teardown_routes(const char *tun, const char *srv, const char *ogw,
-                            const char *odev, const slist_t *routes,
-                            bool had_routes) {
+                            const char *odev, const char *ogw_metric,
+                            const slist_t *routes, bool had_routes) {
     if (had_routes) {
-        route_teardown(tun, srv, ogw, odev, routes);
+        route_teardown(tun, srv, ogw, odev, ogw_metric, routes);
     } else {
         route_iface_down(tun);
     }
@@ -607,7 +605,7 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
              const uint8_t xor_key[8], uint16_t sid, uint32_t tok, uint8_t enc,
              const char *server, const slist_t *route_targets,
              const char *auth_tun_ip, uint16_t auth_mtu) {
-    char ogw[16] = "", odev[16] = "";
+    char ogw[16] = "", odev[16] = "", ogw_metric[16] = "";
 
     slist_t routes;
     slist_init(&routes);
@@ -620,14 +618,15 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
     if (had_routes) {
         /* the default route is only needed when the tunnel hijacks it;
          * a pure-TUN run (no route targets) must not require one */
-        if (!capture_default(ogw, odev)) {
+        if (!capture_default(ogw, odev, ogw_metric)) {
             log_err("cannot detect default route");
             slist_free(&routes);
             return -1;
         }
-        log_debug("default route: via %s dev %s", ogw, odev);
+        log_debug("default route: via %s dev %s%s%s", ogw, odev,
+                  ogw_metric[0] ? " metric " : "", ogw_metric);
         if (!route_setup(tun_name, auth_tun_ip, auth_mtu, server, ogw, odev,
-                         &routes)) {
+                         ogw_metric, &routes)) {
             /* route_setup already rolled back and logged; a half-configured
              * tunnel must not start pumping */
             slist_free(&routes);
@@ -662,6 +661,7 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
     ctx.gso_ok = -1;
     memcpy(ctx.xor_key, xor_key, 8);
     pthread_mutex_init(&ctx.send_lock, NULL);
+    pace_bucket_init(&ctx.pace);
 
     {
         /* multiqueue uplink: attach min(ncpu, TUN_POOL_MAX) queues up
@@ -683,11 +683,15 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
                                    pump_tun_pkt, &ctx, &g_stop);
         if (!ctx.pool) {
             log_err("cannot start TUN reader pool");
-            teardown_routes(tun_name, server, ogw, odev, &routes, had_routes);
+            teardown_routes(tun_name, server, ogw, odev, ogw_metric, &routes,
+                            had_routes);
             slist_free(&routes);
             pthread_mutex_destroy(&ctx.send_lock);
             return -1;
         }
+        /* each reader thread frees its TLS batch on exit (tun.c invokes
+         * this on the exiting thread, after the final flush) */
+        tun_pool_set_exit_cb(ctx.pool, pump_reader_exit);
         log_info("TUN reader pool: %d queues", maxq);
     }
     if (tun_steering_attach(tun_fd) == 0)
@@ -699,7 +703,8 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
     if (pthread_create(&t2, NULL, udp2tun_thread, &ctx) != 0) {
         g_stop = 1;
         tun_pool_destroy(ctx.pool);
-        teardown_routes(tun_name, server, ogw, odev, &routes, had_routes);
+        teardown_routes(tun_name, server, ogw, odev, ogw_metric, &routes,
+                        had_routes);
         slist_free(&routes);
         pthread_mutex_destroy(&ctx.send_lock);
         return -1;
@@ -712,7 +717,8 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
     tun_pool_destroy(ctx.pool);
     pthread_join(t2, NULL);
 
-    teardown_routes(tun_name, server, ogw, odev, &routes, had_routes);
+    teardown_routes(tun_name, server, ogw, odev, ogw_metric, &routes,
+                    had_routes);
 
     send_ctrl(&ctx, PT_CLOSE, enc, sid, tok);
     if (debug_enabled())

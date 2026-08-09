@@ -19,21 +19,25 @@ static void err_unknown(const cli_ctl *ctl, const char *arg)
     usage_exit(ctl);
 }
 
-static void err_need_value(const char *name, const char *valname)
+static void err_need_value(const cli_ctl *ctl, const char *name,
+                           const char *valname)
 {
     fprintf(stderr,
             "error: a value is required for '--%s %s' but none was supplied",
             name, valname);
-    fprintf(stderr, "\n\nFor more information, try '--help'.\n");
+    fprintf(stderr, "\n\n%s\n\nFor more information, try '--help'.\n",
+            ctl->usage_str ? ctl->usage_str() : "");
     exit(2);
 }
 
-static void err_bad_value(const char *name, const char *valname, const char *val,
+static void err_bad_value(const cli_ctl *ctl, const char *name,
+                          const char *valname, const char *val,
                           const char *why)
 {
     fprintf(stderr, "error: invalid value '%s' for '--%s %s': %s",
             val, name, valname, why);
-    fprintf(stderr, "\n\nFor more information, try '--help'.\n");
+    fprintf(stderr, "\n\n%s\n\nFor more information, try '--help'.\n",
+            ctl->usage_str ? ctl->usage_str() : "");
     exit(2);
 }
 
@@ -49,20 +53,22 @@ static void err_bool_value(const cli_ctl *ctl, const char *name,
 /* validate and parse an unsigned value; returns it, or exits with a
  * clap-style error. The actual parsing lives in the shared parse_uint
  * (common.h); here we only classify the failure into a message. */
-static uint64_t check_uint(const char *name, const char *valname, const char *val,
+static uint64_t check_uint(const cli_ctl *ctl, const char *name,
+                           const char *valname, const char *val,
                            uint64_t max, const char *maxstr)
 {
     uint64_t v;
     if (parse_uint(val, max, &v) != 0) {
         if (*val == '\0')
-            err_bad_value(name, valname, val,
+            err_bad_value(ctl, name, valname, val,
                           "cannot parse integer from empty string");
         for (const char *p = val; *p; p++)
             if (*p < '0' || *p > '9')
-                err_bad_value(name, valname, val, "invalid digit found in string");
+                err_bad_value(ctl, name, valname, val,
+                              "invalid digit found in string");
         char msg[96];
         snprintf(msg, sizeof msg, "%s is not in 0..=%s", val, maxstr);
-        err_bad_value(name, valname, val, msg);
+        err_bad_value(ctl, name, valname, val, msg);
     }
     return v;
 }
@@ -82,27 +88,44 @@ static const char *map_short(const cli_ctl *ctl, const char *a)
 {
     char ch;
 
-    if (!ctl->short_aliases || a[0] != '-')
+    /* single-dash single-char form only ("-c"): clap-style parsers do not
+     * accept "--c", and accepting it would mask typos */
+    if (!ctl->short_aliases || a[0] != '-' || a[1] == '-')
         return NULL;
-    if (a[1] == '-') {
-        /* "--c" double-dash single-char form */
-        if (a[2] == '\0' || a[3] != '\0')
-            return NULL;
-        ch = a[2];
-    } else {
-        /* "-c" single-dash single-char form */
-        if (a[2] != '\0')
-            return NULL;
-        ch = a[1];
-    }
+    if (a[2] != '\0')
+        return NULL;
+    ch = a[1];
     for (const char *const(*p)[2] = ctl->short_aliases; (*p)[0]; p++)
         if (ch == (*p)[0][0])
             return (*p)[1];
     return NULL;
 }
 
+/* Every short alias must target an option that exists in the table: a
+ * stale alias would otherwise surface as a confusing internal long name
+ * in errors (this bit the codebase once with a dead -c alias). */
+static void validate_aliases(const cli_opt *opts, size_t nopts,
+                             const cli_ctl *ctl)
+{
+    if (!ctl->short_aliases)
+        return;
+    for (const char *const(*p)[2] = ctl->short_aliases; (*p)[0]; p++) {
+        if (find_opt(opts, nopts, (*p)[1] + 2, strlen((*p)[1] + 2)) == NULL) {
+            fprintf(stderr,
+                    "error: internal: short alias '%s' targets unknown "
+                    "option '%s'\n", (*p)[0], (*p)[1]);
+            exit(2);
+        }
+    }
+}
+
+/* Record the option's canonical name and detect duplicates. Duplicate
+ * detection is unconditional (clap semantics for every binary); the
+ * usage_names list is only consumed by oidc's "smart usage" renderer,
+ * so recording it unconditionally is harmless. */
 static void track_flag(Cli *c, const cli_opt *o, const cli_ctl *ctl)
 {
+    (void)ctl;
     for (int j = 0; j < c->nusage; j++)
         if (strcmp(c->usage_names[j], o->name) == 0) {
             if (o->kind == CLI_OPT_BOOL) {
@@ -165,6 +188,7 @@ void cli_init(Cli *c)
 void cli_parse(Cli *c, int argc, char **argv, int start,
                const cli_opt *opts, size_t nopts, const cli_ctl *ctl)
 {
+    validate_aliases(opts, nopts, ctl);
     for (int i = start; i < argc; i++) {
         const char *a = argv[i];
         if (strcmp(a, "-h") == 0) {
@@ -195,8 +219,8 @@ void cli_parse(Cli *c, int argc, char **argv, int start,
         if (!o)
             err_unknown(ctl, a);
 
-        if (ctl->track_usage)
-            track_flag(c, o, ctl);
+        /* duplicate detection is unconditional (clap semantics) */
+        track_flag(c, o, ctl);
 
         if (o->kind == CLI_OPT_BOOL) {
             *(bool *)o->dst = true;
@@ -206,16 +230,18 @@ void cli_parse(Cli *c, int argc, char **argv, int start,
         }
         if (!val) {
             if (i + 1 >= argc || argv[i + 1][0] == '-')
-                err_need_value(o->name, o->valname);
+                err_need_value(ctl, o->name, o->valname);
             val = argv[++i];
         }
         uint64_t parsed = 0;
         switch (o->kind) {
         case CLI_OPT_U8:
-            parsed = check_uint(o->name, o->valname, val, UINT8_MAX, "255");
+            parsed = check_uint(ctl, o->name, o->valname, val, UINT8_MAX,
+                                "255");
             break;
         case CLI_OPT_U16:
-            parsed = check_uint(o->name, o->valname, val, UINT16_MAX, "65535");
+            parsed = check_uint(ctl, o->name, o->valname, val, UINT16_MAX,
+                                "65535");
             break;
         default:
             break;
@@ -223,7 +249,7 @@ void cli_parse(Cli *c, int argc, char **argv, int start,
         if (o->validate) {
             char err[160];
             if (!o->validate(val, err, sizeof err))
-                err_bad_value(o->name, o->valname, val, err);
+                err_bad_value(ctl, o->name, o->valname, val, err);
         }
         store_value(o, val, parsed);
     }

@@ -33,7 +33,7 @@ typedef struct {
     bool (*validate)(const char *val, char *err, size_t errsz);
 } cli_opt;
 
-#define CLI_MAX_USAGE 12
+#define CLI_MAX_USAGE 16
 
 #define CLI_INIT_CTL { 0 }
 

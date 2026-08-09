@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
@@ -23,6 +24,11 @@
 
 #define VERSION     "0.1.0"
 #define PING_BUF_SZ 64
+/* PING round-trip bound: udp_connect's recv timeout (ms). PING has no
+ * retry loop, so a single bound must cover one request/response pair. */
+#define PING_TIMEOUT_MS 3000
+/* token redaction: only the low 16 bits are ever logged (tok=0x****xxxx) */
+#define TOK_LOG_MASK 0xFFFF
 
 typedef struct {
     const char *server;
@@ -63,11 +69,14 @@ static const char *usage_required(const char *sub)
     if (sub && strcmp(sub, "ping") == 0)
         return "Usage: iwan-client ping --server <SERVER>";
     if (sub && strcmp(sub, "auth") == 0)
-        return "Usage: iwan-client auth --server <SERVER> --pass <PASS>";
+        return "Usage: iwan-client auth --server <SERVER> "
+               "--pass <PASS> or --pass-file <FILE>";
     if (sub && strcmp(sub, "proxy") == 0)
-        return "Usage: iwan-client proxy --server <SERVER> --pass <PASS>";
+        return "Usage: iwan-client proxy --server <SERVER> "
+               "--pass <PASS> or --pass-file <FILE>";
     if (sub && strcmp(sub, "socks") == 0)
-        return "Usage: iwan-client socks --server <SERVER> --pass <PASS>";
+        return "Usage: iwan-client socks --server <SERVER> "
+               "--pass <PASS> or --pass-file <FILE>";
     return "Usage: iwan-client <COMMAND>";
 }
 
@@ -213,19 +222,45 @@ static void err_required_pass(const char *sub)
     err_usage_exit(usage_required(sub));
 }
 
-/* read the first line of a pass file (O_NOFOLLOW, capped at sz-1 bytes,
- * trailing whitespace trimmed); returns buf. Errors exit(1). */
+/* read the first line of a pass file (O_NOFOLLOW|O_NONBLOCK, capped at
+ * sz-1 bytes, trailing whitespace trimmed); returns buf. Only a regular
+ * file is accepted (a FIFO with no writer would otherwise block the
+ * open forever), an empty file or an over-long first line is a hard
+ * error rather than a silently truncated password. Errors exit(1). */
 static const char *read_pass_file(const char *path, char *buf, size_t sz)
 {
-    int fd = open(path, O_RDONLY | O_NOFOLLOW);
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
     if (fd < 0) {
-        log_err("cannot open pass file '%s': %s", path, strerror(errno));
+        log_err("Error: cannot open pass file '%s': %s", path,
+                strerror(errno));
+        exit(1);
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        log_err("Error: cannot stat pass file '%s': %s", path,
+                strerror(errno));
+        close(fd);
+        exit(1);
+    }
+    if (!S_ISREG(st.st_mode)) {
+        log_err("Error: pass file '%s' is not a regular file", path);
+        close(fd);
         exit(1);
     }
     ssize_t n = read(fd, buf, sz - 1);
     close(fd);
     if (n < 0) {
-        log_err("cannot read pass file '%s': %s", path, strerror(errno));
+        log_err("Error: cannot read pass file '%s': %s", path,
+                strerror(errno));
+        exit(1);
+    }
+    if (n == 0) {
+        log_err("Error: pass file '%s' is empty", path);
+        exit(1);
+    }
+    if ((size_t)n == sz - 1 && memchr(buf, '\n', (size_t)n) == NULL) {
+        log_err("Error: pass file '%s' first line too long (max %zu "
+                "bytes)", path, sz - 2);
         exit(1);
     }
     buf[n] = '\0';
@@ -276,7 +311,7 @@ static void die_invalid_address(const char *ctx)
     fprintf(stderr,
             "Error: %s\n\nCaused by:\n    invalid socket address syntax\n",
             ctx);
-    exit(1);
+    exit(2);   /* argument-validation error: same code as the CLI parser */
 }
 
 static void check_server_ip(const char *server, const char *ctx)
@@ -344,7 +379,12 @@ static void add_auth_opts(cli_opt *opts, CmdOpts *o)
 
 /* resolve --pass/--pass-file and --ct-pass/--ct-pass-file into o.pass /
  * o.ct_pass (buffers live for the process); the clap-style required
- * error exits when neither pass form is given */
+ * error exits when neither pass form is given.
+ *
+ * Explicit --pass deliberately wins over --pass-file: a secret typed
+ * on the command line is a higher-trust override of the file default,
+ * so supplying both is accepted (not an error), never the reverse.
+ * The same rule applies to --ct-pass over --ct-pass-file. */
 static void resolve_credentials(CmdOpts *o, const char *sub)
 {
     if (!o->pass) {
@@ -364,7 +404,8 @@ static int authenticate(const CmdOpts *o, int style, AuthResult *res)
 {
     uint8_t ct[16];
     if (get_ct(o->user, o->pass, o->ct_pass, ct) != 0) {
-        log_err("invalid --ct-pass hex (want exactly 32 hex digits)");
+        log_err("Error: invalid --ct-pass hex (want exactly 32 hex digits)");
+        cleanse_str(o->ct_pass);   /* last use of the ct pass */
         return -1;
     }
     cleanse_str(o->ct_pass);   /* last use of the ct pass */
@@ -373,7 +414,8 @@ static int authenticate(const CmdOpts *o, int style, AuthResult *res)
     buf_init(&open);
     if (build_open(&open, o->user, ct, o->mtu, o->encrypt, nonce) != 0) {
         buf_free(&open);
-        fprintf(stderr, "Error: username too long (max 255 bytes)\n");
+        fprintf(stderr, "Error: username too long (max %d bytes)\n",
+                IWAN_TLV_VLEN_MAX);
         return -1;
     }
     int fd = do_auth(o->server, o->port, open.data, open.len, nonce, style,
@@ -397,6 +439,43 @@ static void free_route_opts(CmdOpts *o)
     slist_free(&o->proxy_cidr);
     slist_free(&o->proxy_ip);
     slist_free(&o->proxy_domain);
+}
+
+/* Pre-open cleanup of a stale TUN device. cmd_proxy runs as root, so
+ * never `ip link del` a name we cannot prove is a TUN device — a
+ * guessed --tun value could otherwise remove a physical NIC. The tun
+ * driver exposes /sys/class/net/<name>/tun_flags only for tun devices.
+ * Returns 1 when a tun device existed and deletion was attempted, 0
+ * when no device exists (skip delete), -1 when the name is a non-tun
+ * interface (the caller must abort). */
+static int cleanup_stale_tun(const char *name)
+{
+    char p[256];
+    int fd;
+
+    snprintf(p, sizeof p, "/sys/class/net/%s/tun_flags", name);
+    fd = open(p, O_RDONLY);
+    if (fd >= 0) {
+        close(fd);
+        char *const del[] = { "link", "del", (char *)name, NULL };
+        if (!ip_run_quiet(del))
+            log_err("Error: failed to delete stale tun device '%s'", name);
+        /* keep going: open_tun attaches to an existing device */
+        return 1;
+    }
+    int e = errno;
+    snprintf(p, sizeof p, "/sys/class/net/%s", name);
+    fd = open(p, O_RDONLY);
+    if (fd >= 0) {
+        close(fd);
+        log_err("Error: '%s' exists but is not a tun device; refusing to "
+                "delete it", name);
+        return -1;
+    }
+    if (e != ENOENT)
+        log_err("Error: cannot inspect tun device '%s': %s", name,
+                strerror(e));
+    return 0;   /* absent (or uninspectable): leave it to open_tun */
 }
 
 /* ---- commands ---- */
@@ -456,17 +535,17 @@ static int cmd_ping(int argc, char **argv, int start)
         err_required("ping");
     check_server_ip(o.server, "invalid server address");
 
-    int fd = udp_connect(o.server, o.port, 3000);
+    int fd = udp_connect(o.server, o.port, PING_TIMEOUT_MS);
     if (fd < 0) {
-        log_err("connect UDP: %s", strerror(errno));
+        log_err("Error: connect UDP: %s", strerror(errno));
         return 1;
     }
 
     buf_t pkt;
     buf_init(&pkt);
-    ctrl_hdr(&pkt, PT_PING_REQ, 0, 0xFFFF, 0xFFFFFFFFu);
+    ctrl_hdr(&pkt, PT_PING_REQ, 0, IWAN_PING_SID, IWAN_PING_TOK);
     if (send(fd, pkt.data, pkt.len, 0) != (ssize_t)pkt.len) {
-        log_err("send PING: %s", strerror(errno));
+        log_err("Error: send PING: %s", strerror(errno));
         buf_free(&pkt);
         close(fd);
         return 1;
@@ -478,7 +557,8 @@ static int cmd_ping(int argc, char **argv, int start)
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     ssize_t n = recv(fd, rbuf, sizeof rbuf, 0);
-    if (n == 24 && rbuf[0] == PT_PING_RSP && verify_sig(rbuf, (size_t)n)) {
+    if (n == IWAN_CTRL_LEN && rbuf[0] == PT_PING_RSP &&
+        verify_sig(rbuf, (size_t)n)) {
         clock_gettime(CLOCK_MONOTONIC, &t1);
         uint64_t ns = (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000000ull +
                       (uint64_t)(t1.tv_nsec - t0.tv_nsec);
@@ -506,7 +586,7 @@ static int cmd_auth(int argc, char **argv, int start)
     o.port = 6001;
     o.user = "_rev_m_1";
     o.encrypt = 1;
-    o.mtu = 1400;
+    o.mtu = IWAN_DEFAULT_MTU;
     cli_opt opts[9];
 
     add_auth_opts(opts, &o);
@@ -525,7 +605,7 @@ static int cmd_auth(int argc, char **argv, int start)
     }
 
     log_info("OK sid=0x%04x tok=0x****%04x tun=%s gw=%s dns=%s mtu=%u",
-             res.sid, res.tok & 0xFFFF, res.tun, res.gw, res.dns,
+             res.sid, res.tok & TOK_LOG_MASK, res.tun, res.gw, res.dns,
              (unsigned)res.mtu);
 
     buf_t cl;
@@ -545,7 +625,7 @@ static int cmd_proxy(int argc, char **argv, int start)
     o.port = 6001;
     o.user = "_rev_m_1";
     o.encrypt = 1;
-    o.mtu = 1400;
+    o.mtu = IWAN_DEFAULT_MTU;
     o.tun = "iwan0";
     cli_opt opts[13];
 
@@ -581,7 +661,7 @@ static int cmd_proxy(int argc, char **argv, int start)
     cleanse_str(o.pass);   /* last use of the pass */
 
     if (!tun_name_valid(o.tun)) {
-        log_err("invalid TUN device name '%s'", o.tun);
+        log_err("Error: invalid TUN device name '%s'", o.tun);
         wipe(sk, sizeof sk);
         close(sockfd);
         free_route_opts(&o);
@@ -592,12 +672,17 @@ static int cmd_proxy(int argc, char **argv, int start)
     slist_init(&routes);
     collect_routes(&o, &routes);
 
-    char *const del[] = { "link", "del", (char *)o.tun, NULL };
-    ip_run_quiet(del);
+    if (cleanup_stale_tun(o.tun) < 0) {
+        wipe(sk, sizeof sk);
+        close(sockfd);
+        slist_free(&routes);
+        free_route_opts(&o);
+        return 1;
+    }
 
     int tun_fd = open_tun(o.tun);
     if (tun_fd < 0) {
-        log_err("open tun (must be root)");
+        log_err("Error: open tun (must be root)");
         wipe(sk, sizeof sk);
         close(sockfd);
         slist_free(&routes);
@@ -659,14 +744,14 @@ static int cmd_socks(int argc, char **argv, int start)
 
     uint8_t b[4];
     if (!s2ip4(res.tun, b)) {
-        log_err("server returned invalid tunnel IPv4 address");
+        log_err("Error: server returned invalid tunnel IPv4 address");
         wipe(sk, sizeof sk);
         close(sockfd);
         return 1;
     }
     uint32_t inner_ip = ip4_u32(b);
     if (!s2ip4(res.gw, b)) {
-        log_err("server returned invalid gateway IPv4 address");
+        log_err("Error: server returned invalid gateway IPv4 address");
         wipe(sk, sizeof sk);
         close(sockfd);
         return 1;
@@ -701,6 +786,7 @@ static int cmd_socks(int argc, char **argv, int start)
 
 int main(int argc, char **argv)
 {
+    util_ignore_sigpipe();
     if (argc < 2) {
         /* clap arg_required_else_help: help on stderr, exit 2 */
         print_top_help(stderr);

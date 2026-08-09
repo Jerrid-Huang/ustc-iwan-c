@@ -23,6 +23,10 @@
 #define HTTPS_TIMEOUT_MS    60000
 #define HTTPS_MAX_RESP      (16u * 1024 * 1024)
 #define HTTPS_MAX_REDIRECTS 5
+#define HTTPS_READ_CHUNK    4096    /* read() granularity for the child pipe */
+/* chunk-size ceiling in Transfer-Encoding: chunked (the on-wire length
+ * is hex; anything above INT_MAX is rejected as absurd) */
+#define HTTPS_CHUNK_SZ_CAP  0x7FFFFFFFL
 
 struct sbuf {
     char  *d;
@@ -68,14 +72,19 @@ static long hex_parse_sz(const char *s, size_t n)
             h = c - 'A' + 10;
         else
             return -1;
-        if (v > (0x7FFFFFFFL - h) / 16)
+        if (v > (HTTPS_CHUNK_SZ_CAP - h) / 16)
             return -1;
         v = v * 16 + h;
     }
     return v;
 }
 
-static void chunk_decode(const char *in, size_t in_len, struct sbuf *out)
+/* Decode a chunked body into out. Returns 1 on success; 0 with *err set
+ * when the stream is malformed (bad hex size, chunk overrunning the
+ * buffer, or garbage after the terminal chunk). The caller reports the
+ * failure instead of silently shipping a truncated body. */
+static int chunk_decode(const char *in, size_t in_len, struct sbuf *out,
+                        char *err, size_t errsz)
 {
     size_t i = 0;
     while (i < in_len) {
@@ -84,22 +93,29 @@ static void chunk_decode(const char *in, size_t in_len, struct sbuf *out)
         while (j < in_len && in[j] != '\r' && in[j] != '\n' && in[j] != ';')
             j++;
         sz = hex_parse_sz(in + i, j - i);
-        if (sz < 0)
-            break;
+        if (sz < 0) {
+            snprintf(err, errsz, "bad chunk size at offset %zu", i);
+            return 0;
+        }
         while (j < in_len && in[j] != '\r' && in[j] != '\n')
             j++;
         while (j < in_len && (in[j] == '\r' || in[j] == '\n'))
             j++;
-        if (sz == 0)
+        if (sz == 0) {
+            /* terminal chunk: only trailer junk may follow; ignore it */
             break;
-        if ((size_t)sz > in_len - j)
-            break;
+        }
+        if ((size_t)sz > in_len - j) {
+            snprintf(err, errsz, "chunk overruns body at offset %zu", i);
+            return 0;
+        }
         sbuf_app(out, in + j, (size_t)sz);
         j += (size_t)sz;
         while (j < in_len && (in[j] == '\r' || in[j] == '\n'))
             j++;
         i = j;
     }
+    return 1;
 }
 
 /* Locate header `name` (case-insensitive) in the header block
@@ -200,11 +216,12 @@ static int https_te_is_chunked(const char *val)
 
 /* Split an absolute https:// URL into malloc'd host and path. Returns 1 on
    success; 0 when the URL is not an absolute https URL (other schemes,
-   userinfo, or an explicit port are rejected). */
+   userinfo, or an explicit port are rejected). The authority ends at the
+   first '/', '?' or '#': a query must never leak into the Host header. */
 static int https_url_split(const char *url, char **host_out, char **path_out)
 {
     static const char scheme[] = "https://";
-    const char *auth, *slash, *at;
+    const char *auth, *slash, *at, *cut;
     size_t alen;
 
     for (size_t i = 0; i < sizeof scheme - 1; i++)
@@ -212,7 +229,17 @@ static int https_url_split(const char *url, char **host_out, char **path_out)
             return 0;
     auth = url + sizeof scheme - 1;
     slash = strchr(auth, '/');
-    alen = slash ? (size_t)(slash - auth) : strlen(auth);
+    /* the authority ends at the first '/', '?' or '#' */
+    cut = slash ? slash : auth + strlen(auth);
+    {
+        const char *q = strchr(auth, '?');
+        const char *h = strchr(auth, '#');
+        if (q && q < cut)
+            cut = q;
+        if (h && h < cut)
+            cut = h;
+    }
+    alen = (size_t)(cut - auth);
     if (alen == 0)
         return 0;
     at = memchr(auth, '@', alen);
@@ -230,17 +257,26 @@ static int https_url_split(const char *url, char **host_out, char **path_out)
         oom_abort();
     memcpy(*host_out, auth, alen);
     (*host_out)[alen] = '\0';
-    *path_out = xstrdup(slash ? slash : "/");
+    if (slash) {
+        /* strip the fragment from the request path ('#' and beyond);
+         * the query ('?') is part of the path */
+        const char *frag = strchr(slash, '#');
+        size_t plen = frag ? (size_t)(frag - slash) : strlen(slash);
+        char *p = malloc(plen + 1);
+        if (!p)
+            oom_abort();
+        memcpy(p, slash, plen);
+        p[plen] = '\0';
+        *path_out = p;
+    } else {
+        *path_out = xstrdup("/");
+    }
     return 1;
 }
 
 static char *empty_str(void)
 {
-    char *s = malloc(1);
-    if (!s)
-        oom_abort();
-    s[0] = '\0';
-    return s;
+    return xstrdup("");
 }
 
 /* Assemble the request (request line, headers, body) into *req.
@@ -297,10 +333,12 @@ static const char *https_ca_path(void)
     return NULL;
 }
 
-/* Fork `openssl s_client` with stdin/stdout wired to the pipes;
-   returns the child pid, or -1 on failure. */
+/* Fork `openssl s_client` with stdin/stdout wired to the pipes and
+   stderr captured to err_pipe[0] (diagnostics: a failed TLS handshake
+   must not vanish into /dev/null). Returns the child pid, or -1 on
+   failure (pipes are closed on failure). */
 static pid_t https_spawn_client(const char *host, int in_pipe[2],
-                                int out_pipe[2])
+                                int out_pipe[2], int err_pipe[2])
 {
     char connect_arg[1024];
     pid_t pid;
@@ -313,12 +351,15 @@ static pid_t https_spawn_client(const char *host, int in_pipe[2],
                 "/etc/pki/tls/cacert.pem");
         return -1;
     }
-
-    if (pipe(in_pipe) != 0 || pipe(out_pipe) != 0)
+    /* a host longer than connect_arg would be silently truncated and
+     * connect to the wrong endpoint; refuse instead */
+    if (strlen(host) + 2 > sizeof connect_arg) {
+        log_err("HTTPS host name too long (%zu bytes)", strlen(host));
         return -1;
+    }
 
-    pid = fork();
-    if (pid < 0) {
+    if (pipe(in_pipe) != 0 || pipe(out_pipe) != 0 || pipe(err_pipe) != 0) {
+        log_err("pipe: %s", strerror(errno));
         close(in_pipe[0]);
         close(in_pipe[1]);
         close(out_pipe[0]);
@@ -326,19 +367,29 @@ static pid_t https_spawn_client(const char *host, int in_pipe[2],
         return -1;
     }
 
-    if (pid == 0) {
-        exec_sanitize();
-        int devnull;
+    pid = fork();
+    if (pid < 0) {
+        log_err("fork: %s", strerror(errno));
+        close(in_pipe[0]);
         close(in_pipe[1]);
         close(out_pipe[0]);
-        if (dup2(in_pipe[0], 0) < 0 || dup2(out_pipe[1], 1) < 0)
+        close(out_pipe[1]);
+        close(err_pipe[0]);
+        close(err_pipe[1]);
+        return -1;
+    }
+
+    if (pid == 0) {
+        exec_sanitize();
+        close(in_pipe[1]);
+        close(out_pipe[0]);
+        close(err_pipe[0]);
+        if (dup2(in_pipe[0], 0) < 0 || dup2(out_pipe[1], 1) < 0 ||
+            dup2(err_pipe[1], 2) < 0)
             _exit(127);
-        devnull = open("/dev/null", O_WRONLY);
-        if (devnull >= 0) {
-            dup2(devnull, 2);
-            if (devnull > 2)
-                close(devnull);
-        }
+        close(in_pipe[0]);
+        close(out_pipe[1]);
+        close(err_pipe[1]);
         snprintf(connect_arg, sizeof connect_arg, "%s:443", host);
         execlp("openssl", "openssl", "s_client", "-quiet", "-connect",
                connect_arg, "-servername", host,
@@ -351,20 +402,16 @@ static pid_t https_spawn_client(const char *host, int in_pipe[2],
 
     close(in_pipe[0]);
     close(out_pipe[1]);
+    close(err_pipe[1]);
     return pid;
 }
 
-/* Write the assembled request into the child's stdin pipe, then close it. */
+/* Write the assembled request into the child's stdin pipe, then close it.
+ * SIGPIPE is ignored process-wide (util_ignore_sigpipe at startup), so a
+ * child that died mid-write surfaces EPIPE here instead of killing us. */
 static void https_req_pump(int in_fd, const char *req, size_t req_len)
 {
     size_t off = 0;
-
-    /* the child (openssl s_client) may exit before consuming the request
-     * (e.g. TLS handshake failure): a dying pipe must surface EPIPE on the
-     * write, not kill us with the default SIGPIPE disposition (pipes have
-     * no MSG_NOSIGNAL, so ignore the signal instead). Restore the old
-     * disposition before returning: callers may rely on SIGPIPE. */
-    void (*old_pipe)(int) = signal(SIGPIPE, SIG_IGN);
 
     while (off < req_len) {
         ssize_t w = write(in_fd, req + off, req_len - off);
@@ -376,7 +423,6 @@ static void https_req_pump(int in_fd, const char *req, size_t req_len)
         off += (size_t)w;
     }
     close(in_fd);
-    signal(SIGPIPE, old_pipe);
 }
 
 /* Read the child's stdout until EOF, timeout, or error; on timeout or
@@ -395,7 +441,7 @@ static int https_resp_read(int out_fd, pid_t pid, struct sbuf *resp,
     for (;;) {
         uint64_t now = now_ms();
         int pr;
-        char buf[4096];
+        char buf[HTTPS_READ_CHUNK];
         ssize_t r;
 
         /* hard ceilings for the whole transfer: size (16 MiB) and the
@@ -531,7 +577,15 @@ static int https_resp_parse(struct sbuf *resp, int *status, char **body_out)
 
     if (chunked) {
         struct sbuf dec = {0};
-        chunk_decode(body, resp->len - (size_t)(body - resp->d), &dec);
+        char err[128];
+        if (!chunk_decode(body, resp->len - (size_t)(body - resp->d), &dec,
+                          err, sizeof err)) {
+            log_err("malformed chunked response: %s", err);
+            free(dec.d);
+            free(resp->d);
+            *body_out = empty_str();
+            return 0;
+        }
         out = dec.d ? dec.d : empty_str();
     } else {
         size_t blen = resp->len - (size_t)(body - resp->d);
@@ -548,14 +602,17 @@ static int https_resp_parse(struct sbuf *resp, int *status, char **body_out)
 
 /* One request/response exchange with a fresh openssl s_client: spawn,
    pump the request, read the raw response (deadline-bounded). Returns 1 on
-   success with *resp holding the raw bytes (caller parses), else 0. */
+   success with *resp holding the raw bytes (caller parses), else 0 with a
+   diagnostic logged: the child's stderr is drained and its first line
+   surfaced, so a failed TLS handshake (certificate, hostname, network)
+   is no longer invisible. */
 static bool https_transport(const char *host, struct sbuf *req,
                             struct sbuf *resp, uint64_t deadline_ms)
 {
-    int in_pipe[2], out_pipe[2];
+    int in_pipe[2], out_pipe[2], err_pipe[2];
     pid_t pid;
 
-    pid = https_spawn_client(host, in_pipe, out_pipe);
+    pid = https_spawn_client(host, in_pipe, out_pipe, err_pipe);
     if (pid < 0) {
         free(req->d);
         return false;
@@ -566,27 +623,82 @@ static bool https_transport(const char *host, struct sbuf *req,
 
     if (https_resp_read(out_pipe[0], pid, resp, deadline_ms) ||
         resp->len == 0) {
+        /* the child is already reaped (https_resp_read), so its stderr
+         * is fully buffered in the pipe; drain and keep the first line */
+        char diag[512];
+        size_t n = 0;
+
+        for (;;) {
+            ssize_t r = read(err_pipe[0], diag + n, sizeof diag - 1 - n);
+            if (r <= 0)
+                break;
+            n += (size_t)r;
+            diag[n] = '\0';
+            if (memchr(diag, '\n', n) != NULL || n == sizeof diag - 1)
+                break;
+        }
+        close(err_pipe[0]);
+        if (n > 0) {
+            char *nl = memchr(diag, '\n', n);
+            if (nl)
+                *nl = '\0';
+            log_err("HTTPS transport failed for %s: %s", host, diag);
+        } else {
+            log_err("HTTPS transport failed for %s: no response from "
+                    "openssl s_client", host);
+        }
         free(resp->d);
         return false;
     }
+    close(err_pipe[0]);
     return true;
 }
 
-/* shared transport for the JSON request builders below: follows redirect
+/* Return a NULL-terminated copy of `headers` with any Authorization
+   entry dropped: a redirect to a different host must not carry the
+   caller's Bearer token. Results go into store[] (needs >= n+1 slots;
+   callers pass a small fixed array). Returns NULL on overflow. */
+static const char *const *https_drop_auth(const char *const *headers,
+                                          const char **store, size_t store_sz)
+{
+    size_t src, dst = 0;
+
+    for (src = 0; headers[src]; src++) {
+        if (strncasecmp(headers[src], "Authorization:",
+                        strlen("Authorization:")) == 0)
+            continue;   /* drop it */
+        if (dst + 1 >= store_sz)
+            return NULL;
+        store[dst++] = headers[src];
+    }
+    store[dst] = NULL;
+    return store;
+}
+
+/* shared transport for the request builders below: follows redirect
    chains (301/302/303/307/308 with an absolute https:// Location, at most
-   HTTPS_MAX_REDIRECTS hops) inside one round-trip time budget */
+   HTTPS_MAX_REDIRECTS hops) inside one round-trip time budget.
+ *
+ * Security: a redirect to a DIFFERENT host must not carry the caller's
+ * Authorization header (Bearer tokens would leak to the redirect
+ * target); 303 always downgrades POST to GET, and 301/302 downgrade a
+ * POST to GET per RFC 7231 §6.4.2-3 (307/308 preserve the method). */
 static bool https_roundtrip(const char *host, const char *path,
                             const char *body, const char *const *headers,
                             bool is_get, int *status_out, char **body_out)
 {
     char *cur_host = xstrdup(host);
     char *cur_path = xstrdup(path);
+    const char *const *cur_headers = headers;
+    const char *no_auth[8];      /* headers minus Authorization (cross-host
+                                  * redirects); callers pass <= 2 headers */
     uint64_t deadline = now_ms() + HTTPS_TIMEOUT_MS;
     int status = 0;
     int failed = 0;
 
     if (status_out)
         *status_out = 0;
+    *body_out = empty_str();     /* contract: always assigned on return */
 
     for (int hop = 0; hop <= HTTPS_MAX_REDIRECTS; hop++) {
         struct sbuf req = {0}, resp = {0};
@@ -598,7 +710,7 @@ static bool https_roundtrip(const char *host, const char *path,
             break;
         }
 
-        https_req_build(&req, cur_host, cur_path, body, headers, is_get);
+        https_req_build(&req, cur_host, cur_path, body, cur_headers, is_get);
         if (!https_transport(cur_host, &req, &resp, deadline)) {
             failed = 1;
             break;
@@ -637,11 +749,29 @@ static bool https_roundtrip(const char *host, const char *path,
                     free(loc);
                     status = st;
                     free(resp.d);
-                    free(new_host);
-                    free(new_path);
                     failed = 1;
                     break;
                 }
+                /* cross-host hop: drop the Authorization header */
+                if (strcmp(new_host, cur_host) != 0 && cur_headers) {
+                    cur_headers = https_drop_auth(
+                        cur_headers, no_auth,
+                        sizeof no_auth / sizeof no_auth[0]);
+                    if (!cur_headers) {
+                        log_err("too many request headers for redirect "
+                                "sanitization");
+                        free(loc);
+                        free(new_host);
+                        free(new_path);
+                        status = st;
+                        free(resp.d);
+                        failed = 1;
+                        break;
+                    }
+                }
+                /* 303 -> GET; 301/302 downgrade POST to GET */
+                if (st == 303 || ((st == 301 || st == 302) && !is_get))
+                    is_get = true;
                 free(loc);
                 free(resp.d);
                 free(cur_host);
@@ -670,28 +800,27 @@ static bool https_roundtrip(const char *host, const char *path,
     }
 
     /* loop exited without a final response: transport failure or too many
-     * redirects */
+     * redirects (body_out already set at entry) */
     if (!failed)
         log_err("HTTPS redirect limit (%d) exceeded", HTTPS_MAX_REDIRECTS);
     free(cur_host);
     free(cur_path);
     if (status_out)
         *status_out = status;
-    *body_out = empty_str();
     return false;
 }
 
-bool https_post_json(const char *host, const char *path,
-                     const char *body,
-                     const char *const *headers,
-                     int *status_out, char **body_out)
+bool https_post(const char *host, const char *path,
+                const char *body,
+                const char *const *headers,
+                int *status_out, char **body_out)
 {
     return https_roundtrip(host, path, body, headers, false,
                            status_out, body_out);
 }
 
-bool https_get_json(const char *host, const char *path, int *status_out,
-                    char **body_out)
+bool https_get(const char *host, const char *path, int *status_out,
+               char **body_out)
 {
     return https_roundtrip(host, path, NULL, NULL, true,
                            status_out, body_out);

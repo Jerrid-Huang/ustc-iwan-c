@@ -5,6 +5,8 @@
 #include <stdint.h>
 #include <netinet/in.h>
 
+#include "util.h"
+
 typedef struct {
     struct sockaddr_in listen_addr;
     const char *listen_str;  /* configured address text, printed like Rust */
@@ -20,6 +22,7 @@ typedef struct {
     char     dns[16];      /* server-assigned DNS resolver (AuthResult.dns) */
     int      gso_ok;       /* 0 untried, 1 usable, -1 failed */
     size_t   gso_mss;      /* last UDP_SEGMENT mss set, 0 = none */
+    pace_bucket pace;      /* aggregate send pacing (util.h); 0 = off */
 } SocksConfig;
 
 /* Run SOCKS5 server (blocks). sockfd = authenticated UDP socket. */

@@ -4,8 +4,10 @@
 
 #include "crypto.h"
 #include "protocol.h"
+#include "util.h"
 
-void pkt_hdr(uint8_t typ, uint8_t enc, uint16_t sid, uint32_t tok, uint8_t out[8])
+void pkt_hdr(uint8_t typ, uint8_t enc, uint16_t sid, uint32_t tok,
+             uint8_t out[IWAN_HDR_LEN])
 {
     out[0] = typ;
     out[1] = enc;
@@ -17,17 +19,17 @@ void pkt_hdr(uint8_t typ, uint8_t enc, uint16_t sid, uint32_t tok, uint8_t out[8
     out[7] = (uint8_t)tok;
 }
 
-void pkt_sig(const uint8_t h8[8], uint8_t out[16])
+void pkt_sig(const uint8_t h8[IWAN_HDR_LEN], uint8_t out[IWAN_SIG_LEN])
 {
-    uint8_t x[10];
-    memcpy(x, h8, 8);
-    memcpy(x + 8, IWAN_MW, 2);
+    uint8_t x[IWAN_HDR_LEN + 2];
+    memcpy(x, h8, IWAN_HDR_LEN);
+    memcpy(x + IWAN_HDR_LEN, IWAN_MW, 2);
     md5(x, sizeof x, out);
 }
 
 void ctrl_hdr(buf_t *out, uint8_t typ, uint8_t enc, uint16_t sid, uint32_t tok)
 {
-    uint8_t h[8], s[16];
+    uint8_t h[IWAN_HDR_LEN], s[IWAN_SIG_LEN];
     pkt_hdr(typ, enc, sid, tok, h);
     pkt_sig(h, s);
     buf_put(out, h, sizeof h);
@@ -36,6 +38,14 @@ void ctrl_hdr(buf_t *out, uint8_t typ, uint8_t enc, uint16_t sid, uint32_t tok)
 
 void tlv_put(buf_t *out, uint8_t typ, const void *val, uint8_t vlen)
 {
+    if (vlen > IWAN_TLV_VLEN_MAX) {
+        /* the length byte stores vlen+2: 254/255 would wrap and corrupt
+         * the frame; callers must guard (see build_open). A violation
+         * here is a programming error — fail loudly, not silently. */
+        log_err("tlv_put: value too long (%u > %d)", vlen,
+                IWAN_TLV_VLEN_MAX);
+        abort();
+    }
     buf_put_u8(out, typ);
     buf_put_u8(out, (uint8_t)(vlen + 2));
     if (vlen > 0)
@@ -50,10 +60,12 @@ int parse_tlvs(const uint8_t *data, size_t len,
     while (i + 2 <= len) {
         uint8_t t = data[i];
         uint8_t l = data[i + 1];
-        if (l < 2 || i + l > len)
+        /* l > len - i: i+2 <= len guarantees no underflow */
+        if (l < 2 || l > len - i)
             return -1; /* malformed length or frame truncated mid-TLV */
         if (cb && !cb(t, data + i + 2, l - 2, ud))
-            break; /* callback requested stop: not an error */
+            return 0;  /* callback requested stop: not a parse error;
+                        * the reason travels in the callback's ud */
         i += l;
     }
     /* trailing bytes (< a full TLV header) are truncation, not a clean end */
@@ -62,11 +74,11 @@ int parse_tlvs(const uint8_t *data, size_t len,
 
 bool verify_sig(const uint8_t *buf, size_t len)
 {
-    uint8_t s[16];
-    if (len < 24)
+    uint8_t s[IWAN_SIG_LEN];
+    if (len < IWAN_CTRL_LEN)
         return false;
     pkt_sig(buf, s);
-    return memcmp(s, buf + 8, 16) == 0;
+    return memcmp(s, buf + IWAN_HDR_LEN, IWAN_SIG_LEN) == 0;
 }
 
 void ip_to_string(const uint8_t b[4], char out[16])

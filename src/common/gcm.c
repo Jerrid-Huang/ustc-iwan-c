@@ -7,7 +7,7 @@
 #include "crypto.h"
 #include "gcm.h"
 
-bool gcm_decrypt(const uint8_t key[32], const uint8_t nonce[12],
+bool gcm_decrypt(const uint8_t key[32], const uint8_t nonce[GCM_NONCE_LEN],
                  const uint8_t *ct_tag, size_t ct_tag_len,
                  const uint8_t *aad, size_t aad_len,
                  uint8_t *plain_out, size_t *plain_len) {
@@ -16,9 +16,9 @@ bool gcm_decrypt(const uint8_t key[32], const uint8_t nonce[12],
     EVP_CIPHER_CTX *ctx = NULL;
     size_t ct_len;
 
-    if (ct_tag_len < 16)
+    if (ct_tag_len < GCM_TAG_LEN)
         return false;
-    ct_len = ct_tag_len - 16;
+    ct_len = ct_tag_len - GCM_TAG_LEN;
 
     ctx = EVP_CIPHER_CTX_new();
     if (!ctx)
@@ -26,7 +26,7 @@ bool gcm_decrypt(const uint8_t key[32], const uint8_t nonce[12],
 
     if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1)
         goto done;
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) != 1)
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, GCM_NONCE_LEN, NULL) != 1)
         goto done;
     if (EVP_DecryptInit_ex(ctx, NULL, NULL, key, nonce) != 1)
         goto done;
@@ -34,7 +34,8 @@ bool gcm_decrypt(const uint8_t key[32], const uint8_t nonce[12],
         goto done;
     if (ct_len > 0 && EVP_DecryptUpdate(ctx, plain_out, &outl, ct_tag, (int)ct_len) != 1)
         goto done;
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, (void *)(ct_tag + ct_len)) != 1)
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, GCM_TAG_LEN,
+                            (void *)(ct_tag + ct_len)) != 1)
         goto done;
     if (EVP_DecryptFinal_ex(ctx, outl > 0 ? plain_out + outl : plain_out, &outl2) != 1)
         goto done;
@@ -72,14 +73,15 @@ char *decrypt_password(const char *encrypted_b64, const char *app_secret,
     free(label);
 
     data = b64url_decode(encrypted_b64, &data_len);
-    if (!data || data_len < 28)
+    if (!data || data_len < GCM_NONCE_LEN + GCM_TAG_LEN)
         goto out;
 
-    plain = malloc(data_len - 12);
+    plain = malloc(data_len - GCM_NONCE_LEN - GCM_TAG_LEN);
     if (!plain)
         goto out;
 
-    if (!gcm_decrypt(key, data, data + 12, data_len - 12,
+    if (!gcm_decrypt(key, data, data + GCM_NONCE_LEN,
+                     data_len - GCM_NONCE_LEN,
                      (const uint8_t *)aad, aad_len, plain, &plain_len))
         goto out;
 
@@ -95,7 +97,7 @@ out:
      * cannot optimize away) */
     OPENSSL_cleanse(key, sizeof key);
     if (plain)
-        OPENSSL_cleanse(plain, data_len - 12);
+        OPENSSL_cleanse(plain, data_len - GCM_NONCE_LEN - GCM_TAG_LEN);
     free(plain);
     free(data);
     free(aad);

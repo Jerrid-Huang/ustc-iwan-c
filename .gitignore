@@ -7,7 +7,7 @@ core
 core.*
 .cc_tmp/
 compile_commands.json
-local/
+local*
 *.pem
 *.key
 .env

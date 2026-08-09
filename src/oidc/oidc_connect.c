@@ -158,7 +158,7 @@ void oidc_connect_server(const Opts *o, const Config *cf)
     uint32_t nonce = rand_u32();
     buf_t open;
     buf_init(&open);
-    if (build_open(&open, user, ct, 1400, o->encrypt, nonce) != 0) {
+    if (build_open(&open, user, ct, IWAN_DEFAULT_MTU, o->encrypt, nonce) != 0) {
         buf_free(&open);
         oidc_die("username too long (max 255 bytes)");
     }

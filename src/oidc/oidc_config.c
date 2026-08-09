@@ -62,7 +62,7 @@ void oidc_fetch_config(Config *cf)
     char *ka_body = oidc_build_dev_body("keepalive", device_id, username);
 
     oidc_eprintf("  Registering device... ");
-    fflush(stdout);
+    fflush(stderr);
     char *resp = NULL;
     int st = oidc_ctrl_post("/m/auth", dev_body, kp, &resp);
     if (st != 200) {
@@ -79,7 +79,7 @@ void oidc_fetch_config(Config *cf)
         oidc_die("keepalive failed HTTP %d", st);
 
     oidc_eprintf("  Fetching server config... ");
-    fflush(stdout);
+    fflush(stderr);
     st = oidc_ctrl_post("/m/config", dev_body, kp, &resp);
     free(dev_body);
     free(ka_body);
@@ -136,6 +136,24 @@ void oidc_fetch_config(Config *cf)
     free(username);
 }
 
+/* --all re-execs via sudo, so the fresh file (and any dir we just
+ * created) are root-owned; hand both back to the invoking user, or
+ * the next non-sudo run cannot read or rewrite the config */
+static void restore_owner(const char *path, const char *dir)
+{
+    const char *su = getenv("SUDO_UID");
+    const char *sg = getenv("SUDO_GID");
+    if (getuid() == 0 && su && sg) {
+        uid_t uid = (uid_t)strtoul(su, NULL, 10);
+        gid_t gid = (gid_t)strtoul(sg, NULL, 10);
+        if (chown(path, uid, gid) != 0)
+            oidc_die("cannot chown config %s: %s", path, strerror(errno));
+        if (dir && chown(dir, uid, gid) != 0)
+            oidc_die("cannot chown config dir %s: %s", dir,
+                     strerror(errno));
+    }
+}
+
 void oidc_save_config(const char *path, const Config *cf)
 {
     if (!cf->servers || json_type(cf->servers) != JSON_ARR ||
@@ -144,12 +162,12 @@ void oidc_save_config(const char *path, const Config *cf)
                  "(refusing to write an unusable config)");
 
     const char *slash = strrchr(path, '/');
+    char *dir = NULL;
     if (slash && slash != path) {
-        char *dir = malloc((size_t)(slash - path) + 1);
+        dir = malloc((size_t)(slash - path) + 1);
         memcpy(dir, path, (size_t)(slash - path));
         dir[slash - path] = '\0';
         mkdir_p(dir);
-        free(dir);
     }
     /* write a sibling temp file, then rename() over the target so the
      * config is replaced atomically: a concurrent reader never sees a
@@ -181,6 +199,9 @@ void oidc_save_config(const char *path, const Config *cf)
         oidc_die("cannot write config to %s: %s", path, strerror(errno));
     }
     free(tmp);
+
+    restore_owner(path, dir);
+    free(dir);
     oidc_eprintf("  Saved %zu server(s) to %s\n", json_arr_len(cf->servers),
                  path);
 }

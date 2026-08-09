@@ -1,7 +1,7 @@
 #ifndef IWAN_TUN_H
 #define IWAN_TUN_H
 
-#include <signal.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -29,9 +29,10 @@ int tun_steering_attach(int tun_fd);
 
 /* Write with EAGAIN poll-retry instead of dropping; max_ms == 0 waits
  * indefinitely. Returns 0 when fully written, -1 on persistent EAGAIN
- * (max_ms elapsed) or fatal error (errno preserved). */
+ * (max_ms elapsed) or fatal error (errno preserved). stop is the shared
+ * process stop flag (util.h g_stop); may be NULL to wait unbounded. */
 int tun_write_retry(int fd, const uint8_t *pkt, size_t len, int max_ms,
-                    volatile sig_atomic_t *stop);
+                    atomic_bool *stop);
 
 /* Generic IFF_MULTI_QUEUE reader pool, shared by iwan-server (downlink
  * readers) and the client TUN pump (uplink readers): one thread per
@@ -40,11 +41,16 @@ int tun_write_retry(int fd, const uint8_t *pkt, size_t len, int max_ms,
  * cb(ud, pkt, len, last): last=true is a flush signal emitted once the
  * queue drains (EAGAIN), so batch-oriented callbacks can flush their
  * partial batch. fd0 ownership stays with the caller; tun_pool_destroy
- * detaches and closes the extra queues only. abort is a shared stop
- * flag checked by the reader threads (may be NULL). */
+ * detaches and closes the extra queues only. abort is the shared stop
+ * flag checked by the reader threads (util.h g_stop; may be NULL).
+ * tun_pool_set_exit_cb registers an optional per-thread callback that
+ * each reader thread runs once, on its own thread, just before exiting
+ * (after the final flush signal) — used to free thread-local batch
+ * buffers (client pump's g_tx). */
 struct tun_pool;
 typedef void (*tun_pkt_fn)(void *ud, const uint8_t *pkt, size_t len,
                            bool last);
+typedef void (*tun_exit_fn)(void);
 
 /* tun_pool_tick must be called at (at most) this cadence for the AIMD
  * busy-signal accounting to stay consistent. */
@@ -54,7 +60,8 @@ typedef void (*tun_pkt_fn)(void *ud, const uint8_t *pkt, size_t len,
 
 struct tun_pool *tun_pool_create(const char *name, int fd0, int maxq,
                                  int initq, tun_pkt_fn cb, void *ud,
-                                 volatile sig_atomic_t *abort);
+                                 atomic_bool *abort);
+void tun_pool_set_exit_cb(struct tun_pool *p, tun_exit_fn cb);
 void tun_pool_tick(struct tun_pool *p);
 void tun_pool_destroy(struct tun_pool *p);
 

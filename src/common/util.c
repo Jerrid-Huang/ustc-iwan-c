@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <net/if.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -18,6 +19,20 @@
 #include <unistd.h>
 
 static int debug_cached = -1;
+
+/* process-wide stop flag (see util.h). atomic_bool is lock-free on every
+ * supported target, so the relaxed store below is legal in a signal
+ * handler (C11 7.14.1.1) and race-free against event-loop readers. */
+atomic_bool g_stop;
+
+void util_ignore_sigpipe(void)
+{
+    static bool done;
+    if (!done) {
+        done = true;
+        signal(SIGPIPE, SIG_IGN);
+    }
+}
 
 void oom_abort(void)
 {
@@ -324,6 +339,68 @@ uint64_t now_ms(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+uint64_t now_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+}
+
+/* ---------------- aggregate send pacing ---------------- */
+
+void pace_bucket_init(pace_bucket *b)
+{
+    static int cached = -1;
+    static uint32_t cached_pps;
+
+    if (cached < 0) {
+        const char *v = getenv("IWAN_SEND_PACING_PPS");
+        uint64_t pps = 0;
+        if (v && *v) {
+            if (parse_uint(v, 10000000, &pps) == 0 && pps > 0) {
+                cached_pps = (uint32_t)pps;
+            } else {
+                log_err("invalid IWAN_SEND_PACING_PPS '%s': pacing disabled",
+                        v);
+                cached_pps = 0;
+            }
+        } else {
+            /* default: no pacing. The C server in this repo drains with
+             * multiple queues and has no single-thread ceiling; the Rust
+             * reference server needs IWAN_SEND_PACING_PPS=300000 (see
+             * util.h). */
+            cached_pps = 0;
+        }
+        cached = 1;
+    }
+    b->pps = cached_pps;
+    b->budget = 0;
+    b->last = 0;
+}
+
+void pace_take(pace_bucket *b, int npk)
+{
+    uint64_t now, budget;
+
+    if (b->pps == 0)
+        return;
+    now = now_us();
+    if (!b->last)
+        b->last = now;
+    budget = b->budget + (now - b->last) * b->pps / 1000000u;
+    if (budget > b->pps / 10u)
+        budget = b->pps / 10u;   /* cap the burst */
+    b->last = now;
+    if ((uint64_t)npk > budget) {
+        uint64_t need = ((uint64_t)npk - budget) * 1000000u / b->pps;
+        b->budget = 0;
+        if (need > 0)
+            usleep(need);
+    } else {
+        b->budget = budget - (uint64_t)npk;
+    }
 }
 
 int parse_uint(const char *s, uint64_t max, uint64_t *out)

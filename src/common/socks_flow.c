@@ -13,16 +13,17 @@
 
 #include "common.h"
 #include "crypto.h"
+#include "ipv4.h"
 #include "netstack.h"
 #include "protocol.h"
 #include "socks_internal.h"
 #include "util.h"
 
-#define LOCAL_WRITE_LIMIT 262144
+#define LOCAL_WRITE_LIMIT   262144
+#define LOCAL_IOV_MAX       4      /* zero-copy readv feed: reserve slots */
 #define HANDSHAKE_TIMEOUT_MS 30000u /* ms: greeting/request/resolve/connect */
-#define TCP_RX_CHUNK      16384
-#define DNS_RESULT_Q_LEN  64    /* DNS result ring size (dns_push/dns_drain) */
-#define DNS_DRAIN_MAX     16    /* results handled per event-loop round */
+#define HANDSHAKE_INPUT_MAX (64 * 1024) /* handshake-phase input cap */
+#define TCP_RX_CHUNK        16384
 
 static const char *flow_state_name(FlowState st)
 {
@@ -56,10 +57,6 @@ static pthread_mutex_t g_dns_mu = PTHREAD_MUTEX_INITIALIZER;
 static DnsResult g_dns_q[DNS_RESULT_Q_LEN];
 static int g_dns_hd, g_dns_tl; /* ring */
 
-uint64_t now_mono(void) {
-    return now_ms();
-}
-
 void dns_push(int flow_id, bool ok, uint32_t ip, uint16_t port) {
     pthread_mutex_lock(&g_dns_mu);
     g_dns_q[g_dns_tl].flow_id = flow_id;
@@ -87,11 +84,9 @@ int dns_drain(DnsResult *out, int max) {
  * packets; the server's kernel routes them (MASQUERADE + conntrack
  * bring the reply back). The client never emits plaintext DNS, so the
  * resolver address and every query stay inside the encrypted session. */
+/* DNS_WAIT_MAX / DNS_POLL_MS / DNS_TIMEOUT_MS live in socks_internal.h */
 #define DNS_FALLBACK_IP "114.114.114.114"
-#define DNS_WAIT_MAX    16
-#define DNS_POLL_MS     250u
 #define DNS_MAX_RESEND  3
-#define DNS_TIMEOUT_MS  1500u   /* registration + 6 x 250ms polls */
 
 /* one ephemeral-port allocator for both TCP flows and tunnel DNS:
  * random start in [PORT_BASE, PORT_TOP), up to 2048 tries, collision
@@ -135,6 +130,7 @@ typedef struct {
     int      flow_id;
     uint16_t port;
     char    *domain;
+    unsigned gen;        /* session generation at spawn (see g_dns_gen) */
 } DnsJob;
 
 /* Process-level singletons: g_dns_server_ip4 here and g_sockfd (declared
@@ -166,6 +162,12 @@ typedef struct {
 static DnsWait g_dns_wait[DNS_WAIT_MAX];
 static pthread_mutex_t g_dns_wait_mu = PTHREAD_MUTEX_INITIALIZER;
 
+/* session generation: bumped by dns_reset()/dns_stop() (run_socks).
+ * Workers capture it at spawn and stop registering/sending once it
+ * changes, so a worker can never touch the session socket after it was
+ * closed (and possibly reused by another open()). */
+static atomic_uint g_dns_gen = 1;
+
 /* tunnel-DNS variant of alloc_ephemeral: collision scan over the
  * pending-query wait table (under its lock) */
 static int dns_sport_in_use(uint16_t p)
@@ -187,46 +189,9 @@ static uint16_t dns_alloc_sport(void)
     return alloc_ephemeral(dns_sport_in_use);
 }
 
-/* 16-bit one's-complement checksum helpers (same scheme as netstack.c) */
-static uint32_t csum_buf32(uint32_t sum, const uint8_t *p, size_t n)
-{
-    while (n >= 2) {
-        sum += ((uint32_t)p[0] << 8) | p[1];
-        p += 2;
-        n -= 2;
-    }
-    if (n)
-        sum += (uint32_t)p[0] << 8;
-    return sum;
-}
-
-static uint16_t csum_fold16(uint32_t sum)
-{
-    while (sum >> 16)
-        sum = (sum & 0xffffu) + (sum >> 16);
-    return (uint16_t)~sum;
-}
-
-static uint16_t ip4_csum(const uint8_t *h, size_t n)
-{
-    return csum_fold16(csum_buf32(0, h, n));
-}
-
-/* UDP checksum over the IPv4 pseudo-header + UDP datagram */
-static uint16_t udp4_csum(uint32_t sip, uint32_t dip,
-                          const uint8_t *u, size_t n)
-{
-    uint8_t ph[8];
-    uint32_t sum;
-    ph[0] = (uint8_t)(sip >> 24); ph[1] = (uint8_t)(sip >> 16);
-    ph[2] = (uint8_t)(sip >> 8);  ph[3] = (uint8_t)sip;
-    ph[4] = (uint8_t)(dip >> 24); ph[5] = (uint8_t)(dip >> 16);
-    ph[6] = (uint8_t)(dip >> 8);  ph[7] = (uint8_t)dip;
-    sum = csum_buf32(0, ph, sizeof ph);
-    sum += 17;                  /* zero byte + IPPROTO_UDP as one BE word */
-    sum += (uint32_t)n;         /* UDP length as one BE word */
-    return csum_fold16(csum_buf32(sum, u, n));
-}
+/* checksums come from ipv4.h: ip_csum_accum/ip_csum_fold (plain IP
+ * header) and ip_udp_csum (UDP + pseudo-header), shared with
+ * netstack.c — no local copies. */
 
 /* encode `domain` as a DNS qname; returns length or -1 (invalid name) */
 static int dns_encode_qname(const char *domain, uint8_t *out, size_t outsz)
@@ -316,7 +281,7 @@ static size_t dns_build_inner(uint32_t sip, uint32_t dip, uint16_t sport,
     out[14] = (uint8_t)(sip >> 8);  out[15] = (uint8_t)sip;
     out[16] = (uint8_t)(dip >> 24); out[17] = (uint8_t)(dip >> 16);
     out[18] = (uint8_t)(dip >> 8);  out[19] = (uint8_t)dip;
-    ipc = ip4_csum(out, 20);
+    ipc = ip_csum_fold(ip_csum_accum(0, out, 20));
     out[10] = (uint8_t)(ipc >> 8);
     out[11] = (uint8_t)ipc;
 
@@ -330,7 +295,7 @@ static size_t dns_build_inner(uint32_t sip, uint32_t dip, uint16_t sport,
     u[6] = 0x00;                 /* checksum (computed over the zeroed field) */
     u[7] = 0x00;
     memcpy(u + 8, dnsq, dnslen);
-    uc = udp4_csum(sip, dip, u, udplen);
+    uc = ip_udp_csum(sip, dip, u, udplen);
     u[6] = (uint8_t)(uc >> 8);
     u[7] = (uint8_t)uc;
     return tot;
@@ -353,6 +318,8 @@ static size_t dns_wrap_outer(const uint8_t *inner, size_t inlen,
 static int dns_register(uint16_t id, uint16_t sport, const DnsJob *j)
 {
     for (int spin = 0; spin < 200; spin++) {  /* up to 2s for a free slot */
+        if (atomic_load(&g_dns_gen) != j->gen)
+            return -1;   /* session torn down: stop claiming slots */
         pthread_mutex_lock(&g_dns_wait_mu);
         for (int i = 0; i < DNS_WAIT_MAX; i++) {
             DnsWait *w = &g_dns_wait[i];
@@ -540,6 +507,44 @@ bad:
     return true;   /* consumed: dst port belongs to a pending query */
 }
 
+/* retire the worker's wait-table slot if it is still ours (caller holds
+ * g_dns_wait_mu) */
+static void dns_retire_slot_locked(int slot, uint16_t sport, uint16_t id)
+{
+    if (slot < 0)
+        return;
+    DnsWait *w = &g_dns_wait[slot];
+    if (w->in_use && w->sport == sport && w->dns_id == id)
+        w->in_use = false;
+}
+
+/* run_socks setup: clear any state a previous session left behind —
+ * result ring and wait table — so stale entries can never match a fresh
+ * session's flows or queries. Also bumps the generation, retiring
+ * workers that outlived the previous teardown. */
+void dns_reset(void)
+{
+    pthread_mutex_lock(&g_dns_mu);
+    g_dns_hd = g_dns_tl = 0;
+    pthread_mutex_unlock(&g_dns_mu);
+    pthread_mutex_lock(&g_dns_wait_mu);
+    for (int i = 0; i < DNS_WAIT_MAX; i++)
+        g_dns_wait[i].in_use = false;
+    atomic_fetch_add(&g_dns_gen, 1);
+    pthread_mutex_unlock(&g_dns_wait_mu);
+}
+
+/* run_socks teardown: bump the generation under the wait-table lock.
+ * Worker sends hold the same lock, so no worker can be mid-send when
+ * this returns — the caller may close the session socket and the DNS
+ * eventfd immediately after. */
+void dns_stop(void)
+{
+    pthread_mutex_lock(&g_dns_wait_mu);
+    atomic_fetch_add(&g_dns_gen, 1);
+    pthread_mutex_unlock(&g_dns_wait_mu);
+}
+
 static void *dns_worker(void *arg) {
     DnsJob *j = (DnsJob *)arg;
     uint8_t q[512];
@@ -550,6 +555,12 @@ static void *dns_worker(void *arg) {
     uint64_t last_send;
     int slot = -1;
 
+    /* generation gate: a worker that started under a previous session
+     * (or whose session was torn down) must not register, send, or
+     * push — the flow table is gone and the socket may be closed and
+     * reused by another open() */
+    if (atomic_load(&g_dns_gen) != j->gen)
+        goto done;
     if (g_sockfd < 0 || g_dns_server_ip4 == 0)
         goto fail;
     id = (uint16_t)rand_u32();
@@ -574,6 +585,12 @@ static void *dns_worker(void *arg) {
             goto done;
         }
         ipid = w->ipid;
+        if (atomic_load(&g_dns_gen) != j->gen) {
+            /* session torn down while we registered: retire the slot */
+            dns_retire_slot_locked(slot, sport, id);
+            pthread_mutex_unlock(&g_dns_wait_mu);
+            goto done;
+        }
     }
     pthread_mutex_unlock(&g_dns_wait_mu);
 
@@ -584,15 +601,27 @@ static void *dns_worker(void *arg) {
     outlen = dns_wrap_outer(inner, inlen, out, sizeof out);
     if (outlen == 0)
         goto fail;
-    last_send = now_ms();
+    /* first send, gated on the generation under the wait-table lock:
+     * dns_stop() takes the same lock before closing the socket, so a
+     * send can never race a close — and a reused fd can never receive
+     * tunnel-DNS bytes from a retired session */
+    pthread_mutex_lock(&g_dns_wait_mu);
+    if (atomic_load(&g_dns_gen) != j->gen) {
+        dns_retire_slot_locked(slot, sport, id);
+        pthread_mutex_unlock(&g_dns_wait_mu);
+        goto done;
+    }
     if (send(g_sockfd, out, (int)outlen, 0) < 0 && errno != EAGAIN &&
         errno != EWOULDBLOCK) {
         /* hard send error (ENETUNREACH, EPERM, ...): fail fast — a
          * retry loop cannot succeed, and the flow would only see its
          * rep=4 after the full 1.5s deadline */
+        pthread_mutex_unlock(&g_dns_wait_mu);
         log_err("tunnel DNS send failed: %s", strerror(errno));
         goto fail;
     }
+    pthread_mutex_unlock(&g_dns_wait_mu);
+    last_send = now_ms();
 
     for (;;) {
         int act = 0;             /* 0 wait, 1 resend, 2 fail, 3 done */
@@ -600,6 +629,12 @@ static void *dns_worker(void *arg) {
         usleep(DNS_POLL_MS * 1000);
         now = now_ms();
         pthread_mutex_lock(&g_dns_wait_mu);
+        if (atomic_load(&g_dns_gen) != j->gen) {
+            /* session over: stop polling and resending */
+            dns_retire_slot_locked(slot, sport, id);
+            pthread_mutex_unlock(&g_dns_wait_mu);
+            break;
+        }
         {
             DnsWait *w = &g_dns_wait[slot];
             /* a recycled slot (consumed + re-registered) is not ours */
@@ -610,7 +645,13 @@ static void *dns_worker(void *arg) {
                 act = 2;
             } else if (now - last_send >= DNS_POLL_MS && w->resends > 0) {
                 w->resends--;
-                act = 1;
+                /* resend under the lock: dns_stop() (generation bump +
+                 * socket close) can only run between these critical
+                 * sections, never mid-send */
+                if (send(g_sockfd, out, (int)outlen, 0) >= 0)
+                    last_send = now;
+                /* EAGAIN/short send: last_send stays, the next 250ms
+                 * tick retries */
             }
         }
         pthread_mutex_unlock(&g_dns_wait_mu);
@@ -620,27 +661,30 @@ static void *dns_worker(void *arg) {
             dns_push(j->flow_id, false, 0, j->port);
             break;
         }
-        if (act == 1 && send(g_sockfd, out, (int)outlen, 0) >= 0)
-            last_send = now;
-        /* EAGAIN/short send: last_send stays, the next 250ms tick retries */
     }
     goto done;
 
 fail:
     if (slot >= 0) {
         pthread_mutex_lock(&g_dns_wait_mu);
-        if (g_dns_wait[slot].in_use && g_dns_wait[slot].sport == sport &&
-            g_dns_wait[slot].dns_id == id)
-            g_dns_wait[slot].in_use = false;
+        dns_retire_slot_locked(slot, sport, id);
         pthread_mutex_unlock(&g_dns_wait_mu);
     }
     dns_push(j->flow_id, false, 0, j->port);
 done:
-    if (g_dns_evfd >= 0) {
+    /* wake the event loop, unless the session is gone: its eventfd may
+     * already be closed (and reused), and the loop is not waiting.
+     * Same lock serializes this write against the evfd close. */
+    pthread_mutex_lock(&g_dns_wait_mu);
+    if (atomic_load(&g_dns_gen) == j->gen && g_dns_evfd >= 0) {
         uint64_t one = 1;
-        ssize_t w = write(g_dns_evfd, &one, sizeof one);   /* wake loop */
-        (void)w;
+        /* EAGAIN means the eventfd counter is already non-zero: the loop
+         * is (or will be) awake, so a failed write is not an error */
+        if (write(g_dns_evfd, &one, sizeof one) != (ssize_t)sizeof one &&
+            errno != EAGAIN)
+            log_debug("dns evfd wake: %s", strerror(errno));
     }
+    pthread_mutex_unlock(&g_dns_wait_mu);
     free(j->domain);
     free(j);
     return NULL;
@@ -657,6 +701,7 @@ void spawn_dns(int flow_id, const char *domain, uint16_t port) {
     j->flow_id = flow_id;
     j->port = port;
     j->domain = xstrdup(domain);
+    j->gen = atomic_load(&g_dns_gen);
     if (pthread_create(&th, NULL, dns_worker, j) != 0) {
         free(j->domain);
         free(j);
@@ -670,15 +715,30 @@ void queue_flow_output(Flow *f, const uint8_t *data, size_t n) {
     buf_put(&f->output, data, n);
 }
 
-void queue_socks_error(Flow *f, uint8_t rep) {
+/* SOCKS5 reply frame: ver=5, rep, rsv, atyp=1 (IPv4), bound addr+port.
+ * Shared by the error path (zeroed bind) and the CONNECT success path.
+ * bnd_ip is host-order MSB-first (same convention as g_ns.ip). */
+static void socks_reply(Flow *f, uint8_t rep, uint32_t bnd_ip,
+                        uint16_t bnd_port)
+{
     uint8_t r[10] = {5, rep, 0, 1, 0, 0, 0, 0, 0, 0};
+    r[4] = (uint8_t)(bnd_ip >> 24);
+    r[5] = (uint8_t)(bnd_ip >> 16);
+    r[6] = (uint8_t)(bnd_ip >> 8);
+    r[7] = (uint8_t)bnd_ip;
+    r[8] = (uint8_t)(bnd_port >> 8);
+    r[9] = (uint8_t)bnd_port;
     queue_flow_output(f, r, sizeof r);
+}
+
+void queue_socks_error(Flow *f, uint8_t rep) {
+    socks_reply(f, rep, 0, 0);
     f->state = ST_CLOSING;
 }
 
 void set_flow_state(Flow *f, FlowState st) {
     f->state = st;
-    f->state_ms = now_mono();
+    f->state_ms = now_ms();
 }
 
 Flow *flow_alloc(struct sockaddr_in *peer) {
@@ -701,7 +761,7 @@ Flow *flow_alloc(struct sockaddr_in *peer) {
     f->id = g_next_id++;
     f->ns_idx = -1;
     f->state = ST_GREETING;
-    f->state_ms = now_mono();
+    f->state_ms = now_ms();
     if (debug_enabled()) {
         char peer_s[INET_ADDRSTRLEN] = "";
         inet_ntop(AF_INET, &peer->sin_addr, peer_s, sizeof peer_s);
@@ -817,22 +877,29 @@ static bool handshake_greeting(Flow *f)
     }
 
     /* RFC1929 user/password sub-negotiation, frame
-     * [0x01, ulen, user..., plen, pass...]. Zero-length fields,
-     * declared lengths past the buffered input, or a wrong
-     * version are rejected; a frame that has not even delivered
-     * ulen yet waits for the next read. */
+     * [0x01, ulen, user..., plen, pass...]. Like the greeting, the
+     * frame is only judged once its declared length has fully arrived
+     * (the 30s HANDSHAKE_TIMEOUT_MS bounds a client that stalls mid-
+     * frame; the HANDSHAKE_INPUT_MAX cap bounds a lying length). A
+     * partial frame waits for the next read. Zero-length fields, a
+     * wrong version, or a complete frame that fails the check are
+     * rejected. */
     if (f->input.len < 2)
-        return false;
+        return false;              /* ulen not delivered yet: wait */
     size_t ulen = f->input.data[1];
-    if (ulen == 0 || f->input.len < 2 + ulen + 1) {
-        auth_reject(f);
+    if (ulen == 0) {
+        auth_reject(f);            /* complete header, invalid length */
         return false;
     }
+    if (f->input.len < 2 + ulen + 1)
+        return false;              /* plen byte not delivered yet: wait */
     size_t plen = f->input.data[2 + ulen];
-    if (plen == 0 || f->input.len < 2 + ulen + 1 + plen) {
-        auth_reject(f);
+    if (plen == 0) {
+        auth_reject(f);            /* complete frame, invalid length */
         return false;
     }
+    if (f->input.len < 2 + ulen + 1 + plen)
+        return false;              /* password not fully delivered: wait */
     if (f->input.data[0] != 1) {
         auth_reject(f);
         return false;
@@ -971,7 +1038,7 @@ void update_tcp_states(void) {
          * queued, ST_CLOSING, reaped once the output drains) */
         if (f->state == ST_GREETING || f->state == ST_REQUEST ||
             f->state == ST_RESOLVING) {
-            if (now_mono() - f->state_ms >= HANDSHAKE_TIMEOUT_MS) {
+            if (now_ms() - f->state_ms >= HANDSHAKE_TIMEOUT_MS) {
                 if (debug_enabled())
                     log_debug("[flow %lu] handshake timed out",
                               (unsigned long)f->id);
@@ -984,14 +1051,7 @@ void update_tcp_states(void) {
         TcpConn *c = ns_conn(&g_ns, f->ns_idx);
         NsState st = c ? c->state : NS_CLOSED;
         if (st == NS_ESTABLISHED) {
-            uint8_t reply[10] = {5, 0, 0, 1,
-                                 (uint8_t)((g_ns.ip >> 24) & 0xff),
-                                 (uint8_t)((g_ns.ip >> 16) & 0xff),
-                                 (uint8_t)((g_ns.ip >> 8) & 0xff),
-                                 (uint8_t)(g_ns.ip & 0xff),
-                                 (uint8_t)(f->lport >> 8),
-                                 (uint8_t)(f->lport & 0xff)};
-            queue_flow_output(f, reply, sizeof reply);
+            socks_reply(f, 0, g_ns.ip, f->lport);
             set_flow_state(f, ST_ESTABLISHED);
             if (debug_enabled())
                 log_debug("[flow %lu] TCP established", (unsigned long)f->id);
@@ -999,7 +1059,7 @@ void update_tcp_states(void) {
             if (debug_enabled())
                 log_debug("[flow %lu] TCP connect failed", (unsigned long)f->id);
             queue_socks_error(f, 5);
-        } else if (now_mono() - f->state_ms >= HANDSHAKE_TIMEOUT_MS) {
+        } else if (now_ms() - f->state_ms >= HANDSHAKE_TIMEOUT_MS) {
             if (debug_enabled())
                 log_debug("[flow %lu] TCP connect timed out",
                           (unsigned long)f->id);
@@ -1033,17 +1093,18 @@ void service_local_inputs(Flow *fs) {
              * slots (reserve never commits, so the slot pointers stay
              * stable across the batch) */
             for (;;) {
-                struct iovec iov[4];
-                int nv = ns_send_reservev(&g_ns, f->ns_idx, iov, 4);
+                struct iovec iov[LOCAL_IOV_MAX];
+                int nv = ns_send_reservev(&g_ns, f->ns_idx, iov,
+                                          LOCAL_IOV_MAX);
                 if (nv == 0) {
                     /* backpressure: ring/window full. Dump the conn
                      * state at most once per second per flow so a stuck
                      * upload is diagnosable without flooding an upload
                      * that is merely running at ring capacity */
-                    static uint64_t last_dump[NS_MAX_CONN];
+                    TcpConn *dc = ns_conn(&g_ns, f->ns_idx);
                     uint64_t nowd = now_ms();
-                    if (nowd - last_dump[f->ns_idx] >= 1000) {
-                        last_dump[f->ns_idx] = nowd;
+                    if (dc && nowd - dc->last_dump_ms >= 1000) {
+                        dc->last_dump_ms = nowd;
                         ns_dump_conn(&g_ns, f->ns_idx);
                     }
                     break;       /* stack full: backpressure */
@@ -1096,7 +1157,7 @@ void service_local_inputs(Flow *fs) {
                 set_flow_state(f, ST_CLOSING);
             } else if (n > 0) {
                 buf_put(&f->input, rbuf, (size_t)n);
-                if (f->input.len > 64 * 1024) {
+                if (f->input.len > HANDSHAKE_INPUT_MAX) {
                     /* handshake-phase unbounded-input guard: a local
                      * process flooding data would grow input forever;
                      * reap_flows closes the fd and reclaims the slot */

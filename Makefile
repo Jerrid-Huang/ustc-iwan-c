@@ -1,8 +1,8 @@
 CC      ?= cc
 CLANG   ?= clang
-CFLAGS  ?= -O2 -Wall -Wextra -Wno-unused-parameter -std=c11 -D_GNU_SOURCE -fstack-protector-strong -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3 -fPIE -MMD -MP
-LDFLAGS := -pie -Wl,-z,now -Wl,-z,relro -Wl,-z,noexecstack
-LDLIBS  := -lcrypto -lpthread
+CFLAGS  ?= -O2 -Wall -Wextra -std=c11 -D_GNU_SOURCE -fstack-protector-strong -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3 -fPIE -MMD -MP -pthread
+LDFLAGS ?= -pie -Wl,-z,now -Wl,-z,relro -Wl,-z,noexecstack
+LDLIBS  := -lcrypto
 
 SRC_DIR    := src
 COMMON_DIR := $(SRC_DIR)/common
@@ -26,7 +26,7 @@ OIDC_OBJS   := $(patsubst $(OIDC_DIR)/%.c,$(BUILD_DIR)/oidc/%.o,$(OIDC_SRCS))
 LIBCORE := $(BUILD_DIR)/libiwan_core.a
 LIBOIDC := $(BUILD_DIR)/libiwan_oidc.a
 
-.PHONY: all clean
+.PHONY: all clean test
 all: $(BIN_DIR)/iwan-client $(BIN_DIR)/iwan-client-oidc $(BIN_DIR)/iwan-server
 
 $(LIBCORE): $(COMMON_OBJS) $(BUILD_DIR)/steer_bpf_data.o
@@ -53,7 +53,7 @@ $(BIN_DIR)/iwan-server: $(LIBCORE) $(BUILD_DIR)/main/iwan_server.o
 # and never archive it into the host libraries.
 $(BUILD_DIR)/steer_bpf.o: $(COMMON_DIR)/steer_bpf.c
 	@mkdir -p $(BUILD_DIR)
-	$(CLANG) -O2 -target bpf -Wall -c -o $@ $<
+	$(CLANG) -O2 -target bpf -Wall -MMD -MP -c -o $@ $<
 
 # Embed the BPF object as a C array consumed by src/common/tun.c
 # (bpf_prog_load_steer), which parses the embedded ELF section table and
@@ -93,6 +93,18 @@ $(BUILD_DIR)/main/%.o: $(SRC_DIR)/%.c
 
 clean:
 	rm -rf $(BUILD_DIR) $(BIN_DIR)
+	rm -f SHASUMS.txt build-*.log
+
+# Integration suite: tests/integration.sh needs root (TUN devices) and is
+# therefore not run by CI — only locally, via sudo. The script handles
+# privilege requirements itself; hint when it is not present yet (the
+# script lands with the integration phase).
+test: all
+	@if [ ! -x tests/integration.sh ]; then \
+		echo "tests/integration.sh not found (integration phase pending); make test skipped"; \
+		exit 0; \
+	fi
+	./tests/integration.sh
 
 # Compiler-generated header dependencies (from -MMD -MP). Wildcards expand
 # to nothing on a fresh tree, which -include tolerates.

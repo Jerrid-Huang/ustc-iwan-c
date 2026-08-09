@@ -29,17 +29,40 @@
 #include "tun.h"
 #include "util.h"
 
-static volatile sig_atomic_t g_stop;
-static pid_t g_child_pid = -1; /* root parent: the forked server process */
+/* The shared stop flag comes from util.c (atomic_bool, see util.h): the
+ * SIGINT/SIGTERM/SIGHUP handler stores to it (relaxed, lock-free on every
+ * supported target), the main loop reads it, and the TUN reader pool
+ * receives &g_stop as its abort flag. No private copy — a second flag
+ * would let the readers keep running after the loop stopped. */
+static volatile sig_atomic_t g_child_pid = -1; /* root parent: the forked
+                                                * server process */
 
 /* root parent: forward termination signals to the child. The child owns
  * the graceful shutdown (and the cleanup after it); forwarding makes
  * kill <parent-pid>, SIGHUP from a dropped SSH session and systemd
- * KillMode=process all stop the server instead of being swallowed. */
+ * KillMode=process all stop the server instead of being swallowed.
+ * g_child_pid is sig_atomic_t: written by the main loop after the fork,
+ * read from this async-signal context — a wider type would be a C11
+ * data race. */
 static void parent_fwd_signal(int sig)
 {
     if (g_child_pid > 0)
         kill(g_child_pid, sig);
+}
+
+/* install one handler; returns 0 on success. Callers treat failure as
+ * fatal: a server that cannot catch SIGINT/SIGTERM cannot shut down
+ * gracefully, and a parent that cannot forward leaves the child running
+ * and the NAT state stranded. */
+static int install_sig(int sig, void (*handler)(int), int flags)
+{
+    struct sigaction sa;
+
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = handler;
+    sa.sa_flags = flags;
+    sigemptyset(&sa.sa_mask);
+    return sigaction(sig, &sa, NULL);
 }
 
 struct opts {
@@ -72,7 +95,7 @@ static const struct option long_opts[] = {
 static void on_signal(int sig)
 {
     (void)sig;
-    g_stop = 1;
+    g_stop = true; /* shared atomic_bool (util.c): main loop + pool abort */
 }
 
 static void usage(const char *prog, FILE *out)
@@ -394,7 +417,7 @@ static void srv_tun_pkt(void *ud, const uint8_t *pkt, size_t len, bool last)
 {
     struct srv_pool_ud *pu = ud;
     (void)last;
-    handle_tun_downlink(pu->ctx, pkt, len, -1, pu->udp_fd);
+    handle_tun_downlink(pu->ctx, pkt, len, pu->udp_fd);
 }
 
 /* remove stale device, open, configure. Exits on failure. */
@@ -436,7 +459,7 @@ static int setup_tun(const char *name, const char *server_ip, int mask)
 static int setup_udp(uint16_t port)
 {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    int one = 1, sz = 4 * 1024 * 1024;
+    int one = 1, sz = 16 * 1024 * 1024;
     struct sockaddr_in addr;
 
     if (fd < 0) {
@@ -519,7 +542,6 @@ int main(int argc, char **argv)
     struct opts o;
     struct server_ctx ctx;
     struct server_user users[SERVER_MAX_USERS];
-    struct sigaction sa;
     struct pollfd fds[2];
     struct stat st;
     uint8_t sip[4], dip[4];
@@ -534,6 +556,9 @@ int main(int argc, char **argv)
     int poll_err = 0;   /* fatal poll failure: report exit != 0 */
     uint64_t last_drops = 0, last_qctl = 0;
     bool drop_child = false; /* A1: this process is the forked, de-privileged server */
+
+    util_ignore_sigpipe();     /* EPIPE on a dead socket, not a SIGPIPE kill */
+    server_rate_limits_init(); /* IWAN_RATE_OPEN_MAX / IWAN_RATE_ECHO_MAX */
 
     /* recvmmsg batch buffers (heap: 64 x 64KiB = 4MiB) */
     udp_buf = malloc((size_t)UDP_RXBATCH * 65536);
@@ -660,16 +685,37 @@ int main(int argc, char **argv)
              * (both need root). SIGINT/SIGTERM/SIGHUP/SIGQUIT are
              * forwarded to the child so any stop path reaches the
              * cleanup — ignoring them (as before) let kill <parent-pid>
-             * or an SSH hangup strand the NAT state forever. */
-            struct sigaction fw;
-            memset(&fw, 0, sizeof fw);
-            fw.sa_handler = parent_fwd_signal;
-            sigemptyset(&fw.sa_mask);
-            sigaction(SIGINT, &fw, NULL);
-            sigaction(SIGTERM, &fw, NULL);
-            sigaction(SIGHUP, &fw, NULL);
-            sigaction(SIGQUIT, &fw, NULL);
+             * or an SSH hangup strand the NAT state forever.
+             *
+             * The forwarded signals stay BLOCKED while the handlers and
+             * g_child_pid are installed: a signal arriving in that
+             * window must not be lost (handlers not yet up) or swallowed
+             * without forwarding (g_child_pid still -1). Anything that
+             * arrives meanwhile is delivered once the mask is restored,
+             * with everything in place. */
+            sigset_t mask, oldmask;
+            sigemptyset(&mask);
+            sigaddset(&mask, SIGINT);
+            sigaddset(&mask, SIGTERM);
+            sigaddset(&mask, SIGHUP);
+            sigaddset(&mask, SIGQUIT);
+            sigprocmask(SIG_BLOCK, &mask, &oldmask);
+            if (install_sig(SIGINT, parent_fwd_signal, 0) != 0 ||
+                install_sig(SIGTERM, parent_fwd_signal, 0) != 0 ||
+                install_sig(SIGHUP, parent_fwd_signal, 0) != 0 ||
+                install_sig(SIGQUIT, parent_fwd_signal, 0) != 0) {
+                fprintf(stderr, "error: cannot install forwarding "
+                        "handlers: %s\n", strerror(errno));
+                sigprocmask(SIG_SETMASK, &oldmask, NULL);
+                server_cleanup_nat();
+                return 1;
+            }
             g_child_pid = pid;
+            /* SIGCHLD deliberately keeps its default disposition: the
+             * parent reaps the child with waitpid below, and forwarding
+             * it to the child would be meaningless (the child is the
+             * one that exited). */
+            sigprocmask(SIG_SETMASK, &oldmask, NULL);
             for (;;) {
                 int st;
                 if (waitpid(pid, &st, 0) < 0) {
@@ -707,14 +753,14 @@ int main(int argc, char **argv)
      * forwards SIGINT/SIGTERM/SIGHUP/SIGQUIT while waiting) never takes
      * them; the server process — forked child or non-root deployment —
      * exits gracefully. SIGHUP (terminal hangup) stops the server the
-     * same way SIGINT/SIGTERM do, so the parent's cleanup always runs. */
-    memset(&sa, 0, sizeof sa);
-    sa.sa_handler = on_signal;
-    sa.sa_flags = SA_RESTART;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
-    sigaction(SIGHUP, &sa, NULL);
+     * same way SIGINT/SIGTERM do, so the parent's cleanup always runs.
+     * SA_RESTART keeps poll() resuming instead of failing with EINTR. */
+    if (install_sig(SIGINT, on_signal, SA_RESTART) != 0 ||
+        install_sig(SIGTERM, on_signal, SA_RESTART) != 0 ||
+        install_sig(SIGHUP, on_signal, SA_RESTART) != 0) {
+        log_err("cannot install signal handlers: %s", strerror(errno));
+        return 1;
+    }
 
     if (!o.no_tun) {
         static struct srv_pool_ud pu; /* readers reference this for life */
@@ -758,9 +804,10 @@ int main(int argc, char **argv)
         }
 
         if (fds[0].revents & (POLLIN | POLLERR)) {
-            /* recvmmsg batch (64): the per-packet recvfrom syscall cost
-             * (~2us) capped uplink throughput at ~360k pps; batching
-             * amortizes it the same way the client's udp2tun drain does */
+            /* recvmmsg batch (64): drains up to 64 datagrams per syscall,
+             * amortizing the per-packet recvfrom overhead that used to
+             * be the loop's throughput ceiling — a full poll burst is
+             * consumed in one syscall round */
             for (;;) {
                 int v = recvmmsg(udp_fd, msgs, UDP_RXBATCH, MSG_DONTWAIT,
                                  NULL);

@@ -120,10 +120,10 @@ static int bpf_prog_load_steer(const struct bpf_insn *insns,
         attr.log_level = 1;
         fd = (int)syscall(__NR_bpf, BPF_PROG_LOAD, &attr, sizeof attr);
         if (fd < 0)
-            log_debug("bpf load: %s", log);
+            log_err("tun steering: bpf load: %s", log);
     }
     if (fd < 0)
-        log_debug("bpf load failed: %s", strerror(errno));
+        log_err("tun steering: bpf load failed: %s", strerror(errno));
     return fd;
 }
 
@@ -171,10 +171,26 @@ int tun_steering_attach(int tun_fd)
         if (!memchr(name, '\0', shstr->sh_size - sh[i].sh_name))
             continue;
         if (strcmp(name, "classifier") == 0) {
+            /* the kernel reads insns as (cnt * sizeof insn) bytes; a
+             * trailing partial instruction would be loaded silently —
+             * reject it explicitly instead of truncating */
+            if (sh[i].sh_size % sizeof(struct bpf_insn) != 0) {
+                log_err("tun steering: classifier section is %zu bytes, "
+                        "not a multiple of %zu", (size_t)sh[i].sh_size,
+                        sizeof(struct bpf_insn));
+                return -1;
+            }
             insns = (const struct bpf_insn *)(o + sh[i].sh_offset);
             insn_cnt = (unsigned int)(sh[i].sh_size /
                                       sizeof(struct bpf_insn));
         } else if (strcmp(name, "license") == 0) {
+            /* bpf syscall expects a NUL-terminated license string; the
+             * section data must carry the terminator inside the blob */
+            if (!memchr(o + sh[i].sh_offset, '\0', sh[i].sh_size)) {
+                log_err("tun steering: license section is not "
+                        "NUL-terminated");
+                return -1;
+            }
             license = (const char *)(o + sh[i].sh_offset);
         }
     }
@@ -187,7 +203,7 @@ int tun_steering_attach(int tun_fd)
     rc = ioctl(tun_fd, TUNSETSTEERINGEBPF, &prog_fd);
     close(prog_fd);
     if (rc < 0)
-        log_debug("tun steering attach: %s", strerror(errno));
+        log_err("tun steering attach: %s", strerror(errno));
     return rc < 0 ? -1 : 0;
 }
 
@@ -206,7 +222,7 @@ ptrdiff_t tun_write(int fd, const void *buf, size_t len) {
 }
 
 int tun_write_retry(int fd, const uint8_t *pkt, size_t len, int max_ms,
-                    volatile sig_atomic_t *stop) {
+                    atomic_bool *stop) {
     uint64_t t0 = now_ms();
     while (len > 0 && (stop == NULL || !*stop)) {
         ptrdiff_t w = tun_write(fd, pkt, len);
@@ -268,7 +284,8 @@ struct tun_pool {
     struct tun_queue qs[TUN_POOL_MAX];
     tun_pkt_fn cb;
     void *ud;
-    volatile sig_atomic_t *abort;
+    atomic_bool *abort;
+    tun_exit_fn exit_cb;   /* per-reader-thread cleanup, may be NULL */
     int nq;
     int maxq;
     int slow_start;   /* AIMD state: slow-start phase flag */
@@ -344,6 +361,11 @@ static void *tun_reader_main(void *ud)
     }
     if (!(pool->abort != NULL && *pool->abort))
         pool->cb(pool->ud, NULL, 0, true);
+    /* per-thread cleanup runs on this exiting reader thread, strictly
+     * after the final flush callback, so a batch-oriented callback can
+     * still use its TLS buffer until here (client pump frees its batch) */
+    if (pool->exit_cb)
+        pool->exit_cb();
     return NULL;
 }
 
@@ -389,7 +411,7 @@ static void tun_pool_del(struct tun_pool *pool)
 
 struct tun_pool *tun_pool_create(const char *name, int fd0, int maxq,
                                  int initq, tun_pkt_fn cb, void *ud,
-                                 volatile sig_atomic_t *abort)
+                                 atomic_bool *abort)
 {
     struct tun_pool *pool = calloc(1, sizeof *pool);
     struct tun_queue *q;
@@ -399,6 +421,7 @@ struct tun_pool *tun_pool_create(const char *name, int fd0, int maxq,
     pool->cb = cb;
     pool->ud = ud;
     pool->abort = abort;
+    pool->exit_cb = NULL;
     pool->maxq = maxq > TUN_POOL_MAX ? TUN_POOL_MAX : (maxq < 1 ? 1 : maxq);
     snprintf(pool->tunname, sizeof pool->tunname, "%s", name);
     q = &pool->qs[0];
@@ -423,6 +446,12 @@ struct tun_pool *tun_pool_create(const char *name, int fd0, int maxq,
             break;
     }
     return pool;
+}
+
+void tun_pool_set_exit_cb(struct tun_pool *pool, tun_exit_fn cb)
+{
+    if (pool)
+        pool->exit_cb = cb;
 }
 
 void tun_pool_destroy(struct tun_pool *pool)

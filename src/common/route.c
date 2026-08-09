@@ -82,11 +82,12 @@ static void copy_token(char *dst, size_t cap, const char *tok) {
     dst[n] = '\0';
 }
 
-bool capture_default(char gw[16], char dev[16]) {
+bool capture_default(char gw[16], char dev[16], char metric[16]) {
     char *args[] = { "-4", "route", "show", "default", NULL };
     char *out = cmd_capture(args);
     if (out == NULL)
         return false;
+    gw[0] = dev[0] = metric[0] = '\0';   /* metric: "" when absent */
     bool got_gw = false, got_dev = false;
     char *save = NULL;
     for (char *tok = strtok_r(out, " \t\r\n", &save); tok != NULL;
@@ -103,6 +104,10 @@ bool capture_default(char gw[16], char dev[16]) {
                 copy_token(dev, 16, nt);
                 got_dev = true;
             }
+        } else if (strcmp(tok, "metric") == 0) {
+            char *nt = strtok_r(NULL, " \t\r\n", &save);
+            if (nt != NULL)
+                copy_token(metric, 16, nt);
         }
     }
     free(out);
@@ -133,16 +138,24 @@ bool local_subnet(const char *dev, char out[24]) {
             }
             if (cidr == NULL)
                 break;
+            /* parse "ip/plen" without mutating the cmd_capture buffer:
+             * strndup the address part, then free it on every exit */
             char *slash = strchr(cidr, '/');
-            *slash = '\0';
+            if (slash == NULL)
+                break;
+            char *ip = strndup(cidr, (size_t)(slash - cidr));
+            if (ip == NULL) {
+                oom_abort();
+                break;
+            }
             uint8_t b[4];
-            if (!s2ip4(cidr, b)) {
-                *slash = '/';
+            if (!s2ip4(ip, b)) {
+                free(ip);
                 break;
             }
             char *pend;
             long p = strtol(slash + 1, &pend, 10);
-            *slash = '/';
+            free(ip);
             uint32_t plen;
             if (pend == slash + 1 || *pend != '\0' || p < 0)
                 plen = 24;
@@ -167,7 +180,7 @@ done:
 
 bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
                  const char *srv, const char *ogw, const char *odev,
-                 const slist_t *routes_with_default) {
+                 const char *metric, const slist_t *routes_with_default) {
     char srv32[64];
     struct in_addr s4;
     bool srv_v4 = inet_pton(AF_INET, srv, &s4) == 1;
@@ -200,7 +213,6 @@ bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
             return false;
         }
     }
-    ip_run(fc);
 
     for (size_t i = 0; i < routes_with_default->n; i++) {
         const char *c = routes_with_default->v[i];
@@ -236,8 +248,11 @@ bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
                 goto rollback_routes;
             }
         }
-        ip_run(fc);
     }
+    /* flush the route cache once, after every route is in place (the
+     * per-route flush in the old code restarted the cache 1..N times
+     * for no observable benefit) */
+    ip_run(fc);
     return true;
 
 rollback_routes:
@@ -246,12 +261,13 @@ rollback_routes:
      * tolerates entries that were never applied), then tear the device
      * down below */
     log_err("route_setup: rolling back applied routes");
-    route_teardown(tun, srv, ogw, odev, routes_with_default);
+    route_teardown(tun, srv, ogw, odev, metric, routes_with_default);
     return false;
 }
 
 void route_teardown(const char *tun, const char *srv, const char *ogw,
-                    const char *odev, const slist_t *routes) {
+                    const char *odev, const char *metric,
+                    const slist_t *routes) {
     for (size_t i = 0; i < routes->n; i++) {
         const char *c = routes->v[i];
         if (strcmp(c, "default") == 0 || strcmp(c, "0.0.0.0/0") == 0) {
@@ -262,9 +278,25 @@ void route_teardown(const char *tun, const char *srv, const char *ogw,
                  * alone — deleting it here would strand the machine */
                 continue;
             }
-            /* we removed it: restore the original via-gateway route */
-            char *d2[] = { "route", "add", "default", "via", (char *)ogw,
-                           "dev", (char *)odev, NULL };
+            /* we removed it: restore the original via-gateway route,
+             * keeping its metric (captured by capture_default) so route
+             * precedence matches the pre-VPN state — a metric-less
+             * restore would install a priority-0 default that shadows
+             * (or is shadowed by) other defaults */
+            char *d2[10];
+            int di = 0;
+            d2[di++] = "route";
+            d2[di++] = "add";
+            d2[di++] = "default";
+            d2[di++] = "via";
+            d2[di++] = (char *)ogw;
+            d2[di++] = "dev";
+            d2[di++] = (char *)odev;
+            if (metric[0] != '\0') {
+                d2[di++] = "metric";
+                d2[di++] = (char *)metric;
+            }
+            d2[di] = NULL;
             if (!ip_run(d2)) {
                 /* the original gateway may have vanished while the VPN
                  * was up (wifi switch, NIC down): fall back to a

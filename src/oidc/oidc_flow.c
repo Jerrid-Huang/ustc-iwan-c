@@ -90,27 +90,33 @@ static int load_state_file(const char *path, char *out, size_t outsz)
     return 0;
 }
 
-void oidc_login(char **kp_out, char **user_out)
+/* RFC 7636 PKCE: a random verifier and its S256 challenge (both malloc'd) */
+static void make_pkce(char **verifier_out, char **challenge_out)
 {
     uint8_t vb[64];
     oidc_rand_bytes(vb, sizeof vb);
     char *code_verifier = b64url_no_pad(vb, sizeof vb);
     uint8_t ch[32];
     sha256(code_verifier, strlen(code_verifier), ch);
-    char *code_challenge = b64url_no_pad(ch, sizeof ch);
+    *verifier_out = code_verifier;
+    *challenge_out = b64url_no_pad(ch, sizeof ch);
+}
 
+/* 32 random alphanumeric characters, malloc'd */
+static char *make_state(void)
+{
     static const char ALPH[] =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    char state[33];
+    char *state = malloc(33);
     for (int i = 0; i < 32; i++)
         state[i] = ALPH[rand_u32() % 62];
     state[32] = '\0';
+    return state;
+}
 
-    /* persist the state before issuing the request: the authorization
-     * response must echo it back or the flow is rejected (see below) */
-    char *state_path = state_file_path();
-    save_state_file(state_path, state);
-
+/* authorize URL carrying the PKCE challenge and CSRF state; malloc'd */
+static char *build_auth_url(const char *code_challenge, const char *state)
+{
     buf_t url;
     buf_init(&url);
     buf_put_str(&url, "https://" OIDC_AUTH_HOST OIDC_AUTH_PATH "?client_id=");
@@ -126,19 +132,13 @@ void oidc_login(char **kp_out, char **user_out)
     buf_put_str(&url, "&state=");
     oidc_urlenc(state, &url);
     oidc_buf_cstr(&url);
+    return (char *)url.data;
+}
 
-    oidc_eprintf("  Open in browser:\n  %s\n\n", (char *)url.data);
-    buf_free(&url);
-    free(code_challenge);
-
-    /* the persisted state file has served its purpose once read back:
-     * remove it now, before the interactive input, so no random-named
-     * 0600 file is left behind on any error path below. */
-    char saved[64];
-    int have_state = load_state_file(state_path, saved, sizeof saved) == 0;
-    unlink(state_path);
-    free(state_path);
-
+/* prompt for and read the paste-back redirect URL; dies unless it uses
+ * our private-use scheme */
+static char *read_redirect_url(void)
+{
     fprintf(stderr, "  Paste redirect URL: ");
     fflush(stderr);
 
@@ -158,30 +158,13 @@ void oidc_login(char **kp_out, char **user_out)
     if (strncmp(rp, OIDC_REDIRECT, strlen(OIDC_REDIRECT)) != 0)
         oidc_die("redirect URL must start with "
                  "com.panabit.mobile://oauth2redirect");
+    return xstrdup(rline);
+}
 
-    char *code = oidc_extract_code(rline);
-    char *cb_state = (char *)oidc_url_param(rline, "state");
-
-    /* OIDC Core 3.1.2.1 (CSRF): the client MUST compare the state value
-     * in the authorization response with the one it saved when starting
-     * the request; otherwise an attacker can substitute their own
-     * authorization code for the user's (login CSRF). The saved state
-     * was read back (and the state file removed) above. */
-    if (!cb_state) {
-        free(code);
-        oidc_die("authorization response missing state parameter "
-                 "(OIDC Core 3.1.2.1 CSRF check failed)");
-    }
-    if (!have_state || strcmp(cb_state, saved) != 0) {
-        free(cb_state);
-        free(code);
-        oidc_die("authorization response state does not match the saved "
-                 "state (OIDC Core 3.1.2.1 CSRF check failed)");
-    }
-    free(cb_state);
-    if (!code)
-        oidc_die("no authorization code in redirect URL");
-
+/* exchange the authorization code for tokens (RFC 6749 4.1.3); returns
+ * the parsed JSON response, dies on transport/HTTP/parse errors */
+static Json *exchange_code(const char *code, const char *code_verifier)
+{
     buf_t body;
     buf_init(&body);
     buf_put_str(&body, "{\"client_id\":\"");
@@ -194,14 +177,16 @@ void oidc_login(char **kp_out, char **user_out)
     oidc_esc_put(&body, OIDC_REDIRECT);
     buf_put_str(&body, "\",\"grant_type\":\"authorization_code\"}");
     oidc_buf_cstr(&body);
-    free(code);
-    free(code_verifier);
 
     const char *headers[] = { "Content-Type: application/json", NULL };
     int st = 0;
     char *resp = NULL;
-    https_post_json(OIDC_AUTH_HOST, OIDC_TOKEN_PATH, (char *)body.data, headers,
-                    &st, &resp);
+    if (!https_post(OIDC_AUTH_HOST, OIDC_TOKEN_PATH, (char *)body.data,
+                    headers, &st, &resp)) {
+        buf_free(&body);
+        oidc_die("token exchange failed (HTTP %d): %s", st,
+                 resp && *resp ? resp : "no response (transport error)");
+    }
     buf_free(&body);
     if (st != 200)
         oidc_die("token exchange failed HTTP %d: %s", st, resp ? resp : "");
@@ -210,23 +195,85 @@ void oidc_login(char **kp_out, char **user_out)
     free(resp);
     if (!tok)
         oidc_die("cannot parse token response");
-    const char *at = json_get_str(tok, "access_token");
-    if (!at) {
-        json_free(tok);
-        oidc_die("no access_token");
-    }
-    char *kp = xstrdup(at);
+    return tok;
+}
 
-    /* the id_token is the client's proof of authentication: verify its
-     * signature against the issuer's JWKS and its aud/iss/exp claims
-     * before trusting any of its contents (fail-closed) */
+/* the id_token is the client's proof of authentication: verify its
+ * signature against the issuer's JWKS and its aud/iss/exp claims
+ * before trusting any of its contents (fail-closed) */
+static void verify_id_token(Json *tok)
+{
     const char *id_token = json_get_str(tok, "id_token");
-    if (id_token &&
-        oidc_jwt_verify(id_token, OIDC_CLIENT_ID,
-                        "https://" OIDC_AUTH_HOST) != 0) {
-        json_free(tok);
+    if (!id_token)
+        oidc_die("login response missing id_token");
+    if (oidc_jwt_verify(id_token, OIDC_CLIENT_ID,
+                        "https://" OIDC_AUTH_HOST) != 0)
         oidc_die("id_token verification failed");
-    }
+}
+
+/* OIDC Core 3.1.2.1 (CSRF): the authorization response must echo back
+ * the state saved when the request started; dies otherwise */
+static void check_csrf_state(const char *cb_state, const char *saved,
+                             int have_state)
+{
+    if (!cb_state)
+        oidc_die("authorization response missing state parameter "
+                 "(OIDC Core 3.1.2.1 CSRF check failed)");
+    if (!have_state || strcmp(cb_state, saved) != 0)
+        oidc_die("authorization response state does not match the saved "
+                 "state (OIDC Core 3.1.2.1 CSRF check failed)");
+}
+
+/* pull the access_token out of the token response; dies when absent */
+static char *take_access_token(Json *tok)
+{
+    const char *at = json_get_str(tok, "access_token");
+    if (!at)
+        oidc_die("no access_token");
+    return xstrdup(at);
+}
+
+void oidc_login(char **kp_out, char **user_out)
+{
+    char *code_verifier, *code_challenge;
+    make_pkce(&code_verifier, &code_challenge);
+    char *state = make_state();
+
+    /* persist the state before issuing the request: the authorization
+     * response must echo it back or the flow is rejected below */
+    char *state_path = state_file_path();
+    save_state_file(state_path, state);
+
+    char *url = build_auth_url(code_challenge, state);
+    oidc_eprintf("  Open in browser:\n  %s\n\n", url);
+    free(url);
+    free(code_challenge);
+    free(state);
+
+    /* the persisted state file has served its purpose once read back:
+     * remove it now, before the interactive input, so no random-named
+     * 0600 file is left behind on any error path below. */
+    char saved[64];
+    int have_state = load_state_file(state_path, saved, sizeof saved) == 0;
+    unlink(state_path);
+    free(state_path);
+
+    char *rline = read_redirect_url();
+    char *code = oidc_extract_code(rline);
+    char *cb_state = oidc_url_param(rline, "state");
+    free(rline);
+
+    check_csrf_state(cb_state, saved, have_state);
+    free(cb_state);
+    if (!code)
+        oidc_die("no authorization code in redirect URL");
+
+    Json *tok = exchange_code(code, code_verifier);
+    free(code);
+    free(code_verifier);
+
+    char *kp = take_access_token(tok);
+    verify_id_token(tok);
 
     char *username = oidc_id_token_username(tok);
     json_free(tok);
@@ -238,17 +285,11 @@ void oidc_login(char **kp_out, char **user_out)
     *user_out = username;
 }
 
-int oidc_ctrl_post(const char *path, const char *body,
-                   const char *kp_token, char **resp_out)
+/* X-Auth-Sign: HMAC-SHA256 over the canonical request string
+ * POST\n<path>\n\n<sha256(body) hex>\n<ts>\n<nonce>, hex-encoded */
+static void sign_request(const char *path, const char *body, const char *ts,
+                         const char *nonce, char sig[65])
 {
-    char ts[32];
-    snprintf(ts, sizeof ts, "%lld", (long long)time(NULL));
-
-    uint8_t nb[16];
-    oidc_rand_bytes(nb, sizeof nb);
-    char nonce[33];
-    oidc_hex_upper(nb, sizeof nb, nonce);
-
     uint8_t h[32];
     sha256(body, strlen(body), h);
     char bh[65];
@@ -269,9 +310,23 @@ int oidc_ctrl_post(const char *path, const char *body,
     uint8_t sm[32];
     hmac_sha256((const uint8_t *)OIDC_APP_SECRET, strlen(OIDC_APP_SECRET),
                 canon.data, canon.len, sm);
-    char sig[65];
-    hex_encode(sm, sizeof sm, sig);
     buf_free(&canon);
+    hex_encode(sm, sizeof sm, sig);
+}
+
+int oidc_ctrl_post(const char *path, const char *body,
+                   const char *kp_token, char **resp_out)
+{
+    char ts[32];
+    snprintf(ts, sizeof ts, "%lld", (long long)time(NULL));
+
+    uint8_t nb[16];
+    oidc_rand_bytes(nb, sizeof nb);
+    char nonce[33];
+    oidc_hex_upper(nb, sizeof nb, nonce);
+
+    char sig[65];
+    sign_request(path, body, ts, nonce, sig);
 
     char *auth = malloc(strlen(kp_token) + 32);
     snprintf(auth, strlen(kp_token) + 32, "Authorization: Bearer %s",
@@ -294,7 +349,11 @@ int oidc_ctrl_post(const char *path, const char *body,
 
     int st = 0;
     char *resp = NULL;
-    https_post_json(OIDC_CONTROLLER_HOST, path, body, headers, &st, &resp);
+    if (!https_post(OIDC_CONTROLLER_HOST, path, body, headers, &st, &resp)) {
+        free(auth);
+        oidc_die("request to %s failed (HTTP %d): %s", path, st,
+                 resp && *resp ? resp : "no response (transport error)");
+    }
     free(auth);
     *resp_out = resp;
     return st;

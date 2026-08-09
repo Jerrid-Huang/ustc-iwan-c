@@ -5,7 +5,6 @@
 #include <netinet/udp.h>
 #include <poll.h>
 #include <signal.h>
-#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,11 +26,12 @@
 #include "util.h"
 
 Netstack g_ns;
-volatile sig_atomic_t g_stop;
 
+/* shared stop flag (util.h): written from the signal handler with a
+ * relaxed atomic store (lock-free on every supported target) */
 void on_sig(int sig) {
     (void)sig;
-    g_stop = 1;
+    atomic_store_explicit(&g_stop, true, memory_order_relaxed);
 }
 
 int g_dns_evfd = -1;      /* DNS workers write here to wake the loop */
@@ -95,11 +95,10 @@ void accept_connections(int listener) {
          * hint; this check is the enforcement. */
         if (!(g_socks_cfg && g_socks_cfg->allow_remote &&
               g_socks_cfg->auth_token)) {
-            struct sockaddr_in cpeer;
-            socklen_t cpeer_len = sizeof cpeer;
-            if (getpeername(cfd, (struct sockaddr *)&cpeer, &cpeer_len) != 0 ||
-                (cpeer.sin_addr.s_addr & htonl(0xFF000000u)) !=
-                    htonl(0x7F000000u)) {
+            /* accept() already returned the peer address: an extra
+             * getpeername() syscall here was pure overhead */
+            if ((peer.sin_addr.s_addr & htonl(0xFF000000u)) !=
+                htonl(0x7F000000u)) {
                 char cip[INET_ADDRSTRLEN] = "";
                 inet_ntop(AF_INET, &peer.sin_addr, cip, sizeof cip);
                 log_debug("SOCKS5: closing non-loopback peer %s", cip);
@@ -121,57 +120,17 @@ void accept_connections(int listener) {
 
 /* ---- VPN framing (mirrors netstack/tunnel.rs) ---- */
 
-#define SOCKS_MAX_PK 128     /* drain the whole tx queue: 48 segments +
-                              * control ACKs must not accumulate (a 48-item
-                              * cap left 1 item/round and drop-oldest
-                              * evicted ACKs under load) */
+/* drain the whole tx queue: same size as the netstack's device queue
+ * (NS_TX_MAX), so a full ring is drained in one pass */
+#define SOCKS_MAX_PK NS_TX_MAX
 #define SOCKS_SEND_RETRY_MS 5  /* EAGAIN/ENOBUFS retry budget per drain:
                                 * beyond it, give the event loop its
                                 * receive turn instead of wedging it */
 
-/* aggregate send-rate pacing (token bucket): the server's single-threaded
- * drain caps at roughly 360k pps, and bursting past it overflows its UDP
- * rcvbuf — the kernel drops silently (UdpRcvbufErrors) and the inner TCP
- * collapses into an RTO storm (window freeze + 8x retransmit abort,
- * ~29s). A kernel TCP client self-paces via slow-start; this userspace
- * stack has none, so 4 concurrent uploads burst the full 128-segment
- * ring per round. Cap the aggregate at 300k pps (~416MB/s): above the
- * measured single-conn peak (2.6Gbit/s = 234k pps), below the server's
- * drain ceiling, and high enough that pacing never engages for a single
- * connection. */
-#define IWAN_SEND_PACING_PPS 300000u
-
-static uint64_t g_pace_us;      /* unused send budget, microseconds */
-static uint64_t g_pace_last;    /* last refill timestamp (us) */
-
-static uint64_t now_us(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
-}
-
-static void pace_send(int npk)
-{
-    uint64_t now = now_us();
-    uint64_t budget;
-    if (!g_pace_last)
-        g_pace_last = now;
-    budget = g_pace_us +
-             (now - g_pace_last) * IWAN_SEND_PACING_PPS / 1000000u;
-    if (budget > IWAN_SEND_PACING_PPS / 10u)
-        budget = IWAN_SEND_PACING_PPS / 10u;  /* cap the burst */
-    g_pace_last = now;
-    if ((uint64_t)npk > budget) {
-        uint64_t need = ((uint64_t)npk - budget) * 1000000u /
-                        IWAN_SEND_PACING_PPS;
-        g_pace_us = 0;
-        if (need > 0)
-            usleep(need);
-    } else {
-        g_pace_us = budget - (uint64_t)npk;
-    }
-}
+/* Aggregate send-rate pacing (token bucket) is shared with proxy.c —
+ * see pace_bucket in util.h. Enabled only via the environment variable
+ * IWAN_SEND_PACING_PPS (default 0 = disabled). run_socks() initializes
+ * the bucket and sock_drain_tx() accounts each batch with pace_take(). */
 
 /* Send one accumulated batch: uniform batches (>=2 packets, total <= 65507)
  * go out as a single GSO sendmsg with a multi-iovec message (the kernel
@@ -208,7 +167,10 @@ static int socks_send_batch2(int sockfd, SocksConfig *cfg,
                 log_err("SOCKS UDP_SEGMENT unsupported, using sendmmsg");
             else
                 cfg->gso_mss = mss;
-        } else if (cfg->gso_mss != mss) {
+        } else if (cfg->gso_ok > 0 && cfg->gso_mss != mss) {
+            /* gso_ok == -1 caches the disabled state: once setsockopt
+             * failed it will not succeed later, so stop re-probing it
+             * on every drain round */
             int m = (int)mss;
             if (setsockopt(sockfd, SOL_UDP, UDP_SEGMENT, &m, sizeof m) != 0)
                 cfg->gso_ok = -1;
@@ -228,13 +190,27 @@ static int socks_send_batch2(int sockfd, SocksConfig *cfg,
                     (errno == EAGAIN || errno == EWOULDBLOCK ||
                      errno == ENOBUFS || errno == EINTR)) {
                     if (errno != EINTR) {
+                        /* throttled diagnostic: identify which error
+                         * wedges the drain under burst load */
+                        static uint64_t last_diag;
+                        uint64_t nowd = now_ms();
+                        if (nowd - last_diag >= 1000) {
+                            last_diag = nowd;
+                            log_err("SOCKS GSO EAGAIN: %s (npk=%d)",
+                                    strerror(errno), npk);
+                        }
+                        /* wait up to 1ms for the socket to become
+                         * writable, then retry immediately: writable
+                         * means the buffer drained, so resend now (the
+                         * old poll-then-usleep inverted this and slept
+                         * AFTER a writable poll). Bounded: beyond the
+                         * budget, give the event loop its receive turn
+                         * (see the function comment). The items stay
+                         * queued — the caller only pops what was sent.
+                         * Same retry shape as proxy.c send_gso. */
                         struct pollfd pfd = { .fd = sockfd,
                                               .events = POLLOUT };
-                        if (poll(&pfd, 1, 1) > 0)
-                            usleep(200);
-                        /* bounded: give the event loop its receive turn
-                         * (see the function comment). The items stay
-                         * queued — the caller only pops what was sent */
+                        (void)poll(&pfd, 1, 1);
                         if (now_ms() - retry_t0 >= SOCKS_SEND_RETRY_MS)
                             return 0;
                     }
@@ -274,16 +250,26 @@ static int socks_send_batch2(int sockfd, SocksConfig *cfg,
             if (errno == EINTR)
                 continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS) {
-                /* send buffer full: yield briefly instead of blocking
-                 * the single event loop — receive_vpn must keep draining
-                 * downlink (ACKs, keepalive replies) or the receive
-                 * buffer overflows and the peer's segments (and our own
-                 * ACK stream) get dropped, which triggers a retransmit
-                 * storm upstream. Bounded: beyond the budget, return and
-                 * let the main loop cycle (see the function comment). */
+                /* send buffer full: poll up to 1ms for writability,
+                 * then retry immediately (writable -> the buffer
+                 * drained -> resend; same shape as the GSO path above
+                 * and proxy.c send_batch). Never blocks the single
+                 * event loop — receive_vpn must keep draining downlink
+                 * (ACKs, keepalive replies) or the receive buffer
+                 * overflows and the peer's segments (and our own ACK
+                 * stream) get dropped, which triggers a retransmit
+                 * storm upstream. Bounded: beyond the budget, return
+                 * and let the main loop cycle (see the function
+                 * comment). */
+                static uint64_t last_diag;
+                uint64_t nowd = now_ms();
+                if (nowd - last_diag >= 1000) {
+                    last_diag = nowd;
+                    log_err("SOCKS sendmmsg EAGAIN: %s (npk=%d sent=%u)",
+                            strerror(errno), npk, sent);
+                }
                 struct pollfd pfd = { .fd = sockfd, .events = POLLOUT };
-                if (poll(&pfd, 1, 1) > 0)
-                    usleep(200);
+                (void)poll(&pfd, 1, 1);
                 if (now_ms() - retry_t0 >= SOCKS_SEND_RETRY_MS)
                     return (int)sent;
                 continue;
@@ -345,16 +331,17 @@ static void sock_drain_tx(int sockfd, SocksConfig *cfg)
         }
         int sent = socks_send_batch2(sockfd, cfg, iovs + k, msgs + k,
                                      j - k + 1, run_total, lens[k]);
-        /* pace the aggregate send rate: see IWAN_SEND_PACING_PPS */
+        /* pace the aggregate send rate: see pace_bucket in util.h
+         * (IWAN_SEND_PACING_PPS, default off) */
         if (sent > 0)
-            pace_send(sent);
+            pace_take(&cfg->pace, sent);
         if (sent < j - k + 1) {
             /* blocked: re-enqueue the unsent data segments (see above);
              * the already-sent items of this run were sent in order and
              * are gone — re-enqueue from the first unsent one on */
             for (int m = k + sent; m < npk; m++)
                 if (items[m]->seg)
-                    ns_tx_rearm_seg(&g_ns, items[m]->seg);
+                    ns_tx_rearm_seg(&g_ns, items[m]->seg, items[m]->conn);
             return;
         }
         k = j + 1;
@@ -362,36 +349,121 @@ static void sock_drain_tx(int sockfd, SocksConfig *cfg)
 }
 
 void send_vpn_keepalive(int sockfd, const SocksConfig *cfg,
-                               uint64_t *last_ka) {
-    if (now_mono() - *last_ka < SOCKS_KEEPALIVE_MS)
+                        uint64_t *last_ka) {
+    if (now_ms() - *last_ka < SOCKS_KEEPALIVE_MS)
         return;
     buf_t p;
     buf_init(&p);
     ctrl_hdr(&p, PT_ECHO_REQ, cfg->encryption, cfg->sid, cfg->token);
-    (void)send(sockfd, p.data, (int)p.len, 0);
+    if (send(sockfd, p.data, (int)p.len, 0) < 0) {
+        /* a failed keepalive means the session socket is dead: stop the
+         * tunnel instead of silently dropping the heartbeat (same
+         * policy as proxy.c's pump loop) */
+        log_err("SOCKS keepalive send failed: %s", strerror(errno));
+        atomic_store_explicit(&g_stop, true, memory_order_relaxed);
+    }
     buf_free(&p);
-    *last_ka = now_mono();
+    *last_ka = now_ms();
 }
 
+/* inner DATA dispatch: decrypt, validate, and inject a frame into the
+ * netstack (or consume it as a tunnel-DNS response) */
+static void vpn_handle_data(SocksConfig *cfg, uint8_t *b, size_t n)
+{
+    uint8_t t = b[0];
+    size_t plen = n - 8;
+    if (t == PT_DATA_ENC)
+        xor_crypt(b + 8, plen, cfg->xor_key, 8);
+    else if (cfg->encryption) {
+        /* encrypted session must not accept plaintext frames */
+        log_err("VPN plaintext data on encrypted session, drop");
+        return;
+    }
+    if (debug_enabled() && t == PT_DATA_ENC) {
+        char hex[100] = "";
+        int hn = (int)plen < 32 ? (int)plen : 32;
+        for (int i = 0; i < hn; i++)
+            sprintf(hex + i * 3, "%02x ", b[8 + i]);
+        log_debug("DATA decrypted (%zuB): %s...", plen, hex);
+    }
+    uint32_t saddr, daddr;
+    if (plen < 20 || plen > (size_t)cfg->mtu ||
+        ipv4_pkt_ok(b + 8, plen, &saddr, &daddr) != 0)
+        return;
+    /* M1: inner UDP packets whose dst port belongs to a pending
+     * tunnel DNS query are responses — consume them here, never
+     * hand them to the TCP stack */
+    if (dns_try_handle_response(b + 8, plen))
+        return;
+    ns_rx_packet(&g_ns, b + 8, plen);
+}
+
+/* one received VPN datagram: outer-header validation (type/sid/token),
+ * control frames (CLOSE / ECHO_REQ), and inner-packet dispatch.
+ * Returns -1 when the session must stop (server CLOSE), 0 otherwise. */
+static int vpn_handle_datagram(int sockfd, SocksConfig *cfg, uint8_t *b,
+                               size_t n)
+{
+    uint8_t t = b[0];
+    uint16_t psid = (uint16_t)((b[2] << 8) | b[3]);
+    uint32_t ptok = ((uint32_t)b[4] << 24) | ((uint32_t)b[5] << 16) |
+                    ((uint32_t)b[6] << 8) | b[7];
+    if (dbg_env("IWAN_RXDBG"))
+        fprintf(stderr, "VRX: n=%zu t=%u\n", n, t);
+    if (debug_enabled())
+        log_debug("VPN RX type=%u n=%zu sid=%u tok=****%04x "
+                  "(cfg sid=%u tok=****%04x)",
+                  t, n, psid, ptok & 0xFFFFu, cfg->sid,
+                  cfg->token & 0xFFFFu);
+    if (psid != cfg->sid || ptok != cfg->token)
+        return 0;
+    if (t == PT_CLOSE) {
+        /* control packets carry the 16-byte header sig; never
+         * let a spoofed sid/tok-only datagram kill the session */
+        if (!verify_sig(b, n))
+            return 0;
+        log_err("VPN server closed the session (CLOSE)");
+        return -1;
+    }
+    if (t == PT_ECHO_REQ) {
+        if (!verify_sig(b, n))
+            return 0;
+        buf_t p;
+        buf_init(&p);
+        ctrl_hdr(&p, PT_ECHO_RES, cfg->encryption, cfg->sid, cfg->token);
+        /* a failed reply is not worth tearing the session down for: the
+         * next ECHO_REQ gets an answer (or the keepalive machinery
+         * detects a dead socket) */
+        if (send(sockfd, p.data, (int)p.len, 0) < 0)
+            log_err("SOCKS ECHO_RES send failed: %s", strerror(errno));
+        buf_free(&p);
+        return 0;
+    }
+    if (t != PT_DATA && t != PT_DATA_ENC)
+        return 0;
+    vpn_handle_data(cfg, b, n);
+    return 0;
+}
+
+/* recvmmsg drain: one syscall per up-to-64 datagrams, MSG_DONTWAIT so
+ * the poll in wait_events stays the only latency source (passing a
+ * non-NULL timeout to recvmmsg does NOT bound the first packet's
+ * wait, kernel do_recvmmsg bug). 2KB per slot covers any server
+ * datagram (inner MTU <= 1500 + 8B header); oversized packets are
+ * truncated and skipped via MSG_TRUNC.
+ *
+ * Kernel-feature review (Linux 7.0, source-verified, measured on
+ * loopback): io_uring multishot recv + provided-buffer ring and
+ * UDP_GRO were both evaluated and rejected. UDP_GRO coalesces
+ * datagrams into one buffer, but our 8B outer header has no length
+ * field and the inner IP header is XOR-encrypted, so frame
+ * boundaries become unrecoverable. Multishot recv measured ~15%
+ * SLOWER than this recvmmsg path (1686 vs 1996 MB/s) because per-CQE
+ * handling costs more than the batched syscall it replaces, and the
+ * provided-buffer ring hits an unavoidable consumer-vs-producer
+ * race at full ring (spurious -ENOBUFS that kills the multishot,
+ * kernel io_ring_buffer_select). Keep recvmmsg + poll. */
 int receive_vpn(int sockfd, SocksConfig *cfg) {
-    /* recvmmsg drain: one syscall per up-to-64 datagrams, MSG_DONTWAIT so
-     * the poll in wait_events stays the only latency source (passing a
-     * non-NULL timeout to recvmmsg does NOT bound the first packet's
-     * wait, kernel do_recvmmsg bug). 2KB per slot covers any server
-     * datagram (inner MTU <= 1500 + 8B header); oversized packets are
-     * truncated and skipped via MSG_TRUNC.
-     *
-     * Kernel-feature review (Linux 7.0, source-verified, measured on
-     * loopback): io_uring multishot recv + provided-buffer ring and
-     * UDP_GRO were both evaluated and rejected. UDP_GRO coalesces
-     * datagrams into one buffer, but our 8B outer header has no length
-     * field and the inner IP header is XOR-encrypted, so frame
-     * boundaries become unrecoverable. Multishot recv measured ~15%
-     * SLOWER than this recvmmsg path (1686 vs 1996 MB/s) because per-CQE
-     * handling costs more than the batched syscall it replaces, and the
-     * provided-buffer ring hits an unavoidable consumer-vs-producer
-     * race at full ring (spurious -ENOBUFS that kills the multishot,
-     * kernel io_ring_buffer_select). Keep recvmmsg + poll. */
     enum { RX_VLEN = 64, RX_SLOT = 2048 };
     static _Alignas(8) uint8_t rx_buf[RX_VLEN][RX_SLOT];
     static struct iovec rx_iov[RX_VLEN];
@@ -431,67 +503,8 @@ int receive_vpn(int sockfd, SocksConfig *cfg) {
             ssize_t n = rx_msgs[i].msg_len;
             if (n < 8 || (rx_msgs[i].msg_hdr.msg_flags & MSG_TRUNC))
                 continue;
-            uint8_t *b = rx_buf[i];
-            if (dbg_env("IWAN_RXDBG"))
-                fprintf(stderr, "VRX: n=%zu t=%u\n", (size_t)rx_msgs[i].msg_len,
-                        b[0]);
-            uint8_t t = b[0];
-            uint16_t psid = (uint16_t)((b[2] << 8) | b[3]);
-            uint32_t ptok = ((uint32_t)b[4] << 24) | ((uint32_t)b[5] << 16) |
-                            ((uint32_t)b[6] << 8) | b[7];
-            if (debug_enabled())
-                log_debug("VPN RX type=%u n=%zu sid=%u tok=****%04x "
-                          "(cfg sid=%u tok=****%04x)",
-                          t, n, psid, ptok & 0xFFFFu, cfg->sid,
-                          cfg->token & 0xFFFFu);
-            if (psid != cfg->sid || ptok != cfg->token)
-                continue;
-            if (t == PT_CLOSE) {
-                /* control packets carry the 16-byte header sig; never
-                 * let a spoofed sid/tok-only datagram kill the session */
-                if (!verify_sig(b, (size_t)n))
-                    continue;
-                log_err("VPN server closed the session (CLOSE)");
+            if (vpn_handle_datagram(sockfd, cfg, rx_buf[i], (size_t)n) < 0)
                 return -1;
-            }
-            if (t == PT_ECHO_REQ) {
-                if (!verify_sig(b, (size_t)n))
-                    continue;
-                buf_t p;
-                buf_init(&p);
-                ctrl_hdr(&p, PT_ECHO_RES, cfg->encryption, cfg->sid,
-                         cfg->token);
-                (void)send(sockfd, p.data, (int)p.len, 0);
-                buf_free(&p);
-                continue;
-            }
-            if (t != PT_DATA && t != PT_DATA_ENC)
-                continue;
-            size_t plen = (size_t)(n - 8);
-            if (t == PT_DATA_ENC)
-                xor_crypt(b + 8, plen, cfg->xor_key, 8);
-            else if (cfg->encryption) {
-                /* encrypted session must not accept plaintext frames */
-                log_err("VPN plaintext data on encrypted session, drop");
-                continue;
-            }
-            if (debug_enabled() && t == PT_DATA_ENC) {
-                char hex[100] = "";
-                int hn = (int)plen < 32 ? (int)plen : 32;
-                for (int i = 0; i < hn; i++)
-                    sprintf(hex + i * 3, "%02x ", b[8 + i]);
-                log_debug("DATA decrypted (%zuB): %s...", plen, hex);
-            }
-            uint32_t saddr, daddr;
-            if (plen < 20 || plen > (size_t)cfg->mtu ||
-                ipv4_pkt_ok(b + 8, plen, &saddr, &daddr) != 0)
-                continue;
-            /* M1: inner UDP packets whose dst port belongs to a pending
-             * tunnel DNS query are responses — consume them here, never
-             * hand them to the TCP stack */
-            if (dns_try_handle_response(b + 8, plen))
-                continue;
-            ns_rx_packet(&g_ns, b + 8, plen);
         }
     }
 }
@@ -501,6 +514,7 @@ void run_socks(int sockfd, SocksConfig *cfg) {
     struct sockaddr_in laddr = cfg->listen_addr;
 
     g_socks_cfg = cfg;
+    pace_bucket_init(&cfg->pace);   /* reads IWAN_SEND_PACING_PPS (0 = off) */
 
     listener = socket(AF_INET, SOCK_STREAM, 0);
     if (listener < 0) {
@@ -573,7 +587,16 @@ void run_socks(int sockfd, SocksConfig *cfg) {
         return;
     }
     g_next_id = 1;
+    /* clear any DNS state a previous session left behind (result ring,
+     * wait table) so stale entries can never match a fresh session's
+     * flows or queries; also retires workers that outlived it */
+    dns_reset();
     g_dns_evfd = eventfd(0, EFD_NONBLOCK);
+
+    /* run_socks must be re-entrant: clear any stale stop flag BEFORE
+     * installing the handlers (a signal arriving between the two would
+     * otherwise be dropped) */
+    atomic_store_explicit(&g_stop, false, memory_order_relaxed);
 
     struct sigaction sa, old_int, old_term, old_pipe;
     memset(&sa, 0, sizeof sa);
@@ -585,7 +608,6 @@ void run_socks(int sockfd, SocksConfig *cfg) {
      * save the previous disposition first so exit can restore it */
     sigaction(SIGPIPE, NULL, &old_pipe);
     signal(SIGPIPE, SIG_IGN);
-    g_stop = 0;   /* run_socks must be re-entrant: clear any stale stop */
 
     log_info("SOCKS5 listening on %s", listen_s);
     if (debug_enabled())
@@ -595,7 +617,7 @@ void run_socks(int sockfd, SocksConfig *cfg) {
                   (cfg->gateway >> 24) & 0xff, (cfg->gateway >> 16) & 0xff,
                   (cfg->gateway >> 8) & 0xff, cfg->gateway & 0xff, cfg->mtu);
 
-    uint64_t last_ka = now_mono() - SOCKS_KEEPALIVE_MS;
+    uint64_t last_ka = now_ms() - SOCKS_KEEPALIVE_MS;
 
     while (!g_stop) {
         /* flush leftover tx items first: their segment pointers stay
@@ -612,7 +634,7 @@ void run_socks(int sockfd, SocksConfig *cfg) {
          * unconsumed rxq would make conn_win() report 0 and the peer
          * would stop echoing (advertised-window stall) */
         service_local_outputs();
-        int tick_ms = ns_tick(&g_ns, now_mono());
+        int tick_ms = ns_tick(&g_ns, now_ms());
         /* flush freshly enqueued segments (same-round, pointers valid) */
         sock_drain_tx(sockfd, cfg);
         update_tcp_states();
@@ -646,14 +668,18 @@ void run_socks(int sockfd, SocksConfig *cfg) {
         }
     }
 
-    /* stop tunnel DNS: late workers must not send on the closing socket */
+    /* stop tunnel DNS: bump the session generation so in-flight workers
+     * stop sending. Worker sends are serialized with this call via
+     * g_dns_wait_mu, so closing the session socket below (and the
+     * eventfd further down) can never race a worker's send or wakeup. */
+    dns_stop();
     g_sockfd = -1;
 
     for (int i = 0; i < MAX_FLOWS; i++) {
         if (g_flows[i].active)
             ns_abort(&g_ns, g_flows[i].ns_idx);
     }
-    ns_tick(&g_ns, now_mono());
+    ns_tick(&g_ns, now_ms());
     sock_drain_tx(sockfd, cfg);
     {
         buf_t p;
