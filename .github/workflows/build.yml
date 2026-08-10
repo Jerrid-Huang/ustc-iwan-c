@@ -25,7 +25,10 @@ jobs:
     permissions:
       contents: read
     concurrency:
-      group: build-${{ github.ref }}
+      # matrix jobs share the group expression unless the cc dimension
+      # is included: with cancel-in-progress, gcc and clang would
+      # preempt each other and one matrix leg always got cancelled
+      group: build-${{ github.ref }}-${{ matrix.cc }}
       cancel-in-progress: true
     strategy:
       fail-fast: false
