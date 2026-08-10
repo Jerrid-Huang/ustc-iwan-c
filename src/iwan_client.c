@@ -25,7 +25,7 @@
 #include "tun.h"
 #include "util.h"
 
-#define VERSION     "0.1.0"
+#define VERSION     "0.1.1"
 #define PING_BUF_SZ 64
 /* PING round-trip bound: udp_connect's recv timeout (ms). PING has no
  * retry loop, so a single bound must cover one request/response pair. */
