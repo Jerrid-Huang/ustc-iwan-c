@@ -38,6 +38,46 @@ make TARGET=win32 -B CC=x86_64-w64-mingw32-gcc OPENSSL_DIR=/tmp/mingw-sysroot/uc
 
 MSYS2 的 libcrypto/libssl 是 DLL 导入库:运行时需将 `libcrypto-3-x64.dll`、`libssl-3-x64.dll` 及 mingw 运行库(`libwinpthread-1.dll`、`libssp-0.dll`)与 exe 放在同一目录。TUN 模式还需 `wintun.dll`(与驱动一同安装)并在管理员控制台运行;`socks` / `ping` / `auth` / OIDC 无需管理员。CI(`.github/workflows/build.yml` 的 `win-cross` 任务)自动完成交叉编译 + wine 冒烟 + 与 Linux `iwan-server` 的真实线上握手测试。
 
+### Windows 安装(直接下载,免编译)
+
+1. 从 [Releases](https://github.com/Jerrid-Huang/ustc-iwan-c/releases) 下载 **`iwan-windows-x86_64.zip`**(含两个 exe 与全部运行库 DLL;只下裸 exe 会因缺少 DLL 无法启动)。
+2. 解压到任意目录,例如 `C:\iwan`(保持 exe 与 DLL 在同一文件夹):
+   ```
+   C:\iwan\iwan-client.exe
+   C:\iwan\iwan-client-oidc.exe
+   C:\iwan\libcrypto-3-x64.dll      (OpenSSL 运行库)
+   C:\iwan\libssl-3-x64.dll
+   C:\iwan\libwinpthread-1.dll      (mingw 运行库)
+   C:\iwan\libssp-0.dll
+   ```
+3. **TUN 模式需要额外安装 wintun 驱动**(`socks` / `ping` / `auth` / OIDC 模式不需要):
+   - 从 [wintun.net](https://www.wintun.net/) 下载安装包(或安装 WireGuard 自带),以管理员运行安装;
+   - 把 `wintun.dll` 也放进 `C:\iwan\`(与 exe 同目录)。
+4. 使用(在 `C:\iwan` 下打开终端):
+
+   ```bat
+   :: 连通性测试(无需管理员)
+   iwan-client.exe ping --server <SERVER> --port 6001
+
+   :: SOCKS5 代理,免管理员;应用设置 SOCKS5 127.0.0.1:1080 即可
+   iwan-client.exe socks --server <SERVER> --port 6001 --user <USER> --pass <PASS>
+
+   :: 密码从文件读取,避免口令暴露在命令行(文件保持私有)
+   iwan-client.exe socks --server <SERVER> --port 6001 --user <USER> --pass-file C:\path\pass.txt
+
+   :: TUN 模式(管理员控制台;需要 wintun)
+   iwan-client.exe proxy --server <SERVER> --port 6001 --user <USER> --pass <PASS>
+
+   :: OIDC 登录流程
+   iwan-client-oidc.exe --connect
+   ```
+
+5. 常见问题:
+   - **`wintun.dll not found`**:未安装 wintun 驱动或 DLL 不在 exe 同目录;TUN 模式必须以**管理员**控制台运行。
+   - **提示缺少其他 DLL**:确认使用了 zip 包且解压完整,exe 与 4 个运行库 DLL 在同一目录。
+   - **防火墙/杀毒提示**:UDP 6001 出站需放行;若拦截请添加允许规则。
+   - **64 位**:本项目仅提供 x86_64 构建,不支持 32 位 Windows。
+
 ### Windows 原生编译(MSYS2,推荐)
 
 在 Windows 机器上直接用 MSYS2 的 MinGW-w64 工具链编译,无需 Linux:
