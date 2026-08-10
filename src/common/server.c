@@ -752,8 +752,13 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                 saddr != s_ip) {
                 g_up[tid].h1++;
                 if (debug_enabled())
-                    log_debug("uplink drop: bad inner IPv4 (sid 0x%04x)",
-                              sid);
+                    log_debug("uplink drop: bad inner IPv4 (sid 0x%04x) "
+                              "%u.%u.%u.%u->%u.%u.%u.%u v=%u ihl=%u tot=%u",
+                              sid, raw[8 + 12], raw[8 + 13], raw[8 + 14],
+                              raw[8 + 15], raw[8 + 16], raw[8 + 17],
+                              raw[8 + 18], raw[8 + 19], raw[8] >> 4,
+                              raw[8] & 0x0F,
+                              ((unsigned)raw[8 + 2] << 8) | raw[8 + 3]);
                 break;
             }
             if (ctx->tun_fd >= 0 && len > IWAN_HDR_LEN) {

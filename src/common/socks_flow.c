@@ -1,5 +1,6 @@
 #include <arpa/inet.h>
 #include <errno.h>
+#include <netdb.h>
 #include <stdio.h>
 #include <netinet/in.h>
 #include <pthread.h>
@@ -85,7 +86,6 @@ int dns_drain(DnsResult *out, int max) {
  * bring the reply back). The client never emits plaintext DNS, so the
  * resolver address and every query stay inside the encrypted session. */
 /* DNS_WAIT_MAX / DNS_POLL_MS / DNS_TIMEOUT_MS live in socks_internal.h */
-#define DNS_FALLBACK_IP "114.114.114.114"
 #define DNS_MAX_RESEND  3
 
 /* one ephemeral-port allocator for both TCP flows and tunnel DNS:
@@ -140,7 +140,7 @@ typedef struct {
  * suffice and avoid passing them through every flow API. If the proxy is
  * ever instantiated more than once per process, both must be turned into
  * explicit parameters instead of globals. */
-static char     g_dns_server_ip[16] = DNS_FALLBACK_IP;
+static char     g_dns_server_ip[16] = "system resolver";
 static uint32_t g_dns_server_ip4;    /* host-order, MSB-first */
 static uint16_t g_dns_ip_id;         /* inner IP ID (bumped under the lock) */
 static uint64_t g_dns_ignored;       /* responses dropped by validation */
@@ -344,18 +344,17 @@ static int dns_register(uint16_t id, uint16_t sport, const DnsJob *j)
     return -1;
 }
 
-/* resolver configured by run_socks (server-assigned AuthResult.dns) */
+/* resolver configured by run_socks (server-assigned AuthResult.dns).
+ * A missing/0.0.0.0 value leaves g_dns_server_ip4 == 0, which sends
+ * domain resolution down the system-resolver fallback in dns_worker. */
 void dns_set_server(const char *ip)
 {
     uint8_t b[4];
-    if (ip && ip[0] && s2ip4(ip, b)) {
+    if (ip && ip[0] && s2ip4(ip, b) && ip4_u32(b) != 0) {
         snprintf(g_dns_server_ip, sizeof g_dns_server_ip, "%s", ip);
         g_dns_server_ip4 = ip4_u32(b);
     } else {
-        snprintf(g_dns_server_ip, sizeof g_dns_server_ip, "%s",
-                 DNS_FALLBACK_IP);
-        s2ip4(DNS_FALLBACK_IP, b);
-        g_dns_server_ip4 = ip4_u32(b);
+        g_dns_server_ip4 = 0;
     }
 }
 
@@ -545,6 +544,34 @@ void dns_stop(void)
     pthread_mutex_unlock(&g_dns_wait_mu);
 }
 
+/* --- local fallback resolver -----------------------------------------
+ * When the server hands out no tunnel DNS (dns=0.0.0.0 — observed on
+ * the real USTC service), the SOCKS5 domain path falls back to the
+ * system resolver via getaddrinfo(): whatever /etc/resolv.conf (or
+ * NSS) is configured to use, no hardcoded server. Tunnel DNS stays the
+ * preferred path when the server does advertise one. */
+
+/* one-shot local A query via the system resolver. Blocks the worker
+ * thread for the resolver's own timeout at worst, which only delays
+ * this flow's rep=4; other flows are unaffected. */
+static bool dns_query_local(const char *domain, uint32_t *ip_out)
+{
+    struct addrinfo hints, *res = NULL;
+    int rc;
+
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_INET;      /* the tunnel stack is IPv4-only */
+    hints.ai_socktype = SOCK_STREAM;
+    rc = getaddrinfo(domain, NULL, &hints, &res);
+    if (rc != 0 || !res)
+        return false;
+    /* host-order MSB-first, same convention as the tunnel path's
+     * dns_push()/open_tcp_connection() */
+    *ip_out = ntohl(((struct sockaddr_in *)res->ai_addr)->sin_addr.s_addr);
+    freeaddrinfo(res);
+    return true;
+}
+
 static void *dns_worker(void *arg) {
     DnsJob *j = (DnsJob *)arg;
     uint8_t q[512];
@@ -561,7 +588,18 @@ static void *dns_worker(void *arg) {
      * reused by another open() */
     if (atomic_load(&g_dns_gen) != j->gen)
         goto done;
-    if (g_sockfd < 0 || g_dns_server_ip4 == 0)
+    if (g_dns_server_ip4 == 0) {
+        /* server handed out no tunnel DNS (dns=0.0.0.0): resolve via
+         * the system resolver — no session socket involved, so the
+         * generation gate above is sufficient */
+        uint32_t lip;
+        if (dns_query_local(j->domain, &lip))
+            dns_push(j->flow_id, true, lip, j->port);
+        else
+            dns_push(j->flow_id, false, 0, j->port);
+        goto done;
+    }
+    if (g_sockfd < 0)
         goto fail;
     id = (uint16_t)rand_u32();
     qlen = dns_build_query(id, j->domain, q, sizeof q);
@@ -1001,7 +1039,9 @@ void handle_dns_results(void) {
                 open_tcp_connection(f, q[k].ip, q[k].port);
             } else {
                 log_err("[flow %lu] DNS failed via %s", (unsigned long)f->id,
-                        g_dns_server_ip);
+                        g_dns_server_ip4 == 0
+                            ? "system resolver"
+                            : g_dns_server_ip);
                 queue_socks_error(f, 4);
             }
             break;

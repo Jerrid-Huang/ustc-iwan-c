@@ -95,6 +95,11 @@ printf 'test:s3cret\n' > "$WORK/users.txt"
 chmod 600 "$WORK/users.txt"
 
 echo "== start iwan-server =="
+# outbound interface for MASQUERADE: the default-route device, so
+# tunneled connections to the public internet (DNS, HTTP checks below)
+# work; the echo server binds $SRV_IP on lo and is unaffected
+NAT_IF=$(ip route show default | awk '{print $5; exit}')
+[ -n "$NAT_IF" ] || NAT_IF=lo
 ./bin/iwan-server --users "$WORK/users.txt" --port "$PORT" \
     --tun iwan-srv-it --server-ip "$SRV_IP" --subnet "$SUBNET" \
     --dns 114.114.114.114 --nat-if lo &
@@ -134,6 +139,58 @@ if ! kill -0 "$SOCKS_PID" 2>/dev/null; then
 fi
 python3 tests/echo_client.py --target "$SRV_IP:$ECHO_PORT" \
     --socks "127.0.0.1:$SOCKS_PORT" --conns 4 --bulk-mb "$BULK_MB"
+
+# --- SOCKS5 domain CONNECT: both DNS paths end to end ------------------
+# 1) tunnel DNS (server-advertised): the query is wrapped into the
+#    tunnel and the server relays it to the configured resolver;
+# 2) local fallback: when the server hands out dns=0.0.0.0 (as the real
+#    USTC service does), the client resolves on the real network via
+#    114.114.114.114 — mirroring the Rust reference — instead of failing
+#    every domain CONNECT.
+command -v curl >/dev/null || {
+    echo "error: curl required for the SOCKS5 domain CONNECT checks" >&2
+    exit 1
+}
+socks_dns_check() {
+    local code
+    code=$(curl -sL --socks5-hostname "127.0.0.1:$SOCKS_PORT" \
+        --max-time 20 -o /dev/null -w '%{http_code}' "$1" || true)
+    if [ "$code" != 200 ]; then
+        echo "error: SOCKS5 domain CONNECT $1 failed (http=$code)" >&2
+        exit 1
+    fi
+}
+socks_dns_check http://www.ustc.edu.cn/
+echo "socks domain via tunnel DNS: PASS"
+kill "$SOCKS_PID" 2>/dev/null
+wait "$SOCKS_PID" 2>/dev/null || true
+# restart the server without a tunnel DNS and the socks client against
+# it: the client must fall back to local resolution
+kill "$SERVER_PID" 2>/dev/null
+wait "$SERVER_PID" 2>/dev/null || true
+SERVER_PID=""
+./bin/iwan-server --users "$WORK/users.txt" --port "$PORT" \
+    --tun iwan-srv-it --server-ip "$SRV_IP" --subnet "$SUBNET" \
+    --dns 0.0.0.0 --nat-if "$NAT_IF" &
+SERVER_PID=$!
+for _ in $(seq 1 30); do
+    ip addr show iwan-srv-it 2>/dev/null | grep -q "$SRV_IP" && break
+    sleep 0.5
+done
+ip addr show iwan-srv-it 2>/dev/null | grep -q "$SRV_IP" || {
+    echo "error: server TUN not ready (second instance)" >&2
+    exit 1
+}
+./bin/iwan-client socks --server 127.0.0.1 --port "$PORT" \
+    --user test --pass s3cret --listen "127.0.0.1:$SOCKS_PORT" &
+SOCKS_PID=$!
+sleep 1.5
+if ! kill -0 "$SOCKS_PID" 2>/dev/null; then
+    echo "error: socks client exited (second instance)" >&2
+    exit 1
+fi
+socks_dns_check http://www.ustc.edu.cn/
+echo "socks domain via local fallback: PASS"
 kill "$SOCKS_PID" 2>/dev/null
 wait "$SOCKS_PID" 2>/dev/null || true
 SOCKS_PID=""
