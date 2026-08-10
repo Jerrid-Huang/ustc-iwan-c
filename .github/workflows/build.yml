@@ -37,7 +37,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang libssl-dev
+          sudo apt-get install -y clang libssl-dev linux-libc-dev
 
       - name: Build (${{ matrix.cc }})
         run: |
@@ -95,7 +95,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang libssl-dev
+          sudo apt-get install -y clang libssl-dev linux-libc-dev
 
       # ASan+UBSan build with gcc. No -Werror here: sanitizer
       # instrumentation trips known warnings; the grep gate below still
@@ -138,11 +138,13 @@ jobs:
           sudo apt-get update
           # wine64 (not wine): the wine metapackage hard-depends on
           # wine32:i386, which needs the i386 architecture enabled; the
-          # exes are x86-64 so wine64 alone is sufficient and provides
-          # the wine64 command. clang is needed by the wire-smoke step's
-          # Linux rebuild (steer_bpf.c is compiled with clang -target
-          # bpf).
-          sudo apt-get install -y gcc-mingw-w64-x86-64 zstd wine64 clang
+          # exes are x86-64 so the wine64 loader alone suffices. Note the
+          # wine64 package installs /usr/lib/wine/wine64 but no 'wine64'
+          # command — the smoke steps resolve the loader themselves.
+          # linux-libc-dev is required by the wire-smoke step's Linux
+          # rebuild (steer_bpf.c includes <linux/bpf.h>; the runner image
+          # does not preinstall it), and clang compiles the BPF target.
+          sudo apt-get install -y gcc-mingw-w64-x86-64 zstd wine64 clang linux-libc-dev linux-libc-dev
 
       - name: Download OpenSSL dev package (MSYS2 ucrt64)
         run: |
@@ -186,8 +188,13 @@ jobs:
           cp -f /tmp/mingw-sysroot/ucrt64/bin/libssl-3-x64.dll bin/
           cp -f /usr/lib/gcc/x86_64-w64-mingw32/*-posix/libwinpthread-1.dll bin/ 2>/dev/null || true
           cp -f /usr/lib/gcc/x86_64-w64-mingw32/*-posix/libssp-0.dll bin/ 2>/dev/null || true
-          wine64 bin/iwan-client.exe --help >/dev/null
-          wine64 bin/iwan-client-oidc.exe --help >/dev/null
+          # The wine64 apt package installs only /usr/lib/wine/wine64
+          # (the wine command lives in the wine metapackage, which needs
+          # the i386 architecture); resolve the loader directly.
+          WINE_BIN="$(command -v wine64 2>/dev/null || command -v wine 2>/dev/null || echo /usr/lib/wine/wine64)"
+          echo "using wine loader: $WINE_BIN"
+          "$WINE_BIN" bin/iwan-client.exe --help >/dev/null
+          "$WINE_BIN" bin/iwan-client-oidc.exe --help >/dev/null
 
       # Real wire-level smoke: a Linux iwan-server in --no-tun mode runs
       # without root (control plane only), and the Windows client talks
@@ -204,8 +211,9 @@ jobs:
           SRV=$!
           trap 'kill $SRV 2>/dev/null || true' EXIT
           sleep 1
-          wine64 bin/iwan-client.exe ping --server 127.0.0.1 --port 16001 | grep -q 'PONG'
-          wine64 bin/iwan-client.exe auth --server 127.0.0.1 --port 16001 \
+          WINE_BIN="$(command -v wine64 2>/dev/null || command -v wine 2>/dev/null || echo /usr/lib/wine/wine64)"
+          "$WINE_BIN" bin/iwan-client.exe ping --server 127.0.0.1 --port 16001 | grep -q 'PONG'
+          "$WINE_BIN" bin/iwan-client.exe auth --server 127.0.0.1 --port 16001 \
             --user alice --pass s3cret-pass | grep -q 'OK sid='
 
       - name: Upload artifacts
