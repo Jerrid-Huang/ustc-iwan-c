@@ -25,6 +25,11 @@ static void usage_error(const Cli *usage, const char *msg)
 int main(int argc, char **argv)
 {
     util_ignore_sigpipe();
+    /* WSAStartup + console UTF-8 on Windows; no-op on Linux. Without
+     * this the OIDC client relied on port_socket's WSANOTINITIALISED
+     * recovery for every first socket (wine: wsa 10093), and Chinese
+     * output was mangled (console codepage never set to UTF-8). */
+    port_socket_init();
     Opts o;
     memset(&o, 0, sizeof o);
     o.config_dir = "~/.config/iwan";

@@ -473,6 +473,11 @@ void port_socket_init(void)
         fprintf(stderr, "iwan: WSAStartup failed\n");
         exit(1);
     }
+    /* the program writes UTF-8 (source literals); without this, wine
+     * decodes console output as CP1252 and cmd.exe as the ANSI codepage
+     * (e.g. GBK), mangling Chinese server names. Windows 10+ terminals
+     * and wine honor CP_UTF8. Piped output is unaffected (raw bytes). */
+    SetConsoleOutputCP(CP_UTF8);
 }
 
 int port_close(int fd)
