@@ -465,14 +465,13 @@ static void set_sock_errno(void)
 
 void port_socket_init(void)
 {
-    static int done;
-    if (!done) {
-        WSADATA wd;
-        if (WSAStartup(MAKEWORD(2, 2), &wd) != 0) {
-            fprintf(stderr, "iwan: WSAStartup failed\n");
-            exit(1);
-        }
-        done = 1;
+    /* WSAStartup is refcounted and may be called again after a
+     * WSANOTINITIALISED recovery (see port_socket); no WSACleanup is
+     * ever issued, so the count only grows. */
+    WSADATA wd;
+    if (WSAStartup(MAKEWORD(2, 2), &wd) != 0) {
+        fprintf(stderr, "iwan: WSAStartup failed\n");
+        exit(1);
     }
 }
 
@@ -784,7 +783,23 @@ int port_socket(int domain, int type, int protocol)
 {
     SOCKET s = socket(domain, type, protocol);
     if (s == INVALID_SOCKET) {
-        set_sock_errno();
+        int e = WSAGetLastError();
+        log_debug("port_socket(%d,%d,%d): wsa %d", domain, type, protocol,
+                  e);
+        /* wine has been observed to lose the WSAStartup state between
+         * long idle gaps (subsequent socket() reports WSANOTINITIALISED
+         * even though main() initialized it); re-initialize once and
+         * retry instead of failing the request */
+        if (e == WSANOTINITIALISED) {
+            port_socket_init();
+            s = socket(domain, type, protocol);
+            if (s != INVALID_SOCKET) {
+                log_debug("port_socket: recovered after WSANOTINITIALISED");
+                return (int)s;
+            }
+            e = WSAGetLastError();
+        }
+        errno = wsa_errno(e);
         return -1;
     }
     return (int)s;

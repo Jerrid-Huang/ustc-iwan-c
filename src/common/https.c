@@ -888,6 +888,10 @@ static bool https_transport(const char *host, struct sbuf *req,
     int fd = -1;
     bool ok = false;
 
+    if (debug_enabled())
+        log_debug("https_transport: %s start (deadline %llu ms)",
+                  host, (unsigned long long)deadline_ms);
+
     ctx = https_ctx_new();
     if (!ctx) {
         /* CA problem: https_ctx_new already logged the specific reason
@@ -897,8 +901,14 @@ static bool https_transport(const char *host, struct sbuf *req,
     }
 
     fd = https_connect_tcp(host, 443, deadline_ms, diag, sizeof diag);
-    if (fd < 0)
+    if (fd < 0) {
+        if (debug_enabled())
+            log_debug("https_transport: %s connect failed: %s", host,
+                      diag);
         goto out;
+    }
+    if (debug_enabled())
+        log_debug("https_transport: %s connected fd=%d", host, fd);
 
     ssl = https_ssl_new(ctx, fd, host);
     if (!ssl) {
@@ -922,6 +932,8 @@ out:
         SSL_CTX_free(ctx);
     if (fd >= 0)
         port_close(fd);
+    if (debug_enabled())
+        log_debug("https_transport: %s done ok=%d", host, ok);
     if (!ok || resp->len == 0) {
         /* an empty response is a failure too (the old code treated a
          * child that produced no bytes the same way) */
