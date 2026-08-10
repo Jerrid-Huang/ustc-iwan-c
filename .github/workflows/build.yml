@@ -43,6 +43,14 @@ jobs:
         run: |
           set -o pipefail
           make -B CC=${{ matrix.cc }} CFLAGS="$BASE_CFLAGS -Werror" 2>&1 | tee build-${{ matrix.cc }}.log
+          rc=${PIPESTATUS[0]}
+          if [ $rc -ne 0 ]; then
+            echo "::error::make rc=$rc"
+            tail -4 build-${{ matrix.cc }}.log | tr '\n' '|' | sed 's/^/::error::TAIL:/'
+            free -h | head -2 | tr '\n' '|' | sed 's/^/::error::MEM:/'
+            sudo dmesg 2>/dev/null | grep -iE 'killed process|out of memory' | tail -2 | tr '\n' '|' | sed 's/^/::error::OOM:/' || true
+            exit $rc
+          fi
           if grep -Ei 'error:|warning:' build-${{ matrix.cc }}.log; then
             echo "::error::build emitted errors or warnings"
             exit 1
@@ -133,6 +141,14 @@ jobs:
             CFLAGS="$BASE_CFLAGS -fsanitize=address,undefined -fno-omit-frame-pointer" \
             LDFLAGS="-pie -Wl,-z,now -Wl,-z,relro -Wl,-z,noexecstack -fsanitize=address,undefined" \
             2>&1 | tee build-sanitize.log
+          rc=${PIPESTATUS[0]}
+          if [ $rc -ne 0 ]; then
+            echo "::error::make rc=$rc"
+            tail -4 build-sanitize.log | tr '\n' '|' | sed 's/^/::error::TAIL:/'
+            free -h | head -2 | tr '\n' '|' | sed 's/^/::error::MEM:/'
+            sudo dmesg 2>/dev/null | grep -iE 'killed process|out of memory' | tail -2 | tr '\n' '|' | sed 's/^/::error::OOM:/' || true
+            exit $rc
+          fi
           if grep -Ei 'error:|warning:' build-sanitize.log; then
             echo "::error::sanitizer build emitted errors or warnings"
             exit 1
