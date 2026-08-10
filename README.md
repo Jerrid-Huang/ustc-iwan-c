@@ -38,6 +38,31 @@ make TARGET=win32 -B CC=x86_64-w64-mingw32-gcc OPENSSL_DIR=/tmp/mingw-sysroot/uc
 
 MSYS2 的 libcrypto/libssl 是 DLL 导入库:运行时需将 `libcrypto-3-x64.dll`、`libssl-3-x64.dll` 及 mingw 运行库(`libwinpthread-1.dll`、`libssp-0.dll`)与 exe 放在同一目录。TUN 模式还需 `wintun.dll`(与驱动一同安装)并在管理员控制台运行;`socks` / `ping` / `auth` / OIDC 无需管理员。CI(`.github/workflows/build.yml` 的 `win-cross` 任务)自动完成交叉编译 + wine 冒烟 + 与 Linux `iwan-server` 的真实线上握手测试。
 
+### Windows 原生编译(MSYS2,推荐)
+
+在 Windows 机器上直接用 MSYS2 的 MinGW-w64 工具链编译,无需 Linux:
+
+1. 安装 [MSYS2](https://www.msys2.org/),打开 **UCRT64** 终端;
+2. 安装依赖(编译器 + OpenSSL + GNU make 与基础工具):
+   ```sh
+   pacman -S --needed base-devel mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-openssl make
+   ```
+3. 编译(在仓库根目录):
+   ```sh
+   make TARGET=win32 CC=gcc -j8
+   # 产物:bin/iwan-client.exe、bin/iwan-client-oidc.exe(iwan-server 不构建)
+   ```
+
+要点:
+
+- `CC=gcc` 是必须的:MSYS2 的编译器叫 `gcc`(不是 `cc`,也不是 Linux 交叉场景的 `x86_64-w64-mingw32-gcc`);`cc` 在 MSYS2 中不存在。
+- **不需要 `OPENSSL_DIR`**:MSYS2 的 openssl 包装在 gcc 默认搜索路径(`/mingw64/include`、`/mingw64/lib`),`-lssl -lcrypto` 直接命中。
+- 必须用 MSYS2 环境自带的 `make`(包名 `make`,GNU make):Makefile 配方使用 `mkdir -p`/`rm -rf`/`od`/`awk` 等 POSIX 工具,`mingw32-make`(cmd shell)无法执行这些配方。
+- 在 MSYS2 终端内直接运行产物即可:所有 DLL(`libcrypto-3-x64.dll`、`libssl-3-x64.dll`、`libwinpthread-1.dll`、`libssp-0.dll`)都在 `/mingw64/bin`(已在 PATH)。要脱离 MSYS2 分发/双击运行时,把这些 DLL 拷到 exe 同目录。
+- TUN 模式(`proxy`)需安装 [wintun](https://www.wintun.net/) 驱动、`wintun.dll` 放 exe 旁,并在管理员控制台运行;`ping`/`auth`/`socks`/OIDC 无需管理员。
+- 也可用 MINGW64 环境(`mingw-w64-x86_64-gcc` + `mingw-w64-x86_64-openssl`),命令不变。
+- **不支持 MSVC**:代码使用 GNU 扩展(`__attribute__((may_alias))`)、C11 `stdatomic` 与 GNU make 配方,且依赖 winpthreads;请使用 MinGW-w64 系工具链。
+
 ## 用法
 
 ```sh
