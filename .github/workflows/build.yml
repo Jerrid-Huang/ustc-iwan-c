@@ -50,7 +50,21 @@ jobs:
 
       - name: Show build failure tail (annotations)
         if: failure()
-        run: tail -25 build-${{ matrix.cc }}.log | sed 's/^/::error::/'
+        run: |
+          { echo "=== error-ish lines ==="
+            grep -nE 'error|Error|Killed|killed|signal|No rule|failed|Segmentation|unable|interrupt' build-${{ matrix.cc }}.log | tail -15
+            echo "=== last 6 lines ==="
+            tail -6 build-${{ matrix.cc }}.log
+            echo "=== toolchain ==="
+            clang --version 2>/dev/null | head -1
+            gcc --version 2>/dev/null | head -1
+            make --version 2>/dev/null | head -1
+            nproc
+            echo "=== memory ==="
+            free -h | head -2
+            echo "=== oom killer (dmesg) ==="
+            sudo dmesg 2>/dev/null | grep -iE 'killed process|out of memory' | tail -3 || true
+          } | sed 's/^/::error::/'
 
       - name: Upload build log on failure
         if: failure()
@@ -126,7 +140,20 @@ jobs:
 
       - name: Show build failure tail (annotations)
         if: failure()
-        run: tail -25 build-sanitize.log | sed 's/^/::error::/'
+        run: |
+          { echo "=== error-ish lines ==="
+            grep -nE 'error|Error|Killed|killed|signal|No rule|failed|Segmentation|unable|interrupt' build-sanitize.log | tail -15
+            echo "=== last 6 lines ==="
+            tail -6 build-sanitize.log
+            echo "=== toolchain ==="
+            gcc --version 2>/dev/null | head -1
+            make --version 2>/dev/null | head -1
+            nproc
+            echo "=== memory ==="
+            free -h | head -2
+            echo "=== oom killer (dmesg) ==="
+            sudo dmesg 2>/dev/null | grep -iE 'killed process|out of memory' | tail -3 || true
+          } | sed 's/^/::error::/'
 
       - name: Upload build log on failure
         if: failure()
@@ -223,7 +250,10 @@ jobs:
           # The wine64 apt package installs only /usr/lib/wine/wine64
           # (the wine command lives in the wine metapackage, which needs
           # the i386 architecture); resolve the loader directly.
-          WINE_BIN="$(command -v wine64 2>/dev/null || command -v wine 2>/dev/null || echo /usr/lib/wine/wine64)"
+          # 24.04: no 'wine64' command, loader at /usr/lib/wine/wine64, and the
+          # 'wine' wrapper demands wine32 (multiarch) even for 64-bit exes.
+          # 26.04: 'wine64' command exists. Prefer in that order.
+          WINE_BIN="$(command -v wine64 2>/dev/null || { [ -x /usr/lib/wine/wine64 ] && echo /usr/lib/wine/wine64; } || command -v wine 2>/dev/null || true)"
           echo "using wine loader: $WINE_BIN" | tee /tmp/wine-smoke.log
           "$WINE_BIN" --version 2>&1 | tee -a /tmp/wine-smoke.log || true
           ls -la bin/ >> /tmp/wine-smoke.log
@@ -249,7 +279,10 @@ jobs:
           SRV=$!
           trap 'kill $SRV 2>/dev/null || true' EXIT
           sleep 1
-          WINE_BIN="$(command -v wine64 2>/dev/null || command -v wine 2>/dev/null || echo /usr/lib/wine/wine64)"
+          # 24.04: no 'wine64' command, loader at /usr/lib/wine/wine64, and the
+          # 'wine' wrapper demands wine32 (multiarch) even for 64-bit exes.
+          # 26.04: 'wine64' command exists. Prefer in that order.
+          WINE_BIN="$(command -v wine64 2>/dev/null || { [ -x /usr/lib/wine/wine64 ] && echo /usr/lib/wine/wine64; } || command -v wine 2>/dev/null || true)"
           "$WINE_BIN" bin/iwan-client.exe ping --server 127.0.0.1 --port 16001 | grep -q 'PONG'
           "$WINE_BIN" bin/iwan-client.exe auth --server 127.0.0.1 --port 16001 \
             --user alice --pass s3cret-pass | grep -q 'OK sid='
