@@ -485,9 +485,18 @@ static int https_connect_tcp(const char *host, uint16_t port,
             break;
         }
         fd = port_socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (fd < 0)
+        if (fd < 0) {
+#ifdef _WIN32
+            snprintf(diag, diagsz, "socket(family %d): wsa %d (errno %d)",
+                     ai->ai_family, WSAGetLastError(), errno);
+#endif
             continue;
+        }
         if (port_set_nonblock(fd, true) != 0) {
+#ifdef _WIN32
+            snprintf(diag, diagsz, "ioctlsocket(FIONBIO): wsa %d (errno %d)",
+                     WSAGetLastError(), errno);
+#endif
             port_close(fd);
             fd = -1;
             continue;
@@ -497,6 +506,10 @@ static int https_connect_tcp(const char *host, uint16_t port,
              * EINPROGRESS on Linux; both mean "wait for POLLOUT" */
             if (errno != EINPROGRESS && errno != EAGAIN &&
                 errno != EWOULDBLOCK) {
+#ifdef _WIN32
+                snprintf(diag, diagsz, "connect: wsa %d (errno %d)",
+                         WSAGetLastError(), errno);
+#endif
                 port_close(fd);
                 fd = -1;
                 continue;
@@ -515,6 +528,12 @@ static int https_connect_tcp(const char *host, uint16_t port,
             if (pr == 0)
                 errno = ETIMEDOUT;
             if (pr <= 0 || !(pfd.revents & POLLOUT)) {
+#ifdef _WIN32
+                snprintf(diag, diagsz,
+                         "poll connect: pr=%d revents=0x%x wsa %d "
+                         "(errno %d)",
+                         pr, pfd.revents, WSAGetLastError(), errno);
+#endif
                 port_close(fd);
                 fd = -1;
                 continue;
@@ -528,6 +547,12 @@ static int https_connect_tcp(const char *host, uint16_t port,
                     soerr != 0) {
                     if (soerr != 0)
                         errno = soerr;
+#ifdef _WIN32
+                    snprintf(diag, diagsz,
+                             "connect SO_ERROR: soerr=%d wsa %d "
+                             "(errno %d)",
+                             soerr, WSAGetLastError(), errno);
+#endif
                     port_close(fd);
                     fd = -1;
                     continue;
@@ -544,9 +569,16 @@ static int https_connect_tcp(const char *host, uint16_t port,
     }
     freeaddrinfo(res);
 
-    if (fd < 0)
+    if (fd < 0) {
+#ifdef _WIN32
+        int wsa = WSAGetLastError();
+        snprintf(diag, diagsz, "cannot connect to %s:%u: %s (wsa %d)",
+                 host, (unsigned)port, strerror(errno), wsa);
+#else
         snprintf(diag, diagsz, "cannot connect to %s:%u: %s", host,
                  (unsigned)port, strerror(errno));
+#endif
+    }
     return fd;
 }
 

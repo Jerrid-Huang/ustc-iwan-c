@@ -426,6 +426,9 @@ static int wsa_errno(int e)
     switch (e) {
     case WSAEWOULDBLOCK:      return EAGAIN;
     case WSAEINTR:            return EINTR;
+    case WSAEINPROGRESS:      return EINPROGRESS;
+    case WSAEALREADY:         return EALREADY;
+    case WSANOTINITIALISED:   return EINVAL;
     case WSAECONNRESET:       return ECONNRESET;
     case WSAECONNABORTED:     return ECONNABORTED;
     case WSAECONNREFUSED:     return ECONNREFUSED;
@@ -801,10 +804,17 @@ int port_connect(int fd, const struct sockaddr *addr, socklen_t len)
 {
     if (connect((SOCKET)fd, (const struct sockaddr *)addr, (int)len) ==
         SOCKET_ERROR) {
-        /* a nonblocking connect reports WSAEWOULDBLOCK; the callers in
-         * this codebase only ever block-connect (auth/ping), so any
-         * other error is final */
-        set_sock_errno();
+        int e = WSAGetLastError();
+        /* nonblocking connect: POSIX reports EINPROGRESS; winsock may
+         * report WSAEWOULDBLOCK, WSAEINPROGRESS or WSAEALREADY —
+         * normalize all three so callers' EINPROGRESS/EAGAIN checks
+         * catch every in-flight case */
+        if (e == WSAEWOULDBLOCK || e == WSAEINPROGRESS ||
+            e == WSAEALREADY) {
+            errno = EINPROGRESS;
+            return -1;
+        }
+        errno = wsa_errno(e);
         return -1;
     }
     return 0;
