@@ -48,6 +48,10 @@ jobs:
             exit 1
           fi
 
+      - name: Show build failure tail (annotations)
+        if: failure()
+        run: tail -25 build-${{ matrix.cc }}.log | sed 's/^/::error::/'
+
       - name: Upload build log on failure
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -119,6 +123,10 @@ jobs:
             echo "::error::sanitizer build emitted errors or warnings"
             exit 1
           fi
+
+      - name: Show build failure tail (annotations)
+        if: failure()
+        run: tail -25 build-sanitize.log | sed 's/^/::error::/'
 
       - name: Upload build log on failure
         if: failure()
@@ -204,7 +212,7 @@ jobs:
 
       - name: Smoke test (wine)
         run: |
-          set -e
+          set -eo pipefail
           # The MSYS2 libcrypto/libssl are DLL import libs and the mingw
           # runtime pulls winpthread/ssp dynamically: drop every DLL the
           # exes import next to them so wine can load them.
@@ -216,11 +224,15 @@ jobs:
           # (the wine command lives in the wine metapackage, which needs
           # the i386 architecture); resolve the loader directly.
           WINE_BIN="$(command -v wine64 2>/dev/null || command -v wine 2>/dev/null || echo /usr/lib/wine/wine64)"
-          echo "using wine loader: $WINE_BIN"
-          ls -la bin/ | head -12
-          "$WINE_BIN" --version 2>&1 | head -2 || true
-          "$WINE_BIN" bin/iwan-client.exe --help
-          "$WINE_BIN" bin/iwan-client-oidc.exe --help
+          echo "using wine loader: $WINE_BIN" | tee /tmp/wine-smoke.log
+          "$WINE_BIN" --version 2>&1 | tee -a /tmp/wine-smoke.log || true
+          ls -la bin/ >> /tmp/wine-smoke.log
+          "$WINE_BIN" bin/iwan-client.exe --help 2>&1 | tee -a /tmp/wine-smoke.log
+          "$WINE_BIN" bin/iwan-client-oidc.exe --help 2>&1 | tee -a /tmp/wine-smoke.log
+
+      - name: Show wine smoke failure details (annotations)
+        if: failure()
+        run: cat /tmp/wine-smoke.log | sed 's/^/::error::/'
 
       # Real wire-level smoke: a Linux iwan-server in --no-tun mode runs
       # without root (control plane only), and the Windows client talks
