@@ -1193,7 +1193,10 @@ void service_local_outputs(void) {
         while (f->output.len > 0) {
             ssize_t n = write(f->fd, f->output.data, f->output.len);
             if (n > 0) {
-                buf_consume(&f->output, (size_t)n);
+                if ((size_t)n == f->output.len)
+                    buf_clear(&f->output);   /* full drain: no memmove */
+                else
+                    buf_consume(&f->output, (size_t)n);
             } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                 break;
             } else {
@@ -1216,7 +1219,18 @@ void service_local_outputs(void) {
                                     .iov_len = want };
                 ssize_t n = writev(f->fd, &io, 1);
                 if (n > 0) {
-                    buf_consume(&c->rxq, (size_t)n);
+                    if ((size_t)n == want) {
+                        /* full drain (the common case): the payload is
+                         * already on the local socket, so reset the
+                         * buffer without the O(n) memmove — with a
+                         * 256KB rxq the per-round shift used to cost
+                         * ~4x of the 64KB-era and dominated the loop
+                         * at 4+ conns (socks-down collapsed to
+                         * ~1800 Mbit/s aggregate) */
+                        buf_clear(&c->rxq);
+                    } else {
+                        buf_consume(&c->rxq, (size_t)n);  /* partial */
+                    }
                 } else if (n < 0 && errno != EAGAIN &&
                            errno != EWOULDBLOCK) {
                     f->local_eof = true;

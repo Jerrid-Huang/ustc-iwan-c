@@ -11,6 +11,9 @@
 #define SERVER_MAX_SESSIONS 256
 #define SERVER_MAX_USERS    256
 #define SERVER_USER_MAX     63
+/* max uplink recv threads (SO_REUSEPORT fan-out); the session table's
+ * rwlock and the rate-table mutex are the shared state */
+#define IWAN_SRV_THREADS_MAX 16
 
 /* One authenticated client. Sessions are shared between the UDP main
  * thread (writes) and TUN reader threads (downlink lookups); every
@@ -79,11 +82,11 @@ void server_rate_limits_init(void);
 void srv_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
 /* Handle one UDP packet from peer. May write decrypted data to the TUN
- * (only when ctx->tun_fd >= 0, else dropped). Called from the main
- * thread only. */
+ * (only when ctx->tun_fd >= 0, else dropped). Called from the uplink
+ * recv threads (tid selects the per-thread stats slot). */
 void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nusers,
                 const uint8_t *raw, size_t len,
-                const struct sockaddr_in *peer, int sockfd);
+                const struct sockaddr_in *peer, int sockfd, unsigned tid);
 
 /* Send one IP packet from the TUN to the session owning dst IP.
  * Thread-safe: called from TUN reader threads. Takes a session snapshot
@@ -103,5 +106,7 @@ uint64_t server_dl_pkts(void);
 
 /* IWAN_DEBUG=1: print per-step uplink timing averages once per second. */
 void server_up_stats_print(void);
+/* record the number of uplink recv threads (stats are per-thread) */
+void server_up_stats_set_threads(int n);
 
 #endif

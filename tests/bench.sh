@@ -11,6 +11,18 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# optional positional args: [THREADS] [debug] [mini]
+if [ -n "${1:-}" ]; then
+    export IWAN_SRV_THREADS="$1"
+fi
+if [ "${2:-}" = "debug" ]; then
+    export IWAN_DEBUG=1
+fi
+MINI=0
+if [ "${3:-}" = "mini" ]; then
+    MINI=1
+fi
+
 if [ "$(id -u)" != 0 ]; then
     echo "error: bench needs root (TUN devices); run with sudo" >&2
     exit 1
@@ -58,7 +70,14 @@ printf 'test:s3cret\n' > "$WORK/users.txt"
 chmod 600 "$WORK/users.txt"
 
 echo "== start iwan-server =="
-./bin/iwan-server --users "$WORK/users.txt" --port "$PORT" \
+# a leftover server from an aborted run would share port 16001 via
+# SO_REUSEPORT and answer OPENs with a stale session table — the client
+# then gets a session whose data plane is dead (instant connect refused
+# / benchmark traffic silently bypassing the tunnel). Make sure only our
+# instance is up.
+pkill -f 'bin/iwan-server' 2>/dev/null || true
+sleep 0.5
+stdbuf -oL -eL ./bin/iwan-server --users "$WORK/users.txt" --port "$PORT" \
     --tun iwan-srv-it --server-ip "$SRV_IP" --subnet "$SUBNET" \
     --dns 114.114.114.114 --nat-if lo &
 SERVER_PID=$!
@@ -76,7 +95,7 @@ if ! iptables -C INPUT -i iwan-srv-it -j ACCEPT 2>/dev/null; then
 fi
 
 echo "== start bench server (sink + source) =="
-python3 tests/bench_server.py --bind "$SRV_IP" \
+stdbuf -oL -eL python3 tests/bench_server.py --bind "$SRV_IP" \
     --sink-port "$SINK_PORT" --source-port "$SOURCE_PORT" &
 BENCH_PID=$!
 sleep 0.5
@@ -97,15 +116,29 @@ bench() {   # $1=label  $2=socks-arg(empty=direct)  $3=netns-exec(empty=host)
             $3 python3 tests/bench_client.py --target "$tgt" \
                 --conns "$C" --duration "$DURATION" --direction "$dir" \
                 "${socks_args[@]}"
+            if [ "$MINI" = 1 ]; then
+                return
+            fi
         done
     done
 }
 
 echo "== mode 1: socks =="
-./bin/iwan-client socks --server 127.0.0.1 --port "$PORT" \
+stdbuf -oL -eL env IWAN_FLOWDBG=1 ./bin/iwan-client socks --server 127.0.0.1 --port "$PORT" \
     --user test --pass s3cret --listen "127.0.0.1:$SOCKS_PORT" &
 SOCKS_PID=$!
-sleep 1.5
+# wait for the listener (a transient slow OPEN used to race this and
+# surface as an instant ECONNREFUSED on the first bench connection)
+for _ in $(seq 1 40); do
+    if ! kill -0 "$SOCKS_PID" 2>/dev/null; then
+        echo "error: socks client exited" >&2
+        exit 1
+    fi
+    if ss -tln 2>/dev/null | grep -q ":$SOCKS_PORT "; then
+        break
+    fi
+    sleep 0.25
+done
 kill -0 "$SOCKS_PID" 2>/dev/null || {
     echo "error: socks client exited" >&2
     exit 1
@@ -126,15 +159,30 @@ ip netns exec "$TUN_NS" ip link set lo up
 ip netns exec "$TUN_NS" ip route add default via "$VETH_IP"
 iptables -I INPUT -i veth0 -j ACCEPT 2>/dev/null && INPUT_RULE_VETH=1
 
-ip netns exec "$TUN_NS" ./bin/iwan-client proxy \
+ip netns exec "$TUN_NS" stdbuf -oL -eL ./bin/iwan-client proxy \
     --server "$VETH_IP" --port "$PORT" --user test --pass s3cret \
     --tun "$TUN_NAME" --proxy-cidr "$SUBNET" &
 PROXY_PID=$!
-sleep 2
-kill -0 "$PROXY_PID" 2>/dev/null || {
-    echo "error: proxy client exited" >&2
+# wait for the tunnel route: the proxy's auth can transiently lag (the
+# listener/route appear only after OPEN_ACK), and a bench started before
+# that would bypass the tunnel through the veth and report loopback
+# speeds (measured: 55-211 Gbit/s garbage).
+for _ in $(seq 1 40); do
+    if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+        echo "error: proxy client exited" >&2
+        exit 1
+    fi
+    if ip netns exec "$TUN_NS" ip route show 2>/dev/null | \
+        grep -q "$SUBNET"; then
+        break
+    fi
+    sleep 0.25
+done
+if ! ip netns exec "$TUN_NS" ip route show 2>/dev/null | \
+    grep -q "$SUBNET"; then
+    echo "error: tunnel route not established" >&2
     exit 1
-}
+fi
 bench "tun" "" "ip netns exec $TUN_NS"
 
 echo "BENCH DONE"

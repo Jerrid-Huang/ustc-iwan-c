@@ -48,7 +48,10 @@ def bench_thread(idx, target, proxy, direction, duration, go, results):
         s = socks5_connect(proxy, th, tp) if proxy else \
             socket.create_connection((th, tp), timeout=15)
         s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        s.settimeout(None)
+        # 30s cap: a tunnel that silently stalls (no RST, no FIN) must
+        # not hang the benchmark forever — the thread times out, reports
+        # zero and the run moves on
+        s.settimeout(30)
     except OSError as e:
         print(f"conn {idx}: connect failed: {e}", flush=True)
         return

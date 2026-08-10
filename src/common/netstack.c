@@ -16,8 +16,17 @@
 #include "protocol.h"
 #include "util.h"
 
-#define NS_WINDOW         65535u
-#define NS_WSCALE         6u      /* our advertised window shift */
+#define NS_WINDOW         262144u  /* advertised rx window: 256KB (was
+                                    * 64KB). The downlink bottleneck per
+                                    * conn was window/RTT (64KB at ~1.2ms
+                                    * RTT capped socks-down at ~400
+                                    * Mbit/s/conn); 256KB with WSCALE=7
+                                    * keeps the 16-bit wire field exact
+                                    * (262144>>7 = 2048). The kernel
+                                    * negotiates shift = min(ours, its
+                                    * own, typically 7), so the >>7
+                                    * encoding matches. */
+#define NS_WSCALE         7u       /* our advertised window shift */
 #define NS_RTO_INIT       250u    /* first-segment recovery: the 1000ms
                                    * RFC default makes a single dropped
                                    * segment cost a full second on the
@@ -82,15 +91,15 @@ static void wr_be32(uint8_t *p, uint32_t v) {
 
 /* advertised receive window = remaining rxq space (TCP flow control:
  * the peer must stop sending when we cannot buffer) */
-static uint16_t conn_win(const TcpConn *c)
+static uint32_t conn_win(const TcpConn *c)
 {
     /* never underflow: once the rxq passes NS_WINDOW the peer must be
      * told 0 (and receive-side accounting must drop, see handle_rx),
-     * not a wrapped full window. NS_WINDOW is 65535, so the free space
-     * can never exceed 0xFFFF — no clamp needed */
+     * not a wrapped full window. NS_WINDOW is 256KB, so the return
+     * needs 32 bits (the wire field, >> NS_WSCALE, still fits 16). */
     if (c->rxq.len >= NS_WINDOW)
         return 0;
-    return (uint16_t)(NS_WINDOW - (uint32_t)c->rxq.len);
+    return NS_WINDOW - (uint32_t)c->rxq.len;
 }
 
 /* window field on the wire: actual bytes >> our shift */
@@ -826,7 +835,7 @@ static void seg_seal(Netstack *ns, TcpConn *c, NsPriv *p, uint8_t extra)
     wr_be16(t + 14, conn_win_field(c));   /* scaled, like every other
                                            * transmit path — the raw
                                            * window would overstate by
-                                           * up to 64x with WSCALE=6 */
+                                           * up to 128x with WSCALE=7 */
     wr_be16(t + 16, 0);      /* stale slot reuse would leak into csum */
     wr_be16(t + 18, 0);      /* and so would stale urg */
     wr_be16(t + 16, ip_tcp_csum(c->lip, c->rip, t, 20 + s->len));

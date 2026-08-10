@@ -456,51 +456,64 @@ static int setup_tun(const char *name, const char *server_ip, int mask)
     return fd;
 }
 
-static int setup_udp(uint16_t port)
+/* Create `n` UDP sockets on one port with SO_REUSEPORT: the kernel
+ * fans out incoming datagrams by 4-tuple hash, so each session's
+ * packets land on ONE socket (inner TCP segments stay ordered per
+ * thread) while the recv threads run in parallel. All sockets share
+ * the same port, so replies from any of them look identical to the
+ * client. Returns the number created (== n); fatal errors exit. */
+static int setup_udp(uint16_t port, int *fds, int n)
 {
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
     int one = 1, sz = 16 * 1024 * 1024;
     struct sockaddr_in addr;
 
-    if (fd < 0) {
-        perror("socket");
-        server_cleanup_nat();
-        exit(1);
-    }
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof sz);
-    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof sz);
-    {
-        /* the kernel silently caps SO_RCVBUF at net.core.rmem_max; with
-         * the default (212KB) the session buffer is far smaller than the
-         * clients' aggregate in-flight window, so a burst overflows it
-         * and the kernel drops UDP silently (UdpRcvbufErrors) — the
-         * inner TCP then collapses into an RTO storm. Warn loudly so the
-         * operator raises it. */
-        int actual = 0;
-        socklen_t alen = sizeof actual;
-        if (getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &actual, &alen) == 0 &&
-            actual < sz / 2)
-            fprintf(stderr,
-                    "warning: UDP rcvbuf capped at %d bytes by "
-                    "net.core.rmem_max (%d requested); bursts past the "
-                    "server's drain will drop. Raise it:\n"
-                    "  sysctl -w net.core.rmem_max=16777216 "
-                    "net.core.wmem_max=16777216\n",
-                    actual, sz);
-    }
-    set_nonblock(fd); /* never let sendto backpressure stall the loop */
+    for (int i = 0; i < n; i++) {
+        int fd = socket(AF_INET, SOCK_DGRAM, 0);
 
-    memset(&addr, 0, sizeof addr);
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons(port);
-    if (bind(fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
-        perror("bind");
-        server_cleanup_nat();
-        exit(1);
+        if (fd < 0) {
+            perror("socket");
+            server_cleanup_nat();
+            exit(1);
+        }
+        setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one);
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof sz);
+        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof sz);
+        if (i == 0) {
+            /* the kernel silently caps SO_RCVBUF at net.core.rmem_max;
+             * with the default (212KB) the session buffer is far smaller
+             * than the clients' aggregate in-flight window, so a burst
+             * overflows it and the kernel drops UDP silently
+             * (UdpRcvbufErrors) — the inner TCP then collapses into an
+             * RTO storm. Warn loudly so the operator raises it. */
+            int actual = 0;
+            socklen_t alen = sizeof actual;
+            if (getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &actual, &alen) == 0 &&
+                actual < sz / 2)
+                fprintf(stderr,
+                        "warning: UDP rcvbuf capped at %d bytes by "
+                        "net.core.rmem_max (%d requested); bursts past "
+                        "the server's drain will drop. Raise it:\n"
+                        "  sysctl -w net.core.rmem_max=16777216 "
+                        "net.core.wmem_max=16777216\n",
+                        actual, sz);
+        }
+        set_nonblock(fd); /* never let sendto backpressure the loop */
+
+        memset(&addr, 0, sizeof addr);
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        addr.sin_port = htons(port);
+        if (bind(fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
+            perror("bind");
+            for (int j = 0; j < i; j++)
+                close(fds[j]);
+            server_cleanup_nat();
+            exit(1);
+        }
+        fds[i] = fd;
     }
-    return fd;
+    return n;
 }
 
 /* wire the recvmmsg batch: one 64KiB iovec per slot plus peer storage */
@@ -519,21 +532,162 @@ static void setup_rx_batch(uint8_t *udp_buf, struct iovec *udp_iov,
     }
 }
 
+/* One uplink recv thread: poll its SO_REUSEPORT socket + recvmmsg(64)
+ * batch drain -> handle_udp. tid 0 is the primary: it also runs the
+ * periodic housekeeping (tun pool AIMD tick, session purge, stats).
+ * Shared state is safe: the session table is rwlock-protected, the rate
+ * table has its own mutex (control types only), the tun fd accepts
+ * concurrent atomic writes (EAGAIN retried with poll), and the stats
+ * are per-thread. Exits on g_stop within one poll timeout. */
+struct recv_thr_arg {
+    struct server_ctx *ctx;
+    const struct server_user *users;
+    int nusers;
+    int fd;
+    unsigned tid;
+    int poll_err;   /* primary: fatal poll failure */
+};
+
+static void *recv_thread_main(void *v)
+{
+    struct recv_thr_arg *a = v;
+    struct pollfd pfd = { .fd = a->fd, .events = POLLIN, .revents = 0 };
+    struct mmsghdr msgs[UDP_RXBATCH];
+    struct sockaddr_in peers[UDP_RXBATCH];
+    struct iovec iov[UDP_RXBATCH];
+    uint8_t *buf;
+    uint64_t last_purge = now_ms(), last_qctl = now_ms(), last_drops = 0;
+
+    buf = malloc((size_t)UDP_RXBATCH * 65536);
+    if (!buf) {
+        log_err("uplink recv thread: out of memory");
+        return NULL;
+    }
+    setup_rx_batch(buf, iov, msgs, peers);
+
+    while (!atomic_load_explicit(&g_stop, memory_order_relaxed)) {
+        int pr = poll(&pfd, 1, 100);
+        if (pr < 0) {
+            if (errno == EINTR)
+                continue;
+            perror("poll");
+            a->poll_err = 1;   /* fatal: exit non-zero for service mgrs */
+            break;
+        }
+        if (pfd.revents & POLLERR) {
+            /* A pending ICMP error (e.g. port-unreachable for a datagram
+             * we sent to a client port that just closed) keeps POLLERR
+             * asserted on a UDP socket. Plain recv/recvmmsg does NOT
+             * consume the error queue, so without this the poll loop
+             * busy-spins at 100% CPU and the socket stops delivering
+             * data — measured: one of four REUSEPORT recv threads
+             * wedged this way and every packet hashed to its socket
+             * (including the client's OPEN) was silently lost. Drain
+             * sk_error_queue via MSG_ERRQUEUE until empty. */
+            char ebuf[512];
+            struct sockaddr_in junk;
+            struct iovec eiov = { .iov_base = ebuf, .iov_len = sizeof ebuf };
+            struct msghdr emh = { .msg_name = &junk,
+                                  .msg_namelen = sizeof junk,
+                                  .msg_iov = &eiov, .msg_iovlen = 1 };
+            while (recvmsg(a->fd, &emh, MSG_ERRQUEUE | MSG_DONTWAIT) > 0)
+                ;
+        }
+        if (pfd.revents & (POLLIN | POLLERR)) {
+            /* recvmmsg batch (64): drains up to 64 datagrams per syscall,
+             * amortizing the per-packet recvfrom overhead that used to
+             * be the loop's throughput ceiling — a full poll burst is
+             * consumed in one syscall round */
+            int last_v = 1;
+            for (;;) {
+                int v = recvmmsg(a->fd, msgs, UDP_RXBATCH, MSG_DONTWAIT,
+                                 NULL);
+                if (v > 0) {
+                    for (int i = 0; i < v; i++) {
+                        if (msgs[i].msg_len <= 0)
+                            continue;
+                        handle_udp(a->ctx, a->users, a->nusers,
+                                   (const uint8_t *)msgs[i].msg_hdr.msg_iov[0]
+                                       .iov_base,
+                                   (size_t)msgs[i].msg_len, &peers[i], a->fd,
+                                   a->tid);
+                    }
+                    last_v = v;
+                    if (v < UDP_RXBATCH)
+                        break; /* partial batch: drained */
+                    continue;
+                }
+                if (v < 0 && errno == EINTR)
+                    continue;
+                last_v = v;
+                break; /* EAGAIN: drained, or ICMP error */
+            }
+            /* diagnostic: poll reported readable but nothing was
+             * drained — a transient race between poll and recvmmsg, or
+             * a wedged receive path (see the MSG_ERRQUEUE drain above) */
+            if (last_v <= 0 && (pfd.revents & POLLIN)) {
+                static uint64_t last_pe2;
+                uint64_t nowp = now_ms();
+                if (nowp - last_pe2 >= 1000) {
+                    last_pe2 = nowp;
+                    log_debug("recv thread %u: POLLIN but recvmmsg=%d "
+                              "errno=%d (fd=%d)", a->tid, last_v, errno,
+                              a->fd);
+                }
+            }
+        } else if (pfd.revents != 0) {
+            /* unexpected poll event (POLLNVAL/POLLHUP on the socket):
+             * would busy-spin without receiving anything — log it */
+            static uint64_t last_pe;
+            uint64_t nowp = now_ms();
+            if (nowp - last_pe >= 1000) {
+                last_pe = nowp;
+                log_debug("recv thread %u: poll revents=0x%x (fd=%d)",
+                          a->tid, pfd.revents, a->fd);
+            }
+        }
+
+        if (a->tid == 0) {
+            /* periodic housekeeping: primary thread only */
+            uint64_t now = now_ms();
+            if (a->ctx->qpool && now - last_qctl >= TUN_POOL_TICK_MS) {
+                tun_pool_tick(a->ctx->qpool);
+                last_qctl = now;
+            }
+            if (now - last_purge >= 1000) {
+                purge_expired(a->ctx, now);
+                if (debug_enabled())
+                    server_up_stats_print();
+                uint64_t drops = server_send_drops();
+                if (drops != last_drops) {
+                    fprintf(stderr, "udp send dropped %llu packets\n",
+                            (unsigned long long)drops);
+                    last_drops = drops;
+                }
+                last_purge = now;
+            }
+        }
+    }
+    free(buf);
+    return NULL;
+}
+
 /* orderly shutdown: stop the TUN reader pool, close fds, and — in the
  * original root process — undo the NAT changes; returns the process
  * exit status (poll_err surfaces fatal runtime failures) */
-static int server_shutdown(struct server_ctx *ctx, int tun_fd, int udp_fd,
-                           bool drop_child, uint8_t *udp_buf, int poll_err)
+static int server_shutdown(struct server_ctx *ctx, int tun_fd,
+                           const int *udp_fds, int nfds, bool drop_child,
+                           int poll_err)
 {
     tun_pool_destroy(ctx->qpool); /* stops readers, detaches extra queues */
     ctx->qpool = NULL;
     tun_close(tun_fd);
     ctx->tun_fd = -1;
-    close(udp_fd);
+    for (int i = 0; i < nfds; i++)
+        close(udp_fds[i]);
     if (!drop_child)
         server_cleanup_nat(); /* root process restores ip_forward + MASQUERADE */
     server_ctx_destroy(ctx);
-    free(udp_buf);
     return poll_err ? 1 : 0;
 }
 
@@ -542,31 +696,36 @@ int main(int argc, char **argv)
     struct opts o;
     struct server_ctx ctx;
     struct server_user users[SERVER_MAX_USERS];
-    struct pollfd fds[2];
     struct stat st;
     uint8_t sip[4], dip[4];
     uint32_t subnet_base;
     char subnet_net[64];
-    uint8_t *udp_buf;
-    struct iovec udp_iov[UDP_RXBATCH];
-    struct mmsghdr msgs[UDP_RXBATCH];
-    struct sockaddr_in peers[UDP_RXBATCH];
-    uint64_t last_purge;
-    int nusers, tun_fd = -1, udp_fd, nfds, pr;
+    int udp_fds[IWAN_SRV_THREADS_MAX];
+    int nusers, tun_fd = -1, nfds;
     int poll_err = 0;   /* fatal poll failure: report exit != 0 */
-    uint64_t last_drops = 0, last_qctl = 0;
     bool drop_child = false; /* A1: this process is the forked, de-privileged server */
 
     util_ignore_sigpipe();     /* EPIPE on a dead socket, not a SIGPIPE kill */
     server_rate_limits_init(); /* IWAN_RATE_OPEN_MAX / IWAN_RATE_ECHO_MAX */
 
-    /* recvmmsg batch buffers (heap: 64 x 64KiB = 4MiB) */
-    udp_buf = malloc((size_t)UDP_RXBATCH * 65536);
-    if (!udp_buf) {
-        fprintf(stderr, "error: out of memory\n");
-        return 1;
+    /* uplink recv threads: SO_REUSEPORT fan-out across `recv_threads`
+     * sockets (the kernel hashes each session to one socket, so inner
+     * TCP segments stay ordered per thread). 4 threads clear the
+     * single-threaded drain ceiling (~390k pps) on typical hosts; tune
+     * with IWAN_SRV_THREADS (1..16). */
+    int recv_threads = 4;
+    {
+        const char *rt = getenv("IWAN_SRV_THREADS");
+        if (rt && *rt) {
+            uint64_t v;
+            if (parse_uint(rt, IWAN_SRV_THREADS_MAX, &v) != 0 || v < 1)
+                fprintf(stderr, "warning: invalid IWAN_SRV_THREADS '%s' "
+                        "(default 4)\n", rt);
+            else
+                recv_threads = (int)v;
+        }
     }
-    setup_rx_batch(udp_buf, udp_iov, msgs, peers);
+    server_up_stats_set_threads(recv_threads);
 
     memset(&o, 0, sizeof o);
     o.port = 6001;
@@ -664,7 +823,7 @@ int main(int argc, char **argv)
         printf("tun %s fd=%d\n", o.tun, tun_fd);
     }
 
-    udp_fd = setup_udp(o.port);
+    nfds = setup_udp(o.port, udp_fds, recv_threads);
 
     /* A1: drop root.  All root-only work (TUN setup, NAT rules, socket
      * bind) is done; from here on the server loop runs unprivileged.
@@ -769,7 +928,7 @@ int main(int argc, char **argv)
         if (ncpu > 0 && ncpu < maxq)
             maxq = (int)ncpu;
         pu.ctx = &ctx;
-        pu.udp_fd = udp_fd;
+        pu.udp_fd = udp_fds[0];
         ctx.qpool = tun_pool_create(o.tun, tun_fd, maxq, 1,
                                     srv_tun_pkt, &pu, &g_stop);
         if (!ctx.qpool) {
@@ -782,73 +941,42 @@ int main(int argc, char **argv)
         if (tun_steering_attach(tun_fd) == 0)
             printf("tun steering: eBPF flow hash attached\n");
     }
-    printf("listening UDP 0.0.0.0:%u\n", (unsigned)o.port);
+    printf("listening UDP 0.0.0.0:%u (%d recv thread%s)\n",
+           (unsigned)o.port, recv_threads, recv_threads > 1 ? "s" : "");
     printf("server ready.\n");
 
-    fds[0].fd = udp_fd;
-    fds[0].events = POLLIN;
-    fds[0].revents = 0;
-    nfds = 1;
-    last_purge = now_ms();
-    last_qctl = now_ms();
+    /* uplink recv threads: worker threads own udp_fds[1..], the primary
+     * runs inline below on udp_fds[0] (and does the periodic
+     * housekeeping). The args live on main's stack for the whole run. */
+    pthread_t workers[IWAN_SRV_THREADS_MAX];
+    struct recv_thr_arg args[IWAN_SRV_THREADS_MAX];
+    int nworkers = recv_threads - 1;
 
-    while (!g_stop) {
-        pr = poll(fds, nfds, 100);
-        if (pr < 0) {
-            if (errno == EINTR)
-                continue;
-            perror("poll");
-            poll_err = 1;   /* fatal runtime error: exit non-zero so
-                             * service managers do not see a clean stop */
+    for (int i = 0; i < nworkers; i++) {
+        /* workers take args[1..nworkers]; args[0] is reserved for the
+         * primary thread below. Sharing args[0] here raced the primary's
+         * initialization: worker 0 could read the overwritten values and
+         * become a second thread on udp_fds[0] (two consumers fighting
+         * over one socket -> POLLIN/recvmmsg-EAGAIN busy loop) while
+         * udp_fds[1] had no consumer at all (~25% of packets lost). */
+        args[i + 1] = (struct recv_thr_arg){ &ctx, users, nusers,
+                                             udp_fds[i + 1],
+                                             (unsigned)(i + 1), 0 };
+        if (pthread_create(&workers[i], NULL, recv_thread_main,
+                           &args[i + 1]) != 0) {
+            log_err("cannot start uplink recv thread %d: %s", i + 1,
+                    strerror(errno));
+            atomic_store_explicit(&g_stop, true, memory_order_relaxed);
             break;
         }
-
-        if (fds[0].revents & (POLLIN | POLLERR)) {
-            /* recvmmsg batch (64): drains up to 64 datagrams per syscall,
-             * amortizing the per-packet recvfrom overhead that used to
-             * be the loop's throughput ceiling — a full poll burst is
-             * consumed in one syscall round */
-            for (;;) {
-                int v = recvmmsg(udp_fd, msgs, UDP_RXBATCH, MSG_DONTWAIT,
-                                 NULL);
-                if (v > 0) {
-                    for (int i = 0; i < v; i++) {
-                        if (msgs[i].msg_len <= 0)
-                            continue;
-                        handle_udp(&ctx, users, nusers,
-                                   (const uint8_t *)msgs[i].msg_hdr.msg_iov[0]
-                                       .iov_base,
-                                   (size_t)msgs[i].msg_len, &peers[i], udp_fd);
-                    }
-                    if (v < UDP_RXBATCH)
-                        break; /* partial batch: drained */
-                    continue;
-                }
-                if (v < 0 && errno == EINTR)
-                    continue;
-                break; /* EAGAIN: drained, or ICMP error */
-            }
-        }
-
-        uint64_t now = now_ms();
-        if (ctx.qpool && now - last_qctl >= TUN_POOL_TICK_MS) {
-            tun_pool_tick(ctx.qpool);
-            last_qctl = now;
-        }
-        if (now - last_purge >= 1000) {
-            purge_expired(&ctx, now);
-            if (debug_enabled())
-                server_up_stats_print();
-            uint64_t drops = server_send_drops();
-            if (drops != last_drops) {
-                fprintf(stderr, "udp send dropped %llu packets\n",
-                        (unsigned long long)drops);
-                last_drops = drops;
-            }
-            last_purge = now;
-        }
     }
+    args[0] = (struct recv_thr_arg){ &ctx, users, nusers, udp_fds[0], 0, 0 };
+    recv_thread_main(&args[0]);   /* primary loop, inline */
+    poll_err = args[0].poll_err;
 
-    return server_shutdown(&ctx, tun_fd, udp_fd, drop_child, udp_buf,
+    for (int i = 0; i < nworkers; i++)
+        pthread_join(workers[i], NULL);   /* exit within one poll timeout */
+
+    return server_shutdown(&ctx, tun_fd, udp_fds, nfds, drop_child,
                            poll_err);
 }

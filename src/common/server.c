@@ -84,8 +84,17 @@ struct up_stats {
     uint64_t h1;      /* inner-IPv4 gate drops (malformed/spoofed) */
 };
 
-static struct up_stats g_up;
+/* per-recv-thread stats (the multi-threaded uplink sums them on print) */
+static struct up_stats g_up[IWAN_SRV_THREADS_MAX];
+static int g_up_nthreads = 1;
 static uint64_t g_up_win;
+
+void server_up_stats_set_threads(int n)
+{
+    g_up_nthreads = n < 1 ? 1
+                          : (n > IWAN_SRV_THREADS_MAX ? IWAN_SRV_THREADS_MAX
+                                                      : n);
+}
 
 static uint64_t now_ns(void)
 {
@@ -97,8 +106,19 @@ static uint64_t now_ns(void)
 void server_up_stats_print(void)
 {
     uint64_t now;
+    struct up_stats sum;
 
-    if (g_up.n == 0)
+    memset(&sum, 0, sizeof sum);
+    for (int t = 0; t < g_up_nthreads; t++) {
+        sum.n += g_up[t].n;
+        sum.parse += g_up[t].parse;
+        sum.find += g_up[t].find;
+        sum.xor += g_up[t].xor;
+        sum.write += g_up[t].write;
+        sum.drop += g_up[t].drop;
+        sum.h1 += g_up[t].h1;
+    }
+    if (sum.n == 0)
         return;
     now = now_ns();
     if (now - g_up_win < 1000000000ull)
@@ -108,18 +128,17 @@ void server_up_stats_print(void)
             "uplink: [t=%llu] n=%llu parse=%.0fns find=%.0fns xor=%.0fns"
             " write=%.0fns total=%.0fns drop=%llu h1=%llu dl=%llu"
             " dldrop=%llu ratedrop=%llu\n",
-            (unsigned long long)now_ms(), (unsigned long long)g_up.n,
-            (double)g_up.parse / g_up.n, (double)g_up.find / g_up.n,
-            (double)g_up.xor / g_up.n, (double)g_up.write / g_up.n,
-            (double)(g_up.parse + g_up.find + g_up.xor + g_up.write) / g_up.n,
-            (unsigned long long)g_up.drop,
-            (unsigned long long)g_up.h1,
+            (unsigned long long)now_ms(), (unsigned long long)sum.n,
+            (double)sum.parse / sum.n, (double)sum.find / sum.n,
+            (double)sum.xor / sum.n, (double)sum.write / sum.n,
+            (double)(sum.parse + sum.find + sum.xor + sum.write) / sum.n,
+            (unsigned long long)sum.drop,
+            (unsigned long long)sum.h1,
             (unsigned long long)server_dl_pkts(),
             (unsigned long long)atomic_load(&g_dl_drops),
             (unsigned long long)atomic_load(&g_rate_drops));
-    g_up.n = g_up.parse = g_up.find = g_up.xor = g_up.write = 0;
-    g_up.drop = 0;
-    g_up.h1 = 0;
+    for (int t = 0; t < g_up_nthreads; t++)
+        memset(&g_up[t], 0, sizeof g_up[t]);
     /* dl counter is cumulative (per-second delta is printed by the
      * caller's diff of consecutive lines); do not reset here */
 }
@@ -159,6 +178,11 @@ struct rate_bucket {
 };
 
 static struct rate_bucket g_rates[RATE_BUCKETS];
+
+/* guards g_rates: the multi-threaded uplink recv threads share the
+ * rate table; the lock is only taken for unauthenticated control types
+ * (see rate_allow — the DATA path returns before it) */
+static pthread_mutex_t g_rate_mu = PTHREAD_MUTEX_INITIALIZER;
 
 /* IWAN_RATE_* limits are read once at startup (server_rate_limits_init);
  * malformed or out-of-range values fall back to the defaults with a
@@ -200,6 +224,7 @@ static bool rate_allow(const struct sockaddr_in *peer, uint8_t typ, uint64_t now
     uint32_t *cnt;
     unsigned limit;
     unsigned h;
+    bool ok = true;
 
     switch (typ) {
     case PT_OPEN:
@@ -212,6 +237,11 @@ static bool rate_allow(const struct sockaddr_in *peer, uint8_t typ, uint64_t now
     default:
         return true; /* authenticated or negligible-cost paths */
     }
+    /* the rate table is shared by the multi-threaded uplink recv
+     * threads; the mutex is only taken on the unauthenticated control
+     * types above — the DATA path returns before this point, so the
+     * data path never contends */
+    pthread_mutex_lock(&g_rate_mu);
     h = (unsigned)((ip * RATE_HASH_MUL) >> RATE_HASH_SHIFT); /* top 10 bits */
     /* Linear probing: the hashed slot may belong to another source, so
      * scan up to RATE_PROBE_MAX slots for a bucket of this IP or a
@@ -246,12 +276,14 @@ static bool rate_allow(const struct sockaddr_in *peer, uint8_t typ, uint64_t now
      * budget (or vice versa); OPEN keeps its own, tighter limit */
     cnt = (typ == PT_OPEN) ? &b->open_cnt :
           (typ == PT_PING_REQ) ? &b->ping_cnt : &b->echo_cnt;
-    if (*cnt >= limit) {
+    if (*cnt >= limit)
+        ok = false;
+    else
+        (*cnt)++;
+    pthread_mutex_unlock(&g_rate_mu);
+    if (!ok)
         atomic_fetch_add(&g_rate_drops, 1);
-        return false;
-    }
-    (*cnt)++;
-    return true;
+    return ok;
 }
 
 /* UDP send that can never block the loop; failures are counted, not
@@ -281,21 +313,22 @@ uint64_t server_dl_pkts(void)
 }
 
 /* rate-limited reject logging: at most REJECT_LOG_MAX lines per second,
- * attacker-controlled username rendered printable-only. */
+ * attacker-controlled username rendered printable-only. The throttle
+ * counters are atomic: multiple recv threads may log rejects. */
 static void log_reject(const char *peerstr, const char *user, const char *reason)
 {
-    static uint64_t win;
-    static unsigned cnt;
+    static atomic_ullong win;
+    static atomic_uint cnt;
     uint64_t now = now_ms();
     char u[64];
 
-    if (now - win >= 1000) {
-        win = now;
-        cnt = 0;
+    if (now - atomic_load_explicit(&win, memory_order_relaxed) >= 1000) {
+        atomic_store_explicit(&win, now, memory_order_relaxed);
+        atomic_store_explicit(&cnt, 0, memory_order_relaxed);
     }
-    if (cnt >= REJECT_LOG_MAX)
+    if (atomic_fetch_add_explicit(&cnt, 1, memory_order_relaxed) >=
+        REJECT_LOG_MAX)
         return;
-    cnt++;
     log_escape(user, u, sizeof u);
     srv_log("[%s] OPEN reject: %s (%s)", peerstr, reason, u);
 }
@@ -635,7 +668,7 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
 
 void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nusers,
                 const uint8_t *raw, size_t len,
-                const struct sockaddr_in *peer, int sockfd)
+                const struct sockaddr_in *peer, int sockfd, unsigned tid)
 {
     struct server_session *s;
     buf_t b;
@@ -717,7 +750,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                 ipv4_pkt_ok(raw + IWAN_HDR_LEN, len - IWAN_HDR_LEN,
                             &saddr, &daddr) != 0 ||
                 saddr != s_ip) {
-                g_up.h1++;
+                g_up[tid].h1++;
                 if (debug_enabled())
                     log_debug("uplink drop: bad inner IPv4 (sid 0x%04x)",
                               sid);
@@ -730,15 +763,15 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                  * degrade into a stall. */
                 if (tun_write_retry(ctx->tun_fd, raw + IWAN_HDR_LEN,
                                     len - IWAN_HDR_LEN, 1, NULL) != 0)
-                    g_up.drop++;  /* still full: drop, client retransmits */
+                    g_up[tid].drop++;  /* still full: drop, client retransmits */
             }
             if (debug_enabled()) {
                 tc = now_ns();
-                g_up.parse += tb - ta;
-                g_up.find += tx0 - tb;
-                g_up.xor += tx1 - tx0;
-                g_up.write += tc - tx1;
-                g_up.n++;
+                g_up[tid].parse += tb - ta;
+                g_up[tid].find += tx0 - tb;
+                g_up[tid].xor += tx1 - tx0;
+                g_up[tid].write += tc - tx1;
+                g_up[tid].n++;
             }
             break;
         }
@@ -874,6 +907,13 @@ void handle_tun_downlink(struct server_ctx *ctx, const uint8_t *ip_pkt, size_t l
 void purge_expired(struct server_ctx *ctx, uint64_t now)
 {
     pthread_rwlock_wrlock(&ctx->sess_lock);
+    /* Re-take the timestamp AFTER acquiring the write lock: waiting for
+     * it can span DATA-path last_active updates (readers update it
+     * lock-free), so a `now` sampled before the wait may be OLDER than
+     * last_active — the unsigned subtraction then underflows to a huge
+     * "idle time" and a live session is wiped as expired (measured:
+     * last_active = now + 1ms -> diff = 2^64-1). */
+    now = now_ms();
     for (int i = 0; i < SERVER_MAX_SESSIONS; i++) {
         struct server_session *s = &ctx->sess[i];
         if (s->valid &&
