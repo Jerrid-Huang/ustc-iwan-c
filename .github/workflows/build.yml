@@ -48,6 +48,14 @@ jobs:
             exit 1
           fi
 
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: build-log-${{ matrix.cc }}
+          path: build-${{ matrix.cc }}.log
+          if-no-files-found: error
+
       - name: Incremental parallel build smoke
         run: |
           # make clean removes build-*.log, so regenerate it from the
@@ -112,6 +120,14 @@ jobs:
             exit 1
           fi
 
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: build-log-sanitize
+          path: build-sanitize.log
+          if-no-files-found: error
+
       - name: Smoke test (sanitizers)
         run: |
           ./bin/iwan-client --help >/dev/null
@@ -166,6 +182,14 @@ jobs:
             exit 1
           fi
 
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: build-log-win32
+          path: build-win32.log
+          if-no-files-found: error
+
       - name: Verify PE32+ binaries
         run: |
           file bin/iwan-client.exe bin/iwan-client-oidc.exe
@@ -193,8 +217,10 @@ jobs:
           # the i386 architecture); resolve the loader directly.
           WINE_BIN="$(command -v wine64 2>/dev/null || command -v wine 2>/dev/null || echo /usr/lib/wine/wine64)"
           echo "using wine loader: $WINE_BIN"
-          "$WINE_BIN" bin/iwan-client.exe --help >/dev/null
-          "$WINE_BIN" bin/iwan-client-oidc.exe --help >/dev/null
+          ls -la bin/ | head -12
+          "$WINE_BIN" --version 2>&1 | head -2 || true
+          "$WINE_BIN" bin/iwan-client.exe --help
+          "$WINE_BIN" bin/iwan-client-oidc.exe --help
 
       # Real wire-level smoke: a Linux iwan-server in --no-tun mode runs
       # without root (control plane only), and the Windows client talks
