@@ -569,7 +569,7 @@ static int https_connect_tcp(const char *host, uint16_t port,
     }
     freeaddrinfo(res);
 
-    if (fd < 0) {
+    if (fd < 0 && diag[0] == '\0') {
 #ifdef _WIN32
         int wsa = WSAGetLastError();
         snprintf(diag, diagsz, "cannot connect to %s:%u: %s (wsa %d)",
