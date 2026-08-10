@@ -120,7 +120,11 @@ static int split_https_url(const char *url, char *host, size_t hostsz,
         strcpy(path, "/");
         return 1;
     }
-    end = slash;
+    /* path runs from the first '/' to the end of the URL (or to a
+     * '?'/'#' if present); end must default to the URL end, not to
+     * slash — otherwise any URL without a query/fragment yields an
+     * empty path and is rejected (e.g. jwks_uri) */
+    end = slash + strlen(slash);
     q = strchr(slash, '?');
     f = strchr(slash, '#');
     if (q && (!f || q < f))
