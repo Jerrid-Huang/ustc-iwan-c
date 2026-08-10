@@ -113,7 +113,9 @@ endif
 # /usr/include/asm symlink (the gcc-multilib package that does is not a
 # build dependency), so point clang at the triplet dir explicitly.
 ifneq ($(TARGET),win32)
-BPF_MULTIARCH_INC := $(shell $(CC) -print-multiarch 2>/dev/null)
+# must NOT use $(CC): the clang build passes CC=clang, and clang has no
+# -print-multiarch (gcc option) — probe gcc/cc instead
+BPF_MULTIARCH_INC := $(shell gcc -print-multiarch 2>/dev/null || cc -print-multiarch 2>/dev/null)
 $(BUILD_DIR)/steer_bpf.o: $(COMMON_DIR)/steer_bpf.c
 	@mkdir -p $(BUILD_DIR)
 	$(CLANG) -O2 -target bpf -Wall -MMD -MP -isystem /usr/include/$(BPF_MULTIARCH_INC) -c -o $@ $<

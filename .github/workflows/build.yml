@@ -261,8 +261,16 @@ jobs:
           # exes import next to them so wine can load them.
           cp -f /tmp/mingw-sysroot/ucrt64/bin/libcrypto-3-x64.dll bin/
           cp -f /tmp/mingw-sysroot/ucrt64/bin/libssl-3-x64.dll bin/
-          cp -f /usr/lib/gcc/x86_64-w64-mingw32/*-posix/libwinpthread-1.dll bin/ 2>/dev/null || true
-          cp -f /usr/lib/gcc/x86_64-w64-mingw32/*-posix/libssp-0.dll bin/ 2>/dev/null || true
+          # libwinpthread lives under /usr/lib/gcc/.../posix on some
+          # toolchains and /usr/<triplet>/lib on others; try both.
+          for dll in /usr/lib/gcc/x86_64-w64-mingw32/*-posix/libwinpthread-1.dll \
+                     /usr/x86_64-w64-mingw32/lib/libwinpthread-1.dll; do
+            [ -f "$dll" ] && cp -f "$dll" bin/
+          done
+          for dll in /usr/lib/gcc/x86_64-w64-mingw32/*-posix/libssp-0.dll \
+                     /usr/x86_64-w64-mingw32/lib/libssp-0.dll; do
+            [ -f "$dll" ] && cp -f "$dll" bin/
+          done
           # The wine64 apt package installs only /usr/lib/wine/wine64
           # (the wine command lives in the wine metapackage, which needs
           # the i386 architecture); resolve the loader directly.
