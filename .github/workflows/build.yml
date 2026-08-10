@@ -360,7 +360,9 @@ jobs:
           # dynamically linked against system libssl; Windows exes need
           # the DLLs from the zip next to them)
           cp bin/iwan-client bin/iwan-client-oidc bin/iwan-server dist/linux/
-          cp win32/iwan-client.exe win32/iwan-client-oidc.exe dist/windows/
+          # download-artifact keeps the upload-time relative paths, so
+          # the win32 artifact lands as win32/bin/*.exe + win32/*.log
+          cp win32/bin/iwan-client.exe win32/bin/iwan-client-oidc.exe dist/windows/
           # Linux archive: the three binaries
           (cd dist/linux && tar czf ../iwan-linux-x86_64.tar.gz \
             iwan-client iwan-client-oidc iwan-server)
@@ -368,7 +370,7 @@ jobs:
           # from MSYS2, winpthread/ssp from the mingw runtime); drop the
           # build log from the artifact
           rm -f win32/build-win32.log
-          cp win32/*.dll dist/windows/
+          cp win32/bin/*.dll dist/windows/
           (cd dist/windows && zip -qr ../iwan-windows-x86_64.zip .)
           find dist -type f | sort
 
