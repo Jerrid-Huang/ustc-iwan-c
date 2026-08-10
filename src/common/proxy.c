@@ -269,8 +269,12 @@ static void pump_flush(pump_ctx_t *ctx, pump_tx_t *q)
         /* a GSO unit's total length must fit the 16-bit UDP length
          * field AND stay under the loopback-safe ceiling (software GSO
          * drops larger units on some kernels); oversized (jumbo) batches
-         * fall back to sendmmsg */
-        use_gso = uniform && (size_t)n * l0 <= IWAN_UDP_GSO_UNIT &&
+         * fall back to sendmmsg. The mss floor keeps the armed unit
+         * above every non-batch frame on the socket (control 24B,
+         * tunnel-DNS <= 307B): while UDP_SEGMENT is armed the kernel
+         * splits any longer datagram (see IWAN_GSO_MSS_MIN). */
+        use_gso = uniform && l0 >= IWAN_GSO_MSS_MIN &&
+                  (size_t)n * l0 <= IWAN_UDP_GSO_UNIT &&
                   (size_t)n * l0 <= IWAN_GSO_UNIT_SAFE;
     }
     pthread_mutex_lock(&ctx->send_lock);

@@ -77,6 +77,19 @@
  * syscall per batch). */
 #define IWAN_GSO_UNIT_SAFE 4096
 
+/* floor for ONE GSO unit (mss) in the uniform-batch fast path. The
+ * session socket is shared with non-batch senders: the tunnel-DNS
+ * worker (inner 20+8+up-to-271B query + 8B outer <= 307B) and control
+ * frames (24B) send() on the same fd. While UDP_SEGMENT is armed, the
+ * kernel splits ANY datagram longer than the mss — an ACK-only batch
+ * (48B units) armed mss=48 and silently chopped a 69B DNS query into
+ * 48+21B fragments, both dropped by the server's inner-packet gate
+ * (flaky tunnel-DNS). Every non-batch frame on the socket must stay
+ * below the floor; 512 > 307 covers the largest possible DNS frame.
+ * Sub-floor batches fall back to sendmmsg, which is equally fast for
+ * 2-3 segment batches (see IWAN_GSO_UNIT_SAFE note). */
+#define IWAN_GSO_MSS_MIN 512
+
 /* Compile-time freeze checks: pin the interop-critical layout values. If any
  * of these fires, the wire format has changed and a protocol version bump +
  * coordinated client/server release is required (see PROTOCOL.md). */

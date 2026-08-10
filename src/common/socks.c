@@ -164,7 +164,8 @@ static int socks_send_batch2(int sockfd, SocksConfig *cfg,
                              int npk, size_t total, size_t mss)
 {
     uint64_t retry_t0 = now_ms();
-    if (npk >= 2 && total <= IWAN_UDP_GSO_UNIT &&
+    if (npk >= 2 && mss >= IWAN_GSO_MSS_MIN &&
+        total <= IWAN_UDP_GSO_UNIT &&
         total <= IWAN_GSO_UNIT_SAFE) {
         if (cfg->gso_ok == 0) {
             int m = (int)mss;
