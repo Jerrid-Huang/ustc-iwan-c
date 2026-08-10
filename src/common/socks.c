@@ -1,17 +1,22 @@
-#include <arpa/inet.h>
 #include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/types.h>
+
+/* POSIX-only headers: on Windows the equivalents come from port.h
+ * (winsock2/ws2tcpip) or are local defines (UDP_SEGMENT, MSG_*). */
+#ifndef _WIN32
+#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
 #include <poll.h>
 #include <signal.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
-#include <sys/types.h>
 #include <unistd.h>
+#endif
 
 #include "common.h"
 #include "crypto.h"
@@ -22,7 +27,6 @@
 #include "protocol.h"
 #include "socks.h"
 #include "socks_internal.h"
-#include "tun.h"
 #include "util.h"
 
 Netstack g_ns;
@@ -72,7 +76,7 @@ void wait_events(int listener, int sockfd, int dns_evfd, int timeout_ms)
             fds[n].events |= POLLOUT;
         n++;
     }
-    if (poll(fds, (nfds_t)n, timeout_ms) < 0 && errno != EINTR)
+    if (port_poll(fds, (nfds_t)n, timeout_ms) < 0 && errno != EINTR)
         log_err("poll: %s", strerror(errno));
 }
 
@@ -80,8 +84,10 @@ void accept_connections(int listener) {
     for (;;) {
         struct sockaddr_in peer;
         socklen_t peerlen = sizeof peer;
-        int cfd = accept(listener, (struct sockaddr *)&peer, &peerlen);
+        int cfd = port_accept(listener, (struct sockaddr *)&peer, &peerlen);
         if (cfd < 0) {
+            /* the wrapper maps WSAEWOULDBLOCK -> EAGAIN, so this stays
+             * valid on Windows */
             if (errno == EAGAIN || errno == EWOULDBLOCK)
                 return;
             log_err("accept SOCKS5 client: %s", strerror(errno));
@@ -102,16 +108,17 @@ void accept_connections(int listener) {
                 char cip[INET_ADDRSTRLEN] = "";
                 inet_ntop(AF_INET, &peer.sin_addr, cip, sizeof cip);
                 log_debug("SOCKS5: closing non-loopback peer %s", cip);
-                close(cfd);
+                port_close(cfd);
                 continue;
             }
         }
         int nodelay = 1;
-        setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof nodelay);
-        set_nonblock(cfd);
+        port_setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &nodelay,
+                        sizeof nodelay);
+        port_set_nonblock(cfd, true);
         Flow *f = flow_alloc(&peer);
         if (!f) {
-            close(cfd);
+            port_close(cfd);
             continue;
         }
         f->fd = cfd;
@@ -161,8 +168,12 @@ static int socks_send_batch2(int sockfd, SocksConfig *cfg,
         total <= IWAN_GSO_UNIT_SAFE) {
         if (cfg->gso_ok == 0) {
             int m = (int)mss;
-            cfg->gso_ok = setsockopt(sockfd, SOL_UDP, UDP_SEGMENT,
-                                     &m, sizeof m) == 0 ? 1 : -1;
+            /* port_setsockopt translates UDP_SEGMENT to the Windows
+             * WSAIoctl(SIO_UDP_NETSEGMENT) GSO interface and fails with
+             * EOPNOTSUPP on older systems, so the gso_ok == -1 fallback
+             * below works unchanged on both platforms */
+            cfg->gso_ok = port_setsockopt(sockfd, SOL_UDP, UDP_SEGMENT,
+                                          &m, sizeof m) == 0 ? 1 : -1;
             if (cfg->gso_ok < 0)
                 log_err("SOCKS UDP_SEGMENT unsupported, using sendmmsg");
             else
@@ -172,7 +183,8 @@ static int socks_send_batch2(int sockfd, SocksConfig *cfg,
              * failed it will not succeed later, so stop re-probing it
              * on every drain round */
             int m = (int)mss;
-            if (setsockopt(sockfd, SOL_UDP, UDP_SEGMENT, &m, sizeof m) != 0)
+            if (port_setsockopt(sockfd, SOL_UDP, UDP_SEGMENT, &m,
+                                sizeof m) != 0)
                 cfg->gso_ok = -1;
             else
                 cfg->gso_mss = mss;
@@ -183,7 +195,7 @@ static int socks_send_batch2(int sockfd, SocksConfig *cfg,
             mh.msg_iov = iovs;
             mh.msg_iovlen = (size_t)npk;
             while (!g_stop) {
-                ssize_t r = sendmsg(sockfd, &mh, 0);
+                ssize_t r = port_sendmsg(sockfd, &mh, 0);
                 if (r == (ssize_t)total)
                     return npk;
                 if (r < 0 &&
@@ -210,7 +222,7 @@ static int socks_send_batch2(int sockfd, SocksConfig *cfg,
                          * Same retry shape as proxy.c send_gso. */
                         struct pollfd pfd = { .fd = sockfd,
                                               .events = POLLOUT };
-                        (void)poll(&pfd, 1, 1);
+                        (void)port_poll(&pfd, 1, 1);
                         if (now_ms() - retry_t0 >= SOCKS_SEND_RETRY_MS)
                             return 0;
                     }
@@ -228,7 +240,7 @@ static int socks_send_batch2(int sockfd, SocksConfig *cfg,
      * datagram longer than the mss, so clear it first */
     if (cfg->gso_mss != 0) {
         int z = 0;
-        setsockopt(sockfd, SOL_UDP, UDP_SEGMENT, &z, sizeof z);
+        port_setsockopt(sockfd, SOL_UDP, UDP_SEGMENT, &z, sizeof z);
         cfg->gso_mss = 0;
     }
     memset(msgs, 0, (size_t)npk * sizeof *msgs);   /* zero msg_name etc */
@@ -239,8 +251,8 @@ static int socks_send_batch2(int sockfd, SocksConfig *cfg,
     {
         unsigned sent = 0;
         while (sent < (unsigned)npk && !g_stop) {
-            ssize_t sm = sendmmsg(sockfd, msgs + sent,
-                                  (unsigned)npk - sent, 0);
+            ssize_t sm = port_sendmmsg(sockfd, msgs + sent,
+                                       (unsigned)npk - sent, 0);
             if (sm > 0) {
                 sent += (unsigned)sm;
                 continue;
@@ -269,7 +281,7 @@ static int socks_send_batch2(int sockfd, SocksConfig *cfg,
                             strerror(errno), npk, sent);
                 }
                 struct pollfd pfd = { .fd = sockfd, .events = POLLOUT };
-                (void)poll(&pfd, 1, 1);
+                (void)port_poll(&pfd, 1, 1);
                 if (now_ms() - retry_t0 >= SOCKS_SEND_RETRY_MS)
                     return (int)sent;
                 continue;
@@ -355,7 +367,7 @@ void send_vpn_keepalive(int sockfd, const SocksConfig *cfg,
     buf_t p;
     buf_init(&p);
     ctrl_hdr(&p, PT_ECHO_REQ, cfg->encryption, cfg->sid, cfg->token);
-    if (send(sockfd, p.data, (int)p.len, 0) < 0) {
+    if (port_send(sockfd, p.data, (int)p.len, 0) < 0) {
         /* a failed keepalive means the session socket is dead: stop the
          * tunnel instead of silently dropping the heartbeat (same
          * policy as proxy.c's pump loop) */
@@ -409,7 +421,7 @@ static int vpn_handle_datagram(int sockfd, SocksConfig *cfg, uint8_t *b,
     uint32_t ptok = ((uint32_t)b[4] << 24) | ((uint32_t)b[5] << 16) |
                     ((uint32_t)b[6] << 8) | b[7];
     if (dbg_env("IWAN_RXDBG"))
-        fprintf(stderr, "VRX: n=%zu t=%u\n", n, t);
+        fprintf(stderr, "VRX: n=%llu t=%u\n", (unsigned long long)n, t);
     if (debug_enabled())
         log_debug("VPN RX type=%u n=%zu sid=%u tok=****%04x "
                   "(cfg sid=%u tok=****%04x)",
@@ -434,7 +446,7 @@ static int vpn_handle_datagram(int sockfd, SocksConfig *cfg, uint8_t *b,
         /* a failed reply is not worth tearing the session down for: the
          * next ECHO_REQ gets an answer (or the keepalive machinery
          * detects a dead socket) */
-        if (send(sockfd, p.data, (int)p.len, 0) < 0)
+        if (port_send(sockfd, p.data, (int)p.len, 0) < 0)
             log_err("SOCKS ECHO_RES send failed: %s", strerror(errno));
         buf_free(&p);
         return 0;
@@ -491,7 +503,7 @@ int receive_vpn(int sockfd, SocksConfig *cfg) {
          * loop starves local reads and TX (echo-mode livelock) */
         if (budget <= 0)
             return 0;
-        int v = recvmmsg(sockfd, rx_msgs, RX_VLEN, MSG_DONTWAIT, NULL);
+        int v = port_recvmmsg(sockfd, rx_msgs, RX_VLEN, MSG_DONTWAIT, NULL);
         if (v <= 0) {
             if (v == 0 || errno == EAGAIN || errno == EWOULDBLOCK)
                 return 0;
@@ -516,16 +528,16 @@ void run_socks(int sockfd, SocksConfig *cfg) {
     g_socks_cfg = cfg;
     pace_bucket_init(&cfg->pace);   /* reads IWAN_SEND_PACING_PPS (0 = off) */
 
-    listener = socket(AF_INET, SOCK_STREAM, 0);
+    listener = port_socket(AF_INET, SOCK_STREAM, 0);
     if (listener < 0) {
         log_err("socket SOCKS5 listener: %s", strerror(errno));
         return;
     }
     int one = 1;
-    setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-    if (bind(listener, (struct sockaddr *)&laddr, sizeof laddr) < 0) {
+    port_setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    if (port_bind(listener, (struct sockaddr *)&laddr, sizeof laddr) < 0) {
         log_err("bind SOCKS5 listener: %s", strerror(errno));
-        close(listener);
+        port_close(listener);
         return;
     }
     if (laddr.sin_addr.s_addr != htonl(INADDR_LOOPBACK)) {
@@ -543,24 +555,24 @@ void run_socks(int sockfd, SocksConfig *cfg) {
             log_err("error: refusing to bind SOCKS5 to non-loopback %s; "
                     "pass --allow-remote to override",
                     cfg->listen_str ? cfg->listen_str : "?");
-            close(listener);
+            port_close(listener);
             return;
         }
     }
-    if (listen(listener, LISTEN_BACKLOG) < 0) {
+    if (port_listen(listener, LISTEN_BACKLOG) < 0) {
         log_err("listen SOCKS5: %s", strerror(errno));
-        close(listener);
+        port_close(listener);
         return;
     }
-    set_nonblock(listener);
-    set_nonblock(sockfd);
+    port_set_nonblock(listener, true);
+    port_set_nonblock(sockfd, true);
     {
         /* high-BDP tunnel: default UDP buffers (~212KB) overflow once
          * the TCP window keeps >~150 segments in flight, silently
          * dropping packets at full rate */
         int rbuf = SOCK_BUF_BYTES;
-        setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &rbuf, sizeof rbuf);
-        setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &rbuf, sizeof rbuf);
+        port_setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &rbuf, sizeof rbuf);
+        port_setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &rbuf, sizeof rbuf);
     }
 
     /* M1: tunnel DNS shares the session socket and the server-assigned
@@ -583,7 +595,7 @@ void run_socks(int sockfd, SocksConfig *cfg) {
 
     g_flows = calloc(MAX_FLOWS, sizeof *g_flows);
     if (!g_flows) {
-        close(listener);
+        port_close(listener);
         return;
     }
     g_next_id = 1;
@@ -591,13 +603,21 @@ void run_socks(int sockfd, SocksConfig *cfg) {
      * wait table) so stale entries can never match a fresh session's
      * flows or queries; also retires workers that outlived it */
     dns_reset();
-    g_dns_evfd = eventfd(0, EFD_NONBLOCK);
+    g_dns_evfd = port_evfd_create();
 
     /* run_socks must be re-entrant: clear any stale stop flag BEFORE
      * installing the handlers (a signal arriving between the two would
      * otherwise be dropped) */
     atomic_store_explicit(&g_stop, false, memory_order_relaxed);
 
+#ifdef _WIN32
+    /* Windows: console ctrl events go through the port layer, which
+     * normalizes every stop event to SIGINT. The handler is
+     * process-global: port_set_stop_handler replaces any previous
+     * handler, and there is no per-session save/restore (a console
+     * ctrl handler cannot be scoped to one run_socks instance). */
+    port_set_stop_handler(on_sig);
+#else
     struct sigaction sa, old_int, old_term, old_pipe;
     memset(&sa, 0, sizeof sa);
     sa.sa_handler = on_sig;
@@ -608,6 +628,7 @@ void run_socks(int sockfd, SocksConfig *cfg) {
      * save the previous disposition first so exit can restore it */
     sigaction(SIGPIPE, NULL, &old_pipe);
     signal(SIGPIPE, SIG_IGN);
+#endif
 
     log_info("SOCKS5 listening on %s", listen_s);
     if (debug_enabled())
@@ -661,11 +682,9 @@ void run_socks(int sockfd, SocksConfig *cfg) {
         if (d > POLL_CEIL_MS)
             d = POLL_CEIL_MS;   /* safety ceiling, not a polling tick */
         wait_events(listener, sockfd, g_dns_evfd, (int)d);
-        if (g_dns_evfd >= 0) {
-            uint64_t ev;
-            ssize_t r = read(g_dns_evfd, &ev, sizeof ev);
-            (void)r;   /* EFD_NONBLOCK: drain the counter */
-        }
+        if (g_dns_evfd >= 0)
+            (void)port_evfd_drain(g_dns_evfd);   /* nonblocking: consume
+                                                  * any pending wakeups */
     }
 
     /* stop tunnel DNS: bump the session generation so in-flight workers
@@ -685,24 +704,27 @@ void run_socks(int sockfd, SocksConfig *cfg) {
         buf_t p;
         buf_init(&p);
         ctrl_hdr(&p, PT_CLOSE, cfg->encryption, cfg->sid, cfg->token);
-        (void)send(sockfd, p.data, (int)p.len, 0);
+        (void)port_send(sockfd, p.data, (int)p.len, 0);
         buf_free(&p);
     }
 
-    close(listener);
+    port_close(listener);
     if (g_dns_evfd >= 0) {
-        close(g_dns_evfd);
+        port_evfd_close(g_dns_evfd);
         g_dns_evfd = -1;
     }
     for (int i = 0; i < MAX_FLOWS; i++)
         flow_free(&g_flows[i]);
     free(g_flows);
     g_flows = NULL;
+#ifndef _WIN32
     /* restore the previous signal dispositions (single-call users see
      * no difference; a second run_socks in the same process must not
-     * inherit stale handlers) */
+     * inherit stale handlers). Windows has no per-session restore: the
+     * ctrl handler installed above stays for the process lifetime. */
     sigaction(SIGINT, &old_int, NULL);
     sigaction(SIGTERM, &old_term, NULL);
     sigaction(SIGPIPE, &old_pipe, NULL);
+#endif
     log_info("SOCKS5 stopped");
 }

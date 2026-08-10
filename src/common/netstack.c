@@ -2,13 +2,16 @@
 #include <stdlib.h>
 #include <time.h>
 #include <string.h>
+
+/* POSIX-only headers: netstack.h -> common.h -> port.h provides
+ * struct iovec on both platforms (the stack builds every IP/TCP header
+ * byte-by-byte, so netinet/ip.h and netinet/tcp.h were never used). */
+#ifndef _WIN32
 #include <sys/time.h>
 #include <unistd.h>
-
 #include <netinet/in.h>
-#include <netinet/ip.h>
-#include <netinet/tcp.h>
 #include <arpa/inet.h>
+#endif
 
 #include "crypto.h"
 #include "ipv4.h"
@@ -631,9 +634,10 @@ static void handle_rx_data(Netstack *ns, TcpConn *c, int idx, uint8_t flags,
                 b_put(&c->rxq, payload, paylen);
                 c->rcv_nxt += (uint32_t)paylen;
                 if (dbg_env("IWAN_RXDBG"))
-                    fprintf(stderr, "RXDBG: conn=%d data->rxq pay=%zu "
-                            "rxq=%zu state=%d\n", idx, paylen, c->rxq.len,
-                            c->state);
+                    fprintf(stderr, "RXDBG: conn=%d data->rxq pay=%llu "
+                            "rxq=%llu state=%d\n", idx,
+                            (unsigned long long)paylen,
+                            (unsigned long long)c->rxq.len, c->state);
             }
             /* else: receive window closed — drop without advancing
              * rcv_nxt; the peer retransmits once the window reopens */
@@ -687,9 +691,9 @@ static void handle_rx(Netstack *ns, TcpConn *c, int idx, const uint8_t *t,
     if ((paylen > 0 || (flags & TCP_FIN)) && dbg_env("IWAN_RXDBG"))
         fprintf(stderr,
                 "RXDBG: conn=%d state=%d seq=%u rcv=%u ack=%u "
-                "snd_una=%u flags=%02x pay=%zu\n",
+                "snd_una=%u flags=%02x pay=%llu\n",
                 idx, c->state, seq, c->rcv_nxt, ack, c->snd_una, flags,
-                paylen);
+                (unsigned long long)paylen);
     c->last_rx_ms = now;
     c->keepalive_cnt = 0;
     c->keepalive_ms = 0;
@@ -791,13 +795,13 @@ void ns_dump_conn(const Netstack *ns, int idx)
     const NsPriv *p = &ns->priv[idx];
     fprintf(stderr,
             "NSDUMP: conn=%d state=%d una=%u nxt=%u sent=%u rwin=%u "
-            "scale=%u inflight=%u nsegs=%u txq=%d rxq=%zu rf=%d lf=%d "
+            "scale=%u inflight=%u nsegs=%u txq=%d rxq=%llu rf=%d lf=%d "
             "fs=%d rto=%u srtt=%u\n",
             idx, c->state, c->snd_una, c->snd_nxt, c->sent_nxt,
             c->remote_win, c->peer_scale,
             (unsigned)(c->sent_nxt - c->snd_una), p->nsegs, ns->tx_count,
-            c->rxq.len, c->remote_fin, c->local_fin, p->fin_sent,
-            c->rto, c->srtt);
+            (unsigned long long)c->rxq.len, c->remote_fin, c->local_fin,
+            p->fin_sent, c->rto, c->srtt);
 }
 
 void ns_set_outer(Netstack *ns, const uint8_t hdr[8], const uint8_t key[8])

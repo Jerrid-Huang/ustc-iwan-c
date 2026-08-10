@@ -3,11 +3,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <netinet/in.h>
 
 #include "addr.h"
 #include "cli.h"
-#include "common.h"
+#include "common.h"   /* port.h: sockaddr_in on both platforms */
 #include "oidc.h"
 #include "util.h"
 

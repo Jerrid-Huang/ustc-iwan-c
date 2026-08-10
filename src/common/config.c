@@ -2,11 +2,14 @@
 #include "util.h"
 
 #include <errno.h>
-#include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifndef _WIN32
+#include <pwd.h>
 #include <unistd.h>
+#endif
 
 int load_cidr_file(const char *path, slist_t *out)
 {
@@ -46,6 +49,18 @@ int load_cidr_file(const char *path, slist_t *out)
  * an attacker controls. Returns NULL when undeterminable. */
 static char *home_dir(void)
 {
+#ifdef _WIN32
+    /* no passwd database on Windows: USERPROFILE (the port layer's
+     * canonical home) first, then $HOME for msys-style environments —
+     * absolute POSIX-style paths only, matching the Linux paranoia */
+    char *h = port_home_dir();
+    if (h && *h)
+        return h;
+    const char *home = getenv("HOME");
+    if (home && *home && home[0] == '/')
+        return xstrdup(home);
+    return NULL;
+#else
     const char *su = getenv("SUDO_USER");
     if (su && *su && strcmp(su, "root") != 0) {
         struct passwd *pw = getpwnam(su);
@@ -59,6 +74,7 @@ static char *home_dir(void)
     if (home && *home && home[0] == '/')
         return xstrdup(home);
     return NULL;
+#endif
 }
 
 char *resolve_config_dir(const char *dir)

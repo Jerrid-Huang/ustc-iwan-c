@@ -1,15 +1,12 @@
 #include <arpa/inet.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <openssl/crypto.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/random.h>
 #include <time.h>
 #include <stdarg.h>
-#include <unistd.h>
 
 #include "common.h"
 #include "crypto.h"
@@ -25,6 +22,16 @@
 #define RATE_WINDOW_MS 1000
 #define RATE_OPEN_MAX_DEFAULT 20    /* OPENs per source per window */
 #define RATE_ECHO_MAX_DEFAULT 60    /* PING and ECHO, each per window */
+/* F4: per-source token-mismatch budget. At most 4 failed DATA/CLOSE
+ * authentications (unknown session or wrong token) per second per source
+ * address; beyond that every DATA/CLOSE packet from the source is
+ * silently dropped until the window rolls. 4/s is the sweet spot: a real
+ * client in transition (token refresh, idle expiry, NAT rebinding) sends
+ * at most a handful of stale frames per second, while a guesser
+ * brute-forcing the 32-bit token is throttled to 4 probes/s (centuries
+ * at that rate). Keyed by IP only, like the other rate buckets, so NAT
+ * -shared sources share one budget. */
+#define RATE_TOKEN_MISMATCH_MAX 4
 /* Rate-table hashing: Knuth's multiplicative hash. The constant is
  * 2^32 / golden ratio (~2654435761); multiplying by this odd number
  * scrambles the low bits of the key across the full 32-bit range, and
@@ -175,13 +182,22 @@ struct rate_bucket {
      * budget); uint32_t so env-configured limits above 255 stay
      * representable. */
     uint32_t open_cnt, ping_cnt, echo_cnt;
+    /* F4: DATA/CLOSE token mismatches in the current window (saturating
+     * at RATE_TOKEN_MISMATCH_MAX). Consumed by rate_token_over /
+     * rate_token_zero / rate_token_mismatch; see those. */
+    uint32_t tok_mis_cnt;
 };
 
 static struct rate_bucket g_rates[RATE_BUCKETS];
 
 /* guards g_rates: the multi-threaded uplink recv threads share the
- * rate table; the lock is only taken for unauthenticated control types
- * (see rate_allow — the DATA path returns before it) */
+ * rate table; the lock is taken for the unauthenticated control types
+ * (rate_allow) and for the F4 DATA/CLOSE token-mismatch accounting
+ * (rate_token_over/mismatch/zero). Sections are short and, per flow,
+ * effectively uncontended (SO_REUSEPORT pins one client flow to one
+ * recv thread). Lock order is always sess_lock (outer) -> g_rate_mu
+ * (inner) when both are held; the DATA path releases sess_lock before
+ * touching the rate table. */
 static pthread_mutex_t g_rate_mu = PTHREAD_MUTEX_INITIALIZER;
 
 /* IWAN_RATE_* limits are read once at startup (server_rate_limits_init);
@@ -213,6 +229,44 @@ void server_rate_limits_init(void)
                                      RATE_ECHO_MAX_DEFAULT);
 }
 
+/* locate (or claim) the rate bucket for ip; caller must hold g_rate_mu.
+ * Linear probing: the hashed slot may belong to another source, so scan
+ * up to RATE_PROBE_MAX slots for a bucket of this IP or a never-used one
+ * instead of clobbering a neighbour's counters (that would let one
+ * source reset another's window or dodge the limit by rehashing). Only
+ * when the whole probe window is occupied by other sources do we evict
+ * the slot whose window started longest ago. */
+static struct rate_bucket *rate_bucket_find(uint32_t ip)
+{
+    unsigned h = (unsigned)((ip * RATE_HASH_MUL) >> RATE_HASH_SHIFT); /* top 10 bits */
+    unsigned evict = 0;
+    uint64_t oldest = UINT64_MAX;
+
+    for (unsigned i = 0; i < RATE_PROBE_MAX; i++) {
+        struct rate_bucket *c = &g_rates[(h + i) % RATE_BUCKETS];
+        if (c->win < oldest) {
+            oldest = c->win;
+            evict = i;
+        }
+        if (c->ip == ip || (c->ip == 0 && c->win == 0)) {
+            return c;
+        }
+    }
+    return &g_rates[(h + evict) % RATE_BUCKETS];
+}
+
+/* (re)start the source's window when the bucket is stale or was just
+ * evicted from another source; caller must hold g_rate_mu. */
+static void rate_bucket_touch(struct rate_bucket *b, uint32_t ip, uint64_t now)
+{
+    if (b->ip != ip || now - b->win >= RATE_WINDOW_MS) {
+        b->ip = ip;
+        b->win = now;
+        b->open_cnt = b->ping_cnt = b->echo_cnt = 0;
+        b->tok_mis_cnt = 0;
+    }
+}
+
 /* Per-source token limits on unauthenticated control paths. Over-limit
  * sources are silently dropped (no reject, no log; each drop is counted
  * in g_rate_drops for the per-second stats line) so a single host
@@ -223,7 +277,6 @@ static bool rate_allow(const struct sockaddr_in *peer, uint8_t typ, uint64_t now
     struct rate_bucket *b;
     uint32_t *cnt;
     unsigned limit;
-    unsigned h;
     bool ok = true;
 
     switch (typ) {
@@ -238,40 +291,12 @@ static bool rate_allow(const struct sockaddr_in *peer, uint8_t typ, uint64_t now
         return true; /* authenticated or negligible-cost paths */
     }
     /* the rate table is shared by the multi-threaded uplink recv
-     * threads; the mutex is only taken on the unauthenticated control
-     * types above — the DATA path returns before this point, so the
-     * data path never contends */
+     * threads; the mutex is taken on the unauthenticated control types
+     * above and on the F4 DATA/CLOSE token-mismatch checks below
+     * (rate_token_over/mismatch/zero) */
     pthread_mutex_lock(&g_rate_mu);
-    h = (unsigned)((ip * RATE_HASH_MUL) >> RATE_HASH_SHIFT); /* top 10 bits */
-    /* Linear probing: the hashed slot may belong to another source, so
-     * scan up to RATE_PROBE_MAX slots for a bucket of this IP or a
-     * never-used one instead of clobbering a neighbour's counters (that
-     * would let one source reset another's window or dodge the limit by
-     * rehashing). Only when the whole probe window is occupied by other
-     * sources do we evict the slot whose window started longest ago. */
-    b = NULL;
-    {
-        unsigned evict = 0;
-        uint64_t oldest = UINT64_MAX;
-        for (unsigned i = 0; i < RATE_PROBE_MAX; i++) {
-            struct rate_bucket *c = &g_rates[(h + i) % RATE_BUCKETS];
-            if (c->win < oldest) {
-                oldest = c->win;
-                evict = i;
-            }
-            if (c->ip == ip || (c->ip == 0 && c->win == 0)) {
-                b = c;
-                break;
-            }
-        }
-        if (!b)
-            b = &g_rates[(h + evict) % RATE_BUCKETS];
-    }
-    if (b->ip != ip || now - b->win >= RATE_WINDOW_MS) {
-        b->ip = ip;
-        b->win = now;
-        b->open_cnt = b->ping_cnt = b->echo_cnt = 0;
-    }
+    b = rate_bucket_find(ip);
+    rate_bucket_touch(b, ip, now);
     /* independent per-type counters: a PING flood cannot eat the ECHO
      * budget (or vice versa); OPEN keeps its own, tighter limit */
     cnt = (typ == PT_OPEN) ? &b->open_cnt :
@@ -284,6 +309,65 @@ static bool rate_allow(const struct sockaddr_in *peer, uint8_t typ, uint64_t now
     if (!ok)
         atomic_fetch_add(&g_rate_drops, 1);
     return ok;
+}
+
+/* ---- F4: per-source token-mismatch budget (DATA/CLOSE paths) ---- */
+
+/* true when this source is at/over the mismatch budget: every DATA/CLOSE
+ * packet from it is silently dropped (counted in g_rate_drops) until the
+ * window rolls. Checked at the top of the DATA/CLOSE branches, before
+ * any session work, so a blacklisted source cannot even probe. The OPEN/
+ * PING/ECHO budgets above are NOT affected. */
+static bool rate_token_over(const struct sockaddr_in *peer, uint64_t now)
+{
+    uint32_t ip = (uint32_t)peer->sin_addr.s_addr;
+    struct rate_bucket *b;
+    bool over;
+
+    pthread_mutex_lock(&g_rate_mu);
+    b = rate_bucket_find(ip);
+    rate_bucket_touch(b, ip, now);
+    over = b->tok_mis_cnt >= RATE_TOKEN_MISMATCH_MAX;
+    pthread_mutex_unlock(&g_rate_mu);
+    if (over)
+        atomic_fetch_add(&g_rate_drops, 1);
+    return over;
+}
+
+/* record one token mismatch from this source: a DATA/CLOSE frame with an
+ * unknown session or a wrong token is a guess, and each guess advances
+ * the source toward the blacklist. Counter saturates at the budget. */
+static void rate_token_mismatch(const struct sockaddr_in *peer, uint64_t now)
+{
+    uint32_t ip = (uint32_t)peer->sin_addr.s_addr;
+    struct rate_bucket *b;
+
+    pthread_mutex_lock(&g_rate_mu);
+    b = rate_bucket_find(ip);
+    rate_bucket_touch(b, ip, now);
+    if (b->tok_mis_cnt < RATE_TOKEN_MISMATCH_MAX)
+        b->tok_mis_cnt++;
+    pthread_mutex_unlock(&g_rate_mu);
+}
+
+/* true when the source has accumulated zero token mismatches in the
+ * current window. Peer rebinding (DATA/PING/ECHO) is only granted to
+ * such sources: this single test implements both halves of the rebind
+ * gate — "under the mismatch rate limit" (an over-budget source has
+ * cnt >= RATE_TOKEN_MISMATCH_MAX > 0 and fails here) and "zero recent
+ * mismatches" (any sub-budget sprayer with 1..MAX-1 also fails). */
+static bool rate_token_zero(const struct sockaddr_in *peer, uint64_t now)
+{
+    uint32_t ip = (uint32_t)peer->sin_addr.s_addr;
+    struct rate_bucket *b;
+    bool zero;
+
+    pthread_mutex_lock(&g_rate_mu);
+    b = rate_bucket_find(ip);
+    rate_bucket_touch(b, ip, now);
+    zero = b->tok_mis_cnt == 0;
+    pthread_mutex_unlock(&g_rate_mu);
+    return zero;
 }
 
 /* UDP send that can never block the loop; failures are counted, not
@@ -404,24 +488,20 @@ static void send_reject(int sockfd, const struct sockaddr_in *peer, const char *
     buf_free(&b);
 }
 
-/* 4 random bytes; getrandom(2), /dev/urandom, then clock+pid+address mix. */
+/* 4 random bytes; cryptographically strong entropy, fail-closed (F6).
+ * A guessable token is a session-hijack hole, so there is no acceptable
+ * fallback: an RNG failure means the kernel entropy source is broken and
+ * aborting is correct (this runs per-session at OPEN time). */
 static uint32_t random_token(void)
 {
-    uint32_t tok = 0;
-    struct timespec ts;
+    uint32_t tok;
 
-    if (getrandom(&tok, sizeof tok, 0) == (ssize_t)sizeof tok)
-        return tok;
-    int fd = open("/dev/urandom", O_RDONLY);
-    if (fd >= 0) {
-        ssize_t n = read(fd, &tok, sizeof tok);
-        close(fd);
-        if (n == (ssize_t)sizeof tok)
-            return tok;
+    if (port_rand_bytes(&tok, sizeof tok) != 0) {
+        log_err("random_token: cannot obtain secure randomness "
+                "(port_rand_bytes failed); aborting");
+        abort();
     }
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint32_t)ts.tv_nsec ^ ((uint32_t)getpid() << 16) ^
-           (uint32_t)(uintptr_t)&tok;
+    return tok;
 }
 
 struct open_ctx {
@@ -685,9 +765,10 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
           ((uint32_t)raw[6] << 8) | (uint32_t)raw[7];
     {
         uint64_t ta = 0;
+        uint64_t now = now_ms(); /* one clock read shared by the rate checks */
         if (debug_enabled())
             ta = now_ns();
-        if (!rate_allow(peer, typ, now_ms()))
+        if (!rate_allow(peer, typ, now))
             return; /* unauthenticated flood from this source: silent drop */
 
         switch (typ) {
@@ -702,10 +783,17 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
             uint32_t s_ip, saddr, daddr; /* session addr + inner header */
             if (debug_enabled())
                 tb = now_ns();
+            /* F4: a source at/over the token-mismatch budget is
+             * blacklisted for the rest of the window — every DATA packet
+             * from it is dropped before any session work (counted, not
+             * logged, mirroring the OPEN/PING/ECHO ratedrop behavior) */
+            if (rate_token_over(peer, now))
+                return;
             pthread_rwlock_rdlock(&ctx->sess_lock);
             s = find_session_unlocked(ctx, sid);
-            if (!s || s->token != tok) {
+            if (!s || CRYPTO_memcmp(&s->token, &tok, sizeof tok) != 0) {
                 pthread_rwlock_unlock(&ctx->sess_lock);
+                rate_token_mismatch(peer, now); /* F4: count the guess */
                 return; /* unknown session or bad token: drop */
             }
             /* source binding: only the session's peer may drive the
@@ -714,10 +802,20 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
              * the common path holds only the read lock. */
             if (memcmp(&s->peer, peer, sizeof *peer) != 0) {
                 pthread_rwlock_unlock(&ctx->sess_lock);
+                /* F4 rebind gate: a new source may take over the session
+                 * only with zero recent token mismatches AND while under
+                 * the mismatch rate limit — both are one test
+                 * (rate_token_zero); an address that has been spraying
+                 * guesses is already blocked by rate_token_over above and
+                 * never reaches this point. Honest roamers have a fresh
+                 * counter and rebind on this first packet, as before. */
+                if (!rate_token_zero(peer, now))
+                    return;
                 pthread_rwlock_wrlock(&ctx->sess_lock);
                 s = find_session_unlocked(ctx, sid);
-                if (!s || s->token != tok) {
+                if (!s || CRYPTO_memcmp(&s->token, &tok, sizeof tok) != 0) {
                     pthread_rwlock_unlock(&ctx->sess_lock);
+                    rate_token_mismatch(peer, now); /* F4 */
                     return;
                 }
                 s->peer = *peer;
@@ -782,11 +880,13 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
         }
 
     case PT_CLOSE:
+        if (rate_token_over(peer, now))
+            return; /* F4: blacklisted source */
         if (!verify_sig(raw, len))
             return;
         pthread_rwlock_wrlock(&ctx->sess_lock);
         s = find_session_unlocked(ctx, sid);
-        if (s && s->token == tok) {
+        if (s && CRYPTO_memcmp(&s->token, &tok, sizeof tok) == 0) {
             /* CLOSE is terminal: never rebind to a new source, or a
              * token-holding attacker could kill the session from any
              * address */
@@ -799,6 +899,10 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
             srv_log("[%s] session 0x%04x (ip %u.%u.%u.%u) closed",
                     peerstr, s->sid, s->ip[0], s->ip[1], s->ip[2], s->ip[3]);
             sess_wipe(ctx, s);
+        } else {
+            /* F4: a bad-token (or unknown-sid) CLOSE is a token guess:
+             * count it against the source's budget */
+            rate_token_mismatch(peer, now);
         }
         pthread_rwlock_unlock(&ctx->sess_lock);
         break;
@@ -808,9 +912,18 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
             return;
         pthread_rwlock_wrlock(&ctx->sess_lock);
         s = find_session_unlocked(ctx, sid);
-        if (s && s->token == tok) {
-            s->peer = *peer;
-            atomic_store(&s->last_active_ms, now_ms()); /* keepalive */
+        if (s && CRYPTO_memcmp(&s->token, &tok, sizeof tok) == 0) {
+            /* F4: a token-valid PING from a NEW source rebinds the
+             * session peer — gate that on the source's token-mismatch
+             * history (rate_token_zero) so a guessed token cannot claim
+             * the session from an address that has been spraying.
+             * PING_RSP is still sent regardless: it is a liveness oracle
+             * by design and must not become a token oracle. */
+            if (memcmp(&s->peer, peer, sizeof *peer) == 0 ||
+                rate_token_zero(peer, now)) {
+                s->peer = *peer;
+                atomic_store(&s->last_active_ms, now_ms()); /* keepalive */
+            }
         }
         pthread_rwlock_unlock(&ctx->sess_lock);
         buf_init(&b);
@@ -824,9 +937,14 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
             return;
         pthread_rwlock_wrlock(&ctx->sess_lock);
         s = find_session_unlocked(ctx, sid);
-        if (s && s->token == tok) {
-            s->peer = *peer;
-            atomic_store(&s->last_active_ms, now_ms()); /* keepalive */
+        if (s && CRYPTO_memcmp(&s->token, &tok, sizeof tok) == 0) {
+            /* F4: same rebind gate as PING_REQ — a token guess via ECHO
+             * must not claim the session from a spraying source */
+            if (memcmp(&s->peer, peer, sizeof *peer) == 0 ||
+                rate_token_zero(peer, now)) {
+                s->peer = *peer;
+                atomic_store(&s->last_active_ms, now_ms()); /* keepalive */
+            }
         }
         pthread_rwlock_unlock(&ctx->sess_lock);
         buf_init(&b);

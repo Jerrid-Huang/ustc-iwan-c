@@ -11,6 +11,8 @@ USTC iWAN 校园网 VPN 客户端,用 C11 从 [yyy1mu/ustc-iwan](https://github.
 - 自研用户态 TCP/IP 协议栈(零拷贝段槽、64KB 窗口 + WSCALE、逐段立即 ACK、自适应 RTO、快速重传、keepalive 探测、GSO 批发送)
 - 8B 外层头 + XOR 加密内层 IP 包(整包加密)
 - `--ustc` 快捷路由:一条参数展开为 11 条科大校园网 CIDR,配合 `--server` 直接连接(仅 `iwan-client-oidc`)
+- **Windows 客户端**(MinGW-w64 交叉编译):`ping` / `auth` / `socks` / OIDC 全功能;`proxy`(TUN)经 wintun 驱动,需管理员 + 安装 [wintun](https://www.wintun.net/);`iwan-server` 保持 Linux-only(依赖 TUN/iptables/BPF)
+- **协议已冻结**:线上字节格式(帧布局、帧类型/TLV id、`"mw"` 常量、字节序、vlen+2 怪癖)为与参考实现互操作而固定,完整字节级规范见 [PROTOCOL.md](PROTOCOL.md),`protocol.h` 内有 `_Static_assert` 编译期校验
 
 ## 构建
 
@@ -21,6 +23,20 @@ make            # 产物在 bin/
 make -B         # 强制全量重建
 make clean
 ```
+
+### Windows 交叉编译(Linux 主机)
+
+依赖:`gcc-mingw-w64-x86-64`(posix 线程模型)、`zstd`;OpenSSL 3 使用 MSYS2 ucrt64 开发包(含静态库与头文件),解包到任意目录后用 `OPENSSL_DIR` 指向其 `ucrt64` 根:
+
+```sh
+curl -sL https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-openssl-3.5.1-1-any.pkg.tar.zst -o /tmp/ossl.tar.zst
+mkdir -p /tmp/mingw-sysroot && tar --zstd -xf /tmp/ossl.tar.zst -C /tmp/mingw-sysroot
+
+make TARGET=win32 -B CC=x86_64-w64-mingw32-gcc OPENSSL_DIR=/tmp/mingw-sysroot/ucrt64
+# 产物:bin/iwan-client.exe、bin/iwan-client-oidc.exe(仅客户端;iwan-server 不构建)
+```
+
+MSYS2 的 libcrypto/libssl 是 DLL 导入库:运行时需将 `libcrypto-3-x64.dll`、`libssl-3-x64.dll` 及 mingw 运行库(`libwinpthread-1.dll`、`libssp-0.dll`)与 exe 放在同一目录。TUN 模式还需 `wintun.dll`(与驱动一同安装)并在管理员控制台运行;`socks` / `ping` / `auth` / OIDC 无需管理员。CI(`.github/workflows/build.yml` 的 `win-cross` 任务)自动完成交叉编译 + wine 冒烟 + 与 Linux `iwan-server` 的真实线上握手测试。
 
 ## 用法
 
@@ -74,8 +90,9 @@ sudo ./bin/iwan-server --users /etc/iwan/users.txt \
 - **数据面"加密"无机密性**:载荷为 8 字节静态密钥(派生自 `md5(user+pass)`)的重复 XOR,无 IV/无完整性。单包已知明文即可恢复密钥,任何能嗅探 6001/udp 的人可解密全部隧道流量并可比特翻转篡改。**不要在 VPN 隧道内传输高敏感数据**;如需强保密,请在承载网层叠加受认证的隧道(如 WireGuard/IPsec)。
 - **控制面签名可伪造**:帧签名 `md5(8字节头+"mw")` 的"密钥"是源码公开常量,且不覆盖 TLV 载荷。客户端无法认证服务器,在线攻击者可伪造 OPEN_ACK(下发任意 IP/DNS/网关)或伪造 CLOSE 终止会话。**首次连接没有服务器认证**,请固定服务器 IP 并在网络层限制 6001/udp 的访问来源。
 - **口令可离线爆破**:认证密文为确定性 AES-128-ECB(无盐),嗅探一次 OPEN 即可离线字典攻击;服务器必须持有明文口令(协议要求)。请使用高熵口令,并确保 `users.txt` 权限为 600。
-- **会话可被劫持**:sid+token 以明文传输且是数据面唯一凭据,重放 OPEN 或嗅探 token 可顶替/重绑定会话。CLOSE 已做源地址绑定,但无法防御嗅探者。
-- OIDC 路径:登录走标准 OIDC(证书与主机名校验、PKCE、state 比对、id_token 签名与 aud/iss/exp 校验);`OIDC_APP_SECRET` 为公开常量,`servers.json` 中 passWord 字段的加密仅为混淆级保护,请保持该文件 0600。
+- **会话可被劫持**:sid+token 以明文传输且是数据面唯一凭据,重放 OPEN 或嗅探 token 可顶替/重绑定会话。CLOSE 已做源地址绑定,但无法防御嗅探者。**已加固(不改线上格式)**:服务端对 DATA/CLOSE 的 token 猜测按源地址限速(每窗口 4 次,超限静默丢弃)、token 比较改为常数时间(CRYPTO_memcmp)、会话 peer 重绑定要求该源近 1s 内无任何 token 失配(PING/ECHO 的隐式重绑定同样受限);CLOSE 永不重绑定。
+- **加固(其余,均不改线上格式)**:客户端对 OPEN_REJECT 也做帧签名校验(原来仅 ACK 路径校验);随机数失败即拒绝启动/连接(不再回退到弱熵混合,弱 nonce/token 即劫持漏洞);客户端在 `socks`/`proxy` 启动时对比服务器下发的网关与所连服务器地址,不一致时告警(可能是伪造 OPEN_ACK,也可能是 NAT 拓扑)。
+- OIDC 路径:登录走标准 OIDC(证书与主机名校验、PKCE、state 比对、id_token 签名与 aud/iss/exp 校验);`OIDC_APP_SECRET` 为公开常量,`servers.json` 中 passWord 字段的加密仅为混淆级保护,请保持该文件 0600。HTTPS 传输层已改为进程内 libssl(证书 + 主机名严格校验;Windows 从系统 ROOT 证书库加载信任锚),不再 fork `openssl s_client` 子进程。
 
 ## 实现说明
 

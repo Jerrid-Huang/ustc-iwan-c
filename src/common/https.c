@@ -1,29 +1,31 @@
 #include <stdbool.h>
 #include <ctype.h>
 #include <errno.h>
-#include <fcntl.h>
-#include <poll.h>
-#include <signal.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
-#include <strings.h>
-#include <sys/wait.h>
-#include <unistd.h>
+
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+#include <openssl/x509.h>
+#ifdef _WIN32
+#  include <wincrypt.h>
+#endif
 
 #include "common.h"
 #include "https.h"
 #include "util.h"
 
 /* hard ceilings for one response read: whole-transfer size and the whole
- * round-trip time (redirect hops included), plus the poll granularity used
- * to enforce them */
+ * round-trip time (redirect hops included), plus the per-op socket
+ * timeout cap used to enforce them */
 #define HTTPS_POLL_MS       25000
 #define HTTPS_TIMEOUT_MS    60000
 #define HTTPS_MAX_RESP      (16u * 1024 * 1024)
 #define HTTPS_MAX_REDIRECTS 5
-#define HTTPS_READ_CHUNK    4096    /* read() granularity for the child pipe */
+#define HTTPS_READ_CHUNK    4096    /* SSL_read granularity */
 /* chunk-size ceiling in Transfer-Encoding: chunked (the on-wire length
  * is hex; anything above INT_MAX is rejected as absurd) */
 #define HTTPS_CHUNK_SZ_CAP  0x7FFFFFFFL
@@ -94,7 +96,8 @@ static int chunk_decode(const char *in, size_t in_len, struct sbuf *out,
             j++;
         sz = hex_parse_sz(in + i, j - i);
         if (sz < 0) {
-            snprintf(err, errsz, "bad chunk size at offset %zu", i);
+            snprintf(err, errsz, "bad chunk size at offset %llu",
+                   (unsigned long long)i);
             return 0;
         }
         while (j < in_len && in[j] != '\r' && in[j] != '\n')
@@ -106,7 +109,8 @@ static int chunk_decode(const char *in, size_t in_len, struct sbuf *out,
             break;
         }
         if ((size_t)sz > in_len - j) {
-            snprintf(err, errsz, "chunk overruns body at offset %zu", i);
+            snprintf(err, errsz, "chunk overruns body at offset %llu",
+                   (unsigned long long)i);
             return 0;
         }
         sbuf_app(out, in + j, (size_t)sz);
@@ -160,7 +164,7 @@ static char *https_hdr_value(const char *hdr, size_t len, const char *name)
             continue;
         }
         if ((size_t)(colon - line) == nl &&
-            strncasecmp(line, name, nl) == 0) {
+            port_strncasecmp(line, name, nl) == 0) {
             p = colon + 1;
             while (p < line + llen && (*p == ' ' || *p == '\t'))
                 p++;
@@ -203,7 +207,7 @@ static int https_te_is_chunked(const char *val)
             return 0;   /* empty coding in the list: malformed */
         codings++;
         if (n == sizeof chunked - 1 &&
-            strncasecmp(p, chunked, sizeof chunked - 1) == 0)
+            port_strncasecmp(p, chunked, sizeof chunked - 1) == 0)
             ok = 1;
         else
             ok = 0;
@@ -289,7 +293,8 @@ static void https_req_build(struct sbuf *req, const char *host,
 
     if (!body)
         body = "";
-    snprintf(cl, sizeof cl, "Content-Length: %zu", strlen(body));
+    snprintf(cl, sizeof cl, "Content-Length: %llu",
+                   (unsigned long long)strlen(body));
     sbuf_app(req, is_get ? "GET " : "POST ",
              is_get ? sizeof "GET " - 1 : sizeof "POST " - 1);
     sbuf_app(req, path, strlen(path));
@@ -312,189 +317,424 @@ static void https_req_build(struct sbuf *req, const char *host,
         sbuf_app(req, body, strlen(body));
 }
 
-/* Resolve the CA bundle to hand to openssl s_client: SSL_CERT_FILE wins,
-   otherwise the first of the common per-distro locations that exists,
-   else NULL. */
-static const char *https_ca_path(void)
+/* Fetch the first OpenSSL error from the queue as a single-line string
+   (the queue usually holds one or two entries; the first is the most
+   specific). Falls back to strerror(errno) when no SSL error is queued,
+   which covers pure socket failures (ECONNREFUSED, ...). */
+static void https_ssl_err(char *buf, size_t sz)
 {
+    unsigned long e = ERR_get_error();
+
+    if (e != 0) {
+        ERR_error_string_n(e, buf, sz);
+        return;
+    }
+    snprintf(buf, sz, "%s", strerror(errno));
+}
+
+/* Arm SO_RCVTIMEO / SO_SNDTIMEO for the blocking socket. Every SSL
+   read/write is capped at min(remaining budget, HTTPS_POLL_MS) — the
+   same chunking the old poll loop used — so a dead peer surfaces as a
+   timeout after at most HTTPS_POLL_MS instead of hanging the round
+   trip; the caller re-checks the deadline itself around every call.
+   Returns 0 on success, -1 on failure. */
+static int https_set_io_timeo(int fd, int opt, uint64_t ms)
+{
+    struct timeval tv;
+
+    if (ms > HTTPS_POLL_MS)
+        ms = HTTPS_POLL_MS;
+    tv.tv_sec = (time_t)(ms / 1000);
+    tv.tv_usec = (long)((ms % 1000) * 1000);
+    return port_setsockopt(fd, SOL_SOCKET, opt, &tv, sizeof tv);
+}
+
+/* Load the CA trust anchors into ctx. Linux: SSL_CERT_FILE wins,
+   otherwise the first of the usual per-distro bundle paths (the same
+   candidates the fork-based transport handed to `openssl s_client
+   -CAfile`); no usable bundle -> the historical "no CA bundle found"
+   message. Windows: the system ROOT store via Crypt32. Returns 0 on
+   success, -1 with the specific reason already logged. */
+static int https_ctx_load_cas(SSL_CTX *ctx)
+{
+#ifdef _WIN32
+    HCERTSTORE store;
+    PCCERT_CONTEXT cert = NULL;
+    X509_STORE *xstore = SSL_CTX_get_cert_store(ctx);
+    int n = 0;
+
+    store = CertOpenSystemStoreA(0, "ROOT");
+    if (!store) {
+        log_err("HTTPS: cannot open the Windows ROOT certificate store "
+                "(error %lu)", (unsigned long)GetLastError());
+        return -1;
+    }
+    while ((cert = CertEnumCertificatesInStore(store, cert)) != NULL) {
+        const unsigned char *p = cert->pbCertEncoded;
+        X509 *x = d2i_X509(NULL, &p, (long)cert->cbCertEncoded);
+
+        if (x) {
+            if (X509_STORE_add_cert(xstore, x) == 1)
+                n++;
+            X509_free(x);
+        }
+    }
+    CertCloseStore(store, 0);
+    if (n == 0) {
+        log_err("HTTPS: the Windows ROOT certificate store is empty; "
+                "cannot verify the server certificate");
+        return -1;
+    }
+    log_debug("https: loaded %d CA certificates from the Windows ROOT "
+              "store", n);
+    return 0;
+#else
     static const char *const cands[] = {
         "/etc/ssl/certs/ca-certificates.crt",
         "/etc/pki/tls/certs/ca-bundle.crt",
         "/etc/ssl/cert.pem",
         "/etc/pki/tls/cacert.pem",
     };
-    const char *env = getenv("SSL_CERT_FILE");
+    const char *ca = getenv("SSL_CERT_FILE");
 
-    if (env && env[0])
-        return env;
-    for (size_t i = 0; i < sizeof cands / sizeof cands[0]; i++)
-        if (access(cands[i], R_OK) == 0)
-            return cands[i];
-    return NULL;
-}
-
-/* Fork `openssl s_client` with stdin/stdout wired to the pipes and
-   stderr captured to err_pipe[0] (diagnostics: a failed TLS handshake
-   must not vanish into /dev/null). Returns the child pid, or -1 on
-   failure (pipes are closed on failure). */
-static pid_t https_spawn_client(const char *host, int in_pipe[2],
-                                int out_pipe[2], int err_pipe[2])
-{
-    char connect_arg[1024];
-    pid_t pid;
-    const char *ca_path = https_ca_path();
-
-    if (!ca_path) {
+    if (ca && ca[0]) {
+        /* trust the env var even if the file is unreadable; the load
+         * below reports the failure */
+    } else {
+        ca = NULL;
+        for (size_t i = 0; i < sizeof cands / sizeof cands[0]; i++)
+            if (access(cands[i], R_OK) == 0) {
+                ca = cands[i];
+                break;
+            }
+    }
+    if (!ca) {
         log_err("no CA bundle found: set SSL_CERT_FILE or install one of "
                 "/etc/ssl/certs/ca-certificates.crt, "
                 "/etc/pki/tls/certs/ca-bundle.crt, /etc/ssl/cert.pem, "
                 "/etc/pki/tls/cacert.pem");
         return -1;
     }
-    /* a host longer than connect_arg would be silently truncated and
-     * connect to the wrong endpoint; refuse instead */
-    if (strlen(host) + 2 > sizeof connect_arg) {
-        log_err("HTTPS host name too long (%zu bytes)", strlen(host));
+    if (SSL_CTX_load_verify_locations(ctx, ca, NULL) != 1) {
+        char ebuf[256];
+
+        https_ssl_err(ebuf, sizeof ebuf);
+        log_err("HTTPS: cannot load CA bundle '%s': %s", ca, ebuf);
         return -1;
     }
-
-    if (pipe(in_pipe) != 0 || pipe(out_pipe) != 0 || pipe(err_pipe) != 0) {
-        log_err("pipe: %s", strerror(errno));
-        close(in_pipe[0]);
-        close(in_pipe[1]);
-        close(out_pipe[0]);
-        close(out_pipe[1]);
-        return -1;
-    }
-
-    pid = fork();
-    if (pid < 0) {
-        log_err("fork: %s", strerror(errno));
-        close(in_pipe[0]);
-        close(in_pipe[1]);
-        close(out_pipe[0]);
-        close(out_pipe[1]);
-        close(err_pipe[0]);
-        close(err_pipe[1]);
-        return -1;
-    }
-
-    if (pid == 0) {
-        exec_sanitize();
-        close(in_pipe[1]);
-        close(out_pipe[0]);
-        close(err_pipe[0]);
-        if (dup2(in_pipe[0], 0) < 0 || dup2(out_pipe[1], 1) < 0 ||
-            dup2(err_pipe[1], 2) < 0)
-            _exit(127);
-        close(in_pipe[0]);
-        close(out_pipe[1]);
-        close(err_pipe[1]);
-        snprintf(connect_arg, sizeof connect_arg, "%s:443", host);
-        execlp("openssl", "openssl", "s_client", "-quiet", "-connect",
-               connect_arg, "-servername", host,
-               "-verify_hostname", host,
-               "-verify_return_error",
-               "-CAfile", ca_path,
-               (char *)NULL);
-        _exit(127);
-    }
-
-    close(in_pipe[0]);
-    close(out_pipe[1]);
-    close(err_pipe[1]);
-    return pid;
+    return 0;
+#endif
 }
 
-/* Write the assembled request into the child's stdin pipe, then close it.
- * SIGPIPE is ignored process-wide (util_ignore_sigpipe at startup), so a
- * child that died mid-write surfaces EPIPE here instead of killing us. */
-static void https_req_pump(int in_fd, const char *req, size_t req_len)
+/* One client TLS context with peer verification and CA loading. The
+   context is created per exchange (https_transport) rather than cached:
+   HTTPS round trips are rare (auth/OIDC), and per-exchange ownership
+   keeps the Windows store enumeration and the OpenSSL state clear of
+   static data and locking in a process that spawns threads elsewhere. */
+static SSL_CTX *https_ctx_new(void)
+{
+    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+
+    if (!ctx)
+        return NULL;
+    /* HTTP/1.1 "Connection: close" servers routinely close the TCP
+     * stream without a TLS close_notify; OpenSSL 3 reports that as
+     * error 0A000126. The old pipe-based transport saw plain EOF, so
+     * restore that semantics: SSL_read then returns 0 (clean end). */
+    SSL_CTX_set_options(ctx, SSL_OP_IGNORE_UNEXPECTED_EOF);
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+    if (https_ctx_load_cas(ctx) != 0) {
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+    return ctx;
+}
+
+/* Open a TCP connection to host:port. The connect is driven on a
+   nonblocking socket with a POLLOUT wait (bounded by the remaining
+   deadline), then the socket is switched back to blocking: from there
+   on SO_RCVTIMEO / SO_SNDTIMEO bound every SSL read/write. Returns the
+   fd, or -1 with a reason in diag. */
+static int https_connect_tcp(const char *host, uint16_t port,
+                             uint64_t deadline_ms,
+                             char *diag, size_t diagsz)
+{
+    struct addrinfo hints, *res = NULL, *ai;
+    char service[8];
+    int gai, fd = -1;
+
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    snprintf(service, sizeof service, "%u", (unsigned)port);
+
+    gai = getaddrinfo(host, service, &hints, &res);
+    if (gai != 0) {
+        snprintf(diag, diagsz, "cannot resolve %s: %s", host,
+                 gai_strerror(gai));
+        return -1;
+    }
+
+    for (ai = res; ai; ai = ai->ai_next) {
+        struct pollfd pfd;
+        int pr = 0;
+
+        if (now_ms() >= deadline_ms) {
+            snprintf(diag, diagsz, "timed out connecting to %s", host);
+            break;
+        }
+        fd = port_socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0)
+            continue;
+        if (port_set_nonblock(fd, true) != 0) {
+            port_close(fd);
+            fd = -1;
+            continue;
+        }
+        if (port_connect(fd, ai->ai_addr, ai->ai_addrlen) != 0) {
+            /* nonblocking connect: WSAEWOULDBLOCK -> EAGAIN on Windows,
+             * EINPROGRESS on Linux; both mean "wait for POLLOUT" */
+            if (errno != EINPROGRESS && errno != EAGAIN &&
+                errno != EWOULDBLOCK) {
+                port_close(fd);
+                fd = -1;
+                continue;
+            }
+            pfd.fd = fd;
+            pfd.events = POLLOUT;
+            for (;;) {
+                uint64_t remain = deadline_ms - now_ms();
+                int to = remain > HTTPS_POLL_MS ? (int)HTTPS_POLL_MS
+                                                : (int)remain;
+
+                pr = port_poll(&pfd, 1, to);
+                if (pr >= 0 || errno != EINTR)
+                    break;
+            }
+            if (pr == 0)
+                errno = ETIMEDOUT;
+            if (pr <= 0 || !(pfd.revents & POLLOUT)) {
+                port_close(fd);
+                fd = -1;
+                continue;
+            }
+            {
+                int soerr = 0;
+                socklen_t slen = sizeof soerr;
+
+                if (port_getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr,
+                                    &slen) != 0 ||
+                    soerr != 0) {
+                    if (soerr != 0)
+                        errno = soerr;
+                    port_close(fd);
+                    fd = -1;
+                    continue;
+                }
+            }
+        }
+        /* connected; back to blocking for the TLS exchange */
+        if (port_set_nonblock(fd, false) != 0) {
+            port_close(fd);
+            fd = -1;
+            continue;
+        }
+        break;
+    }
+    freeaddrinfo(res);
+
+    if (fd < 0)
+        snprintf(diag, diagsz, "cannot connect to %s:%u: %s", host,
+                 (unsigned)port, strerror(errno));
+    return fd;
+}
+
+/* Bind the connected socket to a new SSL session for `host`: SNI, peer
+   verification, and the hostname check — the in-process equivalent of
+   `openssl s_client -servername/-verify_hostname -verify_return_error`. */
+static SSL *https_ssl_new(SSL_CTX *ctx, int fd, const char *host)
+{
+    SSL *ssl = SSL_new(ctx);
+
+    if (!ssl)
+        return NULL;
+    if (SSL_set_fd(ssl, fd) != 1 ||
+        SSL_set_tlsext_host_name(ssl, host) != 1 ||
+        SSL_set1_host(ssl, host) != 1) {
+        SSL_free(ssl);
+        return NULL;
+    }
+    SSL_set_verify(ssl, SSL_VERIFY_PEER, NULL);
+    return ssl;
+}
+
+/* Drive the TLS handshake to completion. SO_RCVTIMEO / SO_SNDTIMEO are
+   re-armed to min(remaining budget, HTTPS_POLL_MS) before every SSL
+   call, and the deadline is re-checked whenever a call is interrupted
+   by its socket timeout, so a dead or stalling peer cannot hang the
+   round trip. Returns 0 on success, -1 with a reason in diag. */
+static int https_tls_connect(SSL *ssl, int fd, uint64_t deadline_ms,
+                             char *diag, size_t diagsz)
+{
+    for (;;) {
+        uint64_t remain;
+        int r;
+
+        if (now_ms() >= deadline_ms) {
+            snprintf(diag, diagsz, "TLS handshake timed out");
+            return -1;
+        }
+        remain = deadline_ms - now_ms();
+        if (https_set_io_timeo(fd, SO_RCVTIMEO, remain) != 0 ||
+            https_set_io_timeo(fd, SO_SNDTIMEO, remain) != 0) {
+            snprintf(diag, diagsz, "cannot arm socket timeout: %s",
+                     strerror(errno));
+            return -1;
+        }
+        ERR_clear_error();
+        r = SSL_connect(ssl);
+        if (r == 1)
+            return 0;   /* handshake complete, peer verified */
+        {
+            int e = SSL_get_error(ssl, r);
+
+            if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE)
+                continue;   /* interrupted by the socket timeout */
+            if (e == SSL_ERROR_SYSCALL) {
+                if (errno == EINTR)
+                    continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK ||
+                    errno == ETIMEDOUT) {
+                    if (now_ms() >= deadline_ms) {
+                        snprintf(diag, diagsz, "TLS handshake timed out");
+                        return -1;
+                    }
+                    continue;
+                }
+            }
+            https_ssl_err(diag, diagsz);
+            return -1;
+        }
+    }
+}
+
+/* Send the request. SSL_write on a blocking socket writes the whole
+   buffer or fails; a short count is resumed from where it stopped. A
+   send timeout is final: a record may be half-committed and the
+   connection cannot be resumed (mirrors the old pump, which also gave
+   up the moment the child's pipe broke). Returns 0 on success, -1 with
+   a reason in diag. */
+static int https_tls_write(SSL *ssl, int fd, const char *req,
+                           size_t req_len, uint64_t deadline_ms,
+                           char *diag, size_t diagsz)
 {
     size_t off = 0;
 
     while (off < req_len) {
-        ssize_t w = write(in_fd, req + off, req_len - off);
-        if (w < 0) {
-            if (errno == EINTR)
-                continue;
-            break;
+        uint64_t remain;
+        int w;
+
+        if (now_ms() >= deadline_ms) {
+            snprintf(diag, diagsz, "timed out sending request");
+            return -1;
         }
-        off += (size_t)w;
+        remain = deadline_ms - now_ms();
+        if (https_set_io_timeo(fd, SO_SNDTIMEO, remain) != 0) {
+            snprintf(diag, diagsz, "cannot arm send timeout: %s",
+                     strerror(errno));
+            return -1;
+        }
+        ERR_clear_error();
+        w = SSL_write(ssl, req + off,
+                      req_len - off > INT_MAX ? INT_MAX
+                                              : (int)(req_len - off));
+        if (w > 0) {
+            off += (size_t)w;
+            continue;
+        }
+        {
+            int e = SSL_get_error(ssl, w);
+
+            if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE)
+                continue;
+            if (e == SSL_ERROR_SYSCALL) {
+                if (errno == EINTR)
+                    continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK ||
+                    errno == ETIMEDOUT) {
+                    snprintf(diag, diagsz, "timed out sending request");
+                    return -1;
+                }
+            }
+            https_ssl_err(diag, diagsz);
+            return -1;
+        }
     }
-    close(in_fd);
+    return 0;
 }
 
-/* Read the child's stdout until EOF, timeout, or error; on timeout or
-   runaway response size SIGKILL the child; reap it. Returns 1 if
-   failed (timeout, oversized response, or a child that exited without
-   producing any response), else 0. deadline_ms bounds the whole
-   round-trip (redirect hops included). */
-static int https_resp_read(int out_fd, pid_t pid, struct sbuf *resp,
-                           uint64_t deadline_ms)
+/* Read the raw response until EOF or close_notify, enforcing the 16 MiB
+   ceiling and the round-trip deadline (re-armed before every read, like
+   the old poll loop chunked at HTTPS_POLL_MS). Returns 0 on success,
+   -1 with a reason in diag. */
+static int https_tls_read(SSL *ssl, int fd, struct sbuf *resp,
+                          uint64_t deadline_ms, char *diag, size_t diagsz)
 {
-    struct pollfd pfd;
-    int timed_out = 0;
+    char buf[HTTPS_READ_CHUNK];
 
-    pfd.fd = out_fd;
-    pfd.events = POLLIN;
     for (;;) {
-        uint64_t now = now_ms();
-        int pr;
-        char buf[HTTPS_READ_CHUNK];
-        ssize_t r;
+        uint64_t remain;
+        int r;
 
-        /* hard ceilings for the whole transfer: size (16 MiB) and the
-         * round-trip deadline, checked before polling so an overrun cannot
-         * ride out a full poll interval */
-        if (resp->len > HTTPS_MAX_RESP || now >= deadline_ms) {
-            timed_out = 1;
-            break;
+        if (resp->len > HTTPS_MAX_RESP) {
+            snprintf(diag, diagsz, "response exceeded %u MiB",
+                     (unsigned)(HTTPS_MAX_RESP >> 20));
+            return -1;
         }
-        /* poll no longer than the remaining budget */
-        {
-            uint64_t remain = deadline_ms - now;
-            int to = remain > HTTPS_POLL_MS ? (int)HTTPS_POLL_MS
-                                            : (int)remain;
-            pr = poll(&pfd, 1, to);
+        if (now_ms() >= deadline_ms) {
+            snprintf(diag, diagsz, "timed out waiting for response");
+            return -1;
         }
-        if (pr == 0) {
-            timed_out = 1;
-            break;
+        remain = deadline_ms - now_ms();
+        if (https_set_io_timeo(fd, SO_RCVTIMEO, remain) != 0) {
+            snprintf(diag, diagsz, "cannot arm receive timeout: %s",
+                     strerror(errno));
+            return -1;
         }
-        if (pr < 0) {
-            if (errno == EINTR)
-                continue;
-            timed_out = 1;
-            break;
-        }
-        r = read(out_fd, buf, sizeof buf);
-        if (r == 0)
-            break;
+        ERR_clear_error();
+        r = SSL_read(ssl, buf, sizeof buf);
         if (r > 0) {
             sbuf_app(resp, buf, (size_t)r);
             continue;
         }
-        if (errno != EINTR) {
-            timed_out = 1;
-            break;
+        {
+            int e = SSL_get_error(ssl, r);
+
+            if (e == SSL_ERROR_ZERO_RETURN)
+                return 0;   /* close_notify: clean end of response */
+            if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE)
+                continue;   /* interrupted by the socket timeout */
+            if (e == SSL_ERROR_SYSCALL) {
+                if (r == 0)
+                    return 0;   /* EOF without close_notify: the peer
+                                 * closed after "Connection: close" */
+                if (errno == EINTR)
+                    continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK ||
+                    errno == ETIMEDOUT) {
+                    if (now_ms() >= deadline_ms) {
+                        snprintf(diag, diagsz,
+                                 "timed out waiting for response");
+                        return -1;
+                    }
+                    continue;
+                }
+            }
+            https_ssl_err(diag, diagsz);
+            return -1;
         }
     }
-    if (timed_out)
-        kill(pid, SIGKILL);
-    {
-        int wst = 0;
-        while (waitpid(pid, &wst, 0) < 0 && errno == EINTR)
-            ;
-        /* a child that died without emitting a response (e.g. failed
-         * TLS handshake) is a failure; once bytes arrived the response
-         * stands on its own and the exit code is irrelevant */
-        if (!timed_out && resp->len == 0 &&
-            ((WIFEXITED(wst) && WEXITSTATUS(wst) != 0) || WIFSIGNALED(wst)))
-            timed_out = 1;
-    }
-    close(out_fd);
-    return timed_out;
 }
 
 /* Locate the start of the header lines and of the body in a response. */
@@ -600,57 +840,67 @@ static int https_resp_parse(struct sbuf *resp, int *status, char **body_out)
     return 1;
 }
 
-/* One request/response exchange with a fresh openssl s_client: spawn,
-   pump the request, read the raw response (deadline-bounded). Returns 1 on
-   success with *resp holding the raw bytes (caller parses), else 0 with a
-   diagnostic logged: the child's stderr is drained and its first line
-   surfaced, so a failed TLS handshake (certificate, hostname, network)
-   is no longer invisible. */
+/* One request/response exchange over a fresh TLS connection: resolve +
+   connect, verified handshake, write the request, read the raw response
+   (deadline-bounded, 16 MiB ceiling). Returns 1 on success with *resp
+   holding the raw bytes (caller parses), else 0 with a diagnostic
+   logged in the "HTTPS transport failed for %s" shape: the OpenSSL
+   error string for TLS failures (certificate, hostname, protocol), the
+   errno text for socket failures, or the timeout message. */
 static bool https_transport(const char *host, struct sbuf *req,
                             struct sbuf *resp, uint64_t deadline_ms)
 {
-    int in_pipe[2], out_pipe[2], err_pipe[2];
-    pid_t pid;
+    char diag[512];
+    SSL_CTX *ctx = NULL;
+    SSL *ssl = NULL;
+    int fd = -1;
+    bool ok = false;
 
-    pid = https_spawn_client(host, in_pipe, out_pipe, err_pipe);
-    if (pid < 0) {
+    ctx = https_ctx_new();
+    if (!ctx) {
+        /* CA problem: https_ctx_new already logged the specific reason
+         * (missing bundle on Linux, empty ROOT store on Windows) */
         free(req->d);
         return false;
     }
 
-    https_req_pump(in_pipe[1], req->d, req->len);
+    fd = https_connect_tcp(host, 443, deadline_ms, diag, sizeof diag);
+    if (fd < 0)
+        goto out;
+
+    ssl = https_ssl_new(ctx, fd, host);
+    if (!ssl) {
+        https_ssl_err(diag, sizeof diag);
+        goto out;
+    }
+    if (https_tls_connect(ssl, fd, deadline_ms, diag, sizeof diag) != 0)
+        goto out;
+    if (https_tls_write(ssl, fd, req->d, req->len, deadline_ms, diag,
+                        sizeof diag) != 0)
+        goto out;
+    if (https_tls_read(ssl, fd, resp, deadline_ms, diag, sizeof diag) != 0)
+        goto out;
+    ok = true;
+
+out:
     free(req->d);
-
-    if (https_resp_read(out_pipe[0], pid, resp, deadline_ms) ||
-        resp->len == 0) {
-        /* the child is already reaped (https_resp_read), so its stderr
-         * is fully buffered in the pipe; drain and keep the first line */
-        char diag[512];
-        size_t n = 0;
-
-        for (;;) {
-            ssize_t r = read(err_pipe[0], diag + n, sizeof diag - 1 - n);
-            if (r <= 0)
-                break;
-            n += (size_t)r;
-            diag[n] = '\0';
-            if (memchr(diag, '\n', n) != NULL || n == sizeof diag - 1)
-                break;
-        }
-        close(err_pipe[0]);
-        if (n > 0) {
-            char *nl = memchr(diag, '\n', n);
-            if (nl)
-                *nl = '\0';
-            log_err("HTTPS transport failed for %s: %s", host, diag);
-        } else {
-            log_err("HTTPS transport failed for %s: no response from "
-                    "openssl s_client", host);
-        }
+    if (ssl)
+        SSL_free(ssl);
+    if (ctx)
+        SSL_CTX_free(ctx);
+    if (fd >= 0)
+        port_close(fd);
+    if (!ok || resp->len == 0) {
+        /* an empty response is a failure too (the old code treated a
+         * child that produced no bytes the same way) */
+        log_err("HTTPS transport failed for %s: %s", host,
+                ok ? "no response from server" : diag);
         free(resp->d);
+        resp->d = NULL;
+        resp->len = 0;
+        resp->cap = 0;
         return false;
     }
-    close(err_pipe[0]);
     return true;
 }
 
@@ -664,8 +914,8 @@ static const char *const *https_drop_auth(const char *const *headers,
     size_t src, dst = 0;
 
     for (src = 0; headers[src]; src++) {
-        if (strncasecmp(headers[src], "Authorization:",
-                        strlen("Authorization:")) == 0)
+        if (port_strncasecmp(headers[src], "Authorization:",
+                             strlen("Authorization:")) == 0)
             continue;   /* drop it */
         if (dst + 1 >= store_sz)
             return NULL;

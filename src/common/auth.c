@@ -1,14 +1,17 @@
 #include <errno.h>
-#include <netinet/in.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifndef _WIN32
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <netdb.h>
 #include <unistd.h>
+#endif
 
 #include "auth.h"
 #include "common.h"
@@ -150,6 +153,17 @@ bool parse_ack(const uint8_t *buf, size_t len, uint32_t expect_nonce,
     /* sid/tok are only filled after the signature check below: an
      * attacker-forged frame must not leave half-populated results */
     if (t == PT_OPEN_REJECT) {
+        /* F5: require the same header signature as the ACK branch below;
+         * an unsigned or truncated reject must fail with "bad sig"
+         * instead of rendering attacker-chosen T_ERR_MSG text. The sig
+         * key is public, so this only stops accidental/naive forgeries,
+         * not determined attackers — the real server signs its rejects
+         * (server.c builds them with ctrl_hdr). len < IWAN_CTRL_LEN was
+         * already rejected above. */
+        if (!verify_sig(buf, len)) {
+            set_err(errmsg, errmsg_sz, "bad sig");
+            return false;
+        }
         /* the reason rides in a T_ERR_MSG TLV; render only its value.
          * (Rendering the raw TLV bytes used to mangle the type/length
          * prefix into the message.) Sanitize control bytes in place. */
@@ -240,7 +254,7 @@ int udp_connect(const char *host, uint16_t port, int timeout_ms)
         return -1;
     }
 
-    fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    fd = port_socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (fd < 0) {
         freeaddrinfo(res);
         return -1;
@@ -252,21 +266,21 @@ int udp_connect(const char *host, uint16_t port, int timeout_ms)
      * for diagnostics. (No explicit bind needed: connect() binds the
      * local address implicitly.) */
     int bufsz = 4 * 1024 * 1024;
-    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bufsz, sizeof bufsz) < 0)
+    if (port_setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bufsz, sizeof bufsz) < 0)
         log_debug("SO_RCVBUF: %s", strerror(errno));
-    if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufsz, sizeof bufsz) < 0)
+    if (port_setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufsz, sizeof bufsz) < 0)
         log_debug("SO_SNDBUF: %s", strerror(errno));
-    if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
-        close(fd);
+    if (port_connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
+        port_close(fd);
         freeaddrinfo(res);
         return -1;
     }
 
     tv.tv_sec = timeout_ms / 1000;
     tv.tv_usec = (timeout_ms % 1000) * 1000;
-    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv) < 0)
+    if (port_setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv) < 0)
         log_debug("SO_RCVTIMEO: %s", strerror(errno));
-    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv) < 0)
+    if (port_setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv) < 0)
         log_debug("SO_SNDTIMEO: %s", strerror(errno));
 
     freeaddrinfo(res);
@@ -312,11 +326,11 @@ int do_auth(const char *server, uint16_t port, const uint8_t *open_pkt, size_t o
         return -1;
 
     for (int i = 0; i < AUTH_SEND_MAX; i++) {
-        if (send(fd, open_pkt, open_len, 0) < 0) {
+        if (port_send(fd, open_pkt, open_len, 0) < 0) {
             fprintf(stderr,
                     "Error: send OPEN\n\nCaused by:\n    %s (os error %d)\n",
                     strerror(errno), errno);
-            close(fd);
+            port_close(fd);
             return -1;
         }
         if (style == DO_AUTH_AUTH)
@@ -324,7 +338,7 @@ int do_auth(const char *server, uint16_t port, const uint8_t *open_pkt, size_t o
         else if (style == DO_AUTH_PUMP)
             eprintf("[%d] -> OPEN\n", i);
 
-        ssize_t n = recv(fd, buf, sizeof buf, 0);
+        ssize_t n = port_recv(fd, buf, sizeof buf, 0);
         if (n >= 0) {
             char errmsg[256];
             if (parse_ack(buf, (size_t)n, nonce, r, errmsg, sizeof errmsg))
@@ -344,9 +358,9 @@ int do_auth(const char *server, uint16_t port, const uint8_t *open_pkt, size_t o
                         errno);
         }
         if (i < AUTH_SEND_MAX - 1)
-            usleep(AUTH_RETRY_DELAY_US);
+            port_sleep_us(AUTH_RETRY_DELAY_US);
     }
 
-    close(fd);
+    port_close(fd);
     return -1;
 }

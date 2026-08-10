@@ -52,8 +52,9 @@ static void p_fail(struct P *p, size_t off, int eof, const char *msg)
             last_nl = k;
         }
     col = last_nl == (size_t)-1 ? i : i - last_nl - 1;
-    snprintf(p->err, sizeof p->err, "%s at line %zu column %zu", msg, line,
-             col);
+    /* %llu not %zu: msvcrt printf (Windows) lacks %zu */
+    snprintf(p->err, sizeof p->err, "%s at line %llu column %llu", msg,
+             (unsigned long long)line, (unsigned long long)col);
 }
 
 struct jbuf {

@@ -2,7 +2,38 @@ CC      ?= cc
 CLANG   ?= clang
 CFLAGS  ?= -O2 -Wall -Wextra -std=c11 -D_GNU_SOURCE -fstack-protector-strong -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3 -fPIE -MMD -MP -pthread
 LDFLAGS ?= -pie -Wl,-z,now -Wl,-z,relro -Wl,-z,noexecstack
-LDLIBS  := -lcrypto
+
+# Build target: linux (default) or win32 (Windows cross-compile, e.g.
+# make TARGET=win32 CC=x86_64-w64-mingw32-gcc). Every Windows-specific
+# bit below keys off this variable so the default Linux build is
+# byte-for-byte unchanged.
+TARGET ?= linux
+
+ifeq ($(TARGET),win32)
+# MinGW-w64 build. -D_GNU_SOURCE and -fPIE are glibc/ELF-isms; mingw-w64's
+# FORTIFY_SOURCE support is unreliable, so drop all three and keep the
+# portable flags plus the Windows API version pins. -pthread stays
+# (winpthreads on win32 thread model). These defaults apply when CFLAGS is
+# not given on the command line; CI passes the full set itself.
+CFLAGS := $(filter-out -D_GNU_SOURCE -fPIE -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3,$(CFLAGS))
+CFLAGS += -D_WIN32_WINNT=0x0601 -DWINVER=0x0601
+# ELF hardening flags (-pie, -z now/relro/noexecstack) don't apply to PE;
+# use the equivalent PE hardening flags.
+LDFLAGS := -Wl,--dynamicbase -Wl,--nxcompat -Wl,--high-entropy-va
+LDLIBS  := -lws2_32 -liphlpapi -lbcrypt -lcrypt32 -lssl -lcrypto
+BIN_SUFFIX := .exe
+# OpenSSL cross sysroot (e.g. an MSYS2 ucrt64 package unpacked locally).
+# override: OPENSSL_DIR must take effect even when CFLAGS/LDFLAGS are given
+# on the command line (CI passes CFLAGS explicitly).
+ifneq ($(OPENSSL_DIR),)
+override CFLAGS += -I$(OPENSSL_DIR)/include
+override LDFLAGS += -L$(OPENSSL_DIR)/lib
+endif
+else
+# https.c links against libssl (both platforms).
+LDLIBS := -lssl -lcrypto
+BIN_SUFFIX :=
+endif
 
 SRC_DIR    := src
 COMMON_DIR := $(SRC_DIR)/common
@@ -13,8 +44,18 @@ BIN_DIR    := bin
 # steer_bpf.c is compiled with clang -target bpf into a BPF ELF object
 # (build/steer_bpf.o) that is embedded, not linked: it must never be
 # recompiled for the host nor archived into the host static libraries,
-# so exclude it from COMMON_SRCS.
+# so exclude it from COMMON_SRCS. On win32, server.c (server-only, does
+# not compile for Windows) and tun.c (replaced by tun_win.c) are also
+# excluded, and port.c + tun_win.c supply the Windows halves of the
+# portability layer (the Linux halves are static inlines in port.h).
+ifeq ($(TARGET),win32)
+# tun_win.c is appended explicitly (filtered from the wildcard) so it is
+# listed exactly once whether or not it exists on disk yet; port.c is
+# already picked up by the wildcard.
+COMMON_SRCS := $(filter-out $(COMMON_DIR)/server.c $(COMMON_DIR)/tun.c $(COMMON_DIR)/steer_bpf.c $(COMMON_DIR)/tun_win.c,$(wildcard $(COMMON_DIR)/*.c)) $(COMMON_DIR)/tun_win.c
+else
 COMMON_SRCS := $(filter-out $(COMMON_DIR)/steer_bpf.c,$(wildcard $(COMMON_DIR)/*.c))
+endif
 OIDC_SRCS   := $(wildcard $(OIDC_DIR)/*.c)
 
 # Objects are bucketed by source directory (build/common/, build/oidc/,
@@ -27,30 +68,44 @@ LIBCORE := $(BUILD_DIR)/libiwan_core.a
 LIBOIDC := $(BUILD_DIR)/libiwan_oidc.a
 
 .PHONY: all clean test
-all: $(BIN_DIR)/iwan-client $(BIN_DIR)/iwan-client-oidc $(BIN_DIR)/iwan-server
+all: $(BIN_DIR)/iwan-client$(BIN_SUFFIX) $(BIN_DIR)/iwan-client-oidc$(BIN_SUFFIX)
+ifneq ($(TARGET),win32)
+all: $(BIN_DIR)/iwan-server
+endif
 
-$(LIBCORE): $(COMMON_OBJS) $(BUILD_DIR)/steer_bpf_data.o
+# The steer BPF payload is Linux-only (embedded BPF ELF, loaded by
+# tun.c); win32 links no steer_bpf chain at all, so LIBCORE's prereq list
+# drops the generated data object on that target.
+ifneq ($(TARGET),win32)
+STEER_BPF_DATA_OBJ := $(BUILD_DIR)/steer_bpf_data.o
+endif
+
+$(LIBCORE): $(COMMON_OBJS) $(STEER_BPF_DATA_OBJ)
 	rm -f $@ && ar rcs $@ $^
 
 $(LIBOIDC): $(OIDC_OBJS)
 	rm -f $@ && ar rcs $@ $^
 
-$(BIN_DIR)/iwan-client: $(LIBCORE) $(BUILD_DIR)/main/iwan_client.o
+$(BIN_DIR)/iwan-client$(BIN_SUFFIX): $(LIBCORE) $(BUILD_DIR)/main/iwan_client.o
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(BUILD_DIR)/main/iwan_client.o $(LIBCORE) $(LDLIBS)
 
-$(BIN_DIR)/iwan-client-oidc: $(LIBCORE) $(LIBOIDC) $(BUILD_DIR)/main/iwan_client_oidc.o
+$(BIN_DIR)/iwan-client-oidc$(BIN_SUFFIX): $(LIBCORE) $(LIBOIDC) $(BUILD_DIR)/main/iwan_client_oidc.o
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(BUILD_DIR)/main/iwan_client_oidc.o \
 		-Wl,--start-group $(LIBCORE) $(LIBOIDC) -Wl,--end-group $(LDLIBS)
 
+ifneq ($(TARGET),win32)
 $(BIN_DIR)/iwan-server: $(LIBCORE) $(BUILD_DIR)/main/iwan_server.o
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(BUILD_DIR)/main/iwan_server.o $(LIBCORE) $(LDLIBS)
+endif
 
 # Compile the tun steering classifier with clang for the BPF target. The
 # result is a BPF ELF object, not a host object: never link it directly
-# and never archive it into the host libraries.
+# and never archive it into the host libraries. BPF is Linux-only, so
+# none of this chain exists on win32.
+ifneq ($(TARGET),win32)
 $(BUILD_DIR)/steer_bpf.o: $(COMMON_DIR)/steer_bpf.c
 	@mkdir -p $(BUILD_DIR)
 	$(CLANG) -O2 -target bpf -Wall -MMD -MP -c -o $@ $<
@@ -78,6 +133,7 @@ $(BUILD_DIR)/steer_bpf_data.c: $(BUILD_DIR)/steer_bpf.o
 $(BUILD_DIR)/steer_bpf_data.o: $(BUILD_DIR)/steer_bpf_data.c
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c -o $@ $<
+endif
 
 $(BUILD_DIR)/common/%.o: $(COMMON_DIR)/%.c
 	@mkdir -p $(BUILD_DIR)/common
@@ -98,13 +154,19 @@ clean:
 # Integration suite: tests/integration.sh needs root (TUN devices) and is
 # therefore not run by CI — only locally, via sudo. The script handles
 # privilege requirements itself; hint when it is not present yet (the
-# script lands with the integration phase).
+# script lands with the integration phase). The suite is Linux-only
+# (TUN devices, root); the win32 cross build gets a no-op target.
+ifeq ($(TARGET),win32)
+test:
+	@echo "integration tests are Linux-only (TUN devices, root); skipped for TARGET=win32"
+else
 test: all
 	@if [ ! -x tests/integration.sh ]; then \
 		echo "tests/integration.sh not found (integration phase pending); make test skipped"; \
 		exit 0; \
 	fi
 	./tests/integration.sh
+endif
 
 # Compiler-generated header dependencies (from -MMD -MP). Wildcards expand
 # to nothing on a fresh tree, which -include tolerates.

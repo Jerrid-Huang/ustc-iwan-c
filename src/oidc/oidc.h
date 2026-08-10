@@ -1,7 +1,11 @@
 #ifndef IWAN_OIDC_H
 #define IWAN_OIDC_H
 
-#include <netinet/in.h>
+#ifdef _WIN32
+#  include <winsock2.h>
+#else
+#  include <netinet/in.h>
+#endif
 #include <stdbool.h>
 #include <stdint.h>
 

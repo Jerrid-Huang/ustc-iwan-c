@@ -1,10 +1,13 @@
 /* Small shared helpers for the OIDC client (errors, entropy, URL/hex/JSON). */
 
-#include <arpa/inet.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifndef _WIN32
+#include <arpa/inet.h>
+#endif
 
 #include "common.h"
 #include "crypto.h"

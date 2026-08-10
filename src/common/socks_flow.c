@@ -1,16 +1,30 @@
-#include <arpa/inet.h>
 #include <errno.h>
-#include <netdb.h>
 #include <stdio.h>
-#include <netinet/in.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+
+/* POSIX-only headers: on Windows getaddrinfo/inet_ntop/iovec come from
+ * port.h (winsock2/ws2tcpip). */
+#ifndef _WIN32
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <sys/uio.h>
 #include <unistd.h>
+#endif
+
+/* winsock2 names the shutdown how-values SD_SEND etc.; the numeric
+ * values match the POSIX SHUT_* constants, and port_shutdown passes
+ * them straight through, so alias SHUT_WR for the call below. */
+#ifdef _WIN32
+#ifndef SHUT_WR
+#define SHUT_WR 1
+#endif
+#endif
 
 #include "common.h"
 #include "crypto.h"
@@ -44,10 +58,11 @@ static void flowdbg(const Flow *f, const char *why)
         return;
     c = f->ns_idx >= 0 ? ns_conn(&g_ns, f->ns_idx) : NULL;
     fprintf(stderr, "FLOWDBG: flow=%d fd=%d state=%s ns=%d conn_state=%d "
-            "rxq=%zu out=%zu why=%s\n",
+            "rxq=%llu out=%llu why=%s\n",
             (int)(f - g_flows), f->fd, flow_state_name(f->state),
-            f->ns_idx, c ? (int)c->state : -1, c ? c->rxq.len : 0,
-            f->output.len, why);
+            f->ns_idx, c ? (int)c->state : -1,
+            c ? (unsigned long long)c->rxq.len : 0ULL,
+            (unsigned long long)f->output.len, why);
 }
 
 uint64_t g_next_id = 1;
@@ -339,7 +354,7 @@ static int dns_register(uint16_t id, uint16_t sport, const DnsJob *j)
             return i;
         }
         pthread_mutex_unlock(&g_dns_wait_mu);
-        usleep(10 * 1000);
+        port_sleep_us(10 * 1000);
     }
     return -1;
 }
@@ -649,7 +664,7 @@ static void *dns_worker(void *arg) {
         pthread_mutex_unlock(&g_dns_wait_mu);
         goto done;
     }
-    if (send(g_sockfd, out, (int)outlen, 0) < 0 && errno != EAGAIN &&
+    if (port_send(g_sockfd, out, (int)outlen, 0) < 0 && errno != EAGAIN &&
         errno != EWOULDBLOCK) {
         /* hard send error (ENETUNREACH, EPERM, ...): fail fast — a
          * retry loop cannot succeed, and the flow would only see its
@@ -664,7 +679,7 @@ static void *dns_worker(void *arg) {
     for (;;) {
         int act = 0;             /* 0 wait, 1 resend, 2 fail, 3 done */
         uint64_t now;
-        usleep(DNS_POLL_MS * 1000);
+        port_sleep_us(DNS_POLL_MS * 1000);
         now = now_ms();
         pthread_mutex_lock(&g_dns_wait_mu);
         if (atomic_load(&g_dns_gen) != j->gen) {
@@ -686,7 +701,7 @@ static void *dns_worker(void *arg) {
                 /* resend under the lock: dns_stop() (generation bump +
                  * socket close) can only run between these critical
                  * sections, never mid-send */
-                if (send(g_sockfd, out, (int)outlen, 0) >= 0)
+                if (port_send(g_sockfd, out, (int)outlen, 0) >= 0)
                     last_send = now;
                 /* EAGAIN/short send: last_send stays, the next 250ms
                  * tick retries */
@@ -715,11 +730,12 @@ done:
      * Same lock serializes this write against the evfd close. */
     pthread_mutex_lock(&g_dns_wait_mu);
     if (atomic_load(&g_dns_gen) == j->gen && g_dns_evfd >= 0) {
-        uint64_t one = 1;
         /* EAGAIN means the eventfd counter is already non-zero: the loop
-         * is (or will be) awake, so a failed write is not an error */
-        if (write(g_dns_evfd, &one, sizeof one) != (ssize_t)sizeof one &&
-            errno != EAGAIN)
+         * is (or will be) awake, so a failed wake is not an error.
+         * port_evfd_wake returns -1 with errno == EAGAIN on Linux when
+         * the counter is already set; on Windows the UDP-pair wake send
+         * always succeeds, so this branch is inert there. */
+        if (port_evfd_wake(g_dns_evfd) != 0 && errno != EAGAIN)
             log_debug("dns evfd wake: %s", strerror(errno));
     }
     pthread_mutex_unlock(&g_dns_wait_mu);
@@ -812,7 +828,7 @@ Flow *flow_alloc(struct sockaddr_in *peer) {
 
 void flow_free(Flow *f) {
     if (f->fd >= 0) {
-        close(f->fd);
+        port_close(f->fd);   /* local client stream: a socket */
         f->fd = -1;
     }
     if (f->ns_idx >= 0)
@@ -1149,7 +1165,7 @@ void service_local_inputs(Flow *fs) {
                     }
                     break;       /* stack full: backpressure */
                 }
-                ssize_t r2 = readv(f->fd, iov, nv);
+                ssize_t r2 = port_readv(f->fd, iov, nv);
                 if (r2 > 0) {
                     size_t left = (size_t)r2;
                     for (int k = 0; k < nv && left > 0; k++) {
@@ -1159,8 +1175,10 @@ void service_local_inputs(Flow *fs) {
                         left -= take;
                     }
                 } else if (r2 == 0) {
+#ifndef _WIN32
                     /* diagnostic: why did readv return EOF while the app
-                     * is still connected? dump fd state */
+                     * is still connected? dump fd state. fstat on a
+                     * socket is POSIX-only; this block is debug-only. */
                     if (dbg_env("IWAN_FLOWDBG")) {
                         struct stat st;
                         int soerr = 0;
@@ -1169,13 +1187,14 @@ void service_local_inputs(Flow *fs) {
                                 "FLOWDBG: readv EOF fd=%d fstat=%d "
                                 "mode=%o soerr=", f->fd,
                                 fstat(f->fd, &st), st.st_mode);
-                        if (getsockopt(f->fd, SOL_SOCKET, SO_ERROR,
-                                       &soerr, &sl) == 0)
+                        if (port_getsockopt(f->fd, SOL_SOCKET, SO_ERROR,
+                                            &soerr, &sl) == 0)
                             fprintf(stderr, "%d (%s)\n", soerr,
                                     strerror(soerr));
                         else
                             fprintf(stderr, "getsockopt fail\n");
                     }
+#endif
                     f->local_eof = true;
                     flowdbg(f, "readv EOF -> ns_close");
                     ns_close(&g_ns, f->ns_idx);
@@ -1188,7 +1207,7 @@ void service_local_inputs(Flow *fs) {
         } else {
             /* greeting/request: read into rbuf for the handshake parser */
             uint8_t rbuf[TCP_RX_CHUNK];
-            ssize_t n = read(f->fd, rbuf, sizeof rbuf);
+            ssize_t n = port_recv(f->fd, rbuf, sizeof rbuf, 0);
             if (n == 0) {
                 /* client gone before the handshake finished: close the
                  * flow so reap_flows collects it (previously the slot
@@ -1231,7 +1250,7 @@ void service_local_outputs(void) {
             continue;
 
         while (f->output.len > 0) {
-            ssize_t n = write(f->fd, f->output.data, f->output.len);
+            ssize_t n = port_send(f->fd, f->output.data, f->output.len, 0);
             if (n > 0) {
                 if ((size_t)n == f->output.len)
                     buf_clear(&f->output);   /* full drain: no memmove */
@@ -1257,7 +1276,7 @@ void service_local_outputs(void) {
                                   : c->rxq.len;
                 struct iovec io = { .iov_base = c->rxq.data,
                                     .iov_len = want };
-                ssize_t n = writev(f->fd, &io, 1);
+                ssize_t n = port_writev(f->fd, &io, 1);
                 if (n > 0) {
                     if ((size_t)n == want) {
                         /* full drain (the common case): the payload is
@@ -1286,7 +1305,7 @@ void service_local_outputs(void) {
             if (c && c->state == NS_CLOSE_WAIT && c->rxq.len == 0 &&
                 f->output.len == 0) {
                 flowdbg(f, "CLOSE_WAIT rxq-empty -> ns_close");
-                shutdown(f->fd, SHUT_WR);
+                port_shutdown(f->fd, SHUT_WR);
                 ns_close(&g_ns, f->ns_idx);
                 set_flow_state(f, ST_CLOSING);
             }

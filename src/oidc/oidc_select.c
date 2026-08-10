@@ -60,8 +60,8 @@ void oidc_print_servers(Json *servers)
         const char *nm = name ? name : "";
         int w = utf8_width(nm);
         int pad = w < 30 ? 30 - w : 0;
-        printf("%2zu. %s%*s %s:%lu\n", i + 1, nm, pad, "",
-               host ? host : "", port);
+        printf("%2llu. %s%*s %s:%lu\n", (unsigned long long)(i + 1),
+               nm, pad, "", host ? host : "", port);
     }
 }
 
@@ -126,7 +126,7 @@ Json *oidc_select_server(Json *servers)
 {
     size_t n = json_arr_len(servers);
     for (;;) {
-        printf("  Select server [1-%zu]: ", n);
+        printf("  Select server [1-%llu]: ", (unsigned long long)n);
         fflush(stdout);
         char buf[32];
         if (!fgets(buf, sizeof buf, stdin))

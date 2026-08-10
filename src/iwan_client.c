@@ -1,15 +1,18 @@
-#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+#ifndef _WIN32
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
-#include <time.h>
 #include <unistd.h>
+#endif
 
 #include "addr.h"
 #include "auth.h"
@@ -227,8 +230,66 @@ static void err_required_pass(const char *sub)
  * file is accepted (a FIFO with no writer would otherwise block the
  * open forever), an empty file or an over-long first line is a hard
  * error rather than a silently truncated password. Errors exit(1). */
+#ifdef _WIN32
+/* map a GetLastError() code to a POSIX-style errno so the pass-file
+ * error messages (strerror(errno)) read the same as on Linux */
+static int win_errno(void)
+{
+    switch (GetLastError()) {
+    case ERROR_FILE_NOT_FOUND:
+    case ERROR_PATH_NOT_FOUND:      return ENOENT;
+    case ERROR_ACCESS_DENIED:
+    case ERROR_SHARING_VIOLATION:   return EACCES;
+    case ERROR_TOO_MANY_OPEN_FILES: return EMFILE;
+    default:                        return EIO;
+    }
+}
+#endif
+
 static const char *read_pass_file(const char *path, char *buf, size_t sz)
 {
+#ifdef _WIN32
+    /* CreateFileA with FILE_FLAG_OPEN_REPARSE_POINT: a symlink/junction
+     * is opened as the link itself, never followed, and rejected below —
+     * the O_NOFOLLOW equivalent (O_NOFOLLOW does not exist on Windows).
+     * FILE_FLAG_BACKUP_SEMANTICS allows opening a directory just far
+     * enough to detect and reject it. */
+    HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                           OPEN_EXISTING,
+                           FILE_FLAG_OPEN_REPARSE_POINT |
+                               FILE_FLAG_BACKUP_SEMANTICS,
+                           NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        errno = win_errno();
+        log_err("Error: cannot open pass file '%s': %s", path,
+                strerror(errno));
+        exit(1);
+    }
+    BY_HANDLE_FILE_INFORMATION fi;
+    if (!GetFileInformationByHandle(h, &fi)) {
+        errno = win_errno();
+        log_err("Error: cannot stat pass file '%s': %s", path,
+                strerror(errno));
+        CloseHandle(h);
+        exit(1);
+    }
+    if ((fi.dwFileAttributes &
+         (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY |
+          FILE_ATTRIBUTE_DEVICE)) != 0) {
+        log_err("Error: pass file '%s' is not a regular file", path);
+        CloseHandle(h);
+        exit(1);
+    }
+    DWORD n = 0;
+    if (!ReadFile(h, buf, (DWORD)(sz - 1), &n, NULL)) {
+        errno = win_errno();
+        log_err("Error: cannot read pass file '%s': %s", path,
+                strerror(errno));
+        CloseHandle(h);
+        exit(1);
+    }
+    CloseHandle(h);
+#else
     int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
     if (fd < 0) {
         log_err("Error: cannot open pass file '%s': %s", path,
@@ -254,6 +315,7 @@ static const char *read_pass_file(const char *path, char *buf, size_t sz)
                 strerror(errno));
         exit(1);
     }
+#endif
     if (n == 0) {
         log_err("Error: pass file '%s' is empty", path);
         exit(1);
@@ -329,6 +391,26 @@ static void check_server_ip(const char *server, const char *ctx)
     if (inet_pton(AF_INET, ip, &a4) != 1 &&
         inet_pton(AF_INET6, ip, &a6) != 1)
         die_invalid_address(ctx);
+}
+
+/* F8: cross-check the server-issued gateway against the --server the
+ * client actually connected to. Both are dotted-quads; when --server is a
+ * hostname (or any non-IPv4 literal) it resolves elsewhere, so there is
+ * nothing to compare and the check is skipped silently. A mismatch is
+ * legal in NAT setups, so this is a warning only — but an unexpected
+ * mismatch may indicate a forged OPEN_ACK. */
+static void check_gw_server(const char *server, const char *gw)
+{
+    uint8_t sb[4], gb[4];
+
+    if (!s2ip4(server, sb) || !s2ip4(gw, gb))
+        return;
+    if (memcmp(sb, gb, sizeof sb) != 0) {
+        log_err("WARNING: server-issued gateway %s differs from the "
+                "connected server %s (NAT setups are normal; an "
+                "unexpected mismatch may indicate a forged OPEN_ACK)",
+                gw, server);
+    }
 }
 
 /* parse subcommand args; on -h/--help/errors the shared parser exits */
@@ -450,6 +532,7 @@ static void free_route_opts(CmdOpts *o)
  * interface (the caller must abort). */
 static int cleanup_stale_tun(const char *name)
 {
+#ifndef _WIN32
     char p[256];
     int fd;
 
@@ -476,6 +559,13 @@ static int cleanup_stale_tun(const char *name)
         log_err("Error: cannot inspect tun device '%s': %s", name,
                 strerror(e));
     return 0;   /* absent (or uninspectable): leave it to open_tun */
+#else
+    /* no /sys on Windows: wintun's open_tun (tun_win.c) deletes a stale
+     * adapter with the same name as part of open-or-create, so there is
+     * nothing to pre-clean here. */
+    (void)name;
+    return 0;
+#endif
 }
 
 /* ---- commands ---- */
@@ -544,28 +634,28 @@ static int cmd_ping(int argc, char **argv, int start)
     buf_t pkt;
     buf_init(&pkt);
     ctrl_hdr(&pkt, PT_PING_REQ, 0, IWAN_PING_SID, IWAN_PING_TOK);
-    if (send(fd, pkt.data, pkt.len, 0) != (ssize_t)pkt.len) {
+    if (port_send(fd, pkt.data, pkt.len, 0) != (ssize_t)pkt.len) {
         log_err("Error: send PING: %s", strerror(errno));
         buf_free(&pkt);
-        close(fd);
+        port_close(fd);
         return 1;
     }
     log_info("-> PING (%zuB) to %s:%u", pkt.len, o.server, (unsigned)o.port);
     buf_free(&pkt);
 
     uint8_t rbuf[PING_BUF_SZ] = { 0 };
-    struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    ssize_t n = recv(fd, rbuf, sizeof rbuf, 0);
+    /* port_now_us is the monotonic clock (QPC on Windows); convert the
+     * us delta back to ns so fmt_duration keeps its existing units */
+    uint64_t t0 = port_now_us();
+    ssize_t n = port_recv(fd, rbuf, sizeof rbuf, 0);
     if (n == IWAN_CTRL_LEN && rbuf[0] == PT_PING_RSP &&
         verify_sig(rbuf, (size_t)n)) {
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        uint64_t ns = (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000000ull +
-                      (uint64_t)(t1.tv_nsec - t0.tv_nsec);
+        uint64_t t1 = port_now_us();
+        uint64_t ns = (t1 - t0) * 1000ull;
         char dbuf[48];
         fmt_duration(dbuf, sizeof dbuf, ns);
         log_info("<- PONG  RTT=%s", dbuf);
-        close(fd);
+        port_close(fd);
         return 0;
     }
     if (n < 0) {
@@ -575,7 +665,7 @@ static int cmd_ping(int argc, char **argv, int start)
         hex_encode(rbuf, (size_t)n, hex);
         log_err("Error: <- %dB type=0x%02x %s", (int)n, rbuf[0], hex);
     }
-    close(fd);
+    port_close(fd);
     return 1;
 }
 
@@ -611,10 +701,10 @@ static int cmd_auth(int argc, char **argv, int start)
     buf_t cl;
     buf_init(&cl);
     ctrl_hdr(&cl, PT_CLOSE, o.encrypt, res.sid, res.tok);
-    (void)send(fd, cl.data, cl.len, 0);
+    (void)port_send(fd, cl.data, cl.len, 0);
     log_info("-> CLOSE");
     buf_free(&cl);
-    close(fd);
+    port_close(fd);
     return 0;
 }
 
@@ -653,6 +743,16 @@ static int cmd_proxy(int argc, char **argv, int start)
         return 1;
     }
 
+    check_gw_server(o.server, res.gw);   /* F8: gateway vs connected server */
+
+#ifdef _WIN32
+    /* Windows sockets default to blocking; the pump paths (run_pump /
+     * run_socks) expect a nonblocking datagram socket. On Linux the pump
+     * sets this itself. */
+    if (port_set_nonblock(sockfd, true) != 0)
+        log_err("Error: set nonblock: %s", strerror(errno));
+#endif
+
     if (o.encrypt != 1)
         log_err("WARN: data-plane only XOR(1), got %d", o.encrypt);
 
@@ -663,7 +763,7 @@ static int cmd_proxy(int argc, char **argv, int start)
     if (!tun_name_valid(o.tun)) {
         log_err("Error: invalid TUN device name '%s'", o.tun);
         wipe(sk, sizeof sk);
-        close(sockfd);
+        port_close(sockfd);
         free_route_opts(&o);
         return 1;
     }
@@ -674,7 +774,7 @@ static int cmd_proxy(int argc, char **argv, int start)
 
     if (cleanup_stale_tun(o.tun) < 0) {
         wipe(sk, sizeof sk);
-        close(sockfd);
+        port_close(sockfd);
         slist_free(&routes);
         free_route_opts(&o);
         return 1;
@@ -684,7 +784,7 @@ static int cmd_proxy(int argc, char **argv, int start)
     if (tun_fd < 0) {
         log_err("Error: open tun (must be root)");
         wipe(sk, sizeof sk);
-        close(sockfd);
+        port_close(sockfd);
         slist_free(&routes);
         free_route_opts(&o);
         return 1;
@@ -698,7 +798,7 @@ static int cmd_proxy(int argc, char **argv, int start)
     tun_close(tun_fd);
     log_info("done.");
 
-    close(sockfd);
+    port_close(sockfd);
     slist_free(&routes);
     free_route_opts(&o);
     return rc == 0 ? 0 : 1;
@@ -735,6 +835,12 @@ static int cmd_socks(int argc, char **argv, int start)
         cleanse_str(o.pass);
         return 1;
     }
+#ifdef _WIN32
+    /* Windows sockets default to blocking; run_socks expects a
+     * nonblocking datagram socket. On Linux run_socks sets this itself. */
+    if (port_set_nonblock(sockfd, true) != 0)
+        log_err("Error: set nonblock: %s", strerror(errno));
+#endif
     if (o.encrypt != 1)
         log_err("WARN: data-plane only XOR(1), got %d", o.encrypt);
 
@@ -746,17 +852,18 @@ static int cmd_socks(int argc, char **argv, int start)
     if (!s2ip4(res.tun, b)) {
         log_err("Error: server returned invalid tunnel IPv4 address");
         wipe(sk, sizeof sk);
-        close(sockfd);
+        port_close(sockfd);
         return 1;
     }
     uint32_t inner_ip = ip4_u32(b);
     if (!s2ip4(res.gw, b)) {
         log_err("Error: server returned invalid gateway IPv4 address");
         wipe(sk, sizeof sk);
-        close(sockfd);
+        port_close(sockfd);
         return 1;
     }
     uint32_t gateway = ip4_u32(b);
+    check_gw_server(o.server, res.gw);   /* F8: gateway vs connected server */
 
     /* valid_listen already validated the syntax at parse time; this
      * parse only fills the sockaddr for run_socks */
@@ -780,12 +887,13 @@ static int cmd_socks(int argc, char **argv, int start)
     snprintf(cfg.dns, sizeof cfg.dns, "%s", res.dns);
 
     run_socks(sockfd, &cfg);
-    close(sockfd);
+    port_close(sockfd);
     return 0;
 }
 
 int main(int argc, char **argv)
 {
+    port_socket_init();   /* WSAStartup on Windows; no-op on Linux */
     util_ignore_sigpipe();
     if (argc < 2) {
         /* clap arg_required_else_help: help on stderr, exit 2 */

@@ -5,9 +5,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 #include <time.h>
+
+#ifndef _WIN32
+#include <sys/stat.h>
 #include <unistd.h>
+#else
+#include <io.h>
+#endif
 
 #include "common.h"
 #include "crypto.h"
@@ -42,12 +47,30 @@ static char *state_file_path(void)
     const char *dir = getenv("XDG_RUNTIME_DIR");
     if (!dir || !*dir)
         dir = getenv("TMPDIR");
+#ifndef _WIN32
     if (!dir || !*dir)
         dir = "/tmp";
+#else
+    if (!dir || !*dir)
+        dir = getenv("TEMP");
+    if (!dir || !*dir)
+        dir = getenv("TMP");
+    if (!dir || !*dir)
+        dir = ".";
+#endif
     size_t n = strlen(dir) + 64;
     char *p = malloc(n);
+#ifdef _WIN32
+    /* no uid on Windows: the USERNAME env var stands in for the per-user
+     * directory component. This is not a security boundary — the file is
+     * 0600-created with O_EXCL and the random suffix does that work. */
+    const char *user = getenv("USERNAME");
+    snprintf(p, n, "%s/iwan-oidc-state-%.32s-%08lx", dir,
+             user && *user ? user : "unknown", (unsigned long)rand_u32());
+#else
     snprintf(p, n, "%s/iwan-oidc-state-%ld-%08lx", dir, (long)getuid(),
              (unsigned long)rand_u32());
+#endif
     return p;
 }
 
@@ -55,20 +78,36 @@ static void save_state_file(const char *path, const char *state)
 {
     /* O_EXCL|O_NOFOLLOW: never follow a pre-planted symlink, never
      * overwrite someone else's file. The randomized name makes a
-     * collision negligible, so EEXIST is a hard failure. */
+     * collision negligible, so EEXIST is a hard failure.
+     * Windows: O_NOFOLLOW has no equivalent, but the file is created
+     * fresh with O_CREAT|O_EXCL (fails if ANYTHING exists at the random
+     * path), so there is no pre-existing link to follow. */
+#ifdef _WIN32
+    int fd = _open(path, _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY, 0600);
+#else
     int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+#endif
     if (fd < 0)
         oidc_die("cannot create OAuth state file %s: %s", path,
                  strerror(errno));
     FILE *f = fdopen(fd, "wb");
     if (!f) {
+#ifdef _WIN32
+        _close(fd);
+        _unlink(path);
+#else
         close(fd);
         unlink(path);
+#endif
         oidc_die("cannot create OAuth state file %s", path);
     }
     if (fputs(state, f) == EOF || fputc('\n', f) == EOF ||
         fflush(f) != 0 || fclose(f) != 0) {
+#ifdef _WIN32
+        _unlink(path);
+#else
         unlink(path);
+#endif
         oidc_die("cannot create OAuth state file %s", path);
     }
 }
@@ -76,12 +115,24 @@ static void save_state_file(const char *path, const char *state)
 /* read the persisted state back; 0 on success, -1 on any failure */
 static int load_state_file(const char *path, char *out, size_t outsz)
 {
+#ifdef _WIN32
+    /* O_NOFOLLOW has no Windows equivalent; the path is our own freshly
+     * created random-suffixed file, read back immediately (see the
+     * save_state_file comment). */
+    int fd = _open(path, _O_RDONLY | _O_BINARY);
+    if (fd < 0)
+        return -1;
+    int n = _read(fd, out, (unsigned int)(outsz - 1));
+    if (_close(fd) != 0)
+        return -1;
+#else
     int fd = open(path, O_RDONLY | O_NOFOLLOW);
     if (fd < 0)
         return -1;
     ssize_t n = read(fd, out, outsz - 1);
     if (close(fd) != 0)
         return -1;
+#endif
     if (n <= 0)
         return -1;
     out[n] = '\0';
@@ -255,7 +306,11 @@ void oidc_login(char **kp_out, char **user_out)
      * 0600 file is left behind on any error path below. */
     char saved[64];
     int have_state = load_state_file(state_path, saved, sizeof saved) == 0;
+#ifdef _WIN32
+    _unlink(state_path);
+#else
     unlink(state_path);
+#endif
     free(state_path);
 
     char *rline = read_redirect_url();

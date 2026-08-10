@@ -2,7 +2,11 @@
 #define IWAN_ADDR_H
 
 #include <stdbool.h>
-#include <netinet/in.h>
+#ifdef _WIN32
+#  include <winsock2.h>
+#else
+#  include <netinet/in.h>
+#endif
 
 /*
  * Parse an IPv4 listener as "a.b.c.d:port" into an AF_INET sockaddr.

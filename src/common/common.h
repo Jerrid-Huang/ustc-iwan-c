@@ -4,8 +4,10 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <sys/socket.h>
-#include <sys/types.h>
+
+/* platform layer: winsock2 on Windows, POSIX sockets elsewhere; also
+ * provides the port_* socket/poll/clock/entropy wrappers */
+#include "port.h"
 
 /* ---------- growable byte buffer ---------- */
 typedef struct {

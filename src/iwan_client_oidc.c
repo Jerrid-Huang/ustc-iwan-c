@@ -4,7 +4,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 
 #include "common.h"
 #include "oidc.h"
@@ -44,7 +47,7 @@ int main(int argc, char **argv)
     bool do_connect = o.connect || o.all;
     if (o.socks && !do_connect)
         usage_error(&usage, "--socks requires --connect or --all");
-    if (do_connect && !o.socks && geteuid() != 0)
+    if (do_connect && !o.socks && !port_is_admin())
         oidc_elevate_root(argc, argv);
 
     char *dir = resolve_config_dir(o.config_dir);

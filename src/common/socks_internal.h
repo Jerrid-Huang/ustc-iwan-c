@@ -1,10 +1,15 @@
 #ifndef IWAN_SOCKS_INTERNAL_H
 #define IWAN_SOCKS_INTERNAL_H
 
-#include <netinet/in.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
+
+/* struct sockaddr_in comes from common.h -> port.h (netinet/in.h on
+ * POSIX, winsock2 on Windows) */
+#ifndef _WIN32
+#include <netinet/in.h>
+#endif
 
 #include "common.h"
 #include "netstack.h"

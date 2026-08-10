@@ -5,8 +5,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifndef _WIN32
 #include <sys/stat.h>
 #include <unistd.h>
+#else
+#include <direct.h>
+#include <io.h>
+#endif
 
 #include "common.h"
 #include "crypto.h"
@@ -36,12 +42,22 @@ static void mkdir_p(const char *path)
     for (char *p = tmp + 1; *p; p++) {
         if (*p == '/') {
             *p = '\0';
+#ifdef _WIN32
+            /* _mkdir ignores the mode argument (Windows has no 0700;
+             * ACLs govern access) */
+            if (_mkdir(tmp) != 0 && errno != EEXIST)
+#else
             if (mkdir(tmp, 0700) != 0 && errno != EEXIST)
+#endif
                 oidc_die("cannot create dir %s: %s", tmp, strerror(errno));
             *p = '/';
         }
     }
+#ifdef _WIN32
+    if (_mkdir(tmp) != 0 && errno != EEXIST)
+#else
     if (mkdir(tmp, 0700) != 0 && errno != EEXIST)
+#endif
         oidc_die("cannot create dir %s: %s", tmp, strerror(errno));
 }
 
@@ -141,6 +157,7 @@ void oidc_fetch_config(Config *cf)
  * the next non-sudo run cannot read or rewrite the config */
 static void restore_owner(const char *path, const char *dir)
 {
+#ifndef _WIN32
     const char *su = getenv("SUDO_UID");
     const char *sg = getenv("SUDO_GID");
     if (getuid() == 0 && su && sg) {
@@ -152,6 +169,12 @@ static void restore_owner(const char *path, const char *dir)
             oidc_die("cannot chown config dir %s: %s", dir,
                      strerror(errno));
     }
+#else
+    /* Windows has no unix ownership; files inherit the caller's ACLs
+     * (and there is no sudo re-exec to undo) */
+    (void)path;
+    (void)dir;
+#endif
 }
 
 void oidc_save_config(const char *path, const Config *cf)
@@ -178,24 +201,52 @@ void oidc_save_config(const char *path, const Config *cf)
     size_t tlen = strlen(path) + sizeof ".tmp";
     char *tmp = malloc(tlen);
     snprintf(tmp, tlen, "%s.tmp", path);
+#ifdef _WIN32
+    /* O_NOFOLLOW has no Windows equivalent; the temp path is created
+     * fresh by this process (0600, O_CREAT|O_TRUNC) and rename() then
+     * replaces the target atomically — a pre-planted symlink at the
+     * temp name would simply be overwritten by the open. */
+    int fd = _open(tmp, _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY, 0600);
+#else
     int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+#endif
     if (fd < 0)
         oidc_die("cannot write config to %s", path);
     FILE *f = fdopen(fd, "wb");
     if (!f) {
+#ifdef _WIN32
+        _close(fd);
+        _unlink(tmp);
+#else
         close(fd);
         unlink(tmp);
+#endif
         oidc_die("cannot write config to %s", path);
     }
     /* the file holds decryptable password blobs: never world-readable */
+#ifdef _WIN32
+    /* _chmod: Windows permissions are ACL-driven, so this only clears
+     * the read-only attribute; the 0600 intent is best-effort there */
+    (void)_chmod(tmp, 0600);
+#else
     (void)fchmod(fileno(f), 0600);
+#endif
     if (fputs(cf->pretty, f) == EOF || fflush(f) != 0 ||
+#ifdef _WIN32
+        _commit(fileno(f)) != 0 || fclose(f) != 0) {
+        _unlink(tmp);
+#else
         fsync(fileno(f)) != 0 || fclose(f) != 0) {
         unlink(tmp);
+#endif
         oidc_die("cannot write config to %s: %s", path, strerror(errno));
     }
     if (rename(tmp, path) != 0) {
+#ifdef _WIN32
+        _unlink(tmp);
+#else
         unlink(tmp);
+#endif
         oidc_die("cannot write config to %s: %s", path, strerror(errno));
     }
     free(tmp);

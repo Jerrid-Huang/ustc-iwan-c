@@ -1,16 +1,21 @@
-#include <arpa/inet.h>
 #include <errno.h>
-#include <netdb.h>
-#include <netinet/udp.h>
-#include <poll.h>
 #include <pthread.h>
-#include <signal.h>
+#include <signal.h>   /* SIGINT for on_signal (mingw provides it) */
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* POSIX-only headers: on Windows getaddrinfo/gai_strerror/inet_ntop
+ * come from port.h (ws2tcpip), UDP_SEGMENT is defined locally there. */
+#ifndef _WIN32
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <netinet/udp.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#endif
 
 #include "common.h"
 #include "crypto.h"
@@ -57,10 +62,10 @@ static int send_ctrl(pump_ctx_t *ctx, uint8_t typ, uint8_t enc, uint16_t sid,
     pthread_mutex_lock(&ctx->send_lock);
     if (ctx->gso_mss != 0) {
         int z = 0;
-        setsockopt(ctx->sockfd, SOL_UDP, UDP_SEGMENT, &z, sizeof z);
+        port_setsockopt(ctx->sockfd, SOL_UDP, UDP_SEGMENT, &z, sizeof z);
         ctx->gso_mss = 0;
     }
-    ssize_t r = send(ctx->sockfd, pkt.data, want, 0);
+    ssize_t r = port_send(ctx->sockfd, pkt.data, want, 0);
     pthread_mutex_unlock(&ctx->send_lock);
     buf_free(&pkt);
     if (r < 0 || (size_t)r != want)
@@ -101,12 +106,12 @@ static void send_batch(pump_ctx_t *ctx, struct mmsghdr *msgs, unsigned n)
      * longer than the mss, so disable it before the per-message path */
     if (ctx->gso_mss != 0) {
         int z = 0;
-        setsockopt(ctx->sockfd, SOL_UDP, UDP_SEGMENT, &z, sizeof z);
+        port_setsockopt(ctx->sockfd, SOL_UDP, UDP_SEGMENT, &z, sizeof z);
         ctx->gso_mss = 0;
     }
 
     while (sent < n && !g_stop) {
-        ssize_t sm = sendmmsg(ctx->sockfd, msgs + sent, n - sent, 0);
+        ssize_t sm = port_sendmmsg(ctx->sockfd, msgs + sent, n - sent, 0);
         if (sm > 0) {
             sent += (unsigned)sm;
             continue;
@@ -128,7 +133,7 @@ static void send_batch(pump_ctx_t *ctx, struct mmsghdr *msgs, unsigned n)
             if (el >= PUMP_SEND_RETRY_MS)
                 return;
             struct pollfd pfd = { .fd = ctx->sockfd, .events = POLLOUT };
-            poll(&pfd, 1, (int)(PUMP_SEND_RETRY_MS - el));
+            port_poll(&pfd, 1, (int)(PUMP_SEND_RETRY_MS - el));
             continue;
         }
         eprintf("[TUN->UDP] sendmmsg: %s\n", strerror(errno));
@@ -155,8 +160,11 @@ static int send_gso(pump_ctx_t *ctx, struct iovec *iov, unsigned n,
 
     if (ctx->gso_ok == -1) {
         int m = (int)mss;
-        ctx->gso_ok = setsockopt(ctx->sockfd, SOL_UDP, UDP_SEGMENT,
-                                 &m, sizeof m) == 0;
+        /* port_setsockopt translates UDP_SEGMENT to WSAIoctl
+         * (SIO_UDP_NETSEGMENT) on Windows and fails with EOPNOTSUPP on
+         * older systems, so the sendmmsg fallback below works unchanged */
+        ctx->gso_ok = port_setsockopt(ctx->sockfd, SOL_UDP, UDP_SEGMENT,
+                                      &m, sizeof m) == 0;
         if (!ctx->gso_ok) {
             eprintf("[TUN->UDP] UDP_SEGMENT unsupported, using sendmmsg\n");
             return 0;
@@ -164,7 +172,8 @@ static int send_gso(pump_ctx_t *ctx, struct iovec *iov, unsigned n,
         ctx->gso_mss = mss;
     } else if (ctx->gso_mss != mss) {
         int m = (int)mss;
-        if (setsockopt(ctx->sockfd, SOL_UDP, UDP_SEGMENT, &m, sizeof m) != 0) {
+        if (port_setsockopt(ctx->sockfd, SOL_UDP, UDP_SEGMENT, &m,
+                            sizeof m) != 0) {
             ctx->gso_ok = 0;
             return 0;
         }
@@ -178,7 +187,7 @@ static int send_gso(pump_ctx_t *ctx, struct iovec *iov, unsigned n,
     mh.msg_iov = iov;
     mh.msg_iovlen = n;
     while (!g_stop) {
-        ssize_t r = sendmsg(ctx->sockfd, &mh, 0);
+        ssize_t r = port_sendmsg(ctx->sockfd, &mh, 0);
         if (r == (ssize_t)total)
             return 1;
         if (r >= 0) {
@@ -206,7 +215,7 @@ static int send_gso(pump_ctx_t *ctx, struct iovec *iov, unsigned n,
             if (el >= PUMP_SEND_RETRY_MS)
                 return 1;   /* bounded: let the receive path drain */
             struct pollfd pfd = { .fd = ctx->sockfd, .events = POLLOUT };
-            poll(&pfd, 1, (int)(PUMP_SEND_RETRY_MS - el));
+            port_poll(&pfd, 1, (int)(PUMP_SEND_RETRY_MS - el));
             continue;
         }
         eprintf("[TUN->UDP] sendmsg: %s\n", strerror(errno));
@@ -394,8 +403,8 @@ static void *udp2tun_thread(void *ud) {
             }
             last_ka = now_ms();
         }
-        int v = recvmmsg(ctx->sockfd, msgs, (unsigned)rxbatch,
-                         MSG_DONTWAIT, NULL);
+        int v = port_recvmmsg(ctx->sockfd, msgs, (unsigned)rxbatch,
+                              MSG_DONTWAIT, NULL);
         if (v < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 /* park until data arrives or the next keepalive is due */
@@ -405,7 +414,7 @@ static void *udp2tun_thread(void *ud) {
                 if (to > PUMP_POLL_CEIL_MS)
                     to = PUMP_POLL_CEIL_MS;
                 struct pollfd pfd = { .fd = ctx->sockfd, .events = POLLIN };
-                int pr = poll(&pfd, 1, to);
+                int pr = port_poll(&pfd, 1, to);
                 if (pr < 0 && errno != EINTR) {
                     eprintf("[UDP->TUN] poll err\n");
                     g_stop = 1;   /* any pump-fatal error stops the tunnel */
@@ -491,17 +500,11 @@ static void on_signal(int sig) {
 }
 
 static void install_signals(void) {
-    struct sigaction sa;
-    memset(&sa, 0, sizeof sa);
-    sa.sa_handler = on_signal;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
-    if (sigaction(SIGINT, &sa, NULL) != 0)
-        log_err("install_signals: sigaction(SIGINT): %s", strerror(errno));
-    if (sigaction(SIGTERM, &sa, NULL) != 0)
-        log_err("install_signals: sigaction(SIGTERM): %s", strerror(errno));
-    if (sigaction(SIGHUP, &sa, NULL) != 0)
-        log_err("install_signals: sigaction(SIGHUP): %s", strerror(errno));
+    /* process-wide stop handler: SIGINT/SIGTERM/SIGHUP via sigaction on
+     * POSIX, console ctrl events (normalized to SIGINT) on Windows.
+     * No save/restore — the old code installed with NULL oldact, and
+     * the handler lives for the process lifetime either way. */
+    port_set_stop_handler(on_signal);
 }
 
 static bool slist_has(const slist_t *s, const char *str) {
@@ -669,7 +672,7 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
          * single-queue and multi-queue capacities, which makes the
          * adaptive pool hunt 1<->2 queues instead of scaling.
          * IWAN_PUMP_QUEUES overrides the count for testing. */
-        long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+        long ncpu = port_cpu_count();
         int maxq = TUN_POOL_MAX;
         if (ncpu > 0 && ncpu < maxq)
             maxq = (int)ncpu;
@@ -712,7 +715,7 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
 
     log_info("TUN proxy running -- press Ctrl-C to stop");
     while (!g_stop)
-        usleep(100 * 1000);
+        port_sleep_us(100 * 1000);
 
     tun_pool_destroy(ctx.pool);
     pthread_join(t2, NULL);

@@ -3,7 +3,11 @@
 
 #include <stdbool.h>
 #include <stdint.h>
-#include <netinet/in.h>
+#ifdef _WIN32
+#  include <winsock2.h>
+#else
+#  include <netinet/in.h>
+#endif
 
 #include "util.h"
 

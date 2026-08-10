@@ -5,18 +5,21 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
-#include <net/if.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/random.h>
 #include <sys/types.h>
-#include <sys/wait.h>
 #include <time.h>
+
+#ifndef _WIN32
+#include <net/if.h>
+#include <sys/random.h>
+#include <sys/wait.h>
 #include <unistd.h>
+#endif
 
 static int debug_cached = -1;
 
@@ -27,11 +30,7 @@ atomic_bool g_stop;
 
 void util_ignore_sigpipe(void)
 {
-    static bool done;
-    if (!done) {
-        done = true;
-        signal(SIGPIPE, SIG_IGN);
-    }
+    port_ignore_sigpipe();
 }
 
 void oom_abort(void)
@@ -56,13 +55,19 @@ bool debug_enabled(void)
  * LD_PRELOAD) would execute attacker code with root privileges. */
 void exec_sanitize(void)
 {
+#ifndef _WIN32
     setenv("PATH", "/usr/sbin:/sbin:/usr/bin:/bin", 1);
     unsetenv("LD_PRELOAD");
     unsetenv("LD_LIBRARY_PATH");
     unsetenv("LD_AUDIT");
     unsetenv("GLIBC_TUNABLES");
+#else
+    /* no exec of helper binaries on Windows (port_run_cmd uses
+     * CreateProcess); kept as a defined no-op so callers compile */
+#endif
 }
 
+#ifndef _WIN32
 static char **ip_argv(char *const args[])
 {
     size_t argc = 0;
@@ -106,19 +111,61 @@ static bool run_ip_child(char *const args[], bool quiet)
         return false;
     return WIFEXITED(st) && WEXITSTATUS(st) == 0;
 }
+#else /* _WIN32 */
+/* mirror ip_argv() for the port-layer subprocess helpers: callers pass
+ * argv WITHOUT argv[0] (e.g. {"-4","route","show","default"}), while
+ * port_run_cmd/port_cmd_capture want argv[0] = program name. */
+static char **win32_ip_argv(char *const args[])
+{
+    size_t argc = 0;
+    while (args[argc])
+        argc++;
+    char **argv = malloc((argc + 2) * sizeof(char *));
+    if (!argv)
+        return NULL;
+    size_t off = (argc > 0 && strcmp(args[0], "ip") == 0) ? 0 : 1;
+    argv[0] = "ip";
+    for (size_t i = 0; i < argc; i++)
+        argv[i + off] = args[i];
+    argv[argc + off] = NULL;
+    return argv;
+}
+#endif /* _WIN32 */
 
 bool ip_run(char *const args[])
 {
+#ifndef _WIN32
     return run_ip_child(args, false);
+#else
+    char **argv = win32_ip_argv(args);
+    if (!argv)
+        return false;
+    int rc = port_run_cmd(argv);
+    free(argv);
+    return rc == 0;
+#endif
 }
 
 bool ip_run_quiet(char *const args[])
 {
+#ifndef _WIN32
     return run_ip_child(args, true);
+#else
+    /* Divergence: port_run_cmd cannot redirect the child's stdout/stderr,
+     * so output is not swallowed on Windows (CREATE_NO_WINDOW keeps it off
+     * the console). Callers treat ip_run_quiet as best-effort. */
+    char **argv = win32_ip_argv(args);
+    if (!argv)
+        return false;
+    int rc = port_run_cmd(argv);
+    free(argv);
+    return rc == 0;
+#endif
 }
 
 char *cmd_capture(char *const args[])
 {
+#ifndef _WIN32
     int fds[2];
     if (pipe(fds) != 0)
         return NULL;
@@ -191,6 +238,18 @@ char *cmd_capture(char *const args[])
     }
     out[len] = '\0';
     return out;
+#else
+    char **argv = win32_ip_argv(args);
+    if (!argv)
+        return NULL;
+    /* consumers parse `ip route/addr` output (a few hundred bytes); the
+     * 1 MiB bound is far above any real output. Divergence: on success
+     * with empty output this returns "" where Linux returns NULL — the
+     * util.h contract notes callers treat the two identically. */
+    char *out = port_cmd_capture(argv, 1024 * 1024);
+    free(argv);
+    return out;
+#endif
 }
 
 void log_info(const char *fmt, ...)
@@ -320,32 +379,26 @@ char *xstrdup(const char *s)
 uint32_t rand_u32(void)
 {
     uint32_t v;
-    if (getrandom(&v, sizeof(v), 0) == (ssize_t)sizeof(v))
-        return v;
-    FILE *f = fopen("/dev/urandom", "rb");
-    if (f) {
-        if (fread(&v, 1, sizeof(v), f) == sizeof(v)) {
-            fclose(f);
-            return v;
-        }
-        fclose(f);
+
+    /* fail-closed (F6): the old getrandom -> /dev/urandom -> weak-mix
+     * fallback chain could hand out a guessable value; a guessable nonce
+     * or token is a session-hijack hole, so RNG failure is fatal. */
+    if (port_rand_bytes(&v, sizeof v) != 0) {
+        log_err("rand_u32: cannot obtain secure randomness "
+                "(port_rand_bytes failed); aborting");
+        abort();
     }
-    v = (uint32_t)((uintptr_t)&v ^ (uintptr_t)time(NULL) ^ (uintptr_t)getpid());
     return v;
 }
 
 uint64_t now_ms(void)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+    return port_now_ms();
 }
 
 uint64_t now_us(void)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+    return port_now_us();
 }
 
 /* ---------------- aggregate send pacing ---------------- */
@@ -397,7 +450,7 @@ void pace_take(pace_bucket *b, int npk)
         uint64_t need = ((uint64_t)npk - budget) * 1000000u / b->pps;
         b->budget = 0;
         if (need > 0)
-            usleep(need);
+            port_sleep_us((unsigned)need);
     } else {
         b->budget = budget - (uint64_t)npk;
     }

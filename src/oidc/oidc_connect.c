@@ -4,8 +4,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <openssl/crypto.h>
+
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 #include "addr.h"
 #include "auth.h"
@@ -58,6 +61,19 @@ static int run_socks_mode(const Opts *o, int fd, const uint8_t sk[16],
 /* TUN mode needs root: re-exec the whole invocation via sudo when not root */
 void oidc_elevate_root(int argc, char **argv)
 {
+#ifdef _WIN32
+    /* no sudo on Windows: TUN mode must run from an already-elevated
+     * console. Fail clearly instead of pretending to elevate; the
+     * --socks/--connect-non-TUN paths never call this. */
+    (void)argc;
+    (void)argv;
+    if (!port_is_admin()) {
+        fprintf(stderr,
+                "Error: TUN mode requires an administrator console; run "
+                "from an elevated prompt\n");
+        exit(1);
+    }
+#else
     char self[4096];
     const char *exe = argv[0];
     ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
@@ -80,6 +96,7 @@ void oidc_elevate_root(int argc, char **argv)
         execve("/bin/sudo", args, environ);
     fprintf(stderr, "Error: cannot run sudo: %s\n", strerror(errno));
     exit(1);
+#endif
 }
 
 static void collect_routes(const Opts *o, slist_t *routes)
@@ -178,22 +195,27 @@ void oidc_connect_server(const Opts *o, const Config *cf)
 
     if (o->socks) {
         int rc = run_socks_mode(o, fd, sk, &res);
-        close(fd);
+        port_close(fd);
         if (rc != 0)
             exit(1);
         return;
     }
 
     if (!tun_name_valid(o->tun)) {
-        close(fd);
+        port_close(fd);
         oidc_die("invalid TUN device name '%s'", o->tun);
     }
 
+#ifndef _WIN32
+    /* Linux: pre-delete a stale tun device by name. Windows: wintun's
+     * open_tun (tun_win.c) deletes an existing adapter with the same
+     * name as part of open-or-create, so nothing to do here. */
     char *const del[] = { "link", "del", (char *)o->tun, NULL };
     ip_run_quiet(del);
+#endif
     int tun_fd = open_tun(o->tun);
     if (tun_fd < 0) {
-        close(fd);
+        port_close(fd);
         oidc_die("open tun (must be root or CAP_NET_ADMIN)");
     }
     set_nonblock(tun_fd);
@@ -207,7 +229,7 @@ void oidc_connect_server(const Opts *o, const Config *cf)
     int rc = run_pump(tun_fd, o->tun, fd, sk, res.sid, res.tok, o->encrypt,
                       host, &routes, res.tun, res.mtu);
     tun_close(tun_fd);
-    close(fd);
+    port_close(fd);
     slist_free(&routes);
     if (rc != 0)
         exit(1);

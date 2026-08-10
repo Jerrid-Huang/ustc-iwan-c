@@ -5,6 +5,35 @@
 #include <stdint.h>
 #include "common.h"
 
+/* ============================================================================
+ * FROZEN WIRE PROTOCOL — INTEROP-CRITICAL
+ *
+ * Everything below this banner is the on-the-wire byte layout of the iwan
+ * protocol, shared with the reference implementation (yyy1mu/ustc-iwan).
+ * The following MUST NOT change without a protocol version bump AND a
+ * coordinated client+server release:
+ *
+ *   - frame layout:      8B outer header, 16B MD5 signature, 24B signed
+ *                         control frame (header + signature)
+ *   - frame-type ids     (PT_*): the non-contiguous values (0x11-0x18,
+ *                         0x29, 0x2A) are intentional interop constraints
+ *   - TLV ids            (T_*)
+ *   - the "mw" constant  (signature suffix + key-derivation prefix)
+ *   - byte order         all multi-byte fields are big-endian
+ *   - the vlen+2 quirk   the TLV length byte stores (value length + 2),
+ *                         i.e. it includes the 2 TLV header bytes
+ *   - the 32-bit token, the sid semantics, and the PING wildcard
+ *     (sid 0xFFFF, tok 0xFFFFFFFF)
+ *
+ * See PROTOCOL.md (repo root) for the full byte-exact specification and the
+ * frozen security model. Any wire change requires a version bump and a
+ * coordinated release of client AND server.
+ * ========================================================================== */
+
+/* informational only, NOT on the wire: the wire has no version field.
+ * A protocol version bump means a NEW FRAME LAYOUT, not a new constant. */
+#define IWAN_PROTO_VERSION 1
+
 /* shared "mw" magic used both as the key-derivation prefix (crypto.c) and
  * the ctrl-signature suffix (protocol.c): keep both in sync via one name */
 #define IWAN_MW "mw"
@@ -48,6 +77,20 @@
  * syscall per batch). */
 #define IWAN_GSO_UNIT_SAFE 4096
 
+/* Compile-time freeze checks: pin the interop-critical layout values. If any
+ * of these fires, the wire format has changed and a protocol version bump +
+ * coordinated client/server release is required (see PROTOCOL.md). */
+_Static_assert(IWAN_CTRL_LEN == IWAN_HDR_LEN + IWAN_SIG_LEN,
+               "control frame = header + signature");
+_Static_assert(IWAN_HDR_LEN == 8, "outer header is exactly 8 bytes");
+_Static_assert(IWAN_SIG_LEN == 16, "signature is exactly 16 bytes");
+_Static_assert(IWAN_CTRL_LEN == 24, "signed control frame is exactly 24 bytes");
+_Static_assert(IWAN_TLV_VLEN_MAX + 2 <= 255,
+               "vlen+2 must fit the TLV length byte");
+_Static_assert(IWAN_PING_SID == 0xFFFF && IWAN_PING_TOK == 0xFFFFFFFFu,
+               "PING wildcard sid/token must fit the header fields");
+
+/* FROZEN WIRE VALUES — reordering/renumbering breaks interop */
 enum {
     PT_OPEN_REJECT = 0x11,
     PT_OPEN_ACK    = 0x12,
@@ -61,6 +104,7 @@ enum {
     PT_PING_RSP    = 0x2A,
 };
 
+/* FROZEN WIRE VALUES — reordering/renumbering breaks interop */
 enum {
     T_USERNAME    = 0x01,
     T_PASSWORD    = 0x02,

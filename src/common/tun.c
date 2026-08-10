@@ -19,42 +19,8 @@
 #include "tun.h"
 #include "util.h"
 
-/* ifname families owned by the OS / physical NICs: never create one, and
- * never feed one to `ip link del`. "iw" is deliberately absent: the
- * project's own default devices (iwan0, iwan-srv) share that prefix. */
-static bool tun_name_reserved(const char *name)
-{
-    static const char *const reserved[] = {
-        "eth", "enp", "eno", "ens", "wlp", "wlo", "wwan", "docker",
-        "br-", "veth", "tailscale",
-        "br0", "virbr", "vmbr", "bond", "team", "ovs", "tap", "tun",
-        "vxlan", "vlan", "dummy", "wg", "ppp", "gre", "sit",
-    };
-    if (strcmp(name, "lo") == 0)
-        return true;
-    for (size_t i = 0; i < sizeof reserved / sizeof reserved[0]; i++) {
-        const char *r = reserved[i];
-        if (strncmp(name, r, strlen(r)) == 0)
-            return true;
-    }
-    return false;
-}
-
-bool tun_name_valid(const char *name)
-{
-    size_t n = strlen(name);
-    if (n == 0 || n > IFNAMSIZ - 1)
-        return false;
-    if (!(name[0] >= 'a' && name[0] <= 'z'))
-        return false;
-    for (size_t i = 0; i < n; i++) {
-        char c = name[i];
-        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
-              c == '-' || c == '_'))
-            return false;
-    }
-    return !tun_name_reserved(name);
-}
+/* tun_name_valid lives in tun.h (static inline): both the Linux and the
+ * Windows backend share the same device-name rule set. */
 
 int open_tun(const char *name) {
     if (!tun_name_valid(name))

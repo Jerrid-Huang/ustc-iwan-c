@@ -114,3 +114,95 @@ jobs:
           ./bin/iwan-client --help >/dev/null
           ./bin/iwan-client-oidc --help >/dev/null
           ./bin/iwan-server --help >/dev/null
+
+  # Windows cross-compile: MinGW-w64 on Linux, gated by the same
+  # warning/error grep as the native jobs. The OpenSSL dev package is the
+  # MSYS2 ucrt64 one, unpacked under /tmp/mingw-sysroot exactly like the
+  # local sysroot; OPENSSL_DIR points at its ucrt64 root and the Makefile
+  # adds the include/lib dirs from it.
+  win-cross:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    concurrency:
+      group: win-cross-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64 zstd wine64
+
+      - name: Download OpenSSL dev package (MSYS2 ucrt64)
+        run: |
+          curl -sL https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-openssl-3.5.1-1-any.pkg.tar.zst -o /tmp/ossl.tar.zst
+          mkdir -p /tmp/mingw-sysroot
+          tar --zstd -xf /tmp/ossl.tar.zst -C /tmp/mingw-sysroot
+
+      - name: Build (win32 cross)
+        run: |
+          set -o pipefail
+          make TARGET=win32 -B CC=x86_64-w64-mingw32-gcc \
+            CFLAGS="-O2 -Wall -Wextra -std=c11 -fstack-protector-strong -MMD -MP -pthread -D_WIN32_WINNT=0x0601 -DWINVER=0x0601 -Werror" \
+            OPENSSL_DIR=/tmp/mingw-sysroot/ucrt64 2>&1 | tee build-win32.log
+          if grep -Ei 'error|warning' build-win32.log; then
+            echo "::error::win32 build emitted errors or warnings"
+            exit 1
+          fi
+
+      - name: Verify PE32+ binaries
+        run: |
+          file bin/iwan-client.exe bin/iwan-client-oidc.exe
+          if ! file bin/iwan-client.exe | grep -q 'PE32+'; then
+            echo "::error::bin/iwan-client.exe is not a PE32+ binary"
+            exit 1
+          fi
+          if ! file bin/iwan-client-oidc.exe | grep -q 'PE32+'; then
+            echo "::error::bin/iwan-client-oidc.exe is not a PE32+ binary"
+            exit 1
+          fi
+
+      - name: Smoke test (wine)
+        run: |
+          set -e
+          # The MSYS2 libcrypto/libssl are DLL import libs and the mingw
+          # runtime pulls winpthread/ssp dynamically: drop every DLL the
+          # exes import next to them so wine can load them.
+          cp -f /tmp/mingw-sysroot/ucrt64/bin/libcrypto-3-x64.dll bin/
+          cp -f /tmp/mingw-sysroot/ucrt64/bin/libssl-3-x64.dll bin/
+          cp -f /usr/lib/gcc/x86_64-w64-mingw32/*-posix/libwinpthread-1.dll bin/ 2>/dev/null || true
+          cp -f /usr/lib/gcc/x86_64-w64-mingw32/*-posix/libssp-0.dll bin/ 2>/dev/null || true
+          wine bin/iwan-client.exe --help >/dev/null
+          wine bin/iwan-client-oidc.exe --help >/dev/null
+
+      # Real wire-level smoke: a Linux iwan-server in --no-tun mode runs
+      # without root (control plane only), and the Windows client talks
+      # to it over UDP. This proves the frozen wire format and the
+      # winsock port layer end to end (PING/PONG + OPEN/OPEN_ACK/CLOSE).
+      - name: Wire smoke (Windows client <-> Linux server, wine)
+        run: |
+          set -e
+          make -B -j$(nproc) CFLAGS="$BASE_CFLAGS" >/dev/null 2>&1
+          printf 'alice:s3cret-pass\n' > /tmp/users.txt
+          chmod 600 /tmp/users.txt
+          ./bin/iwan-server --users /tmp/users.txt --port 16001 --no-tun \
+            --user "$(whoami)" > /tmp/iwan-srv.log 2>&1 &
+          SRV=$!
+          trap 'kill $SRV 2>/dev/null || true' EXIT
+          sleep 1
+          wine bin/iwan-client.exe ping --server 127.0.0.1 --port 16001 | grep -q 'PONG'
+          wine bin/iwan-client.exe auth --server 127.0.0.1 --port 16001 \
+            --user alice --pass s3cret-pass | grep -q 'OK sid='
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: iwan-win32
+          path: |
+            bin/iwan-client.exe
+            bin/iwan-client-oidc.exe
+            bin/*.dll
+            build-win32.log
+          if-no-files-found: error

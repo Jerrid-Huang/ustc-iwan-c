@@ -1,9 +1,8 @@
 #include "addr.h"
 
-#include <arpa/inet.h>
 #include <string.h>
 
-#include "common.h"
+#include "common.h"   /* port.h: winsock2/ws2tcpip on Windows, arpa/inet.h on POSIX */
 
 int parse_host_port(const char *s, struct sockaddr_in *out)
 {
