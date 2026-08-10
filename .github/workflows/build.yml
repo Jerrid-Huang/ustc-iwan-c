@@ -4,6 +4,9 @@
 # built binaries. -Werror is CI-only: regular builds append it to CFLAGS,
 # while the sanitizer job omits it (ASan/UBSan-instrumented code trips
 # known false-positive warnings) and relies on the same warning grep gate.
+# The grep gates match 'error:' / 'warning:' (compiler diagnostic shape)
+# rather than bare 'error|warning', which would also match the '-Werror'
+# flag echoed on every make command line and fail the jobs spuriously.
 name: build
 
 on:
@@ -40,7 +43,7 @@ jobs:
         run: |
           set -o pipefail
           make -B CC=${{ matrix.cc }} CFLAGS="$BASE_CFLAGS -Werror" 2>&1 | tee build-${{ matrix.cc }}.log
-          if grep -Ei 'error|warning' build-${{ matrix.cc }}.log; then
+          if grep -Ei 'error:|warning:' build-${{ matrix.cc }}.log; then
             echo "::error::build emitted errors or warnings"
             exit 1
           fi
@@ -53,7 +56,7 @@ jobs:
           make clean
           set -o pipefail
           make -j$(nproc) CC=${{ matrix.cc }} CFLAGS="$BASE_CFLAGS -Werror" 2>&1 | tee build-${{ matrix.cc }}.log
-          if grep -Ei 'error|warning' build-${{ matrix.cc }}.log; then
+          if grep -Ei 'error:|warning:' build-${{ matrix.cc }}.log; then
             echo "::error::incremental build emitted errors or warnings"
             exit 1
           fi
@@ -104,7 +107,7 @@ jobs:
             CFLAGS="$BASE_CFLAGS -fsanitize=address,undefined -fno-omit-frame-pointer" \
             LDFLAGS="-pie -Wl,-z,now -Wl,-z,relro -Wl,-z,noexecstack -fsanitize=address,undefined" \
             2>&1 | tee build-sanitize.log
-          if grep -Ei 'error|warning' build-sanitize.log; then
+          if grep -Ei 'error:|warning:' build-sanitize.log; then
             echo "::error::sanitizer build emitted errors or warnings"
             exit 1
           fi
@@ -133,10 +136,19 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-mingw-w64-x86-64 zstd wine64
+          # wine64 (not wine): the wine metapackage hard-depends on
+          # wine32:i386, which needs the i386 architecture enabled; the
+          # exes are x86-64 so wine64 alone is sufficient and provides
+          # the wine64 command. clang is needed by the wire-smoke step's
+          # Linux rebuild (steer_bpf.c is compiled with clang -target
+          # bpf).
+          sudo apt-get install -y gcc-mingw-w64-x86-64 zstd wine64 clang
 
       - name: Download OpenSSL dev package (MSYS2 ucrt64)
         run: |
+          # Pin matches the Makefile's documented cross-build sysroot
+          # (README "Windows 交叉编译"); bump both together when a newer
+          # MSYS2 OpenSSL is needed.
           curl -sL https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-openssl-3.5.1-1-any.pkg.tar.zst -o /tmp/ossl.tar.zst
           mkdir -p /tmp/mingw-sysroot
           tar --zstd -xf /tmp/ossl.tar.zst -C /tmp/mingw-sysroot
@@ -147,7 +159,7 @@ jobs:
           make TARGET=win32 -B CC=x86_64-w64-mingw32-gcc \
             CFLAGS="-O2 -Wall -Wextra -std=c11 -fstack-protector-strong -MMD -MP -pthread -D_WIN32_WINNT=0x0601 -DWINVER=0x0601 -Werror" \
             OPENSSL_DIR=/tmp/mingw-sysroot/ucrt64 2>&1 | tee build-win32.log
-          if grep -Ei 'error|warning' build-win32.log; then
+          if grep -Ei 'error:|warning:' build-win32.log; then
             echo "::error::win32 build emitted errors or warnings"
             exit 1
           fi
@@ -174,8 +186,8 @@ jobs:
           cp -f /tmp/mingw-sysroot/ucrt64/bin/libssl-3-x64.dll bin/
           cp -f /usr/lib/gcc/x86_64-w64-mingw32/*-posix/libwinpthread-1.dll bin/ 2>/dev/null || true
           cp -f /usr/lib/gcc/x86_64-w64-mingw32/*-posix/libssp-0.dll bin/ 2>/dev/null || true
-          wine bin/iwan-client.exe --help >/dev/null
-          wine bin/iwan-client-oidc.exe --help >/dev/null
+          wine64 bin/iwan-client.exe --help >/dev/null
+          wine64 bin/iwan-client-oidc.exe --help >/dev/null
 
       # Real wire-level smoke: a Linux iwan-server in --no-tun mode runs
       # without root (control plane only), and the Windows client talks
@@ -192,8 +204,8 @@ jobs:
           SRV=$!
           trap 'kill $SRV 2>/dev/null || true' EXIT
           sleep 1
-          wine bin/iwan-client.exe ping --server 127.0.0.1 --port 16001 | grep -q 'PONG'
-          wine bin/iwan-client.exe auth --server 127.0.0.1 --port 16001 \
+          wine64 bin/iwan-client.exe ping --server 127.0.0.1 --port 16001 | grep -q 'PONG'
+          wine64 bin/iwan-client.exe auth --server 127.0.0.1 --port 16001 \
             --user alice --pass s3cret-pass | grep -q 'OK sid='
 
       - name: Upload artifacts
