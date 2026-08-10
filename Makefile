@@ -105,10 +105,18 @@ endif
 # result is a BPF ELF object, not a host object: never link it directly
 # and never archive it into the host libraries. BPF is Linux-only, so
 # none of this chain exists on win32.
+#
+# linux/bpf.h -> linux/types.h includes <asm/types.h>; the asm headers
+# live in the gcc multiarch include dir (/usr/include/<triplet>), which
+# clang does not search when compiling for the bpf target (a cross
+# compile). Ubuntu 24.04+ linux-libc-dev no longer ships the
+# /usr/include/asm symlink (the gcc-multilib package that does is not a
+# build dependency), so point clang at the triplet dir explicitly.
 ifneq ($(TARGET),win32)
+BPF_MULTIARCH_INC := $(shell $(CC) -print-multiarch 2>/dev/null)
 $(BUILD_DIR)/steer_bpf.o: $(COMMON_DIR)/steer_bpf.c
 	@mkdir -p $(BUILD_DIR)
-	$(CLANG) -O2 -target bpf -Wall -MMD -MP -c -o $@ $<
+	$(CLANG) -O2 -target bpf -Wall -MMD -MP -isystem /usr/include/$(BPF_MULTIARCH_INC) -c -o $@ $<
 
 # Embed the BPF object as a C array consumed by src/common/tun.c
 # (bpf_prog_load_steer), which parses the embedded ELF section table and
