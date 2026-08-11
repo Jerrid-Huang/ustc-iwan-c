@@ -214,23 +214,26 @@ jobs:
           # linux-libc-dev is required by the wire-smoke step's Linux
           # rebuild (steer_bpf.c includes <linux/bpf.h>; the runner image
           # does not preinstall it), and clang compiles the BPF target.
-          sudo apt-get install -y gcc-mingw-w64-x86-64 zstd wine64 clang linux-libc-dev linux-libc-dev
+          sudo apt-get install -y gcc-mingw-w64-x86-64 zstd wine64 clang linux-libc-dev
 
-      - name: Download OpenSSL dev package (MSYS2 ucrt64)
+      - name: Build static OpenSSL (mingw no-shared)
         run: |
-          # Pin matches the Makefile's documented cross-build sysroot
-          # (README "Windows 交叉编译"); bump both together when a newer
-          # MSYS2 OpenSSL is needed.
-          curl -sL https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-openssl-3.5.1-1-any.pkg.tar.zst -o /tmp/ossl.tar.zst
-          mkdir -p /tmp/mingw-sysroot
-          tar --zstd -xf /tmp/ossl.tar.zst -C /tmp/mingw-sysroot
+          # The MSYS2 openssl package only ships DLL import libs; the
+          # exes are linked STATIC=1 so no DLLs are needed at runtime.
+          curl -sL --retry 3 --max-time 400 https://www.openssl.org/source/openssl-3.5.1.tar.gz -o /tmp/ossl-src.tar.gz
+          cd /tmp && tar xzf ossl-src.tar.gz
+          cd /tmp/openssl-3.5.1
+          ./Configure mingw64 no-shared no-tests \
+            --cross-compile-prefix=x86_64-w64-mingw32- --prefix=/tmp/ossl-static
+          make -j$(nproc) build_libs
+          make install_sw
 
-      - name: Build (win32 cross)
+      - name: Build (win32 cross, static)
         run: |
           set -o pipefail
-          make TARGET=win32 -B CC=x86_64-w64-mingw32-gcc \
+          make TARGET=win32 -B CC=x86_64-w64-mingw32-gcc STATIC=1 \
             CFLAGS="-O2 -Wall -Wextra -std=c11 -fstack-protector-strong -MMD -MP -pthread -D_WIN32_WINNT=0x0601 -DWINVER=0x0601 -Werror" \
-            OPENSSL_DIR=/tmp/mingw-sysroot/ucrt64 2>&1 | tee build-win32.log
+            OPENSSL_DIR=/tmp/ossl-static 2>&1 | tee build-win32.log
           if grep -Ei 'error:|warning:' build-win32.log; then
             echo "::error::win32 build emitted errors or warnings"
             exit 1
@@ -259,27 +262,9 @@ jobs:
       - name: Smoke test (wine)
         run: |
           set -eo pipefail
-          # The MSYS2 libcrypto/libssl are DLL import libs and the mingw
-          # runtime pulls winpthread/ssp dynamically: drop every DLL the
-          # exes import next to them so wine can load them.
-          cp -f /tmp/mingw-sysroot/ucrt64/bin/libcrypto-3-x64.dll bin/
-          cp -f /tmp/mingw-sysroot/ucrt64/bin/libssl-3-x64.dll bin/
-          # libwinpthread lives under /usr/lib/gcc/.../posix on some
-          # toolchains and /usr/<triplet>/lib on others; try both.
-          for dll in /usr/lib/gcc/x86_64-w64-mingw32/*-posix/libwinpthread-1.dll \
-                     /usr/x86_64-w64-mingw32/lib/libwinpthread-1.dll; do
-            [ -f "$dll" ] && cp -f "$dll" bin/
-          done
-          for dll in /usr/lib/gcc/x86_64-w64-mingw32/*-posix/libssp-0.dll \
-                     /usr/x86_64-w64-mingw32/lib/libssp-0.dll; do
-            [ -f "$dll" ] && cp -f "$dll" bin/
-          done
-          # The wine64 apt package installs only /usr/lib/wine/wine64
-          # (the wine command lives in the wine metapackage, which needs
-          # the i386 architecture); resolve the loader directly.
-          # 24.04: no 'wine64' command, loader at /usr/lib/wine/wine64, and the
-          # 'wine' wrapper demands wine32 (multiarch) even for 64-bit exes.
-          # 26.04: 'wine64' command exists. Prefer in that order.
+          # The exes are STATIC=1: no DLLs are needed next to them. The
+          # wine64 apt package installs only /usr/lib/wine/wine64 (the
+          # 'wine' wrapper needs wine32); resolve the loader directly.
           WINE_BIN="$(command -v wine64 2>/dev/null || { [ -x /usr/lib/wine/wine64 ] && echo /usr/lib/wine/wine64; } || command -v wine 2>/dev/null || true)"
           echo "using wine loader: $WINE_BIN" | tee /tmp/wine-smoke.log
           "$WINE_BIN" --version 2>&1 | tee -a /tmp/wine-smoke.log || true
@@ -321,7 +306,6 @@ jobs:
           path: |
             bin/iwan-client.exe
             bin/iwan-client-oidc.exe
-            bin/*.dll
             build-win32.log
           if-no-files-found: error
 
@@ -361,16 +345,13 @@ jobs:
           # the DLLs from the zip next to them)
           cp bin/iwan-client bin/iwan-client-oidc bin/iwan-server dist/linux/
           # download-artifact keeps the upload-time relative paths, so
-          # the win32 artifact lands as win32/bin/*.exe + win32/*.log
+          # the win32 artifact lands as win32/bin/*.exe + win32/*.log.
+          # The exes are static (STATIC=1): no DLLs to ship.
           cp win32/bin/iwan-client.exe win32/bin/iwan-client-oidc.exe dist/windows/
           # Linux archive: the three binaries
           (cd dist/linux && tar czf ../iwan-linux-x86_64.tar.gz \
             iwan-client iwan-client-oidc iwan-server)
-          # Windows archive: exes + the DLLs they import (libcrypto/libssl
-          # from MSYS2, winpthread/ssp from the mingw runtime); drop the
-          # build log from the artifact
-          rm -f win32/build-win32.log
-          cp win32/bin/*.dll dist/windows/
+          # Windows archive: the two static exes
           (cd dist/windows && zip -qr ../iwan-windows-x86_64.zip .)
           find dist -type f | sort
 

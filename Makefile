@@ -22,12 +22,24 @@ CFLAGS += -D_WIN32_WINNT=0x0601 -DWINVER=0x0601
 LDFLAGS := -Wl,--dynamicbase -Wl,--nxcompat -Wl,--high-entropy-va
 LDLIBS  := -lws2_32 -liphlpapi -lbcrypt -lcrypt32 -lssl -lcrypto
 BIN_SUFFIX := .exe
-# OpenSSL cross sysroot (e.g. an MSYS2 ucrt64 package unpacked locally).
+# OpenSSL cross sysroot (e.g. an MSYS2 ucrt64 package unpacked locally,
+# or a no-shared mingw build installed to lib64/).
 # override: OPENSSL_DIR must take effect even when CFLAGS/LDFLAGS are given
 # on the command line (CI passes CFLAGS explicitly).
 ifneq ($(OPENSSL_DIR),)
 override CFLAGS += -I$(OPENSSL_DIR)/include
-override LDFLAGS += -L$(OPENSSL_DIR)/lib
+override LDFLAGS += -L$(OPENSSL_DIR)/lib -L$(OPENSSL_DIR)/lib64
+endif
+# STATIC=1: link OpenSSL + winpthread + libssp statically so the exe
+# runs with no DLLs beside it (system DLLs — ws2_32, bcrypt, ... — stay
+# imported). Requires a no-shared OpenSSL sysroot (see README). The
+# -Wl,-Bstatic/-Bdynamic scoping is essential: a plain -static would
+# also strip the ws2_32/iphlpapi import libs and fail to link.
+ifeq ($(STATIC),1)
+LDFLAGS += -static-libgcc
+LDLIBS := -Wl,-Bstatic -Wl,--start-group -lcrypto -lssl -Wl,--end-group \
+          -lwinpthread -lssp -Wl,-Bdynamic \
+          $(filter-out -lssl -lcrypto -lwinpthread -lssp,$(LDLIBS))
 endif
 else
 # https.c links against libssl (both platforms).

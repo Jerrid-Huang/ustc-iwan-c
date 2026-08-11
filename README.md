@@ -34,21 +34,25 @@ mkdir -p /tmp/mingw-sysroot && tar --zstd -xf /tmp/ossl.tar.zst -C /tmp/mingw-sy
 
 make TARGET=win32 -B CC=x86_64-w64-mingw32-gcc OPENSSL_DIR=/tmp/mingw-sysroot/ucrt64
 # 产物:bin/iwan-client.exe、bin/iwan-client-oidc.exe(仅客户端;iwan-server 不构建)
+
+# 静态链接(推荐,exe 内嵌 OpenSSL/运行库,无需 DLL):需要 no-shared 的
+# OpenSSL sysroot(MSYS2 包只有 DLL 导入库,须自行编译):
+curl -sL https://www.openssl.org/source/openssl-3.5.1.tar.gz -o /tmp/ossl.tar.gz
+cd /tmp && tar xzf ossl.tar.gz && cd openssl-3.5.1
+./Configure mingw64 no-shared no-tests --cross-compile-prefix=x86_64-w64-mingw32- --prefix=/tmp/ossl-static
+make -j$(nproc) build_libs && make install_sw
+cd <repo> && make TARGET=win32 -B CC=x86_64-w64-mingw32-gcc STATIC=1 OPENSSL_DIR=/tmp/ossl-static
 ```
 
 MSYS2 的 libcrypto/libssl 是 DLL 导入库:运行时需将 `libcrypto-3-x64.dll`、`libssl-3-x64.dll` 及 mingw 运行库(`libwinpthread-1.dll`、`libssp-0.dll`)与 exe 放在同一目录。TUN 模式还需 `wintun.dll`(与驱动一同安装)并在管理员控制台运行;`socks` / `ping` / `auth` / OIDC 无需管理员。CI(`.github/workflows/build.yml` 的 `win-cross` 任务)自动完成交叉编译 + wine 冒烟 + 与 Linux `iwan-server` 的真实线上握手测试。
 
 ### Windows 安装(直接下载,免编译)
 
-1. 从 [Releases](https://github.com/Jerrid-Huang/ustc-iwan-c/releases) 下载 **`iwan-windows-x86_64.zip`**(含两个 exe 与全部运行库 DLL;只下裸 exe 会因缺少 DLL 无法启动)。
-2. 解压到任意目录,例如 `C:\iwan`(保持 exe 与 DLL 在同一文件夹):
+1. 从 [Releases](https://github.com/Jerrid-Huang/ustc-iwan-c/releases) 下载 **`iwan-windows-x86_64.zip`**(含两个静态 exe,OpenSSL 与运行库已内嵌,**无需任何 DLL**;裸 exe 可直接下载运行)。
+2. 解压到任意目录,例如 `C:\iwan`:
    ```
    C:\iwan\iwan-client.exe
    C:\iwan\iwan-client-oidc.exe
-   C:\iwan\libcrypto-3-x64.dll      (OpenSSL 运行库)
-   C:\iwan\libssl-3-x64.dll
-   C:\iwan\libwinpthread-1.dll      (mingw 运行库)
-   C:\iwan\libssp-0.dll
    ```
 3. **TUN 模式需要额外安装 wintun 驱动**(`socks` / `ping` / `auth` / OIDC 模式不需要):
    - 从 [wintun.net](https://www.wintun.net/) 下载安装包(或安装 WireGuard 自带),以管理员运行安装;
@@ -74,7 +78,7 @@ MSYS2 的 libcrypto/libssl 是 DLL 导入库:运行时需将 `libcrypto-3-x64.dl
 
 5. 常见问题:
    - **`wintun.dll not found`**:未安装 wintun 驱动或 DLL 不在 exe 同目录;TUN 模式必须以**管理员**控制台运行。
-   - **提示缺少其他 DLL**:确认使用了 zip 包且解压完整,exe 与 4 个运行库 DLL 在同一目录。
+   - **提示缺少 DLL**:Release 的 exe 是静态链接(OpenSSL/运行库已内嵌),不应缺少第三方 DLL;若提示缺少 `wintun.dll` 之外的 DLL,说明用了非官方/旧构建。
    - **防火墙/杀毒提示**:UDP 6001 出站需放行;若拦截请添加允许规则。
    - **64 位**:本项目仅提供 x86_64 构建,不支持 32 位 Windows。
 

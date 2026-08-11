@@ -429,6 +429,13 @@ static int wsa_errno(int e)
     case WSAEINPROGRESS:      return EINPROGRESS;
     case WSAEALREADY:         return EALREADY;
     case WSANOTINITIALISED:   return EINVAL;
+    case WSAEFAULT:           return EFAULT;
+    case WSAESHUTDOWN:        return EINVAL;
+    case WSAEHOSTDOWN:        return ENETUNREACH;
+    case WSAETOOMANYREFS:     return EIO;
+    case WSAEDISCON:          return EIO;
+    case WSAENOMORE:          return EIO;
+    case WSAEPROCLIM:         return EIO;
     case WSAECONNRESET:       return ECONNRESET;
     case WSAECONNABORTED:     return ECONNABORTED;
     case WSAECONNREFUSED:     return ECONNREFUSED;
@@ -453,14 +460,11 @@ static int wsa_errno(int e)
     }
 }
 
-static int sock_errno(void)
-{
-    return wsa_errno(WSAGetLastError());
-}
-
 static void set_sock_errno(void)
 {
-    errno = sock_errno();
+    int e = WSAGetLastError();
+    errno = wsa_errno(e);
+    log_debug("winsock error %d -> errno %d", e, errno);
 }
 
 void port_socket_init(void)
@@ -655,6 +659,7 @@ ssize_t port_recvmsg(int fd, struct msghdr *msg, int flags)
             return (ssize_t)got;
         }
         errno = wsa_errno(e);
+            log_debug("winsock error %d -> errno %d", e, errno);
         return -1;
     }
     if (heap)
@@ -689,6 +694,7 @@ int port_sendmmsg(int fd, struct mmsghdr *msgvec, unsigned vlen, int flags)
             if (sent > 0)
                 return (int)sent;   /* partial batch: Linux semantics */
             errno = wsa_errno(e);
+            log_debug("winsock error %d -> errno %d", e, errno);
             return -1;
         }
         if (heap)
@@ -734,6 +740,7 @@ int port_recvmmsg(int fd, struct mmsghdr *msgvec, unsigned vlen, int flags,
             if (got > 0)
                 return (int)got;
             errno = wsa_errno(e);
+            log_debug("winsock error %d -> errno %d", e, errno);
             return -1;
         }
         if (heap)
@@ -805,6 +812,7 @@ int port_socket(int domain, int type, int protocol)
             e = WSAGetLastError();
         }
         errno = wsa_errno(e);
+            log_debug("winsock error %d -> errno %d", e, errno);
         return -1;
     }
     return (int)s;
@@ -835,6 +843,7 @@ int port_connect(int fd, const struct sockaddr *addr, socklen_t len)
             return -1;
         }
         errno = wsa_errno(e);
+            log_debug("winsock error %d -> errno %d", e, errno);
         return -1;
     }
     return 0;
@@ -922,6 +931,7 @@ int port_poll(struct pollfd *fds, nfds_t nfds, int timeout_ms)
     if (r == SOCKET_ERROR) {
         int e = WSAGetLastError();
         errno = wsa_errno(e);
+            log_debug("winsock error %d -> errno %d", e, errno);
         return -1;
     }
     return r;
