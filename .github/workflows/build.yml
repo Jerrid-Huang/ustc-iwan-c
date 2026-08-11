@@ -188,6 +188,79 @@ jobs:
           ./bin/iwan-client-oidc --help >/dev/null
           ./bin/iwan-server --help >/dev/null
 
+  # Fully static Linux binaries (musl): zero glibc dependency, run on
+  # any Linux. Downloads the musl.cc cross toolchain and builds a static
+  # OpenSSL with it.
+  musl-static:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    concurrency:
+      group: musl-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y make zstd
+
+      - name: Download musl cross toolchain
+        run: |
+          curl -sL --retry 2 --max-time 300 https://musl.cc/x86_64-linux-musl-cross.tgz -o /tmp/musl.tgz
+          cd /tmp && tar xzf musl.tgz
+
+      - name: Build static OpenSSL (musl)
+        run: |
+          curl -sL --retry 2 --max-time 300 https://www.openssl.org/source/openssl-3.5.1.tar.gz -o /tmp/ossl.tar.gz
+          cd /tmp && tar xzf ossl.tar.gz
+          cd /tmp/openssl-3.5.1
+          ./Configure linux-x86_64 no-shared no-tests \
+            --cross-compile-prefix=/tmp/x86_64-linux-musl-cross/bin/x86_64-linux-musl- \
+            --prefix=/tmp/ossl-musl
+          make -j$(nproc) build_libs
+          make install_sw
+
+      - name: Build (musl static)
+        run: |
+          set -o pipefail
+          make -B -j$(nproc) CC=/tmp/x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc \
+            LINUX_STATIC=1 OPENSSL_DIR=/tmp/ossl-musl \
+            CFLAGS="-O2 -Wall -Wextra -std=c11 -fstack-protector-strong -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3 -MMD -MP -pthread -Werror" \
+            2>&1 | tee build-musl.log
+          if grep -Ei 'error:|warning:' build-musl.log; then
+            echo "::error::musl build emitted errors or warnings"
+            exit 1
+          fi
+
+      - name: Verify static linkage
+        run: |
+          file bin/iwan-client bin/iwan-client-oidc bin/iwan-server
+          if ! file bin/iwan-client | grep -q 'static-pie linked\|statically linked'; then
+            echo "::error::bin/iwan-client is not fully static"
+            exit 1
+          fi
+          if objdump -T bin/iwan-client | grep -q GLIBC; then
+            echo "::error::bin/iwan-client still depends on glibc"
+            exit 1
+          fi
+
+      - name: Smoke test
+        run: |
+          ./bin/iwan-client --help >/dev/null
+          ./bin/iwan-client-oidc --help >/dev/null
+          ./bin/iwan-server --help >/dev/null
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: iwan-musl
+          path: |
+            bin/iwan-client
+            bin/iwan-client-oidc
+            bin/iwan-server
+            build-musl.log
+          if-no-files-found: error
+
   # Windows cross-compile: MinGW-w64 on Linux, gated by the same
   # warning/error grep as the native jobs. The OpenSSL dev package is the
   # MSYS2 ucrt64 one, unpacked under /tmp/mingw-sysroot exactly like the
@@ -317,7 +390,7 @@ jobs:
   #   git tag v0.1.0 && git push origin v0.1.0
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [win-cross]
+    needs: [win-cross, musl-static]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -336,6 +409,12 @@ jobs:
           name: iwan-win32
           path: win32/
 
+      - name: Download musl static binaries
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: iwan-musl
+          path: musl/
+
       - name: Package release archives
         run: |
           set -e
@@ -353,6 +432,14 @@ jobs:
             iwan-client iwan-client-oidc iwan-server)
           # Windows archive: the two static exes
           (cd dist/windows && zip -qr ../iwan-windows-x86_64.zip .)
+          # musl static binaries: raw (any-Linux) + archive; note the
+          # musl artifact keeps its bin/ prefix
+          cp musl/bin/iwan-client musl/bin/iwan-client-oidc musl/bin/iwan-server dist/linux/
+          mv dist/linux/iwan-client dist/linux/iwan-client-musl
+          mv dist/linux/iwan-client-oidc dist/linux/iwan-client-oidc-musl
+          mv dist/linux/iwan-server dist/linux/iwan-server-musl
+          (cd dist/linux && tar czf ../iwan-linux-x86_64-musl.tar.gz \
+            iwan-client-musl iwan-client-oidc-musl iwan-server-musl)
           find dist -type f | sort
 
       - name: Create GitHub Release
@@ -360,10 +447,14 @@ jobs:
         with:
           files: |
             dist/iwan-linux-x86_64.tar.gz
+            dist/iwan-linux-x86_64-musl.tar.gz
             dist/iwan-windows-x86_64.zip
             dist/linux/iwan-client
             dist/linux/iwan-client-oidc
             dist/linux/iwan-server
+            dist/linux/iwan-client-musl
+            dist/linux/iwan-client-oidc-musl
+            dist/linux/iwan-server-musl
             dist/windows/iwan-client.exe
             dist/windows/iwan-client-oidc.exe
           generate_release_notes: true
