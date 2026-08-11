@@ -22,14 +22,6 @@ CFLAGS += -D_WIN32_WINNT=0x0601 -DWINVER=0x0601
 LDFLAGS := -Wl,--dynamicbase -Wl,--nxcompat -Wl,--high-entropy-va
 LDLIBS  := -lws2_32 -liphlpapi -lbcrypt -lcrypt32 -lshell32 -lssl -lcrypto
 BIN_SUFFIX := .exe
-# OpenSSL cross sysroot (e.g. an MSYS2 ucrt64 package unpacked locally,
-# or a no-shared mingw build installed to lib64/).
-# override: OPENSSL_DIR must take effect even when CFLAGS/LDFLAGS are given
-# on the command line (CI passes CFLAGS explicitly).
-ifneq ($(OPENSSL_DIR),)
-override CFLAGS += -I$(OPENSSL_DIR)/include
-override LDFLAGS += -L$(OPENSSL_DIR)/lib -L$(OPENSSL_DIR)/lib64
-endif
 # STATIC=1: link OpenSSL + winpthread + libssp statically so the exe
 # runs with no DLLs beside it (system DLLs — ws2_32, bcrypt, ... — stay
 # imported). Requires a no-shared OpenSSL sysroot (see README). The
@@ -45,8 +37,25 @@ else
 # https.c links against libssl (both platforms).
 LDLIBS := -lssl -lcrypto
 BIN_SUFFIX :=
+# LINUX_STATIC=1: fully static Linux binaries (musl toolchain or glibc
+# -static). Drops -fPIE/-pie (incompatible with -static) and requires a
+# static OpenSSL in OPENSSL_DIR. This is the standard way to ship
+# binaries that run on any Linux regardless of the build host's glibc.
+ifeq ($(LINUX_STATIC),1)
+CFLAGS := $(filter-out -fPIE,$(CFLAGS))
+LDFLAGS := $(filter-out -pie,$(LDFLAGS))
+LDFLAGS += -static
+endif
 endif
 
+# OpenSSL sysroot (shared by win32 and LINUX_STATIC builds; e.g. an
+# MSYS2 ucrt64 package, a no-shared mingw build, or a musl static build).
+# override: OPENSSL_DIR must take effect even when CFLAGS/LDFLAGS are
+# given on the command line (CI passes CFLAGS explicitly).
+ifneq ($(OPENSSL_DIR),)
+override CFLAGS += -I$(OPENSSL_DIR)/include
+override LDFLAGS += -L$(OPENSSL_DIR)/lib -L$(OPENSSL_DIR)/lib64
+endif
 SRC_DIR    := src
 COMMON_DIR := $(SRC_DIR)/common
 OIDC_DIR   := $(SRC_DIR)/oidc
