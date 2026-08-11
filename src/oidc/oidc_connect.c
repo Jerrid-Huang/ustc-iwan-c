@@ -158,80 +158,101 @@ void oidc_connect_server(const Opts *o, const Config *cf)
     const char *srv_user = json_get_str(srv, "username");
     const char *encrypted_pw = json_get_str(srv, "passWord");
 
-    char *password = decrypt_password(encrypted_pw ? encrypted_pw : "",
-                                      OIDC_APP_SECRET, cf->domain,
-                                      srv_user ? srv_user : "");
-    if (!password)
-        oidc_die("cannot decrypt password");
-
     oidc_eprintf("  Connecting to %s (%s:%u)...\n", name ? name : "", host,
                  (unsigned)port);
 
     oidc_check_server_ip(host);
 
     const char *user = srv_user ? srv_user : "";
-    uint8_t ct[16];
-    if (get_ct(user, password, NULL, ct) != 0)
-        oidc_die("cannot derive password");
-    uint32_t nonce = rand_u32();
-    buf_t open;
-    buf_init(&open);
-    if (build_open(&open, user, ct, IWAN_DEFAULT_MTU, o->encrypt, nonce) != 0) {
-        buf_free(&open);
-        oidc_die("username too long (max 255 bytes)");
-    }
-    AuthResult res;
-    int fd = do_auth(host, port, open.data, open.len, nonce, DO_AUTH_OIDC,
-                     &res);
-    buf_free(&open);
-    if (fd < 0)
-        oidc_die("auth failed");
-    oidc_eprintf("  OK  tun=%s gw=%s dns=%s mtu=%u\n", res.tun, res.gw,
-                 res.dns, (unsigned)res.mtu);
 
-    uint8_t sk[16];
-    session_key(user, password, sk);
-    OPENSSL_cleanse(password, strlen(password)); /* plaintext credential */
-    free(password);
-
-    if (o->socks) {
-        int rc = run_socks_mode(o, fd, sk, &res);
-        port_close(fd);
-        if (rc != 0)
-            exit(1);
-        return;
-    }
-
-    if (!tun_name_valid(o->tun)) {
-        port_close(fd);
-        oidc_die("invalid TUN device name '%s'", o->tun);
-    }
-
+    /* TUN device and route prep are session-independent: prepared once,
+     * reused across reconnects (the server keeps the assigned IP on a
+     * re-OPEN, so routing stays valid). */
+    int tun_fd = -1;
+    if (!o->socks) {
+        if (!tun_name_valid(o->tun))
+            oidc_die("invalid TUN device name '%s'", o->tun);
 #ifndef _WIN32
-    /* Linux: pre-delete a stale tun device by name. Windows: wintun's
-     * open_tun (tun_win.c) deletes an existing adapter with the same
-     * name as part of open-or-create, so nothing to do here. */
-    char *const del[] = { "link", "del", (char *)o->tun, NULL };
-    ip_run_quiet(del);
+        /* Linux: pre-delete a stale tun device by name. Windows: wintun's
+         * open_tun (tun_win.c) deletes an existing adapter with the same
+         * name as part of open-or-create, so nothing to do here. */
+        char *const del[] = { "link", "del", (char *)o->tun, NULL };
+        ip_run_quiet(del);
 #endif
-    int tun_fd = open_tun(o->tun);
-    if (tun_fd < 0) {
-        port_close(fd);
-        oidc_die("open tun (must be root or CAP_NET_ADMIN)");
+        tun_fd = open_tun(o->tun);
+        if (tun_fd < 0)
+            oidc_die("open tun (must be root or CAP_NET_ADMIN)");
+        set_nonblock(tun_fd);
+        if (debug_enabled())
+            oidc_eprintf("  tun %s fd=%d\n", o->tun, tun_fd);
     }
-    set_nonblock(tun_fd);
-    if (debug_enabled())
-        oidc_eprintf("  tun %s fd=%d\n", o->tun, tun_fd);
 
     slist_t routes;
     slist_init(&routes);
     collect_routes(o, &routes);
 
-    int rc = run_pump(tun_fd, o->tun, fd, sk, res.sid, res.tok, o->encrypt,
-                      host, &routes, res.tun, res.mtu);
-    tun_close(tun_fd);
-    port_close(fd);
+    /* authenticate/run loop: a lost session (keepalive failure, no
+     * downlink) re-authenticates and re-runs the pump instead of
+     * silently dying. The plaintext password is re-decrypted per
+     * iteration and scrubbed right after use. */
+    for (;;) {
+        char *password = decrypt_password(encrypted_pw ? encrypted_pw : "",
+                                          OIDC_APP_SECRET, cf->domain,
+                                          srv_user ? srv_user : "");
+        if (!password)
+            oidc_die("cannot decrypt password");
+        uint8_t ct[16];
+        if (get_ct(user, password, NULL, ct) != 0) {
+            OPENSSL_cleanse(password, strlen(password));
+            free(password);
+            oidc_die("cannot derive password");
+        }
+        uint32_t nonce = rand_u32();
+        buf_t open;
+        buf_init(&open);
+        if (build_open(&open, user, ct, IWAN_DEFAULT_MTU, o->encrypt,
+                       nonce) != 0) {
+            buf_free(&open);
+            OPENSSL_cleanse(password, strlen(password));
+            free(password);
+            oidc_die("username too long (max 255 bytes)");
+        }
+        AuthResult res;
+        int fd = do_auth(host, port, open.data, open.len, nonce, DO_AUTH_OIDC,
+                         &res);
+        buf_free(&open);
+        if (fd < 0) {
+            OPENSSL_cleanse(password, strlen(password));
+            free(password);
+            oidc_die("auth failed");
+        }
+        oidc_eprintf("  OK  tun=%s gw=%s dns=%s mtu=%u\n", res.tun, res.gw,
+                     res.dns, (unsigned)res.mtu);
+
+        uint8_t sk[16];
+        session_key(user, password, sk);
+        OPENSSL_cleanse(password, strlen(password));
+        free(password);
+
+        int rc;
+        if (o->socks) {
+            rc = run_socks_mode(o, fd, sk, &res);
+            port_close(fd);
+        } else {
+            rc = run_pump(tun_fd, o->tun, fd, sk, res.sid, res.tok,
+                          o->encrypt, host, &routes, res.tun, res.mtu);
+            port_close(fd);
+        }
+        OPENSSL_cleanse(sk, sizeof sk);   /* session key scrub */
+        if (rc == 0 || g_stop)
+            break;   /* user stopped it */
+        if (rc < 0)
+            exit(1);   /* config/startup failure: retrying cannot help */
+        oidc_eprintf("  tunnel session lost; reconnecting...\n");
+        port_sleep_ms(1000);
+    }
+
+    if (tun_fd >= 0)
+        tun_close(tun_fd);
     slist_free(&routes);
-    if (rc != 0)
-        exit(1);
 }

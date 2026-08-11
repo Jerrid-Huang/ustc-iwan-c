@@ -39,6 +39,10 @@ typedef struct {
     struct tun_pool *pool;
     pace_bucket pace;   /* aggregate send pacing (util.h); serialized by
                          * send_lock — the bucket is not thread-safe */
+    bool session_lost;  /* set by udp2tun_thread when the tunnel is
+                         * considered dead (keepalive failures / no
+                         * downlink); distinguishes failure from the
+                         * user's Ctrl-C so run_pump can report it */
 } pump_ctx_t;
 
 static void eprintf(const char *fmt, ...) {
@@ -76,6 +80,15 @@ static int send_ctrl(pump_ctx_t *ctx, uint8_t typ, uint8_t enc, uint16_t sid,
 #define PUMP_BATCH 32
 #define PUMP_SLOT  2048
 #define PUMP_KEEPALIVE_MS 10000u
+/* keepalive send must fail this many times in a row before the tunnel
+ * is declared dead: a transient network blip (wifi roam, carrier
+ * hiccup) must not kill the session, while a persistent failure means
+ * the socket is gone */
+#define PUMP_KA_FAIL_MAX 3
+/* no downlink for this long (the server answers our ECHO_REQ
+ * keepalives, so a live session produces traffic every ~10s) =>
+ * session lost: the server purged or rebooted the session */
+#define PUMP_RX_STALE_MS 60000u
 #define PUMP_POLL_CEIL_MS 1000  /* cap on the recvmmsg park timeout */
 #define RX_BATCH 64             /* recvmmsg batch size (iov/msgs arrays) */
 #define PUMP_SEND_RETRY_MS  5    /* EAGAIN/ENOBUFS retry budget per flush:
@@ -378,6 +391,8 @@ static void *udp2tun_thread(void *ud) {
     uint64_t last_ka = now_ms() > PUMP_KEEPALIVE_MS
                            ? now_ms() - PUMP_KEEPALIVE_MS
                            : 0;
+    uint64_t last_rx = now_ms();   /* any downlink resets the stale clock */
+    int ka_fail = 0;
     int i;
 
     if (!batch) {
@@ -394,16 +409,36 @@ static void *udp2tun_thread(void *ud) {
     }
     while (!g_stop) {
         uint64_t now = now_ms();
+        if (now - last_rx > PUMP_RX_STALE_MS) {
+            /* the server answers our ECHO_REQ keepalives, so a live
+             * session always produces downlink within ~10s; 60s of
+             * silence means the session is gone (server purge/reboot)
+             * even if the socket itself still sends */
+            eprintf("[UDP->TUN] no downlink for %llu ms; session lost\n",
+                    (unsigned long long)(now - last_rx));
+            ctx->session_lost = true;
+            g_stop = 1;
+            break;
+        }
         if (now >= last_ka + PUMP_KEEPALIVE_MS) {
             if (send_ctrl(ctx, PT_ECHO_REQ, ctx->enc, ctx->sid,
                           ctx->tok) != 0) {
-                eprintf("[UDP->TUN] keepalive send err\n");
-                /* pump-fatal, same policy as socks.c: a failed control
-                 * send means the session socket is gone (the server
-                 * will drop us anyway), so stop the pump instead of
-                 * looping on dead keepalives */
-                g_stop = 1;
-                break;
+                int e = errno;
+                /* transient errors (roaming, carrier hiccup) recover;
+                 * only repeated failures declare the socket dead */
+                if (++ka_fail >= PUMP_KA_FAIL_MAX) {
+                    eprintf("[UDP->TUN] keepalive send err: %s (%d "
+                            "consecutive); session lost\n",
+                            strerror(e), ka_fail);
+                    ctx->session_lost = true;
+                    g_stop = 1;
+                    break;
+                }
+                eprintf("[UDP->TUN] keepalive send err: %s (retry "
+                        "%d/%d)\n", strerror(e), ka_fail,
+                        PUMP_KA_FAIL_MAX);
+            } else {
+                ka_fail = 0;
             }
             last_ka = now_ms();
         }
@@ -432,6 +467,7 @@ static void *udp2tun_thread(void *ud) {
             g_stop = 1;   /* any pump-fatal error stops the tunnel */
             break;
         }
+        last_rx = now_ms();   /* any datagram resets the stale clock */
         for (i = 0; i < v; i++) {
             ssize_t n = msgs[i].msg_len;
             uint8_t *m = batch + (size_t)i * slot;
@@ -733,5 +769,7 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
 
     pthread_mutex_destroy(&ctx.send_lock);
     slist_free(&routes);
-    return 0;
+    /* 1 = session lost (keepalive failures / no downlink): the caller
+     * may re-authenticate and re-run the pump; 0 = user stopped it */
+    return ctx.session_lost ? 1 : 0;
 }

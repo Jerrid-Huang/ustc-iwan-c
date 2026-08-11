@@ -750,47 +750,17 @@ static int cmd_proxy(int argc, char **argv, int start)
     }
 #endif
 
-    AuthResult res;
-    int sockfd = authenticate(&o, DO_AUTH_PUMP, &res);
-    if (sockfd < 0) {
-        log_err("Error: auth failed");
-        cleanse_str(o.pass);
-        free_route_opts(&o);
-        return 1;
-    }
-
-    check_gw_server(o.server, res.gw);   /* F8: gateway vs connected server */
-
-#ifdef _WIN32
-    /* Windows sockets default to blocking; the pump paths (run_pump /
-     * run_socks) expect a nonblocking datagram socket. On Linux the pump
-     * sets this itself. */
-    if (port_set_nonblock(sockfd, true) != 0)
-        log_err("Error: set nonblock: %s", strerror(errno));
-#endif
-
-    if (o.encrypt != 1)
-        log_err("WARN: data-plane only XOR(1), got %d", o.encrypt);
-
-    uint8_t sk[16];
-    session_key(o.user, o.pass, sk);
-    cleanse_str(o.pass);   /* last use of the pass */
-
-    if (!tun_name_valid(o.tun)) {
-        log_err("Error: invalid TUN device name '%s'", o.tun);
-        wipe(sk, sizeof sk);
-        port_close(sockfd);
-        free_route_opts(&o);
-        return 1;
-    }
-
     slist_t routes;
     slist_init(&routes);
     collect_routes(&o, &routes);
 
+    if (!tun_name_valid(o.tun)) {
+        log_err("Error: invalid TUN device name '%s'", o.tun);
+        free_route_opts(&o);
+        return 1;
+    }
+
     if (cleanup_stale_tun(o.tun) < 0) {
-        wipe(sk, sizeof sk);
-        port_close(sockfd);
         slist_free(&routes);
         free_route_opts(&o);
         return 1;
@@ -799,8 +769,6 @@ static int cmd_proxy(int argc, char **argv, int start)
     int tun_fd = open_tun(o.tun);
     if (tun_fd < 0) {
         log_err("Error: open tun (must be root)");
-        wipe(sk, sizeof sk);
-        port_close(sockfd);
         slist_free(&routes);
         free_route_opts(&o);
         return 1;
@@ -808,13 +776,49 @@ static int cmd_proxy(int argc, char **argv, int start)
     set_nonblock(tun_fd);
     log_info("tun %s fd=%d", o.tun, tun_fd);
 
-    int rc = run_pump(tun_fd, o.tun, sockfd, sk, res.sid, res.tok, o.encrypt,
-                      o.server, &routes, res.tun, res.mtu);
-    wipe(sk, sizeof sk);   /* last use of the derived key */
+    /* keep the plaintext pass until the session ends: reconnects need
+     * it to re-derive the session key (server re-OPEN keeps the IP) */
+    int rc = 0;
+    for (;;) {
+        AuthResult res;
+        int sockfd = authenticate(&o, DO_AUTH_PUMP, &res);
+        if (sockfd < 0) {
+            log_err("Error: auth failed");
+            rc = 1;
+            break;
+        }
+
+        check_gw_server(o.server, res.gw);   /* F8 */
+
+#ifdef _WIN32
+        /* Windows sockets default to blocking; the pump paths expect a
+         * nonblocking datagram socket. On Linux the pump sets this
+         * itself. */
+        if (port_set_nonblock(sockfd, true) != 0)
+            log_err("Error: set nonblock: %s", strerror(errno));
+#endif
+
+        if (o.encrypt != 1)
+            log_err("WARN: data-plane only XOR(1), got %d", o.encrypt);
+
+        uint8_t sk[16];
+        session_key(o.user, o.pass, sk);
+
+        rc = run_pump(tun_fd, o.tun, sockfd, sk, res.sid, res.tok,
+                      o.encrypt, o.server, &routes, res.tun, res.mtu);
+        wipe(sk, sizeof sk);
+        port_close(sockfd);
+        /* user stopped it (Ctrl-C), or a stop request arrived while we
+         * were tearing down: never reconnect against g_stop */
+        if (rc == 0 || g_stop)
+            break;
+        log_err("tunnel session lost; reconnecting in 1s...");
+        port_sleep_ms(1000);
+    }
+    cleanse_str(o.pass);
     tun_close(tun_fd);
     log_info("done.");
 
-    port_close(sockfd);
     slist_free(&routes);
     free_route_opts(&o);
     return rc == 0 ? 0 : 1;
@@ -844,66 +848,77 @@ static int cmd_socks(int argc, char **argv, int start)
     resolve_credentials(&o, "socks");
     check_server_ip(o.server, "invalid server address");
 
-    AuthResult res;
-    int sockfd = authenticate(&o, DO_AUTH_PUMP, &res);
-    if (sockfd < 0) {
-        log_err("Error: auth failed");
-        cleanse_str(o.pass);
-        return 1;
-    }
+    /* keep the plaintext pass until the session ends: reconnects need
+     * it to re-derive the session key (server re-OPEN keeps the IP) */
+    for (;;) {
+        AuthResult res;
+        int sockfd = authenticate(&o, DO_AUTH_PUMP, &res);
+        if (sockfd < 0) {
+            log_err("Error: auth failed");
+            cleanse_str(o.pass);
+            return 1;
+        }
 #ifdef _WIN32
-    /* Windows sockets default to blocking; run_socks expects a
-     * nonblocking datagram socket. On Linux run_socks sets this itself. */
-    if (port_set_nonblock(sockfd, true) != 0)
-        log_err("Error: set nonblock: %s", strerror(errno));
+        /* Windows sockets default to blocking; run_socks expects a
+         * nonblocking datagram socket. On Linux run_socks sets this
+         * itself. */
+        if (port_set_nonblock(sockfd, true) != 0)
+            log_err("Error: set nonblock: %s", strerror(errno));
 #endif
-    if (o.encrypt != 1)
-        log_err("WARN: data-plane only XOR(1), got %d", o.encrypt);
+        if (o.encrypt != 1)
+            log_err("WARN: data-plane only XOR(1), got %d", o.encrypt);
 
-    uint8_t sk[16];
-    session_key(o.user, o.pass, sk);
-    cleanse_str(o.pass);   /* last use of the pass */
+        uint8_t sk[16];
+        session_key(o.user, o.pass, sk);
 
-    uint8_t b[4];
-    if (!s2ip4(res.tun, b)) {
-        log_err("Error: server returned invalid tunnel IPv4 address");
+        uint8_t b[4];
+        if (!s2ip4(res.tun, b)) {
+            log_err("Error: server returned invalid tunnel IPv4 address");
+            wipe(sk, sizeof sk);
+            port_close(sockfd);
+            cleanse_str(o.pass);
+            return 1;
+        }
+        uint32_t inner_ip = ip4_u32(b);
+        if (!s2ip4(res.gw, b)) {
+            log_err("Error: server returned invalid gateway IPv4 address");
+            wipe(sk, sizeof sk);
+            port_close(sockfd);
+            cleanse_str(o.pass);
+            return 1;
+        }
+        uint32_t gateway = ip4_u32(b);
+        check_gw_server(o.server, res.gw);   /* F8 */
+
+        /* valid_listen already validated the syntax at parse time; this
+         * parse only fills the sockaddr for run_socks */
+        struct sockaddr_in listen;
+        parse_host_port(o.listen_str, &listen);
+
+        SocksConfig cfg;
+        memset(&cfg, 0, sizeof cfg);
+        cfg.listen_addr = listen;
+        cfg.listen_str = o.listen_str;
+        cfg.inner_ip = inner_ip;
+        cfg.gateway = gateway;
+        cfg.mtu = (int)(res.mtu < o.mtu ? res.mtu : o.mtu);
+        memcpy(cfg.xor_key, sk, sizeof cfg.xor_key);
         wipe(sk, sizeof sk);
+        cfg.sid = res.sid;
+        cfg.token = res.tok;
+        cfg.encryption = o.encrypt;
+        cfg.auth_token = o.socks_token;
+        cfg.allow_remote = o.allow_remote;
+        snprintf(cfg.dns, sizeof cfg.dns, "%s", res.dns);
+
+        int rc = run_socks(sockfd, &cfg);
         port_close(sockfd);
-        return 1;
+        if (rc == 0 || g_stop)
+            break;   /* user stopped it */
+        log_err("tunnel session lost; reconnecting in 1s...");
+        port_sleep_ms(1000);
     }
-    uint32_t inner_ip = ip4_u32(b);
-    if (!s2ip4(res.gw, b)) {
-        log_err("Error: server returned invalid gateway IPv4 address");
-        wipe(sk, sizeof sk);
-        port_close(sockfd);
-        return 1;
-    }
-    uint32_t gateway = ip4_u32(b);
-    check_gw_server(o.server, res.gw);   /* F8: gateway vs connected server */
-
-    /* valid_listen already validated the syntax at parse time; this
-     * parse only fills the sockaddr for run_socks */
-    struct sockaddr_in listen;
-    parse_host_port(o.listen_str, &listen);
-
-    SocksConfig cfg;
-    memset(&cfg, 0, sizeof cfg);
-    cfg.listen_addr = listen;
-    cfg.listen_str = o.listen_str;
-    cfg.inner_ip = inner_ip;
-    cfg.gateway = gateway;
-    cfg.mtu = (int)(res.mtu < o.mtu ? res.mtu : o.mtu);
-    memcpy(cfg.xor_key, sk, sizeof cfg.xor_key);
-    wipe(sk, sizeof sk);   /* last use of the derived key */
-    cfg.sid = res.sid;
-    cfg.token = res.tok;
-    cfg.encryption = o.encrypt;
-    cfg.auth_token = o.socks_token;
-    cfg.allow_remote = o.allow_remote;
-    snprintf(cfg.dns, sizeof cfg.dns, "%s", res.dns);
-
-    run_socks(sockfd, &cfg);
-    port_close(sockfd);
+    cleanse_str(o.pass);
     return 0;
 }
 

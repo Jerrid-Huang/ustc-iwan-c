@@ -25,11 +25,12 @@ PORT=16001            # VPN UDP port
 ECHO_PORT=17000       # echo server TCP port
 SOCKS_PORT=18080      # local SOCKS5 listener (17080 collides with a
                       # pre-existing service on some hosts)
-# Test subnet: 100.64.0.0/16 (CGNAT) instead of the production
-# 198.18.0.0/16 — a pre-existing iWAN setup on the host may already own
-# 198.18.0.1/16, which breaks the downlink routing assumptions.
-SRV_IP=100.64.0.1
-SUBNET=100.64.0.0/16
+# Test subnet: 172.16.0.0/16 instead of the production 198.18.0.0/16
+# (a pre-existing iWAN setup on the host may already own 198.18.0.1/16).
+# NOT 100.64.0.0/10: that CGNAT range collides with Tailscale's routes
+# when the host runs Tailscale, silently blackholing tunnel traffic.
+SRV_IP=172.16.0.1
+SUBNET=172.16.0.0/16
 # streaming throughput phase, MiB per connection (0 disables; the small
 # echo rounds are RTT-bound ping-pong and say nothing about bandwidth)
 # Default 2: the echo test drives BOTH directions at full rate, and on
@@ -106,13 +107,13 @@ echo "== start iwan-server =="
 # outbound interface for MASQUERADE: the default-route device, so
 # tunneled connections to the public internet (DNS, HTTP checks below)
 # work; the echo server binds $SRV_IP on lo and is unaffected
-NAT_IF=$(ip route show default 2>/dev/null | awk 'NR==1 {print $5}')
+NAT_IF=$(ip route show default 2>/dev/null | awk 'NR==1 {for (i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}')   # the device after 'dev' ("via"-less routes like ppp0 break \$5 parsing)
 [ -n "$NAT_IF" ] || NAT_IF=lo
 # tunnel-DNS target: the system resolver (the gateway usually answers;
 # fall back to the loopback stub). A hardcoded public resolver is NOT
 # used here — it may be filtered on the host's network, which would
 # fail the tunnel-DNS check for the wrong reason.
-SYS_DNS=$(resolvectl status 2>/dev/null | awk '/DNS Servers:/ && !d {print $3; d=1}')
+SYS_DNS=${SYS_DNS:-223.5.5.5}   # public DNS; the system DNS may collide with Tailscale's CGNAT routes
 [ -n "$SYS_DNS" ] || SYS_DNS=127.0.0.53
 ./bin/iwan-server --users "$WORK/users.txt" --port "$PORT" \
     --tun iwan-srv-it --server-ip "$SRV_IP" --subnet "$SUBNET" \

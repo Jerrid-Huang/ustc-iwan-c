@@ -306,6 +306,7 @@ static int saved_ip_forward = -1; /* -1: not captured */
 static char nat_subnet_saved[64];
 static char nat_if_saved[64];
 static bool nat_rule_added;
+static bool fwd_rule_added;   /* our FORWARD ACCEPT for the tunnel subnet */
 
 static void enable_ip_forward(void)
 {
@@ -373,6 +374,25 @@ static void setup_nat(const char *subnet, const char *nat_if)
                     "warning: iptables MASQUERADE failed (need root and iptables?)\n");
         }
     }
+
+    /* FORWARD 放行:host 防火墙(Tailscale/UFW 等)可能 DROP 转发流量,
+     * 隧道内 DNS 查询和出网数据都要穿过 FORWARD 链;放行隧道子网的
+     * 转发,退出时删除(与 MASQUERADE 同生命周期)。 */
+    if (subnet[0] != '\0') {
+        char *fchk[] = { "iptables", "-C", "FORWARD", "-s", (char *)subnet,
+                         "-j", "ACCEPT", NULL };
+        char *fadd[] = { "iptables", "-I", "FORWARD", "-s", (char *)subnet,
+                         "-j", "ACCEPT", NULL };
+        if (run_cmd(fchk) != 0) {
+            if (run_cmd(fadd) == 0) {
+                fwd_rule_added = true;
+                printf("iptables: FORWARD %s ACCEPT\n", subnet);
+            } else {
+                fprintf(stderr, "warning: iptables FORWARD ACCEPT failed "
+                        "(tunnel forwarding may be firewalled)\n");
+            }
+        }
+    }
 }
 
 /* Best-effort exit cleanup: restore ip_forward and drop the MASQUERADE rule
@@ -404,6 +424,13 @@ static void server_cleanup_nat(void)
                         "MASQUERADE", NULL };
         if (run_cmd(del) != 0)
             fprintf(stderr, "warning: iptables -D MASQUERADE failed\n");
+    }
+
+    if (fwd_rule_added) {
+        char *fdel[] = { "iptables", "-D", "FORWARD", "-s",
+                         nat_subnet_saved, "-j", "ACCEPT", NULL };
+        if (run_cmd(fdel) != 0)
+            fprintf(stderr, "warning: iptables -D FORWARD ACCEPT failed\n");
     }
 }
 

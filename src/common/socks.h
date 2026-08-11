@@ -27,9 +27,13 @@ typedef struct {
     int      gso_ok;       /* 0 untried, 1 usable, -1 failed */
     size_t   gso_mss;      /* last UDP_SEGMENT mss set, 0 = none */
     pace_bucket pace;      /* aggregate send pacing (util.h); 0 = off */
+    /* runtime session-health state (not configuration): */
+    uint64_t last_rx;      /* last downlink datagram (stale-session clock) */
+    int      ka_fail;      /* consecutive keepalive send failures */
+    bool     session_lost; /* tunnel died (keepalive / no downlink) */
 } SocksConfig;
 
 /* Run SOCKS5 server (blocks). sockfd = authenticated UDP socket. */
-void run_socks(int sockfd, SocksConfig *cfg);
+int run_socks(int sockfd, SocksConfig *cfg);   /* 0 stopped, 1 session lost */
 
 #endif

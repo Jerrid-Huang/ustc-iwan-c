@@ -212,6 +212,7 @@ static size_t win_join_argv(char *const argv[], int start, wchar_t *out,
         out[n] = L'\0';
     return n;
 }
+#endif /* _WIN32 */
 
 int port_elevate_self(int argc, char **argv)
 {
@@ -293,8 +294,6 @@ int port_strncasecmp(const char *a, const char *b, size_t n)
 /* ----------------------- subprocess helpers ------------------------ */
 /* Windows: CreateProcessW with redirected stdio. POSIX: fork+execvp
  * (used by util.c's ip_run family on Linux). */
-
-#endif /* _WIN32 */
 
 int port_run_cmd(char *const argv[])
 {

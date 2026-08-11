@@ -45,6 +45,12 @@ Flow *g_flows;            /* fixed MAX_FLOWS array, never NULL-terminated */
 
 /* one GSO unit: max UDP payload (65535 - 20B IP - 8B UDP) */
 #define SOCKS_KEEPALIVE_MS 10000u
+/* keepalive send must fail this many times in a row before the session
+ * is declared dead (transient blips recover; persistent failure means
+ * the socket is gone) */
+#define SOCKS_KA_FAIL_MAX 3
+/* no downlink for this long => session lost (server purged/rebooted) */
+#define SOCKS_RX_STALE_MS 60000u
 #define LISTEN_BACKLOG   64
 #define SOCK_BUF_BYTES   (16 * 1024 * 1024)
 #define POLL_CEIL_MS     1000   /* safety ceiling for the event wait */
@@ -369,11 +375,20 @@ void send_vpn_keepalive(int sockfd, const SocksConfig *cfg,
     buf_init(&p);
     ctrl_hdr(&p, PT_ECHO_REQ, cfg->encryption, cfg->sid, cfg->token);
     if (port_send(sockfd, p.data, (int)p.len, 0) < 0) {
-        /* a failed keepalive means the session socket is dead: stop the
-         * tunnel instead of silently dropping the heartbeat (same
-         * policy as proxy.c's pump loop) */
-        log_err("SOCKS keepalive send failed: %s", strerror(errno));
-        atomic_store_explicit(&g_stop, true, memory_order_relaxed);
+        /* transient failures (roaming, carrier hiccup) recover; only
+         * repeated ones declare the session socket dead */
+        SocksConfig *c = (SocksConfig *)cfg;
+        if (++c->ka_fail >= SOCKS_KA_FAIL_MAX) {
+            log_err("SOCKS keepalive send failed: %s (%d consecutive); "
+                    "session lost", strerror(errno), c->ka_fail);
+            c->session_lost = true;
+            atomic_store_explicit(&g_stop, true, memory_order_relaxed);
+        } else {
+            log_debug("SOCKS keepalive send failed: %s (retry %d/%d)",
+                      strerror(errno), c->ka_fail, SOCKS_KA_FAIL_MAX);
+        }
+    } else {
+        ((SocksConfig *)cfg)->ka_fail = 0;
     }
     buf_free(&p);
     *last_ka = now_ms();
@@ -505,6 +520,8 @@ int receive_vpn(int sockfd, SocksConfig *cfg) {
         if (budget <= 0)
             return 0;
         int v = port_recvmmsg(sockfd, rx_msgs, RX_VLEN, MSG_DONTWAIT, NULL);
+        if (v > 0)
+            cfg->last_rx = now_ms();   /* downlink resets the stale clock */
         if (v <= 0) {
             if (v == 0 || errno == EAGAIN || errno == EWOULDBLOCK)
                 return 0;
@@ -522,8 +539,14 @@ int receive_vpn(int sockfd, SocksConfig *cfg) {
     }
 }
 
-void run_socks(int sockfd, SocksConfig *cfg) {
+int run_socks(int sockfd, SocksConfig *cfg) {
     int listener;
+
+    /* runtime session-health state: memset-to-zero callers leave
+     * last_rx = 0, which would read as "no downlink for 16 hours" */
+    cfg->last_rx = now_ms();
+    cfg->ka_fail = 0;
+    cfg->session_lost = false;
     struct sockaddr_in laddr = cfg->listen_addr;
 
     g_socks_cfg = cfg;
@@ -532,14 +555,14 @@ void run_socks(int sockfd, SocksConfig *cfg) {
     listener = port_socket(AF_INET, SOCK_STREAM, 0);
     if (listener < 0) {
         log_err("socket SOCKS5 listener: %s", strerror(errno));
-        return;
+        return 0;
     }
     int one = 1;
     port_setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
     if (port_bind(listener, (struct sockaddr *)&laddr, sizeof laddr) < 0) {
         log_err("bind SOCKS5 listener: %s", strerror(errno));
         port_close(listener);
-        return;
+        return 0;
     }
     if (laddr.sin_addr.s_addr != htonl(INADDR_LOOPBACK)) {
         if (cfg->allow_remote) {
@@ -557,13 +580,13 @@ void run_socks(int sockfd, SocksConfig *cfg) {
                     "pass --allow-remote to override",
                     cfg->listen_str ? cfg->listen_str : "?");
             port_close(listener);
-            return;
+            return 0;
         }
     }
     if (port_listen(listener, LISTEN_BACKLOG) < 0) {
         log_err("listen SOCKS5: %s", strerror(errno));
         port_close(listener);
-        return;
+        return 0;
     }
     port_set_nonblock(listener, true);
     port_set_nonblock(sockfd, true);
@@ -597,7 +620,7 @@ void run_socks(int sockfd, SocksConfig *cfg) {
     g_flows = calloc(MAX_FLOWS, sizeof *g_flows);
     if (!g_flows) {
         port_close(listener);
-        return;
+        return 0;
     }
     g_next_id = 1;
     /* clear any DNS state a previous session left behind (result ring,
@@ -642,6 +665,16 @@ void run_socks(int sockfd, SocksConfig *cfg) {
     uint64_t last_ka = now_ms() - SOCKS_KEEPALIVE_MS;
 
     while (!g_stop) {
+        /* the server answers our ECHO_REQ keepalives, so a live session
+         * always produces downlink within ~10s; 60s of silence means
+         * the session is gone even if the socket still sends */
+        if (now_ms() - cfg->last_rx > SOCKS_RX_STALE_MS) {
+            log_err("SOCKS: no downlink for %llu ms; session lost",
+                    (unsigned long long)(now_ms() - cfg->last_rx));
+            cfg->session_lost = true;
+            g_stop = 1;
+            break;
+        }
         /* flush leftover tx items first: their segment pointers stay
          * valid only until receive_vpn's handle_rx drop/compact moves
          * the retransmit table */
@@ -728,4 +761,5 @@ void run_socks(int sockfd, SocksConfig *cfg) {
     sigaction(SIGPIPE, &old_pipe, NULL);
 #endif
     log_info("SOCKS5 stopped");
+    return cfg->session_lost ? 1 : 0;
 }
