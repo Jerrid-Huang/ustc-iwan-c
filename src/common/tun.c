@@ -64,8 +64,13 @@ void tun_detach(int fd) {
  * run pinned every flow onto one queue, the queue varying per run).
  * TUNSETSTEERINGEBPF replaces queue selection with a deterministic
  * flow hash; the kernel maps the return value via ret % numqueues.
- * The program is embedded (steer_bpf.o, linked with -r -b binary). */
+ * The program is embedded (steer_bpf.o -> steer_bpf_data.c, see
+ * CMakeLists.txt). When the build cannot produce a BPF object
+ * (IWAN_NO_STEER_BPF: no clang bpf target or no linux/bpf.h — e.g.
+ * cross builds without kernel headers), tun_steering_attach degrades
+ * to the kernel automq steering, like the Windows backend. */
 
+#ifndef IWAN_NO_STEER_BPF
 static int bpf_prog_load_steer(const struct bpf_insn *insns,
                                    unsigned int cnt, const char *license)
 {
@@ -92,9 +97,11 @@ static int bpf_prog_load_steer(const struct bpf_insn *insns,
         log_err("tun steering: bpf load failed: %s", strerror(errno));
     return fd;
 }
+#endif /* !IWAN_NO_STEER_BPF */
 
 int tun_steering_attach(int tun_fd)
 {
+#ifndef IWAN_NO_STEER_BPF
     extern const unsigned char steer_bpf_o[];
     extern const unsigned int steer_bpf_o_len;
     const unsigned char *o = steer_bpf_o;
@@ -171,6 +178,12 @@ int tun_steering_attach(int tun_fd)
     if (rc < 0)
         log_err("tun steering attach: %s", strerror(errno));
     return rc < 0 ? -1 : 0;
+#else
+    /* IWAN_NO_STEER_BPF: no embedded program; the tun automq flow hash
+     * is used instead (matches the tun_win.c behavior). */
+    (void)tun_fd;
+    return -1;
+#endif
 }
 
 void tun_close(int fd) {

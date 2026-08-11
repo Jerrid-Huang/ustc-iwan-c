@@ -1,26 +1,34 @@
-# CI runs on ubuntu-latest with no TUN devices and no root, so the
-# integration suite (make test -> tests/integration.sh, which needs both)
-# runs only locally; this workflow gates compilation and smoke-tests the
-# built binaries. -Werror is CI-only: regular builds append it to CFLAGS,
-# while the sanitizer job omits it (ASan/UBSan-instrumented code trips
-# known false-positive warnings) and relies on the same warning grep gate.
-# The grep gates match 'error:' / 'warning:' (compiler diagnostic shape)
-# rather than bare 'error|warning', which would also match the '-Werror'
-# flag echoed on every make command line and fail the jobs spuriously.
+# CI matrix (all CMake now, no Makefile):
+#   linux-native — x86_64 native, gcc + clang, -Werror
+#   sanitize     — ASan+UBSan gcc build (no -Werror: sanitizer
+#                  instrumentation trips known warnings; the grep gate
+#                  below still fails on any warning/error)
+#   linux-cross  — fully static musl binaries for every common Linux
+#                  arch (x86_64, i686, aarch64, armv7, riscv64, ppc64le,
+#                  s390x), qemu smoke where the arch is not runnable
+#   win-cross    — MinGW-w64 static exes for Windows x86_64 + i686,
+#                  wine smoke + real wire test (x86_64)
+#   win-arm64    — Windows ARM64 via llvm-mingw (clang) + the prebuilt
+#                  MSYS2 clangarm64 OpenSSL (no mingw-aarch64 Configure
+#                  target exists in OpenSSL 3.x)
+#   release      — tag-only: packages everything into per-arch archives
+#
+# The integration suite (tests/integration.sh) needs root + TUN devices
+# and therefore runs only locally, via sudo.
+#
+# The grep gates match 'error:' / 'warning:' (compiler diagnostic
+# shape) rather than bare 'error|warning', which would also match flag
+# echo on command lines and fail jobs spuriously.
 name: build
 
 on:
   push:
   pull_request:
-
-# BASE_CFLAGS mirrors the Makefile defaults (CFLAGS ?=) so CI can append
-# -Werror (regular builds) or sanitizer flags without editing the
-# Makefile; keep this list in sync with the Makefile.
-env:
-  BASE_CFLAGS: -O2 -Wall -Wextra -std=c11 -D_GNU_SOURCE -fstack-protector-strong -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3 -fPIE -MMD -MP -pthread
+  # manual full run (bench included); release stays tag-gated
+  workflow_dispatch:
 
 jobs:
-  build:
+  linux-native:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -28,7 +36,7 @@ jobs:
       # matrix jobs share the group expression unless the cc dimension
       # is included: with cancel-in-progress, gcc and clang would
       # preempt each other and one matrix leg always got cancelled
-      group: build-${{ github.ref }}-${{ matrix.cc }}
+      group: linux-native-${{ github.ref }}-${{ matrix.cc }}
       cancel-in-progress: true
     strategy:
       fail-fast: false
@@ -42,18 +50,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang libssl-dev linux-libc-dev
 
+      - name: Configure
+        run: cmake -B build -DCMAKE_C_COMPILER=${{ matrix.cc }} -DIWAN_WERROR=ON
+
       - name: Build (${{ matrix.cc }})
         run: |
           set -o pipefail
-          make -B CC=${{ matrix.cc }} CFLAGS="$BASE_CFLAGS -Werror" 2>&1 | tee build-${{ matrix.cc }}.log
-          rc=${PIPESTATUS[0]}
-          if [ $rc -ne 0 ]; then
-            echo "::error::make rc=$rc"
-            tail -4 build-${{ matrix.cc }}.log | tr '\n' '|' | sed 's/^/::error::TAIL:/'
-            free -h | head -2 | tr '\n' '|' | sed 's/^/::error::MEM:/'
-            sudo dmesg 2>/dev/null | grep -iE 'killed process|out of memory' | tail -2 | tr '\n' '|' | sed 's/^/::error::OOM:/' || true
-            exit $rc
-          fi
+          cmake --build build -j"$(nproc)" 2>&1 | tee build-${{ matrix.cc }}.log
           if grep -Ei 'error:|warning:' build-${{ matrix.cc }}.log; then
             echo "::error::build emitted errors or warnings"
             exit 1
@@ -69,7 +72,7 @@ jobs:
             echo "=== toolchain ==="
             clang --version 2>/dev/null | head -1
             gcc --version 2>/dev/null | head -1
-            make --version 2>/dev/null | head -1
+            cmake --version | head -1
             nproc
             echo "=== memory ==="
             free -h | head -2
@@ -87,12 +90,11 @@ jobs:
 
       - name: Incremental parallel build smoke
         run: |
-          # make clean removes build-*.log, so regenerate it from the
-          # incremental output (a full rebuild after clean) and gate it
-          # the same way as the initial build.
-          make clean
+          # clean-first removes the previous objects AND the bin/
+          # outputs; the rebuild exercises the incremental path from a
+          # fresh tree and is gated the same way as the first build.
           set -o pipefail
-          make -j$(nproc) CC=${{ matrix.cc }} CFLAGS="$BASE_CFLAGS -Werror" 2>&1 | tee build-${{ matrix.cc }}.log
+          cmake --build build --clean-first -j"$(nproc)" 2>&1 | tee build-${{ matrix.cc }}.log
           if grep -Ei 'error:|warning:' build-${{ matrix.cc }}.log; then
             echo "::error::incremental build emitted errors or warnings"
             exit 1
@@ -140,18 +142,10 @@ jobs:
       - name: Build (ASan+UBSan, gcc)
         run: |
           set -o pipefail
-          make -B CC=gcc \
-            CFLAGS="$BASE_CFLAGS -fsanitize=address,undefined -fno-omit-frame-pointer" \
-            LDFLAGS="-pie -Wl,-z,now -Wl,-z,relro -Wl,-z,noexecstack -fsanitize=address,undefined" \
-            2>&1 | tee build-sanitize.log
-          rc=${PIPESTATUS[0]}
-          if [ $rc -ne 0 ]; then
-            echo "::error::make rc=$rc"
-            tail -4 build-sanitize.log | tr '\n' '|' | sed 's/^/::error::TAIL:/'
-            free -h | head -2 | tr '\n' '|' | sed 's/^/::error::MEM:/'
-            sudo dmesg 2>/dev/null | grep -iE 'killed process|out of memory' | tail -2 | tr '\n' '|' | sed 's/^/::error::OOM:/' || true
-            exit $rc
-          fi
+          cmake -B build-sanitize \
+            -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+          cmake --build build-sanitize -j"$(nproc)" 2>&1 | tee build-sanitize.log
           if grep -Ei 'error:|warning:' build-sanitize.log; then
             echo "::error::sanitizer build emitted errors or warnings"
             exit 1
@@ -166,7 +160,7 @@ jobs:
             tail -6 build-sanitize.log
             echo "=== toolchain ==="
             gcc --version 2>/dev/null | head -1
-            make --version 2>/dev/null | head -1
+            cmake --version | head -1
             nproc
             echo "=== memory ==="
             free -h | head -2
@@ -188,91 +182,156 @@ jobs:
           ./bin/iwan-client-oidc --help >/dev/null
           ./bin/iwan-server --help >/dev/null
 
-  # Fully static Linux binaries (musl): zero glibc dependency, run on
-  # any Linux. Downloads the musl.cc cross toolchain and builds a static
-  # OpenSSL with it.
-  musl-static:
+  # Fully static musl binaries for every common Linux architecture:
+  # zero glibc dependency, run on any Linux of that arch. The BPF
+  # steering object is arch-neutral and compiles against the host's
+  # linux headers (clang -target bpf), so it is embedded in all arches.
+  linux-cross:
     runs-on: ubuntu-latest
     permissions:
       contents: read
     concurrency:
-      group: musl-${{ github.ref }}
+      group: linux-cross-${{ github.ref }}-${{ matrix.arch }}
       cancel-in-progress: true
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, i686, aarch64, armv7, riscv64, ppc64le, s390x]
+        include:
+          - arch: x86_64
+            triplet: x86_64-linux-musl
+            openssl_target: linux-x86_64
+            qemu: ""
+          - arch: i686
+            triplet: i686-linux-musl
+            openssl_target: linux-x86
+            qemu: ""
+          - arch: aarch64
+            triplet: aarch64-linux-musl
+            openssl_target: linux-aarch64
+            qemu: qemu-aarch64
+          - arch: armv7
+            triplet: arm-linux-musleabihf
+            openssl_target: linux-armv4
+            qemu: qemu-arm
+          - arch: riscv64
+            triplet: riscv64-linux-musl
+            openssl_target: linux-riscv64
+            qemu: qemu-riscv64
+          - arch: ppc64le
+            triplet: powerpc64le-linux-musl
+            openssl_target: linux-ppc64le
+            qemu: qemu-ppc64le
+          - arch: s390x
+            triplet: s390x-linux-musl
+            openssl_target: linux-s390x
+            qemu: qemu-s390x
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
 
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y make zstd
-
-      - name: Download musl cross toolchain
         run: |
-          curl -sL --retry 2 --max-time 300 https://musl.cc/x86_64-linux-musl-cross.tgz -o /tmp/musl.tgz
-          cd /tmp && tar xzf musl.tgz
+          sudo apt-get update
+          # clang + linux-libc-dev: BPF payload compile (host headers).
+          # qemu-user: run the static binaries of non-native arches.
+          sudo apt-get install -y clang linux-libc-dev zstd
+          if [ -n "${{ matrix.qemu }}" ]; then
+            sudo apt-get install -y qemu-user
+          fi
 
-      - name: Build static OpenSSL (musl)
+      - name: Download musl cross toolchain (${{ matrix.arch }})
         run: |
-          curl -sL --retry 2 --max-time 300 https://www.openssl.org/source/openssl-3.5.1.tar.gz -o /tmp/ossl.tar.gz
-          cd /tmp && tar xzf ossl.tar.gz
-          cd /tmp/openssl-3.5.1
-          ./Configure linux-x86_64 no-shared no-tests \
-            --cross-compile-prefix=/tmp/x86_64-linux-musl-cross/bin/x86_64-linux-musl- \
-            --prefix=/tmp/ossl-musl
-          make -j$(nproc) build_libs
-          make install_sw
+          curl -sL --retry 2 --max-time 300 \
+            https://musl.cc/${{ matrix.triplet }}-cross.tgz -o /tmp/musl.tgz
+          tar xzf /tmp/musl.tgz -C /opt
 
-      - name: Build (musl static)
+      - name: Build static OpenSSL (${{ matrix.arch }})
+        run: |
+          ci/build-openssl.sh ${{ matrix.openssl_target }} \
+            /opt/${{ matrix.triplet }}-cross/bin/${{ matrix.triplet }}- \
+            /opt/ossl-${{ matrix.arch }}
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/musl-linux-${{ matrix.arch }}.cmake \
+            -DIWAN_MUSL_ROOT=/opt/${{ matrix.triplet }}-cross \
+            -DIWAN_OPENSSL_DIR=/opt/ossl-${{ matrix.arch }} \
+            -DIWAN_LINUX_STATIC=ON -DIWAN_WERROR=ON
+
+      - name: Build (${{ matrix.arch }})
         run: |
           set -o pipefail
-          make -B -j$(nproc) CC=/tmp/x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc \
-            LINUX_STATIC=1 OPENSSL_DIR=/tmp/ossl-musl \
-            CFLAGS="-O2 -Wall -Wextra -std=c11 -fstack-protector-strong -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3 -MMD -MP -pthread -Werror" \
-            2>&1 | tee build-musl.log
-          if grep -Ei 'error:|warning:' build-musl.log; then
-            echo "::error::musl build emitted errors or warnings"
+          cmake --build build -j"$(nproc)" 2>&1 | tee build-${{ matrix.arch }}.log
+          if grep -Ei 'error:|warning:' build-${{ matrix.arch }}.log; then
+            echo "::error::${{ matrix.arch }} build emitted errors or warnings"
             exit 1
           fi
 
-      - name: Verify static linkage
+      - name: Verify static linkage (${{ matrix.arch }})
         run: |
           file bin/iwan-client bin/iwan-client-oidc bin/iwan-server
           if ! file bin/iwan-client | grep -q 'static-pie linked\|statically linked'; then
             echo "::error::bin/iwan-client is not fully static"
             exit 1
           fi
-          if objdump -T bin/iwan-client | grep -q GLIBC; then
-            echo "::error::bin/iwan-client still depends on glibc"
-            exit 1
+          if [ "${{ matrix.arch }}" = "x86_64" ]; then
+            if objdump -T bin/iwan-client | grep -q GLIBC; then
+              echo "::error::bin/iwan-client still depends on glibc"
+              exit 1
+            fi
           fi
 
-      - name: Smoke test
+      - name: Smoke test (${{ matrix.arch }})
         run: |
-          ./bin/iwan-client --help >/dev/null
-          ./bin/iwan-client-oidc --help >/dev/null
-          ./bin/iwan-server --help >/dev/null
+          RUN=""
+          if [ -n "${{ matrix.qemu }}" ]; then
+            RUN="${{ matrix.qemu }}"
+          fi
+          $RUN ./bin/iwan-client --help >/dev/null
+          $RUN ./bin/iwan-client-oidc --help >/dev/null
+          $RUN ./bin/iwan-server --help >/dev/null
 
       - name: Upload artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: iwan-musl
+          name: iwan-linux-musl-${{ matrix.arch }}
           path: |
             bin/iwan-client
             bin/iwan-client-oidc
             bin/iwan-server
-            build-musl.log
+            build-${{ matrix.arch }}.log
           if-no-files-found: error
 
-  # Windows cross-compile: MinGW-w64 on Linux, gated by the same
-  # warning/error grep as the native jobs. The OpenSSL dev package is the
-  # MSYS2 ucrt64 one, unpacked under /tmp/mingw-sysroot exactly like the
-  # local sysroot; OPENSSL_DIR points at its ucrt64 root and the Makefile
-  # adds the include/lib dirs from it.
+  # Windows cross-compile: MinGW-w64 on Linux, both x86_64 and i686,
+  # static (exes embed OpenSSL + winpthread + libssp, no DLLs beside
+  # them). OpenSSL no-asm: binutils' PE assembler rejects the ELF
+  # directives in perlasm-generated .s files (observed with the mingw64
+  # target; deterministic across binutils versions).
   win-cross:
     runs-on: ubuntu-latest
     permissions:
       contents: read
     concurrency:
-      group: win-cross-${{ github.ref }}
+      group: win-cross-${{ github.ref }}-${{ matrix.arch }}
       cancel-in-progress: true
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, i686]
+        include:
+          - arch: x86_64
+            mingw_pkg: gcc-mingw-w64-x86-64
+            openssl_target: mingw64
+            prefix: x86_64-w64-mingw32-
+            toolchain: windows-x86_64.cmake
+            pe: "PE32+"
+          - arch: i686
+            mingw_pkg: gcc-mingw-w64-i686
+            openssl_target: mingw
+            prefix: i686-w64-mingw32-
+            toolchain: windows-i686.cmake
+            pe: "PE32 "
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
 
@@ -281,34 +340,31 @@ jobs:
           sudo apt-get update
           # wine64 (not wine): the wine metapackage hard-depends on
           # wine32:i386, which needs the i386 architecture enabled; the
-          # exes are x86-64 so the wine64 loader alone suffices. Note the
+          # x86_64 exes run under the wine64 loader alone. Note the
           # wine64 package installs /usr/lib/wine/wine64 but no 'wine64'
           # command — the smoke steps resolve the loader themselves.
-          # linux-libc-dev is required by the wire-smoke step's Linux
-          # rebuild (steer_bpf.c includes <linux/bpf.h>; the runner image
-          # does not preinstall it), and clang compiles the BPF target.
-          sudo apt-get install -y gcc-mingw-w64-x86-64 zstd wine64 clang linux-libc-dev
+          # linux-libc-dev + clang are required by the wire-smoke step's
+          # Linux rebuild (steer_bpf.c includes <linux/bpf.h>).
+          sudo apt-get install -y ${{ matrix.mingw_pkg }} zstd wine64 clang linux-libc-dev
 
-      - name: Build static OpenSSL (mingw no-shared)
+      - name: Build static OpenSSL (${{ matrix.arch }})
         run: |
-          # The MSYS2 openssl package only ships DLL import libs; the
-          # exes are linked STATIC=1 so no DLLs are needed at runtime.
-          curl -sL --retry 3 --max-time 400 https://www.openssl.org/source/openssl-3.5.1.tar.gz -o /tmp/ossl-src.tar.gz
-          cd /tmp && tar xzf ossl-src.tar.gz
-          cd /tmp/openssl-3.5.1
-          ./Configure mingw64 no-shared no-tests \
-            --cross-compile-prefix=x86_64-w64-mingw32- --prefix=/tmp/ossl-static
-          make -j$(nproc) build_libs
-          make install_sw
+          ci/build-openssl.sh ${{ matrix.openssl_target }} \
+            ${{ matrix.prefix }} /opt/ossl-${{ matrix.arch }} no-asm
 
-      - name: Build (win32 cross, static)
+      - name: Configure
+        run: |
+          cmake -B build \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/${{ matrix.toolchain }} \
+            -DIWAN_OPENSSL_DIR=/opt/ossl-${{ matrix.arch }} \
+            -DIWAN_STATIC=ON -DIWAN_WERROR=ON
+
+      - name: Build (${{ matrix.arch }})
         run: |
           set -o pipefail
-          make TARGET=win32 -B CC=x86_64-w64-mingw32-gcc STATIC=1 \
-            CFLAGS="-O2 -Wall -Wextra -std=c11 -fstack-protector-strong -MMD -MP -pthread -D_WIN32_WINNT=0x0601 -DWINVER=0x0601 -Werror" \
-            OPENSSL_DIR=/tmp/ossl-static 2>&1 | tee build-win32.log
-          if grep -Ei 'error:|warning:' build-win32.log; then
-            echo "::error::win32 build emitted errors or warnings"
+          cmake --build build -j"$(nproc)" 2>&1 | tee build-${{ matrix.arch }}.log
+          if grep -Ei 'error:|warning:' build-${{ matrix.arch }}.log; then
+            echo "::error::${{ matrix.arch }} build emitted errors or warnings"
             exit 1
           fi
 
@@ -316,26 +372,27 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: build-log-win32
-          path: build-win32.log
+          name: build-log-win32-${{ matrix.arch }}
+          path: build-${{ matrix.arch }}.log
           if-no-files-found: error
 
-      - name: Verify PE32+ binaries
+      - name: Verify PE binaries (${{ matrix.arch }})
         run: |
           file bin/iwan-client.exe bin/iwan-client-oidc.exe
-          if ! file bin/iwan-client.exe | grep -q 'PE32+'; then
-            echo "::error::bin/iwan-client.exe is not a PE32+ binary"
+          if ! file bin/iwan-client.exe | grep -q '${{ matrix.pe }}'; then
+            echo "::error::bin/iwan-client.exe is not a ${{ matrix.pe }} binary"
             exit 1
           fi
-          if ! file bin/iwan-client-oidc.exe | grep -q 'PE32+'; then
-            echo "::error::bin/iwan-client-oidc.exe is not a PE32+ binary"
+          if ! file bin/iwan-client-oidc.exe | grep -q '${{ matrix.pe }}'; then
+            echo "::error::bin/iwan-client-oidc.exe is not a ${{ matrix.pe }} binary"
             exit 1
           fi
 
-      - name: Smoke test (wine)
+      - name: Smoke test (wine, ${{ matrix.arch }})
+        if: matrix.arch == 'x86_64'
         run: |
           set -eo pipefail
-          # The exes are STATIC=1: no DLLs are needed next to them. The
+          # The exes are IWAN_STATIC: no DLLs needed next to them. The
           # wine64 apt package installs only /usr/lib/wine/wine64 (the
           # 'wine' wrapper needs wine32); resolve the loader directly.
           WINE_BIN="$(command -v wine64 2>/dev/null || { [ -x /usr/lib/wine/wine64 ] && echo /usr/lib/wine/wine64; } || command -v wine 2>/dev/null || true)"
@@ -347,16 +404,18 @@ jobs:
 
       - name: Show wine smoke failure details (annotations)
         if: failure()
-        run: cat /tmp/wine-smoke.log | sed 's/^/::error::/'
+        run: cat /tmp/wine-smoke.log | sed 's/^/::error::/' || true
 
       # Real wire-level smoke: a Linux iwan-server in --no-tun mode runs
       # without root (control plane only), and the Windows client talks
       # to it over UDP. This proves the frozen wire format and the
       # winsock port layer end to end (PING/PONG + OPEN/OPEN_ACK/CLOSE).
       - name: Wire smoke (Windows client <-> Linux server, wine)
+        if: matrix.arch == 'x86_64'
         run: |
           set -e
-          make -B -j$(nproc) CFLAGS="$BASE_CFLAGS" >/dev/null 2>&1
+          cmake -B build-linux >/dev/null
+          cmake --build build-linux -j"$(nproc)" >/dev/null
           printf 'alice:s3cret-pass\n' > /tmp/users.txt
           chmod 600 /tmp/users.txt
           ./bin/iwan-server --users /tmp/users.txt --port 16001 --no-tun \
@@ -375,71 +434,212 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: iwan-win32
+          name: iwan-win32-${{ matrix.arch }}
           path: |
             bin/iwan-client.exe
             bin/iwan-client-oidc.exe
-            build-win32.log
+            build-${{ matrix.arch }}.log
+          if-no-files-found: error
+
+  # Windows ARM64: OpenSSL has no mingw-aarch64 Configure target, so the
+  # toolchain is llvm-mingw (clang) and the OpenSSL sysroot is the
+  # prebuilt MSYS2 clangarm64 package. Link check + PE verification only
+  # (no wine support for arm64 Windows binaries on Linux runners).
+  win-arm64:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    concurrency:
+      group: win-arm64-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd jq
+
+      - name: Download llvm-mingw toolchain
+        run: |
+          TAG="$(curl -s https://api.github.com/repos/mstorsjo/llvm-mingw/releases/latest \
+            | jq -r .tag_name)"
+          echo "llvm-mingw $TAG"
+          curl -sL --retry 3 --max-time 400 \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/${TAG}/llvm-mingw-${TAG}-ucrt-ubuntu-20.04-x86_64.tar.xz" \
+            -o /tmp/llvm-mingw.tar.xz
+          mkdir -p /opt/llvm-mingw && tar xJf /tmp/llvm-mingw.tar.xz -C /opt/llvm-mingw --strip-components=1
+          echo "/opt/llvm-mingw/bin" >> "$GITHUB_PATH"
+
+      - name: Download MSYS2 clangarm64 OpenSSL
+        run: |
+          PKG="$(curl -s https://repo.msys2.org/mingw/clangarm64/ \
+            | grep -oE 'mingw-w64-clang-aarch64-openssl-[0-9.]+-[0-9]+-any\.pkg\.tar\.zst' \
+            | sort -V | tail -1)"
+          echo "openssl package: $PKG"
+          [ -n "$PKG" ]
+          mkdir -p /opt/ossl-arm64
+          curl -sL --retry 3 --max-time 400 \
+            "https://repo.msys2.org/mingw/clangarm64/${PKG}" -o /tmp/ossl.pkg.tar.zst
+          tar --zstd -xf /tmp/ossl.pkg.tar.zst -C /opt/ossl-arm64
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/windows-arm64.cmake \
+            -DIWAN_OPENSSL_DIR=/opt/ossl-arm64/clangarm64 \
+            -DIWAN_STATIC=ON -DIWAN_WERROR=ON
+
+      - name: Build (arm64)
+        run: |
+          set -o pipefail
+          cmake --build build -j"$(nproc)" 2>&1 | tee build-arm64.log
+          if grep -Ei 'error:|warning:' build-arm64.log; then
+            echo "::error::arm64 build emitted errors or warnings"
+            exit 1
+          fi
+
+      - name: Verify PE binaries (arm64)
+        run: |
+          file bin/iwan-client.exe bin/iwan-client-oidc.exe
+          # GNU file prints the arch as "Aarch64" (older) or "aarch64"
+          if ! file bin/iwan-client.exe | grep -qiE 'PE32\+.*(aarch64|arm64)'; then
+            echo "::error::bin/iwan-client.exe is not a PE32+ aarch64 binary"
+            exit 1
+          fi
+          if ! file bin/iwan-client-oidc.exe | grep -qiE 'PE32\+.*(aarch64|arm64)'; then
+            echo "::error::bin/iwan-client-oidc.exe is not a PE32+ aarch64 binary"
+            exit 1
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: iwan-win32-arm64
+          path: |
+            bin/iwan-client.exe
+            bin/iwan-client-oidc.exe
+            build-arm64.log
+          if-no-files-found: error
+
+  # Rootless control-plane benchmark (no TUN/root needed): local
+  # iwan-server (--no-tun) + ping RTT / auth handshake latency stats.
+  # The results are attached to the release notes (release needs this
+  # job). Real data-plane throughput needs TUN devices + root and stays
+  # local (sudo tests/bench.sh).
+  bench:
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    concurrency:
+      group: bench-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libssl-dev linux-libc-dev
+
+      - name: Build
+        run: |
+          cmake -B build
+          cmake --build build -j"$(nproc)"
+
+      - name: Run control-plane benchmark
+        run: ci/bench-control.sh
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bench-results
+          path: bench-results.md
           if-no-files-found: error
 
   # Publish a GitHub Release on tag pushes (v*): Linux binaries built
-  # here (deliberately NOT via needs: build — the build matrix is
-  # cancelled as a unit whenever any matrix job is preempted, which
-  # would skip the release), Windows exes + runtime DLLs from the
-  # win-cross artifact. Trigger with:
+  # here (deliberately NOT via needs: linux-native — the matrix job is
+  # cancelled as a unit whenever any matrix leg is preempted, which
+  # would skip the release), musl + Windows binaries from the artifacts.
+  # Trigger with:
   #   git tag v0.1.0 && git push origin v0.1.0
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [win-cross, musl-static]
+    needs: [linux-cross, win-cross, win-arm64, bench]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
 
-      - name: Build Linux binaries
+      - name: Build Linux binaries (glibc x86_64)
         run: |
           sudo apt-get update
           sudo apt-get install -y clang libssl-dev linux-libc-dev
-          make -B -j$(nproc) CFLAGS="$BASE_CFLAGS"
+          cmake -B build
+          cmake --build build -j"$(nproc)"
+
+      - name: Download musl binaries
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          pattern: iwan-linux-musl-*
+          path: musl/
 
       - name: Download Windows binaries
         uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
         with:
-          name: iwan-win32
+          pattern: iwan-win32-*
           path: win32/
 
-      - name: Download musl static binaries
+      - name: Download benchmark results
         uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
         with:
-          name: iwan-musl
-          path: musl/
+          name: bench-results
+          path: .
 
       - name: Package release archives
         run: |
           set -e
           mkdir -p dist/linux dist/windows
-          # raw executables, directly downloadable (Linux binaries are
-          # dynamically linked against system libssl; Windows exes need
-          # the DLLs from the zip next to them)
+
+          # glibc x86_64 (dynamically linked against system libssl)
           cp bin/iwan-client bin/iwan-client-oidc bin/iwan-server dist/linux/
-          # download-artifact keeps the upload-time relative paths, so
-          # the win32 artifact lands as win32/bin/*.exe + win32/*.log.
-          # The exes are static (STATIC=1): no DLLs to ship.
-          cp win32/bin/iwan-client.exe win32/bin/iwan-client-oidc.exe dist/windows/
-          # Linux archive: the three binaries
           (cd dist/linux && tar czf ../iwan-linux-x86_64.tar.gz \
             iwan-client iwan-client-oidc iwan-server)
-          # Windows archive: the two static exes
-          (cd dist/windows && zip -qr ../iwan-windows-x86_64.zip .)
-          # musl static binaries: raw (any-Linux) + archive; note the
-          # musl artifact keeps its bin/ prefix
-          cp musl/bin/iwan-client musl/bin/iwan-client-oidc musl/bin/iwan-server dist/linux/
-          mv dist/linux/iwan-client dist/linux/iwan-client-musl
-          mv dist/linux/iwan-client-oidc dist/linux/iwan-client-oidc-musl
-          mv dist/linux/iwan-server dist/linux/iwan-server-musl
-          (cd dist/linux && tar czf ../iwan-linux-x86_64-musl.tar.gz \
-            iwan-client-musl iwan-client-oidc-musl iwan-server-musl)
+
+          # musl static: one archive per arch, raw binaries beside them
+          # (download-artifact keeps upload-time paths: musl/iwan-linux-musl-<arch>/bin/*)
+          for d in musl/*/; do
+            artifact="$(basename "$d")"
+            arch="${artifact#iwan-linux-musl-}"
+            cp "$d/bin/iwan-client" "$d/bin/iwan-client-oidc" "$d/bin/iwan-server" dist/linux/
+            mv dist/linux/iwan-client    "dist/linux/iwan-client-${arch}-musl"
+            mv dist/linux/iwan-client-oidc "dist/linux/iwan-client-oidc-${arch}-musl"
+            mv dist/linux/iwan-server    "dist/linux/iwan-server-${arch}-musl"
+            # x86_64 keeps the historical archive name for compat
+            if [ "$arch" = "x86_64" ]; then
+              (cd dist/linux && tar czf ../iwan-linux-x86_64-musl.tar.gz \
+                iwan-client-x86_64-musl iwan-client-oidc-x86_64-musl iwan-server-x86_64-musl)
+            else
+              (cd dist/linux && tar czf "../iwan-linux-${arch}-musl.tar.gz" \
+                iwan-client-${arch}-musl iwan-client-oidc-${arch}-musl iwan-server-${arch}-musl)
+            fi
+          done
+
+          # Windows static exes (win32/iwan-win32-<arch>/bin/*.exe)
+          for d in win32/*/; do
+            artifact="$(basename "$d")"
+            arch="${artifact#iwan-win32-}"
+            mkdir -p "dist/windows/${arch}"
+            cp "$d/bin/iwan-client.exe" "$d/bin/iwan-client-oidc.exe" "dist/windows/${arch}/"
+            if [ "$arch" = "x86_64" ]; then
+              (cd "dist/windows/${arch}" && zip -qr "../../iwan-windows-x86_64.zip" .)
+            else
+              (cd "dist/windows/${arch}" && zip -qr "../../iwan-windows-${arch}.zip" .)
+            fi
+          done
+
           find dist -type f | sort
 
       - name: Create GitHub Release
@@ -448,13 +648,24 @@ jobs:
           files: |
             dist/iwan-linux-x86_64.tar.gz
             dist/iwan-linux-x86_64-musl.tar.gz
+            dist/iwan-linux-i686-musl.tar.gz
+            dist/iwan-linux-aarch64-musl.tar.gz
+            dist/iwan-linux-armv7-musl.tar.gz
+            dist/iwan-linux-riscv64-musl.tar.gz
+            dist/iwan-linux-ppc64le-musl.tar.gz
+            dist/iwan-linux-s390x-musl.tar.gz
             dist/iwan-windows-x86_64.zip
+            dist/iwan-windows-i686.zip
+            dist/iwan-windows-arm64.zip
             dist/linux/iwan-client
             dist/linux/iwan-client-oidc
             dist/linux/iwan-server
-            dist/linux/iwan-client-musl
-            dist/linux/iwan-client-oidc-musl
-            dist/linux/iwan-server-musl
-            dist/windows/iwan-client.exe
-            dist/windows/iwan-client-oidc.exe
+            dist/linux/iwan-client-*-musl
+            dist/linux/iwan-client-oidc-*-musl
+            dist/linux/iwan-server-*-musl
+            dist/windows/*/iwan-client.exe
+            dist/windows/*/iwan-client-oidc.exe
           generate_release_notes: true
+          # append the CI control-plane benchmark table to the auto notes
+          append_body: true
+          body_path: bench-results.md

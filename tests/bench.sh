@@ -64,7 +64,8 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== build =="
-make -B
+cmake -B build -DCMAKE_BUILD_TYPE=Release >/dev/null
+cmake --build build -j"$(nproc)" >/dev/null
 
 printf 'test:s3cret\n' > "$WORK/users.txt"
 chmod 600 "$WORK/users.txt"

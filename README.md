@@ -16,59 +16,112 @@ USTC iWAN 校园网 VPN 客户端,用 C11 从 [yyy1mu/ustc-iwan](https://github.
 
 ## 构建
 
-依赖:`cc`(C11)、OpenSSL 头文件与 `libcrypto`、`clang`(仅用于编译 BPF 转向程序 `src/common/steer_bpf.c`)、Linux 内核头文件(`linux-libc-dev`,提供 `linux/bpf.h` 等)。
+依赖:`cmake`(≥3.16)、C11 编译器(`cc`/gcc/clang)、OpenSSL 头文件与 `libcrypto`(Linux 需 `libssl-dev`)、`clang`(仅用于编译 BPF 转向程序 `src/common/steer_bpf.c`)、Linux 内核头文件(`linux-libc-dev`,提供 `linux/bpf.h` 等;缺失时自动降级为内核 automq 转向并打印警告)。
 
 ```sh
-make            # 产物在 bin/
-make -B         # 强制全量重建
-make clean
+cmake -B build            # 配置(默认 Release,-O2,与旧 Makefile 相同的加固/警告 flags)
+cmake --build build -j    # 产物在 bin/(同旧 make 的布局)
+cmake --build build --clean-first -j   # 强制全量重建(旧 make -B)
+rm -rf build bin          # 清理(旧 make clean)
 ```
+
+常用配置项(全部在 `CMakeLists.txt` 顶部注释中):
+
+| 选项 | 说明 | 对应旧 Makefile |
+|---|---|---|
+| `-DIWAN_OPENSSL_DIR=<dir>` | OpenSSL sysroot(`include/` + `lib/` 或 `lib64/`) | `OPENSSL_DIR=` |
+| `-DIWAN_LINUX_STATIC=ON` | Linux 全静态链接(需静态 OpenSSL) | `LINUX_STATIC=1` |
+| `-DIWAN_STATIC=ON` | Windows 静态链接 OpenSSL/winpthread/libssp | `STATIC=1` |
+| `-DIWAN_BPF=OFF` | 禁用 tun 转向 eBPF(自动降级,一般不手动关) | 无 |
+| `-DIWAN_WERROR=ON` | 警告即错误(CI 用) | CI 的 `CFLAGS+= -Werror` |
+
+集成测试(Linux-only,需 root):`sudo tests/integration.sh`(脚本内部自行构建);Windows 上该目标为 no-op。
+
+### 架构支持
+
+代码本身是架构中立的(仅 `_WIN32` 分支;`__attribute__((may_alias))` 等 GNU 扩展 gcc/clang 全架构支持)。CMake 通过工具链文件实现交叉编译,仓库提供 `cmake/toolchains/`:
+
+| 平台 | 架构 | 工具链文件 | 工具链来源 |
+|---|---|---|---|
+| Linux | x86_64, i686, aarch64, armv7, riscv64, ppc64le, s390x | `musl-linux-<arch>.cmake`(全静态) | [musl.cc](https://musl.cc/) |
+| Linux | 同上 | `linux-<arch>.cmake`(glibc 动态) | Debian/Ubuntu `gcc-<triplet>-linux-gnu` |
+| Windows | x86_64, i686 | `windows-<arch>.cmake` | MinGW-w64(apt `gcc-mingw-w64-*` 或 MSYS2) |
+| Windows | arm64 | `windows-arm64.cmake` | [llvm-mingw](https://github.com/mstorsjo/llvm-mingw)(clang) |
+
+CI 对 Linux 全部 7 种架构 + Windows 3 种架构做真实交叉编译(见 `.github/workflows/build.yml`)。
 
 ### 静态 Linux 二进制(musl,无 glibc 依赖)
 
 动态链接的二进制依赖编译机版本的 glibc(本仓库在较新发行版构建时要求
 GLIBC_2.38,旧发行版无法运行)。发布物提供 **musl 全静态**版本
-(`iwan-*-musl` / `iwan-linux-x86_64-musl.tar.gz`):在任何 Linux 上直接
-运行,与 glibc 无关。自建方法:
+(`iwan-*-musl` / `iwan-linux-<arch>-musl.tar.gz`):在任何 Linux 上直接
+运行,与 glibc 无关。自建方法(以 aarch64 为例):
 
 ```sh
 # 1. musl 交叉工具链 + 静态 OpenSSL
-curl -sL https://musl.cc/x86_64-linux-musl-cross.tgz -o /tmp/musl.tgz
-cd /tmp && tar xzf musl.tgz
-curl -sL https://www.openssl.org/source/openssl-3.5.1.tar.gz -o /tmp/ossl.tar.gz
-cd /tmp && tar xzf ossl.tar.gz && cd openssl-3.5.1
-./Configure linux-x86_64 no-shared no-tests \
-  --cross-compile-prefix=/tmp/x86_64-linux-musl-cross/bin/x86_64-linux-musl- \
-  --prefix=/tmp/ossl-musl
-make -j$(nproc) build_libs && make install_sw
+curl -sL https://musl.cc/aarch64-linux-musl-cross.tgz | tar xz -C /opt
+ci/build-openssl.sh linux-aarch64 /opt/aarch64-linux-musl-cross/bin/aarch64-linux-musl- /opt/ossl-musl-aarch64
 
 # 2. 构建(产物为静态,~6MB/个)
-cd <repo> && make -B CC=/tmp/x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc \
-  LINUX_STATIC=1 OPENSSL_DIR=/tmp/ossl-musl
+cmake -B build \
+  -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/musl-linux-aarch64.cmake \
+  -DIWAN_MUSL_ROOT=/opt/aarch64-linux-musl-cross \
+  -DIWAN_OPENSSL_DIR=/opt/ossl-musl-aarch64 -DIWAN_LINUX_STATIC=ON
+cmake --build build -j
 # 验证:file bin/iwan-client 显示 static-pie linked,objdump -T 无 GLIBC
 ```
 
+各架构的 OpenSSL Configure target:`linux-x86_64` / `linux-x86`(i686)/ `linux-aarch64` / `linux-armv4`(armv7)/ `linux-riscv64` / `linux-ppc64le` / `linux-s390x`。x86_64 用 musl gcc 本机构建亦可:`cmake -B build -DCMAKE_C_COMPILER=/opt/x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc -DIWAN_OPENSSL_DIR=/opt/ossl-musl -DIWAN_LINUX_STATIC=ON`。
+
 ### Windows 交叉编译(Linux 主机)
 
-依赖:`gcc-mingw-w64-x86-64`(posix 线程模型)、`zstd`;OpenSSL 3 使用 MSYS2 ucrt64 开发包(含静态库与头文件),解包到任意目录后用 `OPENSSL_DIR` 指向其 `ucrt64` 根:
+依赖:`gcc-mingw-w64-x86-64` / `gcc-mingw-w64-i686`(posix 线程模型)、`zstd`;OpenSSL 3 使用 MSYS2 开发包(含静态库与头文件),解包到任意目录后用 `-DIWAN_OPENSSL_DIR` 指向其 `ucrt64` / `mingw32` 根:
 
 ```sh
 curl -sL https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-openssl-3.5.1-1-any.pkg.tar.zst -o /tmp/ossl.tar.zst
 mkdir -p /tmp/mingw-sysroot && tar --zstd -xf /tmp/ossl.tar.zst -C /tmp/mingw-sysroot
 
-make TARGET=win32 -B CC=x86_64-w64-mingw32-gcc OPENSSL_DIR=/tmp/mingw-sysroot/ucrt64
-# 产物:bin/iwan-client.exe、bin/iwan-client-oidc.exe(仅客户端;iwan-server 不构建)
-
-# 静态链接(推荐,exe 内嵌 OpenSSL/运行库,无需 DLL):需要 no-shared 的
-# OpenSSL sysroot(MSYS2 包只有 DLL 导入库,须自行编译):
-curl -sL https://www.openssl.org/source/openssl-3.5.1.tar.gz -o /tmp/ossl.tar.gz
-cd /tmp && tar xzf ossl.tar.gz && cd openssl-3.5.1
-./Configure mingw64 no-shared no-tests --cross-compile-prefix=x86_64-w64-mingw32- --prefix=/tmp/ossl-static
-make -j$(nproc) build_libs && make install_sw
-cd <repo> && make TARGET=win32 -B CC=x86_64-w64-mingw32-gcc STATIC=1 OPENSSL_DIR=/tmp/ossl-static
+cmake -B build \
+  -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/windows-x86_64.cmake \
+  -DIWAN_OPENSSL_DIR=/tmp/mingw-sysroot/ucrt64 -DIWAN_STATIC=ON
+cmake --build build -j
+# 产物:bin/iwan-client.exe、bin/iwan-client-oidc.exe(iwan-server 不构建)
 ```
 
-MSYS2 的 libcrypto/libssl 是 DLL 导入库:运行时需将 `libcrypto-3-x64.dll`、`libssl-3-x64.dll` 及 mingw 运行库(`libwinpthread-1.dll`、`libssp-0.dll`)与 exe 放在同一目录。TUN 模式还需 `wintun.dll`(与驱动一同安装)并在管理员控制台运行;`socks` / `ping` / `auth` / OIDC 无需管理员。CI(`.github/workflows/build.yml` 的 `win-cross` 任务)自动完成交叉编译 + wine 冒烟 + 与 Linux `iwan-server` 的真实线上握手测试。
+静态链接(推荐,exe 内嵌 OpenSSL/运行库,无需 DLL)需要 no-shared 的 OpenSSL sysroot(MSYS2 包只有 DLL 导入库,须自行编译):
+
+```sh
+curl -sL https://www.openssl.org/source/openssl-3.5.1.tar.gz -o /tmp/ossl.tar.gz
+ci/build-openssl.sh mingw64 x86_64-w64-mingw32- /tmp/ossl-static no-asm
+# i686:ci/build-openssl.sh mingw i686-w64-mingw32- /tmp/ossl-static-i686 no-asm
+# 注:no-asm 必须(binutils 的 PE 汇编器不接受 perlasm 生成的 ELF 指令)
+
+cmake -B build \
+  -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/windows-x86_64.cmake \
+  -DIWAN_OPENSSL_DIR=/tmp/ossl-static -DIWAN_STATIC=ON
+cmake --build build -j
+```
+
+MSYS2 的 libcrypto/libssl 是 DLL 导入库:动态链接时需将 `libcrypto-3-x64.dll`、`libssl-3-x64.dll` 及 mingw 运行库(`libwinpthread-1.dll`、`libssp-0.dll`)与 exe 放在同一目录。TUN 模式还需 `wintun.dll`(与驱动一同安装)并在管理员控制台运行;`socks` / `ping` / `auth` / OIDC 无需管理员。CI(`.github/workflows/build.yml` 的 `win-cross` 任务,含 i686)自动完成交叉编译 + wine 冒烟 + 与 Linux `iwan-server` 的真实线上握手测试。
+
+### Windows ARM64 交叉编译(Linux 主机)
+
+OpenSSL 3.x 没有 mingw-aarch64 的 Configure target,故工具链用 llvm-mingw(clang),OpenSSL 用 MSYS2 clangarm64 预编译包:
+
+```sh
+# 1. llvm-mingw(任意发布版,含 aarch64-w64-mingw32-clang)
+curl -sL https://github.com/mstorsjo/llvm-mingw/releases/download/<TAG>/llvm-mingw-<TAG>-ucrt-ubuntu-20.04-x86_64.tar.xz | tar xJ -C /opt
+export PATH=/opt/llvm-mingw-<TAG>-ucrt-ubuntu-20.04-x86_64/bin:$PATH
+
+# 2. MSYS2 clangarm64 OpenSSL(无 DLL 依赖问题:静态 .a 直接内嵌)
+PKG=$(curl -s https://repo.msys2.org/mingw/clangarm64/ | grep -oE 'mingw-w64-clang-aarch64-openssl-[0-9.]+-[0-9]+-any\.pkg\.tar\.zst' | sort -V | tail -1)
+mkdir -p /tmp/ossl-arm64 && curl -sL "https://repo.msys2.org/mingw/clangarm64/$PKG" | tar --zstd -x -C /tmp/ossl-arm64
+
+cmake -B build \
+  -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/windows-arm64.cmake \
+  -DIWAN_OPENSSL_DIR=/tmp/ossl-arm64/clangarm64 -DIWAN_STATIC=ON
+cmake --build build -j
+```
 
 ### Windows 安装(直接下载,免编译)
 
@@ -105,32 +158,32 @@ MSYS2 的 libcrypto/libssl 是 DLL 导入库:运行时需将 `libcrypto-3-x64.dl
    - **`wintun.dll not found`**:wintun.dll 不在 exe 同目录;下载放入后,TUN 模式必须以**管理员**控制台运行(首次自动安装驱动)。
    - **提示缺少 DLL**:Release 的 exe 是静态链接(OpenSSL/运行库已内嵌),不应缺少第三方 DLL;若提示缺少 `wintun.dll` 之外的 DLL,说明用了非官方/旧构建。
    - **防火墙/杀毒提示**:UDP 6001 出站需放行;若拦截请添加允许规则。
-   - **64 位**:本项目仅提供 x86_64 构建,不支持 32 位 Windows。
+   - **架构**:Release 提供 x86_64、i686、arm64 三种 Windows 架构(文件名 `iwan-windows-<arch>.zip`);Linux 提供 x86_64、i686、aarch64、armv7、riscv64、ppc64le、s390x 的 musl 全静态构建(`iwan-linux-<arch>-musl.tar.gz`)。
 
 ### Windows 原生编译(MSYS2,推荐)
 
 在 Windows 机器上直接用 MSYS2 的 MinGW-w64 工具链编译,无需 Linux:
 
 1. 安装 [MSYS2](https://www.msys2.org/),打开 **UCRT64** 终端;
-2. 安装依赖(编译器 + OpenSSL + GNU make 与基础工具):
+2. 安装依赖(编译器 + OpenSSL + CMake):
    ```sh
-   pacman -S --needed base-devel mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-openssl make
+   pacman -S --needed base-devel mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-openssl cmake
    ```
 3. 编译(在仓库根目录):
    ```sh
-   make TARGET=win32 CC=gcc -j8
+   cmake -B build
+   cmake --build build -j8
    # 产物:bin/iwan-client.exe、bin/iwan-client-oidc.exe(iwan-server 不构建)
    ```
 
 要点:
 
-- `CC=gcc` 是必须的:MSYS2 的编译器叫 `gcc`(不是 `cc`,也不是 Linux 交叉场景的 `x86_64-w64-mingw32-gcc`);`cc` 在 MSYS2 中不存在。
-- **不需要 `OPENSSL_DIR`**:MSYS2 的 openssl 包装在 gcc 默认搜索路径(`/mingw64/include`、`/mingw64/lib`),`-lssl -lcrypto` 直接命中。
-- 必须用 MSYS2 环境自带的 `make`(包名 `make`,GNU make):Makefile 配方使用 `mkdir -p`/`rm -rf`/`od`/`awk` 等 POSIX 工具,`mingw32-make`(cmd shell)无法执行这些配方。
+- **不需要 `-DIWAN_OPENSSL_DIR`**:MSYS2 的 openssl 包装在 gcc 默认搜索路径(`/mingw64/include`、`/mingw64/lib`),`find_package(OpenSSL)` 直接命中;若未命中,追加 `-DCMAKE_PREFIX_PATH=/mingw64`。
+- 默认是动态链接(依赖 MSYS2 的 DLL);要单文件分发,先按上文用 `ci/build-openssl.sh` 构建静态 OpenSSL,再加 `-DIWAN_STATIC=ON` 与 `-DIWAN_OPENSSL_DIR`。
 - 在 MSYS2 终端内直接运行产物即可:所有 DLL(`libcrypto-3-x64.dll`、`libssl-3-x64.dll`、`libwinpthread-1.dll`、`libssp-0.dll`)都在 `/mingw64/bin`(已在 PATH)。要脱离 MSYS2 分发/双击运行时,把这些 DLL 拷到 exe 同目录。
 - TUN 模式(`proxy`)需安装 [wintun](https://www.wintun.net/) 驱动、`wintun.dll` 放 exe 旁,并在管理员控制台运行;`ping`/`auth`/`socks`/OIDC 无需管理员。
-- 也可用 MINGW64 环境(`mingw-w64-x86_64-gcc` + `mingw-w64-x86_64-openssl`),命令不变。
-- **不支持 MSVC**:代码使用 GNU 扩展(`__attribute__((may_alias))`)、C11 `stdatomic` 与 GNU make 配方,且依赖 winpthreads;请使用 MinGW-w64 系工具链。
+- 也可用 MINGW64 环境(`mingw-w64-x86_64-gcc` + `mingw-w64-x86_64-openssl`),命令不变;32 位用 MINGW32 环境 + `cmake/toolchains/windows-i686.cmake` 同理(工具链在 PATH 中即可)。
+- **不支持 MSVC**:代码使用 GNU 扩展(`__attribute__((may_alias))`)、C11 `stdatomic` 与 GNU 工具链特性,且依赖 winpthreads;请使用 MinGW-w64 系工具链。
 
 ## 用法
 
@@ -190,7 +243,7 @@ sudo ./bin/iwan-server --users /etc/iwan/users.txt \
 
 ## 实现说明
 
-目录结构:`src/common/` 为共享核心(协议、加密、用户态 TCP 栈、SOCKS 层、TUN、路由、CLI/JSON/HTTPS 工具,全部打进 `libiwan_core.a`);`src/oidc/` 为 OIDC 登录流(仅 `iwan-client-oidc` 使用,单向依赖 common);三个可执行入口在 `src/` 顶层。构建系统在 `Makefile`(`build/` 下按 `common/`、`oidc/`、`main/` 分桶存放对象;`steer_bpf_data.c` 由 clang 交叉编译的 BPF 目标生成,运行时按 `classifier`/`license` 节名加载)。
+目录结构:`src/common/` 为共享核心(协议、加密、用户态 TCP 栈、SOCKS 层、TUN、路由、CLI/JSON/HTTPS 工具,全部打进 `libiwan_core.a`);`src/oidc/` 为 OIDC 登录流(仅 `iwan-client-oidc` 使用,单向依赖 common);三个可执行入口在 `src/` 顶层。构建系统在 `CMakeLists.txt`(产物落 `bin/`,对象在构建树;`steer_bpf_data.c` 由 clang 交叉编译的 BPF 目标经 `cmake/embed_bpf.cmake` 生成并打进 `libiwan_core.a`,运行时按 `classifier`/`license` 节名加载;工具链文件在 `cmake/toolchains/`,跨架构 OpenSSL 构建脚本在 `ci/build-openssl.sh`)。
 
 - 用户态 TCP 栈支持重传(RTO 自适应 SRTT/RTTVAR)、快速重传(3 个重复 ACK)、逐段立即 ACK(RFC 1122 的每 2 段 delayed ACK 在 ~2ms RTT 隧道上是纯延迟:重传后 cwnd=1 时每段都要等满窗口,见 netstack.c;早期实现的 delayed-ACK 机制已删除,仅保留立即 ACK)、keepalive(空闲 120s 后开始探测,间隔 30s,连续 3 次无响应即断开;`NS_IDLE_TIMEOUT` / `NS_KEEPALIVE_MS`)、64KB 窗口 + WSCALE=6、FIN 进重传表。
 - 发送路径:等长批走 UDP GSO(单 sendmsg 最多 3 段,GSO 单元上限 4096B,见 protocol.h `IWAN_GSO_UNIT_SAFE`),混合批走 sendmmsg;接收路径 recvmmsg(64 槽)+ poll 事件驱动。
@@ -200,6 +253,13 @@ sudo ./bin/iwan-server --users /etc/iwan/users.txt \
 - 协议优化均经本地对照基准验证有效(仓库内无消融测试记录,结论来自当时的本地测量,可自行复测)。
 
 ## 性能基准
+
+**CI 自动基准**:打 tag(或手动 `workflow_dispatch`)时,CI 会跑一个无需 root 的控制面基准(`ci/bench-control.sh`:本地 `--no-tun` 服务器 + ping RTT / auth 握手延迟统计),结果以表格追加进 release notes。数据面吞吐需要 TUN 设备 + root,CI 无法运行,只能在本地测:
+
+```sh
+sudo ./tests/bench.sh                 # 默认 5s/连接 1/2/4/8 并发
+DURATION=10 CONNS="1 2 4 8" sudo ./tests/bench.sh
+```
 
 4 组合矩阵实测(本机双服务器 + 客户端,单位 Mbit/s;每格为「1 连接 / 16 连接」聚合吞吐)。测试脚本 `/tmp/r16_test.sh`(`SRV=C|R` 参数化)与 `/tmp/updown_multi.py` 位于 /tmp,属临时文件、不随仓库保存(`updown_multi.py` 已随系统清理丢失,`r16_test.sh` 亦可能随时消失);如需复测请自行重建脚本。
 

@@ -146,7 +146,7 @@ void oidc_connect_server(const Opts *o, const Config *cf)
     const char *host = json_get_str(srv, "host");
     if (!host || !*host)
         oidc_die("missing host");
-    uint16_t port;
+    uint16_t port = 0;
     double pv;
     int pr = oidc_server_port(srv, &port, &pv);
     if (pr < 0)
