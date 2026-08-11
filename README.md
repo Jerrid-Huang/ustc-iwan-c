@@ -54,9 +54,10 @@ MSYS2 的 libcrypto/libssl 是 DLL 导入库:运行时需将 `libcrypto-3-x64.dl
    C:\iwan\iwan-client.exe
    C:\iwan\iwan-client-oidc.exe
    ```
-3. **TUN 模式需要额外安装 wintun 驱动**(`socks` / `ping` / `auth` / OIDC 模式不需要):
-   - 从 [wintun.net](https://www.wintun.net/) 下载安装包(或安装 WireGuard 自带),以管理员运行安装;
-   - 把 `wintun.dll` 也放进 `C:\iwan\`(与 exe 同目录)。
+3. **TUN 模式需要 wintun 驱动**(`socks` / `ping` / `auth` / OIDC 模式不需要):
+   - 从 [wintun.net](https://www.wintun.net/) 下载 **`wintun.dll` 单个文件**,放进 `C:\iwan\`(与 exe 同目录);
+   - **无需运行任何安装程序**:wintun.dll 内嵌驱动,首次以管理员运行 TUN 模式时会自动安装(Wintun.sys 是内核驱动,TUN 模式必须管理员)。
+   - 注:wintun 为 GPLv2,不能内嵌进本项目的 exe;驱动由 Windows 加载,任何 TUN 方案都无法免除。
 4. 使用(在 `C:\iwan` 下打开终端):
 
    ```bat
@@ -77,7 +78,7 @@ MSYS2 的 libcrypto/libssl 是 DLL 导入库:运行时需将 `libcrypto-3-x64.dl
    ```
 
 5. 常见问题:
-   - **`wintun.dll not found`**:未安装 wintun 驱动或 DLL 不在 exe 同目录;TUN 模式必须以**管理员**控制台运行。
+   - **`wintun.dll not found`**:wintun.dll 不在 exe 同目录;下载放入后,TUN 模式必须以**管理员**控制台运行(首次自动安装驱动)。
    - **提示缺少 DLL**:Release 的 exe 是静态链接(OpenSSL/运行库已内嵌),不应缺少第三方 DLL;若提示缺少 `wintun.dll` 之外的 DLL,说明用了非官方/旧构建。
    - **防火墙/杀毒提示**:UDP 6001 出站需放行;若拦截请添加允许规则。
    - **64 位**:本项目仅提供 x86_64 构建,不支持 32 位 Windows。
