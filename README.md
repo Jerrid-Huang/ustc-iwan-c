@@ -24,6 +24,30 @@ make -B         # 强制全量重建
 make clean
 ```
 
+### 静态 Linux 二进制(musl,无 glibc 依赖)
+
+动态链接的二进制依赖编译机版本的 glibc(本仓库在较新发行版构建时要求
+GLIBC_2.38,旧发行版无法运行)。发布物提供 **musl 全静态**版本
+(`iwan-*-musl` / `iwan-linux-x86_64-musl.tar.gz`):在任何 Linux 上直接
+运行,与 glibc 无关。自建方法:
+
+```sh
+# 1. musl 交叉工具链 + 静态 OpenSSL
+curl -sL https://musl.cc/x86_64-linux-musl-cross.tgz -o /tmp/musl.tgz
+cd /tmp && tar xzf musl.tgz
+curl -sL https://www.openssl.org/source/openssl-3.5.1.tar.gz -o /tmp/ossl.tar.gz
+cd /tmp && tar xzf ossl.tar.gz && cd openssl-3.5.1
+./Configure linux-x86_64 no-shared no-tests \
+  --cross-compile-prefix=/tmp/x86_64-linux-musl-cross/bin/x86_64-linux-musl- \
+  --prefix=/tmp/ossl-musl
+make -j$(nproc) build_libs && make install_sw
+
+# 2. 构建(产物为静态,~6MB/个)
+cd <repo> && make -B CC=/tmp/x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc \
+  LINUX_STATIC=1 OPENSSL_DIR=/tmp/ossl-musl
+# 验证:file bin/iwan-client 显示 static-pie linked,objdump -T 无 GLIBC
+```
+
 ### Windows 交叉编译(Linux 主机)
 
 依赖:`gcc-mingw-w64-x86-64`(posix 线程模型)、`zstd`;OpenSSL 3 使用 MSYS2 ucrt64 开发包(含静态库与头文件),解包到任意目录后用 `OPENSSL_DIR` 指向其 `ucrt64` 根:
@@ -48,7 +72,7 @@ MSYS2 的 libcrypto/libssl 是 DLL 导入库:运行时需将 `libcrypto-3-x64.dl
 
 ### Windows 安装(直接下载,免编译)
 
-1. 从 [Releases](https://github.com/Jerrid-Huang/ustc-iwan-c/releases) 下载 **`iwan-windows-x86_64.zip`**(含两个静态 exe,OpenSSL 与运行库已内嵌,**无需任何 DLL**;裸 exe 可直接下载运行)。
+1. 从 [Releases](https://github.com/Jerrid-Huang/ustc-iwan-c/releases) 下载 **`iwan-windows-x86_64.zip`**(含两个静态 exe,OpenSSL 与运行库已内嵌,**无需任何 DLL**;裸 exe 可直接下载运行)。Linux 用户下载 **`iwan-linux-x86_64-musl.tar.gz`**(musl 全静态,任意发行版直接运行)或 `iwan-linux-x86_64.tar.gz`(glibc 动态,要求构建机同版本或更新 glibc)。
 2. 解压到任意目录,例如 `C:\iwan`:
    ```
    C:\iwan\iwan-client.exe
