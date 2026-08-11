@@ -62,15 +62,16 @@ static int run_socks_mode(const Opts *o, int fd, const uint8_t sk[16],
 void oidc_elevate_root(int argc, char **argv)
 {
 #ifdef _WIN32
-    /* no sudo on Windows: TUN mode must run from an already-elevated
-     * console. Fail clearly instead of pretending to elevate; the
-     * --socks/--connect-non-TUN paths never call this. */
-    (void)argc;
-    (void)argv;
+    /* TUN mode needs an administrator: relaunch via a UAC prompt
+     * (ShellExecuteW runas) instead of failing. The elevated instance
+     * passes port_is_admin() and proceeds. --socks paths never call
+     * this. */
     if (!port_is_admin()) {
+        if (port_elevate_self(argc, argv) == 0)
+            exit(0);   /* UAC accepted: the new instance owns the work */
         fprintf(stderr,
-                "Error: TUN mode requires an administrator console; run "
-                "from an elevated prompt\n");
+                "Error: TUN mode requires administrator privileges "
+                "(elevation declined)\n");
         exit(1);
     }
 #else

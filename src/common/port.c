@@ -10,6 +10,7 @@
 #include <sys/wait.h>
 #else
 #include <signal.h>
+#include <shellapi.h>   /* ShellExecuteW (port_elevate_self) */
 #endif
 
 /* ================================================================== */
@@ -181,6 +182,64 @@ bool port_is_admin(void)
 #endif
 }
 
+#ifdef _WIN32
+/* join argv[start..] with spaces into a Windows command line; quote
+ * args containing spaces and escape embedded quotes. The helper
+ * programs (netsh, route, ...) are trusted, fixed strings. Returns the
+ * length written (excluding NUL), 0 when nothing was written. */
+static size_t win_join_argv(char *const argv[], int start, wchar_t *out,
+                            size_t outsz)
+{
+    size_t n = 0;
+
+    for (int i = start; argv[i]; i++) {
+        const char *a = argv[i];
+        int quote = strchr(a, ' ') != NULL || strchr(a, '\t') != NULL;
+        if (i > start && n < outsz - 1)
+            out[n++] = L' ';
+        if (quote)
+            out[n++] = L'"';
+        while (*a && n < outsz - 2) {
+            if (*a == '"')
+                out[n++] = L'\\';
+            out[n++] = (wchar_t)(unsigned char)*a;
+            a++;
+        }
+        if (quote)
+            out[n++] = L'"';
+    }
+    if (n < outsz)
+        out[n] = L'\0';
+    return n;
+}
+
+int port_elevate_self(int argc, char **argv)
+{
+    (void)argc;
+#ifdef _WIN32
+    wchar_t exe[MAX_PATH];
+    wchar_t args[4096];
+    HINSTANCE r;
+    size_t n;
+
+    if (!GetModuleFileNameW(NULL, exe, MAX_PATH))
+        return -1;
+    n = win_join_argv(argv, 1, args, sizeof args / sizeof args[0]);
+    /* ShellExecuteW with the "runas" verb shows the UAC prompt and
+     * starts a new elevated instance of this exe (the console verb
+     * opens a fresh window). A result > 32 means the launch was
+     * accepted; the user declining the UAC prompt surfaces as
+     * SE_ERR_ACCESSDENIED (5) here. */
+    r = ShellExecuteW(NULL, L"runas", exe,
+                      n > 0 ? args : NULL, NULL, SW_SHOWNORMAL);
+    return (intptr_t)r > 32 ? 0 : -1;
+#else
+    /* POSIX elevation is handled by the callers (sudo re-exec) */
+    (void)argv;
+    return -1;
+#endif
+}
+
 long port_cpu_count(void)
 {
 #ifdef _WIN32
@@ -235,37 +294,20 @@ int port_strncasecmp(const char *a, const char *b, size_t n)
 /* Windows: CreateProcessW with redirected stdio. POSIX: fork+execvp
  * (used by util.c's ip_run family on Linux). */
 
+#endif /* _WIN32 */
+
 int port_run_cmd(char *const argv[])
 {
 #ifdef _WIN32
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
     wchar_t cmdline[2048];
-    size_t n = 0;
 
     memset(&si, 0, sizeof si);
     si.cb = sizeof si;
     memset(&pi, 0, sizeof pi);
 
-    /* join argv with spaces; quote args containing spaces. The helper
-     * programs (netsh, route, ...) are trusted, fixed strings. */
-    for (int i = 0; argv[i]; i++) {
-        const char *a = argv[i];
-        int quote = strchr(a, ' ') != NULL || strchr(a, '\t') != NULL;
-        if (i > 0 && n < sizeof cmdline - 1)
-            cmdline[n++] = L' ';
-        if (quote)
-            cmdline[n++] = L'"';
-        while (*a && n < sizeof cmdline - 2) {
-            if (*a == '"')
-                cmdline[n++] = L'\\';
-            cmdline[n++] = (wchar_t)(unsigned char)*a;
-            a++;
-        }
-        if (quote)
-            cmdline[n++] = L'"';
-    }
-    cmdline[n] = L'\0';
+    win_join_argv(argv, 0, cmdline, sizeof cmdline / sizeof cmdline[0]);
 
     if (!CreateProcessW(NULL, cmdline, NULL, NULL, FALSE,
                         CREATE_NO_WINDOW, NULL, NULL, &si, &pi))

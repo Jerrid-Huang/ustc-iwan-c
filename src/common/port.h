@@ -162,6 +162,13 @@ int port_set_stop_handler(void (*fn)(int sig));
  * membership on Windows (TUN + routing require it there). */
 bool port_is_admin(void);
 
+/* Relaunch the current executable as administrator via a UAC prompt
+ * (ShellExecuteW "runas"). argv is the original main() argv; the
+ * executable path is resolved from the running image. Returns 0 when
+ * the elevated instance was launched (the caller should exit — the new
+ * process owns the work), -1 when elevation failed or was declined. */
+int port_elevate_self(int argc, char **argv);
+
 /* Run a helper binary (the `ip`/`netsh`/`route` shell-outs) and wait
  * for it. argv is NULL-terminated with argv[0] = program name.
  * Returns the exit status (0..255) or -1 on spawn failure. */

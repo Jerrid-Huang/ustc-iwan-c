@@ -20,7 +20,7 @@ CFLAGS += -D_WIN32_WINNT=0x0601 -DWINVER=0x0601
 # ELF hardening flags (-pie, -z now/relro/noexecstack) don't apply to PE;
 # use the equivalent PE hardening flags.
 LDFLAGS := -Wl,--dynamicbase -Wl,--nxcompat -Wl,--high-entropy-va
-LDLIBS  := -lws2_32 -liphlpapi -lbcrypt -lcrypt32 -lssl -lcrypto
+LDLIBS  := -lws2_32 -liphlpapi -lbcrypt -lcrypt32 -lshell32 -lssl -lcrypto
 BIN_SUFFIX := .exe
 # OpenSSL cross sysroot (e.g. an MSYS2 ucrt64 package unpacked locally,
 # or a no-shared mingw build installed to lib64/).

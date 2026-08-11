@@ -734,6 +734,22 @@ static int cmd_proxy(int argc, char **argv, int start)
     resolve_credentials(&o, "proxy");
     check_server_ip(o.server, "invalid server address");
 
+#ifdef _WIN32
+    /* TUN mode requires an administrator (wintun driver + routing):
+     * relaunch via a UAC prompt instead of failing. Must happen before
+     * any network/session work — the elevated instance re-runs the
+     * whole command. */
+    if (!port_is_admin()) {
+        if (port_elevate_self(argc, argv) == 0) {
+            log_info("TUN mode needs administrator; relaunching elevated...");
+            return 0;
+        }
+        log_err("Error: TUN mode requires administrator privileges "
+                "(elevation declined)");
+        return 1;
+    }
+#endif
+
     AuthResult res;
     int sockfd = authenticate(&o, DO_AUTH_PUMP, &res);
     if (sockfd < 0) {
