@@ -372,6 +372,10 @@ static inline int port_poll(struct pollfd *fds, nfds_t nfds, int timeout_ms)
 #  ifdef __APPLE__
 /* macOS: no eventfd; implemented in port.c as a self-connected UDP
  * socketpair on loopback (poll-able), like the Windows substitute. */
+int  port_evfd_create(void);
+int  port_evfd_wake(int fd);    /* make the fd readable */
+int  port_evfd_drain(int fd);   /* consume pending wakeups, nonblocking */
+void port_evfd_close(int fd);
 #  else
 static inline int port_evfd_create(void) { return eventfd(0, EFD_NONBLOCK); }
 static inline int port_evfd_wake(int fd)
