@@ -16,6 +16,70 @@
 #include "tun.h"
 #include "util.h"
 
+/* TCP header flags (RFC 793); netstack.c keeps its own copy */
+#ifndef TCP_FIN
+#define TCP_FIN 0x01
+#define TCP_SYN 0x02
+#define TCP_RST 0x04
+#define TCP_ACK 0x10
+#endif
+
+/* ---- --no-tun echo mirror: per-connection mirror state ----
+ * A pure stateless swap would emit every mirrored data segment with the
+ * same seq (the client's ack), which the client netstack discards as
+ * out-of-order. Track the seq we emit per 4-tuple instead: SYN starts
+ * at ISN 0, data advances it by the payload length. Locked: handle_udp
+ * runs on several SO_REUSEPORT recv threads. */
+#define ECHO_MAX_CONN 64
+struct echo_conn {
+    uint32_t c_ip;               /* client inner IP (BE) */
+    uint16_t c_port;
+    uint32_t t_ip;               /* target IP (BE) */
+    uint16_t t_port;
+    uint32_t seq;                /* next seq to emit */
+    uint64_t last_ms;            /* idle reclamation */
+};
+static struct echo_conn g_echo[ECHO_MAX_CONN];
+static pthread_mutex_t g_echo_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static struct echo_conn *echo_lookup(uint32_t c_ip, uint16_t c_port,
+                                     uint32_t t_ip, uint16_t t_port,
+                                     bool create)
+{
+    uint64_t now = now_ms();
+    struct echo_conn *free_slot = NULL;
+    struct echo_conn *ec;
+    pthread_mutex_lock(&g_echo_mu);
+    for (int i = 0; i < ECHO_MAX_CONN; i++) {
+        ec = &g_echo[i];
+        if (ec->last_ms != 0 && ec->c_ip == c_ip && ec->c_port == c_port &&
+            ec->t_ip == t_ip && ec->t_port == t_port) {
+            ec->last_ms = now;
+            pthread_mutex_unlock(&g_echo_mu);
+            return ec;
+        }
+        if (ec->last_ms == 0)
+            free_slot = ec;
+        else if (now - ec->last_ms > 60000)
+            ec->last_ms = 0, free_slot = ec;   /* idle reclaim */
+    }
+    if (create && free_slot) {
+        free_slot->c_ip = c_ip;
+        free_slot->c_port = c_port;
+        free_slot->t_ip = t_ip;
+        free_slot->t_port = t_port;
+        free_slot->seq = 0;
+        free_slot->last_ms = now;
+        pthread_mutex_unlock(&g_echo_mu);
+        return free_slot;
+    }
+    pthread_mutex_unlock(&g_echo_mu);
+    return NULL;
+}
+
+static int echo_mirror(struct server_ctx *ctx, uint8_t *p, size_t len,
+                       int sockfd);
+
 #define IDLE_TIMEOUT_MS 120000
 #define REJECT_LOG_MAX 10   /* per second, per source-independent window */
 #define RATE_BUCKETS 1024   /* per-source limit table for OPEN/PING/ECHO */
@@ -867,6 +931,13 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                 if (tun_write_retry(ctx->tun_fd, raw + IWAN_HDR_LEN,
                                     len - IWAN_HDR_LEN, 1, NULL) != 0)
                     g_up[tid].drop++;  /* still full: drop, client retransmits */
+            } else if (ctx->tun_fd < 0 && len > IWAN_HDR_LEN) {
+                /* --no-tun test mode: echo the packet back (zero-latency
+                 * lossless mirror) so tunnel + netstack throughput can
+                 * be benchmarked without a TUN device or target network */
+                if (echo_mirror(ctx, (uint8_t *)raw + IWAN_HDR_LEN,
+                                len - IWAN_HDR_LEN, sockfd) != 0)
+                    g_up[tid].drop++;
             }
             if (debug_enabled()) {
                 tc = now_ns();
@@ -957,6 +1028,131 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
         break; /* drop silently */
         }
     }
+}
+
+/* --no-tun echo mode: mirror an inner IPv4/TCP packet back to its
+ * sender by swapping addresses/ports and seq/ack and turning SYN/FIN
+ * into SYN+ACK/FIN+ACK (ISN 0, so no per-connection state). The client
+ * netstack sees a lossless zero-RTT peer, which exercises the full
+ * client<->server tunnel + netstack data path end to end — a bench
+ * harness for SOCKS-mode throughput without a TUN device or a real
+ * target network. */
+int echo_mirror(struct server_ctx *ctx, uint8_t *p, size_t len,
+                int sockfd)
+{
+    uint32_t seq, ack, s_orig, nsrc, ndst;
+    uint16_t sport, dport, cs;
+    uint8_t ihl, flags;
+    size_t thlen, paylen;
+    uint8_t tmp4[4];
+
+    if (len < 40) {              /* 20 IP + 20 TCP */
+        if (debug_enabled())
+            log_debug("echo: short pkt %zu", len);
+        return -1;
+    }
+    ihl = (uint8_t)((p[0] & 0x0F) * 4);
+    if (ihl < 20 || len < (size_t)ihl + 20) {
+        if (debug_enabled())
+            log_debug("echo: bad ihl %u len %zu", ihl, len);
+        return -1;
+    }
+    if (p[9] != IPPROTO_TCP) {
+        if (debug_enabled())
+            log_debug("echo: proto %u not TCP", p[9]);
+        return -1;
+    }
+    thlen = (size_t)((p[ihl + 12] >> 4) & 0x0F) * 4;
+    if (len < (size_t)ihl + thlen) {
+        if (debug_enabled())
+            log_debug("echo: bad thlen %zu len %zu", thlen, len);
+        return -1;
+    }
+    if (debug_enabled()) {
+        char hx[160];
+        size_t hn = len < 48 ? len : 48;
+        for (size_t k = 0; k < hn; k++)
+            sprintf(hx + k * 3, "%02x ", p[k]);
+        log_debug("echo: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u flags=%02x len=%zu [%s]",
+                  p[12], p[13], p[14], p[15],
+                  (unsigned)((p[ihl] << 8) | p[ihl + 1]),
+                  p[16], p[17], p[18], p[19],
+                  (unsigned)((p[ihl + 2] << 8) | p[ihl + 3]),
+                  p[ihl + 13], len, hx);
+    }
+    sport = (uint16_t)((p[ihl] << 8) | p[ihl + 1]);
+    dport = (uint16_t)((p[ihl + 2] << 8) | p[ihl + 3]);
+    s_orig = ((uint32_t)p[ihl + 4] << 24) | ((uint32_t)p[ihl + 5] << 16) |
+             ((uint32_t)p[ihl + 6] << 8) | p[ihl + 7];
+    flags = p[ihl + 13];
+    paylen = len - (size_t)ihl - thlen;
+
+    nsrc = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
+           ((uint32_t)p[14] << 8) | p[15];
+    ndst = ((uint32_t)p[16] << 24) | ((uint32_t)p[17] << 16) |
+           ((uint32_t)p[18] << 8) | p[19];
+    /* per-connection mirror state: SYN opens at ISN 0, data and FIN
+     * advance our emit seq (a stateless swap would repeat the same seq
+     * and the client would discard every mirrored segment as OOO) */
+    {
+        struct echo_conn *ec = echo_lookup(nsrc, sport, ndst, dport,
+                                           (flags & TCP_SYN) != 0);
+        if (!ec)
+            return -1;           /* table full */
+        seq = ec->seq;
+        if (flags & TCP_SYN)
+            ec->seq = 1;
+        else if (flags & TCP_FIN)
+            ec->seq += (uint32_t)paylen + 1;
+        else if (paylen > 0)
+            ec->seq += (uint32_t)paylen;
+    }
+    /* swap addresses byte-wise (never through a host-endian u32: the
+     * little-endian memcpy round-trip would byte-reverse them) */
+    memcpy(tmp4, p + 12, 4);
+    memcpy(p + 12, p + 16, 4);
+    memcpy(p + 16, tmp4, 4);
+    /* swap TCP ports */
+    p[ihl] = (uint8_t)(dport >> 8);
+    p[ihl + 1] = (uint8_t)dport;
+    p[ihl + 2] = (uint8_t)(sport >> 8);
+    p[ihl + 3] = (uint8_t)sport;
+    /* mirrored ack advances past the client's bytes (SYN/FIN each
+     * consume one sequence number); mirrored seq came from the table */
+    if (flags & TCP_SYN) {
+        ack = s_orig + 1;
+        flags |= TCP_ACK;
+    } else if (flags & TCP_FIN) {
+        ack = s_orig + (uint32_t)paylen + 1;
+        flags |= TCP_ACK;
+    } else {
+        ack = s_orig + (uint32_t)paylen;
+    }
+    p[ihl + 13] = flags;
+    p[ihl + 4] = (uint8_t)(seq >> 24);
+    p[ihl + 5] = (uint8_t)(seq >> 16);
+    p[ihl + 6] = (uint8_t)(seq >> 8);
+    p[ihl + 7] = (uint8_t)seq;
+    p[ihl + 8] = (uint8_t)(ack >> 24);
+    p[ihl + 9] = (uint8_t)(ack >> 16);
+    p[ihl + 10] = (uint8_t)(ack >> 8);
+    p[ihl + 11] = (uint8_t)ack;
+    /* TCP checksum: pseudo header uses the mirrored addresses
+     * (src = original dst, dst = original src) */
+    p[ihl + 16] = 0;
+    p[ihl + 17] = 0;
+    cs = ip_tcp_csum(ndst, nsrc, p + ihl, len - (size_t)ihl);
+    p[ihl + 16] = (uint8_t)(cs >> 8);
+    p[ihl + 17] = (uint8_t)cs;
+    /* IP header checksum */
+    p[10] = 0;
+    p[11] = 0;
+    cs = ip_csum_fold(ip_csum_accum(0, p, ihl));
+    p[10] = (uint8_t)(cs >> 8);
+    p[11] = (uint8_t)cs;
+
+    handle_tun_downlink(ctx, p, len, sockfd);
+    return 0;
 }
 
 void handle_tun_downlink(struct server_ctx *ctx, const uint8_t *ip_pkt, size_t len,

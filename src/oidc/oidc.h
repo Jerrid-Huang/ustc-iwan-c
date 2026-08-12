@@ -56,6 +56,7 @@ typedef struct {
 /* oidc_util.c */
 void oidc_die(const char *fmt, ...);
 void oidc_die_with_cause(const char *msg, const char *cause);
+void oidc_pause_if_relaunched(void);
 void oidc_eprintf(const char *fmt, ...);
 void oidc_rand_bytes(uint8_t *out, size_t n);
 void oidc_check_server_ip(const char *server);

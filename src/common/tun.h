@@ -104,6 +104,9 @@ typedef void (*tun_exit_fn)(void);
 struct tun_pool *tun_pool_create(const char *name, int fd0, int maxq,
                                  int initq, tun_pkt_fn cb, void *ud,
                                  atomic_bool *abort);
+/* actual number of reader threads currently running: adapts (AIMD
+ * grow/shrink) on Linux, always 1 on Windows (wintun is single-queue) */
+int tun_pool_queues(const struct tun_pool *p);
 void tun_pool_set_exit_cb(struct tun_pool *p, tun_exit_fn cb);
 void tun_pool_tick(struct tun_pool *p);
 void tun_pool_destroy(struct tun_pool *p);

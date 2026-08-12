@@ -27,6 +27,7 @@ static int debug_cached = -1;
  * supported target, so the relaxed store below is legal in a signal
  * handler (C11 7.14.1.1) and race-free against event-loop readers. */
 atomic_bool g_stop;
+atomic_bool g_user_stop;
 
 void util_ignore_sigpipe(void)
 {

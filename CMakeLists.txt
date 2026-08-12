@@ -190,7 +190,7 @@ endif()
 # only when ld reaches these import libs (a plain archive pass would
 # leave __imp_WSACleanup & co. undefined).
 if(WIN32)
-  target_link_libraries(iwan_core PUBLIC ws2_32 iphlpapi bcrypt crypt32 shell32)
+  target_link_libraries(iwan_core PUBLIC ws2_32 iphlpapi bcrypt crypt32 shell32 mpr)
 endif()
 target_link_libraries(iwan_core PUBLIC Threads::Threads)
 

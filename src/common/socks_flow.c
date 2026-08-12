@@ -786,7 +786,16 @@ static void socks_reply(Flow *f, uint8_t rep, uint32_t bnd_ip,
 }
 
 void queue_socks_error(Flow *f, uint8_t rep) {
-    socks_reply(f, rep, 0, 0);
+    if (debug_enabled())
+        log_debug("[flow %lu] socks error rep=%u (state %d)",
+                  (unsigned long)f->id, rep, f->state);
+    if (f->http_mode) {
+        /* HTTP proxy clients expect an HTTP status, not a SOCKS5 frame */
+        static const char bad[] = "HTTP/1.1 502 Bad Gateway\r\n\r\n";
+        queue_flow_output(f, (const uint8_t *)bad, sizeof bad - 1);
+    } else {
+        socks_reply(f, rep, 0, 0);
+    }
     f->state = ST_CLOSING;
 }
 
@@ -827,6 +836,10 @@ Flow *flow_alloc(struct sockaddr_in *peer) {
 }
 
 void flow_free(Flow *f) {
+    if (!f->active)
+        return;   /* never-allocated or already-freed slot: closing a
+                   * zeroed fd would hit WSAENOTSOCK on Windows and
+                   * g_flow_len would underflow */
     if (f->fd >= 0) {
         port_close(f->fd);   /* local client stream: a socket */
         f->fd = -1;
@@ -895,6 +908,190 @@ static void greet_reject(Flow *f)
     set_flow_state(f, ST_CLOSING);
 }
 
+/* ---- HTTP proxy fallback ----
+ * Browsers and the Windows system proxy speak HTTP CONNECT (and
+ * absolute-URI GET/POST) to a plain proxy port; the SOCKS5-only
+ * handshake rejected them with greet_reject. Detect an HTTP method
+ * line in the greeting buffer and switch the flow into HTTP mode.
+ */
+
+/* Probe the buffered greeting for an HTTP method line. Returns 1 when
+ * the buffer starts with a known method token followed by a space, -1
+ * when the first byte could still begin a method but the token is
+ * incomplete (wait for more data), 0 otherwise (not HTTP). */
+static int greeting_http_probe(const uint8_t *d, size_t n)
+{
+    static const char *const methods[] = {
+        "CONNECT", "GET", "POST", "HEAD", "PUT", "DELETE",
+        "OPTIONS", "TRACE", "PATCH",
+    };
+    static const size_t lens[] = {7, 3, 4, 4, 3, 6, 7, 5, 5};
+
+    if (n == 0)
+        return -1;
+    for (int i = 0; i < (int)(sizeof lens / sizeof lens[0]); i++) {
+        if (n >= lens[i] && memcmp(d, methods[i], lens[i]) == 0) {
+            if (n > lens[i] && d[lens[i]] == ' ')
+                return 1;
+            return n == lens[i] ? -1 : 0;   /* wait / wrong delimiter */
+        }
+    }
+    /* first byte could still start a method whose token is incomplete */
+    if (d[0] == 'C' || d[0] == 'O' || d[0] == 'D' ||
+        (n < 3 && (d[0] == 'G' || d[0] == 'P' || d[0] == 'T')) ||
+        (n < 4 && d[0] == 'H'))
+        return -1;
+    return 0;
+}
+
+/* Parse an HTTP request target: for CONNECT an authority "host:port",
+ * for other methods an absolute URI "http://host[:port]/path". IPv4
+ * literals return 1 (ip4 filled), domains return 0 (domain filled),
+ * anything malformed returns -1. */
+static int http_parse_target(const char *s, size_t n, bool is_connect,
+                             uint32_t *ip4_out, char *domain, size_t dsz,
+                             uint16_t *port_out)
+{
+    size_t i;
+    const char *host;
+    size_t hn;
+    uint16_t port = is_connect ? 443 : 80;
+
+    if (n == 0)
+        return -1;
+    if (!is_connect) {
+        /* strip scheme for absolute-URI requests */
+        if (n >= 7 && strncasecmp(s, "http://", 7) == 0) {
+            s += 7;
+            n -= 7;
+        } else if (n >= 8 && strncasecmp(s, "https://", 8) == 0) {
+            s += 8;
+            n -= 8;
+        }
+        if (n == 0)
+            return -1;
+        /* host part ends at '/', '?' or '#' */
+        for (i = 0; i < n; i++) {
+            char c = s[i];
+            if (c == '/' || c == '?' || c == '#') {
+                n = i;
+                break;
+            }
+        }
+    }
+    if (n == 0)
+        return -1;
+    /* CONNECT: the authority is followed by a space and the HTTP
+     * version (CONNECT host:443 HTTP/1.1); cut at the space too */
+    for (i = 0; i < n; i++) {
+        if (s[i] == ' ') {
+            n = i;
+            break;
+        }
+    }
+    if (n == 0)
+        return -1;
+    if (s[0] == '[')
+        return -1;              /* IPv6 literal: netstack is IPv4-only */
+    /* split host:port at the (single) colon */
+    {
+        const char *colon = NULL;
+        for (i = 0; i < n; i++) {
+            if (s[i] == ':') {
+                if (i == n - 1 || colon)
+                    return -1;
+                colon = s + i;
+            }
+        }
+        if (colon) {
+            const char *ps = colon + 1;
+            size_t pn = n - (size_t)(colon + 1 - s);
+            unsigned long v = 0;
+            for (i = 0; i < pn; i++) {
+                if (ps[i] < '0' || ps[i] > '9')
+                    return -1;
+                v = v * 10 + (unsigned long)(ps[i] - '0');
+                if (v > 65535)
+                    return -1;
+            }
+            if (pn == 0)
+                return -1;
+            port = (uint16_t)v;
+            host = s;
+            hn = (size_t)(colon - s);
+        } else {
+            host = s;
+            hn = n;
+        }
+    }
+    if (hn == 0 || hn > dsz - 1)
+        return -1;
+    /* host charset: letters, digits, '.', '-', '_' */
+    for (i = 0; i < hn; i++) {
+        char c = host[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '_'))
+            return -1;
+    }
+    memcpy(domain, host, hn);
+    domain[hn] = 0;
+    *port_out = port;
+    if (inet_pton(AF_INET, domain, ip4_out) == 1)
+        return 1;               /* IPv4 literal */
+    return 0;                   /* domain: async tunnel DNS */
+}
+
+/* ST_GREETING + http_mode: parse the HTTP request header block. For
+ * CONNECT the header is consumed (post-header bytes stay in f->input
+ * as tunnel data); absolute-URI methods forward the entire request
+ * verbatim, so nothing is consumed. */
+static void http_handshake(Flow *f)
+{
+    uint8_t *d = f->input.data;
+    size_t n = f->input.len;
+    size_t hdr, eol, mn, ts;
+    char domain[256];
+    uint32_t ip4 = 0;
+    uint16_t port;
+    int r;
+
+    /* header block ends at \r\n\r\n (real clients always send CRLF) */
+    for (hdr = 3; hdr < n; hdr++) {
+        if (d[hdr - 3] == '\r' && d[hdr - 2] == '\n' &&
+            d[hdr - 1] == '\r' && d[hdr] == '\n')
+            break;
+    }
+    if (hdr >= n)
+        return;                  /* header not complete: wait for more */
+    hdr += 1;                    /* index past the final \n */
+    for (eol = 0; eol < n && d[eol] != '\r' && d[eol] != '\n'; eol++)
+        ;
+    for (mn = 0; mn < eol && d[mn] != ' '; mn++)
+        ;
+    if (mn == 0 || mn >= eol)
+        goto bad;                /* no method token / no target */
+    f->http_connect = (mn == 7 && memcmp(d, "CONNECT", 7) == 0);
+    for (ts = mn + 1; ts < eol && d[ts] == ' '; ts++)
+        ;
+    if (ts >= eol)
+        goto bad;
+    r = http_parse_target((const char *)d + ts, eol - ts, f->http_connect,
+                          &ip4, domain, sizeof domain, &port);
+    if (r < 0)
+        goto bad;
+    if (f->http_connect)
+        buf_consume(&f->input, hdr);
+    if (r == 1)
+        open_tcp_connection(f, ip4, port);
+    else {
+        set_flow_state(f, ST_RESOLVING);
+        spawn_dns((int)f->id, domain, port);
+    }
+    return;
+bad:
+    queue_socks_error(f, 5);     /* http_mode -> 502 Bad Gateway */
+}
+
 /* ST_GREETING: version/method negotiation plus the RFC1929 sub-
  * negotiation when a token is configured; returns true when a CONNECT
  * request may already be buffered and should be parsed this round */
@@ -904,6 +1101,22 @@ static bool handshake_greeting(Flow *f)
         const char *tok = g_socks_cfg ? g_socks_cfg->auth_token : NULL;
         if (f->input.len < 2)
             return false;
+        /* HTTP proxy fallback: browsers and the Windows system proxy
+         * speak HTTP to a plain proxy port. Only without a SOCKS5 token
+         * (a token-requiring proxy must not silently accept unauthenti-
+         * cated HTTP traffic, and HTTP clients cannot do RFC1929). */
+        if (f->input.data[0] != 5 &&
+            (!g_socks_cfg || !g_socks_cfg->auth_token)) {
+            int pr = greeting_http_probe(f->input.data, f->input.len);
+            if (pr == 1) {
+                f->http_mode = true;
+                http_handshake(f);
+                return false;
+            }
+            if (pr == -1)
+                return false;    /* incomplete method token: wait */
+            /* not HTTP and not SOCKS5: reject below */
+        }
         size_t nmethods = f->input.data[1];
         if (f->input.len < 2 + nmethods)
             return false;
@@ -1029,6 +1242,10 @@ static void handshake_request(Flow *f)
 void process_socks_handshake(Flow *f)
 {
     if (f->state == ST_GREETING) {
+        if (f->http_mode) {
+            http_handshake(f);
+            return;
+        }
         if (!handshake_greeting(f))
             return;
     }
@@ -1107,7 +1324,15 @@ void update_tcp_states(void) {
         TcpConn *c = ns_conn(&g_ns, f->ns_idx);
         NsState st = c ? c->state : NS_CLOSED;
         if (st == NS_ESTABLISHED) {
-            socks_reply(f, 0, g_ns.ip, f->lport);
+            if (f->http_connect) {
+                /* HTTP CONNECT tunnel: confirm after the tunnel is up */
+                static const char okhdr[] =
+                    "HTTP/1.1 200 Connection Established\r\n\r\n";
+                queue_flow_output(f, (const uint8_t *)okhdr,
+                                  sizeof okhdr - 1);
+            } else if (!f->http_mode) {
+                socks_reply(f, 0, g_ns.ip, f->lport);
+            }
             set_flow_state(f, ST_ESTABLISHED);
             if (debug_enabled())
                 log_debug("[flow %lu] TCP established", (unsigned long)f->id);
@@ -1166,6 +1391,13 @@ void service_local_inputs(Flow *fs) {
                     break;       /* stack full: backpressure */
                 }
                 ssize_t r2 = port_readv(f->fd, iov, nv);
+                if (r2 < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    log_debug("[flow %lu] readv fd=%d nv=%d err=%s "
+                              "iov0=%p/%zu",
+                              (unsigned long)f->id, f->fd, nv,
+                              strerror(errno), iov[0].iov_base,
+                              iov[0].iov_len);
+                }
                 if (r2 > 0) {
                     size_t left = (size_t)r2;
                     for (int k = 0; k < nv && left > 0; k++) {
@@ -1330,7 +1562,8 @@ void reap_flows(void) {
         } else {
             removable = f->state == ST_CLOSING && f->output.len == 0;
         }
-        if (removable)
+        if (removable) {
             flow_free(f);
+        }
     }
 }

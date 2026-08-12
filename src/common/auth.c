@@ -14,7 +14,10 @@
 #endif
 
 #include "auth.h"
-#include "common.h"
+#include "common.h"   /* port.h: winsock2.h + windows.h first */
+#ifdef _WIN32
+#include <mswsock.h>   /* SIO_UDP_CONNRESET (mingw keeps it here, not mstcpip.h) */
+#endif
 #include "crypto.h"
 #include "protocol.h"
 #include "util.h"
@@ -259,6 +262,23 @@ int udp_connect(const char *host, uint16_t port, int timeout_ms)
         freeaddrinfo(res);
         return -1;
     }
+
+#ifdef _WIN32
+    /* Connected UDP sockets on Windows surface any ICMP unreachable as
+     * WSAECONNRESET on the NEXT recv (the infamous behavior) — a single
+     * stray ICMP (server restart, middlebox, spoofed probe) would then
+     * kill the tunnel. Disable it: the protocol has its own
+     * keepalive/session-loss detection. */
+    {
+        DWORD b = FALSE;
+        DWORD br = 0;   /* WSAIoctl requires a valid lpcbBytesReturned */
+
+        if (WSAIoctl((SOCKET)fd, SIO_UDP_CONNRESET, &b, sizeof b, NULL, 0,
+                     &br, NULL, NULL) != 0)
+            log_debug("SIO_UDP_CONNRESET: winsock error %d",
+                      WSAGetLastError());
+    }
+#endif
 
     /* large UDP buffers: burst drops on the tunnel path collapse the inner
      * TCP cwnd; default rcvbuf/sndbuf (~208KB) is too small for a VPN.

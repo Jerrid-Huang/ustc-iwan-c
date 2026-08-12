@@ -24,6 +24,9 @@ static void usage_error(const Cli *usage, const char *msg)
 
 int main(int argc, char **argv)
 {
+#ifdef _WIN32
+    port_install_crash_handler();
+#endif
     util_ignore_sigpipe();
     /* WSAStartup + console UTF-8 on Windows; no-op on Linux. Without
      * this the OIDC client relied on port_socket's WSANOTINITIALISED

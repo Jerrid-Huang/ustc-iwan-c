@@ -44,8 +44,6 @@ typedef struct _WINTUN_SESSION *WINTUN_SESSION_HANDLE;
 
 typedef WINTUN_ADAPTER_HANDLE(WINAPI *wintun_create_adapter_fn)(
     const WCHAR *name, const WCHAR *tunnel_type, const GUID *guid);
-typedef void (WINAPI *wintun_delete_adapter_fn)(WINTUN_ADAPTER_HANDLE adapter,
-                                                BOOL force_close_sessions);
 typedef WINTUN_ADAPTER_HANDLE(WINAPI *wintun_open_adapter_fn)(
     const WCHAR *name, const WCHAR *tunnel_type);
 typedef void (WINAPI *wintun_close_adapter_fn)(WINTUN_ADAPTER_HANDLE adapter);
@@ -55,9 +53,17 @@ typedef void (WINAPI *wintun_end_session_fn)(WINTUN_SESSION_HANDLE session);
 typedef BOOL (WINAPI *wintun_get_adapter_luid_fn)(WINTUN_ADAPTER_HANDLE adapter,
                                                   NET_LUID *luid);
 typedef DWORD (WINAPI *wintun_get_running_driver_version_fn)(void);
-typedef BOOL (WINAPI *wintun_send_packet_fn)(WINTUN_SESSION_HANDLE session,
-                                             const BYTE *packet,
-                                             DWORD packet_size);
+/* wintun >= 0.14: reserve ring space (blocks until room) then send the
+ * reserved buffer (VOID — cannot fail); wintun <= 0.13 used a single
+ * BOOL send(Session, Packet, PacketSize). Both are kept: the 0.14 form
+ * is detected by the WintunAllocateSendPacket export. */
+typedef BYTE *(WINAPI *wintun_allocate_send_packet_fn)(
+    WINTUN_SESSION_HANDLE session, DWORD packet_size);
+typedef void (WINAPI *wintun_send_packet_fn)(WINTUN_SESSION_HANDLE session,
+                                             const BYTE *packet);
+typedef BOOL (WINAPI *wintun_send_packet_old_fn)(WINTUN_SESSION_HANDLE session,
+                                                 const BYTE *packet,
+                                                 DWORD packet_size);
 typedef BYTE *(WINAPI *wintun_receive_packet_fn)(WINTUN_SESSION_HANDLE session,
                                                  DWORD *packet_size);
 typedef void (WINAPI *wintun_release_receive_packet_fn)(
@@ -68,14 +74,15 @@ typedef HANDLE (WINAPI *wintun_get_read_wait_event_fn)(
 struct wintun_api {
     HMODULE dll;
     wintun_create_adapter_fn create_adapter;
-    wintun_delete_adapter_fn delete_adapter;
     wintun_open_adapter_fn open_adapter;
     wintun_close_adapter_fn close_adapter;
     wintun_start_session_fn start_session;
     wintun_end_session_fn end_session;
     wintun_get_adapter_luid_fn get_adapter_luid;
     wintun_get_running_driver_version_fn get_running_driver_version;
+    wintun_allocate_send_packet_fn allocate_send_packet;
     wintun_send_packet_fn send_packet;
+    wintun_send_packet_old_fn send_packet_old;
     wintun_receive_packet_fn receive_packet;
     wintun_release_receive_packet_fn release_receive_packet;
     wintun_get_read_wait_event_fn get_read_wait_event;
@@ -105,13 +112,45 @@ static bool wintun_load(void)
 {
     if (iwan_wintun_loaded != 0)
         return iwan_wintun_loaded > 0;
-    iwan_wintun.dll = LoadLibraryA("wintun.dll");
+    /* Load from the exe's own directory by absolute path first: that
+     * directory is by definition readable (the exe itself runs from
+     * it), and this sidesteps loader search-order quirks when running
+     * from network shares. Fall back to the bare name (system/PATH
+     * search). Both error codes are reported so policy blocks
+     * (AppLocker DLL rules -> 1260) are distinguishable from a missing
+     * file (126). */
+    {
+        wchar_t dllpath[MAX_PATH * 2];
+        DWORD n = GetModuleFileNameW(NULL, dllpath,
+                                     (DWORD)(sizeof dllpath /
+                                             sizeof dllpath[0]));
+
+        if (n > 0 && n < sizeof dllpath / sizeof dllpath[0]) {
+            wchar_t *slash = wcsrchr(dllpath, L'\\');
+
+            if (slash) {
+                wcscpy(slash + 1, L"wintun.dll");
+                iwan_wintun.dll = LoadLibraryW(dllpath);
+                /* NOTE: no early return here — the GetProcAddress
+                 * resolution below MUST run for every successful load,
+                 * or the API pointers stay NULL and open_tun calls
+                 * through a NULL function pointer (0xC0000005 at 0x0). */
+            }
+        }
+    }
     if (iwan_wintun.dll == NULL) {
-        log_err("wintun.dll not found — install the wintun driver from "
-                "wintun.net (or WireGuard) and place wintun.dll next to "
-                "the executable");
-        iwan_wintun_loaded = -1;
-        return false;
+        DWORD dir_err = GetLastError();
+
+        iwan_wintun.dll = LoadLibraryA("wintun.dll");
+        if (iwan_wintun.dll == NULL) {
+            log_err("wintun.dll not found or blocked — install the "
+                    "wintun driver from wintun.net (or WireGuard) and "
+                    "place wintun.dll next to the executable "
+                    "(exe-dir load error %lu, name load error %lu)",
+                    dir_err, GetLastError());
+            iwan_wintun_loaded = -1;
+            return false;
+        }
     }
 #define WINTUN_LOAD_ONE(member, name)                                         \
     do {                                                                      \
@@ -126,14 +165,28 @@ static bool wintun_load(void)
         }                                                                     \
     } while (0)
     WINTUN_LOAD_ONE(create_adapter, "WintunCreateAdapter");
-    WINTUN_LOAD_ONE(delete_adapter, "WintunDeleteAdapter");
     WINTUN_LOAD_ONE(open_adapter, "WintunOpenAdapter");
     WINTUN_LOAD_ONE(close_adapter, "WintunCloseAdapter");
     WINTUN_LOAD_ONE(start_session, "WintunStartSession");
     WINTUN_LOAD_ONE(end_session, "WintunEndSession");
-    WINTUN_LOAD_ONE(get_adapter_luid, "WintunGetAdapterLuid");
+    WINTUN_LOAD_ONE(get_adapter_luid, "WintunGetAdapterLUID");
     WINTUN_LOAD_ONE(get_running_driver_version, "WintunGetRunningDriverVersion");
-    WINTUN_LOAD_ONE(send_packet, "WintunSendPacket");
+    /* 0.14+ exports WintunAllocateSendPacket; 0.13 and earlier do not
+     * (there WintunSendPacket takes the packet size as the 3rd arg) */
+    iwan_wintun.allocate_send_packet = (wintun_allocate_send_packet_fn)
+        (void *)GetProcAddress(iwan_wintun.dll, "WintunAllocateSendPacket");
+    iwan_wintun.send_packet = (wintun_send_packet_fn)
+        (void *)GetProcAddress(iwan_wintun.dll, "WintunSendPacket");
+    if (iwan_wintun.send_packet == NULL) {
+        log_err("wintun.dll is missing WintunSendPacket — update "
+                "wintun.dll from wintun.net");
+        FreeLibrary(iwan_wintun.dll);
+        iwan_wintun_loaded = -1;
+        return false;
+    }
+    if (iwan_wintun.allocate_send_packet == NULL)
+        iwan_wintun.send_packet_old = (wintun_send_packet_old_fn)
+            (void *)iwan_wintun.send_packet;
     WINTUN_LOAD_ONE(receive_packet, "WintunReceivePacket");
     WINTUN_LOAD_ONE(release_receive_packet, "WintunReleaseReceivePacket");
     WINTUN_LOAD_ONE(get_read_wait_event, "WintunGetReadWaitEvent");
@@ -294,11 +347,25 @@ ptrdiff_t tun_write(int fd, const void *buf, size_t len)
         errno = EBADF;
         return -1;
     }
-    /* WintunSendPacket blocks while the ring is full (that IS the
-     * backpressure); FALSE therefore means the session is gone */
-    if (!iwan_wintun.send_packet(s->session, buf, (DWORD)len)) {
-        errno = EIO;
-        return -1;
+    if (iwan_wintun.allocate_send_packet) {
+        /* wintun 0.14+: reserve ring space (blocks until room — that is
+         * the backpressure), copy, then send the reserved buffer; the
+         * send itself cannot fail. A NULL alloc means the session is
+         * gone (or the packet exceeds WINTUN_MAX_IP_PACKET_SIZE). */
+        BYTE *dst = iwan_wintun.allocate_send_packet(s->session,
+                                                     (DWORD)len);
+        if (dst == NULL) {
+            errno = EIO;
+            return -1;
+        }
+        memcpy(dst, buf, len);
+        iwan_wintun.send_packet(s->session, dst);
+    } else {
+        /* wintun <= 0.13: BOOL send(Session, Packet, PacketSize) */
+        if (!iwan_wintun.send_packet_old(s->session, buf, (DWORD)len)) {
+            errno = EIO;
+            return -1;
+        }
     }
     return (ptrdiff_t)len;
 }
@@ -413,6 +480,12 @@ struct tun_pool *tun_pool_create(const char *name, int fd0, int maxq,
         return NULL;
     }
     return pool;
+}
+
+int tun_pool_queues(const struct tun_pool *pool)
+{
+    (void)pool;
+    return 1;   /* wintun sessions are single-queue: one reader thread */
 }
 
 void tun_pool_set_exit_cb(struct tun_pool *pool, tun_exit_fn cb)

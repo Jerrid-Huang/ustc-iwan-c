@@ -14,6 +14,25 @@
 #include "json.h"
 #include "oidc.h"
 
+#ifdef _WIN32
+#include <conio.h>   /* _getch: hold the UAC-relaunched window open */
+#endif
+
+/* A UAC-relaunched console app (port_elevate_self sets
+ * IWAN_ELEVATED_RELAUNCH) owns a console window that Windows closes
+ * the moment the process exits — taking any error message with it.
+ * Hold the window open on failure so the user can read the error. */
+void oidc_pause_if_relaunched(void)
+{
+#ifdef _WIN32
+    if (getenv("IWAN_ELEVATED_RELAUNCH")) {
+        fputs("\nPress any key to close this window...", stderr);
+        fflush(stderr);
+        _getch();
+    }
+#endif
+}
+
 void oidc_die(const char *fmt, ...)
 {
     va_list ap;
@@ -22,12 +41,18 @@ void oidc_die(const char *fmt, ...)
     vfprintf(stderr, fmt, ap);
     va_end(ap);
     fputc('\n', stderr);
+#ifdef _WIN32
+    oidc_pause_if_relaunched();
+#endif
     exit(1);
 }
 
 void oidc_die_with_cause(const char *msg, const char *cause)
 {
     fprintf(stderr, "Error: %s\n\nCaused by:\n    %s\n", msg, cause);
+#ifdef _WIN32
+    oidc_pause_if_relaunched();
+#endif
     exit(1);
 }
 

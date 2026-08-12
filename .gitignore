@@ -19,3 +19,4 @@ local*
 users.txt
 servers.json
 SHASUMS.txt
+build-win*/

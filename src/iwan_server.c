@@ -841,7 +841,7 @@ int main(int argc, char **argv)
     }
 
     if (o.no_tun) {
-        printf("no-tun mode: data plane disabled\n");
+        printf("no-tun mode: TCP echo mirror (bench harness)\n");
     } else {
         enable_ip_forward();
         setup_nat(subnet_net, o.nat_if);

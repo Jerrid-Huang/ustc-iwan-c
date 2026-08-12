@@ -244,12 +244,22 @@ void oidc_connect_server(const Opts *o, const Config *cf)
             port_close(fd);
         }
         OPENSSL_cleanse(sk, sizeof sk);   /* session key scrub */
-        if (rc == 0 || g_stop)
-            break;   /* user stopped it */
-        if (rc < 0)
+        if (rc == 0)
+            break;   /* user stopped it (pump returns 0 when the exit
+                      * was not a detected session loss); run_pump
+                      * resets g_stop on entry, so a lost session
+                      * (rc == 1, g_stop set by the pump's detection)
+                      * falls through to reconnect */
+        if (rc < 0) {
+#ifdef _WIN32
+            oidc_pause_if_relaunched();
+#endif
             exit(1);   /* config/startup failure: retrying cannot help */
+        }
         oidc_eprintf("  tunnel session lost; reconnecting...\n");
         port_sleep_ms(1000);
+        if (g_user_stop)
+            break;   /* Ctrl-C during the reconnect wait */
     }
 
     if (tun_fd >= 0)

@@ -363,7 +363,23 @@ static int https_ctx_load_cas(SSL_CTX *ctx)
     X509_STORE *xstore = SSL_CTX_get_cert_store(ctx);
     int n = 0;
 
-    store = CertOpenSystemStoreA(0, "ROOT");
+    /* CertOpenSystemStore opens the CURRENT_USER system store, which on
+     * real Windows (fresh profiles, service accounts) can hold no roots
+     * at all while the machine-wide ROOT store carries the CA trust
+     * anchors. Open the machine store with the user store as fallback
+     * (the combined-flag form is the standard Node/Go pattern; wine
+     * only implements the single-location forms, hence the chain). */
+    store = CertOpenStore(CERT_STORE_PROV_SYSTEM, 0, 0,
+                          CERT_SYSTEM_STORE_LOCAL_MACHINE |
+                          CERT_SYSTEM_STORE_CURRENT_USER, L"ROOT");
+    if (!store)
+        store = CertOpenStore(CERT_STORE_PROV_SYSTEM, 0, 0,
+                              CERT_SYSTEM_STORE_LOCAL_MACHINE, L"ROOT");
+    if (!store)
+        store = CertOpenStore(CERT_STORE_PROV_SYSTEM, 0, 0,
+                              CERT_SYSTEM_STORE_CURRENT_USER, L"ROOT");
+    if (!store)
+        store = CertOpenSystemStoreA(0, "ROOT");
     if (!store) {
         log_err("HTTPS: cannot open the Windows ROOT certificate store "
                 "(error %lu)", (unsigned long)GetLastError());
@@ -385,8 +401,8 @@ static int https_ctx_load_cas(SSL_CTX *ctx)
                 "cannot verify the server certificate");
         return -1;
     }
-    log_debug("https: loaded %d CA certificates from the Windows ROOT "
-              "store", n);
+    log_info("HTTPS: loaded %d CA certificates from the Windows ROOT "
+             "store", n);
     return 0;
 #else
     static const char *const cands[] = {
@@ -426,12 +442,108 @@ static int https_ctx_load_cas(SSL_CTX *ctx)
 #endif
 }
 
+static const char iwan_embedded_cas[] =
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIIF3jCCA8agAwIBAgIQAf1tMPyjylGoG7xkDjUDLTANBgkqhkiG9w0BAQwFADCB\n"
+    "iDELMAkGA1UEBhMCVVMxEzARBgNVBAgTCk5ldyBKZXJzZXkxFDASBgNVBAcTC0pl\n"
+    "cnNleSBDaXR5MR4wHAYDVQQKExVUaGUgVVNFUlRSVVNUIE5ldHdvcmsxLjAsBgNV\n"
+    "BAMTJVVTRVJUcnVzdCBSU0EgQ2VydGlmaWNhdGlvbiBBdXRob3JpdHkwHhcNMTAw\n"
+    "MjAxMDAwMDAwWhcNMzgwMTE4MjM1OTU5WjCBiDELMAkGA1UEBhMCVVMxEzARBgNV\n"
+    "BAgTCk5ldyBKZXJzZXkxFDASBgNVBAcTC0plcnNleSBDaXR5MR4wHAYDVQQKExVU\n"
+    "aGUgVVNFUlRSVVNUIE5ldHdvcmsxLjAsBgNVBAMTJVVTRVJUcnVzdCBSU0EgQ2Vy\n"
+    "dGlmaWNhdGlvbiBBdXRob3JpdHkwggIiMA0GCSqGSIb3DQEBAQUAA4ICDwAwggIK\n"
+    "AoICAQCAEmUXNg7D2wiz0KxXDXbtzSfTTK1Qg2HiqiBNCS1kCdzOiZ/MPans9s/B\n"
+    "3PHTsdZ7NygRK0faOca8Ohm0X6a9fZ2jY0K2dvKpOyuR+OJv0OwWIJAJPuLodMkY\n"
+    "tJHUYmTbf6MG8YgYapAiPLz+E/CHFHv25B+O1ORRxhFnRghRy4YUVD+8M/5+bJz/\n"
+    "Fp0YvVGONaanZshyZ9shZrHUm3gDwFA66Mzw3LyeTP6vBZY1H1dat//O+T23LLb2\n"
+    "VN3I5xI6Ta5MirdcmrS3ID3KfyI0rn47aGYBROcBTkZTmzNg95S+UzeQc0PzMsNT\n"
+    "79uq/nROacdrjGCT3sTHDN/hMq7MkztReJVni+49Vv4M0GkPGw/zJSZrM233bkf6\n"
+    "c0Plfg6lZrEpfDKEY1WJxA3Bk1QwGROs0303p+tdOmw1XNtB1xLaqUkL39iAigmT\n"
+    "Yo61Zs8liM2EuLE/pDkP2QKe6xJMlXzzawWpXhaDzLhn4ugTncxbgtNMs+1b/97l\n"
+    "c6wjOy0AvzVVdAlJ2ElYGn+SNuZRkg7zJn0cTRe8yexDJtC/QV9AqURE9JnnV4ee\n"
+    "UB9XVKg+/XRjL7FQZQnmWEIuQxpMtPAlR1n6BB6T1CZGSlCBst6+eLf8ZxXhyVeE\n"
+    "Hg9j1uliutZfVS7qXMYoCAQlObgOK6nyTJccBz8NUvXt7y+CDwIDAQABo0IwQDAd\n"
+    "BgNVHQ4EFgQUU3m/WqorSs9UgOHYm8Cd8rIDZsswDgYDVR0PAQH/BAQDAgEGMA8G\n"
+    "A1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQEMBQADggIBAFzUfA3P9wF9QZllDHPF\n"
+    "Up/L+M+ZBn8b2kMVn54CVVeWFPFSPCeHlCjtHzoBN6J2/FNQwISbxmtOuowhT6KO\n"
+    "VWKR82kV2LyI48SqC/3vqOlLVSoGIG1VeCkZ7l8wXEskEVX/JJpuXior7gtNn3/3\n"
+    "ATiUFJVDBwn7YKnuHKsSjKCaXqeYalltiz8I+8jRRa8YFWSQEg9zKC7F4iRO/Fjs\n"
+    "8PRF/iKz6y+O0tlFYQXBl2+odnKPi4w2r78NBc5xjeambx9spnFixdjQg3IM8WcR\n"
+    "iQycE0xyNN+81XHfqnHd4blsjDwSXWXavVcStkNr/+XeTWYRUc+ZruwXtuhxkYze\n"
+    "Sf7dNXGiFSeUHM9h4ya7b6NnJSFd5t0dCy5oGzuCr+yDZ4XUmFF0sbmZgIn/f3gZ\n"
+    "XHlKYC6SQK5MNyosycdiyA5d9zZbyuAlJQG03RoHnHcAP9Dc1ew91Pq7P8yF1m9/\n"
+    "qS3fuQL39ZeatTXaw2ewh0qpKJ4jjv9cJ2vhsE/zB+4ALtRZh8tSQZXq9EfX7mRB\n"
+    "VXyNWQKV3WKdwrnuWih0hKWbt5DHDAff9Yk2dDLWKMGwsAvgnEzDHNb842m1R0aB\n"
+    "L6KCq9NjRHDEjf8tM7qtj3u1cIiuPhnPQCjY/MiQu12ZIvVS5ljFH4gxQ+6IHdfG\n"
+    "jjxDah2nGN59PRbxYvnKkKj9\n"
+    "-----END CERTIFICATE-----\n"
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIIFijCCA3KgAwIBAgIQdY39i658BwD6qSWn4cetFDANBgkqhkiG9w0BAQwFADBf\n"
+    "MQswCQYDVQQGEwJHQjEYMBYGA1UEChMPU2VjdGlnbyBMaW1pdGVkMTYwNAYDVQQD\n"
+    "Ey1TZWN0aWdvIFB1YmxpYyBTZXJ2ZXIgQXV0aGVudGljYXRpb24gUm9vdCBSNDYw\n"
+    "HhcNMjEwMzIyMDAwMDAwWhcNNDYwMzIxMjM1OTU5WjBfMQswCQYDVQQGEwJHQjEY\n"
+    "MBYGA1UEChMPU2VjdGlnbyBMaW1pdGVkMTYwNAYDVQQDEy1TZWN0aWdvIFB1Ymxp\n"
+    "YyBTZXJ2ZXIgQXV0aGVudGljYXRpb24gUm9vdCBSNDYwggIiMA0GCSqGSIb3DQEB\n"
+    "AQUAA4ICDwAwggIKAoICAQCTvtU2UnXYASOgHEdCSe5jtrch/cSV1UgrJnwUUxDa\n"
+    "ef0rty2k1Cz66jLdScK5vQ9IPXtamFSvnl0xdE8H/FAh3aTPaE8bEmNtJZlMKpnz\n"
+    "SDBh+oF8HqcIStw+KxwfGExxqjWMrfhu6DtK2eWUAtaJhBOqbchPM8xQljeSM9xf\n"
+    "iOefVNlI8JhD1mb9nxc4Q8UBUQvX4yMPFF1bFOdLvt30yNoDN9HWOaEhUTCDsG3X\n"
+    "ME6WW5HwcCSrv0WBZEMNvSE6Lzzpng3LILVCJ8zab5vuZDCQOc2TZYEhMbUjUDM3\n"
+    "IuM47fgxMMxF/mL50V0yeUKH32rMVhlATc6qu/m1dkmU8Sf4kaWD5QazYw6A3OAS\n"
+    "VYCmO2a0OYctyPDQ0RTp5A1NDvZdV3LFOxxHVp3i1fuBYYzMTYCQNFu31xR13NgE\n"
+    "SJ/AwSiItOkcyqex8Va3e0lMWeUgFaiEAin6OJRpmkkGj80feRQXEgyDet4fsZfu\n"
+    "+Zd4KKTIRJLpfSYFplhym3kT2BFfrsU4YjRosoYwjviQYZ4ybPUHNs2iTG7sijbt\n"
+    "8uaZFURww3y8nDnAtOFr94MlI1fZEoDlSfB1D++N6xybVCi0ITz8fAr/73trdf+L\n"
+    "HaAZBav6+CuBQug4urv7qv094PPK306Xlynt8xhW6aWWrL3DkJiy4Pmi1KZHQ3xt\n"
+    "zwIDAQABo0IwQDAdBgNVHQ4EFgQUVnNYZJX5khqwEioEYnmhQBWIIUkwDgYDVR0P\n"
+    "AQH/BAQDAgGGMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQEMBQADggIBAC9c\n"
+    "mTz8Bl6MlC5w6tIyMY208FHVvArzZJ8HXtXBc2hkeqK5Duj5XYUtqDdFqij0lgVQ\n"
+    "YKlJfp/imTYpE0RHap1VIDzYm/EDMrraQKFz6oOht0SmDpkBm+S8f74TlH7Kph52\n"
+    "gDY9hAaLMyZlbcp+nv4fjFg4exqDsQ+8FxG75gbMY/qB8oFM2gsQa6H61SilzwZA\n"
+    "Fv97fRheORKkU55+MkIQpiGRqRxOF3yEvJ+M0ejf5lG5Nkc/kLnHvALcWxxPDkjB\n"
+    "JYOcCj+esQMzEhonrPcibCTRAUH4WAP+JWgiH5paPHxsnnVI84HxZmduTILA7rpX\n"
+    "DhjvLpr3Etiga+kFpaHpaPi8TD8SHkXoUsCjvxInebnMMTzD9joiFgOgyY9mpFui\n"
+    "TdaBJQbpdqQACj7LzTWb4OE4y2BThihCQRxEV+ioratF4yUQvNs+ZUH7G6aXD+u5\n"
+    "dHn5HrwdVw1Hr8Mvn4dGp+smWg9WY7ViYG4A++MnESLn/pmPNPW56MORcr3Ywx65\n"
+    "LvKRRFHQV80MNNVIIb/bE/FmJUNS0nAiNs2fxBx1IK1jcmMGDw4nztJqDby1ORrp\n"
+    "0XZ60Vzk50lJLVU3aPAaOpg+VBeHVOmmJ1CJeyAvP/+/oYtKR5j/K3tJPsMpRmAY\n"
+    "QqszKbrAKbkTidOIijlBO8n9pu0f9GBj39ItVQGL\n"
+    "-----END CERTIFICATE-----\n"
+    "";
+
+/* Load the bundled fallback roots into the store. Returns the number
+ * added (0 only if the embedded PEM block fails to parse — a build
+ * bug, not a runtime condition). */
+static int https_ctx_add_embedded_cas(SSL_CTX *ctx)
+{
+    BIO *bio = BIO_new_mem_buf(iwan_embedded_cas,
+                               (int)strlen(iwan_embedded_cas));
+    X509_STORE *xstore = SSL_CTX_get_cert_store(ctx);
+    int n = 0;
+
+    if (!bio)
+        return 0;
+    ERR_clear_error();
+    for (;;) {
+        X509 *x = PEM_read_bio_X509(bio, NULL, NULL, NULL);
+
+        if (!x)
+            break;
+        if (X509_STORE_add_cert(xstore, x) == 1)
+            n++;
+        X509_free(x);
+    }
+    BIO_free(bio);
+    ERR_clear_error();
+    return n;
+}
+
 /* One client TLS context with peer verification and CA loading. The
    context is created per exchange (https_transport) rather than cached:
    HTTPS round trips are rare (auth/OIDC), and per-exchange ownership
    keeps the Windows store enumeration and the OpenSSL state clear of
    static data and locking in a process that spawns threads elsewhere. */
-static SSL_CTX *https_ctx_new(void)
+static SSL_CTX *https_ctx_new(bool with_fallback)
 {
     SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
 
@@ -444,8 +556,22 @@ static SSL_CTX *https_ctx_new(void)
     SSL_CTX_set_options(ctx, SSL_OP_IGNORE_UNEXPECTED_EOF);
     SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
     if (https_ctx_load_cas(ctx) != 0) {
-        SSL_CTX_free(ctx);
-        return NULL;
+        if (!with_fallback) {
+            SSL_CTX_free(ctx);
+            return NULL;
+        }
+        /* system store unusable: fall back to the bundled roots alone */
+        log_err("HTTPS: system CA store unusable; using bundled fallback "
+                "roots only");
+    }
+    if (with_fallback) {
+        int n = https_ctx_add_embedded_cas(ctx);
+
+        if (n == 0)
+            log_err("HTTPS: embedded fallback CA bundle failed to parse");
+        else
+            log_info("HTTPS: added %d bundled fallback CA(s) "
+                     "(USERTrust RSA, Sectigo R46)", n);
     }
     return ctx;
 }
@@ -585,6 +711,31 @@ static int https_connect_tcp(const char *host, uint16_t port,
 /* Bind the connected socket to a new SSL session for `host`: SNI, peer
    verification, and the hostname check — the in-process equivalent of
    `openssl s_client -servername/-verify_hostname -verify_return_error`. */
+/* Verify callback: on chain/hostname verification failure, log the
+   precise reason and the offending certificate immediately (this is the
+   only point where the peer certificate is still available — OpenSSL
+   clears it from the session once the handshake fails). The callback
+   always rejects (returns 0) so the handshake fails as before. */
+static int https_verify_cb(int preverify_ok, X509_STORE_CTX *xctx)
+{
+    if (!preverify_ok) {
+        int err = X509_STORE_CTX_get_error(xctx);
+        X509 *cert = X509_STORE_CTX_get_current_cert(xctx);
+        char subj[128];
+
+        if (cert)
+            X509_NAME_oneline(X509_get_subject_name(cert), subj,
+                              sizeof subj);
+        else
+            snprintf(subj, sizeof subj, "?");
+        log_err("HTTPS: server certificate rejected: %s (%d), "
+                "cert subject=%s",
+                X509_verify_cert_error_string(err), err, subj);
+    }
+    /* keep the default verification decision (reject on failure) */
+    return preverify_ok;
+}
+
 static SSL *https_ssl_new(SSL_CTX *ctx, int fd, const char *host)
 {
     SSL *ssl = SSL_new(ctx);
@@ -597,7 +748,7 @@ static SSL *https_ssl_new(SSL_CTX *ctx, int fd, const char *host)
         SSL_free(ssl);
         return NULL;
     }
-    SSL_set_verify(ssl, SSL_VERIFY_PEER, NULL);
+    SSL_set_verify(ssl, SSL_VERIFY_PEER, https_verify_cb);
     return ssl;
 }
 
@@ -607,11 +758,13 @@ static SSL *https_ssl_new(SSL_CTX *ctx, int fd, const char *host)
    by its socket timeout, so a dead or stalling peer cannot hang the
    round trip. Returns 0 on success, -1 with a reason in diag. */
 static int https_tls_connect(SSL *ssl, int fd, uint64_t deadline_ms,
-                             char *diag, size_t diagsz)
+                             char *diag, size_t diagsz, long *verify_err)
 {
     for (;;) {
         uint64_t remain;
         int r;
+        if (verify_err)
+            *verify_err = X509_V_OK;
 
         if (now_ms() >= deadline_ms) {
             snprintf(diag, diagsz, "TLS handshake timed out");
@@ -646,6 +799,24 @@ static int https_tls_connect(SSL *ssl, int fd, uint64_t deadline_ms,
                 }
             }
             https_ssl_err(diag, diagsz);
+            /* certificate/hostname verification failures surface as the
+             * generic "certificate verify failed" SSL error; append the
+             * precise X509 reason (the verify callback above already
+             * logged the offending certificate) and hand the verify
+             * code to the transport (anchor-missing codes trigger the
+             * bundled-fallback retry). */
+            if (verify_err)
+                *verify_err = SSL_get_verify_result(ssl);
+            {
+                long vr = *verify_err ? *verify_err : SSL_get_verify_result(ssl);
+                size_t used = strlen(diag);
+                int left = (int)diagsz - (int)used;
+
+                if (vr != X509_V_OK && left > 0)
+                    snprintf(diag + used, (size_t)left,
+                             "; X509 verify: %s (%ld)",
+                             X509_verify_cert_error_string(vr), vr);
+            }
             return -1;
         }
     }
@@ -892,37 +1063,79 @@ static bool https_transport(const char *host, struct sbuf *req,
         log_debug("https_transport: %s start (deadline %llu ms)",
                   host, (unsigned long long)deadline_ms);
 
-    ctx = https_ctx_new();
-    if (!ctx) {
-        /* CA problem: https_ctx_new already logged the specific reason
-         * (missing bundle on Linux, empty ROOT store on Windows) */
-        free(req->d);
-        return false;
-    }
+    /* Attempt 1 uses the system trust store only; if the chain's anchor
+     * is missing there (trimmed Windows root stores — observed: campus
+     * images with ~18 roots), attempt 2 retries once with the bundled
+     * fallback roots added. Never retried for hostname or other
+     * verification classes. */
+    for (int attempt = 0; attempt < 2; attempt++) {
+        bool fallback = attempt == 1;
 
-    fd = https_connect_tcp(host, 443, deadline_ms, diag, sizeof diag);
-    if (fd < 0) {
         if (debug_enabled())
-            log_debug("https_transport: %s connect failed: %s", host,
-                      diag);
-        goto out;
-    }
-    if (debug_enabled())
-        log_debug("https_transport: %s connected fd=%d", host, fd);
+            log_debug("https_transport: %s attempt %d%s", host,
+                      attempt + 1, fallback ? " (bundled fallback CAs)" : "");
 
-    ssl = https_ssl_new(ctx, fd, host);
-    if (!ssl) {
-        https_ssl_err(diag, sizeof diag);
-        goto out;
+        ctx = https_ctx_new(fallback);
+        if (!ctx) {
+            /* CA problem: https_ctx_new already logged the specific
+             * reason (missing bundle on Linux, empty ROOT store on
+             * Windows). A broken/empty system store still gets one
+             * attempt with the bundled fallback roots. */
+            if (!fallback) {
+                log_info("HTTPS: system CA store unusable; retrying "
+                         "with bundled fallback CAs");
+                continue;
+            }
+            free(req->d);
+            return false;
+        }
+
+        fd = https_connect_tcp(host, 443, deadline_ms, diag, sizeof diag);
+        if (fd < 0) {
+            if (debug_enabled())
+                log_debug("https_transport: %s connect failed: %s", host,
+                          diag);
+            goto out;
+        }
+        if (debug_enabled())
+            log_debug("https_transport: %s connected fd=%d", host, fd);
+
+        ssl = https_ssl_new(ctx, fd, host);
+        if (!ssl) {
+            https_ssl_err(diag, sizeof diag);
+            goto out;
+        }
+        {
+            long verr = X509_V_OK;
+
+            if (https_tls_connect(ssl, fd, deadline_ms, diag, sizeof diag,
+                                  &verr) != 0) {
+                if (!fallback &&
+                    (verr == X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT ||
+                     verr == X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY ||
+                     verr == X509_V_ERR_UNABLE_TO_VERIFY_LEAF_SIGNATURE)) {
+                    log_info("HTTPS: system trust store lacks the chain "
+                             "anchor (%ld); retrying with bundled "
+                             "fallback CAs", verr);
+                    SSL_free(ssl);
+                    SSL_CTX_free(ctx);
+                    port_close(fd);
+                    ssl = NULL;
+                    ctx = NULL;
+                    fd = -1;
+                    continue;
+                }
+                goto out;
+            }
+        }
+        if (https_tls_write(ssl, fd, req->d, req->len, deadline_ms, diag,
+                            sizeof diag) != 0)
+            goto out;
+        if (https_tls_read(ssl, fd, resp, deadline_ms, diag, sizeof diag) != 0)
+            goto out;
+        ok = true;
+        break;
     }
-    if (https_tls_connect(ssl, fd, deadline_ms, diag, sizeof diag) != 0)
-        goto out;
-    if (https_tls_write(ssl, fd, req->d, req->len, deadline_ms, diag,
-                        sizeof diag) != 0)
-        goto out;
-    if (https_tls_read(ssl, fd, resp, deadline_ms, diag, sizeof diag) != 0)
-        goto out;
-    ok = true;
 
 out:
     free(req->d);

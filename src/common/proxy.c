@@ -85,10 +85,28 @@ static int send_ctrl(pump_ctx_t *ctx, uint8_t typ, uint8_t enc, uint16_t sid,
  * hiccup) must not kill the session, while a persistent failure means
  * the socket is gone */
 #define PUMP_KA_FAIL_MAX 3
-/* no downlink for this long (the server answers our ECHO_REQ
- * keepalives, so a live session produces traffic every ~10s) =>
- * session lost: the server purged or rebooted the session */
-#define PUMP_RX_STALE_MS 60000u
+/* no downlink for this long => session lost: the server purged or
+ * rebooted the session. Not all servers answer ECHO_REQ keepalives (a
+ * live-but-silent session then produces no downlink at all), so the
+ * threshold is overridable: IWAN_RX_STALE_MS (default 60s, 10s..24h). */
+#define PUMP_RX_STALE_MS_DEFAULT 60000u
+
+static unsigned pump_rx_stale_ms(void)
+{
+    const char *v = getenv("IWAN_RX_STALE_MS");
+    char *end;
+    unsigned long n;
+
+    if (!v || !v[0])
+        return PUMP_RX_STALE_MS_DEFAULT;
+    n = strtoul(v, &end, 10);
+    if (end == v || *end != '\0' || n < 10000 || n > 86400000) {
+        log_err("IWAN_RX_STALE_MS: invalid value '%s' (10s..24h); "
+                "using default", v);
+        return PUMP_RX_STALE_MS_DEFAULT;
+    }
+    return (unsigned)n;
+}
 #define PUMP_POLL_CEIL_MS 1000  /* cap on the recvmmsg park timeout */
 #define RX_BATCH 64             /* recvmmsg batch size (iov/msgs arrays) */
 #define PUMP_SEND_RETRY_MS  5    /* EAGAIN/ENOBUFS retry budget per flush:
@@ -183,7 +201,11 @@ static int send_gso(pump_ctx_t *ctx, struct iovec *iov, unsigned n,
             return 0;
         }
         ctx->gso_mss = mss;
-    } else if (ctx->gso_mss != mss) {
+    } else if (ctx->gso_ok && ctx->gso_mss != mss) {
+        /* re-arm a WORKING GSO socket for a new mss; once GSO is known
+         * unavailable (e.g. SIO_UDP_NETSEGMENT rejected on Windows)
+         * re-probing on every distinct batch size would just spam
+         * WSAEOPNOTSUPP — stay on the sendmmsg fallback */
         int m = (int)mss;
         if (port_setsockopt(ctx->sockfd, SOL_UDP, UDP_SEGMENT, &m,
                             sizeof m) != 0) {
@@ -409,12 +431,12 @@ static void *udp2tun_thread(void *ud) {
     }
     while (!g_stop) {
         uint64_t now = now_ms();
-        if (now - last_rx > PUMP_RX_STALE_MS) {
+        if (now - last_rx > pump_rx_stale_ms()) {
             /* the server answers our ECHO_REQ keepalives, so a live
              * session always produces downlink within ~10s; 60s of
              * silence means the session is gone (server purge/reboot)
              * even if the socket itself still sends */
-            eprintf("[UDP->TUN] no downlink for %llu ms; session lost\n",
+            log_err("[UDP->TUN] no downlink for %llu ms; session lost",
                     (unsigned long long)(now - last_rx));
             ctx->session_lost = true;
             g_stop = 1;
@@ -427,8 +449,8 @@ static void *udp2tun_thread(void *ud) {
                 /* transient errors (roaming, carrier hiccup) recover;
                  * only repeated failures declare the socket dead */
                 if (++ka_fail >= PUMP_KA_FAIL_MAX) {
-                    eprintf("[UDP->TUN] keepalive send err: %s (%d "
-                            "consecutive); session lost\n",
+                    log_err("[UDP->TUN] keepalive send err: %s (%d "
+                            "consecutive); session lost",
                             strerror(e), ka_fail);
                     ctx->session_lost = true;
                     g_stop = 1;
@@ -446,7 +468,6 @@ static void *udp2tun_thread(void *ud) {
                               MSG_DONTWAIT, NULL);
         if (v < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                /* park until data arrives or the next keepalive is due */
                 uint64_t ka_ms = last_ka + PUMP_KEEPALIVE_MS;
                 uint64_t now_msv = now_ms();
                 int to = ka_ms > now_msv ? (int)(ka_ms - now_msv) : 1;
@@ -461,9 +482,13 @@ static void *udp2tun_thread(void *ud) {
                 }
                 continue;
             }
-            if (errno == EINTR)
-                continue;
-            eprintf("[UDP->TUN] recv err\n");
+            if (errno == EINTR || errno == ECONNREFUSED)
+                continue;   /* EINTR: signal; ECONNREFUSED: one-shot
+                             * connected-UDP ICMP artifact (Linux side;
+                             * Windows is silenced via SIO_UDP_CONNRESET)
+                             * — the keepalive logic detects real loss */
+            log_err("[UDP->TUN] recv err: %s (%d)", strerror(errno),
+                    errno);
             g_stop = 1;   /* any pump-fatal error stops the tunnel */
             break;
         }
@@ -486,7 +511,8 @@ static void *udp2tun_thread(void *ud) {
                 /* control packets carry the 16-byte header sig */
                 if (!verify_sig(m, (size_t)n))
                     continue;
-                eprintf("[UDP->TUN] server sent CLOSE\n");
+                log_err("[UDP->TUN] server sent CLOSE");
+                ctx->session_lost = true;   /* re-auth + re-run */
                 g_stop = 1;
                 break;
             }
@@ -495,7 +521,9 @@ static void *udp2tun_thread(void *ud) {
                     continue;
                 if (send_ctrl(ctx, PT_ECHO_RES, ctx->enc, ctx->sid,
                               ctx->tok) != 0) {
-                    eprintf("[UDP->TUN] keepalive response err\n");
+                    log_err("[UDP->TUN] keepalive response err: %s",
+                            strerror(errno));
+                    ctx->session_lost = true;
                     g_stop = 1;
                     break;
                 }
@@ -537,6 +565,7 @@ static void on_signal(int sig) {
     if (sig == SIGINT)
         eprintf("\nSIGINT -- shutting down...\n");
     g_stop = 1;
+    g_user_stop = 1;
 }
 
 static void install_signals(void) {
@@ -735,7 +764,8 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
         /* each reader thread frees its TLS batch on exit (tun.c invokes
          * this on the exiting thread, after the final flush) */
         tun_pool_set_exit_cb(ctx.pool, pump_reader_exit);
-        log_info("TUN reader pool: %d queues", maxq);
+        log_info("TUN reader pool: %d queues",
+                 tun_pool_queues(ctx.pool));
     }
     if (tun_steering_attach(tun_fd) == 0)
         log_info("tun steering: eBPF flow hash attached");

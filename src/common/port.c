@@ -11,6 +11,42 @@
 #else
 #include <signal.h>
 #include <shellapi.h>   /* ShellExecuteW (port_elevate_self) */
+#include <winnetwk.h>   /* WNetGetConnectionW (UNC for elevation) */
+#include <conio.h>      /* _getch (crash filter window hold) */
+#endif
+
+#ifdef _WIN32
+/* Crash reporter: Windows console apps die silently on unhandled
+ * exceptions, and a UAC-relaunched instance's console window vanishes
+ * with it. Print the exception code, the faulting address and its
+ * module, then hold the window open if this was a UAC relaunch. */
+static LONG WINAPI iwan_crash_filter(EXCEPTION_POINTERS *ep)
+{
+    const EXCEPTION_RECORD *er = ep->ExceptionRecord;
+    HMODULE mod = NULL;
+    wchar_t modpath[MAX_PATH] = L"?";
+
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR)er->ExceptionAddress, &mod) && mod)
+        GetModuleFileNameW(mod, modpath, MAX_PATH);
+    fprintf(stderr,
+            "\n*** runtime error: exception 0x%08lX at %p, module %ls ***\n",
+            (unsigned long)er->ExceptionCode, er->ExceptionAddress,
+            modpath);
+    fflush(stderr);
+    if (getenv("IWAN_ELEVATED_RELAUNCH")) {
+        fprintf(stderr, "Press any key to close this window...");
+        fflush(stderr);
+        _getch();
+    }
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+void port_install_crash_handler(void)
+{
+    SetUnhandledExceptionFilter(iwan_crash_filter);
+}
 #endif
 
 /* ================================================================== */
@@ -167,7 +203,12 @@ bool port_is_admin(void)
                                      DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0,
                                      0, 0, &admins)) {
             for (DWORD i = 0; i < tg->GroupCount; i++)
-                if (EqualSid(tg->Groups[i].Sid, admins)) {
+                /* UAC-filtered tokens still CONTAIN the Administrators
+                 * SID, marked deny-only (no SE_GROUP_ENABLED); without
+                 * the attribute check every admin user is misdetected
+                 * as elevated and the UAC relaunch is skipped. */
+                if (EqualSid(tg->Groups[i].Sid, admins) &&
+                    (tg->Groups[i].Attributes & SE_GROUP_ENABLED)) {
                     admin = true;
                     break;
                 }
@@ -220,20 +261,115 @@ int port_elevate_self(int argc, char **argv)
 #ifdef _WIN32
     wchar_t exe[MAX_PATH];
     wchar_t args[4096];
-    HINSTANCE r;
+    wchar_t unc[MAX_PATH * 2];
+    wchar_t unc_dir[MAX_PATH * 2];
+    bool have_unc = false;
     size_t n;
 
     if (!GetModuleFileNameW(NULL, exe, MAX_PATH))
         return -1;
+    /* The UAC elevation machinery (AppInfo service, session 0) cannot
+     * resolve drive letters: an exe launched from a mapped drive fails
+     * with ERROR_PATH_NOT_FOUND (3) even though the file exists. Resolve
+     * the UNC form — WNetGetConnectionW for standard mappings,
+     * QueryDosDeviceW for SUBST'd drives — and relaunch via that. */
+    if (exe[0] != L'\0' && exe[1] == L':') {
+        wchar_t dletter[3] = { exe[0], L':', L'\0' };
+        wchar_t remote[4096] = L"";
+        DWORD rlen = (DWORD)(sizeof remote / sizeof remote[0]);
+        DWORD we = WNetGetConnectionW(dletter, remote, &rlen);
+
+        if (we == NO_ERROR && remote[0] != L'\0') {
+            int m = _snwprintf(unc, MAX_PATH * 2, L"%s%s", remote,
+                               exe + 2);
+
+            if (m > 0 && (size_t)m < MAX_PATH * 2)
+                have_unc = true;
+        } else {
+            /* not a WNet mapping (SUBST / session-scoped): the DOS
+             * device name records the target too */
+            wchar_t dev[4096] = L"";
+            DWORD dn = QueryDosDeviceW(
+                dletter, dev, (DWORD)(sizeof dev / sizeof dev[0]));
+
+            if (dn > 0 && wcsncmp(dev, L"\\??\\UNC\\", 8) == 0) {
+                int m = _snwprintf(unc, MAX_PATH * 2, L"\\\\%s%s",
+                                   dev + 8, exe + 2);
+
+                if (m > 0 && (size_t)m < MAX_PATH * 2)
+                    have_unc = true;
+            }
+            log_debug("elevation: WNetGetConnectionW(%ls) failed (%lu), "
+                      "QueryDosDeviceW -> %ls", dletter, we, dev);
+        }
+    }
     n = win_join_argv(argv, 1, args, sizeof args / sizeof args[0]);
-    /* ShellExecuteW with the "runas" verb shows the UAC prompt and
-     * starts a new elevated instance of this exe (the console verb
-     * opens a fresh window). A result > 32 means the launch was
-     * accepted; the user declining the UAC prompt surfaces as
-     * SE_ERR_ACCESSDENIED (5) here. */
-    r = ShellExecuteW(NULL, L"runas", exe,
-                      n > 0 ? args : NULL, NULL, SW_SHOWNORMAL);
-    return (intptr_t)r > 32 ? 0 : -1;
+    /* Try the launch path first, then the UNC form. lpDirectory is set
+     * explicitly: the current directory (the Z: prompt) is exactly the
+     * kind of path the elevated context cannot resolve, and an
+     * unresolvable CWD makes process creation fail with error 3. */
+    for (int attempt = 0; attempt < 2; attempt++) {
+        SHELLEXECUTEINFOW sei;
+        const wchar_t *file = attempt == 0 ? exe : unc;
+        const wchar_t *dir = L"C:\\";
+        wchar_t *slash;
+
+        if (attempt == 1 && !have_unc)
+            break;
+        if (attempt == 0 && have_unc) {
+            wcsncpy(unc_dir, unc, MAX_PATH * 2 - 1);
+            unc_dir[MAX_PATH * 2 - 1] = L'\0';
+            slash = wcsrchr(unc_dir, L'\\');
+            if (slash) {
+                *slash = L'\0';
+                dir = unc_dir;
+            }
+        }
+        memset(&sei, 0, sizeof sei);
+        sei.cbSize = sizeof sei;
+        sei.fMask = SEE_MASK_FLAG_NO_UI | SEE_MASK_NOCLOSEPROCESS;
+        sei.lpVerb = L"runas";
+        sei.lpFile = file;
+        sei.lpParameters = n > 0 ? args : NULL;
+        sei.lpDirectory = dir;
+        sei.nShow = SW_SHOWNORMAL;
+        /* marker for the elevated instance: its console window closes
+         * on exit, so error paths hold it open (oidc_pause_if_relaunched) */
+        SetEnvironmentVariableW(L"IWAN_ELEVATED_RELAUNCH", L"1");
+        if (ShellExecuteExW(&sei)) {
+            if (sei.hProcess)
+                CloseHandle(sei.hProcess);
+            return 0;
+        }
+        log_err("UAC elevation refused for %ls (error %d)", file,
+                (int)(intptr_t)sei.hInstApp);
+    }
+    /* Diagnose the cause: the two UAC policies that make runas fail
+     * without showing a prompt. */
+    {
+        DWORD vas = 0, lua = 0, vsz = sizeof vas, lsz = sizeof lua;
+
+        RegGetValueA(HKEY_LOCAL_MACHINE,
+                     "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\"
+                     "Policies\\System",
+                     "ValidateAdminCodeSignatures", RRF_RT_REG_DWORD,
+                     NULL, &vas, &vsz);
+        RegGetValueA(HKEY_LOCAL_MACHINE,
+                     "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\"
+                     "Policies\\System",
+                     "EnableLUA", RRF_RT_REG_DWORD, NULL, &lua, &lsz);
+        log_err("UAC policies: ValidateAdminCodeSignatures=%lu "
+                "EnableLUA=%lu%s",
+                vas, lua,
+                vas ? " — this policy blocks elevating UNSIGNED "
+                      "executables without any prompt; disable it or run "
+                      "iwan from an administrator console" : "");
+    }
+    log_err("elevation failed: if the exe lives on a mapped/SUBST drive "
+            "that UAC cannot resolve, copy the binaries to a local disk "
+            "(e.g. C:\\iwan) and run them from there, or start an "
+            "elevated console (right-click -> Run as administrator)");
+    return -1;
 #else
     /* POSIX elevation is handled by the callers (sudo re-exec) */
     (void)argv;
@@ -501,12 +637,22 @@ static int wsa_errno(int e)
     }
 }
 
-static void set_sock_errno(void)
+static void set_sock_errno_fn(int fd, const char *who)
 {
     int e = WSAGetLastError();
     errno = wsa_errno(e);
-    log_debug("winsock error %d -> errno %d", e, errno);
+    /* WSAEWOULDBLOCK / WSAEINTR are routine conditions on nonblocking
+     * sockets (idle listener accept, flow IO): the callers handle them
+     * like Linux's EAGAIN/EINTR, so log them as quietly as Linux does */
+    if (e == WSAEWOULDBLOCK || e == WSAEINTR)
+        return;
+    log_debug("set_sock_errno(%s, fd=%d): winsock error %d -> errno %d",
+              who, fd, e, errno);
 }
+
+/* logging macro: the failing wrapper's name and fd are recorded so a
+ * winsock error can be traced to its call site */
+#define set_sock_errno(fd) set_sock_errno_fn((int)(fd), __func__)
 
 void port_socket_init(void)
 {
@@ -528,7 +674,7 @@ void port_socket_init(void)
 int port_close(int fd)
 {
     if (closesocket((SOCKET)fd) == SOCKET_ERROR) {
-        set_sock_errno();
+        set_sock_errno(fd);
         return -1;
     }
     return 0;
@@ -539,7 +685,7 @@ int port_set_nonblock(int fd, bool nb)
 {
     u_long mode = nb ? 1 : 0;
     if (ioctlsocket((SOCKET)fd, FIONBIO, &mode) == SOCKET_ERROR) {
-        set_sock_errno();
+        set_sock_errno(fd);
         return -1;
     }
     return 0;
@@ -553,7 +699,7 @@ static int ensure_nonblock(int fd)
 {
     u_long mode = 1;
     if (ioctlsocket((SOCKET)fd, FIONBIO, &mode) == SOCKET_ERROR) {
-        set_sock_errno();
+        set_sock_errno(fd);
         return -1;
     }
     return 0;
@@ -566,7 +712,7 @@ ssize_t port_send(int fd, const void *buf, size_t len, int flags)
         return -1;
     r = send((SOCKET)fd, (const char *)buf, (int)len, 0);
     if (r == SOCKET_ERROR) {
-        set_sock_errno();
+        set_sock_errno(fd);
         return -1;
     }
     return (ssize_t)r;
@@ -579,7 +725,7 @@ ssize_t port_recv(int fd, void *buf, size_t len, int flags)
         return -1;
     r = recv((SOCKET)fd, (char *)buf, (int)len, 0);
     if (r == SOCKET_ERROR) {
-        set_sock_errno();
+        set_sock_errno(fd);
         return -1;
     }
     return (ssize_t)r;
@@ -594,7 +740,7 @@ ssize_t port_sendto(int fd, const void *buf, size_t len, int flags,
     r = sendto((SOCKET)fd, (const char *)buf, (int)len, 0,
                (const struct sockaddr *)to, (int)tolen);
     if (r == SOCKET_ERROR) {
-        set_sock_errno();
+        set_sock_errno(fd);
         return -1;
     }
     return (ssize_t)r;
@@ -609,7 +755,7 @@ ssize_t port_recvfrom(int fd, void *buf, size_t len, int flags,
     r = recvfrom((SOCKET)fd, (char *)buf, (int)len, 0,
                  (struct sockaddr *)from, (int *)fromlen);
     if (r == SOCKET_ERROR) {
-        set_sock_errno();
+        set_sock_errno(fd);
         return -1;
     }
     return (ssize_t)r;
@@ -665,7 +811,7 @@ ssize_t port_sendmsg(int fd, const struct msghdr *msg, int flags)
                   (int)msg->msg_namelen, NULL, NULL) == SOCKET_ERROR) {
         if (heap)
             free(w);
-        set_sock_errno();
+        set_sock_errno(fd);
         return -1;
     }
     if (heap)
@@ -687,8 +833,13 @@ ssize_t port_recvmsg(int fd, struct msghdr *msg, int flags)
     w = iov_to_wsabuf(msg->msg_iov, msg->msg_iovlen, stack, &heap);
     if (!w)
         return -1;
+    /* Windows quirk: WSARecvFrom with lpFrom=NULL and a NON-NULL
+     * lpFromlen fails with WSAEFAULT even on connected datagram
+     * sockets (Linux accepts both). Pass both NULL when the caller
+     * does not want the source address. */
     if (WSARecvFrom((SOCKET)fd, w, (DWORD)msg->msg_iovlen, &got, &wflags,
-                    (struct sockaddr *)msg->msg_name, &namelen, NULL,
+                    (struct sockaddr *)msg->msg_name,
+                    msg->msg_name ? &namelen : NULL, NULL,
                     NULL) == SOCKET_ERROR) {
         int e = WSAGetLastError();
         if (heap)
@@ -700,7 +851,7 @@ ssize_t port_recvmsg(int fd, struct msghdr *msg, int flags)
             return (ssize_t)got;
         }
         errno = wsa_errno(e);
-            log_debug("winsock error %d -> errno %d", e, errno);
+            log_debug("port_sendto: winsock error %d -> errno %d", e, errno);
         return -1;
     }
     if (heap)
@@ -735,7 +886,7 @@ int port_sendmmsg(int fd, struct mmsghdr *msgvec, unsigned vlen, int flags)
             if (sent > 0)
                 return (int)sent;   /* partial batch: Linux semantics */
             errno = wsa_errno(e);
-            log_debug("winsock error %d -> errno %d", e, errno);
+            log_debug("port_sendmmsg: winsock error %d -> errno %d", e, errno);
             return -1;
         }
         if (heap)
@@ -766,7 +917,8 @@ int port_recvmmsg(int fd, struct mmsghdr *msgvec, unsigned vlen, int flags,
         if (WSARecvFrom((SOCKET)fd, w,
                         (DWORD)msgvec[got].msg_hdr.msg_iovlen, &n, &wflags,
                         (struct sockaddr *)msgvec[got].msg_hdr.msg_name,
-                        &namelen, NULL, NULL) == SOCKET_ERROR) {
+                        msgvec[got].msg_hdr.msg_name ? &namelen : NULL,
+                        NULL, NULL) == SOCKET_ERROR) {
             int e = WSAGetLastError();
             if (heap)
                 free(w);
@@ -776,12 +928,17 @@ int port_recvmmsg(int fd, struct mmsghdr *msgvec, unsigned vlen, int flags,
                 got++;
                 return (int)got;
             }
-            if (e == WSAEWOULDBLOCK || e == WSAEINTR)
-                return (int)got;   /* drained: 0 messages is not an error */
+            if (e == WSAEWOULDBLOCK || e == WSAEINTR ||
+                e == WSAECONNRESET)
+                return (int)got;   /* drained: 0 messages is not an
+                                    * error; WSAECONNRESET is the
+                                    * connected-UDP ICMP artifact
+                                    * (SIO_UDP_CONNRESET disables it at
+                                    * the socket, this is the backstop) */
             if (got > 0)
                 return (int)got;
             errno = wsa_errno(e);
-            log_debug("winsock error %d -> errno %d", e, errno);
+            log_debug("port_recvmmsg: winsock error %d -> errno %d", e, errno);
             return -1;
         }
         if (heap)
@@ -792,24 +949,47 @@ int port_recvmmsg(int fd, struct mmsghdr *msgvec, unsigned vlen, int flags,
     return (int)got;
 }
 
+#define READV_BOUNCE_BYTES 16384
+
 ssize_t port_readv(int fd, const struct iovec *iov, int iovcnt)
 {
-    DWORD got = 0;
-    WSABUF stack[IOV_TO_WSABUF_STACK];
-    bool heap = false;
-    LPWSABUF w = iov_to_wsabuf(iov, iovcnt, stack, &heap);
-    if (!w)
-        return -1;
-    if (WSARecv((SOCKET)fd, w, (DWORD)iovcnt, &got, NULL, NULL, NULL) ==
-        SOCKET_ERROR) {
-        if (heap)
-            free(w);
-        set_sock_errno();
+    /* Real Windows (observed on Tiny11) fails WSARecv with WSAEFAULT
+     * (10014) for scatter/gather buffers located in the module's static
+     * data on an otherwise healthy accepted TCP socket — while plain
+     * recv() on the same socket works (the SOCKS handshake proves it).
+     * recv() has no gather: bounce through a stack buffer and copy out. */
+    char bounce[READV_BOUNCE_BYTES];
+    size_t total = 0;
+    int i;
+    ssize_t n;
+
+    if (iovcnt <= 0 || !iov)
+        return 0;
+    for (i = 0; i < iovcnt; i++) {
+        if (iov[i].iov_len >= READV_BOUNCE_BYTES - total) {
+            total = READV_BOUNCE_BYTES;
+            break;
+        }
+        total += iov[i].iov_len;
+    }
+    if (total == 0)
+        return 0;
+    n = recv((SOCKET)fd, bounce, (int)total, 0);
+    if (n == SOCKET_ERROR) {
+        set_sock_errno(fd);
         return -1;
     }
-    if (heap)
-        free(w);
-    return (ssize_t)got;
+    if (n > 0) {
+        size_t off = 0;
+        for (i = 0; i < iovcnt && off < (size_t)n; i++) {
+            size_t c = iov[i].iov_len;
+            if (c > (size_t)n - off)
+                c = (size_t)n - off;
+            memcpy(iov[i].iov_base, bounce + off, c);
+            off += c;
+        }
+    }
+    return (ssize_t)n;
 }
 
 ssize_t port_writev(int fd, const struct iovec *iov, int iovcnt)
@@ -824,7 +1004,7 @@ ssize_t port_writev(int fd, const struct iovec *iov, int iovcnt)
         SOCKET_ERROR) {
         if (heap)
             free(w);
-        set_sock_errno();
+        set_sock_errno(fd);
         return -1;
     }
     if (heap)
@@ -853,7 +1033,7 @@ int port_socket(int domain, int type, int protocol)
             e = WSAGetLastError();
         }
         errno = wsa_errno(e);
-            log_debug("winsock error %d -> errno %d", e, errno);
+            log_debug("port_socket: winsock error %d -> errno %d", e, errno);
         return -1;
     }
     return (int)s;
@@ -863,7 +1043,7 @@ int port_accept(int fd, struct sockaddr *addr, socklen_t *addrlen)
 {
     SOCKET s = accept((SOCKET)fd, addr, (int *)addrlen);
     if (s == INVALID_SOCKET) {
-        set_sock_errno();
+        set_sock_errno(fd);
         return -1;
     }
     return (int)s;
@@ -884,7 +1064,7 @@ int port_connect(int fd, const struct sockaddr *addr, socklen_t len)
             return -1;
         }
         errno = wsa_errno(e);
-            log_debug("winsock error %d -> errno %d", e, errno);
+            log_debug("port_connect: winsock error %d -> errno %d", e, errno);
         return -1;
     }
     return 0;
@@ -894,7 +1074,7 @@ int port_bind(int fd, const struct sockaddr *addr, socklen_t len)
 {
     if (bind((SOCKET)fd, (const struct sockaddr *)addr, (int)len) ==
         SOCKET_ERROR) {
-        set_sock_errno();
+        set_sock_errno(fd);
         return -1;
     }
     return 0;
@@ -903,7 +1083,7 @@ int port_bind(int fd, const struct sockaddr *addr, socklen_t len)
 int port_listen(int fd, int backlog)
 {
     if (listen((SOCKET)fd, backlog) == SOCKET_ERROR) {
-        set_sock_errno();
+        set_sock_errno(fd);
         return -1;
     }
     return 0;
@@ -912,7 +1092,7 @@ int port_listen(int fd, int backlog)
 int port_shutdown(int fd, int how)
 {
     if (shutdown((SOCKET)fd, how) == SOCKET_ERROR) {
-        set_sock_errno();
+        set_sock_errno(fd);
         return -1;
     }
     return 0;
@@ -923,7 +1103,7 @@ int port_getsockopt(int fd, int level, int optname, void *optval,
 {
     if (getsockopt((SOCKET)fd, level, optname, (char *)optval,
                    (int *)optlen) == SOCKET_ERROR) {
-        set_sock_errno();
+        set_sock_errno(fd);
         return -1;
     }
     return 0;
@@ -939,7 +1119,7 @@ int port_setsockopt(int fd, int level, int optname, const void *optval,
         DWORD ms = (DWORD)(tv->tv_sec * 1000 + tv->tv_usec / 1000);
         if (setsockopt((SOCKET)fd, SOL_SOCKET, optname, (const char *)&ms,
                        sizeof ms) == SOCKET_ERROR) {
-            set_sock_errno();
+            set_sock_errno(fd);
             return -1;
         }
         return 0;
@@ -953,14 +1133,14 @@ int port_setsockopt(int fd, int level, int optname, const void *optval,
         DWORD ret = 0;
         if (WSAIoctl((SOCKET)fd, SIO_UDP_NETSEGMENT, &mss, sizeof mss,
                      NULL, 0, &ret, NULL, NULL) == SOCKET_ERROR) {
-            set_sock_errno();
+            set_sock_errno(fd);
             return -1;
         }
         return 0;
     }
     if (setsockopt((SOCKET)fd, level, optname, (const char *)optval,
                    (int)optlen) == SOCKET_ERROR) {
-        set_sock_errno();
+        set_sock_errno(fd);
         return -1;
     }
     return 0;
@@ -972,7 +1152,7 @@ int port_poll(struct pollfd *fds, nfds_t nfds, int timeout_ms)
     if (r == SOCKET_ERROR) {
         int e = WSAGetLastError();
         errno = wsa_errno(e);
-            log_debug("winsock error %d -> errno %d", e, errno);
+            log_debug("port_poll: winsock error %d -> errno %d", e, errno);
         return -1;
     }
     return r;

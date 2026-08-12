@@ -36,6 +36,7 @@ Netstack g_ns;
 void on_sig(int sig) {
     (void)sig;
     atomic_store_explicit(&g_stop, true, memory_order_relaxed);
+    atomic_store_explicit(&g_user_stop, true, memory_order_relaxed);
 }
 
 int g_dns_evfd = -1;      /* DNS workers write here to wake the loop */
@@ -50,7 +51,26 @@ Flow *g_flows;            /* fixed MAX_FLOWS array, never NULL-terminated */
  * the socket is gone) */
 #define SOCKS_KA_FAIL_MAX 3
 /* no downlink for this long => session lost (server purged/rebooted) */
-#define SOCKS_RX_STALE_MS 60000u
+/* same override as the TUN pump: IWAN_RX_STALE_MS (default 60s,
+ * range 10s..24h) — some servers never answer ECHO_REQ keepalives */
+#define SOCKS_RX_STALE_MS_DEFAULT 60000u
+
+static unsigned socks_rx_stale_ms(void)
+{
+    const char *v = getenv("IWAN_RX_STALE_MS");
+    char *end;
+    unsigned long n;
+
+    if (!v || !v[0])
+        return SOCKS_RX_STALE_MS_DEFAULT;
+    n = strtoul(v, &end, 10);
+    if (end == v || *end != '\0' || n < 10000 || n > 86400000) {
+        log_err("IWAN_RX_STALE_MS: invalid value '%s' (10s..24h); "
+                "using default", v);
+        return SOCKS_RX_STALE_MS_DEFAULT;
+    }
+    return (unsigned)n;
+}
 #define LISTEN_BACKLOG   64
 #define SOCK_BUF_BYTES   (16 * 1024 * 1024)
 #define POLL_CEIL_MS     1000   /* safety ceiling for the event wait */
@@ -451,9 +471,9 @@ static int vpn_handle_datagram(int sockfd, SocksConfig *cfg, uint8_t *b,
         if (!verify_sig(b, n))
             return 0;
         log_err("VPN server closed the session (CLOSE)");
+        cfg->session_lost = true;   /* re-auth + re-run (caller loop) */
         return -1;
-    }
-    if (t == PT_ECHO_REQ) {
+    }    if (t == PT_ECHO_REQ) {
         if (!verify_sig(b, n))
             return 0;
         buf_t p;
@@ -523,8 +543,10 @@ int receive_vpn(int sockfd, SocksConfig *cfg) {
         if (v > 0)
             cfg->last_rx = now_ms();   /* downlink resets the stale clock */
         if (v <= 0) {
-            if (v == 0 || errno == EAGAIN || errno == EWOULDBLOCK)
-                return 0;
+            if (v == 0 || errno == EAGAIN || errno == EWOULDBLOCK ||
+                errno == ECONNREFUSED)
+                return 0;   /* ECONNREFUSED: one-shot connected-UDP ICMP
+                             * artifact; keepalives detect real loss */
             log_err("receive_vpn: recvmmsg: %s", strerror(errno));
             return -1;
         }
@@ -547,6 +569,8 @@ int run_socks(int sockfd, SocksConfig *cfg) {
     cfg->last_rx = now_ms();
     cfg->ka_fail = 0;
     cfg->session_lost = false;
+    g_stop = 0;   /* a lost-session return set it; the caller's
+                   * reconnect loop must not inherit the flag */
     struct sockaddr_in laddr = cfg->listen_addr;
 
     g_socks_cfg = cfg;
@@ -668,7 +692,7 @@ int run_socks(int sockfd, SocksConfig *cfg) {
         /* the server answers our ECHO_REQ keepalives, so a live session
          * always produces downlink within ~10s; 60s of silence means
          * the session is gone even if the socket still sends */
-        if (now_ms() - cfg->last_rx > SOCKS_RX_STALE_MS) {
+        if (now_ms() - cfg->last_rx > socks_rx_stale_ms()) {
             log_err("SOCKS: no downlink for %llu ms; session lost",
                     (unsigned long long)(now_ms() - cfg->last_rx));
             cfg->session_lost = true;
@@ -748,7 +772,8 @@ int run_socks(int sockfd, SocksConfig *cfg) {
         g_dns_evfd = -1;
     }
     for (int i = 0; i < MAX_FLOWS; i++)
-        flow_free(&g_flows[i]);
+        if (g_flows[i].active)
+            flow_free(&g_flows[i]);
     free(g_flows);
     g_flows = NULL;
 #ifndef _WIN32

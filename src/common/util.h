@@ -37,6 +37,10 @@ bool dbg_env(const char *name);
  * Defined once in util.c; socks.c/proxy.c/iwan_server.c use it instead of
  * private copies. */
 extern atomic_bool g_stop;
+/* set (with g_stop) by the SIGINT/SIGTERM/console-ctrl handler only;
+ * lets reconnect loops distinguish "user pressed Ctrl-C" from the
+ * pump's own session-loss flag (which also sets g_stop) */
+extern atomic_bool g_user_stop;
 /* SIG_IGN SIGPIPE once per process: pipe writes then surface EPIPE
  * instead of killing the process. Call at the top of each main(). */
 void util_ignore_sigpipe(void);

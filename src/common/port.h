@@ -169,6 +169,11 @@ bool port_is_admin(void);
  * process owns the work), -1 when elevation failed or was declined. */
 int port_elevate_self(int argc, char **argv);
 
+/* Install the Windows unhandled-exception reporter (prints the
+ * exception code/address/module and holds a UAC-relaunched window
+ * open). Call once at startup. */
+void port_install_crash_handler(void);
+
 /* Run a helper binary (the `ip`/`netsh`/`route` shell-outs) and wait
  * for it. argv is NULL-terminated with argv[0] = program name.
  * Returns the exit status (0..255) or -1 on spawn failure. */

@@ -808,12 +808,15 @@ static int cmd_proxy(int argc, char **argv, int start)
                       o.encrypt, o.server, &routes, res.tun, res.mtu);
         wipe(sk, sizeof sk);
         port_close(sockfd);
-        /* user stopped it (Ctrl-C), or a stop request arrived while we
-         * were tearing down: never reconnect against g_stop */
-        if (rc == 0 || g_stop)
+        /* user stopped it (Ctrl-C): run_pump returns 0 when the exit
+         * was not a detected session loss; a lost session (rc == 1)
+         * reconnects (run_pump resets g_stop on entry) */
+        if (rc == 0)
             break;
         log_err("tunnel session lost; reconnecting in 1s...");
         port_sleep_ms(1000);
+        if (g_user_stop)
+            break;   /* Ctrl-C during the reconnect wait */
     }
     cleanse_str(o.pass);
     tun_close(tun_fd);
@@ -913,10 +916,14 @@ static int cmd_socks(int argc, char **argv, int start)
 
         int rc = run_socks(sockfd, &cfg);
         port_close(sockfd);
-        if (rc == 0 || g_stop)
-            break;   /* user stopped it */
+        if (rc == 0)
+            break;   /* user stopped it (run_socks returns 0 unless the
+                      * session was detected lost; the reconnect re-runs
+                      * auth via the caller's loop) */
         log_err("tunnel session lost; reconnecting in 1s...");
         port_sleep_ms(1000);
+        if (g_user_stop)
+            break;   /* Ctrl-C during the reconnect wait */
     }
     cleanse_str(o.pass);
     return 0;
@@ -924,6 +931,9 @@ static int cmd_socks(int argc, char **argv, int start)
 
 int main(int argc, char **argv)
 {
+#ifdef _WIN32
+    port_install_crash_handler();
+#endif
     port_socket_init();   /* WSAStartup on Windows; no-op on Linux */
     util_ignore_sigpipe();
     if (argc < 2) {

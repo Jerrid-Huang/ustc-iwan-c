@@ -47,6 +47,9 @@ typedef struct {
     bool     local_eof;
     uint64_t state_ms;         /* when state last changed */
     bool     auth_pending;     /* RFC1929 auth sub-negotiation in progress */
+    bool     http_mode;        /* client speaks HTTP proxy, not SOCKS5 */
+    bool     http_connect;     /* HTTP mode: CONNECT tunnel (else absolute-URI
+                                * forwarding: the whole request is tunneled) */
 } Flow;
 
 /* Result of an async DNS lookup, queued for the event loop. */

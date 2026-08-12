@@ -427,6 +427,11 @@ struct tun_pool *tun_pool_create(const char *name, int fd0, int maxq,
     return pool;
 }
 
+int tun_pool_queues(const struct tun_pool *pool)
+{
+    return pool->nq;
+}
+
 void tun_pool_set_exit_cb(struct tun_pool *pool, tun_exit_fn cb)
 {
     if (pool)
