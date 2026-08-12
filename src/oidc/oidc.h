@@ -51,6 +51,7 @@ typedef struct {
     bool        socks;
     const char *socks_listen;
     uint16_t    socks_mtu;
+    bool        allow_remote;
 } Opts;
 
 /* oidc_util.c */
