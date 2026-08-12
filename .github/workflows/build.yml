@@ -608,8 +608,10 @@ jobs:
         run: |
           # Homebrew's libcrypto is arm64 on this runner; build a
           # static x86_64 OpenSSL from source for the cross link.
-          VER="$(curl -s https://api.github.com/repos/openssl/openssl/releases/latest \
-            | jq -r .tag_name)"
+          # Pin the 3.5 line: the 4.x Configure targets were renamed and
+          # darwin64-x86_64-cc is gone (the rest of CI also builds 3.5).
+          VER="$(curl -s "https://api.github.com/repos/openssl/openssl/tags?per_page=100" \
+            | jq -r '.[].name | select(test("^openssl-3\\.5\\."))' | head -1)"
           [ -n "$VER" ] && [ "$VER" != "null" ]
           echo "building OpenSSL $VER for x86_64"
           curl -sL --retry 3 --max-time 400 \
