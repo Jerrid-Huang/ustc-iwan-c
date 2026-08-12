@@ -59,6 +59,7 @@ static void print_help_short(void)
         "      --socks                        Use a rootless userspace SOCKS5 proxy instead of a TUN device\n"
         "      --socks-listen <SOCKS_LISTEN>  Local SOCKS5 listen address [default: 127.0.0.1:1080]\n"
         "      --socks-mtu <SOCKS_MTU>        Maximum userspace inner IP MTU [default: 1380]\n"
+        "      --allow-remote                 Allow non-loopback SOCKS5 listen addresses\n"
         "  -h, --help                         Print help (see more with '--help')\n"
         "  -V, --version                      Print version\n");
 }
@@ -127,6 +128,9 @@ static void print_help_long(void)
         "          Maximum userspace inner IP MTU\n"
         "          \n"
         "          [default: 1380]\n"
+        "\n"
+        "      --allow-remote\n"
+        "          Allow non-loopback SOCKS5 listen addresses\n"
         "\n"
         "  -h, --help\n"
         "          Print help (see a summary with '-h')\n"
@@ -197,6 +201,7 @@ void oidc_parse_cli(int argc, char **argv, Opts *o, Cli *usage)
         { "socks",        CLI_OPT_BOOL, &o->socks,         NULL,             NULL },
         { "socks-listen", CLI_OPT_STR,  &o->socks_listen,  "<SOCKS_LISTEN>", valid_listen },
         { "socks-mtu",    CLI_OPT_U16,  &o->socks_mtu,     "<SOCKS_MTU>",    NULL },
+        { "allow-remote", CLI_OPT_BOOL, &o->allow_remote,  NULL,             NULL },
     };
 
     cli_ctl ctl = {
