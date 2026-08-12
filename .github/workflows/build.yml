@@ -266,11 +266,12 @@ jobs:
             mkdir -p /tmp/musl-x
             tar xJf /tmp/musl.tgz -C /tmp/musl-x
             chmod -R u+w /tmp/musl-x   # tarball ships read-only dirs
-            # the tarball nests the toolchain one or two levels deep;
-            # locate the dir that holds bin/ and move it into place
-            TOOLDIR="$(dirname "$(find /tmp/musl-x -type d -name bin | head -1)")"
+            # the tarball nests the toolchain one or two levels deep and
+            # may carry multiple bin/ dirs; move the whole top-level
+            # directory so bin + sysroot stay together
+            TOPDIR="$(find /tmp/musl-x -mindepth 1 -maxdepth 1 -type d | head -1)"
             mkdir -p /opt/${{ matrix.triplet }}-cross
-            mv "$TOOLDIR"/* /opt/${{ matrix.triplet }}-cross/
+            mv "$TOPDIR"/* /opt/${{ matrix.triplet }}-cross/
             cd /opt/${{ matrix.triplet }}-cross/bin
             for f in ${{ matrix.ct_triplet }}-*; do
               alias_name="${{ matrix.triplet }}-${f#${{ matrix.ct_triplet }}-}"
