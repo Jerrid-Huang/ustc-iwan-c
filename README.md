@@ -9,17 +9,25 @@ USTC iWAN 校园网 VPN 客户端/服务器，用 C11 从 [yyy1mu/ustc-iwan](htt
 - 自研用户态 TCP/IP 协议栈（零拷贝段槽、64KB 窗口 + WSCALE、立即 ACK、自适应 RTO、快速重传、keepalive、GSO 批发送）
 - 8B 外层头 + XOR 加密内层 IP 包
 - **Windows 客户端**（MinGW-w64）：`ping` / `auth` / `socks` / OIDC 全功能；TUN 模式经 wintun 驱动（需管理员）
+- **macOS 客户端**（原生构建）：`ping` / `auth` / `socks` / OIDC 全功能；TUN 模式经 utun（需 root，自动 `sudo` 提权）
 - **协议已冻结**：线上字节格式与参考实现互操作，完整规范见 [PROTOCOL.md](PROTOCOL.md)
 
 ## 快速开始
 
-### 构建（Linux）
+### 构建（Linux / macOS）
 
-依赖：`cmake`（≥3.16）、C11 编译器、OpenSSL 头文件与 `libcrypto`（Debian/Ubuntu 装 `libssl-dev`）。
+依赖：`cmake`（≥3.16）、C11 编译器、OpenSSL 头文件与 `libcrypto`（Debian/Ubuntu 装 `libssl-dev`；macOS 装 `brew install openssl@3`）。
 
 ```sh
 cmake -B build
 cmake --build build -j      # 产物在 bin/
+```
+
+macOS 需显式指定 Homebrew OpenSSL（keg-only）：
+
+```sh
+cmake -B build -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"
+cmake --build build -j      # iwan-client / iwan-client-oidc（iwan-server 仅 Linux）
 ```
 
 ### Windows 安装（免编译）

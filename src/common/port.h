@@ -115,7 +115,9 @@ typedef unsigned int nfds_t;
 #  include <poll.h>
 #  include <signal.h>
 #  include <strings.h>
-#  include <sys/eventfd.h>
+#  ifdef __linux__
+#    include <sys/eventfd.h>
+#  endif
 #  include <sys/socket.h>
 #  include <sys/time.h>
 #  include <sys/uio.h>
@@ -123,6 +125,26 @@ typedef unsigned int nfds_t;
 #  include <unistd.h>
 
 #  define PORT_POLL_INFTIM (-1)
+
+   /* macOS lacks the mmsghdr type and the sendmmsg/recvmmsg syscalls
+    * (Linux-only). Define the type like the Windows branch and emulate
+    * the batching with a sendmsg/recvmsg loop below. SOL_UDP and
+    * UDP_SEGMENT are Linux socket constants absent from macOS; defining
+    * them to the Linux values lets the GSO probe in socks.c fail with
+    * ENOPROTOOPT and degrade to per-datagram sends, exactly like Linux
+    * without GSO support. */
+#  ifdef __APPLE__
+struct mmsghdr {
+    struct msghdr msg_hdr;
+    unsigned int  msg_len;
+};
+#    ifndef SOL_UDP
+#      define SOL_UDP IPPROTO_UDP
+#    endif
+#    ifndef UDP_SEGMENT
+#      define UDP_SEGMENT 103
+#    endif
+#  endif
 
 #endif
 
@@ -275,11 +297,51 @@ static inline ssize_t port_recvmsg(int fd, struct msghdr *msg, int flags)
 { return recvmsg(fd, msg, flags); }
 static inline int port_sendmmsg(int fd, struct mmsghdr *msgvec,
                                 unsigned vlen, int flags)
-{ return sendmmsg(fd, msgvec, vlen, flags); }
+{
+#  ifdef __APPLE__
+    /* macOS has no sendmmsg: emulate with a loop. Semantics match
+     * Linux: the batch count returned on error reflects messages sent
+     * (partial batches are not errors), mirroring the winsock path. */
+    unsigned sent = 0;
+    for (; sent < vlen; sent++) {
+        ssize_t n = sendmsg(fd, &msgvec[sent].msg_hdr, flags);
+        if (n < 0) {
+            if (sent > 0)
+                return (int)sent;
+            return -1;
+        }
+    }
+    return (int)sent;
+#  else
+    return sendmmsg(fd, msgvec, vlen, flags);
+#  endif
+}
 static inline int port_recvmmsg(int fd, struct mmsghdr *msgvec,
                                 unsigned vlen, int flags,
                                 struct timespec *timeout)
-{ return recvmmsg(fd, msgvec, vlen, flags, timeout); }
+{
+#  ifdef __APPLE__
+    /* recvmmsg emulation: same drained-shape as the winsock path
+     * (0 messages with EAGAIN/EINTR/ECONNRESET is not an error). */
+    (void)timeout;
+    unsigned got = 0;
+    for (; got < vlen; got++) {
+        ssize_t n = recvmsg(fd, &msgvec[got].msg_hdr, flags);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK ||
+                errno == EINTR || errno == ECONNRESET)
+                return (int)got;
+            if (got > 0)
+                return (int)got;
+            return -1;
+        }
+        msgvec[got].msg_len = (unsigned)n;
+    }
+    return (int)got;
+#  else
+    return recvmmsg(fd, msgvec, vlen, flags, timeout);
+#  endif
+}
 static inline ssize_t port_readv(int fd, const struct iovec *iov, int iovcnt)
 { return readv(fd, iov, iovcnt); }
 static inline ssize_t port_writev(int fd, const struct iovec *iov, int iovcnt)
@@ -307,6 +369,10 @@ static inline int port_setsockopt(int fd, int level, int optname,
 { return setsockopt(fd, level, optname, optval, optlen); }
 static inline int port_poll(struct pollfd *fds, nfds_t nfds, int timeout_ms)
 { return poll(fds, nfds, timeout_ms); }
+#  ifdef __APPLE__
+/* macOS: no eventfd; implemented in port.c as a self-connected UDP
+ * socketpair on loopback (poll-able), like the Windows substitute. */
+#  else
 static inline int port_evfd_create(void) { return eventfd(0, EFD_NONBLOCK); }
 static inline int port_evfd_wake(int fd)
 {
@@ -319,6 +385,7 @@ static inline int port_evfd_drain(int fd)
     return read(fd, &v, sizeof v) > 0 ? 0 : -1;
 }
 static inline void port_evfd_close(int fd) { close(fd); }
+#  endif /* __APPLE__ */
 static inline void port_ignore_sigpipe(void)
 {
     signal(SIGPIPE, SIG_IGN);

@@ -16,7 +16,9 @@
 
 #ifndef _WIN32
 #include <net/if.h>
+#ifdef __linux__
 #include <sys/random.h>
+#endif
 #include <sys/wait.h>
 #include <unistd.h>
 #endif

@@ -576,6 +576,93 @@ jobs:
             build-arm64.log
           if-no-files-found: error
 
+  # macOS native client builds (no server: iwan-server is Linux-only).
+  # Both Intel and Apple Silicon runners; OpenSSL comes from Homebrew
+  # (keg-only, so OPENSSL_ROOT_DIR is passed explicitly). Wire smoke is
+  # skipped: no iwan-server binary exists on macOS — the TUN/route
+  # paths (utun + ifconfig/route) need root and are validated on real
+  # Macs by users.
+  macos:
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    concurrency:
+      group: macos-${{ github.ref }}-${{ matrix.arch }}
+      cancel-in-progress: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: macos-14
+          - arch: arm64
+            runner: macos-14-arm64
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+
+      - name: Install dependencies
+        run: |
+          brew install openssl@3
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)" \
+            -DIWAN_WERROR=ON
+
+      - name: Build (${{ matrix.arch }})
+        run: |
+          set -o pipefail
+          cmake --build build -j"$(sysctl -n hw.ncpu)" 2>&1 | tee build-macos-${{ matrix.arch }}.log
+          if grep -Ei 'error:|warning:' build-macos-${{ matrix.arch }}.log; then
+            echo "::error::macOS build emitted errors or warnings"
+            exit 1
+          fi
+
+      - name: Show build failure tail (annotations)
+        if: failure()
+        run: |
+          { echo "=== error-ish lines ==="
+            grep -nE 'error|Error|Killed|killed|signal|No rule|failed|Segmentation|unable|interrupt' build-macos-${{ matrix.arch }}.log | tail -15
+            echo "=== last 6 lines ==="
+            tail -6 build-macos-${{ matrix.arch }}.log
+            echo "=== toolchain ==="
+            clang --version 2>/dev/null | head -1
+            cmake --version | head -1
+            sysctl -n hw.ncpu hw.memsize
+          } | sed 's/^/::error::/'
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: build-log-macos-${{ matrix.arch }}
+          path: build-macos-${{ matrix.arch }}.log
+          if-no-files-found: error
+
+      - name: Verify Mach-O binaries (${{ matrix.arch }})
+        run: |
+          file bin/iwan-client bin/iwan-client-oidc
+          if ! file bin/iwan-client | grep -qiE 'Mach-O.*(${{ matrix.arch }}|arm64|x86_64)'; then
+            echo "::error::bin/iwan-client is not a Mach-O ${{ matrix.arch }} binary"
+            exit 1
+          fi
+
+      - name: Smoke test
+        run: |
+          ./bin/iwan-client --help >/dev/null
+          ./bin/iwan-client-oidc --help >/dev/null
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: iwan-macos-${{ matrix.arch }}
+          path: |
+            bin/iwan-client
+            bin/iwan-client-oidc
+            build-macos-${{ matrix.arch }}.log
+          if-no-files-found: error
+
   # Rootless control-plane benchmark (no TUN/root needed): local
   # iwan-server (--no-tun) + ping RTT / auth handshake latency stats.
   # The results are attached to the release notes (release needs this
@@ -620,7 +707,7 @@ jobs:
   #   git tag v0.1.0 && git push origin v0.1.0
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [linux-cross, win-cross, win-arm64, bench]
+    needs: [linux-cross, win-cross, win-arm64, macos, bench]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -645,6 +732,12 @@ jobs:
         with:
           pattern: iwan-win32-*
           path: win32/
+
+      - name: Download macOS binaries
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          pattern: iwan-macos-*
+          path: macos/
 
       - name: Download benchmark results
         uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
@@ -694,6 +787,15 @@ jobs:
             fi
           done
 
+          # macOS native binaries (macos/iwan-macos-<arch>/bin/*)
+          for d in macos/*/; do
+            artifact="$(basename "$d")"
+            arch="${artifact#iwan-macos-}"
+            mkdir -p "dist/macos/${arch}"
+            cp "$d/bin/iwan-client" "$d/bin/iwan-client-oidc" "dist/macos/${arch}/"
+            (cd "dist/macos/${arch}" && zip -qr "../../iwan-macos-${arch}.zip" .)
+          done
+
           find dist -type f | sort
 
       - name: Stage per-arch bare exes
@@ -721,6 +823,8 @@ jobs:
             dist/iwan-windows-x86_64.zip
             dist/iwan-windows-i686.zip
             dist/iwan-windows-arm64.zip
+            dist/iwan-macos-x86_64.zip
+            dist/iwan-macos-arm64.zip
             dist/linux/iwan-client
             dist/linux/iwan-client-oidc
             dist/linux/iwan-server

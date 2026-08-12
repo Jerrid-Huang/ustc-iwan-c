@@ -4,6 +4,7 @@
 
 #include "protocol.h"
 #include "route.h"
+#include "tun.h"
 #include "util.h"
 
 #ifdef _WIN32
@@ -12,6 +13,17 @@
  * default-route and adapter discovery use the IP Helper API. */
 #  include <iphlpapi.h>
 #  include <windows.h>
+#elif defined(__APPLE__)
+#  include <arpa/inet.h>
+/* macOS backend: ifconfig/route/netstat via port_run_cmd. No iproute2
+ * exists on macOS; utun interface names come from tun_ifname(). */
+static bool mac_run(char *const argv[], const char *what)
+{
+    if (port_run_cmd(argv) == 0)
+        return true;
+    log_err("%s failed (%s)", what, argv[0]);
+    return false;
+}
 #else
 #  include <arpa/inet.h>
 #endif
@@ -62,6 +74,28 @@ bool route_iface_up(const char *tun, const char *tun_ip, uint16_t mtu)
         return false;
     return true;
 }
+#elif defined(__APPLE__)
+bool route_iface_up(const char *tun, const char *tun_ip, uint16_t mtu)
+{
+    /* utun is point-to-point: the destination equals the local
+     * address (client routes use -interface, never a gateway). */
+    const char *ifn = tun_ifname(tun);
+    char mtu_s[8];
+    snprintf(mtu_s, sizeof mtu_s, "%u", (unsigned)mtu);
+    char *a1[] = { "ifconfig", (char *)ifn, (char *)tun_ip, (char *)tun_ip,
+                   "up", NULL };
+    if (!mac_run(a1, "iface up: ifconfig")) {
+        log_err("iface up: ifconfig %s %s %s up failed", ifn, tun_ip,
+                tun_ip);
+        return false;
+    }
+    char *a2[] = { "ifconfig", (char *)ifn, "mtu", mtu_s, NULL };
+    if (!mac_run(a2, "iface up: mtu")) {
+        log_err("iface up: mtu %s on %s failed", mtu_s, ifn);
+        return false;
+    }
+    return true;
+}
 #else
 bool route_iface_up(const char *tun, const char *tun_ip, uint16_t mtu)
 {
@@ -102,6 +136,13 @@ void route_iface_down(const char *tun)
     char *d1[] = { "netsh", "interface", "ipv4", "delete", "address",
                    namea, NULL };
     port_run_cmd(d1);   /* best-effort: no address left, or iface gone */
+}
+#elif defined(__APPLE__)
+void route_iface_down(const char *tun)
+{
+    const char *ifn = tun_ifname(tun);
+    char *d1[] = { "ifconfig", (char *)ifn, "down", NULL };
+    port_run_cmd(d1);   /* best-effort: device may be gone */
 }
 #else
 void route_iface_down(const char *tun)
@@ -249,6 +290,48 @@ bool capture_default(char gw[16], char dev[16], char metric[16])
     free(aa);
     return gw[0] != '\0';
 }
+#elif defined(__APPLE__)
+bool capture_default(char gw[16], char dev[16], char metric[16])
+{
+    char *args[] = { "netstat", "-rn", "-f", "inet", NULL };
+    char *out = port_cmd_capture(args, 8192);
+    if (out == NULL)
+        return false;
+    gw[0] = dev[0] = metric[0] = '\0';   /* metric: "" when absent */
+    bool ok = false;
+    char *lsave = NULL;
+    /* modern netstat -rn prints no metric column (and the old one puts
+     * it in the middle), so metric stays empty: on macOS the physical
+     * default route is never deleted, only shadowed, so nothing needs
+     * restoring with a metric. */
+    for (char *line = strtok_r(out, "\n", &lsave); line != NULL;
+         line = strtok_r(NULL, "\n", &lsave)) {
+        char *save = NULL;
+        char *tok = strtok_r(line, " \t\r", &save);
+        if (tok == NULL || strcmp(tok, "default") != 0)
+            continue;
+        char *gt = strtok_r(NULL, " \t\r", &save);
+        if (gt == NULL)
+            continue;
+        /* the interface is the LAST token; drop a trailing sticky '!'
+         * marker that some rows carry */
+        char *last = NULL;
+        char *t;
+        while ((t = strtok_r(NULL, " \t\r", &save)) != NULL)
+            last = t;
+        if (last == NULL)
+            continue;
+        size_t llen = strlen(last);
+        if (llen > 0 && last[llen - 1] == '!')
+            last[llen - 1] = '\0';
+        copy_token(gw, 16, gt);
+        copy_token(dev, 16, last);
+        ok = true;
+        break;
+    }
+    free(out);
+    return ok;
+}
 #else
 bool capture_default(char gw[16], char dev[16], char metric[16]) {
     char *args[] = { "-4", "route", "show", "default", NULL };
@@ -333,6 +416,55 @@ bool local_subnet(const char *dev, char out[24])
 done:
     free(aa);
     return found;
+}
+#elif defined(__APPLE__)
+bool local_subnet(const char *dev, char out[24])
+{
+    char *args[] = { "ifconfig", (char *)dev, NULL };
+    char *cap = port_cmd_capture(args, 8192);
+    if (cap == NULL)
+        return false;
+    bool ok = false;
+    char *lsave = NULL;
+    for (char *line = strtok_r(cap, "\n", &lsave); line != NULL;
+         line = strtok_r(NULL, "\n", &lsave)) {
+        char *save = NULL;
+        char *tok = strtok_r(line, " \t\r", &save);
+        if (tok == NULL || strcmp(tok, "inet") != 0)
+            continue;
+        char *ip = strtok_r(NULL, " \t\r", &save);
+        if (ip == NULL)
+            continue;
+        uint8_t b[4];
+        if (!s2ip4(ip, b))
+            continue;
+        /* "netmask 0xffffff00" (hex, host order after strtoul) */
+        uint32_t mask = 0;
+        char *t;
+        while ((t = strtok_r(NULL, " \t\r", &save)) != NULL) {
+            if (strcmp(t, "netmask") == 0) {
+                char *mv = strtok_r(NULL, " \t\r", &save);
+                if (mv != NULL)
+                    mask = (uint32_t)strtoul(mv, NULL, 0);
+                break;
+            }
+        }
+        unsigned plen = 0;
+        for (uint32_t m = mask; m; m >>= 1)
+            plen += (unsigned)(m & 1u);   /* popcount of the netmask */
+        /* netmask 0xffffffff -> 32; sanity guard for weird output */
+        if (mask == 0)
+            plen = 24;
+        uint32_t net = ip4_u32(b) & mask;
+        uint8_t nb[4];
+        u32_ip4(net, nb);
+        snprintf(out, 24, "%u.%u.%u.%u/%u", nb[0], nb[1], nb[2], nb[3],
+                 plen);
+        ok = true;
+        break;
+    }
+    free(cap);
+    return ok;
 }
 #else
 bool local_subnet(const char *dev, char out[24]) {
@@ -497,6 +629,71 @@ rollback:
     route_teardown(tun, srv, ogw, odev, metric, routes_with_default);
     return false;
 }
+#elif defined(__APPLE__)
+bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
+                 const char *srv, const char *ogw, const char *odev,
+                 const char *metric, const slist_t *routes_with_default) {
+    (void)metric;
+    const char *ifn = tun_ifname(tun);
+    struct in_addr s4;
+    bool srv_v4 = inet_pton(AF_INET, srv, &s4) == 1;
+    bool srv_lo = srv_v4 && (ntohl(s4.s_addr) >> 24) == 127;
+    char srv32[64];
+    snprintf(srv32, sizeof srv32, "%s/32", srv);
+
+    /* every step mutates system state, so a failure must stop the
+     * sequence and undo what was applied (mirror the Linux sequence) */
+    if (!route_iface_up(tun, tun_ip, mtu)) {
+        route_iface_down(tun);
+        return false;
+    }
+    /* pin the server route via the physical gateway so the session
+     * never loops back through the tunnel */
+    if (srv_v4 && !srv_lo) {
+        char *pin[] = { "route", "-n", "add", "-host", srv32,
+                        (char *)ogw, NULL };
+        if (!mac_run(pin, "route_setup: pin server route")) {
+            route_iface_down(tun);
+            return false;
+        }
+    }
+
+    for (size_t i = 0; i < routes_with_default->n; i++) {
+        const char *c = routes_with_default->v[i];
+        if (strcmp(c, "default") == 0 || strcmp(c, "0.0.0.0/0") == 0) {
+            /* the physical default is never removed: add ours
+             * alongside (macOS convention, cf. OpenVPN/WireGuard).
+             * Delete-then-add keeps setup idempotent. */
+            char *d0[] = { "route", "-n", "delete", "default",
+                           "-interface", (char *)ifn, NULL };
+            port_run_cmd(d0);   /* best-effort */
+            char *r2[] = { "route", "-n", "add", "default",
+                           "-interface", (char *)ifn, NULL };
+            if (!mac_run(r2, "route_setup: default via tun"))
+                goto rollback;
+        } else {
+            uint32_t net;
+            int prefix;
+            if (cidr_parse(c, &net, &prefix) != 0) {
+                log_err("route_setup: invalid route target '%s'", c);
+                goto rollback;
+            }
+            char *d3[] = { "route", "-n", "delete", "-net", (char *)c,
+                           "-interface", (char *)ifn, NULL };
+            port_run_cmd(d3);   /* idempotent setup */
+            char *r3[] = { "route", "-n", "add", "-net", (char *)c,
+                           "-interface", (char *)ifn, NULL };
+            if (!mac_run(r3, "route_setup: add route"))
+                goto rollback;
+        }
+    }
+    return true;
+
+rollback:
+    log_err("route_setup: rolling back applied routes");
+    route_teardown(tun, srv, ogw, odev, metric, routes_with_default);
+    return false;
+}
 #else
 bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
                  const char *srv, const char *ogw, const char *odev,
@@ -629,6 +826,38 @@ void route_teardown(const char *tun, const char *srv, const char *ogw,
         char *d3[] = { "netsh", "interface", "ipv4", "delete", "route",
                        srv32, odev_if, NULL };
         port_run_cmd(d3);
+    }
+    route_iface_down(tun);
+}
+#elif defined(__APPLE__)
+void route_teardown(const char *tun, const char *srv, const char *ogw,
+                    const char *odev, const char *metric,
+                    const slist_t *routes) {
+    (void)ogw;
+    (void)odev;
+    (void)metric;
+    const char *ifn = tun_ifname(tun);
+    for (size_t i = 0; i < routes->n; i++) {
+        const char *c = routes->v[i];
+        if (strcmp(c, "default") == 0 || strcmp(c, "0.0.0.0/0") == 0) {
+            /* only OUR default is removed (interface-scoped); the
+             * physical default was never touched */
+            char *d1[] = { "route", "-n", "delete", "default",
+                           "-interface", (char *)ifn, NULL };
+            port_run_cmd(d1);   /* best-effort */
+        } else {
+            char *d3[] = { "route", "-n", "delete", "-net", (char *)c,
+                           "-interface", (char *)ifn, NULL };
+            port_run_cmd(d3);   /* best-effort */
+        }
+    }
+    char srv32[64];
+    struct in_addr s4;
+    snprintf(srv32, sizeof srv32, "%s/32", srv);
+    if (inet_pton(AF_INET, srv, &s4) == 1 &&
+        (ntohl(s4.s_addr) >> 24) != 127) {
+        char *d4[] = { "route", "-n", "delete", "-host", srv32, NULL };
+        port_run_cmd(d4);   /* best-effort */
     }
     route_iface_down(tun);
 }

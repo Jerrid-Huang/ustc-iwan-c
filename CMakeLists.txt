@@ -52,14 +52,17 @@ set(IWAN_OPENSSL_DIR "" CACHE PATH "OpenSSL sysroot (include/ + lib/ or lib64/)"
 add_compile_options(-Wall -Wextra)
 
 string(TOUPPER "${CMAKE_BUILD_TYPE}" _bt)
-if(UNIX)
-  # -D_GNU_SOURCE and FORTIFY_SOURCE are glibc/musl-isms; FORTIFY_SOURCE
-  # needs optimization (silently dropped at -O0, but gcc warns).
+if(UNIX AND NOT APPLE)
+  # Linux-only: -D_GNU_SOURCE and FORTIFY_SOURCE are glibc/musl-isms;
+  # FORTIFY_SOURCE needs optimization (silently dropped at -O0, but gcc
+  # warns). macOS (clang) gets only the stack protector below.
   add_compile_definitions(_GNU_SOURCE)
   add_compile_options(-fstack-protector-strong)
   if(_bt STREQUAL "RELEASE")
     add_compile_options(-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3)
   endif()
+elseif(APPLE)
+  add_compile_options(-fstack-protector-strong)
 elseif(WIN32)
   # MinGW-w64 (and MSYS2). -D_GNU_SOURCE and -fPIE are ELF-isms and
   # mingw's FORTIFY_SOURCE support is unreliable, so drop all three;
@@ -82,7 +85,7 @@ if(WIN32)
   if(IWAN_STATIC)
     add_link_options(-static-libgcc)
   endif()
-elseif(UNIX)
+elseif(UNIX AND NOT APPLE)
   add_link_options(-Wl,-z,now -Wl,-z,relro -Wl,-z,noexecstack)
   if(IWAN_LINUX_STATIC)
     # -static is incompatible with -pie/-fPIE (and with PIE, glibc's
@@ -92,6 +95,8 @@ elseif(UNIX)
     add_compile_options(-fPIE)
     add_link_options(-pie)
   endif()
+elseif(APPLE)
+  # macOS: PIE is the default for clang builds; no -z flags on ld64.
 endif()
 
 # Binaries land in <repo>/bin like the Makefile produced (tests and CI
@@ -129,6 +134,9 @@ if(WIN32)
   # tun_win.c replaces tun.c (wintun backend; tun.c is Linux TUN ioctls),
   # and server.c is Linux-only (TUN/iptables/BPF, see src/common/server.c).
   list(APPEND IWAN_CORE_SRCS src/common/tun_win.c)
+elseif(APPLE)
+  # macOS client: tun_mac.c (utun backend); no server (Linux-only).
+  list(APPEND IWAN_CORE_SRCS src/common/tun_mac.c)
 else()
   list(APPEND IWAN_CORE_SRCS src/common/server.c src/common/tun.c)
 endif()
@@ -270,7 +278,7 @@ function(iwan_enable_bpf)
   target_sources(iwan_core PRIVATE "${IWAN_STEER_DIR}/steer_bpf_data.c")
 endfunction()
 
-if(UNIX AND IWAN_BPF)
+if(UNIX AND NOT APPLE AND IWAN_BPF)
   iwan_enable_bpf()
 endif()
 if(UNIX AND NOT IWAN_BPF)
@@ -302,7 +310,7 @@ target_link_libraries(iwan-client PRIVATE iwan_core)
 add_executable(iwan-client-oidc src/iwan_client_oidc.c)
 target_link_libraries(iwan-client-oidc PRIVATE iwan_oidc)
 
-if(UNIX)
+if(UNIX AND NOT APPLE)
   add_executable(iwan-server src/iwan_server.c)
   target_include_directories(iwan-server PRIVATE src/common)
   target_link_libraries(iwan-server PRIVATE iwan_core)
@@ -312,7 +320,7 @@ endif()
 # Integration suite: tests/integration.sh needs root (TUN devices) and is
 # Linux-only, so it is not wired into CI — run it via sudo locally.
 # ---------------------------------------------------------------------------
-if(WIN32)
+if(WIN32 OR APPLE)
   add_custom_target(test
     COMMAND "${CMAKE_COMMAND}" -E echo
             "integration tests are Linux-only (TUN devices, root); skipped")

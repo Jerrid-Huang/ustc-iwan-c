@@ -20,6 +20,13 @@
 int  open_tun(const char *name);     /* device owner fd or -1 */
 int  tun_attach(const char *name);   /* extra queue fd or -1 */
 
+/* The interface name to hand to ifconfig/route etc. Linux/Windows:
+ * the requested name IS the interface. macOS: utun devices are named
+ * by the kernel (utunN), so open_tun maps the requested name to the
+ * actual device and this returns that mapping (or the name unchanged
+ * when no mapping exists). */
+const char *tun_ifname(const char *name);
+
 /* Validate a TUN device name before it is handed to open_tun or fed to
  * `ip link del` as root: non-empty, at most IFNAMSIZ-1 chars, lowercase
  * alnum/'-'/'_' with a leading letter, and not a typical physical/system

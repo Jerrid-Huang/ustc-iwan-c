@@ -1,9 +1,13 @@
+#ifdef __linux__
 #include <elf.h>
-#include <errno.h>
-#include <fcntl.h>
 #include <linux/bpf.h>
 #include <linux/if.h>
 #include <linux/if_tun.h>
+#include <sys/ioctl.h>
+#include <sys/syscall.h>
+#endif
+#include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -11,17 +15,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/ioctl.h>
-#include <sys/syscall.h>
 #include <unistd.h>
 
 #include "common.h"
 #include "tun.h"
 #include "util.h"
 
-/* tun_name_valid lives in tun.h (static inline): both the Linux and the
- * Windows backend share the same device-name rule set. */
+/* tun_name_valid lives in tun.h (static inline): all backends share the
+ * same device-name rule set. */
 
+#ifdef __linux__
 int open_tun(const char *name) {
     if (!tun_name_valid(name))
         return -1;
@@ -58,7 +61,21 @@ void tun_detach(int fd) {
     ioctl(fd, TUNSETQUEUE, (void *)(long)IFF_DETACH_QUEUE);
 }
 
-/* ---- tun steering eBPF ----
+/* macOS/other non-Linux backends (tun_mac.c) implement open_tun,
+ * tun_attach, tun_detach and tun_steering_attach themselves. */
+
+/* tun_ifname: the interface name to hand to ifconfig/route.
+ * Linux/Windows: the requested name IS the interface name.
+ * macOS: utun names are kernel-assigned, so the requested name maps
+ * to the actual utunN (see tun_mac.c). */
+const char *tun_ifname(const char *name)
+{
+    return name;
+}
+#endif /* __linux__ */
+
+#ifdef __linux__
+/* ---- tun steering eBPF (Linux only) ----
  * The tun driver's automq flow table degenerates on this kernel: the
  * flow hash collapses to a per-device constant (observed: every flood
  * run pinned every flow onto one queue, the queue varying per run).
@@ -185,6 +202,15 @@ int tun_steering_attach(int tun_fd)
     return -1;
 #endif
 }
+
+#else /* !__linux__ */
+/* Non-Linux backends (tun_mac.c) have no steering program. */
+int tun_steering_attach(int tun_fd)
+{
+    (void)tun_fd;
+    return -1;
+}
+#endif /* __linux__ */
 
 void tun_close(int fd) {
     close(fd);

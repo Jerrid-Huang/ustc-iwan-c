@@ -5,6 +5,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <openssl/crypto.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>   /* _NSGetExecutablePath */
+#endif
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -96,11 +99,24 @@ void oidc_elevate_root(int argc, char **argv)
 #else
     char self[4096];
     const char *exe = argv[0];
+#ifdef __APPLE__
+    /* macOS has no /proc/self/exe; _NSGetExecutablePath gives the
+     * absolute path of the running image (may contain symlinks, which
+     * sudo resolves fine). */
+    {
+        uint32_t sz = (uint32_t)sizeof self - 1;
+        if (_NSGetExecutablePath(self, &sz) == 0) {
+            self[sz] = '\0';
+            exe = self;
+        }
+    }
+#else
     ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
     if (n > 0) {
         self[n] = '\0';
         exe = self;
     }
+#endif
     char **args = malloc(((size_t)argc + 2) * sizeof(char *));
     if (!args)
         oidc_die("out of memory");
