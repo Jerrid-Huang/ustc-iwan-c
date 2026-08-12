@@ -464,9 +464,15 @@ jobs:
         run: |
           TAG="$(curl -s https://api.github.com/repos/mstorsjo/llvm-mingw/releases/latest \
             | jq -r .tag_name)"
-          echo "llvm-mingw $TAG"
+          # asset naming changed across releases (ubuntu-20.04 -> 22.04);
+          # pick whatever ucrt x86_64 tarball the latest release ships
+          ASSET="$(curl -s https://api.github.com/repos/mstorsjo/llvm-mingw/releases/latest \
+            | jq -r '.assets[].name | select(test("ucrt-ubuntu-.*-x86_64\\.tar\\.xz$"))' \
+            | head -1)"
+          echo "llvm-mingw $TAG asset $ASSET"
+          [ -n "$ASSET" ]
           curl -sL --retry 3 --max-time 400 \
-            "https://github.com/mstorsjo/llvm-mingw/releases/download/${TAG}/llvm-mingw-${TAG}-ucrt-ubuntu-20.04-x86_64.tar.xz" \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/${TAG}/${ASSET}" \
             -o /tmp/llvm-mingw.tar.xz
           mkdir -p /opt/llvm-mingw && tar xJf /tmp/llvm-mingw.tar.xz -C /opt/llvm-mingw --strip-components=1
           echo "/opt/llvm-mingw/bin" >> "$GITHUB_PATH"
