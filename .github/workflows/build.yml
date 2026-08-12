@@ -200,30 +200,37 @@ jobs:
         include:
           - arch: x86_64
             triplet: x86_64-linux-musl
+            ct_triplet: x86_64-unknown-linux-musl
             openssl_target: linux-x86_64
             qemu: ""
           - arch: i686
             triplet: i686-linux-musl
+            ct_triplet: i686-unknown-linux-musl
             openssl_target: linux-x86
             qemu: ""
           - arch: aarch64
             triplet: aarch64-linux-musl
+            ct_triplet: aarch64-unknown-linux-musl
             openssl_target: linux-aarch64
             qemu: qemu-aarch64
           - arch: armv7
             triplet: arm-linux-musleabihf
+            ct_triplet: armv7-unknown-linux-musleabihf
             openssl_target: linux-armv4
             qemu: qemu-arm
           - arch: riscv64
             triplet: riscv64-linux-musl
+            ct_triplet: riscv64-unknown-linux-musl
             openssl_target: linux-riscv64
             qemu: qemu-riscv64
           - arch: ppc64le
             triplet: powerpc64le-linux-musl
+            ct_triplet: powerpc64le-unknown-linux-musl
             openssl_target: linux-ppc64le
             qemu: qemu-ppc64le
           - arch: s390x
             triplet: s390x-linux-musl
+            ct_triplet: s390x-ibm-linux-musl
             openssl_target: linux-s390x
             qemu: qemu-s390x
     steps:
@@ -241,9 +248,38 @@ jobs:
 
       - name: Download musl cross toolchain (${{ matrix.arch }})
         run: |
-          curl -sL --retry 2 --max-time 300 \
-            https://musl.cc/${{ matrix.triplet }}-cross.tgz -o /tmp/musl.tgz
-          tar xzf /tmp/musl.tgz -C /opt
+          # musl.cc first; GitHub runners have been observed timing out
+          # against it for extended periods. Fall back to the GitHub-
+          # hosted cross-tools/musl-cross mirror (same toolchain family)
+          # and alias its <arch>-unknown-linux-musl-* prefixes to the
+          # musl.cc-style triplet the build scripts expect.
+          if ! curl -sL --retry 2 --max-time 120 \
+              https://musl.cc/${{ matrix.triplet }}-cross.tgz -o /tmp/musl.tgz; then
+            echo "musl.cc unreachable; falling back to cross-tools mirror"
+            TAG="$(curl -s -H "Authorization: Bearer ${{ github.token }}" \
+              https://api.github.com/repos/cross-tools/musl-cross/releases/latest \
+              | jq -r .tag_name)"
+            [ -n "$TAG" ] && [ "$TAG" != "null" ]
+            curl -sL --retry 3 --max-time 400 \
+              "https://github.com/cross-tools/musl-cross/releases/download/${TAG}/${{ matrix.ct_triplet }}.tar.xz" \
+              -o /tmp/musl.tgz
+            mkdir -p /tmp/musl-x
+            tar xJf /tmp/musl.tgz -C /tmp/musl-x
+            chmod -R u+w /tmp/musl-x   # tarball ships read-only dirs
+            # the tarball nests the toolchain one or two levels deep;
+            # locate the dir that holds bin/ and move it into place
+            TOOLDIR="$(dirname "$(find /tmp/musl-x -type d -name bin | head -1)")"
+            mkdir -p /opt/${{ matrix.triplet }}-cross
+            mv "$TOOLDIR"/* /opt/${{ matrix.triplet }}-cross/
+            cd /opt/${{ matrix.triplet }}-cross/bin
+            for f in ${{ matrix.ct_triplet }}-*; do
+              alias_name="${{ matrix.triplet }}-${f#${{ matrix.ct_triplet }}-}"
+              [ -e "$alias_name" ] || ln -s "$f" "$alias_name"
+            done
+          else
+            tar xzf /tmp/musl.tgz -C /opt
+          fi
+          ls /opt/${{ matrix.triplet }}-cross/bin | head -3
 
       - name: Build static OpenSSL (${{ matrix.arch }})
         run: |
