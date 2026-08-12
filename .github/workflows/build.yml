@@ -696,6 +696,16 @@ jobs:
 
           find dist -type f | sort
 
+      - name: Stage per-arch bare exes
+        run: |
+          # bare exes from every windows arch would collide on the same
+          # asset name in the release upload; give each arch a suffix
+          for d in dist/windows/*/; do
+            arch="$(basename "$d")"
+            cp "$d/iwan-client.exe" "dist/iwan-client-${arch}.exe"
+            cp "$d/iwan-client-oidc.exe" "dist/iwan-client-oidc-${arch}.exe"
+          done
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.2.1
         with:
@@ -717,8 +727,12 @@ jobs:
             dist/linux/iwan-client-*-musl
             dist/linux/iwan-client-oidc-*-musl
             dist/linux/iwan-server-*-musl
-            dist/windows/*/iwan-client.exe
-            dist/windows/*/iwan-client-oidc.exe
+            dist/iwan-client-x86_64.exe
+            dist/iwan-client-i686.exe
+            dist/iwan-client-arm64.exe
+            dist/iwan-client-oidc-x86_64.exe
+            dist/iwan-client-oidc-i686.exe
+            dist/iwan-client-oidc-arm64.exe
           generate_release_notes: true
           # append the CI control-plane benchmark table to the auto notes
           append_body: true
