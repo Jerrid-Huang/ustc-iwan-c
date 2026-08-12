@@ -55,7 +55,10 @@ static void sbuf_app(struct sbuf *s, const void *p, size_t n)
             oom_abort();
         s->cap = nc;
     }
-    memcpy(s->d + s->len, p, n);
+    /* memmove, not memcpy: gcc >= 16 -Wrestrict cannot prove the caller
+     * buffer does not alias the sbuf and errors on the (in practice
+     * impossible) huge-length path */
+    memmove(s->d + s->len, p, n);
     s->len += n;
     s->d[s->len] = '\0';
 }
