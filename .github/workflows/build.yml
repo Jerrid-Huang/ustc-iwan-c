@@ -725,7 +725,6 @@ jobs:
             dist/linux/iwan-client-oidc
             dist/linux/iwan-server
             dist/linux/iwan-client-*-musl
-            dist/linux/iwan-client-oidc-*-musl
             dist/linux/iwan-server-*-musl
             dist/iwan-client-x86_64.exe
             dist/iwan-client-i686.exe
