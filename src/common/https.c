@@ -36,6 +36,14 @@ struct sbuf {
     size_t cap;
 };
 
+/* memmove, not memcpy: gcc >= 16 -Wrestrict cannot prove the caller
+ * buffer does not alias the sbuf and errors on the (in practice
+ * impossible) huge-length path. noinline: gcc 16's IPA then cannot
+ * fold caller arguments into a -Wstringop-overflow false positive
+ * either (observed on riscv64/i686 musl cross builds). */
+#if defined(__GNUC__) && __GNUC__ >= 12
+__attribute__((noinline))
+#endif
 static void sbuf_app(struct sbuf *s, const void *p, size_t n)
 {
     if (n > SIZE_MAX - s->len - 1)
