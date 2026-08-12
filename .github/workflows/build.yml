@@ -221,7 +221,7 @@ jobs:
           - arch: riscv64
             triplet: riscv64-linux-musl
             ct_triplet: riscv64-unknown-linux-musl
-            openssl_target: linux-riscv64
+            openssl_target: linux64-riscv64
             qemu: qemu-riscv64
           - arch: ppc64le
             triplet: powerpc64le-linux-musl
@@ -231,7 +231,7 @@ jobs:
           - arch: s390x
             triplet: s390x-linux-musl
             ct_triplet: s390x-ibm-linux-musl
-            openssl_target: linux-s390x
+            openssl_target: linux64-s390x
             qemu: qemu-s390x
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
