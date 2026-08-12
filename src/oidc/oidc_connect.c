@@ -22,6 +22,25 @@
 #include "tun.h"
 #include "util.h"
 
+/* F8: cross-check the server-issued gateway against the server actually
+ * connected to (same check as iwan_client's proxy/socks paths; the OIDC
+ * entry missed it). A mismatch is legal in NAT setups, so this is a
+ * warning only — but an unexpected mismatch may indicate a forged
+ * OPEN_ACK. Skipped when either side is not an IPv4 literal. */
+static void check_gw_server(const char *server, const char *gw)
+{
+    uint8_t sb[4], gb[4];
+
+    if (!s2ip4(server, sb) || !s2ip4(gw, gb))
+        return;
+    if (memcmp(sb, gb, sizeof sb) != 0) {
+        log_err("WARNING: server-issued gateway %s differs from the "
+                "connected server %s (NAT setups are normal; an "
+                "unexpected mismatch may indicate a forged OPEN_ACK)",
+                gw, server);
+    }
+}
+
 static int run_socks_mode(const Opts *o, int fd, const uint8_t sk[16],
                           const AuthResult *res)
 {
@@ -228,6 +247,7 @@ void oidc_connect_server(const Opts *o, const Config *cf)
         }
         oidc_eprintf("  OK  tun=%s gw=%s dns=%s mtu=%u\n", res.tun, res.gw,
                      res.dns, (unsigned)res.mtu);
+        check_gw_server(host, res.gw);   /* F8 */
 
         uint8_t sk[16];
         session_key(user, password, sk);
