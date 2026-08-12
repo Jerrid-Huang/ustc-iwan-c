@@ -7,6 +7,7 @@
 #include <openssl/crypto.h>
 #ifdef __APPLE__
 #include <mach-o/dyld.h>   /* _NSGetExecutablePath */
+extern char **environ;     /* macOS unistd.h does not declare it */
 #endif
 
 #ifndef _WIN32
