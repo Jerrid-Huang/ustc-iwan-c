@@ -135,8 +135,10 @@ if(WIN32)
   # and server.c is Linux-only (TUN/iptables/BPF, see src/common/server.c).
   list(APPEND IWAN_CORE_SRCS src/common/tun_win.c)
 elseif(APPLE)
-  # macOS client: tun_mac.c (utun backend); no server (Linux-only).
-  list(APPEND IWAN_CORE_SRCS src/common/tun_mac.c)
+  # macOS client: tun.c holds the generic code (reader pool, write
+  # retry, close; its Linux-only ioctl/BPF parts are #ifdef __linux__),
+  # tun_mac.c provides the utun open/attach/detach + name mapping.
+  list(APPEND IWAN_CORE_SRCS src/common/tun.c src/common/tun_mac.c)
 else()
   list(APPEND IWAN_CORE_SRCS src/common/server.c src/common/tun.c)
 endif()

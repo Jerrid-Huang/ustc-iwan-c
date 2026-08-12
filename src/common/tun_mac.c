@@ -61,6 +61,9 @@ void tun_detach(int fd)
     (void)fd;   /* nothing to detach */
 }
 
+/* tun_steering_attach comes from tun.c's non-Linux stub (no steering
+ * program on macOS). */
+
 const char *tun_ifname(const char *name)
 {
     if (g_requested[0] != '\0' && strcmp(name, g_requested) == 0)
