@@ -53,9 +53,13 @@ Flow *g_flows;            /* fixed MAX_FLOWS array, never NULL-terminated */
  * the socket is gone) */
 #define SOCKS_KA_FAIL_MAX 3
 /* no downlink for this long => session lost (server purged/rebooted) */
-/* same override as the TUN pump: IWAN_RX_STALE_MS (default 60s,
- * range 10s..24h) — some servers never answer ECHO_REQ keepalives */
-#define SOCKS_RX_STALE_MS_DEFAULT 60000u
+/* same override as the TUN pump: IWAN_RX_STALE_MS (default 120s,
+ * range 10s..24h) — some servers never answer ECHO_REQ keepalives.
+ * 120s (was 60s): the USTC servers answer every ECHO_REQ, so silence
+ * is usually return-path UDP loss on the mobile line, not a dead
+ * session; 120s = 12 consecutive unanswered keepalives (the Rust
+ * reference client has no such check and never spuriously reconnects). */
+#define SOCKS_RX_STALE_MS_DEFAULT 120000u
 
 static unsigned socks_rx_stale_ms(void)
 {
@@ -122,13 +126,14 @@ void accept_connections(int listener) {
             return;
         }
         /* Serve only loopback peers by default: an unauthenticated
-         * remote peer would turn the host into an open proxy. The only
-         * exception is an explicit --allow-remote bind WITH RFC 1929
-         * credentials configured — remote use then requires the token
-         * password. The non-loopback bind warning stays as a config-time
-         * hint; this check is the enforcement. */
+         * remote peer would turn the host into an open proxy. Remote
+         * peers are served only with an explicit --allow-remote bind
+         * AND either RFC1929 credentials (--socks-token, required) or
+         * the explicit open-proxy opt-out (--socks-no-token). The
+         * non-loopback bind warning stays as a config-time hint; this
+         * check is the enforcement. */
         if (!(g_socks_cfg && g_socks_cfg->allow_remote &&
-              g_socks_cfg->auth_token)) {
+              (g_socks_cfg->auth_token || g_socks_cfg->open_proxy))) {
             /* accept() already returned the peer address: an extra
              * getpeername() syscall here was pure overhead */
             if ((peer.sin_addr.s_addr & htonl(0xFF000000u)) !=
@@ -139,6 +144,13 @@ void accept_connections(int listener) {
                 port_close(cfd);
                 continue;
             }
+        }
+        if (auth_fail_blocked(peer.sin_addr.s_addr)) {
+            char cip[INET_ADDRSTRLEN] = "";
+            inet_ntop(AF_INET, &peer.sin_addr, cip, sizeof cip);
+            log_debug("SOCKS5: dropping %s (auth failure lockout)", cip);
+            port_close(cfd);
+            continue;
         }
         int nodelay = 1;
         port_setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &nodelay,
@@ -596,6 +608,10 @@ int run_socks(int sockfd, SocksConfig *cfg) {
                 log_err("WARNING: SOCKS5 proxy bound to a non-loopback "
                         "address; remote clients are served only with the "
                         "--socks-token password");
+            else if (cfg->open_proxy)
+                log_err("WARNING: OPEN SOCKS5 proxy bound to a non-loopback "
+                        "address with no password (--socks-no-token); any "
+                        "reachable client can use it");
             else
                 log_err("WARNING: SOCKS5 proxy bound to a non-loopback "
                         "address but remote peers will still be rejected "

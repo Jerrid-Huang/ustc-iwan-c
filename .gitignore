@@ -20,3 +20,7 @@ users.txt
 servers.json
 SHASUMS.txt
 build-win*/
+
+# Python
+__pycache__/
+*.pyc

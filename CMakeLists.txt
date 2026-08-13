@@ -312,6 +312,11 @@ target_link_libraries(iwan-client PRIVATE iwan_core)
 add_executable(iwan-client-oidc src/iwan_client_oidc.c)
 target_link_libraries(iwan-client-oidc PRIVATE iwan_oidc)
 
+# SOCKS5 handshake test harness (root-free: drives the real accept/handshake/
+# netstack code with a loopback listener; see tests/socks_handshake.py).
+add_executable(socks_handshake_harness tests/socks_handshake_harness.c)
+target_link_libraries(socks_handshake_harness PRIVATE iwan_core)
+
 if(UNIX AND NOT APPLE)
   add_executable(iwan-server src/iwan_server.c)
   target_include_directories(iwan-server PRIVATE src/common)

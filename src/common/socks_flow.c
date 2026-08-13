@@ -68,6 +68,133 @@ static void flowdbg(const Flow *f, const char *why)
 uint64_t g_next_id = 1;
 int g_flow_len;         /* active count */
 
+/* ---- brute-force auth lockout ----
+ * Tracks wrong-password RFC1929 failures per source IPv4 so a brute-
+ * forcing client cannot hammer the token check. Only WELL-FORMED
+ * RFC1929 frames that fail the password check count: broken clients
+ * (ulen=0/plen=0/bad version) and greeting-method probes are protocol
+ * violations, not auth attempts, so they can neither lock a source out
+ * nor be used to DoS it (a probe flood must not be able to trip the
+ * lockout of the real user). After auth_fail_max() counted failures
+ * within auth_fail_window_ms() the source is blocked until now+window;
+ * blocked connections are dropped silently at accept() time (no bytes
+ * written). A successful auth clears the source's counter. The table
+ * is a fixed-size linear scan (AUTH_FAIL_TRACK_MAX entries) with
+ * oldest-first eviction when full, and everything runs on the single-
+ * threaded event loop, so no locking is needed. The env overrides
+ * (IWAN_AUTH_FAIL_MAX / IWAN_AUTH_FAIL_WINDOW_MS) let tests shrink the
+ * threshold and window without recompiling. */
+#define AUTH_FAIL_MAX_DEFAULT 5
+#define AUTH_FAIL_WINDOW_MS_DEFAULT 60000u
+#define AUTH_FAIL_TRACK_MAX 16
+typedef struct {
+    uint32_t ip;               /* peer IPv4, network byte order */
+    int      fail;
+    uint64_t first_fail_ms;
+    uint64_t blocked_until_ms; /* 0 = not blocked */
+} AuthFailRec;
+static AuthFailRec g_auth_fail[AUTH_FAIL_TRACK_MAX];
+
+static unsigned auth_fail_max(void)
+{
+    const char *v = getenv("IWAN_AUTH_FAIL_MAX");
+    char *end;
+    unsigned long n;
+    static int cached = -1;
+
+    if (cached >= 0)
+        return (unsigned)cached;
+    if (!v || !v[0]) {
+        cached = (int)AUTH_FAIL_MAX_DEFAULT;
+        return AUTH_FAIL_MAX_DEFAULT;
+    }
+    n = strtoul(v, &end, 10);
+    if (end == v || *end != '\0' || n < 1 || n > 100) {
+        log_err("IWAN_AUTH_FAIL_MAX: invalid value '%s' (1..100); "
+                "using default", v);
+        cached = (int)AUTH_FAIL_MAX_DEFAULT;
+        return AUTH_FAIL_MAX_DEFAULT;
+    }
+    cached = (int)n;
+    return (unsigned)n;
+}
+
+static unsigned auth_fail_window_ms(void)
+{
+    const char *v = getenv("IWAN_AUTH_FAIL_WINDOW_MS");
+    char *end;
+    unsigned long n;
+    static int cached = -1;
+
+    if (cached >= 0)
+        return (unsigned)cached;
+    if (!v || !v[0]) {
+        cached = (int)AUTH_FAIL_WINDOW_MS_DEFAULT;
+        return AUTH_FAIL_WINDOW_MS_DEFAULT;
+    }
+    n = strtoul(v, &end, 10);
+    if (end == v || *end != '\0' || n < 100 || n > 86400000) {
+        log_err("IWAN_AUTH_FAIL_WINDOW_MS: invalid value '%s' "
+                "(100..86400000); using default", v);
+        cached = (int)AUTH_FAIL_WINDOW_MS_DEFAULT;
+        return AUTH_FAIL_WINDOW_MS_DEFAULT;
+    }
+    cached = (int)n;
+    return (unsigned)n;
+}
+
+void auth_fail_note(uint32_t ip, bool success)
+{
+    uint64_t now = now_ms();
+    AuthFailRec *e = NULL;
+    AuthFailRec *oldest = &g_auth_fail[0];
+
+    if (success) {
+        for (int i = 0; i < AUTH_FAIL_TRACK_MAX; i++) {
+            if (g_auth_fail[i].ip == ip) {
+                memset(&g_auth_fail[i], 0, sizeof g_auth_fail[i]);
+                return;
+            }
+        }
+        return;
+    }
+    for (int i = 0; i < AUTH_FAIL_TRACK_MAX; i++) {
+        AuthFailRec *r = &g_auth_fail[i];
+        if (r->ip == ip) {
+            e = r;
+            break;
+        }
+        /* empty slot wins; otherwise keep the oldest first_fail_ms
+         * (the entry that would age out first) */
+        if (r->ip == 0 || r->first_fail_ms < oldest->first_fail_ms)
+            oldest = r;
+    }
+    if (!e)
+        e = oldest;
+    /* fresh entry, or the previous burst aged out of the window */
+    if (e->first_fail_ms == 0 ||
+        now - e->first_fail_ms > auth_fail_window_ms()) {
+        e->ip = ip;
+        e->fail = 1;
+        e->first_fail_ms = now;
+        e->blocked_until_ms = 0;
+        return;
+    }
+    e->ip = ip;
+    e->fail++;
+    if (e->fail >= (int)auth_fail_max())
+        e->blocked_until_ms = now + auth_fail_window_ms();
+}
+
+bool auth_fail_blocked(uint32_t ip)
+{
+    for (int i = 0; i < AUTH_FAIL_TRACK_MAX; i++) {
+        if (g_auth_fail[i].ip == ip && g_auth_fail[i].blocked_until_ms != 0)
+            return g_auth_fail[i].blocked_until_ms > now_ms();
+    }
+    return false;
+}
+
 /* ---- DNS result queue ---- */
 static pthread_mutex_t g_dns_mu = PTHREAD_MUTEX_INITIALIZER;
 static DnsResult g_dns_q[DNS_RESULT_Q_LEN];
@@ -825,6 +952,8 @@ Flow *flow_alloc(struct sockaddr_in *peer) {
     f->ns_idx = -1;
     f->state = ST_GREETING;
     f->state_ms = now_ms();
+    f->peer_ip = peer->sin_addr.s_addr;   /* network byte order */
+    f->peer_port = ntohs(peer->sin_port); /* host order */
     if (debug_enabled()) {
         char peer_s[INET_ADDRSTRLEN] = "";
         inet_ntop(AF_INET, &peer->sin_addr, peer_s, sizeof peer_s);
@@ -904,6 +1033,22 @@ static void auth_reject(Flow *f)
 static void greet_reject(Flow *f)
 {
     uint8_t r[2] = {5, 0xff};
+    char ipbuf[INET_ADDRSTRLEN] = "";
+    if (g_socks_cfg && g_socks_cfg->auth_token) {
+        /* auth is required: a client offering no acceptable method is
+         * worth an error log (likely a misconfigured client or an
+         * unauthenticated probe against a token-protected proxy) */
+        inet_ntop(AF_INET, &(struct in_addr){ .s_addr = f->peer_ip },
+                  ipbuf, sizeof ipbuf);
+        log_err("[flow %lu] SOCKS5 client %s:%u offered no acceptable "
+                "method while auth is required",
+                (unsigned long)f->id, ipbuf, f->peer_port);
+    } else if (debug_enabled()) {
+        inet_ntop(AF_INET, &(struct in_addr){ .s_addr = f->peer_ip },
+                  ipbuf, sizeof ipbuf);
+        log_debug("[flow %lu] SOCKS5 client %s:%u offered no acceptable "
+                  "method", (unsigned long)f->id, ipbuf, f->peer_port);
+    }
     queue_flow_output(f, r, 2);
     set_flow_state(f, ST_CLOSING);
 }
@@ -1153,8 +1298,13 @@ static bool handshake_greeting(Flow *f)
      * rejected. */
     if (f->input.len < 2)
         return false;              /* ulen not delivered yet: wait */
+    char ipbuf[INET_ADDRSTRLEN] = "";
     size_t ulen = f->input.data[1];
     if (ulen == 0) {
+        inet_ntop(AF_INET, &(struct in_addr){ .s_addr = f->peer_ip },
+                  ipbuf, sizeof ipbuf);
+        log_debug("[flow %lu] RFC1929 auth frame malformed (ulen=0) "
+                  "from %s:%u", (unsigned long)f->id, ipbuf, f->peer_port);
         auth_reject(f);            /* complete header, invalid length */
         return false;
     }
@@ -1162,12 +1312,20 @@ static bool handshake_greeting(Flow *f)
         return false;              /* plen byte not delivered yet: wait */
     size_t plen = f->input.data[2 + ulen];
     if (plen == 0) {
+        inet_ntop(AF_INET, &(struct in_addr){ .s_addr = f->peer_ip },
+                  ipbuf, sizeof ipbuf);
+        log_debug("[flow %lu] RFC1929 auth frame malformed (plen=0) "
+                  "from %s:%u", (unsigned long)f->id, ipbuf, f->peer_port);
         auth_reject(f);            /* complete frame, invalid length */
         return false;
     }
     if (f->input.len < 2 + ulen + 1 + plen)
         return false;              /* password not fully delivered: wait */
     if (f->input.data[0] != 1) {
+        inet_ntop(AF_INET, &(struct in_addr){ .s_addr = f->peer_ip },
+                  ipbuf, sizeof ipbuf);
+        log_debug("[flow %lu] RFC1929 auth frame malformed (bad version) "
+                  "from %s:%u", (unsigned long)f->id, ipbuf, f->peer_port);
         auth_reject(f);
         return false;
     }
@@ -1179,9 +1337,17 @@ static bool handshake_greeting(Flow *f)
     buf_consume(&f->input, 2 + ulen + 1 + plen);
     f->auth_pending = false;
     if (!ok) {
+        /* well-formed frame, wrong password: counts toward the source's
+         * brute-force lockout */
+        auth_fail_note(f->peer_ip, false);
+        inet_ntop(AF_INET, &(struct in_addr){ .s_addr = f->peer_ip },
+                  ipbuf, sizeof ipbuf);
+        log_err("[flow %lu] SOCKS5 RFC1929 auth failed (wrong password) "
+                "from %s:%u", (unsigned long)f->id, ipbuf, f->peer_port);
         auth_reject(f);
         return false;
     }
+    auth_fail_note(f->peer_ip, true);   /* success clears the source */
     uint8_t okr[2] = {1, 0};
     queue_flow_output(f, okr, 2);
     set_flow_state(f, ST_REQUEST);
@@ -1195,7 +1361,21 @@ static void handshake_request(Flow *f)
 {
     if (f->input.len < 4)
         return;
-    if (f->input.data[0] != 5 || f->input.data[1] != 1) {
+    /* RFC 1928: the request header is [VER, CMD, RSV, ATYP]; VER must
+     * be 5 (any other version is a general failure, rep=1) */
+    if (f->input.data[0] != 5) {
+        queue_socks_error(f, 1);
+        return;
+    }
+    /* RFC 1928: only CONNECT(1) is implemented; other commands (BIND=2,
+     * UDP ASSOCIATE=3) are rejected with rep=7 (command not supported) */
+    if (f->input.data[1] != 1) {
+        queue_socks_error(f, 7);
+        return;
+    }
+    /* RFC 1928: RSV must be zero; a nonzero reserved byte is a malformed
+     * frame and gets the same rep=7 as an unsupported command */
+    if (f->input.data[2] != 0) {
         queue_socks_error(f, 7);
         return;
     }
@@ -1218,7 +1398,16 @@ static void handshake_request(Flow *f)
             return;
         size_t dlen = f->input.data[4];
         size_t req_len = 5 + dlen + 2;
-        if (dlen == 0 || f->input.len < req_len)
+        if (dlen == 0) {
+            /* RFC 1928: a zero-length domain is an address-type error
+             * (rep=8). The frame is 5 + 0 + 2 = 7 bytes; wait until the
+             * full frame has arrived so the reply is not raced. */
+            if (f->input.len < req_len)
+                return;
+            queue_socks_error(f, 8);
+            return;
+        }
+        if (f->input.len < req_len)
             return;
         char domain[256];
         size_t n = dlen;
@@ -1307,15 +1496,24 @@ void update_tcp_states(void) {
         if (!f->active)
             continue;
         /* handshake states (greeting/request/DNS-resolve) time out exactly
-         * like ST_CONNECTING: same window, same cleanup path (error reply
-         * queued, ST_CLOSING, reaped once the output drains) */
+         * like ST_CONNECTING: same window, same cleanup path. The failure
+         * is the client's own silence, so a SOCKS5 client gets NO reply
+         * (rep=4 would claim a connect error, and the proxy never wrote
+         * a greeting it could pair the failure with): just close. HTTP-
+         * mode flows get an HTTP 502, because an HTTP client expects a
+         * status line for every request. */
         if (f->state == ST_GREETING || f->state == ST_REQUEST ||
             f->state == ST_RESOLVING) {
             if (now_ms() - f->state_ms >= HANDSHAKE_TIMEOUT_MS) {
-                if (debug_enabled())
-                    log_debug("[flow %lu] handshake timed out",
-                              (unsigned long)f->id);
-                queue_socks_error(f, 4);
+                if (f->http_mode) {
+                    /* HTTP clients expect a status for every request */
+                    queue_socks_error(f, 5);
+                } else {
+                    if (debug_enabled())
+                        log_debug("[flow %lu] handshake timed out (no reply)",
+                                  (unsigned long)f->id);
+                    set_flow_state(f, ST_CLOSING);
+                }
             }
             continue;
         }
@@ -1337,9 +1535,15 @@ void update_tcp_states(void) {
             if (debug_enabled())
                 log_debug("[flow %lu] TCP established", (unsigned long)f->id);
         } else if (st == NS_CLOSED) {
+            uint8_t why = c ? c->term_reason : NS_TERM_NONE;
             if (debug_enabled())
-                log_debug("[flow %lu] TCP connect failed", (unsigned long)f->id);
-            queue_socks_error(f, 5);
+                log_debug("[flow %lu] TCP connect closed (term=%u)",
+                          (unsigned long)f->id, why);
+            /* NS_TERM_TIMEOUT -> rep 4 (host unreachable); RST/other ->
+             * rep 5 (connection refused). Same-iteration slot reuse can
+             * reset the reason before this read; worst case the flow
+             * reports rep=5. */
+            queue_socks_error(f, why == NS_TERM_TIMEOUT ? 4 : 5);
         } else if (now_ms() - f->state_ms >= HANDSHAKE_TIMEOUT_MS) {
             if (debug_enabled())
                 log_debug("[flow %lu] TCP connect timed out",

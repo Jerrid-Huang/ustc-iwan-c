@@ -170,9 +170,15 @@ static void b_reset(buf_t *b) {
 static void conn_clear(Netstack *ns, int idx) {
     TcpConn *c = &ns->conns[idx];
     NsPriv *p = &ns->priv[idx];
+    uint8_t term = c->term_reason;
     b_reset(&c->rxq);
     memset(c, 0, sizeof *c);
     memset(p, 0, sizeof *p);
+    /* term_reason must survive the memset: the SOCKS layer reads it in
+     * update_tcp_states after the slot was cleared (possibly by the
+     * same event-loop iteration) to map the failure to a reply code.
+     * ns_connect resets it to NS_TERM_NONE for the new connection. */
+    c->term_reason = term;
 }
 
 /* Enqueue one TX item. Returns 1 when queued, 0 when the device queue is
@@ -521,6 +527,7 @@ static void handle_rx_syn_sent(Netstack *ns, TcpConn *c, int idx,
          * handshake */
         if (ack != c->snd_nxt)
             return;
+        c->term_reason = NS_TERM_RST;   /* accepted RST: refused */
         conn_clear(ns, idx);
         return;
     }
@@ -681,6 +688,7 @@ static void handle_rx(Netstack *ns, TcpConn *c, int idx, const uint8_t *t,
         if ((int32_t)(seq - c->rcv_nxt) < 0 ||
             (int32_t)(seq - c->rcv_nxt) > (int32_t)NS_WINDOW)
             return;
+        c->term_reason = NS_TERM_RST;   /* accepted RST: refused */
         conn_clear(ns, idx);
         return;
     }
@@ -722,6 +730,24 @@ void ns_init(Netstack *ns, uint32_t inner_ip, uint32_t gw, uint16_t mtu) {
     ns->gw = gw;
     ns->mtu = mtu;
     ns->last_conn = -1;   /* rx lookup cache starts empty (memset gave 0) */
+    /* connect timeout: IWAN_NS_CONNECT_TIMEOUT_MS override for tests
+     * (1s..300s), default NS_CONNECT_TIMEOUT; invalid values keep the
+     * default so a bad env cannot silently shorten/lengthen the SYN
+     * path */
+    ns->connect_timeout_ms = NS_CONNECT_TIMEOUT;
+    {
+        const char *v = getenv("IWAN_NS_CONNECT_TIMEOUT_MS");
+        char *end;
+        unsigned long n;
+        if (v && v[0]) {
+            n = strtoul(v, &end, 10);
+            if (end != v && *end == '\0' && n >= 1000 && n <= 300000)
+                ns->connect_timeout_ms = (uint32_t)n;
+            else
+                log_err("IWAN_NS_CONNECT_TIMEOUT_MS: invalid value '%s' "
+                        "(1000..300000); using default", v);
+        }
+    }
 }
 
 int ns_connect(Netstack *ns, uint16_t lport, uint32_t rip, uint16_t rport) {
@@ -742,6 +768,7 @@ int ns_connect(Netstack *ns, uint16_t lport, uint32_t rip, uint16_t rport) {
 
     c = &ns->conns[idx];
     conn_clear(ns, idx);
+    c->term_reason = NS_TERM_NONE;   /* fresh connection: no stale reason */
     /* full 32-bit random ISN per connection: the old 10-bit jitter on a
      * fixed base let an observer predict sequence numbers and forge RST */
     isn = rand_u32();
@@ -952,6 +979,9 @@ void ns_abort(Netstack *ns, int idx) {
     if (idx < 0 || idx >= NS_MAX_CONN)
         return;
     c = &ns->conns[idx];
+    /* term_reason is deliberately NOT touched here: local aborts keep
+     * whatever reason the caller set (or NS_TERM_NONE); conn_clear
+     * preserves the field for the SOCKS layer. */
     if (c->state == NS_CLOSED) {
         conn_clear(ns, idx);
         return;
@@ -1108,13 +1138,14 @@ void ns_rx_packet(Netstack *ns, const uint8_t *pkt, size_t n) {
 static int64_t conn_syn_retransmit(Netstack *ns, TcpConn *c, int idx,
                                    uint64_t now) {
     uint64_t deadline = c->syn_retx_ms + NS_SYN_RETX_MS;
-    int64_t conn_d = (int64_t)(c->state_ms + NS_CONNECT_TIMEOUT - now);
+    int64_t conn_d = (int64_t)(c->state_ms + ns->connect_timeout_ms - now);
 
     if (now < deadline)
         return conn_d < (int64_t)(deadline - now) ? conn_d
                                                   : (int64_t)(deadline - now);
     c->syn_retx_cnt++;
     if (c->syn_retx_cnt > NS_MAX_SYN_TRIES) {
+        c->term_reason = NS_TERM_TIMEOUT;   /* connect never completed */
         ns_abort(ns, idx);
         return -1;
     }
@@ -1167,6 +1198,7 @@ static bool conn_retransmit_loop(Netstack *ns, TcpConn *c, NsPriv *p, int idx,
                     c->remote_win,
                     (unsigned)(c->sent_nxt - c->snd_una));
         if (s->cnt > NS_MAX_DATA_RETX) {
+            c->term_reason = NS_TERM_TIMEOUT;   /* retransmit budget */
             ns_abort(ns, idx);
             return true;
         }
@@ -1302,6 +1334,7 @@ static int64_t conn_tick(Netstack *ns, int i, uint64_t now)
          * is a bare ACK with seq = snd_nxt - 1, which any peer answers
          * with an ACK for snd_nxt */
         if (c->state != NS_ESTABLISHED) {
+            c->term_reason = NS_TERM_TIMEOUT;   /* idle, never established */
             ns_abort(ns, i);
             return 0;
         }
@@ -1309,12 +1342,15 @@ static int64_t conn_tick(Netstack *ns, int i, uint64_t now)
             emit_tcp(ns, c, TCP_ACK, c->snd_nxt - 1u, c->rcv_nxt, 0);
             c->keepalive_ms = now + NS_KEEPALIVE_MS;
             if (++c->keepalive_cnt > NS_KEEPALIVE_MAX) {
+                c->term_reason = NS_TERM_TIMEOUT;   /* probes unanswered */
                 ns_abort(ns, i);
                 return 0;
             }
         }
     }
-    if (c->state == NS_SYN_SENT && now > c->state_ms + NS_CONNECT_TIMEOUT) {
+    if (c->state == NS_SYN_SENT &&
+        now > c->state_ms + ns->connect_timeout_ms) {
+        c->term_reason = NS_TERM_TIMEOUT;   /* SYN connect timeout */
         ns_abort(ns, i);
         return 0;
     }

@@ -76,11 +76,15 @@ static int run_socks_mode(const Opts *o, int fd, const uint8_t sk[16],
     cfg.token = res->tok;
     cfg.encryption = o->encrypt;
     cfg.auth_token = o->socks_token;
+    cfg.open_proxy = o->socks_no_token;
     cfg.allow_remote = o->allow_remote;
     snprintf(cfg.dns, sizeof cfg.dns, "%s", res->dns);
 
-    run_socks(fd, &cfg);
-    return 0;
+    /* propagate run_socks's return: 1 = session lost (reconnect),
+     * 0 = stopped. The hardcoded 0 here used to make every lost
+     * session look like a clean user stop — the process exited
+     * silently instead of reconnecting. */
+    return run_socks(fd, &cfg);
 }
 
 /* TUN mode needs root: re-exec the whole invocation via sudo when not root */
@@ -233,6 +237,7 @@ void oidc_connect_server(const Opts *o, const Config *cf)
      * downlink) re-authenticates and re-runs the pump instead of
      * silently dying. The plaintext password is re-decrypted per
      * iteration and scrubbed right after use. */
+    bool reconnecting = false;
     for (;;) {
         char *password = decrypt_password(encrypted_pw ? encrypted_pw : "",
                                           OIDC_APP_SECRET, cf->domain,
@@ -262,7 +267,17 @@ void oidc_connect_server(const Opts *o, const Config *cf)
         if (fd < 0) {
             OPENSSL_cleanse(password, strlen(password));
             free(password);
-            oidc_die("auth failed");
+            if (!reconnecting)
+                oidc_die("auth failed");
+            /* a reconnect hit the same loss window that killed the
+             * session: the OPEN is just as likely to be eaten, so
+             * retry with a backoff instead of dying */
+            oidc_eprintf("  auth failed during reconnect; retrying in "
+                         "3s...\n");
+            port_sleep_ms(3000);
+            if (g_user_stop)
+                break;
+            continue;
         }
         oidc_eprintf("  OK  tun=%s gw=%s dns=%s mtu=%u\n", res.tun, res.gw,
                      res.dns, (unsigned)res.mtu);
@@ -296,6 +311,7 @@ void oidc_connect_server(const Opts *o, const Config *cf)
             exit(1);   /* config/startup failure: retrying cannot help */
         }
         oidc_eprintf("  tunnel session lost; reconnecting...\n");
+        reconnecting = true;
         port_sleep_ms(1000);
         if (g_user_stop)
             break;   /* Ctrl-C during the reconnect wait */

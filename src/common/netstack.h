@@ -40,6 +40,17 @@ typedef enum {
     NS_FIN_WAIT,       /* we called close(); draining */
 } NsState;
 
+/* why a connection ended: set on the acceptance/abort paths and read by
+ * the SOCKS layer (socks_flow.c update_tcp_states) to map the failure to
+ * a reply code (timeout -> rep 4, RST/other -> rep 5). conn_clear
+ * PRESERVES the field across its memset — it must survive slot reuse
+ * until the SOCKS flow has read it — and ns_connect resets it to
+ * NS_TERM_NONE after conn_clear. ns_abort itself leaves it untouched
+ * (local aborts keep whatever reason was set before the abort). */
+#define NS_TERM_NONE    0   /* local teardown / never set */
+#define NS_TERM_RST     1   /* peer RST accepted */
+#define NS_TERM_TIMEOUT 2   /* retransmit/keepalive/idle timeout */
+
 /* one TCP connection (indexed 0..NS_MAX_CONN-1) */
 struct TcpConn {
     NsState  state;
@@ -69,6 +80,8 @@ struct TcpConn {
     uint64_t keepalive_ms;  /* next keepalive probe deadline */
     uint8_t  keepalive_cnt; /* unanswered probes before abort */
     uint64_t last_dump_ms;  /* last ns_dump_conn timestamp (diagnostic) */
+    uint8_t  term_reason;   /* NS_TERM_*: why the conn ended; preserved by
+                             * conn_clear, reset by ns_connect */
 };
 
 #define NS_MAX_CONN 64
@@ -138,6 +151,9 @@ typedef struct {
     int tx_head, tx_count;
     /* device-queue items per conn (fair-share accounting, NS_TX_CONN_CAP) */
     uint8_t q_used[NS_MAX_CONN];
+    /* connect timeout (ms) for the SYN path: IWAN_NS_CONNECT_TIMEOUT_MS
+     * override for tests, default NS_CONNECT_TIMEOUT. */
+    uint32_t connect_timeout_ms;
 } Netstack;
 
 void ns_init(Netstack *ns, uint32_t inner_ip, uint32_t gw, uint16_t mtu);

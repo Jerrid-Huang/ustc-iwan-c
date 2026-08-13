@@ -807,13 +807,26 @@ static int cmd_proxy(int argc, char **argv, int start)
     /* keep the plaintext pass until the session ends: reconnects need
      * it to re-derive the session key (server re-OPEN keeps the IP) */
     int rc = 0;
+    bool reconnecting = false;
     for (;;) {
         AuthResult res;
         int sockfd = authenticate(&o, DO_AUTH_PUMP, &res);
         if (sockfd < 0) {
-            log_err("Error: auth failed");
-            rc = 1;
-            break;
+            if (!reconnecting) {
+                log_err("Error: auth failed");
+                rc = 1;
+                break;
+            }
+            /* a reconnect hit the same loss window that killed the
+             * session: the OPEN is just as likely to be eaten, so
+             * retry with a backoff instead of dying */
+            log_err("auth failed during reconnect; retrying in 3s...");
+            port_sleep_ms(3000);
+            if (g_user_stop) {
+                rc = 1;
+                break;
+            }
+            continue;
         }
 
         check_gw_server(o.server, res.gw);   /* F8 */
@@ -841,6 +854,7 @@ static int cmd_proxy(int argc, char **argv, int start)
          * reconnects (run_pump resets g_stop on entry) */
         if (rc == 0)
             break;
+        reconnecting = true;
         log_err("tunnel session lost; reconnecting in 1s...");
         port_sleep_ms(1000);
         if (g_user_stop)
@@ -891,13 +905,26 @@ static int cmd_socks(int argc, char **argv, int start)
 
     /* keep the plaintext pass until the session ends: reconnects need
      * it to re-derive the session key (server re-OPEN keeps the IP) */
+    bool reconnecting = false;
     for (;;) {
         AuthResult res;
         int sockfd = authenticate(&o, DO_AUTH_PUMP, &res);
         if (sockfd < 0) {
-            log_err("Error: auth failed");
-            cleanse_str(o.pass);
-            return 1;
+            if (!reconnecting) {
+                log_err("Error: auth failed");
+                cleanse_str(o.pass);
+                return 1;
+            }
+            /* a reconnect hit the same loss window that killed the
+             * session: the OPEN is just as likely to be eaten, so
+             * retry with a backoff instead of dying */
+            log_err("auth failed during reconnect; retrying in 3s...");
+            port_sleep_ms(3000);
+            if (g_user_stop) {
+                cleanse_str(o.pass);
+                return 1;
+            }
+            continue;
         }
 #ifdef _WIN32
         /* Windows sockets default to blocking; run_socks expects a
@@ -949,6 +976,7 @@ static int cmd_socks(int argc, char **argv, int start)
         cfg.token = res.tok;
         cfg.encryption = o.encrypt;
         cfg.auth_token = o.socks_token;
+        cfg.open_proxy = o.socks_no_token;
         cfg.allow_remote = o.allow_remote;
         snprintf(cfg.dns, sizeof cfg.dns, "%s", res.dns);
 
@@ -958,6 +986,7 @@ static int cmd_socks(int argc, char **argv, int start)
             break;   /* user stopped it (run_socks returns 0 unless the
                       * session was detected lost; the reconnect re-runs
                       * auth via the caller's loop) */
+        reconnecting = true;
         log_err("tunnel session lost; reconnecting in 1s...");
         port_sleep_ms(1000);
         if (g_user_stop)

@@ -16,6 +16,8 @@ typedef struct {
     const char *listen_str;  /* configured address text, printed like Rust */
     const char *auth_token;  /* RFC1929 password; NULL = no auth (as before) */
     bool     allow_remote;   /* allow non-loopback bind (--allow-remote) */
+    bool     open_proxy;     /* explicit --socks-no-token: serve remote
+                              * peers WITHOUT auth (open proxy) */
     uint32_t inner_ip;     /* host-order IPv4 (from auth.tun) */
     uint32_t gateway;      /* host-order IPv4 (from auth.gw) */
     int      mtu;

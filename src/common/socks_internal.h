@@ -39,6 +39,8 @@ typedef struct {
     int      active;
     uint64_t id;               /* monotonically increasing flow id */
     int      fd;               /* local client stream */
+    uint32_t peer_ip;          /* client IPv4, network byte order (sin_addr.s_addr) */
+    uint16_t peer_port;        /* client port, host order */
     FlowState state;
     buf_t    input;
     buf_t    output;
@@ -96,6 +98,11 @@ Flow *flow_alloc(struct sockaddr_in *peer);
 void flow_free(Flow *f);
 void open_tcp_connection(Flow *f, uint32_t rip, uint16_t rport);
 void process_socks_handshake(Flow *f);
+/* brute-force auth lockout (socks_flow.c): note a wrong-password
+ * failure (success=false) or a successful auth (success=true, clears
+ * the source's counter); auth_fail_blocked() decides accept-time drops */
+void auth_fail_note(uint32_t ip, bool success);
+bool auth_fail_blocked(uint32_t ip);
 void handle_dns_results(void);
 void update_tcp_states(void);
 int64_t next_conn_timeout_ms(void);
