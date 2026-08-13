@@ -986,22 +986,34 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
     case PT_PING_REQ:
         if (!verify_sig(raw, len))
             return;
-        pthread_rwlock_wrlock(&ctx->sess_lock);
+        /* Common path (same peer, valid token) takes only the read
+         * lock: last_active is an atomic store, so keepalives no longer
+         * serialize the whole session table against every DATA reader.
+         * A peer change (rebind) upgrades to the write lock — gated on
+         * the source's token-mismatch history (F4) so a guessed token
+         * cannot claim the session from an address that has been
+         * spraying. PING_RSP is still sent regardless: it is a liveness
+         * oracle by design and must not become a token oracle. */
+        pthread_rwlock_rdlock(&ctx->sess_lock);
         s = find_session_unlocked(ctx, sid);
         if (s && CRYPTO_memcmp(&s->token, &tok, sizeof tok) == 0) {
-            /* F4: a token-valid PING from a NEW source rebinds the
-             * session peer — gate that on the source's token-mismatch
-             * history (rate_token_zero) so a guessed token cannot claim
-             * the session from an address that has been spraying.
-             * PING_RSP is still sent regardless: it is a liveness oracle
-             * by design and must not become a token oracle. */
-            if (memcmp(&s->peer, peer, sizeof *peer) == 0 ||
-                rate_token_zero(peer, now)) {
-                s->peer = *peer;
+            if (memcmp(&s->peer, peer, sizeof *peer) == 0) {
                 atomic_store(&s->last_active_ms, now_ms()); /* keepalive */
+                pthread_rwlock_unlock(&ctx->sess_lock);
+            } else {
+                pthread_rwlock_unlock(&ctx->sess_lock);
+                pthread_rwlock_wrlock(&ctx->sess_lock);
+                s = find_session_unlocked(ctx, sid);
+                if (s && CRYPTO_memcmp(&s->token, &tok, sizeof tok) == 0 &&
+                    rate_token_zero(peer, now)) {
+                    s->peer = *peer;
+                    atomic_store(&s->last_active_ms, now_ms());
+                }
+                pthread_rwlock_unlock(&ctx->sess_lock);
             }
+        } else {
+            pthread_rwlock_unlock(&ctx->sess_lock);
         }
-        pthread_rwlock_unlock(&ctx->sess_lock);
         buf_init(&b);
         ctrl_hdr(&b, PT_PING_RSP, 0, IWAN_PING_SID, IWAN_PING_TOK);
         udp_send(sockfd, peer, b.data, b.len);
@@ -1011,18 +1023,27 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
     case PT_ECHO_REQ:
         if (!verify_sig(raw, len))
             return;
-        pthread_rwlock_wrlock(&ctx->sess_lock);
+        /* same read-lock fast path / write-lock rebind as PING_REQ */
+        pthread_rwlock_rdlock(&ctx->sess_lock);
         s = find_session_unlocked(ctx, sid);
         if (s && CRYPTO_memcmp(&s->token, &tok, sizeof tok) == 0) {
-            /* F4: same rebind gate as PING_REQ — a token guess via ECHO
-             * must not claim the session from a spraying source */
-            if (memcmp(&s->peer, peer, sizeof *peer) == 0 ||
-                rate_token_zero(peer, now)) {
-                s->peer = *peer;
+            if (memcmp(&s->peer, peer, sizeof *peer) == 0) {
                 atomic_store(&s->last_active_ms, now_ms()); /* keepalive */
+                pthread_rwlock_unlock(&ctx->sess_lock);
+            } else {
+                pthread_rwlock_unlock(&ctx->sess_lock);
+                pthread_rwlock_wrlock(&ctx->sess_lock);
+                s = find_session_unlocked(ctx, sid);
+                if (s && CRYPTO_memcmp(&s->token, &tok, sizeof tok) == 0 &&
+                    rate_token_zero(peer, now)) {
+                    s->peer = *peer;
+                    atomic_store(&s->last_active_ms, now_ms());
+                }
+                pthread_rwlock_unlock(&ctx->sess_lock);
             }
+        } else {
+            pthread_rwlock_unlock(&ctx->sess_lock);
         }
-        pthread_rwlock_unlock(&ctx->sess_lock);
         buf_init(&b);
         ctrl_hdr(&b, PT_ECHO_RES, raw[1], sid, tok);
         udp_send(sockfd, peer, b.data, b.len);

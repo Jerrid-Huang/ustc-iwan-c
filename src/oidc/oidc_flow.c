@@ -199,6 +199,11 @@ static char *read_redirect_url(void)
     char *nl = strchr(rline, '\n');
     if (nl)
         *nl = '\0';
+    else if (!feof(stdin))
+        /* no newline but not EOF: the paste exceeded the buffer and was
+         * silently truncated — the resulting URL would fail with a
+         * baffling state/code mismatch later, so fail loudly instead */
+        oidc_die("redirect URL too long (max 4095 bytes)");
 
     /* refuse URLs that do not carry our private-use scheme: pasting an
      * arbitrary http(s) URL here would otherwise make the client parse

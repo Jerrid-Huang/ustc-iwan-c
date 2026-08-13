@@ -1565,19 +1565,40 @@ void service_local_inputs(Flow *fs) {
         if (f->ns_idx >= 0 && f->state != ST_GREETING &&
             f->state != ST_REQUEST && f->state != ST_RESOLVING &&
             f->input.len > 0) {
-            /* spill leftover input into the stack's pending segment slot.
-             * Also during ST_CONNECTING (SYN_SENT): a slow tunnel connect
-             * (DNS + SYN over the mobile line) lets the client pile up
-             * body bytes in input while the handshake parser waits; the
-             * netstack accepts payload from SYN_SENT on, so feed it
-             * instead of letting HANDSHAKE_INPUT_MAX kill the upload. */
-            size_t room = 0;
-            uint8_t *dst = ns_send_reserve(&g_ns, f->ns_idx, &room);
-            if (dst && room > 0) {
-                size_t n = f->input.len > room ? room : f->input.len;
-                memcpy(dst, f->input.data, n);
-                ns_send_commit(&g_ns, f->ns_idx, n);
-                buf_consume(&f->input, n);
+            /* spill leftover input into the stack's pending segment
+             * slots. Also during ST_CONNECTING (SYN_SENT): a slow
+             * tunnel connect (DNS + SYN over the mobile line) lets the
+             * client pile up body bytes in input while the handshake
+             * parser waits; the netstack accepts payload from SYN_SENT
+             * on, so feed it instead of letting HANDSHAKE_INPUT_MAX
+             * kill the upload. Fill up to LOCAL_IOV_MAX slots per
+             * round (a one-slot spill drained 64KB in ~45 rounds,
+             * collapsing buffered uploads to MSS/RTT). */
+            for (;;) {
+                struct iovec iov[LOCAL_IOV_MAX];
+                int nv = ns_send_reservev(&g_ns, f->ns_idx, iov,
+                                          LOCAL_IOV_MAX);
+                if (nv == 0) {
+                    f->rx_paused = true;   /* ring full: stop POLLIN */
+                    break;
+                }
+                size_t used = 0;
+                int k;
+                for (k = 0; k < nv && used < f->input.len; k++) {
+                    size_t take = f->input.len - used < iov[k].iov_len
+                                      ? f->input.len - used
+                                      : iov[k].iov_len;
+                    memcpy(iov[k].iov_base, f->input.data + used, take);
+                    ns_send_commit(&g_ns, f->ns_idx, take);
+                    used += take;
+                    if (take < iov[k].iov_len)
+                        break;   /* input exhausted mid-slot */
+                }
+                buf_consume(&f->input, used);
+                if (f->input.len == 0)
+                    break;
+                if (k < nv)
+                    break;   /* partial slot: reserve again next round */
             }
             if (f->input.len > 0) {
                 f->rx_paused = true;   /* ring full: stop polling POLLIN */

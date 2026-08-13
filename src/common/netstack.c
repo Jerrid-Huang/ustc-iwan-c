@@ -592,9 +592,15 @@ static uint32_t handle_rx_ack(Netstack *ns, TcpConn *c, NsPriv *p, int idx,
             Seg *s0 = seg_at(p, 0);
             if (s0->sent) {
                 seg_refresh_hdr(ns, c, s0);
-                tx_enqueue(ns, (uint8_t)idx, s0, NULL, 0);
-                s0->last_sent_ms = now;
-                s0->rto = c->rto;
+                /* only reset the RTO clock when the retransmit actually
+                 * made it into the tx queue: a failed enqueue leaves
+                 * the segment pending, and pushing its RTO deadline
+                 * back by a full RTO would make the peer wait exactly
+                 * as long as the packet it is missing */
+                if (tx_enqueue(ns, (uint8_t)idx, s0, NULL, 0) == 0) {
+                    s0->last_sent_ms = now;
+                    s0->rto = c->rto;
+                }
                 /* fast retransmit does NOT count toward the
                  * NS_MAX_DATA_RETX abort budget: only RTO-driven
                  * retransmits (conn_retransmit_loop) increment cnt, so
@@ -1384,7 +1390,10 @@ static int64_t conn_tick(Netstack *ns, int i, uint64_t now)
 }
 
 int ns_tick(Netstack *ns, uint64_t now) {
-    int64_t next = NS_TICK_DEFAULT_MS;
+    /* start at the MAX cap: with no live conn deadlines the loop can
+     * sleep the full 10s (keepalive/DNS-eventfd still wake it), instead
+     * of waking every 100ms to scan an empty table */
+    int64_t next = NS_TICK_MAX_MS;
     for (int i = 0; i < NS_MAX_CONN; i++) {
         if (ns->conns[i].state == NS_CLOSED)
             continue;

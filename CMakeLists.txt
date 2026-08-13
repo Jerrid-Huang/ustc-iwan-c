@@ -30,8 +30,9 @@ cmake_minimum_required(VERSION 3.16)
 
 project(iwan VERSION 0.1.1 LANGUAGES C)
 
-# Release-by-default with the historical -O2 (no -DNDEBUG: the code has
-# no runtime assert()s, only _Static_assert, which is NDEBUG-independent).
+# Release-by-default (CMAKE_C_FLAGS_RELEASE = -O3; no -DNDEBUG: the
+# code has no runtime assert()s, only _Static_assert, which is
+# NDEBUG-independent).
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
@@ -314,8 +315,12 @@ target_link_libraries(iwan-client-oidc PRIVATE iwan_oidc)
 
 # SOCKS5 handshake test harness (root-free: drives the real accept/handshake/
 # netstack code with a loopback listener; see tests/socks_handshake.py).
-add_executable(socks_handshake_harness tests/socks_handshake_harness.c)
-target_link_libraries(socks_handshake_harness PRIVATE iwan_core)
+# Built only when testing is enabled so release binaries don't ship it.
+include(CTest)
+if(BUILD_TESTING)
+  add_executable(socks_handshake_harness tests/socks_handshake_harness.c)
+  target_link_libraries(socks_handshake_harness PRIVATE iwan_core)
+endif()
 
 if(UNIX AND NOT APPLE)
   add_executable(iwan-server src/iwan_server.c)

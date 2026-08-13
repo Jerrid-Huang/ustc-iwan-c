@@ -896,6 +896,40 @@ static int https_tls_write(SSL *ssl, int fd, const char *req,
     return 0;
 }
 
+/* Parse Content-Length from a complete header block (NUL-free, len
+ * bytes). Returns the byte count, or -1 when absent/malformed (the
+ * caller then falls back to EOF-delimited reads, which still work for
+ * "Connection: close" and chunked responses). */
+static long long https_content_length(const char *hdrs, size_t hlen)
+{
+    size_t i = 0;
+    while (i < hlen) {
+        size_t eol = i;
+        while (eol < hlen && hdrs[eol] != '\r' && hdrs[eol] != '\n')
+            eol++;
+        size_t llen = eol - i;
+        if (llen >= 15 &&
+            port_strncasecmp(hdrs + i, "Content-Length:", 15) == 0) {
+            size_t j = i + 15;
+            while (j < eol && (hdrs[j] == ' ' || hdrs[j] == '\t'))
+                j++;
+            long long v = 0;
+            for (; j < eol; j++) {
+                if (hdrs[j] < '0' || hdrs[j] > '9')
+                    return -1;   /* malformed: use EOF-delimited mode */
+                v = v * 10 + (long long)(hdrs[j] - '0');
+                if (v > (long long)HTTPS_MAX_RESP)
+                    return -1;
+            }
+            return v;
+        }
+        i = eol;
+        while (i < hlen && (hdrs[i] == '\r' || hdrs[i] == '\n'))
+            i++;
+    }
+    return -1;
+}
+
 /* Read the raw response until EOF or close_notify, enforcing the 16 MiB
    ceiling and the round-trip deadline (re-armed before every read, like
    the old poll loop chunked at HTTPS_POLL_MS). Returns 0 on success,
@@ -904,6 +938,8 @@ static int https_tls_read(SSL *ssl, int fd, struct sbuf *resp,
                           uint64_t deadline_ms, char *diag, size_t diagsz)
 {
     char buf[HTTPS_READ_CHUNK];
+    long long content_len = -1;   /* -1: unknown (EOF-delimited) */
+    size_t body_start = 0;
 
     for (;;) {
         uint64_t remain;
@@ -928,19 +964,62 @@ static int https_tls_read(SSL *ssl, int fd, struct sbuf *resp,
         r = SSL_read(ssl, buf, sizeof buf);
         if (r > 0) {
             sbuf_app(resp, buf, (size_t)r);
+            if (content_len < 0) {
+                /* once the header block has fully arrived, learn the
+                 * body length so we can stop at the last body byte
+                 * instead of waiting for the peer to close (a
+                 * keep-alive server would otherwise stall every
+                 * request until the 60s deadline) */
+                const char *he = memmem(resp->data, resp->len, "\r\n\r\n", 4);
+                size_t hesz = he ? 4 : 0;
+                if (!he) {
+                    he = memmem(resp->data, resp->len, "\n\n", 2);
+                    hesz = he ? 2 : 0;
+                }
+                if (he) {
+                    body_start = (size_t)(he - resp->data) + hesz;
+                    content_len =
+                        https_content_length(resp->data, body_start);
+                    if (content_len == 0)
+                        return 0;   /* declared empty body */
+                }
+            }
+            if (content_len > 0 &&
+                resp->len - body_start >= (size_t)content_len)
+                return 0;   /* full body in hand: no need to await EOF */
             continue;
         }
         {
             int e = SSL_get_error(ssl, r);
 
-            if (e == SSL_ERROR_ZERO_RETURN)
-                return 0;   /* close_notify: clean end of response */
+            if (e == SSL_ERROR_ZERO_RETURN) {
+                /* close_notify: clean end — unless a declared body is
+                 * still short (truncated transfer) */
+                if (content_len > 0 &&
+                    resp->len - body_start < (size_t)content_len) {
+                    snprintf(diag, diagsz,
+                             "response truncated (%zu of %lld bytes)",
+                             resp->len - body_start, content_len);
+                    return -1;
+                }
+                return 0;
+            }
             if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE)
                 continue;   /* interrupted by the socket timeout */
             if (e == SSL_ERROR_SYSCALL) {
-                if (r == 0)
-                    return 0;   /* EOF without close_notify: the peer
-                                 * closed after "Connection: close" */
+                if (r == 0) {
+                    /* EOF without close_notify: the peer closed after
+                     * "Connection: close" — truncated if a declared
+                     * body is incomplete */
+                    if (content_len > 0 &&
+                        resp->len - body_start < (size_t)content_len) {
+                        snprintf(diag, diagsz,
+                                 "response truncated (%zu of %lld bytes)",
+                                 resp->len - body_start, content_len);
+                        return -1;
+                    }
+                    return 0;
+                }
                 if (errno == EINTR)
                     continue;
                 if (errno == EAGAIN || errno == EWOULDBLOCK ||

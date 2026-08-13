@@ -23,7 +23,14 @@ int steer(struct __sk_buff *skb)
 
     if (bpf_skb_load_bytes(skb, 9, &proto, 1))
         return 0;
-    if (proto != 17)   /* UDP only: TCP/ICMP -> queue 0 */
+    /* TCP/UDP carry the 4-tuple at a fixed offset; ICMP/other go to
+     * queue 0. The offset assumes an optionless IPv4 header (IHL=5):
+     * true for tun-device traffic (the kernel emits and accepts
+     * optionless headers there), and a wrong queue choice on exotic
+     * input only misbalances the reader pool — it never drops data.
+     * Hash TCP too: the pool's whole point is spreading the dominant
+     * inner-TCP load, not just the DNS/QUIC UDP fraction. */
+    if (proto != 6 && proto != 17)
         return 0;
     if (bpf_skb_load_bytes(skb, 12, &saddr, 4) ||
         bpf_skb_load_bytes(skb, 16, &daddr, 4) ||

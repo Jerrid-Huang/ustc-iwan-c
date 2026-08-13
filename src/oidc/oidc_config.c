@@ -249,6 +249,18 @@ void oidc_save_config(const char *path, const Config *cf)
 #endif
         oidc_die("cannot write config to %s: %s", path, strerror(errno));
     }
+#ifndef _WIN32
+    /* fsync the parent directory so the rename itself is durable: an
+     * atomic-replace promise is only half kept if a crash can roll the
+     * directory entry back to the old file */
+    {
+        int dfd = open(dir, O_RDONLY | O_DIRECTORY);
+        if (dfd >= 0) {
+            (void)fsync(dfd);
+            close(dfd);
+        }
+    }
+#endif
     free(tmp);
 
     restore_owner(path, dir);
@@ -266,6 +278,15 @@ void oidc_load_config(const char *path, Config *cf)
                  "cannot read config file %s (run iwan-client-oidc --fetch first)",
                  path);
         oidc_die_with_cause(msg, strerror(errno));
+    }
+    /* the file holds per-line encrypted passwords (obfuscation-level):
+     * warn when it is group/world readable instead of silently loading */
+    {
+        struct stat st;
+        if (fstat(fileno(f), &st) == 0 &&
+            (st.st_mode & (S_IRWXG | S_IRWXO)))
+            oidc_eprintf("WARNING: %s is group/world readable; "
+                         "chmod 600 it\n", path);
     }
     buf_t b;
     buf_init(&b);

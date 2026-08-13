@@ -20,6 +20,8 @@ users.txt
 servers.json
 SHASUMS.txt
 build-win*/
+build-linux/
+build-sanitize/
 
 # Python
 __pycache__/

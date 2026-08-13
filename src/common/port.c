@@ -1182,6 +1182,14 @@ int port_evfd_create(void)
     SOCKET s, peer;
     int one = 1;
 
+    /* process-level singleton: only one evfd exists per process (the
+     * SOCKS DNS wakeup). A second create would otherwise silently
+     * redirect the first one's wakeups; retire the old peer first. */
+    if (g_evfd_peer != INVALID_SOCKET) {
+        closesocket(g_evfd_peer);
+        g_evfd_peer = INVALID_SOCKET;
+    }
+
     s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (s == INVALID_SOCKET)
         return -1;
@@ -1274,6 +1282,12 @@ int port_evfd_create(void)
     socklen_t alen = sizeof a;
     int s, peer;
     int one = 1;
+
+    /* process-level singleton, same reasoning as the winsock version */
+    if (g_evfd_peer >= 0) {
+        close(g_evfd_peer);
+        g_evfd_peer = -1;
+    }
 
     s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (s < 0)
