@@ -280,7 +280,9 @@ void oidc_load_config(const char *path, Config *cf)
         oidc_die_with_cause(msg, strerror(errno));
     }
     /* the file holds per-line encrypted passwords (obfuscation-level):
-     * warn when it is group/world readable instead of silently loading */
+     * warn when it is group/world readable instead of silently loading
+     * (POSIX only: Windows has no group/world permission bits) */
+#ifndef _WIN32
     {
         struct stat st;
         if (fstat(fileno(f), &st) == 0 &&
@@ -288,6 +290,7 @@ void oidc_load_config(const char *path, Config *cf)
             oidc_eprintf("WARNING: %s is group/world readable; "
                          "chmod 600 it\n", path);
     }
+#endif
     buf_t b;
     buf_init(&b);
     char tmp[4096];

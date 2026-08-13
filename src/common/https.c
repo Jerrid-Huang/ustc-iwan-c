@@ -930,6 +930,20 @@ static long long https_content_length(const char *hdrs, size_t hlen)
     return -1;
 }
 
+/* memmem is a GNU extension absent from mingw-w64: hand-roll the two
+ * tiny needle searches we need (header terminator) so the code builds
+ * on every toolchain. */
+static const char *sbuf_find(const char *hay, size_t hlen,
+                             const char *needle, size_t nlen)
+{
+    if (nlen == 0 || hlen < nlen)
+        return NULL;
+    for (size_t i = 0; i + nlen <= hlen; i++)
+        if (memcmp(hay + i, needle, nlen) == 0)
+            return hay + i;
+    return NULL;
+}
+
 /* Read the raw response until EOF or close_notify, enforcing the 16 MiB
    ceiling and the round-trip deadline (re-armed before every read, like
    the old poll loop chunked at HTTPS_POLL_MS). Returns 0 on success,
@@ -970,10 +984,10 @@ static int https_tls_read(SSL *ssl, int fd, struct sbuf *resp,
                  * instead of waiting for the peer to close (a
                  * keep-alive server would otherwise stall every
                  * request until the 60s deadline) */
-                const char *he = memmem(resp->d, resp->len, "\r\n\r\n", 4);
+                const char *he = sbuf_find(resp->d, resp->len, "\r\n\r\n", 4);
                 size_t hesz = he ? 4 : 0;
                 if (!he) {
-                    he = memmem(resp->d, resp->len, "\n\n", 2);
+                    he = sbuf_find(resp->d, resp->len, "\n\n", 2);
                     hesz = he ? 2 : 0;
                 }
                 if (he) {
@@ -998,8 +1012,8 @@ static int https_tls_read(SSL *ssl, int fd, struct sbuf *resp,
                 if (content_len > 0 &&
                     resp->len - body_start < (size_t)content_len) {
                     snprintf(diag, diagsz,
-                             "response truncated (%zu of %lld bytes)",
-                             resp->len - body_start, content_len);
+                             "response truncated (%llu of %lld bytes)",
+                             (unsigned long long)(resp->len - body_start), content_len);
                     return -1;
                 }
                 return 0;
@@ -1014,8 +1028,8 @@ static int https_tls_read(SSL *ssl, int fd, struct sbuf *resp,
                     if (content_len > 0 &&
                         resp->len - body_start < (size_t)content_len) {
                         snprintf(diag, diagsz,
-                                 "response truncated (%zu of %lld bytes)",
-                                 resp->len - body_start, content_len);
+                                 "response truncated (%llu of %lld bytes)",
+                                 (unsigned long long)(resp->len - body_start), content_len);
                         return -1;
                     }
                     return 0;
