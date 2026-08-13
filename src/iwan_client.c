@@ -49,6 +49,7 @@ typedef struct {
     slist_t     proxy_domain;
     const char *listen_str;
     const char *socks_token;
+    bool        socks_no_token;
     bool        allow_remote;
 } CmdOpts;
 
@@ -181,6 +182,7 @@ static void print_sub_help(const char *sub)
             "      --mtu <MTU>          [default: 1380]\n"
             "      --listen <LISTEN>    Local SOCKS5 listen address [default: 127.0.0.1:1080]\n"
             "      --socks-token <TOKEN>\n"
+            "      --socks-no-token     Explicitly allow a passwordless proxy with --allow-remote\n"
             "      --allow-remote       Allow non-loopback listen addresses\n"
             "  -h, --help               Print help\n");
     }
@@ -222,6 +224,21 @@ static void err_required_pass(const char *sub)
     fprintf(stderr,
             "error: the following required arguments were not provided:\n"
             "  --pass <PASS> or --pass-file <FILE>");
+    err_usage_exit(usage_required(sub));
+}
+
+/* --allow-remote without an explicit proxy password is an open proxy
+ * waiting to happen: require an explicit --socks-token, or an explicit
+ * --socks-no-token opt-out. Local (loopback) binds stay passwordless
+ * by default. */
+static void err_remote_token(const char *sub)
+{
+    fprintf(stderr,
+            "error: --allow-remote requires an explicit SOCKS proxy "
+            "password:\n"
+            "  pass --socks-token <PASS> to require RFC1929 auth, or\n"
+            "  pass --socks-no-token to confirm an open (passwordless) "
+            "proxy");
     err_usage_exit(usage_required(sub));
 }
 
@@ -365,6 +382,17 @@ static bool valid_listen(const char *val, char *err, size_t errsz)
     if (parse_host_port(val, &tmp) == 0)
         return true;
     snprintf(err, errsz, "invalid socket address syntax");
+    return false;
+}
+
+/* RFC1929 (SOCKS5 username/password) carries the password in a
+ * one-byte length field: longer tokens can never authenticate and
+ * would silently deny every peer. Reject at parse time. */
+static bool validate_token_len(const char *val, char *err, size_t errsz)
+{
+    if (strlen(val) <= 255)
+        return true;
+    snprintf(err, errsz, "must be at most 255 bytes (RFC1929 limit)");
     return false;
 }
 
@@ -836,20 +864,30 @@ static int cmd_socks(int argc, char **argv, int start)
     o.encrypt = 1;
     o.mtu = 1380;
     o.listen_str = "127.0.0.1:1080";
-    cli_opt opts[12];
+    cli_opt opts[13];
 
     add_auth_opts(opts, &o);
     opts[9] = (cli_opt){ "listen",       CLI_OPT_STR, &o.listen_str,
                          "<LISTEN>",  valid_listen };
     opts[10] = (cli_opt){ "socks-token", CLI_OPT_STR, &o.socks_token,
-                          "<TOKEN>", NULL };
-    opts[11] = (cli_opt){ "allow-remote", CLI_OPT_BOOL, &o.allow_remote,
+                          "<TOKEN>", validate_token_len };
+    opts[11] = (cli_opt){ "socks-no-token", CLI_OPT_BOOL, &o.socks_no_token,
+                          NULL, NULL };
+    opts[12] = (cli_opt){ "allow-remote", CLI_OPT_BOOL, &o.allow_remote,
                           NULL, NULL };
     parse_cmd(argc, argv, start, "socks", opts, sizeof opts / sizeof opts[0]);
     if (!o.server)
         err_required("socks");
     resolve_credentials(&o, "socks");
     check_server_ip(o.server, "invalid server address");
+    if (o.socks_token && o.socks_no_token) {
+        fprintf(stderr,
+                "error: --socks-token and --socks-no-token are "
+                "mutually exclusive");
+        err_usage_exit(usage_required("socks"));
+    }
+    if (o.allow_remote && !o.socks_token && !o.socks_no_token)
+        err_remote_token("socks");
 
     /* keep the plaintext pass until the session ends: reconnects need
      * it to re-derive the session key (server re-OPEN keeps the IP) */

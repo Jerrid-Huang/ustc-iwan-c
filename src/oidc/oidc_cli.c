@@ -59,6 +59,8 @@ static void print_help_short(void)
         "      --socks                        Use a rootless userspace SOCKS5 proxy instead of a TUN device\n"
         "      --socks-listen <SOCKS_LISTEN>  Local SOCKS5 listen address [default: 127.0.0.1:1080]\n"
         "      --socks-mtu <SOCKS_MTU>        Maximum userspace inner IP MTU [default: 1380]\n"
+        "      --socks-token <TOKEN>          Require this RFC1929 password from SOCKS5 clients\n"
+        "      --socks-no-token               Explicitly allow a passwordless proxy with --allow-remote\n"
         "      --allow-remote                 Allow non-loopback SOCKS5 listen addresses\n"
         "  -h, --help                         Print help (see more with '--help')\n"
         "  -V, --version                      Print version\n");
@@ -129,6 +131,16 @@ static void print_help_long(void)
         "          \n"
         "          [default: 1380]\n"
         "\n"
+        "      --socks-token <TOKEN>\n"
+        "          Require this RFC1929 password from SOCKS5 clients\n"
+        "          (HTTP proxy mode is disabled while a token is set)\n"
+        "          \n"
+        "          [default: no auth for loopback-only binds]\n"
+        "\n"
+        "      --socks-no-token\n"
+        "          Explicitly allow a passwordless proxy with --allow-remote\n"
+        "          (without this, --allow-remote requires --socks-token)\n"
+        "\n"
         "      --allow-remote\n"
         "          Allow non-loopback SOCKS5 listen addresses\n"
         "\n"
@@ -145,6 +157,17 @@ static bool valid_listen(const char *val, char *err, size_t errsz)
     if (parse_host_port(val, &tmp) == 0)
         return true;
     snprintf(err, errsz, "invalid socket address syntax");
+    return false;
+}
+
+/* RFC1929 (SOCKS5 username/password) carries the password in a
+ * one-byte length field: longer tokens can never authenticate and
+ * would silently deny every peer. Reject at parse time. */
+static bool validate_token_len(const char *val, char *err, size_t errsz)
+{
+    if (strlen(val) <= 255)
+        return true;
+    snprintf(err, errsz, "must be at most 255 bytes (RFC1929 limit)");
     return false;
 }
 
@@ -201,6 +224,8 @@ void oidc_parse_cli(int argc, char **argv, Opts *o, Cli *usage)
         { "socks",        CLI_OPT_BOOL, &o->socks,         NULL,             NULL },
         { "socks-listen", CLI_OPT_STR,  &o->socks_listen,  "<SOCKS_LISTEN>", valid_listen },
         { "socks-mtu",    CLI_OPT_U16,  &o->socks_mtu,     "<SOCKS_MTU>",    NULL },
+        { "socks-token",  CLI_OPT_STR,  &o->socks_token,   "<TOKEN>",        validate_token_len },
+        { "socks-no-token", CLI_OPT_BOOL, &o->socks_no_token, NULL,          NULL },
         { "allow-remote", CLI_OPT_BOOL, &o->allow_remote,  NULL,             NULL },
     };
 

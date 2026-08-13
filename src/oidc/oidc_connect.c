@@ -75,6 +75,7 @@ static int run_socks_mode(const Opts *o, int fd, const uint8_t sk[16],
     cfg.sid = res->sid;
     cfg.token = res->tok;
     cfg.encryption = o->encrypt;
+    cfg.auth_token = o->socks_token;
     cfg.allow_remote = o->allow_remote;
     snprintf(cfg.dns, sizeof cfg.dns, "%s", res->dns);
 

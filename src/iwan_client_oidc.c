@@ -55,6 +55,16 @@ int main(int argc, char **argv)
     bool do_connect = o.connect || o.all;
     if (o.socks && !do_connect)
         usage_error(&usage, "--socks requires --connect or --all");
+    if (o.socks_token && o.socks_no_token)
+        usage_error(&usage,
+                    "--socks-token and --socks-no-token are mutually "
+                    "exclusive");
+    if (o.socks && o.allow_remote && !o.socks_token && !o.socks_no_token)
+        usage_error(&usage,
+                    "--allow-remote requires an explicit SOCKS proxy "
+                    "password: pass --socks-token <PASS>, or "
+                    "--socks-no-token to confirm an open (passwordless) "
+                    "proxy");
     if (do_connect && !o.socks && !port_is_admin())
         oidc_elevate_root(argc, argv);
 

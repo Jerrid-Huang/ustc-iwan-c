@@ -51,6 +51,8 @@ typedef struct {
     bool        socks;
     const char *socks_listen;
     uint16_t    socks_mtu;
+    const char *socks_token;   /* RFC1929 password; NULL = no auth */
+    bool        socks_no_token;/* explicit opt-out for --allow-remote */
     bool        allow_remote;
 } Opts;
 
