@@ -88,8 +88,15 @@ static int send_ctrl(pump_ctx_t *ctx, uint8_t typ, uint8_t enc, uint16_t sid,
 /* no downlink for this long => session lost: the server purged or
  * rebooted the session. Not all servers answer ECHO_REQ keepalives (a
  * live-but-silent session then produces no downlink at all), so the
- * threshold is overridable: IWAN_RX_STALE_MS (default 60s, 10s..24h). */
-#define PUMP_RX_STALE_MS_DEFAULT 60000u
+ * threshold is overridable: IWAN_RX_STALE_MS (default 120s, 10s..24h).
+ *
+ * 120s (not 60s): the USTC servers answer every ECHO_REQ, so a long
+ * downlink silence means the return path is dropping UDP, not that the
+ * session died — and the 60s default caused spurious reconnects on the
+ * mobile line (6 consecutive keepalives lost inside one window), which
+ * the Rust reference client never exhibits (it has no downlink-stale
+ * check at all). 120s = 12 consecutive unanswered keepalives. */
+#define PUMP_RX_STALE_MS_DEFAULT 120000u
 
 static unsigned pump_rx_stale_ms(void)
 {
@@ -419,6 +426,9 @@ static void *udp2tun_thread(void *ud) {
 
     if (!batch) {
         log_err("out of memory");
+        ctx->session_lost = true;   /* abnormal exit: let the caller
+                                     * re-auth instead of silently
+                                     * reporting "user stopped" */
         g_stop = 1;   /* the downlink thread is dead: stop the pump */
         return NULL;
     }
@@ -477,6 +487,7 @@ static void *udp2tun_thread(void *ud) {
                 int pr = port_poll(&pfd, 1, to);
                 if (pr < 0 && errno != EINTR) {
                     eprintf("[UDP->TUN] poll err\n");
+                    ctx->session_lost = true;   /* abnormal: reconnect */
                     g_stop = 1;   /* any pump-fatal error stops the tunnel */
                     break;
                 }
@@ -489,6 +500,7 @@ static void *udp2tun_thread(void *ud) {
                              * — the keepalive logic detects real loss */
             log_err("[UDP->TUN] recv err: %s (%d)", strerror(errno),
                     errno);
+            ctx->session_lost = true;   /* abnormal: reconnect */
             g_stop = 1;   /* any pump-fatal error stops the tunnel */
             break;
         }
