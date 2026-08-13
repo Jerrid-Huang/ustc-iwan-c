@@ -316,7 +316,9 @@ target_link_libraries(iwan-client-oidc PRIVATE iwan_oidc)
 # SOCKS5 handshake test harness (root-free: drives the real accept/handshake/
 # netstack code with a loopback listener; see tests/socks_handshake.py).
 # Built only when testing is enabled so release binaries don't ship it.
-include(CTest)
+# Plain option() — NOT include(CTest), whose enable_testing() defines a
+# `test` target that collides with the integration-suite target below.
+option(BUILD_TESTING "Build the SOCKS5 handshake test harness" ON)
 if(BUILD_TESTING)
   add_executable(socks_handshake_harness tests/socks_handshake_harness.c)
   target_link_libraries(socks_handshake_harness PRIVATE iwan_core)

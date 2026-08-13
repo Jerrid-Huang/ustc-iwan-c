@@ -970,16 +970,16 @@ static int https_tls_read(SSL *ssl, int fd, struct sbuf *resp,
                  * instead of waiting for the peer to close (a
                  * keep-alive server would otherwise stall every
                  * request until the 60s deadline) */
-                const char *he = memmem(resp->data, resp->len, "\r\n\r\n", 4);
+                const char *he = memmem(resp->d, resp->len, "\r\n\r\n", 4);
                 size_t hesz = he ? 4 : 0;
                 if (!he) {
-                    he = memmem(resp->data, resp->len, "\n\n", 2);
+                    he = memmem(resp->d, resp->len, "\n\n", 2);
                     hesz = he ? 2 : 0;
                 }
                 if (he) {
-                    body_start = (size_t)(he - resp->data) + hesz;
+                    body_start = (size_t)(he - resp->d) + hesz;
                     content_len =
-                        https_content_length(resp->data, body_start);
+                        https_content_length(resp->d, body_start);
                     if (content_len == 0)
                         return 0;   /* declared empty body */
                 }
