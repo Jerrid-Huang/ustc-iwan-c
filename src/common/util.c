@@ -110,9 +110,11 @@ static bool run_ip_child(char *const args[], bool quiet)
         _exit(127);
     }
     int st = 0;
-    if (waitpid(pid, &st, 0) < 0)
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR)
+        ;
+    if (!WIFEXITED(st))
         return false;
-    return WIFEXITED(st) && WEXITSTATUS(st) == 0;
+    return WEXITSTATUS(st) == 0;
 }
 #else /* _WIN32 */
 /* mirror ip_argv() for the port-layer subprocess helpers: callers pass
@@ -234,7 +236,8 @@ char *cmd_capture(char *const args[])
         len += (size_t)n;
     }
     close(fds[0]);
-    waitpid(pid, &st, 0);
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR)
+        ;
     if (read_err || len == 0 || (WIFEXITED(st) && WEXITSTATUS(st) == 127)) {
         free(out);
         return NULL;
@@ -472,7 +475,9 @@ int parse_uint(const char *s, uint64_t max, uint64_t *out)
     uint64_t v = 0;
     for (p = s; *p; p++) {
         uint64_t d = (uint64_t)(*p - '0');
-        if (v > (max - d) / 10)
+        /* d > max would underflow max - d below (unsigned wrap) and
+         * admit out-of-range values when max < 9 */
+        if (d > max || v > (max - d) / 10)
             return -1;
         v = v * 10 + d;
     }

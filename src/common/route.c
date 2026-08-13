@@ -340,26 +340,39 @@ bool capture_default(char gw[16], char dev[16], char metric[16]) {
         return false;
     gw[0] = dev[0] = metric[0] = '\0';   /* metric: "" when absent */
     bool got_gw = false, got_dev = false;
-    char *save = NULL;
-    for (char *tok = strtok_r(out, " \t\r\n", &save); tok != NULL;
-         tok = strtok_r(NULL, " \t\r\n", &save)) {
-        if (strcmp(tok, "via") == 0) {
-            char *nt = strtok_r(NULL, " \t\r\n", &save);
-            if (nt != NULL) {
-                copy_token(gw, 16, nt);
-                got_gw = true;
+    char *lsave = NULL;
+    /* One default route per line ("default via 10.0.2.2 dev enp0s3
+     * proto dhcp metric 100"). Parse LINE BY LINE and take the first
+     * line carrying both via and dev: the old token-stream parse could
+     * mix via/dev/metric from different default routes on multi-homed
+     * hosts, yielding a wrong gateway for the server pin or a bogus
+     * restore route at teardown. */
+    for (char *line = strtok_r(out, "\n", &lsave); line != NULL;
+         line = strtok_r(NULL, "\n", &lsave)) {
+        char *save = NULL;
+        char *line_gw = NULL, *line_dev = NULL, *line_metric = NULL;
+        for (char *tok = strtok_r(line, " \t\r", &save); tok != NULL;
+             tok = strtok_r(NULL, " \t\r", &save)) {
+            if (strcmp(tok, "via") == 0) {
+                line_gw = strtok_r(NULL, " \t\r", &save);
+            } else if (strcmp(tok, "dev") == 0) {
+                line_dev = strtok_r(NULL, " \t\r", &save);
+            } else if (strcmp(tok, "metric") == 0) {
+                line_metric = strtok_r(NULL, " \t\r", &save);
             }
-        } else if (strcmp(tok, "dev") == 0) {
-            char *nt = strtok_r(NULL, " \t\r\n", &save);
-            if (nt != NULL) {
-                copy_token(dev, 16, nt);
-                got_dev = true;
-            }
-        } else if (strcmp(tok, "metric") == 0) {
-            char *nt = strtok_r(NULL, " \t\r\n", &save);
-            if (nt != NULL)
-                copy_token(metric, 16, nt);
         }
+        if (line_gw != NULL && line_dev != NULL) {
+            copy_token(gw, 16, line_gw);
+            copy_token(dev, 16, line_dev);
+            if (line_metric != NULL)
+                copy_token(metric, 16, line_metric);
+            got_gw = true;
+            got_dev = true;
+            break;
+        }
+        /* an on-link default (no via) still carries dev; without a
+         * gateway we keep the historical behavior of failing the
+         * capture (callers refuse to hijack routing blind) */
     }
     free(out);
     return got_gw && got_dev;

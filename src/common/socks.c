@@ -103,7 +103,11 @@ void wait_events(int listener, int sockfd, int dns_evfd, int timeout_ms)
         if (!f->active)
             continue;
         fds[n].fd = f->fd;
-        fds[n].events = POLLIN;
+        /* rx_paused (netstack ring full): do NOT register POLLIN — the
+         * socket stays readable, so polling it would return instantly
+         * and busy-spin the loop; the next netstack tick (<=100ms)
+         * retries the reserve and clears the pause when room frees */
+        fds[n].events = f->rx_paused ? 0 : POLLIN;
         if (f->output.len > 0)
             fds[n].events |= POLLOUT;
         n++;
@@ -562,6 +566,9 @@ int receive_vpn(int sockfd, SocksConfig *cfg) {
                 return 0;   /* ECONNREFUSED: one-shot connected-UDP ICMP
                              * artifact; keepalives detect real loss */
             log_err("receive_vpn: recvmmsg: %s", strerror(errno));
+            cfg->session_lost = true;   /* abnormal: reconnect, not a
+                                         * clean user stop (run_socks
+                                         * returns 1) */
             return -1;
         }
         budget -= v;

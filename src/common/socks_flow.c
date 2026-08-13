@@ -1559,8 +1559,18 @@ void service_local_inputs(Flow *fs) {
         Flow *f = &fs[i];
         if (!f->active || f->local_eof)
             continue;
-        if (f->ns_idx >= 0 && f->state == ST_ESTABLISHED && f->input.len > 0) {
-            /* spill leftover input into the stack's pending segment slot */
+        /* every tick/event re-attempts the feed; if the ring is still
+         * full the reserve below re-pauses for another cycle */
+        f->rx_paused = false;
+        if (f->ns_idx >= 0 && f->state != ST_GREETING &&
+            f->state != ST_REQUEST && f->state != ST_RESOLVING &&
+            f->input.len > 0) {
+            /* spill leftover input into the stack's pending segment slot.
+             * Also during ST_CONNECTING (SYN_SENT): a slow tunnel connect
+             * (DNS + SYN over the mobile line) lets the client pile up
+             * body bytes in input while the handshake parser waits; the
+             * netstack accepts payload from SYN_SENT on, so feed it
+             * instead of letting HANDSHAKE_INPUT_MAX kill the upload. */
             size_t room = 0;
             uint8_t *dst = ns_send_reserve(&g_ns, f->ns_idx, &room);
             if (dst && room > 0) {
@@ -1569,8 +1579,10 @@ void service_local_inputs(Flow *fs) {
                 ns_send_commit(&g_ns, f->ns_idx, n);
                 buf_consume(&f->input, n);
             }
-            if (f->input.len > 0)
+            if (f->input.len > 0) {
+                f->rx_paused = true;   /* ring full: stop polling POLLIN */
                 continue;
+            }
         }
 
         if (f->ns_idx >= 0 && f->state == ST_ESTABLISHED) {
@@ -1592,6 +1604,8 @@ void service_local_inputs(Flow *fs) {
                         dc->last_dump_ms = nowd;
                         ns_dump_conn(&g_ns, f->ns_idx);
                     }
+                    f->rx_paused = true;   /* stop polling POLLIN until
+                                            * the next tick frees room */
                     break;       /* stack full: backpressure */
                 }
                 ssize_t r2 = port_readv(f->fd, iov, nv);
@@ -1636,8 +1650,22 @@ void service_local_inputs(Flow *fs) {
                     ns_close(&g_ns, f->ns_idx);
                     set_flow_state(f, ST_CLOSING);
                     break;
+                } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    break;             /* drained for now */
                 } else {
-                    break;             /* EAGAIN or error */
+                    /* hard read error (ECONNRESET when the local app
+                     * RSTs, e.g. a cancelled browser tab): treat it as
+                     * client EOF — close the netstack conn and move to
+                     * ST_CLOSING. Leaving ST_ESTABLISHED would keep the
+                     * fd in the poll set with the kernel reporting
+                     * POLLERR forever (the error is not cleared by
+                     * read), busy-spinning one core and leaking the
+                     * fd/conn/flow triple. */
+                    flowdbg(f, "readv err -> ns_close");
+                    f->local_eof = true;
+                    ns_close(&g_ns, f->ns_idx);
+                    set_flow_state(f, ST_CLOSING);
+                    break;
                 }
             }
         } else {
@@ -1652,10 +1680,18 @@ void service_local_inputs(Flow *fs) {
                 set_flow_state(f, ST_CLOSING);
             } else if (n > 0) {
                 buf_put(&f->input, rbuf, (size_t)n);
-                if (f->input.len > HANDSHAKE_INPUT_MAX) {
-                    /* handshake-phase unbounded-input guard: a local
-                     * process flooding data would grow input forever;
-                     * reap_flows closes the fd and reclaims the slot */
+                /* Handshake-phase unbounded-input guard: bound only the
+                 * frame parsing states (greeting/request/DNS). Once the
+                 * connect is in flight (ST_CONNECTING) the buffered
+                 * bytes are tunnel payload — the ST_CONNECTING spill in
+                 * service_local_inputs feeds them into the netstack
+                 * (and pauses reads when the ring is full), so a large
+                 * HTTP upload during a slow connect must NOT be killed
+                 * by this cap. */
+                if (f->input.len > HANDSHAKE_INPUT_MAX &&
+                    (f->state == ST_GREETING ||
+                     f->state == ST_REQUEST ||
+                     f->state == ST_RESOLVING)) {
                     f->local_eof = true;
                     set_flow_state(f, ST_CLOSING);
                 }

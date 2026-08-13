@@ -564,6 +564,10 @@ static void *udp2tun_thread(void *ud) {
                                 &g_stop) != 0) {
                 if (!g_stop)
                     log_err("tun write: %s", strerror(errno));
+                /* device gone (ENODEV/EIO): the session is unrecoverable
+                 * from this end too — reconnect (rc=1) rather than
+                 * reporting a clean user stop */
+                ctx->session_lost = true;
                 g_stop = 1;
                 break;
             }

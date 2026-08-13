@@ -292,19 +292,44 @@ fail:
 /* exp/aud/iss claim validation (RFC 7519 / OIDC Core); 0 on success */
 static int validate_claims(Json *pay_j, const char *aud, const char *iss)
 {
+    time_t now = time(NULL);
     Json *exp = json_get(pay_j, "exp");
     if (!exp || json_type(exp) != JSON_NUM) {
         oidc_eprintf("oidc_jwt_verify: id_token has no numeric exp\n");
         return -1;
     }
-    if (json_num(exp) <= (double)time(NULL)) {
+    /* 60s clock-skew tolerance: a client clock up to a minute fast
+     * must not permanently fail login on a freshly-issued token */
+    if (json_num(exp) <= (double)(now - 60)) {
         oidc_eprintf("oidc_jwt_verify: id_token expired\n");
         return -1;
+    }
+    {
+        Json *nbf = json_get(pay_j, "nbf");
+        if (nbf && json_type(nbf) == JSON_NUM &&
+            json_num(nbf) > (double)(now + 60)) {
+            oidc_eprintf("oidc_jwt_verify: id_token not yet valid (nbf)\n");
+            return -1;
+        }
     }
     if (!aud_matches(pay_j, aud)) {
         oidc_eprintf("oidc_jwt_verify: id_token aud does not include "
                      "\"%s\"\n", aud);
         return -1;
+    }
+    /* RFC 7519 4.1.3: when aud is an array, the token must carry azp
+     * naming the authorized party — otherwise an id_token issued for
+     * another client under the same issuer would pass the array check */
+    {
+        Json *audc = json_get(pay_j, "aud");
+        if (audc && json_type(audc) == JSON_ARR) {
+            const char *azp = json_get_str(pay_j, "azp");
+            if (!azp || strcmp(azp, aud) != 0) {
+                oidc_eprintf("oidc_jwt_verify: id_token azp \"%s\" != "
+                             "\"%s\"\n", azp ? azp : "(missing)", aud);
+                return -1;
+            }
+        }
     }
     {
         const char *tiss = json_get_str(pay_j, "iss");

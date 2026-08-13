@@ -239,9 +239,12 @@ static int https_url_split(const char *url, char **host_out, char **path_out)
     const char *auth, *slash, *at, *cut;
     size_t alen;
 
-    for (size_t i = 0; i < sizeof scheme - 1; i++)
-        if (tolower((unsigned char)url[i]) != scheme[i])
-            return 0;
+    /* strncasecmp reads exactly 8 bytes but stops at the NUL of a
+     * shorter string, unlike the old per-char loop which read url[0..7]
+     * unconditionally (out-of-bounds on URLs shorter than 8 bytes —
+     * the URL here is attacker-influenced via the JWKS document) */
+    if (port_strncasecmp(url, scheme, sizeof scheme - 1) != 0)
+        return 0;
     auth = url + sizeof scheme - 1;
     slash = strchr(auth, '/');
     /* the authority ends at the first '/', '?' or '#' */
@@ -563,8 +566,13 @@ static SSL_CTX *https_ctx_new(bool with_fallback)
     /* HTTP/1.1 "Connection: close" servers routinely close the TCP
      * stream without a TLS close_notify; OpenSSL 3 reports that as
      * error 0A000126. The old pipe-based transport saw plain EOF, so
-     * restore that semantics: SSL_read then returns 0 (clean end). */
+     * restore that semantics: SSL_read then returns 0 (clean end).
+     * The option is OpenSSL 3.0+; 1.1.1 lacks it (and never surfaces
+     * 0A000126 — it already treats the missing close_notify as EOF),
+     * so keep the fallback path below for older versions. */
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
     SSL_CTX_set_options(ctx, SSL_OP_IGNORE_UNEXPECTED_EOF);
+#endif
     SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
     if (https_ctx_load_cas(ctx) != 0) {
         if (!with_fallback) {

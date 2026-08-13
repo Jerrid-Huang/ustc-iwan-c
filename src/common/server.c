@@ -545,9 +545,14 @@ static void sess_wipe(struct server_ctx *ctx, struct server_session *s)
 static void send_reject(int sockfd, const struct sockaddr_in *peer, const char *msg)
 {
     buf_t b;
+    size_t mlen = strlen(msg);
+    /* tlv_put aborts on vlen > IWAN_TLV_VLEN_MAX: clamp instead of
+     * letting an over-long message crash the whole server */
+    if (mlen > IWAN_TLV_VLEN_MAX)
+        mlen = IWAN_TLV_VLEN_MAX;
     buf_init(&b);
     ctrl_hdr(&b, PT_OPEN_REJECT, 0, 0, 0);
-    tlv_put(&b, T_ERR_MSG, msg, (uint8_t)strlen(msg));
+    tlv_put(&b, T_ERR_MSG, msg, (uint8_t)mlen);
     udp_send(sockfd, peer, b.data, b.len);
     buf_free(&b);
 }

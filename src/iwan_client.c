@@ -851,9 +851,15 @@ static int cmd_proxy(int argc, char **argv, int start)
         port_close(sockfd);
         /* user stopped it (Ctrl-C): run_pump returns 0 when the exit
          * was not a detected session loss; a lost session (rc == 1)
-         * reconnects (run_pump resets g_stop on entry) */
+         * reconnects (run_pump resets g_stop on entry). rc < 0 is a
+         * deterministic setup failure (route_setup already rolled back):
+         * retrying cannot help and would churn server sessions. */
         if (rc == 0)
             break;
+        if (rc < 0) {
+            log_err("tunnel setup failed; giving up");
+            break;
+        }
         reconnecting = true;
         log_err("tunnel session lost; reconnecting in 1s...");
         port_sleep_ms(1000);

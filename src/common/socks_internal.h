@@ -52,6 +52,9 @@ typedef struct {
     bool     http_mode;        /* client speaks HTTP proxy, not SOCKS5 */
     bool     http_connect;     /* HTTP mode: CONNECT tunnel (else absolute-URI
                                 * forwarding: the whole request is tunneled) */
+    bool     rx_paused;        /* uplink backpressure: netstack ring full,
+                                * stop registering POLLIN until the next
+                                * tick (wait_events reads this) */
 } Flow;
 
 /* Result of an async DNS lookup, queued for the event loop. */

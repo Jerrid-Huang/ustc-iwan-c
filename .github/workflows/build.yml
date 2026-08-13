@@ -182,6 +182,14 @@ jobs:
           ./bin/iwan-client-oidc --help >/dev/null
           ./bin/iwan-server --help >/dev/null
 
+      # The only rootless behavioral suite: 19 byte-level SOCKS5/RFC1929
+      # handshake cases against the ASan+UBSan harness (the frozen wire
+      # parser is exactly what sanitizers should cover).
+      - name: SOCKS5 handshake suite (ASan+UBSan)
+        run: |
+          python3 tests/socks_handshake.py
+          python3 tests/socks_handshake.py --token review-token
+
   # Fully static musl binaries for every common Linux architecture:
   # zero glibc dependency, run on any Linux of that arch. The BPF
   # steering object is arch-neutral and compiles against the host's

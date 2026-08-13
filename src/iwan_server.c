@@ -978,6 +978,7 @@ int main(int argc, char **argv)
     pthread_t workers[IWAN_SRV_THREADS_MAX];
     struct recv_thr_arg args[IWAN_SRV_THREADS_MAX];
     int nworkers = recv_threads - 1;
+    int ncreated = 0;   /* only threads actually created get joined */
 
     for (int i = 0; i < nworkers; i++) {
         /* workers take args[1..nworkers]; args[0] is reserved for the
@@ -996,12 +997,16 @@ int main(int argc, char **argv)
             atomic_store_explicit(&g_stop, true, memory_order_relaxed);
             break;
         }
+        ncreated++;
     }
     args[0] = (struct recv_thr_arg){ &ctx, users, nusers, udp_fds[0], 0, 0 };
     recv_thread_main(&args[0]);   /* primary loop, inline */
     poll_err = args[0].poll_err;
 
-    for (int i = 0; i < nworkers; i++)
+    /* join ONLY the threads that were created: pthread_create failure
+     * leaves the remaining workers[] entries uninitialized, and joining
+     * them is UB (EINVAL at best, crash at worst) on the degraded path */
+    for (int i = 0; i < ncreated; i++)
         pthread_join(workers[i], NULL);   /* exit within one poll timeout */
 
     return server_shutdown(&ctx, tun_fd, udp_fds, nfds, drop_child,
