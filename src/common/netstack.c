@@ -51,6 +51,9 @@
 #define NS_IPHDR_V_IHL    0x45
 #define NS_RXQ_INIT       256     /* initial rxq buffer capacity */
 #define NS_COMPACT_THRESH (NS_MAX_OUTSTANDING >> 1)
+#define NS_TX_DEFER_MS    25      /* retransmit deferred by a full tx
+                                   * queue: re-try cadence (see
+                                   * conn_retransmit_loop) */
 #define NS_SYN_RETX_MS    1000u   /* SYN retransmit interval */
 #define NS_DUP_ACK_THRESH 3       /* dup ACKs before fast retransmit */
 #define NS_RTT_MAX_MS     10000u  /* RTT sample clamp (bogus samples) */
@@ -593,11 +596,12 @@ static uint32_t handle_rx_ack(Netstack *ns, TcpConn *c, NsPriv *p, int idx,
             if (s0->sent) {
                 seg_refresh_hdr(ns, c, s0);
                 /* only reset the RTO clock when the retransmit actually
-                 * made it into the tx queue: a failed enqueue leaves
-                 * the segment pending, and pushing its RTO deadline
-                 * back by a full RTO would make the peer wait exactly
-                 * as long as the packet it is missing */
-                if (tx_enqueue(ns, (uint8_t)idx, s0, NULL, 0) == 0) {
+                 * made it into the tx queue (tx_enqueue: 1 = queued):
+                 * a failed enqueue leaves the segment pending, and
+                 * pushing its RTO deadline back by a full RTO would
+                 * make the peer wait exactly as long as the packet it
+                 * is missing */
+                if (tx_enqueue(ns, (uint8_t)idx, s0, NULL, 0) != 0) {
                     s0->last_sent_ms = now;
                     s0->rto = c->rto;
                 }
@@ -1187,9 +1191,15 @@ static bool conn_retransmit_loop(Netstack *ns, TcpConn *c, NsPriv *p, int idx,
         /* queue full: defer the retransmit without advancing the
          * backoff or retransmit count — nothing was transmitted this
          * tick, so counting it would double the RTO for a segment the
-         * peer never even saw repeated */
-        if (!tx_enqueue(ns, (uint8_t)idx, s, NULL, 0))
+         * peer never even saw repeated. Also nudge the deadline out:
+         * leaving last_sent_ms untouched would make conn_next_deadline
+         * return <= 0 every tick, collapsing the event loop into a 1ms
+         * busy-poll (accept/read EAGAIN storms) while the tx queue
+         * stays full */
+        if (!tx_enqueue(ns, (uint8_t)idx, s, NULL, 0)) {
+            s->last_sent_ms = now - s->rto + NS_TX_DEFER_MS;
             continue;
+        }
         s->last_sent_ms = now;
         s->rto = (uint16_t)((int)s->rto * 2 > (int)NS_RTO_MAX
                                ? (int)NS_RTO_MAX
