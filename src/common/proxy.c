@@ -158,11 +158,14 @@ static void send_batch(pump_ctx_t *ctx, struct mmsghdr *msgs, unsigned n)
             return;   /* cannot happen for UDP; guard against a busy loop */
         if (errno == EINTR)
             continue;
-        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS) {
-            /* poll must never outlive the retry budget: cap the wait at
-             * the remaining budget (min(100ms, budget-left); with the
-             * 5ms budget the remaining time always binds) and stop
-             * retrying once it is spent — an unbounded retry here
+        if (errno == EAGAIN || errno == EWOULDBLOCK ||
+            errno == ENOBUFS || errno == EPERM) {
+            /* EPERM: netfilter OUTPUT DROP returns EPERM for the
+             * dropped datagram — transient per-packet, retry like
+             * EAGAIN (poll must never outlive the retry budget: cap
+             * the wait at the remaining budget (min(100ms, budget-left);
+             * with the 5ms budget the remaining time always binds) and
+             * stop retrying once it is spent — an unbounded retry here
              * wedges the pump, while the receive thread (udp2tun) keeps
              * draining the socket so backpressure clears once we stop
              * hammering it. poll() already waited for writability, so
@@ -250,9 +253,13 @@ static int send_gso(pump_ctx_t *ctx, struct iovec *iov, unsigned n,
         }
         if (errno == EINTR)
             continue;
-        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS) {
-            /* same budget-bounded wait as send_batch: poll at most the
-             * remaining retry budget, then yield to the receive path */
+        if (errno == EAGAIN || errno == EWOULDBLOCK ||
+            errno == ENOBUFS || errno == EPERM) {
+            /* EPERM: netfilter OUTPUT DROP returns EPERM for the
+             * dropped datagram — transient per-packet, retry like
+             * EAGAIN (same budget-bounded wait as send_batch: poll at
+             * most the remaining retry budget, then yield to the
+             * receive path) */
             uint64_t el = now_ms() - retry_t0;
             if (el >= PUMP_SEND_RETRY_MS)
                 return 1;   /* bounded: let the receive path drain */

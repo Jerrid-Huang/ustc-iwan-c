@@ -250,7 +250,12 @@ static int socks_send_batch2(int sockfd, SocksConfig *cfg,
                     return npk;
                 if (r < 0 &&
                     (errno == EAGAIN || errno == EWOULDBLOCK ||
-                     errno == ENOBUFS || errno == EINTR)) {
+                     errno == ENOBUFS || errno == EINTR ||
+                     errno == EPERM)) {
+                    /* EPERM: netfilter OUTPUT DROP returns EPERM for
+                     * the dropped datagram (firewall rule, not a dead
+                     * tunnel) — transient per-packet, retry like
+                     * EAGAIN; TCP retransmission covers the loss */
                     if (errno != EINTR) {
                         /* throttled diagnostic: identify which error
                          * wedges the drain under burst load */
@@ -325,13 +330,17 @@ per_msg:
                 return (int)sent;
             if (errno == EINTR)
                 continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS) {
-                /* send buffer full: poll up to 1ms for writability,
-                 * then retry immediately (writable -> the buffer
-                 * drained -> resend; same shape as the GSO path above
-                 * and proxy.c send_batch). Never blocks the single
-                 * event loop — receive_vpn must keep draining downlink
-                 * (ACKs, keepalive replies) or the receive buffer
+            if (errno == EAGAIN || errno == EWOULDBLOCK ||
+                errno == ENOBUFS || errno == EPERM) {
+                /* EPERM: netfilter OUTPUT DROP returns EPERM for the
+                 * dropped datagram — transient per-packet, retry like
+                 * EAGAIN (send buffer full: poll up to 1ms for
+                 * writability, then retry immediately (writable -> the
+                 * buffer drained -> resend; same shape as the GSO path
+                 * above and proxy.c send_batch). Never blocks the
+                 * single event loop — receive_vpn must keep draining
+                 * downlink (ACKs, keepalive replies) or the receive
+                 * buffer
                  * overflows and the peer's segments (and our own ACK
                  * stream) get dropped, which triggers a retransmit
                  * storm upstream. Bounded: beyond the budget, return
