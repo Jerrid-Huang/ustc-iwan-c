@@ -7,8 +7,8 @@ bin/
 *.o
 *.a
 *.log
-core
-core.*
+/core
+/core.*
 .cc_tmp/
 compile_commands.json
 local*
