@@ -191,6 +191,18 @@ target_include_directories(lwip PUBLIC
   third_party/lwip/include
   third_party/lwip/port)
 
+# clang-only: vendored tcp.c:941 compares TCP_WND/2 (131072 with our
+# 256KB window) against pcb->mss (u16_t), which
+# -Wtautological-constant-out-of-range-compare (promoted by -Werror)
+# flags as always-false. Upstream lwIP assumes TCP_WND fits u16; keep
+# the vendored tree pristine and silence the diagnostic for the
+# third-party library only (our own code still builds with -Werror).
+# GCC/MinGW never see this flag (unknown-option warning would trip the
+# CI grep gate).
+if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+  target_compile_options(lwip PRIVATE -Wno-tautological-constant-out-of-range-compare)
+endif()
+
 add_library(iwan_core STATIC ${IWAN_CORE_SRCS})
 target_include_directories(iwan_core PUBLIC src/common)
 target_link_libraries(iwan_core PUBLIC lwip)
