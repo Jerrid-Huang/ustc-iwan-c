@@ -52,6 +52,10 @@ sudo ./iwan-client-oidc --all
 - 同一端口同时接受 HTTP 代理握手（设置 `--socks-token` 后禁用）。
 - 默认按服务器不支持 IPv6 处理：域名仅解析 IPv4，`ATYP=4`（IPv6 目标）请求返回 `rep=8`。确认服务器可转发 IPv6 时加 `--socks-ipv6`，此时域名解析优先 IPv6（AAAA）并接受 IPv6 目标。
 
+### TUN 模式附加代理
+
+TUN 模式下加 `--socks-listen 127.0.0.1:1080` 即可在同一端口提供 SOCKS5 + HTTP 代理；代理连接走本机内核栈，**与 TUN 路由规则一致**（默认路由全走隧道；`--proxy-cidr` 模式下仅 CIDR 内目标走隧道）。`--socks-token` / `--socks-no-token` / `--allow-remote` 语义与 SOCKS5 模式相同。
+
 ### 常用参数
 
 | 参数 | 说明 |
