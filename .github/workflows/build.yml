@@ -665,11 +665,16 @@ jobs:
           # static x86_64 OpenSSL from source for the cross link.
           # Pin the 3.5 line: the 4.x Configure targets were renamed and
           # darwin64-x86_64-cc is gone (the rest of CI also builds 3.5).
-          VER="$(curl -s "https://api.github.com/repos/openssl/openssl/tags?per_page=100" \
-            | jq -r '.[].name | select(test("^openssl-3\\.5\\."))' | head -1)"
-          [ -n "$VER" ] && [ "$VER" != "null" ]
+          # The unauthenticated tags API is rate-limited on shared
+          # runners and can return a non-array body; tolerate that and
+          # fall back to a known-good pinned version instead of
+          # downloading "<empty>.tar.gz".
+          VER="$(curl -s --retry 3 "https://api.github.com/repos/openssl/openssl/tags?per_page=100" \
+            | jq -r 'if type == "array" then (.[].name | select(test("^openssl-3\\.5\\."))) else empty end' \
+            | head -1)"
+          [ -n "$VER" ] || VER="openssl-3.5.1"
           echo "building OpenSSL $VER for x86_64"
-          curl -sL --retry 3 --max-time 400 \
+          curl -sfL --retry 3 --max-time 400 \
             "https://github.com/openssl/openssl/archive/refs/tags/${VER}.tar.gz" \
             -o /tmp/ossl.tgz
           tar xzf /tmp/ossl.tgz -C /tmp
