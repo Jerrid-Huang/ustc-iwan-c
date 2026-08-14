@@ -5,6 +5,7 @@ Usage: echo_server.py --bind IP --port PORT
 One thread per connection; echoes every received byte back verbatim.
 """
 import argparse
+import socket
 import socketserver
 import threading
 
@@ -29,6 +30,13 @@ class EchoHandler(socketserver.BaseRequestHandler):
 class ThreadedServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
+
+    def __init__(self, addr, handler):
+        # socketserver defaults to AF_INET, which cannot bind an IPv6
+        # address; pick the family from the bind address instead.
+        self.address_family = (socket.AF_INET6 if ":" in addr[0]
+                               else socket.AF_INET)
+        super().__init__(addr, handler)
 
 
 def main():
