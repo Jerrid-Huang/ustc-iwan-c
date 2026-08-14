@@ -791,7 +791,7 @@ static void *dns_worker(void *arg) {
          * resolve via the system resolver — no session socket involved,
          * so the generation gate above is sufficient */
         uint32_t lip = 0;
-        uint8_t lip6[16], af = 4;
+        uint8_t lip6[16] = {0}, af = 4;
         if (dns_query_local(j->domain, &af, &lip, lip6))
             dns_push(j->flow_id, true, af, lip, lip6, j->port);
         else

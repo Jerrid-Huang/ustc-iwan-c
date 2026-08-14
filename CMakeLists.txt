@@ -206,6 +206,12 @@ target_include_directories(lwip PUBLIC
 if(CMAKE_C_COMPILER_ID MATCHES "Clang")
   target_compile_options(lwip PRIVATE -Wno-tautological-constant-out-of-range-compare)
 endif()
+# vendored ip6_addr.c:284 (ip6addr_ntoa_r) indexes addr[(block+1)>>1]
+# which is addr[4] at the last block — a latent upstream OOB read that
+# gcc's -Warray-bounds only proves on some targets (s390x). Suppress for
+# the third-party library only; the function is used solely for debug
+# printing, never in the data path. Known to both gcc and clang.
+target_compile_options(lwip PRIVATE -Wno-array-bounds)
 
 add_library(iwan_core STATIC ${IWAN_CORE_SRCS})
 target_include_directories(iwan_core PUBLIC src/common)
