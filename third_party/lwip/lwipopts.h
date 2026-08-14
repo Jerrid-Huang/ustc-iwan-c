@@ -73,6 +73,15 @@
 
 /* ---- TCP tuning ---- */
 #define TCP_MSS           1460
+/* Initial TCP retransmission timeout: 1000ms (RFC 6298 fast-network
+ * value) instead of lwIP's 3000ms default. A single lost inner segment
+ * (UDP loss / local TX backpressure) would otherwise stall the flow for
+ * a full 3s before the first retransmit — measured as multi-second
+ * "tail" stalls on small TLS/HTTP requests over the real line, where
+ * there is no dupACK traffic to trigger fast retransmit. SYN retries
+ * follow the same 1s cadence (6 retries -> ~6.5s connect timeout
+ * instead of ~18.5s). */
+#define LWIP_TCP_RTO_TIME 1000
 /* 256KB receive window, matching native NS_WINDOW; WSCALE=4 keeps the
  * wire field at 16KB (<<16 fits). */
 #define TCP_WND           (256 * 1024)

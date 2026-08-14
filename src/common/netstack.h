@@ -217,5 +217,8 @@ void ns_tx_rearm_seg(Netstack *ns, const void *seg, uint8_t conn);
  * inline control) */
 size_t ns_tx_item_len(const struct TxItem *it);
 const uint8_t *ns_tx_item_buf(const struct TxItem *it);
+/* no-op on the native stack (see lwip_bridge.h); exists so the SOCKS
+ * loop can call it uniformly after draining the tx queue */
+void ns_tx_kick(Netstack *ns);
 
 #endif

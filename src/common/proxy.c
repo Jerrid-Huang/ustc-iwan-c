@@ -260,9 +260,20 @@ static int send_gso(pump_ctx_t *ctx, struct iovec *iov, unsigned n,
             port_poll(&pfd, 1, (int)(PUMP_SEND_RETRY_MS - el));
             continue;
         }
-        eprintf("[TUN->UDP] sendmsg: %s\n", strerror(errno));
-        g_stop = 1;
-        return 1;
+        eprintf("[TUN->UDP] sendmsg GSO failed: %s; disabling "
+                "UDP_SEGMENT\n", strerror(errno));
+        /* a hard GSO error means the feature is unusable on this
+         * socket, not that the tunnel died: disable it and fall back
+         * to the per-message sendmmsg path (send_batch) for this batch
+         * and all future ones */
+        ctx->gso_ok = 0;
+        ctx->gso_mss = 0;
+        {
+            int z = 0;
+            port_setsockopt(ctx->sockfd, SOL_UDP, UDP_SEGMENT, &z,
+                            sizeof z);
+        }
+        return 0;
     }
     return 1;
 }

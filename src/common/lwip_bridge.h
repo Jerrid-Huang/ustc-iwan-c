@@ -140,5 +140,10 @@ const struct TxItem *ns_tx_pop(Netstack *ns);
 void ns_tx_rearm_seg(Netstack *ns, const void *seg, uint8_t conn);
 size_t ns_tx_item_len(const struct TxItem *it);
 const uint8_t *ns_tx_item_buf(const struct TxItem *it);
+/* Call after the tx queue has been drained: lwIP may have marked
+ * TF_NAGLEMEMERR when bridge_output returned ERR_MEM (queue full), and
+ * tcp_txnow() retries the pending output immediately instead of waiting
+ * for an ACK/timer/RTO. No-op on the native stack. */
+void ns_tx_kick(Netstack *ns);
 
 #endif /* IWAN_LWIP_BRIDGE_H */

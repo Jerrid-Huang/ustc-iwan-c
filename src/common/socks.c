@@ -278,13 +278,27 @@ static int socks_send_batch2(int sockfd, SocksConfig *cfg,
                     }
                     continue;
                 }
-                log_err("SOCKS GSO send failed: %s", strerror(errno));
-                g_stop = 1;
-                return 0;
+                /* hard error (EIO/EINVAL/EMSGSIZE/...): UDP_SEGMENT is
+                 * unusable on this socket — a feature failure, NOT a
+                 * dead tunnel. Disable GSO permanently and fall through
+                 * to the per-message sendmmsg path for this batch and
+                 * all future ones; only that path may declare the
+                 * session lost. */
+                log_err("SOCKS GSO send failed: %s; disabling "
+                        "UDP_SEGMENT", strerror(errno));
+                cfg->gso_ok = -1;
+                cfg->gso_mss = 0;
+                {
+                    int z = 0;
+                    port_setsockopt(sockfd, SOL_UDP, UDP_SEGMENT,
+                                    &z, sizeof z);
+                }
+                goto per_msg;
             }
             return 0;
         }
     }
+per_msg:
 
     /* per-message path: a lingering UDP_SEGMENT would silently split any
      * datagram longer than the mss, so clear it first */
@@ -337,7 +351,11 @@ static int socks_send_batch2(int sockfd, SocksConfig *cfg,
                 continue;
             }
             log_err("SOCKS sendmmsg: %s", strerror(errno));
-            g_stop = 1;
+            /* the tunnel socket itself is broken (not a transient
+             * buffer condition): mark the session lost so the main
+             * loop re-auths in place (or the legacy caller reconnects)
+             * instead of killing the whole SOCKS proxy */
+            cfg->session_lost = true;
             return (int)sent;
         }
         return (int)sent;
@@ -843,6 +861,25 @@ int run_socks(int sockfd, SocksConfig *cfg) {
          * valid only until receive_vpn's handle_rx drop/compact moves
          * the retransmit table */
         sock_drain_tx(sockfd, cfg);
+        if (cfg->session_lost) {
+            /* a hard send error killed the tunnel socket: re-auth in
+             * place (callback) or legacy exit for the caller loop.
+             * session_lost is cleared inside socks_reauth_tunnel on
+             * success; on failure it stays cleared so the retry runs
+             * on the reauth_at schedule instead of every loop round. */
+            int nfd = socks_reauth_tunnel(cfg);
+            if (nfd >= 0) {
+                port_close(sockfd);
+                sockfd = nfd;
+                g_sockfd = nfd;
+            } else if (!cfg->reauth) {
+                break;
+            } else {
+                cfg->session_lost = false;
+            }
+        }
+        /* the queue drained: let lwIP retry output it held on ERR_MEM */
+        ns_tx_kick(&g_ns);
         send_vpn_keepalive(sockfd, cfg, &last_ka);
         if (cfg->ka_fail >= SOCKS_KA_FAIL_MAX) {
             log_err("SOCKS: %d consecutive keepalive send failures; "
@@ -884,6 +921,8 @@ int run_socks(int sockfd, SocksConfig *cfg) {
         int tick_ms = ns_tick(&g_ns, now_ms());
         /* flush freshly enqueued segments (same-round, pointers valid) */
         sock_drain_tx(sockfd, cfg);
+        /* the queue drained: retry lwIP output it held on ERR_MEM */
+        ns_tx_kick(&g_ns);
         update_tcp_states();
         reap_flows();
 

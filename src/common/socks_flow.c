@@ -742,8 +742,8 @@ static bool dns_query_local(const char *domain, uint8_t *af_out,
     /* dual-stack (prefer IPv6 when present) only when the server is
      * assumed to relay IPv6 (--socks-ipv6); the default assumes a
      * v4-only relay and resolves A records only — a v6-first choice
-     * would blackhole dual-stack domains there (~18.5s SYN retries,
-     * then rep=4). */
+     * would blackhole dual-stack domains there (~6.5s SYN retries with
+     * the 1s RTO, then rep=4). */
     hints.ai_family = socks_v6_ok() ? AF_UNSPEC : AF_INET;
     hints.ai_socktype = SOCK_STREAM;
     rc = getaddrinfo(domain, NULL, &hints, &res);
@@ -1594,7 +1594,7 @@ static void handshake_request(Flow *f)
             /* default: the server is assumed to be IPv4-only — an
              * ATYP=4 target cannot be relayed, so reject it like any
              * other unsupported address type instead of blackholing
-             * the SYN for ~18.5s */
+             * the SYN for ~6.5s */
             buf_consume(&f->input, 22);
             queue_socks_error(f, 8);
             return;

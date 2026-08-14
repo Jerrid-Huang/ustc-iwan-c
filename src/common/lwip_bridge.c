@@ -37,6 +37,7 @@
 #include "lwip/pbuf.h"
 #include "lwip/sys.h"
 #include "lwip/tcp.h"
+#include "lwip/priv/tcp_priv.h"   /* tcp_txnow() */
 #include "lwip/timeouts.h"
 
 #define NS_CONNECT_TIMEOUT 30000u
@@ -794,4 +795,15 @@ size_t ns_tx_item_len(const TxItem *it)
 const uint8_t *ns_tx_item_buf(const TxItem *it)
 {
     return it->seg ? ((const FramedPkt *)it->seg)->buf : it->ctl;
+}
+
+void ns_tx_kick(Netstack *ns)
+{
+    (void)ns;
+    /* bridge_output returned ERR_MEM while the tx queue was full, which
+     * made lwIP set TF_NAGLEMEMERR and hold the pending output; the
+     * queue has since been drained, so retry it now instead of waiting
+     * for the next ACK, timer or RTO (measured as multi-second stalls
+     * on uploads under local backpressure). */
+    tcp_txnow();
 }

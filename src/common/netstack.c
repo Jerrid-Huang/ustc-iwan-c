@@ -1464,4 +1464,11 @@ const uint8_t *ns_tx_item_buf(const TxItem *it)
     return it->seg ? ((const Seg *)it->seg)->hdr : it->ctl;
 }
 
+void ns_tx_kick(Netstack *ns)
+{
+    /* native stack has no lwIP-style TF_NAGLEMEMERR stall: the retransmit
+     * timer and per-tick conn_tick re-drive unsent segments on their own */
+    (void)ns;
+}
+
 
