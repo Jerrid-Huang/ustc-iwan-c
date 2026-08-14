@@ -32,9 +32,12 @@
  * runs on several SO_REUSEPORT recv threads. */
 #define ECHO_MAX_CONN 64
 struct echo_conn {
-    uint32_t c_ip;               /* client inner IP (BE) */
+    uint8_t  af;                 /* 4 or 6 */
+    uint32_t c_ip;               /* client inner IP (BE) — af == 4 */
+    uint8_t  c6[16];             /* client inner address — af == 6 */
     uint16_t c_port;
-    uint32_t t_ip;               /* target IP (BE) */
+    uint32_t t_ip;               /* target IP (BE) — af == 4 */
+    uint8_t  t6[16];             /* target address — af == 6 */
     uint16_t t_port;
     uint32_t seq;                /* next seq to emit */
     uint64_t last_ms;            /* idle reclamation */
@@ -42,8 +45,10 @@ struct echo_conn {
 static struct echo_conn g_echo[ECHO_MAX_CONN];
 static pthread_mutex_t g_echo_mu = PTHREAD_MUTEX_INITIALIZER;
 
-static struct echo_conn *echo_lookup(uint32_t c_ip, uint16_t c_port,
-                                     uint32_t t_ip, uint16_t t_port,
+static struct echo_conn *echo_lookup(uint8_t af, const uint32_t *c4,
+                                     const uint8_t c6[16], uint16_t c_port,
+                                     const uint32_t *t4,
+                                     const uint8_t t6[16], uint16_t t_port,
                                      bool create)
 {
     uint64_t now = now_ms();
@@ -52,8 +57,11 @@ static struct echo_conn *echo_lookup(uint32_t c_ip, uint16_t c_port,
     pthread_mutex_lock(&g_echo_mu);
     for (int i = 0; i < ECHO_MAX_CONN; i++) {
         ec = &g_echo[i];
-        if (ec->last_ms != 0 && ec->c_ip == c_ip && ec->c_port == c_port &&
-            ec->t_ip == t_ip && ec->t_port == t_port) {
+        if (ec->last_ms != 0 && ec->af == af && ec->c_port == c_port &&
+            ec->t_port == t_port &&
+            ((af == 4 && ec->c_ip == *c4 && ec->t_ip == *t4) ||
+             (af == 6 && memcmp(ec->c6, c6, 16) == 0 &&
+              memcmp(ec->t6, t6, 16) == 0))) {
             ec->last_ms = now;
             pthread_mutex_unlock(&g_echo_mu);
             return ec;
@@ -64,10 +72,16 @@ static struct echo_conn *echo_lookup(uint32_t c_ip, uint16_t c_port,
             ec->last_ms = 0, free_slot = ec;   /* idle reclaim */
     }
     if (create && free_slot) {
-        free_slot->c_ip = c_ip;
+        free_slot->af = af;
         free_slot->c_port = c_port;
-        free_slot->t_ip = t_ip;
         free_slot->t_port = t_port;
+        if (af == 4) {
+            free_slot->c_ip = *c4;
+            free_slot->t_ip = *t4;
+        } else {
+            memcpy(free_slot->c6, c6, 16);
+            memcpy(free_slot->t6, t6, 16);
+        }
         free_slot->seq = 0;
         free_slot->last_ms = now;
         pthread_mutex_unlock(&g_echo_mu);
@@ -908,25 +922,50 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
             if (debug_enabled())
                 tx1 = now_ns();
             /* H1: the decrypted payload must be a sane IPv4 packet whose
-             * source is the session's assigned address. Anything else is
-             * a malformed or spoofed frame — drop it before it reaches
+             * source is the session's assigned address, or a sane IPv6
+             * packet whose source is the session's derived ULA
+             * (fd00::/96 + assigned IPv4, see protocol.h). Anything else
+             * is a malformed or spoofed frame — drop it before it reaches
              * the TUN (counted; logged only under IWAN_DEBUG). The inner
              * header sits at raw+IWAN_HDR_LEN, behind the outer
              * header. */
-            if (len <= IWAN_HDR_LEN ||
-                ipv4_pkt_ok(raw + IWAN_HDR_LEN, len - IWAN_HDR_LEN,
-                            &saddr, &daddr) != 0 ||
-                saddr != s_ip) {
+            if (len <= IWAN_HDR_LEN) {
                 g_up[tid].h1++;
-                if (debug_enabled())
-                    log_debug("uplink drop: bad inner IPv4 (sid 0x%04x) "
-                              "%u.%u.%u.%u->%u.%u.%u.%u v=%u ihl=%u tot=%u",
-                              sid, raw[8 + 12], raw[8 + 13], raw[8 + 14],
-                              raw[8 + 15], raw[8 + 16], raw[8 + 17],
-                              raw[8 + 18], raw[8 + 19], raw[8] >> 4,
-                              raw[8] & 0x0F,
-                              ((unsigned)raw[8 + 2] << 8) | raw[8 + 3]);
                 break;
+            }
+            {
+                const uint8_t *in = raw + IWAN_HDR_LEN;
+                size_t inlen = len - IWAN_HDR_LEN;
+                if ((in[0] >> 4) == 6) {
+                    uint8_t s6[16], d6[16], want6[16];
+                    ip6_derive_ula(s_ip, want6);
+                    if (ip6_pkt_ok(in, inlen, s6, d6) != 0 ||
+                        memcmp(s6, want6, 16) != 0) {
+                        g_up[tid].h1++;
+                        if (debug_enabled())
+                            log_debug("uplink drop: bad inner IPv6 "
+                                      "(sid 0x%04x) v=%u nexth=%u plen=%u",
+                                      sid, in[0] >> 4, in[6],
+                                      ((unsigned)in[4] << 8) | in[5]);
+                        break;
+                    }
+                } else {
+                    if (ipv4_pkt_ok(in, inlen, &saddr, &daddr) != 0 ||
+                        saddr != s_ip) {
+                        g_up[tid].h1++;
+                        if (debug_enabled())
+                            log_debug("uplink drop: bad inner IPv4 "
+                                      "(sid 0x%04x) %u.%u.%u.%u->%u.%u.%u.%u "
+                                      "v=%u ihl=%u tot=%u",
+                                      sid, raw[8 + 12], raw[8 + 13],
+                                      raw[8 + 14], raw[8 + 15], raw[8 + 16],
+                                      raw[8 + 17], raw[8 + 18], raw[8 + 19],
+                                      raw[8] >> 4, raw[8] & 0x0F,
+                                      ((unsigned)raw[8 + 2] << 8) |
+                                          raw[8 + 3]);
+                        break;
+                    }
+                }
             }
             if (ctx->tun_fd >= 0 && len > IWAN_HDR_LEN) {
                 /* device TX queue full: wait briefly for drain instead of
@@ -1056,6 +1095,107 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
     }
 }
 
+/* --no-tun echo mode: mirror an inner IPv6/TCP packet back to its
+ * sender (v6 sibling of echo_mirror; same stateless-ish swap, checksum
+ * via the IPv6 pseudo header). */
+static int echo_mirror6(struct server_ctx *ctx, uint8_t *p, size_t len,
+                        int sockfd)
+{
+    uint32_t seq, ack, s_orig;
+    uint16_t sport, dport, cs;
+    uint8_t flags;
+    size_t thlen, paylen;
+    uint8_t tmp16[16];
+
+    if (len < 60) {              /* 40 IPv6 + 20 TCP */
+        if (debug_enabled())
+            log_debug("echo6: short pkt %zu", len);
+        return -1;
+    }
+    if (p[6] != IPPROTO_TCP) {   /* next header must be TCP (no ext hdrs) */
+        if (debug_enabled())
+            log_debug("echo6: nexth %u not TCP", p[6]);
+        return -1;
+    }
+    thlen = (size_t)((p[52] >> 4) & 0x0F) * 4;
+    if (len < 40 + thlen) {
+        if (debug_enabled())
+            log_debug("echo6: bad thlen %zu len %zu", thlen, len);
+        return -1;
+    }
+    if (debug_enabled()) {
+        char hx[160];
+        size_t hn = len < 52 ? len : 52;   /* 52*3+1 = 157 < 160 */
+        for (size_t k = 0; k < hn; k++)
+            sprintf(hx + k * 3, "%02x ", p[k]);
+        log_debug("echo6: [%02x%02x:..:%02x%02x]:%u -> [%02x%02x:..:%02x%02x]:%u "
+                  "flags=%02x len=%zu [%s]",
+                  p[8], p[9], p[22], p[23],
+                  (unsigned)((p[40] << 8) | p[41]),
+                  p[24], p[25], p[38], p[39],
+                  (unsigned)((p[42] << 8) | p[43]),
+                  p[53], len, hx);
+    }
+    sport = (uint16_t)((p[40] << 8) | p[41]);
+    dport = (uint16_t)((p[42] << 8) | p[43]);
+    s_orig = ((uint32_t)p[44] << 24) | ((uint32_t)p[45] << 16) |
+             ((uint32_t)p[46] << 8) | p[47];
+    flags = p[53];
+    paylen = len - 40 - thlen;
+
+    {
+        struct echo_conn *ec = echo_lookup(6, NULL, p + 8, sport,
+                                           NULL, p + 24, dport,
+                                           (flags & TCP_SYN) != 0);
+        if (!ec)
+            return -1;           /* table full */
+        seq = ec->seq;
+        if (flags & TCP_SYN)
+            ec->seq = 1;
+        else if (flags & TCP_FIN)
+            ec->seq += (uint32_t)paylen + 1;
+        else if (paylen > 0)
+            ec->seq += (uint32_t)paylen;
+    }
+    /* swap addresses byte-wise */
+    memcpy(tmp16, p + 8, 16);
+    memcpy(p + 8, p + 24, 16);
+    memcpy(p + 24, tmp16, 16);
+    /* swap TCP ports */
+    p[40] = (uint8_t)(dport >> 8);
+    p[41] = (uint8_t)dport;
+    p[42] = (uint8_t)(sport >> 8);
+    p[43] = (uint8_t)sport;
+    /* mirrored ack advances past the client's bytes; seq from the table */
+    if (flags & TCP_SYN) {
+        ack = s_orig + 1;
+        flags |= TCP_ACK;
+    } else if (flags & TCP_FIN) {
+        ack = s_orig + (uint32_t)paylen + 1;
+        flags |= TCP_ACK;
+    } else {
+        ack = s_orig + (uint32_t)paylen;
+    }
+    p[53] = flags;
+    p[44] = (uint8_t)(seq >> 24);
+    p[45] = (uint8_t)(seq >> 16);
+    p[46] = (uint8_t)(seq >> 8);
+    p[47] = (uint8_t)seq;
+    p[48] = (uint8_t)(ack >> 24);
+    p[49] = (uint8_t)(ack >> 16);
+    p[50] = (uint8_t)(ack >> 8);
+    p[51] = (uint8_t)ack;
+    /* TCP checksum over the IPv6 pseudo header (mirrored addresses) */
+    p[56] = 0;
+    p[57] = 0;
+    cs = ip6_tcp_csum(p + 8, p + 24, p + 40, len - 40);
+    p[56] = (uint8_t)(cs >> 8);
+    p[57] = (uint8_t)cs;
+
+    handle_tun_downlink(ctx, p, len, sockfd);
+    return 0;
+}
+
 /* --no-tun echo mode: mirror an inner IPv4/TCP packet back to its
  * sender by swapping addresses/ports and seq/ack and turning SYN/FIN
  * into SYN+ACK/FIN+ACK (ISN 0, so no per-connection state). The client
@@ -1066,6 +1206,9 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
 int echo_mirror(struct server_ctx *ctx, uint8_t *p, size_t len,
                 int sockfd)
 {
+    if (len >= 1 && (p[0] >> 4) == 6)
+        return echo_mirror6(ctx, p, len, sockfd);
+
     uint32_t seq, ack, s_orig, nsrc, ndst;
     uint16_t sport, dport, cs;
     uint8_t ihl, flags;
@@ -1121,7 +1264,8 @@ int echo_mirror(struct server_ctx *ctx, uint8_t *p, size_t len,
      * advance our emit seq (a stateless swap would repeat the same seq
      * and the client would discard every mirrored segment as OOO) */
     {
-        struct echo_conn *ec = echo_lookup(nsrc, sport, ndst, dport,
+        struct echo_conn *ec = echo_lookup(4, &nsrc, NULL, sport,
+                                           &ndst, NULL, dport,
                                            (flags & TCP_SYN) != 0);
         if (!ec)
             return -1;           /* table full */
@@ -1192,43 +1336,85 @@ void handle_tun_downlink(struct server_ctx *ctx, const uint8_t *ip_pkt, size_t l
 
     if (len < 20 || len > 65536)
         return;
-    /* H1: gate the inner IPv4 header before any session lookup. dst
-     * must be a client address or the server's own address; the latter
-     * is the SOCKS-mode local-delivery case and must never be rejected
-     * here (a session can never own it: server_ip is validated outside
-     * the client pool at startup). */
-    if (ipv4_pkt_ok(ip_pkt, len, &saddr, &daddr) != 0) {
-        atomic_fetch_add(&g_dl_drops, 1);
-        if (debug_enabled()) {
-            /* len<20 already filtered above, so src/dst bytes are safe */
-            log_debug("downlink drop: bad inner IPv4 (%zuB) %u.%u.%u.%u->%u.%u.%u.%u v=%u ihl=%u tot=%u",
-                      len, ip_pkt[12], ip_pkt[13], ip_pkt[14], ip_pkt[15],
-                      ip_pkt[16], ip_pkt[17], ip_pkt[18], ip_pkt[19],
-                      ip_pkt[0] >> 4, ip_pkt[0] & 0x0F,
-                      ((unsigned)ip_pkt[2] << 8) | ip_pkt[3]);
-        }
-        return;
-    }
-    if (daddr == ip4_u32(ctx->server_ip)) {
-        /* server-bound packet: the gate allows it, but no client owns
-         * this address — the server machine consumes it locally */
-        return;
-    }
-    /* snapshot under the read lock; the send happens lock-free */
-    pthread_rwlock_rdlock(&ctx->sess_lock);
-    {
-        struct server_session *s = find_session_by_ip_unlocked(ctx, ip_pkt + 16);
-        if (!s) {
-            pthread_rwlock_unlock(&ctx->sess_lock);
+    /* H1: gate the inner header before any session lookup. dst must be a
+     * client address or the server's own address; the latter is the
+     * SOCKS-mode local-delivery case and must never be rejected here (a
+     * session can never own it: server_ip is validated outside the client
+     * pool at startup). IPv4 sessions match the assigned address; IPv6
+     * sessions match the derived ULA (fd00::/96 + assigned IPv4). */
+    if ((ip_pkt[0] >> 4) == 6) {
+        uint8_t s6[16], d6[16];
+        if (len < 40 || ip6_pkt_ok(ip_pkt, len, s6, d6) != 0) {
+            atomic_fetch_add(&g_dl_drops, 1);
+            if (debug_enabled())
+                log_debug("downlink drop: bad inner IPv6 (%zuB) v=%u "
+                          "plen=%u",
+                          len, ip_pkt[0] >> 4,
+                          ((unsigned)ip_pkt[4] << 8) | ip_pkt[5]);
             return;
         }
-        snap.peer = s->peer;
-        snap.sid = s->sid;
-        snap.token = s->token;
-        snap.enc = s->enc;
-        memcpy(snap.xor_key, s->xor_key, sizeof snap.xor_key);
+        /* server-bound (its own derived ULA): consumed locally */
+        {
+            uint8_t srv6[16];
+            ip6_derive_ula(ip4_u32(ctx->server_ip), srv6);
+            if (memcmp(d6, srv6, 16) == 0)
+                return;
+        }
+        /* session lookup: the client's ULA embeds its inner IPv4 in the
+         * low 32 bits (protocol.h), so the IPv4 session table applies */
+        pthread_rwlock_rdlock(&ctx->sess_lock);
+        {
+            struct server_session *s = find_session_by_ip_unlocked(ctx, d6 + 12);
+            if (!s) {
+                pthread_rwlock_unlock(&ctx->sess_lock);
+                return;
+            }
+            snap.peer = s->peer;
+            snap.sid = s->sid;
+            snap.token = s->token;
+            snap.enc = s->enc;
+            memcpy(snap.xor_key, s->xor_key, sizeof snap.xor_key);
+        }
+        pthread_rwlock_unlock(&ctx->sess_lock);
+    } else {
+        /* H1: gate the inner IPv4 header before any session lookup. dst
+         * must be a client address or the server's own address; the latter
+         * is the SOCKS-mode local-delivery case and must never be rejected
+         * here (a session can never own it: server_ip is validated outside
+         * the client pool at startup). */
+        if (ipv4_pkt_ok(ip_pkt, len, &saddr, &daddr) != 0) {
+            atomic_fetch_add(&g_dl_drops, 1);
+            if (debug_enabled()) {
+                /* len<20 already filtered above, so src/dst bytes are safe */
+                log_debug("downlink drop: bad inner IPv4 (%zuB) %u.%u.%u.%u->%u.%u.%u.%u v=%u ihl=%u tot=%u",
+                          len, ip_pkt[12], ip_pkt[13], ip_pkt[14], ip_pkt[15],
+                          ip_pkt[16], ip_pkt[17], ip_pkt[18], ip_pkt[19],
+                          ip_pkt[0] >> 4, ip_pkt[0] & 0x0F,
+                          ((unsigned)ip_pkt[2] << 8) | ip_pkt[3]);
+            }
+            return;
+        }
+        if (daddr == ip4_u32(ctx->server_ip)) {
+            /* server-bound packet: the gate allows it, but no client owns
+             * this address — the server machine consumes it locally */
+            return;
+        }
+        /* snapshot under the read lock; the send happens lock-free */
+        pthread_rwlock_rdlock(&ctx->sess_lock);
+        {
+            struct server_session *s = find_session_by_ip_unlocked(ctx, ip_pkt + 16);
+            if (!s) {
+                pthread_rwlock_unlock(&ctx->sess_lock);
+                return;
+            }
+            snap.peer = s->peer;
+            snap.sid = s->sid;
+            snap.token = s->token;
+            snap.enc = s->enc;
+            memcpy(snap.xor_key, s->xor_key, sizeof snap.xor_key);
+        }
+        pthread_rwlock_unlock(&ctx->sess_lock);
     }
-    pthread_rwlock_unlock(&ctx->sess_lock);
 
     pkt_hdr(snap.enc ? PT_DATA_ENC : PT_DATA, snap.enc, snap.sid,
             snap.token, out);

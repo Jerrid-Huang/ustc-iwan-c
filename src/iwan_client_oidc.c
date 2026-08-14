@@ -43,6 +43,7 @@ int main(int argc, char **argv)
     slist_init(&o.proxy_cidr);
     slist_init(&o.proxy_ip);
     slist_init(&o.proxy_domain);
+    slist_init(&o.proxy_cidr6);
 
     Cli usage;
     oidc_parse_cli(argc, argv, &o, &usage);
@@ -125,5 +126,6 @@ int main(int argc, char **argv)
     slist_free(&o.proxy_cidr);
     slist_free(&o.proxy_ip);
     slist_free(&o.proxy_domain);
+    slist_free(&o.proxy_cidr6);
     return 0;
 }

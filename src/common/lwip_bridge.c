@@ -23,12 +23,15 @@
 
 #include "crypto.h"
 #include "lwip_bridge.h"
+#include "protocol.h"
 #include "util.h"
 
 #include "lwip/init.h"
 #include "lwip/ip.h"
 #include "lwip/ip4.h"
 #include "lwip/ip4_addr.h"
+#include "lwip/ip6.h"
+#include "lwip/ip6_addr.h"
 #include "lwip/ip_addr.h"
 #include "lwip/netif.h"
 #include "lwip/pbuf.h"
@@ -118,14 +121,15 @@ static int tx_enqueue(Netstack *ns, FramedPkt *fp, uint8_t conn)
     return 1;
 }
 
-/* parse the inner IPv4+TCP header of an outgoing packet: return the owning
- * conn index (matched by local/remote port) and whether it carries payload.
- * Returns -1 when the header cannot be parsed (chained pbuf is handled via
- * pbuf_copy_partial, so this is robust). */
+/* parse the inner IPv4+TCP or IPv6+TCP header of an outgoing packet:
+ * return the owning conn index (matched by local/remote port) and
+ * whether it carries payload. Returns -1 when the header cannot be
+ * parsed (chained pbuf is handled via pbuf_copy_partial, so this is
+ * robust). */
 static int bridge_output_parse(Netstack *ns, const struct pbuf *p,
                                int *has_payload)
 {
-    uint8_t h[40];
+    uint8_t h[80];   /* 40B IPv6 hdr + 40B TCP (v6 SYN has thlen 28..40) */
     const uint8_t *t;
     uint16_t sport, dport;
     size_t ihl, thlen, tot;
@@ -133,19 +137,36 @@ static int bridge_output_parse(Netstack *ns, const struct pbuf *p,
     *has_payload = 0;
     if (pbuf_copy_partial(p, h, sizeof h, 0) != sizeof h)
         return -1;
-    ihl = (size_t)(h[0] & 0x0f) * 4;
-    if (ihl < 20 || ihl > sizeof h - 20)
-        return -1;
-    t = h + ihl;
-    thlen = (size_t)(t[12] >> 4) * 4;
-    if (thlen < 20 || ihl + thlen > sizeof h)
-        return -1;
-    tot = ((size_t)h[2] << 8) | h[3];
-    if (tot < ihl + thlen)
-        return -1;
-    *has_payload = tot > ihl + thlen;
-    sport = (uint16_t)((t[0] << 8) | t[1]);
-    dport = (uint16_t)((t[2] << 8) | t[3]);
+
+    if ((h[0] >> 4) == 6) {
+        /* IPv6: fixed 40-byte header, next header must be TCP (we never
+         * generate extension headers) */
+        if (h[6] != 6)
+            return -1;
+        ihl = 40;
+        tot = ((size_t)h[4] << 8) | h[5];   /* payload length */
+        t = h + 40;
+        thlen = (size_t)(t[12] >> 4) * 4;
+        if (thlen < 20 || thlen > 40 || tot < thlen)
+            return -1;
+        *has_payload = tot > thlen;
+        sport = (uint16_t)((t[0] << 8) | t[1]);
+        dport = (uint16_t)((t[2] << 8) | t[3]);
+    } else {
+        ihl = (size_t)(h[0] & 0x0f) * 4;
+        if (ihl < 20 || ihl > sizeof h - 20)
+            return -1;
+        t = h + ihl;
+        thlen = (size_t)(t[12] >> 4) * 4;
+        if (thlen < 20 || ihl + thlen > sizeof h)
+            return -1;
+        tot = ((size_t)h[2] << 8) | h[3];
+        if (tot < ihl + thlen)
+            return -1;
+        *has_payload = tot > ihl + thlen;
+        sport = (uint16_t)((t[0] << 8) | t[1]);
+        dport = (uint16_t)((t[2] << 8) | t[3]);
+    }
     for (int i = 0; i < NS_MAX_CONN; i++) {
         TcpConn *c = &ns->conns[i];
         if (c->pcb != NULL && c->lport == sport && c->rport == dport)
@@ -154,12 +175,10 @@ static int bridge_output_parse(Netstack *ns, const struct pbuf *p,
     return -1;
 }
 
-static err_t bridge_output(struct netif *netif, struct pbuf *p,
-                           const ip4_addr_t *ipaddr)
+/* frame one outbound IP packet (v4 or v6 — the tunnel treats the inner
+ * payload as opaque) into a tx slot: [8B outer][inner IP]. */
+static err_t bridge_output_frame(Netstack *ns, struct pbuf *p)
 {
-    Netstack *ns = (Netstack *)netif->state;
-    (void)ipaddr;
-
     if (p->tot_len > 1500)
         return ERR_MEM;   /* should never happen (netif MTU <= 1500) */
 
@@ -188,9 +207,26 @@ static err_t bridge_output(struct netif *netif, struct pbuf *p,
     return ERR_OK;
 }
 
+static err_t bridge_output(struct netif *netif, struct pbuf *p,
+                           const ip4_addr_t *ipaddr)
+{
+    Netstack *ns = (Netstack *)netif->state;
+    (void)ipaddr;
+    return bridge_output_frame(ns, p);
+}
+
+static err_t bridge_output6(struct netif *netif, struct pbuf *p,
+                            const ip6_addr_t *ip6addr)
+{
+    Netstack *ns = (Netstack *)netif->state;
+    (void)ip6addr;
+    return bridge_output_frame(ns, p);
+}
+
 static err_t bridge_netif_init(struct netif *netif)
 {
     netif->output = bridge_output;
+    netif->output_ip6 = bridge_output6;
     return ERR_OK;
 }
 
@@ -244,8 +280,8 @@ static err_t bridge_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p,
 static void bridge_err(void *arg, err_t err)
 {
     TcpConn *c = (TcpConn *)arg;
-    if (c->pcb == NULL)
-        return;   /* already reclaimed */
+    if (c == NULL || c->pcb == NULL)
+        return;   /* arg cleared / already reclaimed */
     c->term_reason = (err == ERR_RST) ? NS_TERM_RST : NS_TERM_TIMEOUT;
     c->state = NS_CLOSED;
     c->pcb = NULL;        /* lwIP freed the pcb just before firing err_cb */
@@ -313,6 +349,28 @@ void ns_init(Netstack *ns, uint32_t inner_ip, uint32_t gw, uint16_t mtu)
         return;
     n->mtu = (mtu > 1500) ? 1500 : mtu;
     n->state = ns;
+    /* no link layer on a point-to-point tunnel: hwaddr_len stays 0 so
+     * nothing (ND6 options, ARP-style paths) ever reads hwaddr[] */
+    n->hwaddr_len = 0;
+
+    /* inner IPv6 address: fd00::/96 + inner IPv4 (protocol.h). The wire
+     * protocol assigns only an IPv4, so the ULA is the deterministic
+     * source address of every inner IPv6 connection; the server derives
+     * the same address for its H1 spoof check and session lookup. */
+    {
+        uint8_t b6[16];
+        ip6_addr_t a6;
+        ip6_derive_ula(inner_ip, b6);
+        /* ip6_addr_t stores the raw wire bytes (packed form): ip6_input
+         * copies the header words verbatim and ip6_addr_eq compares
+         * them as-is; the checksum code then byte-swaps every word
+         * consistently, including the final checksum field. */
+        memset(&a6, 0, sizeof a6);
+        memcpy(a6.addr, b6, 16);
+        netif_ip6_addr_set(n, 0, &a6);
+        netif_ip6_addr_set_state(n, 0, IP6_ADDR_VALID);
+    }
+
     netif_set_link_up(n);
     netif_set_up(n);
     netif_set_default(n);
@@ -324,7 +382,8 @@ void ns_set_outer(Netstack *ns, const uint8_t hdr[8], const uint8_t key[8])
     memcpy(ns->xor_key, key, 8);
 }
 
-int ns_connect(Netstack *ns, uint16_t lport, uint32_t rip, uint16_t rport)
+/* slot allocation + pcb setup shared by ns_connect / ns_connect6 */
+static int conn_slot_alloc(Netstack *ns, TcpConn **out)
 {
     int idx = -1;
     for (int i = 0; i < NS_MAX_CONN; i++) {
@@ -339,24 +398,46 @@ int ns_connect(Netstack *ns, uint16_t lport, uint32_t rip, uint16_t rport)
     TcpConn *c = &ns->conns[idx];
     conn_slot_clear(c);
     c->ns = ns;
-    c->rip = rip;
-    c->lport = lport;
-    c->rport = rport;
     c->term_reason = NS_TERM_NONE;
     c->state_ms = now_ms();
     c->last_poll_ms = c->state_ms;
+    *out = c;
+    return idx;
+}
 
+static struct tcp_pcb *conn_pcb_new(TcpConn *c)
+{
     struct tcp_pcb *pcb = tcp_new();
     if (pcb == NULL)
-        return -1;
+        return NULL;
     tcp_arg(pcb, c);
     tcp_recv(pcb, bridge_recv);
     tcp_err(pcb, bridge_err);
     tcp_poll(pcb, bridge_poll, 1);   /* 500ms liveness heartbeat */
     ip_set_option(pcb, SOF_KEEPALIVE);  /* lwIP built-in idle/keepalive */
+    return pcb;
+}
+
+int ns_connect(Netstack *ns, uint16_t lport, uint32_t rip, uint16_t rport)
+{
+    TcpConn *c;
+    int idx = conn_slot_alloc(ns, &c);
+    if (idx < 0)
+        return -1;
+
+    c->af = 4;
+    c->rip = rip;
+    c->lport = lport;
+    c->rport = rport;
+
+    struct tcp_pcb *pcb = conn_pcb_new(c);
+    if (pcb == NULL)
+        return -1;
 
     ip_addr_t ip;
-    ip_addr_set_ip4_u32(&ip, lwip_htonl(rip));
+    /* _val variant: with LWIP_IPV6=1 the plain macro wraps the set in
+     * if(ipaddr){...}, and &ip is an lvalue -> -Waddress under -Werror */
+    ip_addr_set_ip4_u32_val(ip, lwip_htonl(rip));
 
     if (tcp_bind(pcb, IP_ADDR_ANY, lport) != ERR_OK)
         goto fail;
@@ -369,8 +450,59 @@ int ns_connect(Netstack *ns, uint16_t lport, uint32_t rip, uint16_t rport)
     return idx;
 
 fail:
-    tcp_arg(pcb, NULL);
+    /* abort FIRST, while the arg is still the conn: tcp_abort fires the
+     * err callback synchronously, and bridge_err early-returns on a NULL
+     * pcb (c->pcb is not assigned until success). Nulling the arg first
+     * would make bridge_err dereference a NULL conn (crash). */
     tcp_abort(pcb);
+    tcp_arg(pcb, NULL);
+    c->pcb = NULL;
+    return -1;
+}
+
+int ns_connect6(Netstack *ns, uint16_t lport, const uint8_t rip6[16],
+                uint16_t rport)
+{
+    TcpConn *c;
+    int idx = conn_slot_alloc(ns, &c);
+    if (idx < 0)
+        return -1;
+
+    c->af = 6;
+    memcpy(c->rip6, rip6, 16);
+    c->lport = lport;
+    c->rport = rport;
+
+    struct tcp_pcb *pcb = conn_pcb_new(c);
+    if (pcb == NULL)
+        return -1;
+
+    /* ip6_addr_t stores the raw wire bytes (packed form, see ns_init) */
+    ip6_addr_t a6;
+    memset(&a6, 0, sizeof a6);
+    memcpy(a6.addr, rip6, 16);
+    ip_addr_t ip;
+    memset(&ip, 0, sizeof ip);
+    ip.type = IPADDR_TYPE_V6;
+    ip.u_addr.ip6 = a6;
+
+    if (tcp_bind(pcb, IP_ADDR_ANY, lport) != ERR_OK)
+        goto fail;
+    if (tcp_connect(pcb, &ip, rport, bridge_connected) != ERR_OK)
+        goto fail;
+    tcp_nagle_disable(pcb);
+
+    c->pcb = pcb;
+    c->state = NS_SYN_SENT;
+    return idx;
+
+fail:
+    /* abort FIRST, while the arg is still the conn: tcp_abort fires the
+     * err callback synchronously, and bridge_err early-returns on a NULL
+     * pcb (c->pcb is not assigned until success). Nulling the arg first
+     * would make bridge_err dereference a NULL conn (crash). */
+    tcp_abort(pcb);
+    tcp_arg(pcb, NULL);
     c->pcb = NULL;
     return -1;
 }
@@ -393,8 +525,28 @@ void ns_dump_conn(const Netstack *ns, int idx)
         return;
     const TcpConn *c = &ns->conns[idx];
     const struct tcp_pcb *pcb = c->pcb;
+    if (c->af == 6) {
+        fprintf(stderr,
+                "NSDUMP: conn=%d af=6 state=%d pcb=%p rxq=%llu term=%u "
+                "pcbstate=%d snd_buf=%u rcv_wnd=%u cwnd=%u snd_wnd=%u "
+                "q_used=%u rip6=%02x%02x:%02x%02x:%02x%02x:%02x%02x:"
+                "%02x%02x:%02x%02x:%02x%02x:%02x%02x\n",
+                idx, c->state, (void *)pcb, (unsigned long long)c->rxq.len,
+                c->term_reason,
+                pcb ? (int)pcb->state : -1,
+                pcb ? (unsigned)pcb->snd_buf : 0,
+                pcb ? (unsigned)pcb->rcv_wnd : 0,
+                pcb ? (unsigned)pcb->cwnd : 0,
+                pcb ? (unsigned)pcb->snd_wnd : 0,
+                ns->q_used[idx],
+                c->rip6[0], c->rip6[1], c->rip6[2], c->rip6[3],
+                c->rip6[4], c->rip6[5], c->rip6[6], c->rip6[7],
+                c->rip6[8], c->rip6[9], c->rip6[10], c->rip6[11],
+                c->rip6[12], c->rip6[13], c->rip6[14], c->rip6[15]);
+        return;
+    }
     fprintf(stderr,
-            "NSDUMP: conn=%d state=%d pcb=%p rxq=%llu term=%u "
+            "NSDUMP: conn=%d af=4 state=%d pcb=%p rxq=%llu term=%u "
             "pcbstate=%d snd_buf=%u rcv_wnd=%u cwnd=%u snd_wnd=%u q_used=%u\n",
             idx, c->state, (void *)pcb, (unsigned long long)c->rxq.len,
             c->term_reason,
@@ -532,7 +684,10 @@ void ns_rx_packet(Netstack *ns, const uint8_t *pkt, size_t n)
         pbuf_free(p);
         return;
     }
-    ip4_input(p, ns->netif);
+    if ((pkt[0] >> 4) == 6)
+        ip6_input(p, ns->netif);
+    else
+        ip4_input(p, ns->netif);
 }
 
 /* ------------------------------------------------------------------ */

@@ -120,3 +120,11 @@ void u32_ip4(uint32_t v, uint8_t out[4])
     out[2] = (uint8_t)(v >> 8);
     out[3] = (uint8_t)v;
 }
+
+/* fd00::/96 + the 32-bit inner IPv4 (see protocol.h) */
+void ip6_derive_ula(uint32_t v4, uint8_t out[16])
+{
+    memset(out, 0, 16);
+    out[0] = IWAN_IP6_ULA_BYTE0;
+    u32_ip4(v4, out + 12);
+}

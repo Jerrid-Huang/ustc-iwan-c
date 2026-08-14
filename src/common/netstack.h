@@ -164,6 +164,11 @@ void ns_set_outer(Netstack *ns, const uint8_t hdr[8], const uint8_t key[8]);
 
 /* find/allocate a conn slot; returns index or -1 */
 int  ns_connect(Netstack *ns, uint16_t lport, uint32_t rip, uint16_t rport);
+/* IPv6 remote: the native rollback stack is IPv4-only, so this always
+ * returns -1 (the SOCKS layer maps that to rep=8). Kept in the API so
+ * socks_flow.c compiles against either stack. */
+int  ns_connect6(Netstack *ns, uint16_t lport, const uint8_t rip6[16],
+                 uint16_t rport);
 TcpConn *ns_conn(Netstack *ns, int idx);
 NsState ns_state(const TcpConn *c);
 /* diagnostic: dump conn send state (IWAN_FLOWDBG=1) */

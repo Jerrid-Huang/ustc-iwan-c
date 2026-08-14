@@ -4,9 +4,9 @@
  * Constraints that shape every choice below:
  *   - The stack runs in the existing single-threaded SOCKS event loop
  *     (NO_SYS=1, raw/callback API, no lwIP socket layer).
- *   - The tunnel carries only inner IPv4/TCP (tunnel DNS is built and
- *     consumed OUTSIDE lwIP by socks_flow.c); IPv6/UDP/ICMP/DNS/ARP/DHCP
- *     are all disabled to keep the surface minimal.
+ *   - The tunnel carries inner IPv4/TCP and IPv6/TCP (tunnel DNS is built
+ *     and consumed OUTSIDE lwIP by socks_flow.c as inner IPv4 UDP);
+ *     UDP/ICMP/DNS/ARP/DHCP are disabled to keep the surface minimal.
  *   - The inner IP+TCP checksums MUST be generated/verified in software:
  *     the peer (remote host kernel) verifies them after the XOR decap.
  *   - A desktop client (not embedded): memory is generous and sized for
@@ -26,9 +26,25 @@
  * included when !NO_SYS) must be compiled out. */
 #define SYS_LIGHTWEIGHT_PROT 0
 
-/* ---- protocol surface: TCP / IPv4 only ---- */
+/* ---- protocol surface: TCP / IPv4 + IPv6 ---- */
 #define LWIP_IPV4         1
-#define LWIP_IPV6         0
+#define LWIP_IPV6         1
+/* IPv6 extras kept minimal: ICMPv6 stays ON (upstream ip6.c calls
+ * icmp6_param_problem() on malformed packets outside any LWIP_ICMP6
+ * guard, so the function must exist; ICMPv6 is RFC-mandatory anyway).
+ * MLD and IPv6 fragmentation are OFF: no multicast on a point-to-point
+ * tunnel, and fragments are dropped like the IPv4 policy. Compiled
+ * surface: ip6.c + ip6_addr.c + nd6.c + icmp6.c. */
+#define LWIP_ICMP6        1
+#define LWIP_IPV6_MLD     0
+#define LWIP_IPV6_FRAG    0
+#define LWIP_IPV6_REASS   0
+/* No Router Advertisements on a point-to-point tunnel: with RA updates
+ * on (the default), netif_mtu6 stays 0 (only RA sets it) and
+ * tcp_eff_send_mss_netif falls back to the unclamped TCP_MSS, so v6
+ * segments would be 40+20+1460=1520B > the 1500 inner MTU. Off, the
+ * v6 MTU is netif->mtu and the effective v6 MSS becomes 1500-60=1440. */
+#define LWIP_ND6_ALLOW_RA_UPDATES 0
 #define LWIP_TCP          1
 #define LWIP_UDP          0
 #define LWIP_RAW          0

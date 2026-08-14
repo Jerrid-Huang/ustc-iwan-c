@@ -679,9 +679,103 @@ static int expand_route_targets(const slist_t *targets, slist_t *out) {
     return 0;
 }
 
+/* IPv6 route targets: "<v6-cidr>" or a bare IPv6 address (-> /128), or
+ * a domain resolved AF_INET6 (-> /128 per address). Returns 0 on
+ * success, -1 on a malformed target (rejected before it reaches
+ * `ip -6 route` verbatim). */
+static int expand_route_targets6(const slist_t *targets, slist_t *out)
+{
+    if (targets == NULL)
+        return 0;
+    for (size_t i = 0; i < targets->n; i++) {
+        const char *p = targets->v[i];
+        char *t = xstrdup(p == NULL ? "" : p);
+        char *q = t;
+        while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n')
+            q++;
+        size_t l = strlen(q);
+        while (l > 0 && (q[l - 1] == ' ' || q[l - 1] == '\t' ||
+                         q[l - 1] == '\r' || q[l - 1] == '\n'))
+            q[--l] = '\0';
+        if (*q == '\0') {
+            free(t);
+            continue;
+        }
+        if (strchr(q, '/') != NULL) {
+            char addr[64];
+            size_t an = (size_t)(strchr(q, '/') - q);
+            long plen;
+            char *end;
+            if (an == 0 || an >= sizeof addr) {
+                log_err("invalid IPv6 CIDR route target '%s'", q);
+                free(t);
+                return -1;
+            }
+            memcpy(addr, q, an);
+            addr[an] = '\0';
+            struct in6_addr a6;
+            if (inet_pton(AF_INET6, addr, &a6) != 1) {
+                log_err("invalid IPv6 CIDR route target '%s'", q);
+                free(t);
+                return -1;
+            }
+            plen = strtol(q + an + 1, &end, 10);
+            if (*end != '\0' || plen < 0 || plen > 128) {
+                log_err("invalid IPv6 CIDR route target '%s'", q);
+                free(t);
+                return -1;
+            }
+            push_unique(out, q);
+        } else {
+            struct in6_addr a6;
+            if (inet_pton(AF_INET6, q, &a6) == 1) {
+                char r128[64];
+                snprintf(r128, sizeof r128, "%s/128", q);
+                push_unique(out, r128);
+            } else {
+                /* domain: resolve AF_INET6 */
+                struct addrinfo hints;
+                memset(&hints, 0, sizeof hints);
+                hints.ai_family = AF_INET6;
+                hints.ai_socktype = SOCK_STREAM;
+                struct addrinfo *res = NULL;
+                int rc = getaddrinfo(q, NULL, &hints, &res);
+                if (rc != 0) {
+                    log_err("resolve domain %s: %s", q, gai_strerror(rc));
+                    free(t);
+                    return -1;
+                }
+                int found = 0;
+                for (struct addrinfo *ai = res; ai != NULL; ai = ai->ai_next) {
+                    if (ai->ai_family != AF_INET6)
+                        continue;
+                    char ip[INET6_ADDRSTRLEN];
+                    const struct sockaddr_in6 *s6 =
+                        (const struct sockaddr_in6 *)ai->ai_addr;
+                    inet_ntop(AF_INET6, &s6->sin6_addr, ip, sizeof ip);
+                    char r128[64];
+                    snprintf(r128, sizeof r128, "%s/128", ip);
+                    push_unique(out, r128);
+                    found = 1;
+                }
+                freeaddrinfo(res);
+                if (!found) {
+                    log_err("domain has no IPv6 address: %s", q);
+                    free(t);
+                    return -1;
+                }
+            }
+        }
+        free(t);
+    }
+    return 0;
+}
+
 static void teardown_routes(const char *tun, const char *srv, const char *ogw,
                             const char *odev, const char *ogw_metric,
-                            const slist_t *routes, bool had_routes) {
+                            const slist_t *routes, bool had_routes,
+                            const slist_t *routes6) {
+    route_teardown6(tun, routes6);
     if (had_routes) {
         route_teardown(tun, srv, ogw, odev, ogw_metric, routes);
     } else {
@@ -692,6 +786,7 @@ static void teardown_routes(const char *tun, const char *srv, const char *ogw,
 int run_pump(int tun_fd, const char *tun_name, int sockfd,
              const uint8_t xor_key[8], uint16_t sid, uint32_t tok, uint8_t enc,
              const char *server, const slist_t *route_targets,
+             const slist_t *route_targets6,
              const char *auth_tun_ip, uint16_t auth_mtu) {
     char ogw[16] = "", odev[16] = "", ogw_metric[16] = "";
 
@@ -699,6 +794,13 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
     slist_init(&routes);
     if (expand_route_targets(route_targets, &routes) != 0) {
         slist_free(&routes);
+        return -1;
+    }
+    slist_t routes6;
+    slist_init(&routes6);
+    if (expand_route_targets6(route_targets6, &routes6) != 0) {
+        slist_free(&routes);
+        slist_free(&routes6);
         return -1;
     }
 
@@ -718,6 +820,7 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
             /* route_setup already rolled back and logged; a half-configured
              * tunnel must not start pumping */
             slist_free(&routes);
+            slist_free(&routes6);
             return -1;
         }
         log_info("tun %s ready: %zu route%s", tun_name, routes.n,
@@ -730,10 +833,18 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
              * instead of claiming the tunnel is up */
             route_iface_down(tun_name);
             slist_free(&routes);
+            slist_free(&routes6);
             return -1;
         }
         log_info("tun %s up with IP %s/24 (no route hijack)", tun_name,
                  auth_tun_ip);
+    }
+    /* IPv6 policy routes through the tunnel (best-effort; the derived
+     * ULA/96 on the interface was added by route_iface_up) */
+    if (routes6.n > 0) {
+        route_setup6(tun_name, &routes6);
+        for (size_t i = 0; i < routes6.n; i++)
+            log_debug("route6 %s -> dev %s", routes6.v[i], tun_name);
     }
 
     g_stop = 0;
@@ -772,8 +883,9 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
         if (!ctx.pool) {
             log_err("cannot start TUN reader pool");
             teardown_routes(tun_name, server, ogw, odev, ogw_metric, &routes,
-                            had_routes);
+                            had_routes, &routes6);
             slist_free(&routes);
+            slist_free(&routes6);
             pthread_mutex_destroy(&ctx.send_lock);
             return -1;
         }
@@ -793,8 +905,9 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
         g_stop = 1;
         tun_pool_destroy(ctx.pool);
         teardown_routes(tun_name, server, ogw, odev, ogw_metric, &routes,
-                        had_routes);
+                        had_routes, &routes6);
         slist_free(&routes);
+        slist_free(&routes6);
         pthread_mutex_destroy(&ctx.send_lock);
         return -1;
     }
@@ -807,7 +920,7 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
     pthread_join(t2, NULL);
 
     teardown_routes(tun_name, server, ogw, odev, ogw_metric, &routes,
-                    had_routes);
+                    had_routes, &routes6);
 
     send_ctrl(&ctx, PT_CLOSE, enc, sid, tok);
     if (debug_enabled())
@@ -815,6 +928,7 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
 
     pthread_mutex_destroy(&ctx.send_lock);
     slist_free(&routes);
+    slist_free(&routes6);
     /* 1 = session lost (keepalive failures / no downlink): the caller
      * may re-authenticate and re-run the pump; 0 = user stopped it */
     return ctx.session_lost ? 1 : 0;

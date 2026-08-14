@@ -152,6 +152,12 @@ static void collect_routes(const Opts *o, slist_t *routes)
         slist_push(routes, o->proxy_domain.v[i]);
 }
 
+static void collect_routes6(const Opts *o, slist_t *routes6)
+{
+    for (size_t i = 0; i < o->proxy_cidr6.n; i++)
+        slist_push(routes6, o->proxy_cidr6.v[i]);
+}
+
 /* server "port" value from a server entry: 1 = valid (out set),
  * 0 = absent (caller uses OIDC_DEFAULT_PORT), -1 = not an integer in
  * 1..65535 (raw receives the offending value). */
@@ -232,6 +238,9 @@ void oidc_connect_server(const Opts *o, const Config *cf)
     slist_t routes;
     slist_init(&routes);
     collect_routes(o, &routes);
+    slist_t routes6;
+    slist_init(&routes6);
+    collect_routes6(o, &routes6);
 
     /* authenticate/run loop: a lost session (keepalive failure, no
      * downlink) re-authenticates and re-runs the pump instead of
@@ -294,7 +303,8 @@ void oidc_connect_server(const Opts *o, const Config *cf)
             port_close(fd);
         } else {
             rc = run_pump(tun_fd, o->tun, fd, sk, res.sid, res.tok,
-                          o->encrypt, host, &routes, res.tun, res.mtu);
+                          o->encrypt, host, &routes, &routes6,
+                          res.tun, res.mtu);
             port_close(fd);
         }
         OPENSSL_cleanse(sk, sizeof sk);   /* session key scrub */
@@ -320,4 +330,5 @@ void oidc_connect_server(const Opts *o, const Config *cf)
     if (tun_fd >= 0)
         tun_close(tun_fd);
     slist_free(&routes);
+    slist_free(&routes6);
 }

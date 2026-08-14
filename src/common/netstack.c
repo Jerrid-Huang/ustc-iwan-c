@@ -811,6 +811,15 @@ int ns_connect(Netstack *ns, uint16_t lport, uint32_t rip, uint16_t rport) {
     return idx;
 }
 
+int ns_connect6(Netstack *ns, uint16_t lport, const uint8_t rip6[16],
+                uint16_t rport)
+{
+    /* the native rollback stack is IPv4-only; the SOCKS layer maps -1
+     * to SOCKS5 rep=8 (address type not supported) */
+    (void)ns; (void)lport; (void)rip6; (void)rport;
+    return -1;
+}
+
 TcpConn *ns_conn(Netstack *ns, int idx) {
     if (idx < 0 || idx >= NS_MAX_CONN)
         return NULL;

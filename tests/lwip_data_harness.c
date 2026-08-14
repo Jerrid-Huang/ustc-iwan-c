@@ -29,6 +29,13 @@
 #define CLIENT_PORT 40000
 #define PATTERN_LEN (44 * 1460)   /* 44 full-MSS segments = 22 reorder pairs */
 
+/* IPv6 fake peer (IWAN_TEST_IPV6=1): the client's inner v6 is derived
+ * from CLIENT_IP (fd00::/96 + v4, see protocol.h); the peer is a
+ * plain off-link address. */
+static const uint8_t PEER_IP6[16] = {
+    0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1  /* 2001:db8::1 */
+};
+
 static Netstack g_ns;
 static int g_conn = -1;
 
@@ -43,6 +50,8 @@ static uint32_t g_drop_seq;      /* seq of the first (dropped) data segment */
 static int g_drop_seen;
 static size_t g_total;           /* echo size (PATTERN_LEN, or bench override) */
 static int g_bench;              /* IWAN_TEST_BENCH_BYTES: skip verify, time */
+static int g_ipv6;               /* IWAN_TEST_IPV6: v6 inner packets */
+static uint8_t g_client_ip6[16]; /* fd00::/96 + CLIENT_IP */
 /* pending echo (for out-of-order injection) */
 static uint8_t g_pending[1500];
 static size_t g_pending_len;
@@ -108,25 +117,94 @@ static size_t peer_build(uint8_t *out, uint32_t sip, uint32_t dip,
     return tot;
 }
 
+/* build a plain inner IPv6+TCP packet; returns total length. Same
+ * MSS/WSCALE option handling as the v4 builder. */
+static size_t peer_build6(uint8_t *out, const uint8_t sip[16],
+                          const uint8_t dip[16], uint16_t sport,
+                          uint16_t dport, uint32_t seq, uint32_t ack,
+                          uint8_t flags, const uint8_t *payload,
+                          size_t paylen, uint16_t mss_opt, uint8_t wscale)
+{
+    size_t optlen = (mss_opt ? 4 : 0) + (wscale ? 4 : 0);
+    size_t thlen = 20 + optlen;
+    size_t tot = 40 + thlen + paylen;
+    memset(out, 0, 40);
+    out[0] = 0x60;               /* version 6, no traffic class/flow */
+    out[4] = (uint8_t)((thlen + paylen) >> 8);   /* payload length */
+    out[5] = (uint8_t)(thlen + paylen);
+    out[6] = 6;                  /* next header: TCP */
+    out[7] = 64;                 /* hop limit */
+    memcpy(out + 8, sip, 16);
+    memcpy(out + 24, dip, 16);
+
+    uint8_t *t = out + 40;
+    memset(t, 0, (size_t)thlen); /* zero TCP header incl. checksum field */
+    t[0] = (uint8_t)(sport >> 8); t[1] = (uint8_t)sport;
+    t[2] = (uint8_t)(dport >> 8); t[3] = (uint8_t)dport;
+    t[4] = (uint8_t)(seq >> 24); t[5] = (uint8_t)(seq >> 16);
+    t[6] = (uint8_t)(seq >> 8);  t[7] = (uint8_t)seq;
+    t[8] = (uint8_t)(ack >> 24); t[9] = (uint8_t)(ack >> 16);
+    t[10] = (uint8_t)(ack >> 8); t[11] = (uint8_t)ack;
+    t[12] = (uint8_t)((thlen / 4) << 4);  /* data offset */
+    t[13] = flags;
+    t[14] = 0xff; t[15] = 0xff;  /* window 65535 */
+    if (mss_opt) {
+        t[20] = 2;               /* kind = MSS */
+        t[21] = 4;
+        t[22] = (uint8_t)(mss_opt >> 8);
+        t[23] = (uint8_t)mss_opt;
+    }
+    if (wscale) {
+        size_t o = mss_opt ? 24 : 20;
+        t[o] = 3;                /* kind = WSCALE */
+        t[o + 1] = 3;
+        t[o + 2] = wscale;
+        t[o + 3] = 1;            /* NOP pad */
+    }
+    if (payload && paylen)
+        memcpy(t + thlen, payload, paylen);
+    uint16_t tc = ip6_tcp_csum(sip, dip, t, thlen + paylen);
+    t[16] = (uint8_t)(tc >> 8);
+    t[17] = (uint8_t)tc;
+    return tot;
+}
+
 static void peer_reply(uint32_t seq, uint32_t ack, uint8_t flags,
                        const uint8_t *payload, size_t paylen, uint16_t mss_opt,
                        uint8_t wscale)
 {
     uint8_t out[2048];
-    size_t n = peer_build(out, SERVER_IP, CLIENT_IP, SERVER_PORT,
-                          g_client_lport, seq, ack, flags, payload, paylen,
-                          mss_opt, wscale);
+    size_t n;
+    if (g_ipv6) {
+        n = peer_build6(out, PEER_IP6, g_client_ip6, SERVER_PORT,
+                        g_client_lport, seq, ack, flags, payload, paylen,
+                        mss_opt, wscale);
+    } else {
+        n = peer_build(out, SERVER_IP, CLIENT_IP, SERVER_PORT,
+                       g_client_lport, seq, ack, flags, payload, paylen,
+                       mss_opt, wscale);
+    }
     ns_rx_packet(&g_ns, out, n);
 }
 
 /* consume one inner IP packet from the bridge's tx queue */
 static void peer_feed(const uint8_t *pkt, size_t n)
 {
+    const uint8_t *t;
+    size_t ihl, thlen;
+
     if (n < 40)
         return;
-    size_t ihl = (size_t)(pkt[0] & 0x0f) * 4;
-    const uint8_t *t = pkt + ihl;
-    size_t thlen = (size_t)(t[12] >> 4) * 4;
+    if ((pkt[0] >> 4) == 6) {
+        if (pkt[6] != 6)         /* next header must be TCP */
+            return;
+        ihl = 40;
+        t = pkt + 40;
+    } else {
+        ihl = (size_t)(pkt[0] & 0x0f) * 4;
+        t = pkt + ihl;
+    }
+    thlen = (size_t)(t[12] >> 4) * 4;
     uint16_t sport = (uint16_t)((t[0] << 8) | t[1]);
     uint32_t seq = ((uint32_t)t[4] << 24) | ((uint32_t)t[5] << 16) |
                    ((uint32_t)t[6] << 8) | t[7];
@@ -206,6 +284,7 @@ int main(void)
 {
     g_reorder = getenv("IWAN_TEST_REORDER") != NULL;
     g_drop_once = getenv("IWAN_TEST_DROP_ONCE") != NULL;
+    g_ipv6 = getenv("IWAN_TEST_IPV6") != NULL;
     g_total = PATTERN_LEN;
     {
         const char *b = getenv("IWAN_TEST_BENCH_BYTES");
@@ -229,7 +308,13 @@ int main(void)
     ns_init(&g_ns, CLIENT_IP, SERVER_IP, 1500);
     ns_set_outer(&g_ns, (const uint8_t[8]){0}, (const uint8_t[8]){0});
 
-    g_conn = ns_connect(&g_ns, CLIENT_PORT, SERVER_IP, SERVER_PORT);
+    if (g_ipv6) {
+        /* the client's inner v6 = fd00::/96 + CLIENT_IP (protocol.h) */
+        ip6_derive_ula(CLIENT_IP, g_client_ip6);
+        g_conn = ns_connect6(&g_ns, CLIENT_PORT, PEER_IP6, SERVER_PORT);
+    } else {
+        g_conn = ns_connect(&g_ns, CLIENT_PORT, SERVER_IP, SERVER_PORT);
+    }
     if (g_conn < 0) {
         fprintf(stderr, "FAIL: ns_connect\n");
         free(pattern);

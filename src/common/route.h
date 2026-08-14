@@ -27,6 +27,13 @@ void route_teardown(const char *tun, const char *srv, const char *ogw,
                     const char *odev, const char *metric,
                     const slist_t *routes);
 
+/* IPv6 proxy routes ("<v6-cidr>" entries) through the tunnel, installed
+ * alongside the IPv4 route_setup. Best-effort: IPv6 routing must never
+ * take the tunnel down (the IPv4 path is the load-bearing one), so
+ * failures are logged and skipped, never fatal. */
+bool route_setup6(const char *tun, const slist_t *routes6);
+void route_teardown6(const char *tun, const slist_t *routes6);
+
 /* bring the tunnel interface up with an address and MTU (no routes);
  * shared by route_setup and the no-route-hijack pump path. Returns
  * false when a step failed (state partially applied). */

@@ -1,3 +1,5 @@
+#include <string.h>
+
 #include "ipv4.h"
 #include "protocol.h"
 
@@ -46,6 +48,23 @@ uint16_t ip_tcp_csum(uint32_t sip, uint32_t dip, const void *tcp, size_t n)
     return ip_csum_fold(ip_csum_accum(sum, tcp, n));
 }
 
+uint16_t ip6_tcp_csum(const uint8_t sip[16], const uint8_t dip[16],
+                      const void *tcp, size_t n)
+{
+    uint8_t ph[40];
+    uint32_t sum;
+    memcpy(ph, sip, 16);
+    memcpy(ph + 16, dip, 16);
+    memset(ph + 32, 0, 3);
+    ph[35] = 6;                 /* IPPROTO_TCP (next header) */
+    ph[36] = (uint8_t)(n >> 24);
+    ph[37] = (uint8_t)(n >> 16);
+    ph[38] = (uint8_t)(n >> 8);
+    ph[39] = (uint8_t)n;
+    sum = ip_csum_accum(0, ph, sizeof ph);
+    return ip_csum_fold(ip_csum_accum(sum, tcp, n));
+}
+
 uint16_t ip_udp_csum(uint32_t sip, uint32_t dip, const void *udp, size_t n)
 {
     uint8_t ph[8];
@@ -58,6 +77,37 @@ uint16_t ip_udp_csum(uint32_t sip, uint32_t dip, const void *udp, size_t n)
     sum += 17;                  /* zero byte + IPPROTO_UDP as one BE word */
     sum += (uint32_t)n;         /* UDP length as one BE word */
     return ip_csum_fold(ip_csum_accum(sum, udp, n));
+}
+
+int ip6_pkt_ok(const uint8_t *pkt, size_t len,
+               uint8_t saddr[16], uint8_t daddr[16])
+{
+    uint32_t plen;
+
+    if (pkt == NULL || saddr == NULL || daddr == NULL)
+        return -1;
+    if (len < 40)
+        return -1;
+    if ((pkt[0] >> 4) != 6)          /* version */
+        return -1;
+    plen = ((uint32_t)pkt[4] << 8) | pkt[5];
+    if (40u + plen > len)            /* truncated / padded garbage */
+        return -1;
+    /* src: :: is invalid; multicast sources are invalid (RFC 4291) */
+    {
+        int any = 1;
+        for (int i = 0; i < 16; i++)
+            any = any && pkt[8 + i] == 0;
+        if (any)
+            return -1;
+        if ((pkt[8] & 0xFF) == 0xFF) /* ff00::/8 multicast src */
+            return -1;
+    }
+    if ((pkt[24] & 0xFF) == 0xFF)    /* ff00::/8 multicast dst */
+        return -1;
+    memcpy(saddr, pkt + 8, 16);
+    memcpy(daddr, pkt + 24, 16);
+    return 0;
 }
 
 int ipv4_pkt_ok(const uint8_t *pkt, size_t len,

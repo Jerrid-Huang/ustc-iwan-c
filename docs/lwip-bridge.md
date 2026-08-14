@@ -20,13 +20,23 @@ tun2socks 场景生产验证过。
   （`netinet/tcp.h` 定义 `TCP_MSS`、`netinet/in.h` 定义 `BYTE_ORDER`），再拉进
   `lwip/opt.h` + `lwipopts.h` 会宏冲突。lwIP 类型以 opaque 指针（`struct tcp_pcb *`、
   `struct netif *`）出现，由 `lwip_bridge.c` 里 include 真实头做完整类型。
-- **`lwipopts.h`**：`NO_SYS=1` raw API、`LWIP_SOCKET=0`、IPv4/TCP only（关掉
-  UDP/DNS/ICMP/IGMP/ARP/DHCP/IPv6）、`LWIP_WND_SCALE=1` + `TCP_RCV_SCALE=4`
+- **`lwipopts.h`**：`NO_SYS=1` raw API、`LWIP_SOCKET=0`、IPv4+IPv6/TCP（关掉
+  UDP/DNS/ICMP/IGMP/ARP/DHCP；IPv6 侧只开 `LWIP_IPV6=1` + 必需的
+  `nd6.c`/`icmp6.c`，MLD/分片/重组全关）、`LWIP_WND_SCALE=1` + `TCP_RCV_SCALE=4`
   （256KB 接收窗口，对齐旧栈 `NS_WINDOW`）、`TCP_QUEUE_OOSEQ=1` +
   `LWIP_TCP_SACK_OUT=1`（乱序重组 + SACK 输出）、软件校验和、`SYS_LIGHTWEIGHT_PROT=0`、
   `LWIP_DONT_PROVIDE_BYTEORDER_FUNCTIONS=1`（避免与系统 `htons/htonl` 冲突）、
   `MEM_ALIGNMENT=8`（UBSan 对齐）。内存按 64 并发连接 × 256KB 在飞上限 sizing，
   `tcp_write` 因此保证不因堆耗尽失败。
+- **IPv6 内层地址**：wire 协议只分配内层 IPv4（`T_IP`），所以内层 IPv6 一律按
+  `fd00::/96 + 内层 IPv4` 派生（`ip6_derive_ula`，protocol.h）：桥接 netif 的
+  v6 源地址、SOCKS5 回复的 BND.ADDR、服务端 H1 反欺骗门与回程会话查找都用同一
+  条规则，客户端和服务端无需协商。
+- **IPv6 MTU**：`LWIP_ND6_ALLOW_RA_UPDATES=0`——否则 `netif_mtu6` 恒为 0（只有
+  RA 会设置），v6 有效 MSS 退化为未收敛的 1460，内层段 1520B 会超出 1500 内层
+  MTU 被桥拒绝；关闭后 v6 有效 MSS = 1500-60 = 1440。netif 无链路层，
+  `hwaddr_len=0` 必须在 `ns_init` 显式清零（malloc 的 netif 不保证为 0，ND6 的
+  周期 Router Solicitation 会按 `hwaddr_len` 拷贝 `hwaddr[]`——ASan 抓到过越界）。
 - **`port/arch/cc.h`**：`BYTE_ORDER` 按编译器宏检测（CI 交叉编译 s390x 是大端）、
   `LWIP_RAND()` 委托项目自己的 `rand_u32()`（全 32 位 ISN，避免可预测 RST 伪造）。
 
@@ -38,8 +48,8 @@ tun2socks 场景生产验证过。
   `pcb->snd_buf >= MSS`，保证 commit 的 `tcp_write` 不失败（不丢数据）。
 - **下行（隧道 → 本地 fd）**：`lwip_output_cb`（`netif->output`）把 lwIP 交出的
   完整内层 IP pbuf 套上 `[8B outer][XOR inner]`，拷进 tx 队列；`ns_rx_packet`
-  把解出内层段 `pbuf_alloc(PBUF_POOL)` 后喂 `ip4_input`；`tcp_recv` 回调把 pbuf
-  拷进 `conn->rxq`。
+  把解出内层段 `pbuf_alloc(PBUF_POOL)` 后按版本喂 `ip4_input` / `ip6_input`；
+  `tcp_recv` 回调把 pbuf 拷进 `conn->rxq`。
 - **背压**：`recv_cb` 只追加 `rxq` 不调 `tcp_recved`（窗口收缩→对端停发），
   `conn_reconcile_rxq` 在 `ns_tick`/`ns_close` 里对「已被 SOCKS 层排空」的部分
   调 `tcp_recved`。用 `rxq_unrecved = delivered - recved` 精确计数，避免同一轮内

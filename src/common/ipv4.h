@@ -16,6 +16,11 @@ uint16_t ip_csum_fold(uint32_t sum);
 /* TCP checksum over the 12-byte IPv4 pseudo header + TCP segment. The
  * caller must zero the checksum field in the segment first. */
 uint16_t ip_tcp_csum(uint32_t sip, uint32_t dip, const void *tcp, size_t n);
+/* TCP checksum over the 40-byte IPv6 pseudo header (16-byte src+dst,
+ * next-header TCP, 32-bit segment length) + TCP segment. The caller
+ * must zero the checksum field in the segment first. */
+uint16_t ip6_tcp_csum(const uint8_t sip[16], const uint8_t dip[16],
+                      const void *tcp, size_t n);
 /* UDP checksum over the IPv4 pseudo header + UDP datagram. The caller
  * must zero the checksum field in the datagram first. */
 uint16_t ip_udp_csum(uint32_t sip, uint32_t dip, const void *udp, size_t n);
@@ -49,5 +54,20 @@ uint16_t ip_udp_csum(uint32_t sip, uint32_t dip, const void *udp, size_t n);
  */
 int ipv4_pkt_ok(const uint8_t *pkt, size_t len,
                 uint32_t *saddr, uint32_t *daddr);
+
+/* Validate a raw IPv6 datagram (header + payload, as received on the
+ * wire) and extract the addresses as raw 16-byte values.
+ *
+ * Rejection criteria (all return -1):
+ *   - pkt/saddr/daddr NULL, or len < 40
+ *   - version != 6
+ *   - payload length (plen) + 40 > len (truncated / padded garbage)
+ *   - src: :: (any), ff00::/8 multicast
+ *   - dst: ff00::/8 multicast
+ *
+ * Same pointer-offset parse discipline as ipv4_pkt_ok: no allocation,
+ * no logging. */
+int ip6_pkt_ok(const uint8_t *pkt, size_t len,
+               uint8_t saddr[16], uint8_t daddr[16]);
 
 #endif /* IWAN_IPV4_H */

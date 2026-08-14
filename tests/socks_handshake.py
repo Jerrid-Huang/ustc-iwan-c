@@ -212,9 +212,16 @@ def run_no_token(port, connect_timeout_ms):
                       port)
 
     def atyp_ipv6():
-        # ATYP=4 -> rep=8
-        greeting_then(b"\x05\x01\x00\x04" + b"\x00" * 16 + b"\x00\x50",
-                      b"\x05\x08", port)
+        # ATYP=4 is accepted (IPv6 targets supported): the SYN goes to
+        # the unreachable off-link target (2001:db8::1) and the connect
+        # times out -> rep=4. No premature reply before the timeout.
+        def body(s):
+            s.sendall(b"\x05\x01\x00" b"\x05\x01\x00\x04"
+                      b"\x20\x01\x0d\xb8" + b"\x00" * 12 + b"\x00\x50")
+            expect_prefix(s, b"\x05\x00", DEFAULT_READ_TIMEOUT)
+            expect_silence(s, STALL_TIMEOUT, "atyp_ipv6 (premature reply)")
+            expect_prefix(s, b"\x05\x04", ct_wait)
+        with_conn(port, body)
 
     def stall_big_nmethods():
         # lying nmethods=0xff must produce NO reply

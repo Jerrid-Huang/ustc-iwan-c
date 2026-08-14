@@ -55,13 +55,22 @@ typedef struct {
     bool     rx_paused;        /* uplink backpressure: netstack ring full,
                                 * stop registering POLLIN until the next
                                 * tick (wait_events reads this) */
+    uint8_t  target_af;        /* request target family: 0 unknown (domain),
+                                * 4 = IPv4, 6 = IPv6 (SOCKS5 reply BND.ADDR
+                                * and the reply-format decision) */
+    int      dns_pending;      /* outstanding DNS results: >0 while at least
+                                * one query may still succeed (2 with tunnel
+                                * DNS AAAA+A, 1 with the local fallback);
+                                * the flow fails rep=4 only at 0 */
 } Flow;
 
 /* Result of an async DNS lookup, queued for the event loop. */
 typedef struct {
     int      flow_id;
     bool     ok;
-    uint32_t ip;               /* host-order MSB-first */
+    uint8_t  af;               /* 4 or 6 */
+    uint32_t ip;               /* host-order MSB-first (af == 4) */
+    uint8_t  ip6[16];          /* raw bytes (af == 6) */
     uint16_t port;
 } DnsResult;
 
@@ -84,7 +93,8 @@ void send_vpn_keepalive(int sockfd, const SocksConfig *cfg,
 int  receive_vpn(int sockfd, SocksConfig *cfg);
 
 /* ---- flow lifecycle / SOCKS5 handshake / DNS / port alloc / I/O (socks_flow.c) ---- */
-void dns_push(int flow_id, bool ok, uint32_t ip, uint16_t port);
+void dns_push(int flow_id, bool ok, uint8_t af, uint32_t ip,
+              const uint8_t ip6[16], uint16_t port);
 int  dns_drain(DnsResult *out, int max);
 void spawn_dns(int flow_id, const char *domain, uint16_t port);
 void dns_set_server(const char *ip);   /* tunnel DNS resolver (run_socks) */
@@ -100,6 +110,7 @@ void set_flow_state(Flow *f, FlowState st);
 Flow *flow_alloc(struct sockaddr_in *peer);
 void flow_free(Flow *f);
 void open_tcp_connection(Flow *f, uint32_t rip, uint16_t rport);
+void open_tcp_connection6(Flow *f, const uint8_t rip6[16], uint16_t rport);
 void process_socks_handshake(Flow *f);
 /* brute-force auth lockout (socks_flow.c): note a wrong-password
  * failure (success=false) or a successful auth (success=true, clears

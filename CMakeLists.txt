@@ -181,7 +181,11 @@ set(IWAN_LWIP_SRCS
   third_party/lwip/src/core/timeouts.c
   third_party/lwip/src/core/ipv4/ip4.c
   third_party/lwip/src/core/ipv4/ip4_addr.c
-  third_party/lwip/src/core/ipv4/ip4_frag.c)
+  third_party/lwip/src/core/ipv4/ip4_frag.c
+  third_party/lwip/src/core/ipv6/ip6.c
+  third_party/lwip/src/core/ipv6/ip6_addr.c
+  third_party/lwip/src/core/ipv6/nd6.c
+  third_party/lwip/src/core/ipv6/icmp6.c)
 
 add_library(lwip STATIC ${IWAN_LWIP_SRCS})
 # Include order: third_party/lwip (lwipopts.h), third_party/lwip/include

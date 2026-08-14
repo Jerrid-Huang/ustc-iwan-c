@@ -480,6 +480,26 @@ static int setup_tun(const char *name, const char *server_ip, int mask)
         server_cleanup_nat();
         exit(1);
     }
+    /* IPv6 side of the same tun: the derived ULA (fd00::/96 + the IPv4,
+     * protocol.h) is what inner IPv6 return traffic is addressed to. The
+     * /96 prefix makes the whole client pool on-link, so kernel routing
+     * back into the tunnel works without extra routes. Best-effort: an
+     * environment without IPv6 support must not kill the server. */
+    {
+        uint8_t v4[4], b6[16];
+        char addr6[64];
+        if (s2ip4(server_ip, v4)) {
+            ip6_derive_ula(ip4_u32(v4), b6);
+            snprintf(addr6, sizeof addr6,
+                     "%02x%02x:%02x%02x:%02x%02x:%02x%02x:"
+                     "%02x%02x:%02x%02x:%02x%02x:%02x%02x/96",
+                     b6[0], b6[1], b6[2], b6[3], b6[4], b6[5], b6[6], b6[7],
+                     b6[8], b6[9], b6[10], b6[11], b6[12], b6[13], b6[14],
+                     b6[15]);
+            (void)ip_run((char *[]){"-6", "addr", "add", addr6,
+                                    "dev", (char *)name, NULL});
+        }
+    }
     return fd;
 }
 

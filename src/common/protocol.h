@@ -155,4 +155,12 @@ bool s2ip4(const char *s, uint8_t out[4]);
 uint32_t ip4_u32(const uint8_t b[4]);
 void u32_ip4(uint32_t v, uint8_t out[4]);
 
+/* IPv6 inner addresses: the tunnel assigns only an IPv4 (T_IP, wire
+ * format stays IPv4-only), so every IPv6 inner address is derived from
+ * it by a fixed rule shared by the lwIP bridge (source address), the
+ * SOCKS5 replies (BND.ADDR), the server H1 gate (spoof check) and the
+ * TUN config: fd00::/96 + the 32-bit IPv4 (ULA, deterministic). */
+#define IWAN_IP6_ULA_BYTE0 0xfd
+void ip6_derive_ula(uint32_t v4, uint8_t out[16]);
+
 #endif

@@ -10,8 +10,10 @@
  */
 
 #if defined(IWAN_TCP_STACK_LWIP)
+#  define IWAN_NS_IPV6 1   /* the lwIP bridge speaks inner IPv6 */
 #  include "lwip_bridge.h"
 #else
+#  define IWAN_NS_IPV6 0   /* the native rollback stack is IPv4-only */
 #  include "netstack.h"
 #endif
 

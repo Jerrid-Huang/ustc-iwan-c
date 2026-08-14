@@ -46,6 +46,7 @@ typedef struct {
     slist_t     proxy_cidr;
     slist_t     proxy_ip;
     slist_t     proxy_domain;
+    slist_t     proxy_cidr6;    /* IPv6: CIDRs, addresses or domains */
     bool        ustc;   /* route USTC campus networks through the tunnel */
     uint8_t     encrypt;
     bool        socks;

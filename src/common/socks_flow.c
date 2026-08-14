@@ -200,11 +200,15 @@ static pthread_mutex_t g_dns_mu = PTHREAD_MUTEX_INITIALIZER;
 static DnsResult g_dns_q[DNS_RESULT_Q_LEN];
 static int g_dns_hd, g_dns_tl; /* ring */
 
-void dns_push(int flow_id, bool ok, uint32_t ip, uint16_t port) {
+void dns_push(int flow_id, bool ok, uint8_t af, uint32_t ip,
+              const uint8_t ip6[16], uint16_t port) {
     pthread_mutex_lock(&g_dns_mu);
     g_dns_q[g_dns_tl].flow_id = flow_id;
     g_dns_q[g_dns_tl].ok = ok;
+    g_dns_q[g_dns_tl].af = af;
     g_dns_q[g_dns_tl].ip = ip;
+    if (ip6)
+        memcpy(g_dns_q[g_dns_tl].ip6, ip6, 16);
     g_dns_q[g_dns_tl].port = port;
     g_dns_tl = (g_dns_tl + 1) % DNS_RESULT_Q_LEN;
     if (g_dns_tl == g_dns_hd)
@@ -273,6 +277,8 @@ typedef struct {
     uint16_t port;
     char    *domain;
     unsigned gen;        /* session generation at spawn (see g_dns_gen) */
+    uint8_t  qtype;      /* DNS query type: 1 = A, 28 = AAAA, 0 = local
+                          * fallback (system resolver, AF_UNSPEC) */
 } DnsJob;
 
 /* Process-level singletons: g_dns_server_ip4 here and g_sockfd (declared
@@ -299,6 +305,7 @@ typedef struct {
     char     domain[256];
     int      flow_id;
     uint16_t port;       /* requested remote port, replayed by dns_push */
+    uint8_t  qtype;      /* query type this wait entry is for (1 / 28) */
 } DnsWait;
 
 static DnsWait g_dns_wait[DNS_WAIT_MAX];
@@ -375,8 +382,8 @@ static int dns_encode_qname(const char *domain, uint8_t *out, size_t outsz)
     return (int)o;
 }
 
-/* build a DNS query payload: header + question (qname, type A, class IN) */
-static size_t dns_build_query(uint16_t id, const char *domain,
+/* build a DNS query payload: header + question (qname, qtype, class IN) */
+static size_t dns_build_query(uint16_t id, const char *domain, uint8_t qtype,
                               uint8_t *out, size_t outsz)
 {
     int qn;
@@ -392,8 +399,8 @@ static size_t dns_build_query(uint16_t id, const char *domain,
     out[4] = 0x00;               /* QDCOUNT = 1 */
     out[5] = 0x01;
     out[6] = out[7] = out[8] = out[9] = out[10] = out[11] = 0;
-    out[12 + qn]     = 0x00;     /* QTYPE = A */
-    out[12 + qn + 1] = 0x01;
+    out[12 + qn]     = 0x00;     /* QTYPE = A / AAAA */
+    out[12 + qn + 1] = qtype;
     out[12 + qn + 2] = 0x00;     /* QCLASS = IN */
     out[12 + qn + 3] = 0x01;
     return 12 + (size_t)qn + 4;
@@ -475,6 +482,7 @@ static int dns_register(uint16_t id, uint16_t sport, const DnsJob *j)
             w->resends = DNS_MAX_RESEND;
             w->flow_id = j->flow_id;
             w->port = j->port;
+            w->qtype = j->qtype;
             snprintf(w->domain, sizeof w->domain, "%s", j->domain);
             w->in_use = true;
             pthread_mutex_unlock(&g_dns_wait_mu);
@@ -533,6 +541,7 @@ bool dns_try_handle_response(const uint8_t *pkt, size_t n)
 {
     size_t ihl, ulen, dnslen, off;
     uint16_t dport, an, want_id, fport;
+    uint8_t want_qtype;
     int slot = -1, flow_id;
     char want_domain[256];
     uint8_t q[300];
@@ -556,6 +565,7 @@ bool dns_try_handle_response(const uint8_t *pkt, size_t n)
         if (w->in_use && w->sport == dport) {
             slot = i;
             want_id = w->dns_id;
+            want_qtype = w->qtype;
             flow_id = w->flow_id;
             fport = w->port;
             memcpy(want_domain, w->domain, sizeof want_domain);
@@ -587,12 +597,12 @@ bool dns_try_handle_response(const uint8_t *pkt, size_t n)
     if (dns[4] != 0 || dns[5] < 1)             /* QDCOUNT >= 1 */
         goto bad;
     /* question echo: the response must repeat our exact question bytes
-     * (qname + QTYPE A + QCLASS IN) — a blind injector that guesses the
+     * (qname + QTYPE + QCLASS IN) — a blind injector that guesses the
      * ID is still rejected */
     qn = dns_encode_qname(want_domain, q, sizeof q - 4);
     if (qn < 0)
         goto bad;
-    q[qn] = 0x00; q[qn + 1] = 0x01;
+    q[qn] = 0x00; q[qn + 1] = want_qtype;
     q[qn + 2] = 0x00; q[qn + 3] = 0x01;
     qn += 4;
     if (12 + (size_t)qn > dnslen ||
@@ -620,23 +630,40 @@ bool dns_try_handle_response(const uint8_t *pkt, size_t n)
         off += 10;
         if (off + rdlen > dnslen)
             goto bad;
-        if (typ == 1 && cls == 1 && rdlen == 4) {
-            uint32_t ip = ip4_u32(dns + off);
-            /* slot may have been recycled by the timed-out worker: only
-             * consume (and push) when it is still OUR transaction */
-            pthread_mutex_lock(&g_dns_wait_mu);
-            {
-                DnsWait *w = &g_dns_wait[slot];
-                if (w->in_use && w->sport == dport &&
-                    w->dns_id == want_id) {
-                    w->in_use = false;
-                    pthread_mutex_unlock(&g_dns_wait_mu);
-                    dns_push(flow_id, true, ip, fport);
-                } else {
-                    pthread_mutex_unlock(&g_dns_wait_mu);
+        if (typ == want_qtype && cls == 1) {
+            if (want_qtype == 1 && rdlen == 4) {
+                uint32_t ip = ip4_u32(dns + off);
+                /* slot may have been recycled by the timed-out worker: only
+                 * consume (and push) when it is still OUR transaction */
+                pthread_mutex_lock(&g_dns_wait_mu);
+                {
+                    DnsWait *w = &g_dns_wait[slot];
+                    if (w->in_use && w->sport == dport &&
+                        w->dns_id == want_id) {
+                        w->in_use = false;
+                        pthread_mutex_unlock(&g_dns_wait_mu);
+                        dns_push(flow_id, true, 4, ip, NULL, fport);
+                    } else {
+                        pthread_mutex_unlock(&g_dns_wait_mu);
+                    }
                 }
+                return true;
             }
-            return true;
+            if (want_qtype == 28 && rdlen == 16) {
+                pthread_mutex_lock(&g_dns_wait_mu);
+                {
+                    DnsWait *w = &g_dns_wait[slot];
+                    if (w->in_use && w->sport == dport &&
+                        w->dns_id == want_id) {
+                        w->in_use = false;
+                        pthread_mutex_unlock(&g_dns_wait_mu);
+                        dns_push(flow_id, true, 6, 0, dns + off, fport);
+                    } else {
+                        pthread_mutex_unlock(&g_dns_wait_mu);
+                    }
+                }
+                return true;
+            }
         }
         off += rdlen;
     }
@@ -693,23 +720,52 @@ void dns_stop(void)
  * NSS) is configured to use, no hardcoded server. Tunnel DNS stays the
  * preferred path when the server does advertise one. */
 
-/* one-shot local A query via the system resolver. Blocks the worker
+/* one-shot A/AAAA query via the system resolver. Blocks the worker
  * thread for the resolver's own timeout at worst, which only delays
  * this flow's rep=4; other flows are unaffected. */
-static bool dns_query_local(const char *domain, uint32_t *ip_out)
+static bool dns_query_local(const char *domain, uint8_t *af_out,
+                            uint32_t *ip_out, uint8_t ip6_out[16])
 {
-    struct addrinfo hints, *res = NULL;
+    struct addrinfo hints, *res = NULL, *r;
     int rc;
 
     memset(&hints, 0, sizeof hints);
-    hints.ai_family = AF_INET;      /* the tunnel stack is IPv4-only */
+    hints.ai_family = AF_UNSPEC;    /* dual-stack: prefer IPv6 when present */
     hints.ai_socktype = SOCK_STREAM;
     rc = getaddrinfo(domain, NULL, &hints, &res);
     if (rc != 0 || !res)
         return false;
-    /* host-order MSB-first, same convention as the tunnel path's
-     * dns_push()/open_tcp_connection() */
-    *ip_out = ntohl(((struct sockaddr_in *)res->ai_addr)->sin_addr.s_addr);
+    /* prefer an IPv6 answer; fall back to IPv4 (RFC 8305-style order) */
+    r = NULL;
+    for (struct addrinfo *a = res; a != NULL; a = a->ai_next) {
+        if (a->ai_family == AF_INET6 && a->ai_addrlen >= 16) {
+            r = a;
+            break;
+        }
+    }
+    if (r == NULL) {
+        for (struct addrinfo *a = res; a != NULL; a = a->ai_next) {
+            if (a->ai_family == AF_INET) {
+                r = a;
+                break;
+            }
+        }
+    }
+    if (r == NULL) {
+        freeaddrinfo(res);
+        return false;
+    }
+    if (r->ai_family == AF_INET6) {
+        /* raw wire bytes, same convention as ns_connect6 / ip6_derive_ula */
+        memcpy(ip6_out,
+               &((const struct sockaddr_in6 *)r->ai_addr)->sin6_addr, 16);
+        *af_out = 6;
+    } else {
+        /* host-order MSB-first, same convention as the tunnel path's
+         * dns_push()/open_tcp_connection() */
+        *ip_out = ntohl(((const struct sockaddr_in *)r->ai_addr)->sin_addr.s_addr);
+        *af_out = 4;
+    }
     freeaddrinfo(res);
     return true;
 }
@@ -730,21 +786,22 @@ static void *dns_worker(void *arg) {
      * reused by another open() */
     if (atomic_load(&g_dns_gen) != j->gen)
         goto done;
-    if (g_dns_server_ip4 == 0) {
-        /* server handed out no tunnel DNS (dns=0.0.0.0): resolve via
-         * the system resolver — no session socket involved, so the
-         * generation gate above is sufficient */
-        uint32_t lip;
-        if (dns_query_local(j->domain, &lip))
-            dns_push(j->flow_id, true, lip, j->port);
+    if (g_dns_server_ip4 == 0 || j->qtype == 0) {
+        /* no tunnel DNS (dns=0.0.0.0) or a local-fallback worker:
+         * resolve via the system resolver — no session socket involved,
+         * so the generation gate above is sufficient */
+        uint32_t lip = 0;
+        uint8_t lip6[16], af = 4;
+        if (dns_query_local(j->domain, &af, &lip, lip6))
+            dns_push(j->flow_id, true, af, lip, lip6, j->port);
         else
-            dns_push(j->flow_id, false, 0, j->port);
+            dns_push(j->flow_id, false, 4, 0, NULL, j->port);
         goto done;
     }
     if (g_sockfd < 0)
         goto fail;
     id = (uint16_t)rand_u32();
-    qlen = dns_build_query(id, j->domain, q, sizeof q);
+    qlen = dns_build_query(id, j->domain, j->qtype, q, sizeof q);
     if (qlen == 0)
         goto fail;                       /* invalid domain */
     sport = dns_alloc_sport();
@@ -838,7 +895,7 @@ static void *dns_worker(void *arg) {
         if (act == 3)
             break;
         if (act == 2) {
-            dns_push(j->flow_id, false, 0, j->port);
+            dns_push(j->flow_id, false, 4, 0, NULL, j->port);
             break;
         }
     }
@@ -850,7 +907,7 @@ fail:
         dns_retire_slot_locked(slot, sport, id);
         pthread_mutex_unlock(&g_dns_wait_mu);
     }
-    dns_push(j->flow_id, false, 0, j->port);
+    dns_push(j->flow_id, false, 4, 0, NULL, j->port);
 done:
     /* wake the event loop, unless the session is gone: its eventfd may
      * already be closed (and reused), and the loop is not waiting.
@@ -871,25 +928,41 @@ done:
     return NULL;
 }
 
-/* spawn detached thread resolving `domain` then pushing a result for flow id. */
+/* spawn detached threads resolving `domain` then pushing a result for
+ * flow id. With tunnel DNS active, two workers run concurrently — one
+ * AAAA (preferred), one A — so dual-stack domains resolve with the
+ * latency of the faster answer; the flow fails (rep=4) only after ALL
+ * its outstanding queries failed (Flow.dns_pending). Without tunnel
+ * DNS a single worker uses the system resolver (AF_UNSPEC). */
 void spawn_dns(int flow_id, const char *domain, uint16_t port) {
-    pthread_t th;
-    DnsJob *j = malloc(sizeof *j);
-    if (!j) {
-        dns_push(flow_id, false, 0, port);
-        return;
+    uint8_t qtypes[2] = {28, 1};   /* AAAA first, then A */
+    int nq = (g_dns_server_ip4 != 0) ? 2 : 1;
+    for (int i = 0; i < MAX_FLOWS; i++) {
+        if (g_flows[i].active && (uint64_t)flow_id == g_flows[i].id) {
+            g_flows[i].dns_pending = nq;
+            break;
+        }
     }
-    j->flow_id = flow_id;
-    j->port = port;
-    j->domain = xstrdup(domain);
-    j->gen = atomic_load(&g_dns_gen);
-    if (pthread_create(&th, NULL, dns_worker, j) != 0) {
-        free(j->domain);
-        free(j);
-        dns_push(flow_id, false, 0, port);
-        return;
+    for (int k = 0; k < nq; k++) {
+        pthread_t th;
+        DnsJob *j = malloc(sizeof *j);
+        if (!j) {
+            dns_push(flow_id, false, 4, 0, NULL, port);
+            continue;
+        }
+        j->flow_id = flow_id;
+        j->port = port;
+        j->domain = xstrdup(domain);
+        j->gen = atomic_load(&g_dns_gen);
+        j->qtype = qtypes[k];
+        if (pthread_create(&th, NULL, dns_worker, j) != 0) {
+            free(j->domain);
+            free(j);
+            dns_push(flow_id, false, 4, 0, NULL, port);
+            continue;
+        }
+        pthread_detach(th);
     }
-    pthread_detach(th);
 }
 
 void queue_flow_output(Flow *f, const uint8_t *data, size_t n) {
@@ -909,6 +982,18 @@ static void socks_reply(Flow *f, uint8_t rep, uint32_t bnd_ip,
     r[7] = (uint8_t)bnd_ip;
     r[8] = (uint8_t)(bnd_port >> 8);
     r[9] = (uint8_t)bnd_port;
+    queue_flow_output(f, r, sizeof r);
+}
+
+/* SOCKS5 reply with an IPv6 bound address: ver=5, rep, rsv, atyp=4,
+ * 16-byte addr, port. bnd6 is raw wire bytes. */
+static void socks_reply6(Flow *f, uint8_t rep, const uint8_t bnd6[16],
+                         uint16_t bnd_port)
+{
+    uint8_t r[22] = {5, rep, 0, 4};
+    memcpy(r + 4, bnd6, 16);
+    r[20] = (uint8_t)(bnd_port >> 8);
+    r[21] = (uint8_t)bnd_port;
     queue_flow_output(f, r, sizeof r);
 }
 
@@ -1010,6 +1095,41 @@ void open_tcp_connection(Flow *f, uint32_t rip, uint16_t rport) {
     }
 }
 
+void open_tcp_connection6(Flow *f, const uint8_t rip6[16], uint16_t rport) {
+    if (!IWAN_NS_IPV6) {
+        /* native rollback stack: honest "address type not supported" */
+        queue_socks_error(f, 8);
+        return;
+    }
+    uint16_t lport = alloc_port();
+    if (lport == 0) {
+        queue_socks_error(f, 1);
+        return;
+    }
+    int idx = ns_connect6(&g_ns, lport, rip6, rport);
+    if (idx < 0) {
+        queue_socks_error(f, 1);
+        return;
+    }
+    f->ns_idx = idx;
+    f->lport = lport;
+    set_flow_state(f, ST_CONNECTING);
+    if (debug_enabled()) {
+        uint8_t b6[16];
+        ip6_derive_ula(g_ns.ip, b6);
+        log_debug("[flow %lu] [%02x%02x:%02x%02x:%02x%02x:%02x%02x:"
+                  "%02x%02x:%02x%02x:%02x%02x:%02x%02x]:%u -> "
+                  "[%02x%02x:%02x%02x:%02x%02x:%02x%02x:"
+                  "%02x%02x:%02x%02x:%02x%02x:%02x%02x]:%u",
+                  (unsigned long)f->id, b6[0], b6[1], b6[2], b6[3], b6[4],
+                  b6[5], b6[6], b6[7], b6[8], b6[9], b6[10], b6[11], b6[12],
+                  b6[13], b6[14], b6[15], lport, rip6[0], rip6[1], rip6[2],
+                  rip6[3], rip6[4], rip6[5], rip6[6], rip6[7], rip6[8],
+                  rip6[9], rip6[10], rip6[11], rip6[12], rip6[13], rip6[14],
+                  rip6[15], rport);
+    }
+}
+
 /* constant-time equality: both buffers are exactly n bytes (the caller
  * rejects length mismatches first), so the loop hides the comparison
  * shape from timing */
@@ -1094,8 +1214,8 @@ static int greeting_http_probe(const uint8_t *d, size_t n)
  * literals return 1 (ip4 filled), domains return 0 (domain filled),
  * anything malformed returns -1. */
 static int http_parse_target(const char *s, size_t n, bool is_connect,
-                             uint32_t *ip4_out, char *domain, size_t dsz,
-                             uint16_t *port_out)
+                             uint32_t *ip4_out, uint8_t ip6_out[16],
+                             char *domain, size_t dsz, uint16_t *port_out)
 {
     size_t i;
     const char *host;
@@ -1136,8 +1256,43 @@ static int http_parse_target(const char *s, size_t n, bool is_connect,
     }
     if (n == 0)
         return -1;
-    if (s[0] == '[')
-        return -1;              /* IPv6 literal: netstack is IPv4-only */
+    if (s[0] == '[') {
+        /* bracketed IPv6 literal: [addr]:port (RFC 7230 authority) */
+        size_t close = 0;
+        while (close < n && s[close] != ']')
+            close++;
+        if (close == n || close < 3 || close > 45)
+            return -1;          /* ] must exist, addr 3..45 chars */
+        size_t hn6 = close - 1;
+        char buf[48];
+        if (hn6 >= sizeof buf)
+            return -1;
+        memcpy(buf, s + 1, hn6);
+        buf[hn6] = 0;
+        if (inet_pton(AF_INET6, buf, ip6_out) != 1)
+            return -1;
+        if (close + 1 >= n) {
+            *port_out = port;
+            return 2;           /* no port: use the method default */
+        }
+        if (s[close + 1] != ':')
+            return -1;
+        {
+            size_t pn = n - (close + 2);
+            unsigned long v = 0;
+            if (pn == 0)
+                return -1;
+            for (i = 0; i < pn; i++) {
+                if (s[close + 2 + i] < '0' || s[close + 2 + i] > '9')
+                    return -1;
+                v = v * 10 + (unsigned long)(s[close + 2 + i] - '0');
+                if (v > 65535)
+                    return -1;
+            }
+            *port_out = (uint16_t)v;
+        }
+        return 2;
+    }
     /* split host:port at the (single) colon */
     {
         const char *colon = NULL;
@@ -1197,6 +1352,7 @@ static void http_handshake(Flow *f)
     size_t hdr, eol, mn, ts;
     char domain[256];
     uint32_t ip4 = 0;
+    uint8_t ip6[16];
     uint16_t port;
     int r;
 
@@ -1221,14 +1377,19 @@ static void http_handshake(Flow *f)
     if (ts >= eol)
         goto bad;
     r = http_parse_target((const char *)d + ts, eol - ts, f->http_connect,
-                          &ip4, domain, sizeof domain, &port);
+                          &ip4, ip6, domain, sizeof domain, &port);
     if (r < 0)
         goto bad;
     if (f->http_connect)
         buf_consume(&f->input, hdr);
-    if (r == 1)
+    if (r == 1) {
+        f->target_af = 4;
         open_tcp_connection(f, ip4, port);
-    else {
+    } else if (r == 2) {
+        f->target_af = 6;
+        open_tcp_connection6(f, ip6, port);
+    } else {
+        f->target_af = 0;
         set_flow_state(f, ST_RESOLVING);
         spawn_dns((int)f->id, domain, port);
     }
@@ -1390,7 +1551,20 @@ static void handshake_request(Flow *f)
             ((uint32_t)f->input.data[6] << 8) | f->input.data[7];
         uint16_t rport = (uint16_t)((f->input.data[8] << 8) | f->input.data[9]);
         buf_consume(&f->input, 10);
+        f->target_af = 4;
         open_tcp_connection(f, rip, rport);
+        return;
+    }
+    case 4: { /* IPv6 (RFC 1928) */
+        if (f->input.len < 22)
+            return;
+        uint8_t rip6[16];
+        memcpy(rip6, f->input.data + 4, 16);
+        uint16_t rport = (uint16_t)((f->input.data[20] << 8) |
+                                    f->input.data[21]);
+        buf_consume(&f->input, 22);
+        f->target_af = 6;
+        open_tcp_connection6(f, rip6, rport);
         return;
     }
     case 3: { /* domain */
@@ -1418,6 +1592,7 @@ static void handshake_request(Flow *f)
         uint16_t rport = (uint16_t)((f->input.data[5 + dlen] << 8) |
                                     f->input.data[6 + dlen]);
         buf_consume(&f->input, req_len);
+        f->target_af = 0;   /* domain: family decided by the DNS result */
         set_flow_state(f, ST_RESOLVING);
         spawn_dns((int)f->id, domain, rport);
         return;
@@ -1453,18 +1628,39 @@ void handle_dns_results(void) {
             if ((uint64_t)q[k].flow_id != f->id)
                 continue;
             if (q[k].ok) {
-                if (debug_enabled())
-                    log_debug("[flow %lu] DNS -> %d.%d.%d.%d",
-                              (unsigned long)f->id, (q[k].ip >> 24) & 0xff,
-                              (q[k].ip >> 16) & 0xff, (q[k].ip >> 8) & 0xff,
-                              q[k].ip & 0xff);
-                open_tcp_connection(f, q[k].ip, q[k].port);
+                if (q[k].af == 6) {
+                    if (debug_enabled())
+                        log_debug("[flow %lu] DNS -> [IPv6] %02x%02x:%02x%02x:"
+                                  "%02x%02x:%02x%02x:%02x%02x:%02x%02x:"
+                                  "%02x%02x:%02x%02x",
+                                  (unsigned long)f->id, q[k].ip6[0],
+                                  q[k].ip6[1], q[k].ip6[2], q[k].ip6[3],
+                                  q[k].ip6[4], q[k].ip6[5], q[k].ip6[6],
+                                  q[k].ip6[7], q[k].ip6[8], q[k].ip6[9],
+                                  q[k].ip6[10], q[k].ip6[11], q[k].ip6[12],
+                                  q[k].ip6[13], q[k].ip6[14], q[k].ip6[15]);
+                    open_tcp_connection6(f, q[k].ip6, q[k].port);
+                } else {
+                    if (debug_enabled())
+                        log_debug("[flow %lu] DNS -> %d.%d.%d.%d",
+                                  (unsigned long)f->id, (q[k].ip >> 24) & 0xff,
+                                  (q[k].ip >> 16) & 0xff,
+                                  (q[k].ip >> 8) & 0xff, q[k].ip & 0xff);
+                    open_tcp_connection(f, q[k].ip, q[k].port);
+                }
             } else {
-                log_err("[flow %lu] DNS failed via %s", (unsigned long)f->id,
-                        g_dns_server_ip4 == 0
-                            ? "system resolver"
-                            : g_dns_server_ip);
-                queue_socks_error(f, 4);
+                /* A dual query (AAAA+A) may still be pending: fail the
+                 * flow only after the last outstanding result arrived */
+                if (f->dns_pending > 0)
+                    f->dns_pending--;
+                if (f->dns_pending <= 0) {
+                    log_err("[flow %lu] DNS failed via %s",
+                            (unsigned long)f->id,
+                            g_dns_server_ip4 == 0
+                                ? "system resolver"
+                                : g_dns_server_ip);
+                    queue_socks_error(f, 4);
+                }
             }
             break;
         }
@@ -1529,7 +1725,13 @@ void update_tcp_states(void) {
                 queue_flow_output(f, (const uint8_t *)okhdr,
                                   sizeof okhdr - 1);
             } else if (!f->http_mode) {
-                socks_reply(f, 0, g_ns.ip, f->lport);
+                if (f->target_af == 6) {
+                    uint8_t b6[16];
+                    ip6_derive_ula(g_ns.ip, b6);
+                    socks_reply6(f, 0, b6, f->lport);
+                } else {
+                    socks_reply(f, 0, g_ns.ip, f->lport);
+                }
             }
             set_flow_state(f, ST_ESTABLISHED);
             if (debug_enabled())

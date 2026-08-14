@@ -453,9 +453,18 @@ static void vpn_handle_data(SocksConfig *cfg, uint8_t *b, size_t n)
         log_debug("DATA decrypted (%zuB): %s...", plen, hex);
     }
     uint32_t saddr, daddr;
-    if (plen < 20 || plen > (size_t)cfg->mtu ||
-        ipv4_pkt_ok(b + 8, plen, &saddr, &daddr) != 0)
+    if (plen < 20 || plen > (size_t)cfg->mtu)
         return;
+    if ((b[8] >> 4) == 6) {
+        /* inner IPv6 (SOCKS targets over IPv6): structural check only —
+         * spoof protection is the server's job (its H1 gate binds the
+         * source to the session's derived ULA) */
+        uint8_t s6[16], d6[16];
+        if (plen < 40 || ip6_pkt_ok(b + 8, plen, s6, d6) != 0)
+            return;
+    } else if (ipv4_pkt_ok(b + 8, plen, &saddr, &daddr) != 0) {
+        return;
+    }
     /* M1: inner UDP packets whose dst port belongs to a pending
      * tunnel DNS query are responses — consume them here, never
      * hand them to the TCP stack */

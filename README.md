@@ -50,6 +50,7 @@ sudo ./iwan-client-oidc --all
 
 - 默认仅监听回环、无密码；监听非回环地址时必须指定 `--socks-token <PASS>` 或 `--socks-no-token`（互斥），或配合 `--allow-remote`。
 - 同一端口同时接受 HTTP 代理握手（设置 `--socks-token` 后禁用）。
+- 支持 IPv6 目标（ATYP=4）与 IPv6 域名解析（AAAA）。
 
 ### 常用参数
 
@@ -57,8 +58,9 @@ sudo ./iwan-client-oidc --all
 |------|------|
 | `--fetch` / `--list` / `--connect` / `--all` | 四个动作，必须指定其一 |
 | `--server <NAME\|HOST:PORT>` | 跳过线路选择直接连接 |
-| `--proxy-ip` / `--proxy-domain` / `--proxy-cidr` | 指定走隧道的 IP / 域名 / CIDR（可重复） |
-| `--proxy-cidr 0.0.0.0/0` | 全部流量走隧道 |
+| `--proxy-ip` / `--proxy-domain` / `--proxy-cidr` | 指定走隧道的 IPv4 / 域名 / CIDR（可重复） |
+| `--proxy-cidr6` | 指定走隧道的 IPv6 CIDR / 地址 / 域名（可重复） |
+| `--proxy-cidr 0.0.0.0/0` | 全部 IPv4 流量走隧道 |
 | `--tun` / `--encrypt` | TUN 设备名（默认 `iwan0`）/ 加密模式（默认 `1`） |
 | `--ustc` | 将全部校园网 CIDR 加入代理路由 |
 

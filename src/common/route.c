@@ -28,6 +28,53 @@ static bool mac_run(char *const argv[], const char *what)
 #  include <arpa/inet.h>
 #endif
 
+/* derived inner ULA (fd00::/96 + the inner IPv4, protocol.h) as text;
+ * returns false when tun_ip is not a valid IPv4. */
+static bool tun_ula_str(const char *tun_ip, char out[64])
+{
+    uint8_t v4[4], b6[16];
+    if (!s2ip4(tun_ip, v4))
+        return false;
+    ip6_derive_ula(ip4_u32(v4), b6);
+    snprintf(out, 64,
+             "%02x%02x:%02x%02x:%02x%02x:%02x%02x:"
+             "%02x%02x:%02x%02x:%02x%02x:%02x%02x",
+             b6[0], b6[1], b6[2], b6[3], b6[4], b6[5], b6[6], b6[7],
+             b6[8], b6[9], b6[10], b6[11], b6[12], b6[13], b6[14], b6[15]);
+    return true;
+}
+
+/* best-effort: give the tunnel interface its IPv6 side (the derived
+ * ULA/96). The /96 makes the whole client pool on-link, so the kernel
+ * routes v6 return traffic into the tunnel without extra routes. */
+static void tun_iface_up6(const char *tun, const char *tun_ip)
+{
+#ifdef _WIN32
+    char ula[64], namea[32];
+    if (!tun_ula_str(tun_ip, ula))
+        return;
+    snprintf(namea, sizeof namea, "name=%s", tun);
+    char *a[] = { "netsh", "interface", "ipv6", "add", "address", namea,
+                  ula, NULL };
+    (void)port_run_cmd(a);   /* idempotent; best-effort */
+#elif defined(__APPLE__)
+    char ula[64];
+    if (!tun_ula_str(tun_ip, ula))
+        return;
+    const char *ifn = tun_ifname(tun);
+    char *a[] = { "ifconfig", (char *)ifn, "inet6", ula, "prefixlen", "96",
+                  NULL };
+    (void)port_run_cmd(a);   /* best-effort */
+#else
+    char ula[64], ula96[72];
+    if (!tun_ula_str(tun_ip, ula))
+        return;
+    snprintf(ula96, sizeof ula96, "%s/96", ula);
+    (void)ip_run((char *[]){"-6", "addr", "add", ula96,
+                            "dev", (char *)tun, NULL});
+#endif
+}
+
 #ifdef _WIN32
 /* ------------------------- Windows helpers ------------------------ */
 
@@ -72,6 +119,7 @@ bool route_iface_up(const char *tun, const char *tun_ip, uint16_t mtu)
                    namea, mtuarg, NULL };
     if (!netsh_run(a2, "iface up: set mtu"))
         return false;
+    tun_iface_up6(tun, tun_ip);   /* best-effort IPv6 side */
     return true;
 }
 #elif defined(__APPLE__)
@@ -94,6 +142,7 @@ bool route_iface_up(const char *tun, const char *tun_ip, uint16_t mtu)
         log_err("iface up: mtu %s on %s failed", mtu_s, ifn);
         return false;
     }
+    tun_iface_up6(tun, tun_ip);   /* best-effort IPv6 side */
     return true;
 }
 #else
@@ -122,6 +171,7 @@ bool route_iface_up(const char *tun, const char *tun_ip, uint16_t mtu)
         log_err("iface up: addr add %s dev %s failed", ip24, tun);
         return false;
     }
+    tun_iface_up6(tun, tun_ip);   /* best-effort IPv6 side */
     return true;
 }
 #endif /* _WIN32 */
@@ -942,3 +992,80 @@ void route_teardown(const char *tun, const char *srv, const char *ogw,
     ip_run(fc);
 }
 #endif /* _WIN32 */
+
+/* IPv6 proxy routes through the tunnel (see route.h: best-effort) */
+bool route_setup6(const char *tun, const slist_t *routes6)
+{
+    if (routes6 == NULL)
+        return true;
+#ifdef _WIN32
+    char namea[32];
+    snprintf(namea, sizeof namea, "name=%s", tun);
+    for (size_t i = 0; i < routes6->n; i++) {
+        const char *c = routes6->v[i];
+        char *a[] = { "netsh", "interface", "ipv6", "add", "route",
+                      (char *)c, namea, NULL };
+        if (netsh_run(a, "route_setup6: add route"))
+            continue;
+        log_err("route_setup6: add %s failed", c);
+    }
+#elif defined(__APPLE__)
+    const char *ifn = tun_ifname(tun);
+    for (size_t i = 0; i < routes6->n; i++) {
+        const char *c = routes6->v[i];
+        char *d[] = { "route", "-n", "delete", "-inet6", (char *)c,
+                      "-interface", (char *)ifn, NULL };
+        port_run_cmd(d);   /* idempotent setup */
+        char *a[] = { "route", "-n", "add", "-inet6", (char *)c,
+                      "-interface", (char *)ifn, NULL };
+        if (mac_run(a, "route_setup6: add route"))
+            continue;
+        log_err("route_setup6: add %s failed", c);
+    }
+#else
+    for (size_t i = 0; i < routes6->n; i++) {
+        const char *c = routes6->v[i];
+        char *a[] = { "-6", "route", "add", (char *)c,
+                      "dev", (char *)tun, NULL };
+        if (!ip_run(a))
+            log_err("route_setup6: ip -6 route add %s dev %s failed", c, tun);
+    }
+#endif
+    return true;
+}
+
+void route_teardown6(const char *tun, const slist_t *routes6)
+{
+    if (routes6 == NULL)
+        return;
+#ifdef _WIN32
+    char namea[32];
+    snprintf(namea, sizeof namea, "name=%s", tun);
+    for (size_t i = 0; i < routes6->n; i++) {
+        const char *c = routes6->v[i];
+        char *d[] = { "netsh", "interface", "ipv6", "delete", "route",
+                      (char *)c, namea, NULL };
+        if (netsh_run(d, "route_teardown6: delete route"))
+            continue;
+        log_debug("route_teardown6: del %s: not present", c);
+    }
+#elif defined(__APPLE__)
+    const char *ifn = tun_ifname(tun);
+    for (size_t i = 0; i < routes6->n; i++) {
+        const char *c = routes6->v[i];
+        char *d[] = { "route", "-n", "delete", "-inet6", (char *)c,
+                      "-interface", (char *)ifn, NULL };
+        if (mac_run(d, "route_teardown6: delete route"))
+            continue;
+        log_debug("route_teardown6: del %s: not present", c);
+    }
+#else
+    for (size_t i = 0; i < routes6->n; i++) {
+        const char *c = routes6->v[i];
+        char *d[] = { "-6", "route", "del", (char *)c,
+                      "dev", (char *)tun, NULL };
+        if (!ip_run(d))
+            log_debug("route_teardown6: ip -6 route del %s: not present", c);
+    }
+#endif
+}

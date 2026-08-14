@@ -47,6 +47,7 @@ typedef struct {
     slist_t     proxy_cidr;
     slist_t     proxy_ip;
     slist_t     proxy_domain;
+    slist_t     proxy_cidr6;    /* IPv6: CIDRs, addresses or domains */
     const char *listen_str;
     const char *socks_token;
     bool        socks_no_token;
@@ -163,6 +164,7 @@ static void print_sub_help(const char *sub)
             "      --proxy-cidr <PROXY_CIDR>      \n"
             "      --proxy-ip <PROXY_IP>          \n"
             "      --proxy-domain <PROXY_DOMAIN>  \n"
+            "      --proxy-cidr6 <PROXY_CIDR6>    \n"
             "  -h, --help                         Print help\n");
     } else if (strcmp(sub, "socks") == 0) {
         printf(
@@ -544,11 +546,18 @@ static void collect_routes(const CmdOpts *o, slist_t *routes)
         slist_push(routes, o->proxy_domain.v[i]);
 }
 
+static void collect_routes6(const CmdOpts *o, slist_t *routes6)
+{
+    for (size_t i = 0; i < o->proxy_cidr6.n; i++)
+        slist_push(routes6, o->proxy_cidr6.v[i]);
+}
+
 static void free_route_opts(CmdOpts *o)
 {
     slist_free(&o->proxy_cidr);
     slist_free(&o->proxy_ip);
     slist_free(&o->proxy_domain);
+    slist_free(&o->proxy_cidr6);
 }
 
 /* Pre-open cleanup of a stale TUN device. cmd_proxy runs as root, so
@@ -745,7 +754,7 @@ static int cmd_proxy(int argc, char **argv, int start)
     o.encrypt = 1;
     o.mtu = IWAN_DEFAULT_MTU;
     o.tun = "iwan0";
-    cli_opt opts[13];
+    cli_opt opts[14];
 
     add_auth_opts(opts, &o);
     opts[9] = (cli_opt){ "tun",          CLI_OPT_STR, &o.tun,
@@ -756,6 +765,8 @@ static int cmd_proxy(int argc, char **argv, int start)
                           "<PROXY_IP>", NULL };
     opts[12] = (cli_opt){ "proxy-domain", CLI_OPT_CSV, &o.proxy_domain,
                           "<PROXY_DOMAIN>", NULL };
+    opts[13] = (cli_opt){ "proxy-cidr6", CLI_OPT_CSV, &o.proxy_cidr6,
+                          "<PROXY_CIDR6>", NULL };
     parse_cmd(argc, argv, start, "proxy", opts, sizeof opts / sizeof opts[0]);
     if (!o.server)
         err_required("proxy");
@@ -845,8 +856,13 @@ static int cmd_proxy(int argc, char **argv, int start)
         uint8_t sk[16];
         session_key(o.user, o.pass, sk);
 
+        slist_t routes6;
+        slist_init(&routes6);
+        collect_routes6(&o, &routes6);
         rc = run_pump(tun_fd, o.tun, sockfd, sk, res.sid, res.tok,
-                      o.encrypt, o.server, &routes, res.tun, res.mtu);
+                      o.encrypt, o.server, &routes, &routes6,
+                      res.tun, res.mtu);
+        slist_free(&routes6);
         wipe(sk, sizeof sk);
         port_close(sockfd);
         /* user stopped it (Ctrl-C): run_pump returns 0 when the exit

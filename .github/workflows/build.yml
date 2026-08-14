@@ -194,6 +194,8 @@ jobs:
       # the readv/commit path against an in-process fake TCP peer and verifies
       # the echo byte-for-byte, in three modes: in-order, out-of-order
       # injection (OOS reassembly), and drop-once (RTO retransmit recovery).
+      # Each runs over inner IPv4 and inner IPv6 (IWAN_TEST_IPV6=1; the
+      # client's v6 = derived fd00::/96 ULA, peer 2001:db8::1).
       # Exercises tcp_write / tcp_recv / netif output / rx / tcp_recved
       # reconciliation under the sanitizers.
       - name: lwIP data-path test (ASan+UBSan)
@@ -201,6 +203,53 @@ jobs:
           ./bin/lwip_data_harness
           IWAN_TEST_REORDER=1 ./bin/lwip_data_harness
           IWAN_TEST_DROP_ONCE=1 ./bin/lwip_data_harness
+          IWAN_TEST_IPV6=1 ./bin/lwip_data_harness
+          IWAN_TEST_IPV6=1 IWAN_TEST_REORDER=1 ./bin/lwip_data_harness
+          IWAN_TEST_IPV6=1 IWAN_TEST_DROP_ONCE=1 ./bin/lwip_data_harness
+
+      # Root-free IPv6 SOCKS end-to-end: iwan-server --no-tun (TCP echo
+      # mirror) + iwan-client socks; an IPv6 CONNECT must get a 22-byte
+      # ATYP=4 success reply and round-trip payload through the tunnel.
+      - name: IPv6 SOCKS end-to-end (ASan+UBSan)
+        run: |
+          set -e
+          printf 'alice:s3cret-pass\n' > /tmp/users.txt
+          chmod 600 /tmp/users.txt
+          ./bin/iwan-server --users /tmp/users.txt --port 16031 --no-tun \
+            --user "$(whoami)" > /tmp/iwan-srv6.log 2>&1 &
+          SRV=$!
+          trap 'kill $SRV 2>/dev/null || true' EXIT
+          sleep 1
+          ./bin/iwan-client socks --server 127.0.0.1 --port 16031 \
+            --user alice --pass 's3cret-pass' --listen 127.0.0.1:11081 \
+            > /tmp/iwan-cli6.log 2>&1 &
+          CLI=$!
+          sleep 1.5
+          python3 - <<'PYEOF'
+import socket
+s = socket.create_connection(("127.0.0.1", 11081), timeout=10)
+s.sendall(b"\x05\x01\x00")
+assert s.recv(2) == b"\x05\x00", "greeting"
+s.sendall(b"\x05\x01\x00\x04" b"\x20\x01\x0d\xb8" + b"\x00" * 12 + b"\x00\x50")
+r = b""
+while len(r) < 22:
+    r += s.recv(22 - len(r))
+assert r[0] == 5 and r[1] == 0 and r[3] == 4, "v6 success reply: %r" % r
+assert r[4] == 0xfd, "BND.ADDR must be the derived ULA: %r" % r
+data = b"ipv6-e2e-payload" * 100
+s.sendall(data)
+got = b""
+s.settimeout(10)
+while len(got) < len(data):
+    x = s.recv(4096)
+    if not x:
+        break
+    got += x
+assert got == data, "echo mismatch: %d/%d" % (len(got), len(data))
+s.close()
+print("IPv6 SOCKS e2e: PASS")
+PYEOF
+          kill $CLI 2>/dev/null || true
 
       # Multi-connection fairness smoke: N concurrent uploads must all
       # complete (guards the per-conn tx-queue fair-share gate against

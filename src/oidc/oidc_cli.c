@@ -52,6 +52,7 @@ static void print_help_short(void)
         "      --server <NAME|HOST:PORT>     Connect directly to a server by name or host:port\n"
         "      --tun <TUN>                    TUN device name [default: iwan0]\n"
         "      --proxy-cidr <PROXY_CIDR>      CIDR ranges to route through the tunnel. Can be repeated or comma-separated (also read from proxy.conf)\n"
+        "      --proxy-cidr6 <PROXY_CIDR6>    IPv6 CIDRs/addresses/domains to route through the tunnel\n"
         "      --ustc                         Route USTC campus networks through the tunnel (shortcut for the usual --proxy-cidr list)\n"
         "      --proxy-ip <PROXY_IP>          IPv4 addresses to route through the tunnel. Can be repeated or comma-separated\n"
         "      --proxy-domain <PROXY_DOMAIN>  Domains to resolve and route through the tunnel. Can be repeated or comma-separated\n"
@@ -103,6 +104,9 @@ static void print_help_long(void)
         "\n"
         "      --proxy-cidr <PROXY_CIDR>\n"
         "          CIDR ranges to route through the tunnel. Can be repeated or comma-separated (also read from proxy.conf)\n"
+        "\n"
+        "      --proxy-cidr6 <PROXY_CIDR6>\n"
+        "          IPv6 CIDRs, addresses or domains to route through the tunnel. Can be repeated or comma-separated\n"
         "\n"
         "      --ustc\n"
         "          Route USTC campus networks through the tunnel (shortcut for the usual --proxy-cidr list)\n"
@@ -220,6 +224,7 @@ void oidc_parse_cli(int argc, char **argv, Opts *o, Cli *usage)
         { "ustc",         CLI_OPT_BOOL, &o->ustc,          NULL,             NULL },
         { "proxy-ip",     CLI_OPT_CSV,  &o->proxy_ip,      "<PROXY_IP>",     NULL },
         { "proxy-domain", CLI_OPT_CSV,  &o->proxy_domain,  "<PROXY_DOMAIN>", NULL },
+        { "proxy-cidr6",  CLI_OPT_CSV,  &o->proxy_cidr6,   "<PROXY_CIDR6>",  NULL },
         { "encrypt",      CLI_OPT_U8,   &o->encrypt,       "<ENCRYPT>",      NULL },
         { "socks",        CLI_OPT_BOOL, &o->socks,         NULL,             NULL },
         { "socks-listen", CLI_OPT_STR,  &o->socks_listen,  "<SOCKS_LISTEN>", valid_listen },

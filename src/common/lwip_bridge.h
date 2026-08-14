@@ -79,7 +79,9 @@ struct TcpConn {
     /* ---- bridge-internal ---- */
     struct Netstack *ns;    /* back-pointer for callbacks */
     struct tcp_pcb *pcb;    /* NULL when the slot is free */
+    uint8_t  af;            /* 4 = IPv4 (rip), 6 = IPv6 (rip6) */
     uint32_t rip;
+    uint8_t  rip6[16];
     uint16_t rport, lport;
     uint64_t state_ms;      /* when state last changed (connect start) */
     size_t   rxq_unrecved;   /* bytes delivered to recv_cb but not yet
@@ -119,6 +121,10 @@ typedef struct Netstack {
 void ns_init(Netstack *ns, uint32_t inner_ip, uint32_t gw, uint16_t mtu);
 void ns_set_outer(Netstack *ns, const uint8_t hdr[8], const uint8_t key[8]);
 int  ns_connect(Netstack *ns, uint16_t lport, uint32_t rip, uint16_t rport);
+/* IPv6 remote: rip6 is 16 raw bytes. Native (netstack.h) has no IPv6
+ * and returns -1; the SOCKS layer maps that to rep=8. */
+int  ns_connect6(Netstack *ns, uint16_t lport, const uint8_t rip6[16],
+                 uint16_t rport);
 TcpConn *ns_conn(Netstack *ns, int idx);
 NsState ns_state(const TcpConn *c);
 void ns_dump_conn(const Netstack *ns, int idx);
