@@ -98,6 +98,15 @@ if ! iptables -C INPUT -i "$TUN_NAME" -j ACCEPT 2>/dev/null; then
         INPUT_RULE_SRV=1
 fi
 
+# optional RPS experiment: spread the tun device's RX softirq across
+# cores (the single-queue netif_rx path is the suspected ~9.5G wall)
+if [ -n "${IWAN_RPS_CPUS:-}" ]; then
+    for q in /sys/class/net/"$TUN_NAME"/queues/rx-*/rps_cpus; do
+        [ -e "$q" ] && echo "$IWAN_RPS_CPUS" > "$q" 2>/dev/null
+    done
+    echo "RPS: set rps_cpus=$IWAN_RPS_CPUS on $TUN_NAME"
+fi
+
 echo "== start bench server (sink) =="
 stdbuf -oL -eL python3 tests/bench_server.py --bind "$SRV_IP" \
     --sink-port "$SINK_PORT" --source-port 17011 &
@@ -203,7 +212,8 @@ for C in $CLIENTS_LIST; do
             for u in $(echo "$d1" | tr ' ' '\n' | cut -d: -f1 | sort -un); do
                 a=$(echo "$d0" | tr ' ' '\n' | grep "^$u:" | cut -d: -f2)
                 b=$(echo "$d1" | tr ' ' '\n' | grep "^$u:" | cut -d: -f2)
-                dd="$dd uid$u:+$((b - ${a:-0}))"
+                a=${a:-0}; b=${b:-0}
+                dd="$dd uid$u:+$((b - a))"
             done
             echo "UDP drops by uid:$dd"
         fi

@@ -40,9 +40,18 @@ class SourceHandler(socketserver.BaseRequestHandler):
         print(f"source conn: {total / 1e6:.1f} MB", flush=True)
 
 
-class BenchServer(socketserver.ThreadingTCPServer):
-    allow_reuse_address = True
-    daemon_threads = True
+# Fork per connection (Linux/macOS test tool only): 8-16 concurrent
+# 1Gbit+ sinks in ONE python process hit the GIL (~162% CPU measured,
+# capping aggregate at ~9.5Gbit/s and misattributed to the tunnel);
+# separate processes remove the interpreter lock from the bench path.
+if hasattr(socketserver, "ForkingTCPServer"):
+    class BenchServer(socketserver.ForkingTCPServer):
+        allow_reuse_address = True
+        daemon_threads = True
+else:
+    class BenchServer(socketserver.ThreadingTCPServer):
+        allow_reuse_address = True
+        daemon_threads = True
 
 
 def main():
