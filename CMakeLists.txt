@@ -46,6 +46,11 @@ option(IWAN_STATIC       "Windows: statically link OpenSSL + runtime libs" OFF)
 option(IWAN_BPF          "Linux: compile and embed the tun steering eBPF program" ON)
 option(IWAN_WERROR       "Treat compiler warnings as errors" OFF)
 set(IWAN_OPENSSL_DIR "" CACHE PATH "OpenSSL sysroot (include/ + lib/ or lib64/)")
+# SOCKS-mode userspace TCP stack. lwip = vendored lwIP 2.2.1 (default);
+# native = the hand-rolled netstack.c, retained one release cycle as a
+# rollback target.
+set(IWAN_TCP_STACK "lwip" CACHE STRING "SOCKS-mode TCP stack (lwip | native)")
+set_property(CACHE IWAN_TCP_STACK PROPERTY STRINGS lwip native)
 
 # ---------------------------------------------------------------------------
 # Global flags — the old Makefile's CFLAGS/LDFLAGS, split per platform.
@@ -123,7 +128,6 @@ set(IWAN_CORE_SRCS
   src/common/https.c
   src/common/ipv4.c
   src/common/json.c
-  src/common/netstack.c
   src/common/port.c
   src/common/protocol.c
   src/common/proxy.c
@@ -144,8 +148,55 @@ else()
   list(APPEND IWAN_CORE_SRCS src/common/server.c src/common/tun.c)
 endif()
 
+# Userspace TCP stack for the SOCKS mode (exactly one implementation).
+if(IWAN_TCP_STACK STREQUAL "lwip")
+  list(APPEND IWAN_CORE_SRCS src/common/lwip_bridge.c)
+elseif(IWAN_TCP_STACK STREQUAL "native")
+  list(APPEND IWAN_CORE_SRCS src/common/netstack.c)
+else()
+  message(FATAL_ERROR "IWAN_TCP_STACK must be 'lwip' or 'native' (got '${IWAN_TCP_STACK}')")
+endif()
+
+# ---------------------------------------------------------------------------
+# Vendored lwIP 2.2.1 (third_party/lwip): the userspace TCP stack behind the
+# SOCKS mode. NO_SYS=1 raw API, IPv4/TCP only, no socket layer — configured by
+# third_party/lwip/lwipopts.h and third_party/lwip/port/arch/cc.h. Built as a
+# standalone static lib; iwan_core links it (native netstack.c remains the
+# IWAN_TCP_STACK=native alternative).
+# ---------------------------------------------------------------------------
+set(IWAN_LWIP_SRCS
+  third_party/lwip/src/core/def.c
+  third_party/lwip/src/core/inet_chksum.c
+  third_party/lwip/src/core/init.c
+  third_party/lwip/src/core/ip.c
+  third_party/lwip/src/core/mem.c
+  third_party/lwip/src/core/memp.c
+  third_party/lwip/src/core/netif.c
+  third_party/lwip/src/core/pbuf.c
+  third_party/lwip/src/core/stats.c
+  third_party/lwip/src/core/sys.c
+  third_party/lwip/src/core/tcp.c
+  third_party/lwip/src/core/tcp_in.c
+  third_party/lwip/src/core/tcp_out.c
+  third_party/lwip/src/core/timeouts.c
+  third_party/lwip/src/core/ipv4/ip4.c
+  third_party/lwip/src/core/ipv4/ip4_addr.c
+  third_party/lwip/src/core/ipv4/ip4_frag.c)
+
+add_library(lwip STATIC ${IWAN_LWIP_SRCS})
+# Include order: third_party/lwip (lwipopts.h), third_party/lwip/include
+# (lwip/*.h), third_party/lwip/port (arch/cc.h).
+target_include_directories(lwip PUBLIC
+  third_party/lwip
+  third_party/lwip/include
+  third_party/lwip/port)
+
 add_library(iwan_core STATIC ${IWAN_CORE_SRCS})
 target_include_directories(iwan_core PUBLIC src/common)
+target_link_libraries(iwan_core PUBLIC lwip)
+if(IWAN_TCP_STACK STREQUAL "lwip")
+  target_compile_definitions(iwan_core PUBLIC IWAN_TCP_STACK_LWIP=1)
+endif()
 # Threads::Threads is linked LAST: on MinGW it resolves to -lpthread, and
 # in the IWAN_STATIC build it must come after the -Bstatic winpthread group
 # (whose archive then satisfies the pthread refs and the trailing -lpthread
@@ -322,6 +373,16 @@ option(BUILD_TESTING "Build the SOCKS5 handshake test harness" ON)
 if(BUILD_TESTING)
   add_executable(socks_handshake_harness tests/socks_handshake_harness.c)
   target_link_libraries(socks_handshake_harness PRIVATE iwan_core)
+  # Root-free data-plane test: the lwIP bridge uploads a pattern through the
+  # readv/commit path against an in-process fake TCP peer and verifies the
+  # echo (exercises tcp_write / tcp_recv / netif output / rx). Only meaningful
+  # for the lwip stack.
+  add_executable(lwip_data_harness tests/lwip_data_harness.c)
+  target_link_libraries(lwip_data_harness PRIVATE iwan_core)
+  # Multi-conn fairness test: N simultaneous uploads must all complete (the
+  # per-conn tx-queue fair-share gate, NS_TX_CONN_CAP).
+  add_executable(lwip_fairness_harness tests/lwip_fairness_harness.c)
+  target_link_libraries(lwip_fairness_harness PRIVATE iwan_core)
 endif()
 
 if(UNIX AND NOT APPLE)

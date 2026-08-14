@@ -190,6 +190,26 @@ jobs:
           python3 tests/socks_handshake.py
           python3 tests/socks_handshake.py --token review-token
 
+      # Root-free data-plane test: the lwIP bridge uploads a pattern through
+      # the readv/commit path against an in-process fake TCP peer and verifies
+      # the echo byte-for-byte, in three modes: in-order, out-of-order
+      # injection (OOS reassembly), and drop-once (RTO retransmit recovery).
+      # Exercises tcp_write / tcp_recv / netif output / rx / tcp_recved
+      # reconciliation under the sanitizers.
+      - name: lwIP data-path test (ASan+UBSan)
+        run: |
+          ./bin/lwip_data_harness
+          IWAN_TEST_REORDER=1 ./bin/lwip_data_harness
+          IWAN_TEST_DROP_ONCE=1 ./bin/lwip_data_harness
+
+      # Multi-connection fairness smoke: N concurrent uploads must all
+      # complete (guards the per-conn tx-queue fair-share gate against
+      # multi-conn regressions; the throughput fairness itself is bench.sh).
+      - name: lwIP multi-conn fairness test (ASan+UBSan)
+        run: |
+          ./bin/lwip_fairness_harness
+          IWAN_TEST_CONNS=4 ./bin/lwip_fairness_harness
+
   # Fully static musl binaries for every common Linux architecture:
   # zero glibc dependency, run on any Linux of that arch. The BPF
   # steering object is arch-neutral and compiles against the host's

@@ -29,7 +29,7 @@
 #include "common.h"
 #include "crypto.h"
 #include "ipv4.h"
-#include "netstack.h"
+#include "tcpstack.h"
 #include "protocol.h"
 #include "socks_internal.h"
 #include "util.h"

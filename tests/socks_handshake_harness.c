@@ -21,7 +21,7 @@
 
 #include "common.h"
 #include "socks_internal.h"
-#include "netstack.h"
+#include "tcpstack.h"
 
 int main(int argc, char **argv)
 {

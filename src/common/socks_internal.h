@@ -12,7 +12,7 @@
 #endif
 
 #include "common.h"
-#include "netstack.h"
+#include "tcpstack.h"
 #include "socks.h"
 
 #define MAX_FLOWS       256

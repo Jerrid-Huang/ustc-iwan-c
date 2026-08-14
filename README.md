@@ -325,6 +325,32 @@ cmake --build build -j      # iwan-client / iwan-client-oidc
 Windows 交叉编译（在 Linux 上）需要 MinGW-w64 工具链与 OpenSSL sysroot，见
 [`.github/workflows/build.yml`](.github/workflows/build.yml) 中的 `win-cross` / `macos` 任务。
 
+## SOCKS5 模式的 TCP 栈（lwIP）
+
+SOCKS5 模式内置一个用户态 TCP 栈，用来把本地客户端的字节流重新打包成隧道内的
+TCP 段。默认使用 vendored 的 [lwIP 2.2.1](third_party/lwip/README.iwan)
+（BSD-3-Clause，`NO_SYS=1` raw API，无 socket 层，单线程跑在现有事件循环里），
+提供完整的 TCP：慢启动/拥塞控制、快速重传、乱序段重组（`TCP_QUEUE_OOSEQ`）与
+SACK 输出（`LWIP_TCP_SACK_OUT`）、窗口缩放、RTO。
+
+旧的 1458 行手写 `netstack.c` 保留了一个版本周期作为回退，用 CMake 选项切换：
+
+```bash
+cmake -B build -DIWAN_TCP_STACK=lwip      # 默认（lwIP）
+cmake -B build -DIWAN_TCP_STACK=native    # 回退到旧的 netstack.c
+```
+
+桥接层在 [`src/common/lwip_bridge.c`](src/common/lwip_bridge.c)，对 SOCKS 层暴露
+与原 netstack 完全相同的 `ns_*` 接口（`src/common/tcpstack.h` 做二选一分发），
+因此 `socks.c` / `socks_flow.c` 无需改动。lwIP 配置在
+[`third_party/lwip/lwipopts.h`](third_party/lwip/lwipopts.h)，移植层在
+[`third_party/lwip/port/arch/cc.h`](third_party/lwip/port/arch/cc.h)。详见
+[`docs/lwip-bridge.md`](docs/lwip-bridge.md)。
+
+root-free 的数据面测试在 [`tests/lwip_data_harness.c`](tests/lwip_data_harness.c)：
+用进程内 fake TCP 对端回显一个 64KB 模式，覆盖三种情形——顺序、乱序注入
+（`IWAN_TEST_REORDER=1`）、丢包重传恢复（`IWAN_TEST_DROP_ONCE=1`）。
+
 ## 服务端
 
 `iwan-server` 用于自建测试环境。连接 USTC iWAN 不需要运行服务端。
