@@ -35,6 +35,10 @@ TUN_NAME=iwan-srv-mt
 OUT=bench-multi.out
 WORK=$(mktemp -d)
 
+# everything (incl. the server's startup logs: rcvbuf sizes, warnings)
+# goes to bench-multi.out AND the console from here on
+exec > >(tee "$OUT") 2>&1
+
 SERVER_PID=""; CLI_PIDS=""; BENCH_PIDS=""; BENCH_SRV_PID=""; INPUT_RULE_SRV=0
 
 cleanup() {
@@ -154,8 +158,10 @@ for C in $CLIENTS_LIST; do
     u0=$(sed -n 's/^Udp: \([0-9][0-9]*\) \([0-9][0-9]*\) \([0-9][0-9]*\) \([0-9][0-9]*\).*/\1 \2 \3 \4/p' /proc/net/snmp)
     # per-owner UDP drops from /proc/net/udp (drops column by uid):
     # tells whether the SERVER sockets (uid 0/nobody) or the CLIENT
-    # sockets (the bench user) are overflowing. uid is column 10.
-    d0=$(awk 'NR>1 {s[$10]+=$NF} END {for (u in s) printf "%s:%s ", u, s[u]}' /proc/net/udp 2>/dev/null)
+    # sockets (the bench user) are overflowing. Column layout:
+    # sl local rem st tx:rx tr:tm->when retrnsmt uid timeout inode ...
+    # so uid is field 8 and drops is the last field.
+    d0=$(awk 'NR>1 {s[$8]+=$NF} END {for (u in s) printf "%s:%s ", u, s[u]}' /proc/net/udp 2>/dev/null)
     t0=$(date +%s%N)
     BENCH_PIDS=""
     for i in $(seq 1 "$C"); do
@@ -170,7 +176,7 @@ for C in $CLIENTS_LIST; do
     st1=$(awk '/^cpu / {print $2 + $3 + $4 + $5 + $6 + $7 + $8 + $9 + $10 + $11}' /proc/stat)
     id1=$(awk '/^cpu / {print $5}' /proc/stat)
     u1=$(sed -n 's/^Udp: \([0-9][0-9]*\) \([0-9][0-9]*\) \([0-9][0-9]*\) \([0-9][0-9]*\).*/\1 \2 \3 \4/p' /proc/net/snmp)
-    d1=$(awk 'NR>1 {s[$10]+=$NF} END {for (u in s) printf "%s:%s ", u, s[u]}' /proc/net/udp 2>/dev/null)
+    d1=$(awk 'NR>1 {s[$8]+=$NF} END {for (u in s) printf "%s:%s ", u, s[u]}' /proc/net/udp 2>/dev/null)
     t1=$(date +%s%N)
     if [ "$t1" -gt "$t0" ] && [ "$st1" -gt "$st0" ]; then
         dticks=$((st1 - st0))

@@ -540,18 +540,24 @@ static int setup_udp(uint16_t port, int *fds, int n)
              * than the clients' aggregate in-flight window, so a burst
              * overflows it and the kernel drops UDP silently
              * (UdpRcvbufErrors) — the inner TCP then collapses into an
-             * RTO storm. Warn loudly so the operator raises it. */
+             * RTO storm. SO_RCVBUFFORCE (root, before the fork drops
+             * privileges) bypasses the cap; the getsockopt below always
+             * prints what actually took effect so a capped buffer is
+             * visible even when the warning threshold is not crossed. */
             int actual = 0;
             socklen_t alen = sizeof actual;
-            if (getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &actual, &alen) == 0 &&
-                actual < sz / 2)
-                fprintf(stderr,
-                        "warning: UDP rcvbuf capped at %d bytes by "
-                        "net.core.rmem_max (%d requested); bursts past "
-                        "the server's drain will drop. Raise it:\n"
-                        "  sysctl -w net.core.rmem_max=16777216 "
-                        "net.core.wmem_max=16777216\n",
+            if (getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &actual, &alen) == 0) {
+                fprintf(stderr, "udp rcvbuf: %d bytes (requested %d)\n",
                         actual, sz);
+                if (actual < sz)
+                    fprintf(stderr,
+                            "warning: UDP rcvbuf capped at %d bytes by "
+                            "net.core.rmem_max (%d requested); bursts past "
+                            "the server's drain will drop. Raise it:\n"
+                            "  sysctl -w net.core.rmem_max=16777216 "
+                            "net.core.wmem_max=16777216\n",
+                            actual, sz);
+            }
         }
         set_nonblock(fd); /* never let sendto backpressure the loop */
 
