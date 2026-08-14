@@ -52,14 +52,16 @@ Flow *g_flows;            /* fixed MAX_FLOWS array, never NULL-terminated */
  * is declared dead (transient blips recover; persistent failure means
  * the socket is gone) */
 #define SOCKS_KA_FAIL_MAX 3
-/* no downlink for this long => session lost (server purged/rebooted) */
-/* same override as the TUN pump: IWAN_RX_STALE_MS (default 120s,
- * range 10s..24h) — some servers never answer ECHO_REQ keepalives.
- * 120s (was 60s): the USTC servers answer every ECHO_REQ, so silence
- * is usually return-path UDP loss on the mobile line, not a dead
- * session; 120s = 12 consecutive unanswered keepalives (the Rust
- * reference client has no such check and never spuriously reconnects). */
-#define SOCKS_RX_STALE_MS_DEFAULT 120000u
+/* Downlink-silence watchdog. OFF by default: the USTC server's relay
+ * intermittently goes silent for minutes (its userspace relay stalls or
+ * the mobile line loses the return path) and then recovers — the inner
+ * TCP recovers on its own, and the Rust reference client has no such
+ * check and never spuriously reconnects. Killing the whole proxy after
+ * N seconds of silence (as a fixed 120s default did) turned those
+ * stalls into "the SOCKS client died": the listener was torn down and
+ * every in-flight connection dropped, which is worse than the stall
+ * itself. Opt in with IWAN_RX_STALE_MS (range 10s..24h); 0 disables. */
+#define SOCKS_RX_STALE_MS_DEFAULT 0u
 
 static unsigned socks_rx_stale_ms(void)
 {
@@ -70,9 +72,14 @@ static unsigned socks_rx_stale_ms(void)
     if (!v || !v[0])
         return SOCKS_RX_STALE_MS_DEFAULT;
     n = strtoul(v, &end, 10);
-    if (end == v || *end != '\0' || n < 10000 || n > 86400000) {
-        log_err("IWAN_RX_STALE_MS: invalid value '%s' (10s..24h); "
-                "using default", v);
+    if (end == v || *end != '\0' || n == 0) {
+        log_err("IWAN_RX_STALE_MS: invalid value '%s' (10s..24h, or 0 to "
+                "disable); using default", v);
+        return SOCKS_RX_STALE_MS_DEFAULT;
+    }
+    if (n < 10000 || n > 86400000) {
+        log_err("IWAN_RX_STALE_MS: invalid value '%s' (10s..24h, or 0 to "
+                "disable); using default", v);
         return SOCKS_RX_STALE_MS_DEFAULT;
     }
     return (unsigned)n;
@@ -723,10 +730,11 @@ int run_socks(int sockfd, SocksConfig *cfg) {
     uint64_t last_ka = now_ms() - SOCKS_KEEPALIVE_MS;
 
     while (!g_stop) {
-        /* the server answers our ECHO_REQ keepalives, so a live session
-         * always produces downlink within ~10s; 60s of silence means
-         * the session is gone even if the socket still sends */
-        if (now_ms() - cfg->last_rx > socks_rx_stale_ms()) {
+        /* optional downlink-silence watchdog (see SOCKS_RX_STALE_MS_DEFAULT):
+         * off by default, because a silent-but-alive session recovers and
+         * tearing the proxy down drops every in-flight connection */
+        if (socks_rx_stale_ms() > 0 &&
+            now_ms() - cfg->last_rx > socks_rx_stale_ms()) {
             log_err("SOCKS: no downlink for %llu ms; session lost",
                     (unsigned long long)(now_ms() - cfg->last_rx));
             cfg->session_lost = true;
