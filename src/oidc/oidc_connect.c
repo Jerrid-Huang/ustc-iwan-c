@@ -22,6 +22,7 @@ extern char **environ;     /* macOS unistd.h does not declare it */
 #include "oidc.h"
 #include "protocol.h"
 #include "proxy.h"
+#include "relay_proxy.h"
 #include "socks.h"
 #include "tun.h"
 #include "util.h"
@@ -302,6 +303,7 @@ void oidc_connect_server(const Opts *o, const Config *cf)
      * reused across reconnects (the server keeps the assigned IP on a
      * re-OPEN, so routing stays valid). */
     int tun_fd = -1;
+    struct RelayProxy *rp = NULL;
     if (!o->socks) {
         if (!tun_name_valid(o->tun))
             oidc_die("invalid TUN device name '%s'", o->tun);
@@ -318,6 +320,12 @@ void oidc_connect_server(const Opts *o, const Config *cf)
         set_nonblock(tun_fd);
         if (debug_enabled())
             oidc_eprintf("  tun %s fd=%d\n", o->tun, tun_fd);
+        /* optional SOCKS5+HTTP proxy sharing the TUN routes */
+        if (o->socks_listen &&
+            relay_proxy_start(o->socks_listen, o->socks_token,
+                              o->socks_no_token, o->allow_remote,
+                              &rp) != 0)
+            oidc_die("cannot start the SOCKS5+HTTP proxy");
     }
 
     slist_t routes;
@@ -416,6 +424,7 @@ void oidc_connect_server(const Opts *o, const Config *cf)
             break;   /* Ctrl-C during the reconnect wait */
     }
 
+    relay_proxy_stop(rp);
     if (tun_fd >= 0)
         tun_close(tun_fd);
     slist_free(&routes);

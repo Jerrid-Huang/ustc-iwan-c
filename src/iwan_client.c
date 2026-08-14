@@ -21,6 +21,7 @@
 #include "crypto.h"
 #include "protocol.h"
 #include "proxy.h"
+#include "relay_proxy.h"
 #include "socks.h"
 #include "tun.h"
 #include "util.h"
@@ -166,6 +167,10 @@ static void print_sub_help(const char *sub)
             "      --proxy-ip <PROXY_IP>          \n"
             "      --proxy-domain <PROXY_DOMAIN>  \n"
             "      --proxy-cidr6 <PROXY_CIDR6>    \n"
+            "      --listen <LISTEN>              SOCKS5+HTTP proxy sharing the TUN routes (optional)\n"
+            "      --socks-token <TOKEN>          RFC1929 password for the proxy\n"
+            "      --socks-no-token               Explicit proxy password opt-out with --allow-remote\n"
+            "      --allow-remote                 Allow non-loopback --listen\n"
             "  -h, --help                         Print help\n");
     } else if (strcmp(sub, "socks") == 0) {
         printf(
@@ -756,7 +761,7 @@ static int cmd_proxy(int argc, char **argv, int start)
     o.encrypt = 1;
     o.mtu = IWAN_DEFAULT_MTU;
     o.tun = "iwan0";
-    cli_opt opts[14];
+    cli_opt opts[18];
 
     add_auth_opts(opts, &o);
     opts[9] = (cli_opt){ "tun",          CLI_OPT_STR, &o.tun,
@@ -769,11 +774,28 @@ static int cmd_proxy(int argc, char **argv, int start)
                           "<PROXY_DOMAIN>", NULL };
     opts[13] = (cli_opt){ "proxy-cidr6", CLI_OPT_CSV, &o.proxy_cidr6,
                           "<PROXY_CIDR6>", NULL };
+    opts[14] = (cli_opt){ "listen",      CLI_OPT_STR, &o.listen_str,
+                          "<LISTEN>", valid_listen };
+    opts[15] = (cli_opt){ "socks-token", CLI_OPT_STR, &o.socks_token,
+                          "<TOKEN>", validate_token_len };
+    opts[16] = (cli_opt){ "socks-no-token", CLI_OPT_BOOL, &o.socks_no_token,
+                          NULL, NULL };
+    opts[17] = (cli_opt){ "allow-remote", CLI_OPT_BOOL, &o.allow_remote,
+                          NULL, NULL };
     parse_cmd(argc, argv, start, "proxy", opts, sizeof opts / sizeof opts[0]);
     if (!o.server)
         err_required("proxy");
     resolve_credentials(&o, "proxy");
     check_server_ip(o.server, "invalid server address");
+    if (o.socks_token && o.socks_no_token) {
+        fprintf(stderr,
+                "error: --socks-token and --socks-no-token are "
+                "mutually exclusive");
+        err_usage_exit(usage_required("proxy"));
+    }
+    if (o.allow_remote && !o.socks_token && !o.socks_no_token &&
+        o.listen_str)
+        err_remote_token("proxy");
 
 #ifdef _WIN32
     /* TUN mode requires an administrator (wintun driver + routing):
@@ -816,6 +838,18 @@ static int cmd_proxy(int argc, char **argv, int start)
     }
     set_nonblock(tun_fd);
     log_info("tun %s fd=%d", o.tun, tun_fd);
+
+    /* optional SOCKS5+HTTP proxy sharing the TUN routes (kernel-stack
+     * forwarding): started once, independent of session reconnects */
+    struct RelayProxy *rp = NULL;
+    if (o.listen_str &&
+        relay_proxy_start(o.listen_str, o.socks_token, o.socks_no_token,
+                          o.allow_remote, &rp) != 0) {
+        tun_close(tun_fd);
+        slist_free(&routes);
+        free_route_opts(&o);
+        return 1;
+    }
 
     /* keep the plaintext pass until the session ends: reconnects need
      * it to re-derive the session key (server re-OPEN keeps the IP) */
@@ -885,6 +919,7 @@ static int cmd_proxy(int argc, char **argv, int start)
             break;   /* Ctrl-C during the reconnect wait */
     }
     cleanse_str(o.pass);
+    relay_proxy_stop(rp);
     tun_close(tun_fd);
     log_info("done.");
 

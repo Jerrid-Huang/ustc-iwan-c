@@ -236,7 +236,8 @@ fi
 
 ip netns exec "$TUN_NS" ./bin/iwan-client proxy \
     --server "$VETH_IP" --port "$PORT" --user test --pass s3cret \
-    --tun "$TUN_NAME" --proxy-cidr "$SUBNET" &
+    --tun "$TUN_NAME" --proxy-cidr "$SUBNET" \
+    --listen 127.0.0.1:17080 &
 PROXY_PID=$!
 sleep 2
 if ! kill -0 "$PROXY_PID" 2>/dev/null; then
@@ -245,6 +246,68 @@ if ! kill -0 "$PROXY_PID" 2>/dev/null; then
 fi
 ip netns exec "$TUN_NS" python3 tests/echo_client.py \
     --target "$SRV_IP:$ECHO_PORT" --conns 4 --bulk-mb "$BULK_MB"
+echo "== TUN mode + SOCKS5/HTTP proxy (--listen, kernel-stack relay) =="
+ip netns exec "$TUN_NS" python3 - <<'EOF'
+import socket
+
+HOST, PORT = "172.16.0.1", 17000
+PROXY = ("127.0.0.1", 17080)
+PAYLOAD = b"proxy-relay-payload" * 50
+
+# SOCKS5 CONNECT through the TUN-mode proxy
+s = socket.create_connection(PROXY, timeout=15)
+s.sendall(b"\x05\x01\x00")
+assert s.recv(2) == b"\x05\x00", "socks greeting"
+s.sendall(b"\x05\x01\x00\x01" + socket.inet_aton(HOST) +
+          PORT.to_bytes(2, "big"))
+r = s.recv(10)
+assert len(r) == 10 and r[1] == 0, "socks connect reply: %r" % r
+s.sendall(PAYLOAD)
+got = b""
+while len(got) < len(PAYLOAD):
+    x = s.recv(4096)
+    if not x:
+        break
+    got += x
+assert got == PAYLOAD, "socks echo mismatch"
+s.close()
+print("  SOCKS5 via TUN proxy: PASS")
+
+# HTTP CONNECT tunnel through the proxy
+s = socket.create_connection(PROXY, timeout=15)
+s.sendall(b"CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\n\r\n"
+          % (HOST.encode(), PORT, HOST.encode(), PORT))
+r = s.recv(4096)
+assert b"200" in r, "CONNECT reply: %r" % r
+s.sendall(PAYLOAD)
+got = b""
+while len(got) < len(PAYLOAD):
+    x = s.recv(4096)
+    if not x:
+        break
+    got += x
+assert got == PAYLOAD, "CONNECT echo mismatch"
+s.close()
+print("  HTTP CONNECT via TUN proxy: PASS")
+
+# absolute-URI forwarding (the echo server returns the request verbatim)
+s = socket.create_connection(PROXY, timeout=15)
+s.sendall(b"GET http://%s:%d/probe HTTP/1.0\r\n\r\n"
+          % (HOST.encode(), PORT))
+got = b""
+s.settimeout(10)
+try:
+    while True:
+        x = s.recv(4096)
+        if not x:
+            break
+        got += x
+except socket.timeout:
+    pass
+assert b"/probe" in got, "absolute-URI echo: %r" % got[:80]
+s.close()
+print("  HTTP absolute-URI via TUN proxy: PASS")
+EOF
 kill "$PROXY_PID" 2>/dev/null
 wait "$PROXY_PID" 2>/dev/null || true
 PROXY_PID=""
