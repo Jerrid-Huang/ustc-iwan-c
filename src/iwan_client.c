@@ -891,6 +891,46 @@ static int cmd_proxy(int argc, char **argv, int start)
     return rc == 0 ? 0 : 1;
 }
 
+/* in-place tunnel re-auth (socks.h): re-authenticate and refresh the
+ * session fields of cfg. The SOCKS listener, flows and lwIP inner TCP
+ * state are kept by run_socks; only the carrier switches. */
+static int socks_reauth_cb(void *ud, SocksConfig *cfg, int *out_fd)
+{
+    CmdOpts *o = ud;
+    AuthResult res;
+    int fd = authenticate(o, DO_AUTH_PUMP, &res);
+    if (fd < 0) {
+        log_err("SOCKS re-auth: authenticate failed");
+        return -1;
+    }
+    uint8_t sk[16];
+    session_key(o->user, o->pass, sk);
+    uint8_t b[4];
+    if (!s2ip4(res.tun, b)) {
+        log_err("SOCKS re-auth: server returned invalid tun");
+        wipe(sk, sizeof sk);
+        port_close(fd);
+        return -1;
+    }
+    cfg->inner_ip = ip4_u32(b);
+    if (!s2ip4(res.gw, b)) {
+        log_err("SOCKS re-auth: server returned invalid gw");
+        wipe(sk, sizeof sk);
+        port_close(fd);
+        return -1;
+    }
+    cfg->gateway = ip4_u32(b);
+    cfg->mtu = (int)(res.mtu < o->mtu ? res.mtu : o->mtu);
+    memcpy(cfg->xor_key, sk, sizeof cfg->xor_key);
+    wipe(sk, sizeof sk);
+    cfg->sid = res.sid;
+    cfg->token = res.tok;
+    cfg->encryption = o->encrypt;
+    snprintf(cfg->dns, sizeof cfg->dns, "%s", res.dns);
+    *out_fd = fd;
+    return 0;
+}
+
 static int cmd_socks(int argc, char **argv, int start)
 {
     CmdOpts o;
@@ -1001,6 +1041,8 @@ static int cmd_socks(int argc, char **argv, int start)
         cfg.open_proxy = o.socks_no_token;
         cfg.allow_remote = o.allow_remote;
         snprintf(cfg.dns, sizeof cfg.dns, "%s", res.dns);
+        cfg.reauth = socks_reauth_cb;   /* in-place tunnel re-auth */
+        cfg.reauth_ud = &o;
 
         int rc = run_socks(sockfd, &cfg);
         port_close(sockfd);

@@ -1084,6 +1084,9 @@ void open_tcp_connection(Flow *f, uint32_t rip, uint16_t rport) {
     }
     f->ns_idx = idx;
     f->lport = lport;
+    f->tgt_af = 4;
+    f->tgt_ip4 = rip;
+    f->tgt_port = rport;
     set_flow_state(f, ST_CONNECTING);
     if (debug_enabled()) {
         uint8_t b[4];
@@ -1113,6 +1116,9 @@ void open_tcp_connection6(Flow *f, const uint8_t rip6[16], uint16_t rport) {
     }
     f->ns_idx = idx;
     f->lport = lport;
+    f->tgt_af = 6;
+    memcpy(f->tgt_ip6, rip6, 16);
+    f->tgt_port = rport;
     set_flow_state(f, ST_CONNECTING);
     if (debug_enabled()) {
         uint8_t b6[16];
@@ -1718,20 +1724,23 @@ void update_tcp_states(void) {
         TcpConn *c = ns_conn(&g_ns, f->ns_idx);
         NsState st = c ? c->state : NS_CLOSED;
         if (st == NS_ESTABLISHED) {
-            if (f->http_connect) {
-                /* HTTP CONNECT tunnel: confirm after the tunnel is up */
-                static const char okhdr[] =
-                    "HTTP/1.1 200 Connection Established\r\n\r\n";
-                queue_flow_output(f, (const uint8_t *)okhdr,
-                                  sizeof okhdr - 1);
-            } else if (!f->http_mode) {
-                if (f->target_af == 6) {
-                    uint8_t b6[16];
-                    ip6_derive_ula(g_ns.ip, b6);
-                    socks_reply6(f, 0, b6, f->lport);
-                } else {
-                    socks_reply(f, 0, g_ns.ip, f->lport);
+            if (!f->reply_sent) {
+                if (f->http_connect) {
+                    /* HTTP CONNECT tunnel: confirm after the tunnel is up */
+                    static const char okhdr[] =
+                        "HTTP/1.1 200 Connection Established\r\n\r\n";
+                    queue_flow_output(f, (const uint8_t *)okhdr,
+                                      sizeof okhdr - 1);
+                } else if (!f->http_mode) {
+                    if (f->target_af == 6) {
+                        uint8_t b6[16];
+                        ip6_derive_ula(g_ns.ip, b6);
+                        socks_reply6(f, 0, b6, f->lport);
+                    } else {
+                        socks_reply(f, 0, g_ns.ip, f->lport);
+                    }
                 }
+                f->reply_sent = true;
             }
             set_flow_state(f, ST_ESTABLISHED);
             if (debug_enabled())
@@ -1744,14 +1753,23 @@ void update_tcp_states(void) {
             /* NS_TERM_TIMEOUT -> rep 4 (host unreachable); RST/other ->
              * rep 5 (connection refused). Same-iteration slot reuse can
              * reset the reason before this read; worst case the flow
-             * reports rep=5. */
-            queue_socks_error(f, why == NS_TERM_TIMEOUT ? 4 : 5);
+             * reports rep=5. A re-established flow already got its
+             * success reply: close without a second reply. */
+            if (f->reply_sent) {
+                set_flow_state(f, ST_CLOSING);
+            } else {
+                queue_socks_error(f, why == NS_TERM_TIMEOUT ? 4 : 5);
+            }
         } else if (now_ms() - f->state_ms >= HANDSHAKE_TIMEOUT_MS) {
             if (debug_enabled())
                 log_debug("[flow %lu] TCP connect timed out",
                           (unsigned long)f->id);
             ns_abort(&g_ns, f->ns_idx);
-            queue_socks_error(f, 4);
+            if (f->reply_sent) {
+                set_flow_state(f, ST_CLOSING);
+            } else {
+                queue_socks_error(f, 4);
+            }
         }
     }
 }
@@ -1891,8 +1909,12 @@ void service_local_inputs(Flow *fs) {
                     break;
                 }
             }
-        } else {
-            /* greeting/request: read into rbuf for the handshake parser */
+        } else if (f->state != ST_ESTABLISHED) {
+            /* greeting/request (or CONNECTING): read into rbuf for the
+             * handshake parser. An ESTABLISHED flow whose conn vanished
+             * (dead tunnel, in-place re-auth pending) is NOT read: the
+             * kernel socket buffers the client's bytes (backpressure)
+             * until the re-established connection drains them. */
             uint8_t rbuf[TCP_RX_CHUNK];
             ssize_t n = port_recv(f->fd, rbuf, sizeof rbuf, 0);
             if (n == 0) {

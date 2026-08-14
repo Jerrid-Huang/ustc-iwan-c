@@ -45,8 +45,90 @@ static void check_gw_server(const char *server, const char *gw)
     }
 }
 
+/* in-place tunnel re-auth (socks.h): re-run the OIDC auth and refresh
+ * the session fields of cfg. The SOCKS listener, flows and lwIP inner
+ * TCP state are kept by run_socks; only the carrier switches. */
+struct oidc_reauth_ctx {
+    const Opts *o;
+    const char *host;
+    uint16_t port;
+    const char *user;
+    const char *srv_user;
+    const char *encrypted_pw;
+    const Config *cf;
+};
+
+static int oidc_socks_reauth_cb(void *ud, SocksConfig *cfg, int *out_fd)
+{
+    const struct oidc_reauth_ctx *rc = ud;
+    char *password = decrypt_password(rc->encrypted_pw ? rc->encrypted_pw : "",
+                                      OIDC_APP_SECRET, rc->cf->domain,
+                                      rc->srv_user ? rc->srv_user : "");
+    if (!password) {
+        log_err("SOCKS re-auth: cannot decrypt password");
+        return -1;
+    }
+    uint8_t ct[16];
+    if (get_ct(rc->user, password, NULL, ct) != 0) {
+        OPENSSL_cleanse(password, strlen(password));
+        free(password);
+        log_err("SOCKS re-auth: cannot derive password");
+        return -1;
+    }
+    uint32_t nonce = rand_u32();
+    buf_t open;
+    buf_init(&open);
+    if (build_open(&open, rc->user, ct, IWAN_DEFAULT_MTU, rc->o->encrypt,
+                   nonce) != 0) {
+        buf_free(&open);
+        OPENSSL_cleanse(password, strlen(password));
+        free(password);
+        log_err("SOCKS re-auth: username too long");
+        return -1;
+    }
+    AuthResult res;
+    int fd = do_auth(rc->host, rc->port, open.data, open.len, nonce,
+                     DO_AUTH_OIDC, &res);
+    buf_free(&open);
+    if (fd < 0) {
+        OPENSSL_cleanse(password, strlen(password));
+        free(password);
+        log_err("SOCKS re-auth: auth failed");
+        return -1;
+    }
+    uint8_t sk[16];
+    session_key(rc->user, password, sk);
+    OPENSSL_cleanse(password, strlen(password));
+    free(password);
+    uint8_t b[4];
+    if (!s2ip4(res.tun, b)) {
+        log_err("SOCKS re-auth: server returned invalid tun");
+        OPENSSL_cleanse(sk, sizeof sk);
+        port_close(fd);
+        return -1;
+    }
+    cfg->inner_ip = ip4_u32(b);
+    if (!s2ip4(res.gw, b)) {
+        log_err("SOCKS re-auth: server returned invalid gw");
+        OPENSSL_cleanse(sk, sizeof sk);
+        port_close(fd);
+        return -1;
+    }
+    cfg->gateway = ip4_u32(b);
+    cfg->mtu = res.mtu < rc->o->socks_mtu ? res.mtu : rc->o->socks_mtu;
+    memcpy(cfg->xor_key, sk, sizeof cfg->xor_key);
+    OPENSSL_cleanse(sk, sizeof sk);
+    cfg->sid = res.sid;
+    cfg->token = res.tok;
+    cfg->encryption = rc->o->encrypt;
+    snprintf(cfg->dns, sizeof cfg->dns, "%s", res.dns);
+    *out_fd = fd;
+    return 0;
+}
+
 static int run_socks_mode(const Opts *o, int fd, const uint8_t sk[16],
-                          const AuthResult *res)
+                          const AuthResult *res,
+                          const struct oidc_reauth_ctx *rc)
 {
     uint8_t b[4];
     if (!s2ip4(res->tun, b)) {
@@ -79,6 +161,8 @@ static int run_socks_mode(const Opts *o, int fd, const uint8_t sk[16],
     cfg.open_proxy = o->socks_no_token;
     cfg.allow_remote = o->allow_remote;
     snprintf(cfg.dns, sizeof cfg.dns, "%s", res->dns);
+    cfg.reauth = oidc_socks_reauth_cb;   /* in-place tunnel re-auth */
+    cfg.reauth_ud = (void *)rc;
 
     /* propagate run_socks's return: 1 = session lost (reconnect),
      * 0 = stopped. The hardcoded 0 here used to make every lost
@@ -246,6 +330,10 @@ void oidc_connect_server(const Opts *o, const Config *cf)
      * downlink) re-authenticates and re-runs the pump instead of
      * silently dying. The plaintext password is re-decrypted per
      * iteration and scrubbed right after use. */
+    struct oidc_reauth_ctx reauth_ctx = {
+        .o = o, .host = host, .port = port, .user = user,
+        .srv_user = srv_user, .encrypted_pw = encrypted_pw, .cf = cf,
+    };
     bool reconnecting = false;
     for (;;) {
         char *password = decrypt_password(encrypted_pw ? encrypted_pw : "",
@@ -299,7 +387,7 @@ void oidc_connect_server(const Opts *o, const Config *cf)
 
         int rc;
         if (o->socks) {
-            rc = run_socks_mode(o, fd, sk, &res);
+            rc = run_socks_mode(o, fd, sk, &res, &reauth_ctx);
             port_close(fd);
         } else {
             rc = run_pump(tun_fd, o->tun, fd, sk, res.sid, res.tok,

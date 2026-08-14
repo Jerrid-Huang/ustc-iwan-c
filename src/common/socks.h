@@ -11,7 +11,26 @@
 
 #include "util.h"
 
-typedef struct {
+typedef struct SocksConfig SocksConfig;
+
+/* In-place tunnel re-auth, called by run_socks when the session must be
+ * re-established (downlink-silence watchdog, keepalive failures, server
+ * CLOSE). The callback authenticates a NEW session and refreshes every
+ * session-derived field of cfg (sid/token/inner_ip/gateway/mtu/dns; the
+ * xor_key usually stays identical — it derives from the same
+ * credentials). On success it returns 0 with *out_fd = the new UDP
+ * socket (run_socks closes the old one). Returns -1 on failure:
+ * run_socks keeps the old socket and retries later.
+ *
+ * The SOCKS listener, the accepted client flows and the userspace inner
+ * TCP state (lwIP) are NOT touched by the re-auth: the tunnel is only
+ * the carrier, and the USTC server keeps the inner IP across re-OPENs,
+ * so established inner connections resume seamlessly. Only the tx queue
+ * is flushed (queued frames carry the old sid/token; lwIP's RTO
+ * retransmits them with the new outer header). */
+typedef int (*socks_reauth_fn)(void *ud, SocksConfig *cfg, int *out_fd);
+
+typedef struct SocksConfig {
     struct sockaddr_in listen_addr;
     const char *listen_str;  /* configured address text, printed like Rust */
     const char *auth_token;  /* RFC1929 password; NULL = no auth (as before) */
@@ -29,8 +48,12 @@ typedef struct {
     int      gso_ok;       /* 0 untried, 1 usable, -1 failed */
     size_t   gso_mss;      /* last UDP_SEGMENT mss set, 0 = none */
     pace_bucket pace;      /* aggregate send pacing (util.h); 0 = off */
+    /* in-place tunnel re-auth (NULL = legacy: return 1 -> caller loop) */
+    void          *reauth_ud;
+    socks_reauth_fn reauth;
     /* runtime session-health state (not configuration): */
     uint64_t last_rx;      /* last downlink datagram (stale-session clock) */
+    uint64_t reauth_at;    /* next in-place re-auth retry (0 = none) */
     int      ka_fail;      /* consecutive keepalive send failures */
     bool     session_lost; /* tunnel died (keepalive / no downlink) */
 } SocksConfig;

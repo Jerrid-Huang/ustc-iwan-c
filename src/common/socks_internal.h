@@ -62,6 +62,15 @@ typedef struct {
                                 * one query may still succeed (2 with tunnel
                                 * DNS AAAA+A, 1 with the local fallback);
                                 * the flow fails rep=4 only at 0 */
+    bool     reply_sent;       /* CONNECT success reply already queued: a
+                                * tunnel re-auth that re-establishes this
+                                * flow must not send it again */
+    /* last requested target, for re-establishing the inner connection on
+     * a tunnel re-auth when the server changed our inner IP */
+    uint8_t  tgt_af;
+    uint32_t tgt_ip4;
+    uint8_t  tgt_ip6[16];
+    uint16_t tgt_port;
 } Flow;
 
 /* Result of an async DNS lookup, queued for the event loop. */

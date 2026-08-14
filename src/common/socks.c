@@ -52,16 +52,14 @@ Flow *g_flows;            /* fixed MAX_FLOWS array, never NULL-terminated */
  * is declared dead (transient blips recover; persistent failure means
  * the socket is gone) */
 #define SOCKS_KA_FAIL_MAX 3
-/* Downlink-silence watchdog. OFF by default: the USTC server's relay
- * intermittently goes silent for minutes (its userspace relay stalls or
- * the mobile line loses the return path) and then recovers — the inner
- * TCP recovers on its own, and the Rust reference client has no such
- * check and never spuriously reconnects. Killing the whole proxy after
- * N seconds of silence (as a fixed 120s default did) turned those
- * stalls into "the SOCKS client died": the listener was torn down and
- * every in-flight connection dropped, which is worse than the stall
- * itself. Opt in with IWAN_RX_STALE_MS (range 10s..24h); 0 disables. */
-#define SOCKS_RX_STALE_MS_DEFAULT 0u
+/* Downlink-silence watchdog: after this much silence the tunnel is
+ * re-authenticated IN PLACE (see socks_reauth_tunnel) — the SOCKS
+ * listener, client flows and inner TCP state are kept, so connections
+ * survive the switch. 0 disables. The USTC server's relay intermittently
+ * goes silent for minutes and then recovers; re-authing (server keeps
+ * the inner IP across re-OPENs) restores the carrier without dropping
+ * anything. */
+#define SOCKS_RX_STALE_MS_DEFAULT 120000u
 
 static unsigned socks_rx_stale_ms(void)
 {
@@ -420,18 +418,12 @@ void send_vpn_keepalive(int sockfd, const SocksConfig *cfg,
     buf_init(&p);
     ctrl_hdr(&p, PT_ECHO_REQ, cfg->encryption, cfg->sid, cfg->token);
     if (port_send(sockfd, p.data, (int)p.len, 0) < 0) {
-        /* transient failures (roaming, carrier hiccup) recover; only
-         * repeated ones declare the session socket dead */
+        /* transient failures (roaming, carrier hiccup) recover; the
+         * main loop re-auths the tunnel once the counter hits the max */
         SocksConfig *c = (SocksConfig *)cfg;
-        if (++c->ka_fail >= SOCKS_KA_FAIL_MAX) {
-            log_err("SOCKS keepalive send failed: %s (%d consecutive); "
-                    "session lost", strerror(errno), c->ka_fail);
-            c->session_lost = true;
-            atomic_store_explicit(&g_stop, true, memory_order_relaxed);
-        } else {
-            log_debug("SOCKS keepalive send failed: %s (retry %d/%d)",
-                      strerror(errno), c->ka_fail, SOCKS_KA_FAIL_MAX);
-        }
+        ++c->ka_fail;
+        log_debug("SOCKS keepalive send failed: %s (retry %d/%d)",
+                  strerror(errno), c->ka_fail, SOCKS_KA_FAIL_MAX);
     } else {
         ((SocksConfig *)cfg)->ka_fail = 0;
     }
@@ -598,6 +590,95 @@ int receive_vpn(int sockfd, SocksConfig *cfg) {
     }
 }
 
+/* Re-establish every active flow on a rebuilt netstack (only used when
+ * the re-auth changed our inner IP/gateway/MTU). Flows with a target
+ * (CONNECTING/ESTABLISHED) get a fresh inner connection on the new
+ * tunnel; the success reply is not repeated (reply_sent). DNS-bound
+ * flows fail (their workers were retired by dns_reset). */
+static void socks_reauth_flows(void)
+{
+    for (int i = 0; i < MAX_FLOWS; i++) {
+        Flow *f = &g_flows[i];
+        if (!f->active)
+            continue;
+        if (f->state == ST_RESOLVING) {
+            f->ns_idx = -1;
+            queue_socks_error(f, 4);
+            set_flow_state(f, ST_CLOSING);
+            continue;
+        }
+        if (f->ns_idx < 0)
+            continue;   /* handshake states: nothing to re-establish */
+        if (f->state != ST_CONNECTING && f->state != ST_ESTABLISHED) {
+            f->ns_idx = -1;   /* stale index into the rebuilt stack */
+            continue;
+        }
+        uint16_t port = f->tgt_port;
+        uint8_t af = f->tgt_af;
+        f->ns_idx = -1;
+        f->rx_paused = false;
+        if (af == 6)
+            open_tcp_connection6(f, f->tgt_ip6, port);
+        else if (af == 4)
+            open_tcp_connection(f, f->tgt_ip4, port);
+    }
+}
+
+/* Re-auth the tunnel IN PLACE: the callback opens a fresh session and
+ * refreshes cfg's session fields. On success returns the new UDP socket
+ * fd (the caller closes the old one); on failure schedules a retry and
+ * returns -1 (the proxy keeps running either way). */
+static int socks_reauth_tunnel(SocksConfig *cfg)
+{
+    if (!cfg->reauth)
+        return -1;
+    uint32_t old_ip = cfg->inner_ip, old_gw = cfg->gateway;
+    int old_mtu = cfg->mtu;
+    int newfd = -1;
+    if (cfg->reauth(cfg->reauth_ud, cfg, &newfd) != 0 || newfd < 0) {
+        cfg->reauth_at = now_ms() + SOCKS_KEEPALIVE_MS;
+        log_err("SOCKS: tunnel re-auth failed; retrying in %us",
+                SOCKS_KEEPALIVE_MS / 1000);
+        return -1;
+    }
+    cfg->last_rx = now_ms();
+    cfg->ka_fail = 0;
+    cfg->reauth_at = 0;
+    cfg->session_lost = false;
+    log_err("SOCKS: tunnel re-authenticated (sid 0x%04x, inner %u.%u.%u.%u)",
+            cfg->sid, (cfg->inner_ip >> 24) & 0xff, (cfg->inner_ip >> 16) & 0xff,
+            (cfg->inner_ip >> 8) & 0xff, cfg->inner_ip & 0xff);
+    /* the tunnel-DNS workers are session-bound: retire them before the
+     * old socket closes and reset the wait table for the new session */
+    dns_stop();
+    dns_set_server(cfg->dns);
+    dns_reset();
+    uint8_t oh[8];
+    pkt_hdr(cfg->encryption ? PT_DATA_ENC : PT_DATA, cfg->encryption,
+            cfg->sid, cfg->token, oh);
+    if (cfg->inner_ip == old_ip && cfg->gateway == old_gw &&
+        cfg->mtu == old_mtu) {
+        /* same carrier, fresh session: the tunnel is only the carrier, so
+         * the lwIP stack and every inner connection survive untouched.
+         * Drop the queued tx frames (their outer headers carry the old
+         * sid/token); lwIP's RTO retransmits the same segments with the
+         * new header. Old-session downlink frames are rejected by the
+         * sid/token gate in receive_vpn. */
+        ns_set_outer(&g_ns, oh, cfg->xor_key);
+        while (ns_tx_peek(&g_ns))
+            ns_tx_pop(&g_ns);
+        log_info("SOCKS: inner connections kept (same inner IP)");
+    } else {
+        /* the server re-assigned our inner IP: rebuild the stack and
+         * re-establish every active flow on the new tunnel */
+        ns_init(&g_ns, cfg->inner_ip, cfg->gateway, (uint16_t)cfg->mtu);
+        ns_set_outer(&g_ns, oh, cfg->xor_key);
+        socks_reauth_flows();
+        log_info("SOCKS: inner IP changed; flows re-established");
+    }
+    return newfd;
+}
+
 int run_socks(int sockfd, SocksConfig *cfg) {
     int listener;
 
@@ -730,25 +811,70 @@ int run_socks(int sockfd, SocksConfig *cfg) {
     uint64_t last_ka = now_ms() - SOCKS_KEEPALIVE_MS;
 
     while (!g_stop) {
-        /* optional downlink-silence watchdog (see SOCKS_RX_STALE_MS_DEFAULT):
-         * off by default, because a silent-but-alive session recovers and
-         * tearing the proxy down drops every in-flight connection */
+        /* downlink-silence watchdog: re-auth the tunnel in place (the
+         * listener, flows and inner TCP survive); the old behavior —
+         * declaring the session lost and exiting — only applies when no
+         * re-auth callback was provided */
         if (socks_rx_stale_ms() > 0 &&
             now_ms() - cfg->last_rx > socks_rx_stale_ms()) {
-            log_err("SOCKS: no downlink for %llu ms; session lost",
+            log_err("SOCKS: no downlink for %llu ms; re-authing tunnel",
                     (unsigned long long)(now_ms() - cfg->last_rx));
-            cfg->session_lost = true;
-            g_stop = 1;
-            break;
+            int nfd = socks_reauth_tunnel(cfg);
+            if (nfd >= 0) {
+                port_close(sockfd);
+                sockfd = nfd;
+                g_sockfd = nfd;
+            } else if (!cfg->reauth) {
+                cfg->session_lost = true;
+                g_stop = 1;
+                break;
+            }
+        }
+        /* a failed re-auth retries on this schedule */
+        if (cfg->reauth_at != 0 && now_ms() >= cfg->reauth_at) {
+            int nfd = socks_reauth_tunnel(cfg);
+            if (nfd >= 0) {
+                port_close(sockfd);
+                sockfd = nfd;
+                g_sockfd = nfd;
+            }
         }
         /* flush leftover tx items first: their segment pointers stay
          * valid only until receive_vpn's handle_rx drop/compact moves
          * the retransmit table */
         sock_drain_tx(sockfd, cfg);
         send_vpn_keepalive(sockfd, cfg, &last_ka);
+        if (cfg->ka_fail >= SOCKS_KA_FAIL_MAX) {
+            log_err("SOCKS: %d consecutive keepalive send failures; "
+                    "re-authing tunnel", cfg->ka_fail);
+            int nfd = socks_reauth_tunnel(cfg);
+            if (nfd >= 0) {
+                port_close(sockfd);
+                sockfd = nfd;
+                g_sockfd = nfd;
+            } else if (!cfg->reauth) {
+                cfg->session_lost = true;
+                g_stop = 1;
+                break;
+            }
+        }
         accept_connections(listener);
-        if (receive_vpn(sockfd, cfg) < 0)
-            break;
+        if (receive_vpn(sockfd, cfg) < 0) {
+            /* server CLOSE / hard recv error: re-auth in place when a
+             * callback exists, else legacy exit for the caller loop */
+            int nfd = socks_reauth_tunnel(cfg);
+            if (nfd >= 0) {
+                port_close(sockfd);
+                sockfd = nfd;
+                g_sockfd = nfd;
+                continue;
+            }
+            if (!cfg->reauth) {
+                cfg->session_lost = true;
+                g_stop = 1;
+                break;
+            }
+        }
         service_local_inputs(g_flows);
         handle_dns_results();
         /* consume the rxq BEFORE ns_tick advertises the window: an
