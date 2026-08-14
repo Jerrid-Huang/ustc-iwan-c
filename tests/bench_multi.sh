@@ -108,7 +108,6 @@ if ! ss -tln 2>/dev/null | grep -q ":$SINK_PORT "; then
     exit 1
 fi
 
-exec > >(tee "$OUT") 2>&1   # everything -> bench-multi.out + console
 NCORES=$(nproc)
 echo "=== multi-client aggregate bench ($(date -u +%FT%TZ)) ==="
 echo "clients=$CLIENTS_LIST conns/client=$CONNS duration=${DURATION}s (${NCORES} cores)"
