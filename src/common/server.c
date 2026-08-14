@@ -972,7 +972,18 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                  * silently dropping the segment. A dropped uplink segment
                  * makes the client RTO-retry; under a burst that can
                  * degrade into a stall. */
-                if (tun_write_retry(ctx->tun_fd, raw + IWAN_HDR_LEN,
+                int wfd = ctx->tun_fd;
+                if (ctx->qpool != NULL) {
+                    /* spread uplink writes across the reader pool's
+                     * queue fds: the device write lock is otherwise a
+                     * single serialization point (measured: TUN write
+                     * was 85-90% of per-frame cost at multi-client
+                     * aggregate >5 Gbit/s) */
+                    int pf = tun_pool_write_fd(ctx->qpool, tid);
+                    if (pf >= 0)
+                        wfd = pf;
+                }
+                if (tun_write_retry(wfd, raw + IWAN_HDR_LEN,
                                     len - IWAN_HDR_LEN, 1, NULL) != 0)
                     g_up[tid].drop++;  /* still full: drop, client retransmits */
             } else if (ctx->tun_fd < 0 && len > IWAN_HDR_LEN) {

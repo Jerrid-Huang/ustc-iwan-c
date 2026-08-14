@@ -976,7 +976,13 @@ int main(int argc, char **argv)
             maxq = (int)ncpu;
         pu.ctx = &ctx;
         pu.udp_fd = udp_fds[0];
-        ctx.qpool = tun_pool_create(o.tun, tun_fd, maxq, 1,
+        /* eager full pool: uplink writers spread across the queue fds
+         * (tun_pool_write_fd, tid % nq); starting at the recv-thread
+         * count means the write-side fan-out is effective immediately
+         * instead of waiting for the downlink-driven AIMD to grow the
+         * pool (ACK-only downlink keeps it near 1 queue otherwise) */
+        ctx.qpool = tun_pool_create(o.tun, tun_fd, maxq,
+                                    recv_threads < maxq ? recv_threads : maxq,
                                     srv_tun_pkt, &pu, &g_stop);
         if (!ctx.qpool) {
             fprintf(stderr, "error: cannot start TUN reader pool\n");

@@ -291,7 +291,9 @@ struct tun_pool {
     void *ud;
     atomic_bool *abort;
     tun_exit_fn exit_cb;   /* per-reader-thread cleanup, may be NULL */
-    int nq;
+    atomic_int nq;         /* live queue count; read by uplink writers
+                            * (server recv threads), written by the
+                            * pool owner (tun_pool_tick) */
     int maxq;
     int slow_start;   /* AIMD state: slow-start phase flag */
     int idle_cycles;  /* consecutive idle ticks before shrink */
@@ -377,15 +379,16 @@ static void *tun_reader_main(void *ud)
 static int tun_pool_add(struct tun_pool *pool)
 {
     int fd;
+    int nq = atomic_load(&pool->nq);
 
-    if (pool->nq >= pool->maxq)
+    if (nq >= pool->maxq)
         return -1;
     fd = tun_attach(pool->tunname);
     if (fd < 0)
         return -1;
     set_nonblock(fd);
     {
-        struct tun_queue *q = &pool->qs[pool->nq];
+        struct tun_queue *q = &pool->qs[nq];
         q->pool = pool;
         q->fd = fd;
         q->stop = 0;
@@ -395,23 +398,26 @@ static int tun_pool_add(struct tun_pool *pool)
             return -1;
         }
     }
-    pool->nq++;
+    atomic_store(&pool->nq, nq + 1);
     return 0;
 }
 
-/* drop the newest queue; queue 0 (the device owner) is never dropped */
+/* drop the newest queue; queue 0 (the device owner) is never dropped.
+ * nq is decremented BEFORE the fd is detached/closed so a concurrent
+ * uplink writer that loaded the old nq can no longer select this fd
+ * (the device owner's fd stays valid throughout). */
 static void tun_pool_del(struct tun_pool *pool)
 {
     int i;
 
-    if (pool->nq <= 1)
+    if (atomic_load(&pool->nq) <= 1)
         return;
-    i = pool->nq - 1;
+    i = atomic_load(&pool->nq) - 1;
     pool->qs[i].stop = 1;
     pthread_join(pool->qs[i].th, NULL);
+    atomic_store(&pool->nq, i);
     tun_detach(pool->qs[i].fd);
     tun_close(pool->qs[i].fd);
-    pool->nq--;
 }
 
 struct tun_pool *tun_pool_create(const char *name, int fd0, int maxq,
@@ -438,7 +444,7 @@ struct tun_pool *tun_pool_create(const char *name, int fd0, int maxq,
         free(pool);
         return NULL;
     }
-    pool->nq = 1;
+    atomic_store(&pool->nq, 1);
     pool->slow_start = 1;
     pool->idle_cycles = 0;
     /* eager start: attach initq-1 extra queues up front (used by the
@@ -446,7 +452,7 @@ struct tun_pool *tun_pool_create(const char *name, int fd0, int maxq,
      * between the single-queue and multi-queue capacities) */
     if (initq > pool->maxq)
         initq = pool->maxq;
-    while (pool->nq < initq) {
+    while (atomic_load(&pool->nq) < initq) {
         if (tun_pool_add(pool) != 0)
             break;
     }
@@ -455,7 +461,23 @@ struct tun_pool *tun_pool_create(const char *name, int fd0, int maxq,
 
 int tun_pool_queues(const struct tun_pool *pool)
 {
-    return pool->nq;
+    return atomic_load(&pool->nq);
+}
+
+/* Select the queue fd an uplink writer (recv thread `tid`) should use:
+ * writers spread across the pool's queue fds so the single device
+ * write lock no longer serializes every uplink frame (measured: TUN
+ * write was 85-90% of per-frame cost at >5 Gbit/s aggregate). The pool
+ * owner may grow/shrink nq concurrently; the load is atomic and a
+ * writer can only observe fds that are fully initialized (add fills
+ * the slot before publishing nq; del publishes the smaller nq before
+ * closing). -1 when the pool is empty. */
+int tun_pool_write_fd(const struct tun_pool *pool, unsigned tid)
+{
+    int nq = atomic_load(&pool->nq);
+    if (nq <= 0)
+        return -1;
+    return pool->qs[tid % (unsigned)nq].fd;
 }
 
 void tun_pool_set_exit_cb(struct tun_pool *pool, tun_exit_fn cb)
@@ -467,14 +489,15 @@ void tun_pool_set_exit_cb(struct tun_pool *pool, tun_exit_fn cb)
 void tun_pool_destroy(struct tun_pool *pool)
 {
     int i;
+    int nq = atomic_load(&pool->nq);
 
     if (!pool)
         return;
-    for (i = 0; i < pool->nq; i++)
+    for (i = 0; i < nq; i++)
         pool->qs[i].stop = 1;
-    for (i = 0; i < pool->nq; i++)
+    for (i = 0; i < nq; i++)
         pthread_join(pool->qs[i].th, NULL);
-    for (i = 1; i < pool->nq; i++) {
+    for (i = 1; i < nq; i++) {
         tun_detach(pool->qs[i].fd);
         tun_close(pool->qs[i].fd);
     }
@@ -487,34 +510,35 @@ void tun_pool_tick(struct tun_pool *pool)
     uint64_t wsum = 0;
     double busy;
     int target;
+    int nq = atomic_load(&pool->nq);
 
-    for (int i = 0; i < pool->nq; i++)
+    for (int i = 0; i < nq; i++)
         wsum += atomic_exchange(&pool->qs[i].waits, 0);
     busy = 1.0 - (double)wsum /
                   ((double)TUN_QCTL_MS / (double)TUN_POLL_MS *
-                   (double)pool->nq);
+                   (double)nq);
     if (busy < 0)
         busy = 0;
     if (busy > 1)
         busy = 1;
 
-    target = pool->nq;
+    target = nq;
     if (busy > TUN_BUSY_GROW) {
         pool->idle_cycles = 0;
         if (pool->slow_start) {
-            target = pool->nq * 2;
+            target = nq * 2;
             if (target >= 4)
                 pool->slow_start = 0;
         } else {
-            target = pool->nq + 1;
+            target = nq + 1;
         }
     } else if (busy < TUN_BUSY_SHRINK) {
         pool->idle_cycles++;
-        if (pool->idle_cycles >= 4 && pool->nq > 1) {
+        if (pool->idle_cycles >= 4 && nq > 1) {
             /* conservative shrink: only after 2s of sustained idle, so
              * brief load gaps (test pauses, app think time) do not drop
              * queued packets of live flows */
-            target = pool->nq / 2;
+            target = nq / 2;
             if (target < 1)
                 target = 1;
             pool->idle_cycles = 0;
@@ -525,13 +549,16 @@ void tun_pool_tick(struct tun_pool *pool)
     if (target > pool->maxq)
         target = pool->maxq;
 
-    while (pool->nq < target) {
+    while (atomic_load(&pool->nq) < target) {
         if (tun_pool_add(pool) != 0)
             break;
-        fprintf(stderr, "tun reader pool: %d queues\n", pool->nq);
+        fprintf(stderr, "tun reader pool: %d queues\n",
+                atomic_load(&pool->nq));
     }
-    while (pool->nq > target && pool->nq > 1) {
+    while (atomic_load(&pool->nq) > target &&
+           atomic_load(&pool->nq) > 1) {
         tun_pool_del(pool);
-        fprintf(stderr, "tun reader pool: %d queues\n", pool->nq);
+        fprintf(stderr, "tun reader pool: %d queues\n",
+                atomic_load(&pool->nq));
     }
 }

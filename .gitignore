@@ -28,3 +28,6 @@ build-clang/
 # Python
 __pycache__/
 *.pyc
+
+# bench output
+bench-multi.out

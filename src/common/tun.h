@@ -114,6 +114,10 @@ struct tun_pool *tun_pool_create(const char *name, int fd0, int maxq,
 /* actual number of reader threads currently running: adapts (AIMD
  * grow/shrink) on Linux, always 1 on Windows (wintun is single-queue) */
 int tun_pool_queues(const struct tun_pool *p);
+/* queue fd for uplink writer `tid` (spread writes across queue fds so
+ * the device write lock is not a single serialization point); -1 when
+ * the pool is empty. Safe to call concurrently with tun_pool_tick. */
+int tun_pool_write_fd(const struct tun_pool *p, unsigned tid);
 void tun_pool_set_exit_cb(struct tun_pool *p, tun_exit_fn cb);
 void tun_pool_tick(struct tun_pool *p);
 void tun_pool_destroy(struct tun_pool *p);
