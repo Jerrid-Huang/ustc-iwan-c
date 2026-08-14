@@ -984,8 +984,13 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                         wfd = pf;
                 }
                 if (tun_write_retry(wfd, raw + IWAN_HDR_LEN,
-                                    len - IWAN_HDR_LEN, 1, NULL) != 0)
-                    g_up[tid].drop++;  /* still full: drop, client retransmits */
+                                    len - IWAN_HDR_LEN, 1, NULL) != 0) {
+                    /* still full: drop, client retransmits. Also tell
+                     * the pool the device queue is congested so its
+                     * AIMD keeps the write fan-out (never shrinks). */
+                    tun_pool_note_stall(ctx->qpool);
+                    g_up[tid].drop++;
+                }
             } else if (ctx->tun_fd < 0 && len > IWAN_HDR_LEN) {
                 /* --no-tun test mode: echo the packet back (zero-latency
                  * lossless mirror) so tunnel + netstack throughput can

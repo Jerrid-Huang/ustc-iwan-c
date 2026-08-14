@@ -118,6 +118,9 @@ int tun_pool_queues(const struct tun_pool *p);
  * the device write lock is not a single serialization point); -1 when
  * the pool is empty. Safe to call concurrently with tun_pool_tick. */
 int tun_pool_write_fd(const struct tun_pool *p, unsigned tid);
+/* uplink write hit the device queue: prevents the AIMD shrink for the
+ * next tick (write fan-out must not collapse under upload congestion) */
+void tun_pool_note_stall(struct tun_pool *p);
 void tun_pool_set_exit_cb(struct tun_pool *p, tun_exit_fn cb);
 void tun_pool_tick(struct tun_pool *p);
 void tun_pool_destroy(struct tun_pool *p);

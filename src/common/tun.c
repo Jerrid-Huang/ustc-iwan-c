@@ -294,6 +294,10 @@ struct tun_pool {
     atomic_int nq;         /* live queue count; read by uplink writers
                             * (server recv threads), written by the
                             * pool owner (tun_pool_tick) */
+    atomic_uint_fast64_t wstall; /* uplink write stalls since last tick:
+                            * writers signal congestion so the AIMD
+                            * never shrinks the pool under upload load
+                            * (write-side fan-out must not collapse) */
     int maxq;
     int slow_start;   /* AIMD state: slow-start phase flag */
     int idle_cycles;  /* consecutive idle ticks before shrink */
@@ -480,6 +484,15 @@ int tun_pool_write_fd(const struct tun_pool *pool, unsigned tid)
     return pool->qs[tid % (unsigned)nq].fd;
 }
 
+/* An uplink writer hit the device queue (EAGAIN / write-budget expiry):
+ * record the congestion so the next tun_pool_tick treats the pool as
+ * busy and never shrinks the write fan-out under upload load. */
+void tun_pool_note_stall(struct tun_pool *pool)
+{
+    if (pool)
+        atomic_fetch_add(&pool->wstall, 1);
+}
+
 void tun_pool_set_exit_cb(struct tun_pool *pool, tun_exit_fn cb)
 {
     if (pool)
@@ -517,6 +530,11 @@ void tun_pool_tick(struct tun_pool *pool)
     busy = 1.0 - (double)wsum /
                   ((double)TUN_QCTL_MS / (double)TUN_POLL_MS *
                    (double)nq);
+    /* uplink writers stalled since the last tick (write EAGAIN / budget
+     * expiry): treat the pool as busy so the fan-out never shrinks while
+     * uploads are actively congesting the device queue */
+    if (atomic_exchange(&pool->wstall, 0) > 0)
+        busy = 1;
     if (busy < 0)
         busy = 0;
     if (busy > 1)

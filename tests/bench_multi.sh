@@ -147,6 +147,11 @@ for C in $CLIENTS_LIST; do
     cpu0=$(srv_ticks)
     st0=$(awk '/^cpu / {print $2 + $3 + $4 + $5 + $6 + $7 + $8 + $9 + $10 + $11}' /proc/stat)
     id0=$(awk '/^cpu / {print $5}' /proc/stat)
+    # kernel UDP drop counters (server-side rcvbuf overflow shows here,
+    # not in the server's own drop= statistic). Udp: InDatagrams
+    # NoPorts InErrors RcvbufErrors; the header line is skipped by the
+    # digit-anchored sed.
+    u0=$(sed -n 's/^Udp: \([0-9][0-9]*\) \([0-9][0-9]*\) \([0-9][0-9]*\) \([0-9][0-9]*\).*/\1 \2 \3 \4/p' /proc/net/snmp)
     t0=$(date +%s%N)
     BENCH_PIDS=""
     for i in $(seq 1 "$C"); do
@@ -160,6 +165,7 @@ for C in $CLIENTS_LIST; do
     cpu1=$(srv_ticks)
     st1=$(awk '/^cpu / {print $2 + $3 + $4 + $5 + $6 + $7 + $8 + $9 + $10 + $11}' /proc/stat)
     id1=$(awk '/^cpu / {print $5}' /proc/stat)
+    u1=$(sed -n 's/^Udp: \([0-9][0-9]*\) \([0-9][0-9]*\) \([0-9][0-9]*\) \([0-9][0-9]*\).*/\1 \2 \3 \4/p' /proc/net/snmp)
     t1=$(date +%s%N)
     if [ "$t1" -gt "$t0" ] && [ "$st1" -gt "$st0" ]; then
         dticks=$((st1 - st0))
@@ -171,6 +177,12 @@ for C in $CLIENTS_LIST; do
         sys_cpu=$(awk -v d="$didle" -v t="$dticks" \
             'BEGIN { printf "%.0f", 100.0 * (1 - d * 1.0 / t) }')
         echo "server CPU: ${srv_cpu} cores | system CPU: ${sys_cpu}% (${NCORES} cores)"
+        # Udp: InDatagrams NoPorts InErrors RcvbufErrors (per window delta)
+        du=""; for i in 1 2 3 4; do
+            a=$(echo "$u0" | cut -d' ' -f$i); b=$(echo "$u1" | cut -d' ' -f$i)
+            du="$du $((b - a))"
+        done
+        echo "kernel UDP delta: InDatagrams$du (NoPorts/RcvbufErrors>0 = drops)"
     fi
     total=0
     for i in $(seq 1 "$C"); do
@@ -182,6 +194,9 @@ for C in $CLIENTS_LIST; do
         total=$((total + v))
     done
     echo "TOTAL ($C clients): $total Mbit/s aggregate"
+    # client-side send stalls (UDP sndbuf full) visible in cli logs
+    ne=$(grep -l "EAGAIN" "$WORK"/cli*.log 2>/dev/null | wc -l)
+    [ "$ne" -gt 0 ] && echo "WARN: $ne client(s) hit UDP send EAGAIN"
 
     [ -n "$CLI_PIDS" ] && kill $CLI_PIDS 2>/dev/null
     CLI_PIDS=""

@@ -524,7 +524,15 @@ static int setup_udp(uint16_t port, int *fds, int n)
         }
         setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one);
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof sz);
+        /* SO_RCVBUFFORCE (root only, before the fork drops privileges)
+         * bypasses the net.core.rmem_max cap: a plain SO_RCVBUF request
+         * is clamped to rmem_max (4MB here), and with the TUN write
+         * occasionally stalling the recv thread the 4MB queue overflows
+         * — measured 340k packets/s dropped at the kernel (UdpRcvbuf-
+         * Errors), ~53% of arrivals, collapsing the inner TCP into an
+         * RTO storm. Non-root deployments fall back to SO_RCVBUF. */
+        if (setsockopt(fd, SOL_SOCKET, SO_RCVBUFFORCE, &sz, sizeof sz) != 0)
+            setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof sz);
         setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof sz);
         if (i == 0) {
             /* the kernel silently caps SO_RCVBUF at net.core.rmem_max;
