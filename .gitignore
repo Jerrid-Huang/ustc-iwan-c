@@ -23,6 +23,7 @@ build-win*/
 build-linux/
 build-sanitize/
 build-native/
+build-clang/
 
 # Python
 __pycache__/
