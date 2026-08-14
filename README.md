@@ -50,7 +50,7 @@ sudo ./iwan-client-oidc --all
 
 - 默认仅监听回环、无密码；监听非回环地址时必须指定 `--socks-token <PASS>` 或 `--socks-no-token`（互斥），或配合 `--allow-remote`。
 - 同一端口同时接受 HTTP 代理握手（设置 `--socks-token` 后禁用）。
-- 支持 IPv6 目标（ATYP=4）与 IPv6 域名解析（AAAA）。
+- 默认按服务器不支持 IPv6 处理：域名仅解析 IPv4，`ATYP=4`（IPv6 目标）请求返回 `rep=8`。确认服务器可转发 IPv6 时加 `--socks-ipv6`，此时域名解析优先 IPv6（AAAA）并接受 IPv6 目标。
 
 ### 常用参数
 

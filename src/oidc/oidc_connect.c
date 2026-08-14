@@ -160,6 +160,7 @@ static int run_socks_mode(const Opts *o, int fd, const uint8_t sk[16],
     cfg.auth_token = o->socks_token;
     cfg.open_proxy = o->socks_no_token;
     cfg.allow_remote = o->allow_remote;
+    cfg.ipv6 = o->socks_ipv6;
     snprintf(cfg.dns, sizeof cfg.dns, "%s", res->dns);
     cfg.reauth = oidc_socks_reauth_cb;   /* in-place tunnel re-auth */
     cfg.reauth_ud = (void *)rc;

@@ -52,6 +52,7 @@ typedef struct {
     const char *socks_token;
     bool        socks_no_token;
     bool        allow_remote;
+    bool        socks_ipv6;     /* assume the server relays IPv6 (opt-in) */
 } CmdOpts;
 
 /* ---- help/usage text ---- */
@@ -186,6 +187,7 @@ static void print_sub_help(const char *sub)
             "      --socks-token <TOKEN>\n"
             "      --socks-no-token     Explicitly allow a passwordless proxy with --allow-remote\n"
             "      --allow-remote       Allow non-loopback listen addresses\n"
+            "      --socks-ipv6         Assume the server relays IPv6: AAAA DNS + ATYP=4 (off by default)\n"
             "  -h, --help               Print help\n");
     }
 }
@@ -940,7 +942,7 @@ static int cmd_socks(int argc, char **argv, int start)
     o.encrypt = 1;
     o.mtu = 1380;
     o.listen_str = "127.0.0.1:1080";
-    cli_opt opts[13];
+    cli_opt opts[14];
 
     add_auth_opts(opts, &o);
     opts[9] = (cli_opt){ "listen",       CLI_OPT_STR, &o.listen_str,
@@ -950,6 +952,8 @@ static int cmd_socks(int argc, char **argv, int start)
     opts[11] = (cli_opt){ "socks-no-token", CLI_OPT_BOOL, &o.socks_no_token,
                           NULL, NULL };
     opts[12] = (cli_opt){ "allow-remote", CLI_OPT_BOOL, &o.allow_remote,
+                          NULL, NULL };
+    opts[13] = (cli_opt){ "socks-ipv6", CLI_OPT_BOOL, &o.socks_ipv6,
                           NULL, NULL };
     parse_cmd(argc, argv, start, "socks", opts, sizeof opts / sizeof opts[0]);
     if (!o.server)
@@ -1040,6 +1044,7 @@ static int cmd_socks(int argc, char **argv, int start)
         cfg.auth_token = o.socks_token;
         cfg.open_proxy = o.socks_no_token;
         cfg.allow_remote = o.allow_remote;
+        cfg.ipv6 = o.socks_ipv6;
         snprintf(cfg.dns, sizeof cfg.dns, "%s", res.dns);
         cfg.reauth = socks_reauth_cb;   /* in-place tunnel re-auth */
         cfg.reauth_ud = &o;

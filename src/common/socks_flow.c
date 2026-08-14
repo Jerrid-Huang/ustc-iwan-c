@@ -50,6 +50,15 @@ static const char *flow_state_name(FlowState st)
     return (size_t)st < sizeof names / sizeof names[0] ? names[st] : "?";
 }
 
+/* IPv6 relay assumption (--socks-ipv6): off by default — the server is
+ * assumed to be IPv4-only, so domains resolve A-only and ATYP=4
+ * CONNECTs are rejected rep=8. With the flag, v6 is preferred for
+ * dual-stack domains (AAAA-first, RFC 8305-style). */
+static bool socks_v6_ok(void)
+{
+    return g_socks_cfg && g_socks_cfg->ipv6;
+}
+
 /* diagnostic (IWAN_FLOWDBG=1): flow close triggers */
 static void flowdbg(const Flow *f, const char *why)
 {
@@ -730,7 +739,12 @@ static bool dns_query_local(const char *domain, uint8_t *af_out,
     int rc;
 
     memset(&hints, 0, sizeof hints);
-    hints.ai_family = AF_UNSPEC;    /* dual-stack: prefer IPv6 when present */
+    /* dual-stack (prefer IPv6 when present) only when the server is
+     * assumed to relay IPv6 (--socks-ipv6); the default assumes a
+     * v4-only relay and resolves A records only — a v6-first choice
+     * would blackhole dual-stack domains there (~18.5s SYN retries,
+     * then rep=4). */
+    hints.ai_family = socks_v6_ok() ? AF_UNSPEC : AF_INET;
     hints.ai_socktype = SOCK_STREAM;
     rc = getaddrinfo(domain, NULL, &hints, &res);
     if (rc != 0 || !res)
@@ -930,13 +944,19 @@ done:
 
 /* spawn detached threads resolving `domain` then pushing a result for
  * flow id. With tunnel DNS active, two workers run concurrently — one
- * AAAA (preferred), one A — so dual-stack domains resolve with the
- * latency of the faster answer; the flow fails (rep=4) only after ALL
- * its outstanding queries failed (Flow.dns_pending). Without tunnel
- * DNS a single worker uses the system resolver (AF_UNSPEC). */
+ * AAAA (preferred when the server relays IPv6, --socks-ipv6), one A —
+ * so dual-stack domains resolve with the latency of the faster answer;
+ * the flow fails (rep=4) only after ALL its outstanding queries failed
+ * (Flow.dns_pending). Without the flag (default: IPv4-only relay) only
+ * the A worker runs. Without tunnel DNS a single worker uses the
+ * system resolver (AF_UNSPEC, v6-preferred only when flagged). */
 void spawn_dns(int flow_id, const char *domain, uint16_t port) {
     uint8_t qtypes[2] = {28, 1};   /* AAAA first, then A */
     int nq = (g_dns_server_ip4 != 0) ? 2 : 1;
+    if (!socks_v6_ok()) {
+        qtypes[0] = 1;             /* A only */
+        nq = 1;
+    }
     for (int i = 0; i < MAX_FLOWS; i++) {
         if (g_flows[i].active && (uint64_t)flow_id == g_flows[i].id) {
             g_flows[i].dns_pending = nq;
@@ -1392,6 +1412,12 @@ static void http_handshake(Flow *f)
         f->target_af = 4;
         open_tcp_connection(f, ip4, port);
     } else if (r == 2) {
+        if (!socks_v6_ok()) {
+            /* IPv4-only relay assumption (--socks-ipv6 off): an IPv6
+             * literal target cannot be relayed; 502 in HTTP mode */
+            queue_socks_error(f, 8);
+            return;
+        }
         f->target_af = 6;
         open_tcp_connection6(f, ip6, port);
     } else {
@@ -1564,6 +1590,15 @@ static void handshake_request(Flow *f)
     case 4: { /* IPv6 (RFC 1928) */
         if (f->input.len < 22)
             return;
+        if (!socks_v6_ok()) {
+            /* default: the server is assumed to be IPv4-only — an
+             * ATYP=4 target cannot be relayed, so reject it like any
+             * other unsupported address type instead of blackholing
+             * the SYN for ~18.5s */
+            buf_consume(&f->input, 22);
+            queue_socks_error(f, 8);
+            return;
+        }
         uint8_t rip6[16];
         memcpy(rip6, f->input.data + 4, 16);
         uint16_t rport = (uint16_t)((f->input.data[20] << 8) |

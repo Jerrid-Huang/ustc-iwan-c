@@ -32,6 +32,13 @@ tun2socks 场景生产验证过。
   `fd00::/96 + 内层 IPv4` 派生（`ip6_derive_ula`，protocol.h）：桥接 netif 的
   v6 源地址、SOCKS5 回复的 BND.ADDR、服务端 H1 反欺骗门与回程会话查找都用同一
   条规则，客户端和服务端无需协商。
+- **IPv6 是 SOCKS 模式的显式开关**（`--socks-ipv6`，默认关）：默认假设服务器
+  只转发 IPv4——域名只发 A 查询（`spawn_dns` 单 worker）、本地解析只查
+  `AF_INET`、`ATYP=4` CONNECT 直接 `rep=8`。开启后才发 AAAA（`{28,1}` 先到
+  先得，双栈域名偏好 v6）并接受 v6 目标。默认关的原因：真实 relay 若没有 v6
+  出口，v6 SYN 会被静默丢弃，客户端要等满 lwIP 的 SYN 重传预算（`TCP_SYNMAXRTX=6`
+  × 固定 3s RTO，SYN_SENT 不退避）≈18.5s 才以 `rep=4` 失败——这正是「连
+  cloudflare 报 (4) 且耗时 18.5s」的线上症状（v0.5.0 曾无条件首选 v6）。
 - **IPv6 MTU**：`LWIP_ND6_ALLOW_RA_UPDATES=0`——否则 `netif_mtu6` 恒为 0（只有
   RA 会设置），v6 有效 MSS 退化为未收敛的 1460，内层段 1520B 会超出 1500 内层
   MTU 被桥拒绝；关闭后 v6 有效 MSS = 1500-60 = 1440。netif 无链路层，

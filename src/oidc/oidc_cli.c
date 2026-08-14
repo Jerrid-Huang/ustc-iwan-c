@@ -63,6 +63,7 @@ static void print_help_short(void)
         "      --socks-token <TOKEN>          Require this RFC1929 password from SOCKS5 clients\n"
         "      --socks-no-token               Explicitly allow a passwordless proxy with --allow-remote\n"
         "      --allow-remote                 Allow non-loopback SOCKS5 listen addresses\n"
+        "      --socks-ipv6                   Assume the server relays IPv6: v6 DNS (AAAA) + ATYP=4 targets (off by default)\n"
         "  -h, --help                         Print help (see more with '--help')\n"
         "  -V, --version                      Print version\n");
 }
@@ -148,6 +149,13 @@ static void print_help_long(void)
         "      --allow-remote\n"
         "          Allow non-loopback SOCKS5 listen addresses\n"
         "\n"
+        "      --socks-ipv6\n"
+        "          Assume the server relays IPv6: enable AAAA DNS lookups\n"
+        "          (v6 preferred for dual-stack domains) and accept ATYP=4\n"
+        "          IPv6 targets. Off by default: the server is assumed to\n"
+        "          be IPv4-only, so domains resolve A-only and ATYP=4\n"
+        "          requests are rejected (rep=8)\n"
+        "\n"
         "  -h, --help\n"
         "          Print help (see a summary with '-h')\n"
         "\n"
@@ -232,6 +240,7 @@ void oidc_parse_cli(int argc, char **argv, Opts *o, Cli *usage)
         { "socks-token",  CLI_OPT_STR,  &o->socks_token,   "<TOKEN>",        validate_token_len },
         { "socks-no-token", CLI_OPT_BOOL, &o->socks_no_token, NULL,          NULL },
         { "allow-remote", CLI_OPT_BOOL, &o->allow_remote,  NULL,             NULL },
+        { "socks-ipv6",   CLI_OPT_BOOL, &o->socks_ipv6,   NULL,             NULL },
     };
 
     cli_ctl ctl = {

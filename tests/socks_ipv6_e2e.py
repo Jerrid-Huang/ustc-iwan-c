@@ -3,7 +3,9 @@
 
 Requires (started by the caller, e.g. the CI step):
   - iwan-server --no-tun (TCP echo mirror) on a known port, and
-  - iwan-client socks listening on a known port.
+  - iwan-client socks --socks-ipv6 listening on a known port
+    (without --socks-ipv6 the server is assumed IPv4-only and ATYP=4
+    CONNECTs are rejected rep=8).
 
 The client opens a SOCKS5 connection with an ATYP=4 (IPv6) CONNECT to
 the unreachable-off-link target 2001:db8::1; the server's echo mirror

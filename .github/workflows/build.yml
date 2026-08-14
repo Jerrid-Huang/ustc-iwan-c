@@ -222,6 +222,7 @@ jobs:
           sleep 1
           ./bin/iwan-client socks --server 127.0.0.1 --port 16031 \
             --user alice --pass 's3cret-pass' --listen 127.0.0.1:11081 \
+            --socks-ipv6 \
             > /tmp/iwan-cli6.log 2>&1 &
           CLI=$!
           trap 'kill $SRV $CLI 2>/dev/null || true' EXIT

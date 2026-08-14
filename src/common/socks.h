@@ -37,6 +37,11 @@ typedef struct SocksConfig {
     bool     allow_remote;   /* allow non-loopback bind (--allow-remote) */
     bool     open_proxy;     /* explicit --socks-no-token: serve remote
                               * peers WITHOUT auth (open proxy) */
+    bool     ipv6;           /* assume the server relays IPv6 (opt-in via
+                              * --socks-ipv6): off by default, in which
+                              * case domains resolve IPv4 only and ATYP=4
+                              * CONNECTs are rejected rep=8; when on, v6
+                              * is preferred for dual-stack domains */
     uint32_t inner_ip;     /* host-order IPv4 (from auth.tun) */
     uint32_t gateway;      /* host-order IPv4 (from auth.gw) */
     int      mtu;

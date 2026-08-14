@@ -48,6 +48,9 @@ int main(int argc, char **argv)
     static SocksConfig cfg;
     memset(&cfg, 0, sizeof cfg);
     cfg.auth_token = token;        /* NULL = no RFC1929 auth */
+    cfg.ipv6 = 1;                  /* harness simulates a v6-relaying server:
+                                    * the atyp_ipv6 case expects ATYP=4 to be
+                                    * accepted (connect-timeout -> rep=4) */
     cfg.inner_ip = 0xC6120002u;    /* 198.18.0.2, host order */
     cfg.gateway = 0xC6120001u;     /* 198.18.0.1, host order */
     cfg.mtu = 1500;

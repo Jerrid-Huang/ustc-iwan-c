@@ -55,6 +55,7 @@ typedef struct {
     const char *socks_token;   /* RFC1929 password; NULL = no auth */
     bool        socks_no_token;/* explicit opt-out for --allow-remote */
     bool        allow_remote;
+    bool        socks_ipv6;    /* assume the server relays IPv6 (opt-in) */
 } Opts;
 
 /* oidc_util.c */
