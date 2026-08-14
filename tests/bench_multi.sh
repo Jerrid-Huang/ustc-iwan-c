@@ -210,8 +210,8 @@ for C in $CLIENTS_LIST; do
         if [ -n "$d0" ] && [ -n "$d1" ]; then
             dd=""
             for u in $(echo "$d1" | tr ' ' '\n' | cut -d: -f1 | sort -un); do
-                a=$(echo "$d0" | tr ' ' '\n' | grep "^$u:" | cut -d: -f2)
-                b=$(echo "$d1" | tr ' ' '\n' | grep "^$u:" | cut -d: -f2)
+                a=$(echo "$d0" | tr ' ' '\n' | grep "^$u:" | cut -d: -f2) || true
+                b=$(echo "$d1" | tr ' ' '\n' | grep "^$u:" | cut -d: -f2) || true
                 a=${a:-0}; b=${b:-0}
                 dd="$dd uid$u:+$((b - a))"
             done
