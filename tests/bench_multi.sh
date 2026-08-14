@@ -152,6 +152,10 @@ for C in $CLIENTS_LIST; do
     # NoPorts InErrors RcvbufErrors; the header line is skipped by the
     # digit-anchored sed.
     u0=$(sed -n 's/^Udp: \([0-9][0-9]*\) \([0-9][0-9]*\) \([0-9][0-9]*\) \([0-9][0-9]*\).*/\1 \2 \3 \4/p' /proc/net/snmp)
+    # per-owner UDP drops from /proc/net/udp (drops column by uid):
+    # tells whether the SERVER sockets (uid 0/nobody) or the CLIENT
+    # sockets (the bench user) are overflowing. uid is column 10.
+    d0=$(awk 'NR>1 {s[$10]+=$NF} END {for (u in s) printf "%s:%s ", u, s[u]}' /proc/net/udp 2>/dev/null)
     t0=$(date +%s%N)
     BENCH_PIDS=""
     for i in $(seq 1 "$C"); do
@@ -166,6 +170,7 @@ for C in $CLIENTS_LIST; do
     st1=$(awk '/^cpu / {print $2 + $3 + $4 + $5 + $6 + $7 + $8 + $9 + $10 + $11}' /proc/stat)
     id1=$(awk '/^cpu / {print $5}' /proc/stat)
     u1=$(sed -n 's/^Udp: \([0-9][0-9]*\) \([0-9][0-9]*\) \([0-9][0-9]*\) \([0-9][0-9]*\).*/\1 \2 \3 \4/p' /proc/net/snmp)
+    d1=$(awk 'NR>1 {s[$10]+=$NF} END {for (u in s) printf "%s:%s ", u, s[u]}' /proc/net/udp 2>/dev/null)
     t1=$(date +%s%N)
     if [ "$t1" -gt "$t0" ] && [ "$st1" -gt "$st0" ]; then
         dticks=$((st1 - st0))
@@ -183,6 +188,17 @@ for C in $CLIENTS_LIST; do
             du="$du $((b - a))"
         done
         echo "kernel UDP delta: InDatagrams$du (NoPorts/RcvbufErrors>0 = drops)"
+        # per-uid drops delta: server = uid 0 (parent) / 65534 (nobody
+        # child), clients = the invoking user's uid
+        if [ -n "$d0" ] && [ -n "$d1" ]; then
+            dd=""
+            for u in $(echo "$d1" | tr ' ' '\n' | cut -d: -f1 | sort -un); do
+                a=$(echo "$d0" | tr ' ' '\n' | grep "^$u:" | cut -d: -f2)
+                b=$(echo "$d1" | tr ' ' '\n' | grep "^$u:" | cut -d: -f2)
+                dd="$dd uid$u:+$((b - ${a:-0}))"
+            done
+            echo "UDP drops by uid:$dd"
+        fi
     fi
     total=0
     for i in $(seq 1 "$C"); do

@@ -171,6 +171,16 @@ struct up_stats {
 
 /* per-recv-thread stats (the multi-threaded uplink sums them on print) */
 static struct up_stats g_up[IWAN_SRV_THREADS_MAX];
+
+/* IWAN_SRV_TUN_SINGLE=1: uplink TUN writes go to the owner fd instead
+ * of the multi-queue fan-out (A/B benchmark switch; cached at startup) */
+static bool srv_tun_single(void)
+{
+    static int v = -1;
+    if (v < 0)
+        v = getenv("IWAN_SRV_TUN_SINGLE") != NULL;
+    return v != 0;
+}
 static int g_up_nthreads = 1;
 static uint64_t g_up_win;
 
@@ -973,12 +983,13 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                  * makes the client RTO-retry; under a burst that can
                  * degrade into a stall. */
                 int wfd = ctx->tun_fd;
-                if (ctx->qpool != NULL) {
+                if (ctx->qpool != NULL && !srv_tun_single()) {
                     /* spread uplink writes across the reader pool's
                      * queue fds: the device write lock is otherwise a
                      * single serialization point (measured: TUN write
                      * was 85-90% of per-frame cost at multi-client
-                     * aggregate >5 Gbit/s) */
+                     * aggregate >5 Gbit/s). IWAN_SRV_TUN_SINGLE=1
+                     * reverts to the owner fd for A/B benchs. */
                     int pf = tun_pool_write_fd(ctx->qpool, tid);
                     if (pf >= 0)
                         wfd = pf;
