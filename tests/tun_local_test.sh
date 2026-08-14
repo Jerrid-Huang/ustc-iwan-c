@@ -57,9 +57,11 @@ printf 'alice:s3cret-pass\n' > "$USERS"
 chmod 600 "$USERS"
 
 # ---- server: real TUN device -----------------------------------------
-"$BIN/iwan-server" --users "$USERS" --port "$PORT" --tun "$SRV_TUN" \
-    --server-ip 198.18.0.1 --subnet 198.18.0.0/16 --nat-if lo \
-    > /tmp/iwan-tun-srv.log 2>&1 &
+# stdbuf -oL: "server ready." is a bare printf; without line buffering it
+# stays in the stdout block buffer until exit when redirected to a file.
+stdbuf -oL "$BIN/iwan-server" --users "$USERS" --port "$PORT" \
+    --tun "$SRV_TUN" --server-ip 198.18.0.1 --subnet 198.18.0.0/16 \
+    --nat-if lo > /tmp/iwan-tun-srv.log 2>&1 &
 SRV=$!
 for _ in $(seq 1 50); do
     grep -q "server ready" /tmp/iwan-tun-srv.log && break

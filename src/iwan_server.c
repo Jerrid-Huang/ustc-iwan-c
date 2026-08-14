@@ -991,6 +991,7 @@ int main(int argc, char **argv)
     printf("listening UDP 0.0.0.0:%u (%d recv thread%s)\n",
            (unsigned)o.port, recv_threads, recv_threads > 1 ? "s" : "");
     printf("server ready.\n");
+    fflush(stdout);   /* readiness contract: callers grep the log */
 
     /* uplink recv threads: worker threads own udp_fds[1..], the primary
      * runs inline below on udp_fds[0] (and does the periodic
