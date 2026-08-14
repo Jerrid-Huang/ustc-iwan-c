@@ -26,9 +26,11 @@ fi
 CLIENTS_LIST=${CLIENTS_LIST:-"1 2 4 8"}
 CONNS=${CONNS:-1}              # TCP conns per client
 DURATION=${DURATION:-5}        # seconds per window
+DIR=${DIR:-up}                 # up (client->sink) or down (source->client)
 PORT=16001                     # VPN UDP port
 BASE_SOCKS=18080               # first local SOCKS listener
 SINK_PORT=17010                # upload discard target
+SOURCE_PORT=17011              # download data source
 SRV_IP=100.64.0.1
 SUBNET=100.64.0.0/16
 TUN_NAME=iwan-srv-mt
@@ -174,9 +176,10 @@ for C in $CLIENTS_LIST; do
     d0=$(awk 'NR>1 {s[$8]+=$NF} END {for (u in s) printf "%s:%s ", u, s[u]}' /proc/net/udp 2>/dev/null)
     t0=$(date +%s%N)
     BENCH_PIDS=""
+    TGT_PORT="$SINK_PORT"; [ "$DIR" = "down" ] && TGT_PORT="$SOURCE_PORT"
     for i in $(seq 1 "$C"); do
-        python3 tests/bench_client.py --target "$SRV_IP:$SINK_PORT" \
-            --conns "$CONNS" --duration "$DURATION" --direction up \
+        python3 tests/bench_client.py --target "$SRV_IP:$TGT_PORT" \
+            --conns "$CONNS" --duration "$DURATION" --direction "$DIR" \
             --socks "127.0.0.1:$((BASE_SOCKS + i))" \
             > "$WORK/bench$i.out" 2>&1 &
         BENCH_PIDS="$BENCH_PIDS $!"
