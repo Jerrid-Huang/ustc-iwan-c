@@ -224,31 +224,9 @@ jobs:
             --user alice --pass 's3cret-pass' --listen 127.0.0.1:11081 \
             > /tmp/iwan-cli6.log 2>&1 &
           CLI=$!
+          trap 'kill $SRV $CLI 2>/dev/null || true' EXIT
           sleep 1.5
-          python3 - <<'PYEOF'
-import socket
-s = socket.create_connection(("127.0.0.1", 11081), timeout=10)
-s.sendall(b"\x05\x01\x00")
-assert s.recv(2) == b"\x05\x00", "greeting"
-s.sendall(b"\x05\x01\x00\x04" b"\x20\x01\x0d\xb8" + b"\x00" * 12 + b"\x00\x50")
-r = b""
-while len(r) < 22:
-    r += s.recv(22 - len(r))
-assert r[0] == 5 and r[1] == 0 and r[3] == 4, "v6 success reply: %r" % r
-assert r[4] == 0xfd, "BND.ADDR must be the derived ULA: %r" % r
-data = b"ipv6-e2e-payload" * 100
-s.sendall(data)
-got = b""
-s.settimeout(10)
-while len(got) < len(data):
-    x = s.recv(4096)
-    if not x:
-        break
-    got += x
-assert got == data, "echo mismatch: %d/%d" % (len(got), len(data))
-s.close()
-print("IPv6 SOCKS e2e: PASS")
-PYEOF
+          python3 tests/socks_ipv6_e2e.py
           kill $CLI 2>/dev/null || true
 
       # Multi-connection fairness smoke: N concurrent uploads must all
