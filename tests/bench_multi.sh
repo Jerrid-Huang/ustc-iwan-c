@@ -13,9 +13,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # optional positional args: [THREADS] [CLIENTS_LIST] [debug] [proxy]
-# [relay-model: m2] (like bench.sh; "proxy" = one TUN client with
-# --listen proxy, and CLIENTS_LIST means concurrent connections through
-# it; "m2" switches the relay to one poll-based thread per connection)
+# (like bench.sh; "proxy" = one TUN client with --listen proxy, and
+# CLIENTS_LIST means concurrent connections through it)
 if [ -n "${1:-}" ]; then
     export IWAN_SRV_THREADS="$1"
 fi
@@ -27,9 +26,6 @@ if [ "${3:-}" = "debug" ]; then
 fi
 if [ "${4:-}" = "proxy" ]; then
     PROXY_MODE=1
-fi
-if [ "${5:-}" = "m2" ]; then
-    export IWAN_RP_MODEL=2   # relay_proxy: one thread per connection
 fi
 
 CLIENTS_LIST=${CLIENTS_LIST:-"1 2 4 8"}
