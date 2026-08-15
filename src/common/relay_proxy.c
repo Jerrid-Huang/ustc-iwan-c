@@ -56,6 +56,11 @@ struct RelayProxy {
  * connection threads may still be reading it. One proxy per process. */
 struct RelayProxy *g_rp_current;
 
+/* relay thread model (read once at start): 1 = two threads per
+ * connection (default), 2 = one poll-based thread per connection.
+ * IWAN_RP_MODEL selects; kept as a runtime switch for A/B benches. */
+static int g_rp_model = 1;
+
 /* constant-time byte compare (auth token) */
 static int rp_ct_eq(const uint8_t *a, const uint8_t *b, size_t n)
 {
@@ -423,6 +428,77 @@ out:
     return NULL;
 }
 
+/* M2 relay model (IWAN_RP_MODEL=2): one thread per connection, poll
+ * both directions, blocking send (kernel-buffer backpressure). One
+ * direction reaching EOF half-closes the other (SHUT_WR) and keeps
+ * polling the live direction; both EOFs end the connection. */
+struct rp_pair {
+    int a, b;
+};
+
+static void *rp_relay_one(void *ud)
+{
+    struct rp_pair pr = *(struct rp_pair *)ud;
+    uint8_t buf[RP_BUF];
+    bool eof_a = false, eof_b = false;
+
+    for (;;) {
+        struct pollfd p[2];
+        p[0].fd = pr.a;
+        p[0].events = eof_a ? 0 : POLLIN;
+        p[0].revents = 0;
+        p[1].fd = pr.b;
+        p[1].events = eof_b ? 0 : POLLIN;
+        p[1].revents = 0;
+        if (eof_a && eof_b)
+            break;
+        if (port_poll(p, 2, 60000) < 0) {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+        if (!eof_a && (p[0].revents & (POLLIN | POLLHUP | POLLERR))) {
+            ssize_t r = port_recv(pr.a, buf, sizeof buf, 0);
+            if (r <= 0) {
+                eof_a = true;
+                port_shutdown(pr.b, 1);   /* half-close: peer sees EOF */
+            } else {
+                const uint8_t *q = buf;
+                size_t left = (size_t)r;
+                while (left > 0) {
+                    ssize_t w = port_send(pr.b, q, left, 0);
+                    if (w <= 0) {
+                        eof_a = eof_b = true;
+                        break;
+                    }
+                    q += w;
+                    left -= (size_t)w;
+                }
+            }
+        }
+        if (!eof_b && (p[1].revents & (POLLIN | POLLHUP | POLLERR))) {
+            ssize_t r = port_recv(pr.b, buf, sizeof buf, 0);
+            if (r <= 0) {
+                eof_b = true;
+                port_shutdown(pr.a, 1);
+            } else {
+                const uint8_t *q = buf;
+                size_t left = (size_t)r;
+                while (left > 0) {
+                    ssize_t w = port_send(pr.a, q, left, 0);
+                    if (w <= 0) {
+                        eof_a = eof_b = true;
+                        break;
+                    }
+                    q += w;
+                    left -= (size_t)w;
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
 static void *rp_conn_main(void *ud)
 {
     int fd = (int)(intptr_t)ud;
@@ -445,7 +521,16 @@ static void *rp_conn_main(void *ud)
     if (up < 0)
         goto out;
 
-    {
+    if (g_rp_model == 2) {
+        /* M2: one thread per connection, poll-based bidirectional
+         * relay (A/B model switch; see rp_relay_one) */
+        struct rp_pair pr = { fd, up };
+        pthread_t t;
+        if (pthread_create(&t, NULL, rp_relay_one, &pr) != 0)
+            goto out;
+        pthread_join(t, NULL);
+    } else {
+        /* M1: two threads per connection (one per direction) */
         struct rp_dir d1 = { fd, up }, d2 = { up, fd };
         pthread_t t1, t2;
         if (pthread_create(&t1, NULL, rp_relay_dir, &d1) != 0)
@@ -528,6 +613,11 @@ int relay_proxy_start(const char *listen_str, const char *auth_token,
     rp->listener = -1;
     if (auth_token)
         rp->token = xstrdup(auth_token);
+    {
+        const char *m = getenv("IWAN_RP_MODEL");
+        if (m && strcmp(m, "2") == 0)
+            g_rp_model = 2;
+    }
 
     fd = port_socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0)

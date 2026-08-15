@@ -12,7 +12,10 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-# optional positional args: [THREADS] [CLIENTS_LIST] [debug] (like bench.sh)
+# optional positional args: [THREADS] [CLIENTS_LIST] [debug] [proxy]
+# [relay-model: m2] (like bench.sh; "proxy" = one TUN client with
+# --listen proxy, and CLIENTS_LIST means concurrent connections through
+# it; "m2" switches the relay to one poll-based thread per connection)
 if [ -n "${1:-}" ]; then
     export IWAN_SRV_THREADS="$1"
 fi
@@ -22,18 +25,31 @@ fi
 if [ "${3:-}" = "debug" ]; then
     export IWAN_DEBUG=1   # server prints per-second uplink/drop stats
 fi
+if [ "${4:-}" = "proxy" ]; then
+    PROXY_MODE=1
+fi
+if [ "${5:-}" = "m2" ]; then
+    export IWAN_RP_MODEL=2   # relay_proxy: one thread per connection
+fi
 
 CLIENTS_LIST=${CLIENTS_LIST:-"1 2 4 8"}
 CONNS=${CONNS:-1}              # TCP conns per client
 DURATION=${DURATION:-5}        # seconds per window
 DIR=${DIR:-up}                 # up (client->sink) or down (source->client)
+PROXY_MODE=${PROXY_MODE:-0}    # 1 = one TUN client with --listen proxy;
+                               # CLIENTS_LIST then means concurrent conns
+                               # through the proxy (thread-model bench)
 PORT=16001                     # VPN UDP port
 BASE_SOCKS=18080               # first local SOCKS listener
+PROXY_PORT=18080               # TUN-mode proxy listener (PROXY_MODE)
 SINK_PORT=17010                # upload discard target
 SOURCE_PORT=17011              # download data source
 SRV_IP=100.64.0.1
 SUBNET=100.64.0.0/16
 TUN_NAME=iwan-srv-mt
+CLI_TUN=iwan-cli-tun
+TUN_NS=iwanpns
+VETH_IP=172.31.199.1
 OUT=bench-multi.out
 WORK=$(mktemp -d)
 
@@ -53,6 +69,8 @@ cleanup() {
         iptables -D INPUT -i "$TUN_NAME" -j ACCEPT 2>/dev/null
     fi
     ip link del "$TUN_NAME" 2>/dev/null
+    ip netns del "$TUN_NS" 2>/dev/null
+    ip link del veth0 2>/dev/null
     sleep 0.2
     wait 2>/dev/null
     rm -rf "$WORK"
@@ -121,33 +139,72 @@ fi
 
 NCORES=$(nproc)
 echo "=== multi-client aggregate bench ($(date -u +%FT%TZ)) ==="
-echo "clients=$CLIENTS_LIST conns/client=$CONNS duration=${DURATION}s (${NCORES} cores)"
+echo "clients=$CLIENTS_LIST conns/client=$CONNS duration=${DURATION}s (${NCORES} cores)${PROXY_MODE:+ PROXY_MODE}"
+
+if [ "$PROXY_MODE" = 1 ]; then
+    # one TUN client with the --listen proxy, reused across rounds, in
+    # its own netns (client and server TUNs share 100.64.0.0/16: in one
+    # routing table their routes would clobber each other and blackhole
+    # the SYN; netns isolation is exactly what integration.sh mode 2
+    # does for the same reason)
+    ip netns del "$TUN_NS" 2>/dev/null || true
+    ip netns add "$TUN_NS"
+    ip link add veth0 type veth peer name veth1
+    ip link set veth1 netns "$TUN_NS"
+    ip addr add "$VETH_IP/24" dev veth0
+    ip link set veth0 up
+    ip netns exec "$TUN_NS" ip addr add 172.31.199.2/24 dev veth1
+    ip netns exec "$TUN_NS" ip link set veth1 up
+    ip netns exec "$TUN_NS" ip link set lo up
+    ip netns exec "$TUN_NS" ip route add default via "$VETH_IP"
+    iptables -I INPUT -i veth0 -j ACCEPT 2>/dev/null || true
+    ip netns exec "$TUN_NS" ./bin/iwan-client proxy \
+        --server "$VETH_IP" --port "$PORT" --user u1 --pass s3cret \
+        --tun "$CLI_TUN" --listen "127.0.0.1:$PROXY_PORT" \
+        --proxy-cidr "$SUBNET" \
+        > "$WORK/proxycli.log" 2>&1 &
+    CLI_PIDS="$!"
+    for _ in $(seq 1 60); do
+        ip netns exec "$TUN_NS" ss -tln 2>/dev/null | \
+            grep -q ":$PROXY_PORT " && break
+        sleep 0.5
+    done
+    ip netns exec "$TUN_NS" ss -tln 2>/dev/null | \
+        grep -q ":$PROXY_PORT " || {
+        echo "error: proxy listener not up" >&2
+        tail -5 "$WORK/proxycli.log" >&2
+        exit 1
+    }
+fi
 
 for C in $CLIENTS_LIST; do
-    # start C client processes
-    CLI_PIDS=""
-    for i in $(seq 1 "$C"); do
-        ./bin/iwan-client socks --server 127.0.0.1 --port "$PORT" \
-            --user "u$i" --pass s3cret \
-            --listen "127.0.0.1:$((BASE_SOCKS + i))" \
-            --allow-remote --socks-no-token \
-            > "$WORK/cli$i.log" 2>&1 &
-        CLI_PIDS="$CLI_PIDS $!"
-    done
-    for i in $(seq 1 "$C"); do
-        for _ in $(seq 1 40); do
-            if ss -tln 2>/dev/null | grep -q ":$((BASE_SOCKS + i)) "; then
-                break
-            fi
-            sleep 0.25
+    # PROXY_MODE: one TUN client + --listen proxy already running
+    if [ "$PROXY_MODE" != 1 ]; then
+        # start C client processes
+        CLI_PIDS=""
+        for i in $(seq 1 "$C"); do
+            ./bin/iwan-client socks --server 127.0.0.1 --port "$PORT" \
+                --user "u$i" --pass s3cret \
+                --listen "127.0.0.1:$((BASE_SOCKS + i))" \
+                --allow-remote --socks-no-token \
+                > "$WORK/cli$i.log" 2>&1 &
+            CLI_PIDS="$CLI_PIDS $!"
         done
-        ss -tln 2>/dev/null | grep -q ":$((BASE_SOCKS + i)) " || {
-            echo "error: client $i listener not up" >&2
-            exit 1
-        }
-    done
+        for i in $(seq 1 "$C"); do
+            for _ in $(seq 1 40); do
+                if ss -tln 2>/dev/null | grep -q ":$((BASE_SOCKS + i)) "; then
+                    break
+                fi
+                sleep 0.25
+            done
+            ss -tln 2>/dev/null | grep -q ":$((BASE_SOCKS + i)) " || {
+                echo "error: client $i listener not up" >&2
+                exit 1
+            }
+        done
+    fi
 
-    echo "--- clients=$C (${DURATION}s window) ---"
+    echo "--- ${PROXY_MODE:+proxy }clients=$C (${DURATION}s window) ---"
     # server CPU sampling: sum utime+stime ticks over ALL iwan-server
     # processes (fork+drop leaves the parent waiting) plus the system
     # total from /proc/stat, both as deltas across the window.
@@ -177,13 +234,36 @@ for C in $CLIENTS_LIST; do
     t0=$(date +%s%N)
     BENCH_PIDS=""
     TGT_PORT="$SINK_PORT"; [ "$DIR" = "down" ] && TGT_PORT="$SOURCE_PORT"
-    for i in $(seq 1 "$C"); do
-        python3 tests/bench_client.py --target "$SRV_IP:$TGT_PORT" \
-            --conns "$CONNS" --duration "$DURATION" --direction "$DIR" \
-            --socks "127.0.0.1:$((BASE_SOCKS + i))" \
-            > "$WORK/bench$i.out" 2>&1 &
-        BENCH_PIDS="$BENCH_PIDS $!"
-    done
+    if [ "$PROXY_MODE" = 1 ]; then
+        # C concurrent connections through the single TUN-mode proxy
+        # (bench client runs inside the proxy's netns)
+        ip netns exec "$TUN_NS" python3 tests/bench_client.py \
+            --target "$SRV_IP:$TGT_PORT" \
+            --conns "$C" --duration "$DURATION" --direction "$DIR" \
+            --socks "127.0.0.1:$PROXY_PORT" \
+            > "$WORK/bench.out" 2>&1 &
+        BENCH_PIDS="$!"
+    else
+        for i in $(seq 1 "$C"); do
+            python3 tests/bench_client.py --target "$SRV_IP:$TGT_PORT" \
+                --conns "$CONNS" --duration "$DURATION" --direction "$DIR" \
+                --socks "127.0.0.1:$((BASE_SOCKS + i))" \
+                > "$WORK/bench$i.out" 2>&1 &
+            BENCH_PIDS="$BENCH_PIDS $!"
+        done
+    fi
+    # sample the proxy thread count mid-window (after wait the
+    # connections are closed and the relay threads are gone)
+    if [ "$PROXY_MODE" = 1 ]; then
+        sleep 1
+        thr="?"
+        for p in $(pgrep -f 'bin/iwan-client proxy' 2>/dev/null); do
+            t=$(awk '/^Threads/ {print $2}' "/proc/$p/status" 2>/dev/null)
+            [ -n "$t" ] && { [ "$thr" = "?" ] || [ "$t" -gt "$thr" ]; } && \
+                thr=$t
+        done
+        echo "proxy threads during window: $thr"
+    fi
     wait $BENCH_PIDS 2>/dev/null || true
     cpu1=$(srv_ticks)
     st1=$(awk '/^cpu / {print $2 + $3 + $4 + $5 + $6 + $7 + $8 + $9 + $10 + $11}' /proc/stat)
@@ -221,22 +301,31 @@ for C in $CLIENTS_LIST; do
             echo "UDP drops by uid:$dd"
         fi
     fi
-    total=0
-    for i in $(seq 1 "$C"); do
-        # "AGG up: 1879.8 MB in 5.00s = 3007 Mbit/s aggregate"
-        v=$(grep '^AGG' "$WORK/bench$i.out" | sed -n \
+    if [ "$PROXY_MODE" = 1 ]; then
+        v=$(grep '^AGG' "$WORK/bench.out" | sed -n \
             's/.*= \([0-9][0-9]*\) Mbit\/s aggregate.*/\1/p')
         [ -n "$v" ] || v=0
-        echo "client $i: $v Mbit/s"
-        total=$((total + v))
-    done
-    echo "TOTAL ($C clients): $total Mbit/s aggregate"
-    # client-side send stalls (UDP sndbuf full) visible in cli logs
-    ne=$(grep -l "EAGAIN" "$WORK"/cli*.log 2>/dev/null | wc -l)
-    [ "$ne" -gt 0 ] && echo "WARN: $ne client(s) hit UDP send EAGAIN"
+        echo "proxy conns=$C: $v Mbit/s aggregate"
+    else
+        total=0
+        for i in $(seq 1 "$C"); do
+            # "AGG up: 1879.8 MB in 5.00s = 3007 Mbit/s aggregate"
+            v=$(grep '^AGG' "$WORK/bench$i.out" | sed -n \
+                's/.*= \([0-9][0-9]*\) Mbit\/s aggregate.*/\1/p')
+            [ -n "$v" ] || v=0
+            echo "client $i: $v Mbit/s"
+            total=$((total + v))
+        done
+        echo "TOTAL ($C clients): $total Mbit/s aggregate"
+        # client-side send stalls (UDP sndbuf full) visible in cli logs
+        ne=$(grep -l "EAGAIN" "$WORK"/cli*.log 2>/dev/null | wc -l)
+        [ "$ne" -gt 0 ] && echo "WARN: $ne client(s) hit UDP send EAGAIN"
+    fi
 
-    [ -n "$CLI_PIDS" ] && kill $CLI_PIDS 2>/dev/null
-    CLI_PIDS=""
+    if [ "$PROXY_MODE" != 1 ]; then
+        [ -n "$CLI_PIDS" ] && kill $CLI_PIDS 2>/dev/null
+        CLI_PIDS=""
+    fi
     sleep 1
 done
 
