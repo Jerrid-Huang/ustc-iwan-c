@@ -235,6 +235,15 @@ static bool utf8_to_wchar(const char *s, wchar_t *out, size_t cap)
 
 /* ------------------------- tun.h API ------------------------------- */
 
+/* tun_ifname: the interface name to hand to ifconfig/route.
+ * Linux/Windows: the requested name IS the interface name.
+ * macOS: utun names are kernel-assigned, so the requested name maps
+ * to the actual utunN (see tun_mac.c). */
+const char *tun_ifname(const char *name)
+{
+    return name;
+}
+
 int open_tun(const char *name)
 {
     wchar_t name16[IFNAMSIZ];
@@ -486,6 +495,25 @@ int tun_pool_queues(const struct tun_pool *pool)
 {
     (void)pool;
     return 1;   /* wintun sessions are single-queue: one reader thread */
+}
+
+/* Windows backend has no per-queue write fds (wintun sends go through
+ * the single session), so there is no queue to spread uplink writes
+ * across; this only completes the link contract. The sole caller
+ * (server.c) is Linux-only and never runs here. */
+int tun_pool_write_fd(const struct tun_pool *pool, unsigned tid)
+{
+    (void)pool;
+    (void)tid;
+    return -1;
+}
+
+/* No AIMD shrink exists on Windows (single queue), so an uplink write
+ * stall needs no bookkeeping; this only completes the link contract.
+ * The sole caller (server.c) is Linux-only and never runs here. */
+void tun_pool_note_stall(struct tun_pool *pool)
+{
+    (void)pool;
 }
 
 void tun_pool_set_exit_cb(struct tun_pool *pool, tun_exit_fn cb)

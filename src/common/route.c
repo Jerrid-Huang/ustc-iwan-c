@@ -50,12 +50,16 @@ static bool tun_ula_str(const char *tun_ip, char out[64])
 static void tun_iface_up6(const char *tun, const char *tun_ip)
 {
 #ifdef _WIN32
-    char ula[64], namea[32];
+    char ula[64], ula96[72], namea[32];
     if (!tun_ula_str(tun_ip, ula))
         return;
+    /* netsh would default a bare address to no /96 prefix, breaking the
+     * client-pool on-link semantics; pass the explicit /96 like Linux.
+     * ula96[72] is provably enough: ula holds at most 63 chars + "/96" */
+    snprintf(ula96, sizeof ula96, "%s/96", ula);
     snprintf(namea, sizeof namea, "name=%s", tun);
     char *a[] = { "netsh", "interface", "ipv6", "add", "address", namea,
-                  ula, NULL };
+                  ula96, NULL };
     (void)port_run_cmd(a);   /* idempotent; best-effort */
 #elif defined(__APPLE__)
     char ula[64];
@@ -1034,7 +1038,8 @@ bool route_setup6(const char *tun, const slist_t *routes6)
     return true;
 }
 
-void route_teardown6(const char *tun, const slist_t *routes6)
+void route_teardown6(const char *tun, const char *tun_ip,
+                     const slist_t *routes6)
 {
     if (routes6 == NULL)
         return;
@@ -1049,7 +1054,19 @@ void route_teardown6(const char *tun, const slist_t *routes6)
             continue;
         log_debug("route_teardown6: del %s: not present", c);
     }
+    /* best-effort: also drop the derived ULA address. wintun adapters
+     * are persistent objects, so a leftover ULA would stick to the next
+     * run; delete is idempotent and failure is only logged (bare ULA,
+     * no /96). */
+    char ula[64];
+    if (tun_ula_str(tun_ip, ula)) {
+        char *u[] = { "netsh", "interface", "ipv6", "delete", "address",
+                      namea, ula, NULL };
+        if (port_run_cmd(u) != 0)
+            log_debug("route_teardown6: delete ULA %s: not present", ula);
+    }
 #elif defined(__APPLE__)
+    (void)tun_ip;
     const char *ifn = tun_ifname(tun);
     for (size_t i = 0; i < routes6->n; i++) {
         const char *c = routes6->v[i];
@@ -1060,6 +1077,7 @@ void route_teardown6(const char *tun, const slist_t *routes6)
         log_debug("route_teardown6: del %s: not present", c);
     }
 #else
+    (void)tun_ip;
     for (size_t i = 0; i < routes6->n; i++) {
         const char *c = routes6->v[i];
         char *d[] = { "-6", "route", "del", (char *)c,

@@ -234,7 +234,11 @@ bool port_is_admin(void)
 
 #ifdef _WIN32
 /* join argv[start..] with spaces into a Windows command line; quote
- * args containing spaces and escape embedded quotes. The helper
+ * args containing spaces and escape embedded quotes. Every argument is
+ * converted UTF-8 -> UTF-16 first: netsh interface names (e.g. "以太网"
+ * on a zh-CN system) reach here as UTF-8 via route.c's
+ * WideCharToMultiByte(CP_UTF8), and a byte-for-byte (wchar_t) cast
+ * would garble them so netsh could not find the interface. The helper
  * programs (netsh, route, ...) are trusted, fixed strings. Returns the
  * length written (excluding NUL), 0 when nothing was written. */
 static size_t win_join_argv(char *const argv[], int start, wchar_t *out,
@@ -244,19 +248,62 @@ static size_t win_join_argv(char *const argv[], int start, wchar_t *out,
 
     for (int i = start; argv[i]; i++) {
         const char *a = argv[i];
-        int quote = strchr(a, ' ') != NULL || strchr(a, '\t') != NULL;
+        size_t alen = strlen(a);
+        wchar_t *w = NULL;
+        int wlen = 0;
+
+        /* UTF-8 -> UTF-16 (wlen includes the NUL): worst case one
+         * wchar per 3 UTF-8 bytes, so 2*(len+1) always fits. */
+        if (alen <= (SIZE_MAX / 2) - 1) {
+            size_t wcap = 2 * (alen + 1);
+            w = malloc(wcap * sizeof *w);
+            if (w != NULL) {
+                wlen = MultiByteToWideChar(CP_UTF8, 0, a, -1, w, (int)wcap);
+                if (wlen <= 0) {
+                    /* invalid UTF-8 (defensive; not expected): fall back
+                     * to the historical byte-for-byte cast */
+                    wlen = (int)alen + 1;
+                    for (size_t k = 0; k <= alen; k++)
+                        w[k] = (wchar_t)(unsigned char)a[k];
+                }
+            }
+        }
+        if (w == NULL) {
+            /* allocation failure: write the raw bytes directly */
+            int quote = strchr(a, ' ') != NULL || strchr(a, '\t') != NULL;
+            if (i > start && n < outsz - 1)
+                out[n++] = L' ';
+            if (quote)
+                out[n++] = L'"';
+            while (*a && n < outsz - 2) {
+                if (*a == '"')
+                    out[n++] = L'\\';
+                out[n++] = (wchar_t)(unsigned char)*a;
+                a++;
+            }
+            if (quote)
+                out[n++] = L'"';
+            continue;
+        }
+        int quote = 0;
+        for (int k = 0; k < wlen - 1; k++) {
+            if (w[k] == L' ' || w[k] == L'\t') {
+                quote = 1;
+                break;
+            }
+        }
         if (i > start && n < outsz - 1)
             out[n++] = L' ';
         if (quote)
             out[n++] = L'"';
-        while (*a && n < outsz - 2) {
-            if (*a == '"')
+        for (int k = 0; k < wlen - 1 && n < outsz - 2; k++) {
+            if (w[k] == L'"')
                 out[n++] = L'\\';
-            out[n++] = (wchar_t)(unsigned char)*a;
-            a++;
+            out[n++] = w[k];
         }
         if (quote)
             out[n++] = L'"';
+        free(w);
     }
     if (n < outsz)
         out[n] = L'\0';

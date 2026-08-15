@@ -1,0 +1,8 @@
+iwan needs the wintun driver DLL next to the exe at runtime.
+Download it from https://www.wintun.net/ and pick the architecture
+that matches this exe:
+  x86_64 (iwan-client-x86_64.exe) -> amd64
+  i686   (iwan-client-i686.exe)   -> x86
+  arm64  (iwan-client-arm64.exe)  -> arm64
+Place wintun.dll in the same directory as the exe. TUN mode requires
+it; SOCKS5-only mode does not.

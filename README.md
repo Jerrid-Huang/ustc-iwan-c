@@ -183,6 +183,26 @@ cmake --build build -j      # 产物在 bin/
 
 macOS 需指定 Homebrew OpenSSL：`cmake -B build -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"`。
 
+macOS 最低系统版本为 macOS 11（Apple Silicon 与 Intel 均支持）；发布包为 ad-hoc 签名、未公证，首次运行若被 Gatekeeper 拦截需手动放行（`xattr -d com.apple.quarantine iwan-client`，或 系统设置→隐私与安全性）。构建依赖 OpenSSL 3.x（`brew install openssl@3` 或源码静态构建），发布包为源码静态链接，无 Homebrew 运行时依赖。
+
+### Windows 从源码构建
+
+在 Linux 上交叉编译：
+
+```bash
+cmake -B build -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/windows-x86_64.cmake -DIWAN_OPENSSL_DIR=<mingw-openssl> -DIWAN_STATIC=ON
+```
+
+工具链文件提供 `windows-x86_64` / `windows-i686` / `windows-arm64` 三个（arm64 需 llvm-mingw + MSYS2 clangarm64 OpenSSL，见 CI 的 win-arm64 job）。
+
+OpenSSL 需先交叉构建：`ci/build-openssl.sh mingw64 x86_64-w64-mingw32- /path/to/prefix no-asm`（i686 用 `mingw` target + `i686-w64-mingw32-` 前缀；no-asm 必需，PE 汇编器不接受 perlasm 生成的 ELF 指令）。apt 依赖：`gcc-mingw-w64-x86-64`。
+
+`IWAN_STATIC=ON` 使 exe 静态链接 OpenSSL/winpthread，可独立运行；否则需随包附带 DLL。
+
+运行依赖：TUN 模式需要与 exe 同目录的 `wintun.dll`（架构匹配：x86_64→amd64，i686→x86，arm64→arm64，下载 https://www.wintun.net/）；SOCKS5 模式不需要。发布 zip 内已附 README/LICENSE/WINTUN.txt 说明。
+
+> Windows TUN 模式的 netsh 路由命令已通过 wine 冒烟与代码审查，但尚未在真实 Windows 10/11 上验证。
+
 ## 致谢
 
 - 基于 [yyy1mu/ustc-iwan](https://github.com/yyy1mu/ustc-iwan) 重写与优化。

@@ -29,7 +29,7 @@ on:
 
 jobs:
   linux-native:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     concurrency:
@@ -122,7 +122,7 @@ jobs:
           if-no-files-found: error
 
   sanitize:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     concurrency:
@@ -243,7 +243,7 @@ jobs:
   # steering object is arch-neutral and compiles against the host's
   # linux headers (clang -target bpf), so it is embedded in all arches.
   linux-cross:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     concurrency:
@@ -413,7 +413,7 @@ jobs:
   # directives in perlasm-generated .s files (observed with the mingw64
   # target; deterministic across binutils versions).
   win-cross:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     concurrency:
@@ -491,6 +491,14 @@ jobs:
             echo "::error::bin/iwan-client-oidc.exe is not a ${{ matrix.pe }} binary"
             exit 1
           fi
+          # static-link gate: the exes must not import OpenSSL or
+          # winpthread DLLs — they must run on a stock Windows
+          for b in bin/iwan-client.exe bin/iwan-client-oidc.exe; do
+            if objdump -p "$b" | grep -E 'DLL Name: .*(libssl|libcrypto|winpthread)'; then
+              echo "::error::$b has a non-system DLL dependency"
+              exit 1
+            fi
+          done
 
       - name: Smoke test (wine, ${{ matrix.arch }})
         if: matrix.arch == 'x86_64'
@@ -535,6 +543,27 @@ jobs:
           "$WINE_BIN" bin/iwan-client.exe auth --server 127.0.0.1 --port 16001 \
             --user alice --pass s3cret-pass | grep -q 'OK sid='
 
+      # Root-free SOCKS5 handshake suite against the Windows build: the
+      # harness exe runs under the wine loader (wine's winsock shares
+      # the host loopback), so the suite drives the real Windows
+      # accept/handshake/netstack code — same wire checks as the Linux
+      # sanitize job.
+      - name: SOCKS5 handshake suite (wine, ${{ matrix.arch }})
+        if: matrix.arch == 'x86_64'
+        run: |
+          set -e
+          WINE_BIN="$(command -v wine64 2>/dev/null || { [ -x /usr/lib/wine/wine64 ] && echo /usr/lib/wine/wine64; } || command -v wine 2>/dev/null || true)"
+          # the suite spawns the harness directly; wrap the exe in a
+          # loader script (printf: a YAML-indented heredoc would put
+          # leading spaces before the shebang line) so it runs under
+          # wine on the Linux host
+          printf '#!/bin/sh\nexec "%s" "%s/bin/socks_handshake_harness.exe" "$@"\n' \
+            "$WINE_BIN" "$(pwd)" > /tmp/harness-wine.sh
+          chmod +x /tmp/harness-wine.sh
+          python3 tests/socks_handshake.py --harness /tmp/harness-wine.sh
+          python3 tests/socks_handshake.py --harness /tmp/harness-wine.sh \
+            --token review-token
+
       - name: Upload artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -550,7 +579,7 @@ jobs:
   # prebuilt MSYS2 clangarm64 package. Link check + PE verification only
   # (no wine support for arm64 Windows binaries on Linux runners).
   win-arm64:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     concurrency:
@@ -566,11 +595,11 @@ jobs:
 
       - name: Download llvm-mingw toolchain
         run: |
-          TAG="$(curl -s https://api.github.com/repos/mstorsjo/llvm-mingw/releases/latest \
-            | jq -r .tag_name)"
-          # asset naming changed across releases (ubuntu-20.04 -> 22.04);
-          # pick whatever ucrt x86_64 tarball the latest release ships
-          ASSET="$(curl -s https://api.github.com/repos/mstorsjo/llvm-mingw/releases/latest \
+          # pinned release: "latest" drifts with new upstream releases
+          # and breaks reproducibility (20260616 is known-good); bump
+          # deliberately, not by drift
+          TAG="20260616"
+          ASSET="$(curl -s "https://api.github.com/repos/mstorsjo/llvm-mingw/releases/tags/${TAG}" \
             | jq -r '.assets[].name | select(test("ucrt-ubuntu-.*-x86_64\\.tar\\.xz$"))' \
             | head -1)"
           echo "llvm-mingw $TAG asset $ASSET"
@@ -634,12 +663,12 @@ jobs:
 
   # macOS native client builds (no server: iwan-server is Linux-only).
   # Both architectures on one runner type: as of 2026 GitHub's macos-14
-  # label resolves to an Apple Silicon runner, so arm64 links against
-  # Homebrew openssl@3 while x86_64 is cross-compiled with
-  # CMAKE_OSX_ARCHITECTURES against a source-built x86_64 OpenSSL
-  # (darwin64-x86_64-cc). Wire smoke is skipped: no iwan-server binary
-  # exists on macOS — the TUN/route paths (utun + ifconfig/route) need
-  # root and are validated on real Macs by users.
+  # label resolves to an Apple Silicon runner, so x86_64 is
+  # cross-compiled. Each arch builds its own static no-shared OpenSSL
+  # from source (darwin64-<arch>-cc) — no Homebrew dependency, so the
+  # release zips run on a stock macOS. Wire smoke is skipped: no
+  # iwan-server binary exists on macOS — the TUN/route paths (utun +
+  # ifconfig/route) need root and are validated on real Macs by users.
   macos:
     runs-on: macos-14
     permissions:
@@ -654,18 +683,15 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
 
-      - name: Install dependencies
-        if: matrix.arch == 'arm64'
+      - name: Build OpenSSL from source (${{ matrix.arch }})
         run: |
-          brew install openssl@3
-
-      - name: Build x86_64 OpenSSL (cross-compile)
-        if: matrix.arch == 'x86_64'
-        run: |
-          # Homebrew's libcrypto is arm64 on this runner; build a
-          # static x86_64 OpenSSL from source for the cross link.
+          # Both arches link a static no-shared OpenSSL built from
+          # source. Homebrew's keg would be a dynamic runtime
+          # dependency that the release zip cannot carry (its dylibs
+          # also drift with the runner image); building from source
+          # pins the 3.5 line like the rest of CI.
           # Pin the 3.5 line: the 4.x Configure targets were renamed and
-          # darwin64-x86_64-cc is gone (the rest of CI also builds 3.5).
+          # darwin64-*-cc is gone (the rest of CI also builds 3.5).
           # The unauthenticated tags API is rate-limited on shared
           # runners and can return a non-array body; tolerate that and
           # fall back to a known-good pinned version instead of
@@ -674,24 +700,28 @@ jobs:
             | jq -r 'if type == "array" then (.[].name | select(test("^openssl-3\\.5\\."))) else empty end' \
             | head -1)"
           [ -n "$VER" ] || VER="openssl-3.5.1"
-          echo "building OpenSSL $VER for x86_64"
+          echo "building OpenSSL $VER for ${{ matrix.arch }}"
           curl -sfL --retry 3 --max-time 400 \
             "https://github.com/openssl/openssl/archive/refs/tags/${VER}.tar.gz" \
             -o /tmp/ossl.tgz
           tar xzf /tmp/ossl.tgz -C /tmp
           # GitHub source tarballs unpack to <repo>-<ref> (openssl-openssl-*)
           cd /tmp/openssl-openssl-*
-          ./Configure darwin64-x86_64-cc no-shared --prefix=/opt/ossl-x86_64
-          make -j"$(sysctl -n hw.ncpu)"
+          # match the main build's deployment target so every linked
+          # object carries a consistent minos (11.0 = first macOS with
+          # Apple Silicon support)
+          CFLAGS="-mmacosx-version-min=11.0" \
+            ./Configure darwin64-${{ matrix.arch }}-cc no-shared \
+            --prefix=/opt/ossl-${{ matrix.arch }}
+          make -j"$(sysctl -n hw.ncpu)" build_libs
           sudo make install_sw   # /opt is root-owned on runners
 
       - name: Configure
         run: |
-          OSSL_DIR="$(brew --prefix openssl@3)"
-          [ "${{ matrix.arch }}" = "x86_64" ] && OSSL_DIR=/opt/ossl-x86_64
           cmake -B build \
-            -DOPENSSL_ROOT_DIR="$OSSL_DIR" \
+            -DOPENSSL_ROOT_DIR=/opt/ossl-${{ matrix.arch }} \
             -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
             -DIWAN_WERROR=ON
 
       - name: Build (${{ matrix.arch }})
@@ -735,11 +765,37 @@ jobs:
             echo "::error::bin/iwan-client-oidc is not a Mach-O ${{ matrix.arch }} binary"
             exit 1
           fi
+          # no Homebrew/other non-system dylibs: the release zip must run
+          # on a stock macOS (a dynamic Homebrew OpenSSL would not)
+          for b in bin/iwan-client bin/iwan-client-oidc; do
+            if otool -L "$b" | grep -Eq '/opt/homebrew|/usr/local/'; then
+              echo "::error::$b depends on a non-system dylib"
+              otool -L "$b"
+              exit 1
+            fi
+          done
+
+      - name: Ad-hoc codesign (${{ matrix.arch }})
+        run: |
+          # uniform ad-hoc signature on both arches (arm64 gets one from
+          # the linker by default, x86_64 does not). Not notarized: a
+          # Developer ID certificate is out of scope for CI builds;
+          # first-run Gatekeeper needs a manual bypass on stock macOS.
+          codesign -s - -f bin/iwan-client bin/iwan-client-oidc
+          codesign -dv bin/iwan-client 2>&1 | head -3
 
       - name: Smoke test
         run: |
           ./bin/iwan-client --help >/dev/null
           ./bin/iwan-client-oidc --help >/dev/null
+
+      # Root-free behavioral suite against the real macOS build (same
+      # wire checks as the Linux sanitize job): loopback SOCKS5
+      # handshakes drive the production accept/handshake/netstack code.
+      - name: SOCKS5 handshake suite (${{ matrix.arch }})
+        run: |
+          python3 tests/socks_handshake.py
+          python3 tests/socks_handshake.py --token review-token
 
       - name: Upload artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -758,7 +814,7 @@ jobs:
   # local (sudo tests/bench.sh).
   bench:
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     concurrency:
@@ -796,7 +852,7 @@ jobs:
   release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [linux-cross, win-cross, win-arm64, macos, bench]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
@@ -868,6 +924,7 @@ jobs:
             arch="${artifact#iwan-win32-}"
             mkdir -p "dist/windows/${arch}"
             cp "$d/bin/iwan-client.exe" "$d/bin/iwan-client-oidc.exe" "dist/windows/${arch}/"
+            cp README.md LICENSE ci/WINTUN.txt "dist/windows/${arch}/"
             if [ "$arch" = "x86_64" ]; then
               (cd "dist/windows/${arch}" && zip -qr "../../iwan-windows-x86_64.zip" .)
             else
@@ -881,10 +938,36 @@ jobs:
             arch="${artifact#iwan-macos-}"
             mkdir -p "dist/macos/${arch}"
             cp "$d/bin/iwan-client" "$d/bin/iwan-client-oidc" "dist/macos/${arch}/"
+            # artifact upload/download can drop the exec bit; the zip
+            # must unpack with executable binaries on stock macOS
+            chmod 0755 "dist/macos/${arch}/iwan-client" \
+                      "dist/macos/${arch}/iwan-client-oidc"
             (cd "dist/macos/${arch}" && zip -qr "../../iwan-macos-${arch}.zip" .)
           done
 
           find dist -type f | sort
+
+      - name: Verify release archives
+        run: |
+          set -e
+          # macOS zips: binaries must carry the exec bit, or unpacked
+          # builds fail with "Permission denied"
+          for z in dist/iwan-macos-*.zip; do
+            if ! unzip -Z -v "$z" | grep -q 'Unix file attributes (100755'; then
+              echo "::error::$z contains non-executable binaries"
+              exit 1
+            fi
+          done
+          # Windows zips: every archive must carry the exes plus the
+          # README/LICENSE/wintun note
+          for z in dist/iwan-windows-*.zip; do
+            for f in iwan-client.exe iwan-client-oidc.exe README.md LICENSE WINTUN.txt; do
+              unzip -l "$z" | grep -q "$f" || {
+                echo "::error::$z is missing $f"
+                exit 1
+              }
+            done
+          done
 
       - name: Stage per-arch bare exes
         run: |

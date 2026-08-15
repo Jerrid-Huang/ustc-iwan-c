@@ -419,7 +419,12 @@ static int https_ctx_load_cas(SSL_CTX *ctx)
              "store", n);
     return 0;
 #else
+    /* macOS: /etc/ssl/cert.pem is a stale symlink; prefer the current
+     * bundle from the Homebrew keg (the keg paths simply do not exist on
+     * Linux). SSL_CERT_FILE still takes precedence over everything. */
     static const char *const cands[] = {
+        "/opt/homebrew/etc/openssl@3/cert.pem",   /* macOS: Homebrew (arm64) */
+        "/usr/local/etc/openssl@3/cert.pem",      /* macOS: Homebrew (x86_64) */
         "/etc/ssl/certs/ca-certificates.crt",
         "/etc/pki/tls/certs/ca-bundle.crt",
         "/etc/ssl/cert.pem",

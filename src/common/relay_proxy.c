@@ -674,11 +674,14 @@ static void *rp_dir_main(void *ud)
             prof_print(up_dir ? "rp up send" : "rp dn send", &pst2,
                        up_dir ? g_prof_rp_up_send : g_prof_rp_dn_send);
             prof_print("rp pend", &pst3, g_prof_rp_pend);
+            /* %llu, never %zu: msvcrt printf (Windows) lacks %zu and
+             * newer MinGW-w64 toolchains reject it under -Werror */
             fprintf(stderr, "[prof] loop iters=%llu poll0=%llu "
-                    "n=%zu pfn=%zu dirty=%d\n",
+                    "n=%llu pfn=%llu dirty=%d\n",
                     (unsigned long long)g_prof_rp_iters,
                     (unsigned long long)g_prof_rp_poll0,
-                    n, pf_n, (int)pf_dirty);
+                    (unsigned long long)n, (unsigned long long)pf_n,
+                    (int)pf_dirty);
         }
 
         for (size_t i = 0; i < n; i++) {

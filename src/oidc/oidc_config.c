@@ -40,7 +40,10 @@ static void mkdir_p(const char *path)
     if (tmp[n - 1] == '/')
         tmp[n - 1] = '\0';
     for (char *p = tmp + 1; *p; p++) {
-        if (*p == '/') {
+        /* treat '\' as an equivalent separator so explicit Windows
+         * paths like C:\a\b work; on POSIX '\' is an ordinary char */
+        if (*p == '/' || *p == '\\') {
+            char sep = *p;
             *p = '\0';
 #ifdef _WIN32
             /* _mkdir ignores the mode argument (Windows has no 0700;
@@ -50,7 +53,7 @@ static void mkdir_p(const char *path)
             if (mkdir(tmp, 0700) != 0 && errno != EEXIST)
 #endif
                 oidc_die("cannot create dir %s: %s", tmp, strerror(errno));
-            *p = '/';
+            *p = sep;
         }
     }
 #ifdef _WIN32
@@ -184,7 +187,13 @@ void oidc_save_config(const char *path, const Config *cf)
         oidc_die("cannot save config: server list is empty "
                  "(refusing to write an unusable config)");
 
+    /* Windows users may pass C:\a\b: look for both separators and keep
+     * the later one ('\' is an ordinary char on POSIX, so this is a
+     * no-op there) */
     const char *slash = strrchr(path, '/');
+    const char *bslash = strrchr(path, '\\');
+    if (bslash && (!slash || bslash > slash))
+        slash = bslash;
     char *dir = NULL;
     if (slash && slash != path) {
         dir = malloc((size_t)(slash - path) + 1);

@@ -789,7 +789,10 @@ static int expand_route_targets6(const slist_t *targets, slist_t *out)
                         (const struct sockaddr_in6 *)ai->ai_addr;
                     inet_ntop(AF_INET6, &s6->sin6_addr, ip, sizeof ip);
                     char r128[64];
-                    snprintf(r128, sizeof r128, "%s/128", ip);
+                    /* precision cap: inet_ntop emits at most 45 visible
+                     * chars, and mingw -Wformat-truncation cannot bound
+                     * a bare %s here (45+4=49 < 64 is provable) */
+                    snprintf(r128, sizeof r128, "%.45s/128", ip);
                     push_unique(out, r128);
                     found = 1;
                 }
@@ -806,11 +809,12 @@ static int expand_route_targets6(const slist_t *targets, slist_t *out)
     return 0;
 }
 
-static void teardown_routes(const char *tun, const char *srv, const char *ogw,
+static void teardown_routes(const char *tun, const char *tun_ip,
+                            const char *srv, const char *ogw,
                             const char *odev, const char *ogw_metric,
                             const slist_t *routes, bool had_routes,
                             const slist_t *routes6) {
-    route_teardown6(tun, routes6);
+    route_teardown6(tun, tun_ip, routes6);
     if (had_routes) {
         route_teardown(tun, srv, ogw, odev, ogw_metric, routes);
     } else {
@@ -917,8 +921,8 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
                                    pump_tun_pkt, &ctx, &g_stop);
         if (!ctx.pool) {
             log_err("cannot start TUN reader pool");
-            teardown_routes(tun_name, server, ogw, odev, ogw_metric, &routes,
-                            had_routes, &routes6);
+            teardown_routes(tun_name, auth_tun_ip, server, ogw, odev,
+                            ogw_metric, &routes, had_routes, &routes6);
             slist_free(&routes);
             slist_free(&routes6);
             pthread_mutex_destroy(&ctx.send_lock);
@@ -939,8 +943,8 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
     if (pthread_create(&t2, NULL, udp2tun_thread, &ctx) != 0) {
         g_stop = 1;
         tun_pool_destroy(ctx.pool);
-        teardown_routes(tun_name, server, ogw, odev, ogw_metric, &routes,
-                        had_routes, &routes6);
+        teardown_routes(tun_name, auth_tun_ip, server, ogw, odev,
+                        ogw_metric, &routes, had_routes, &routes6);
         slist_free(&routes);
         slist_free(&routes6);
         pthread_mutex_destroy(&ctx.send_lock);
@@ -954,8 +958,8 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
     tun_pool_destroy(ctx.pool);
     pthread_join(t2, NULL);
 
-    teardown_routes(tun_name, server, ogw, odev, ogw_metric, &routes,
-                    had_routes, &routes6);
+    teardown_routes(tun_name, auth_tun_ip, server, ogw, odev,
+                    ogw_metric, &routes, had_routes, &routes6);
 
     send_ctrl(&ctx, PT_CLOSE, enc, sid, tok);
     if (debug_enabled())
