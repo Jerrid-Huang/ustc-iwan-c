@@ -436,12 +436,14 @@ out:
  *
  * Up thread: client -> upstream. Down thread: upstream -> client.
  * Each direction owns an array of entries and one poll() event loop:
- *   - nonblocking recv, fully drained per readiness event
- *   - nonblocking send with a lazily-allocated pending buffer per
- *     entry; POLLOUT is registered while pending data exists
- *   - POLLIN is dropped while more than RP3_PEND_LIMIT bytes are
- *     pending, so a slow peer throttles the sender through the kernel
- *     buffers (the same backpressure M1 gets from its blocking send)
+ *   - nonblocking recv with a write-through fast path: when no backlog
+ *     exists the chunk is sent immediately (zero pend, zero extra
+ *     poll round-trip); only a partial/EAGAIN send leaves a remainder
+ *     in the pending buffer, and once anything is pending the loop
+ *     stops reading that pass so the kernel socket buffer stays the
+ *     backpressure point (pend is bounded by RP3_PEND_LIMIT)
+ *   - POLLOUT is registered while pending data exists; POLLIN is
+ *     dropped once more than RP3_PEND_LIMIT bytes are pending
  *   - registration is picked up by a bounded poll timeout (100 ms):
  *     the pollset is rebuilt every iteration, so a connection added
  *     while the loop was parked is serviced within one timeout. An
@@ -661,9 +663,60 @@ static void *rp3_dir_main(void *ud)
                 for (;;) {
                     ssize_t r = port_recv(e->from, buf, sizeof buf, 0);
                     if (r > 0) {
-                        if (!rp3_pend(e, buf, (size_t)r)) {
-                            e->plen = 0;   /* OOM: drop, half-close */
-                            e->from_eof = true;
+                        if (e->plen == 0) {
+                            /* fast path, zero pend: write straight
+                             * through. Only a partial/EAGAIN send
+                             * leaves a remainder in pend (bounded —
+                             * see RP3_PEND_LIMIT below). Ordering is
+                             * safe: pend is empty, so nothing is
+                             * queued ahead of this data. */
+                            size_t off = 0;
+                            for (;;) {
+                                ssize_t w = port_send(e->to, buf + off,
+                                                      (size_t)r - off, 0);
+                                if (w > 0) {
+                                    off += (size_t)w;
+                                    if (off == (size_t)r)
+                                        break;
+                                    continue;
+                                }
+                                if (w < 0 &&
+                                    (errno == EAGAIN ||
+                                     errno == EWOULDBLOCK ||
+                                     errno == EINTR))
+                                    break;
+                                e->plen = 0;   /* hard send error */
+                                e->from_eof = true;
+                                break;
+                            }
+                            if (e->from_eof)
+                                break;
+                            if (off < (size_t)r) {
+                                size_t rem = (size_t)r - off;
+                                if (!rp3_pend(e, buf + off, rem)) {
+                                    /* OOM: drop, half-close */
+                                    e->plen = 0;
+                                    e->from_eof = true;
+                                    break;
+                                }
+                                /* `to` is congested: stop reading this
+                                 * pass — the rest stays in the kernel
+                                 * buffer (backpressure), pend is
+                                 * bounded, POLLOUT will flush it */
+                                break;
+                            }
+                        } else {
+                            /* backlog: append in order, flush on
+                             * POLLOUT. One chunk per pass keeps the
+                             * kernel buffer as the backpressure point
+                             * and pend bounded. */
+                            if (e->plen + (size_t)r > RP3_PEND_LIMIT)
+                                break;
+                            if (!rp3_pend(e, buf, (size_t)r)) {
+                                e->plen = 0;   /* OOM: drop, half-close */
+                                e->from_eof = true;
+                                break;
+                            }
                             break;
                         }
                         continue;

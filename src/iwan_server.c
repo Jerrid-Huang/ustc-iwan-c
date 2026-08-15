@@ -440,7 +440,7 @@ struct srv_pool_ud {
     int udp_fd;
 };
 
-static void srv_tun_pkt(void *ud, const uint8_t *pkt, size_t len, bool last)
+static void srv_tun_pkt(void *ud, uint8_t *pkt, size_t len, bool last)
 {
     struct srv_pool_ud *pu = ud;
     (void)last;

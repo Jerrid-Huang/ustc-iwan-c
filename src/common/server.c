@@ -1352,13 +1352,11 @@ int echo_mirror(struct server_ctx *ctx, uint8_t *p, size_t len,
     return 0;
 }
 
-void handle_tun_downlink(struct server_ctx *ctx, const uint8_t *ip_pkt, size_t len,
+void handle_tun_downlink(struct server_ctx *ctx, uint8_t *ip_pkt, size_t len,
                          int sockfd)
 {
     struct server_sess_snap snap;
-    /* fixed stack buffer: outer header + max TUN datagram; avoids a
-     * malloc/realloc cycle per forwarded packet */
-    uint8_t out[IWAN_HDR_LEN + 65536];
+    uint8_t hdr[IWAN_HDR_LEN];
     uint32_t saddr, daddr;
 
     if (len < 20 || len > 65536)
@@ -1444,19 +1442,37 @@ void handle_tun_downlink(struct server_ctx *ctx, const uint8_t *ip_pkt, size_t l
     }
 
     pkt_hdr(snap.enc ? PT_DATA_ENC : PT_DATA, snap.enc, snap.sid,
-            snap.token, out);
-    memcpy(out + IWAN_HDR_LEN, ip_pkt, len);
+            snap.token, hdr);
     if (snap.enc)
-        xor_crypt(out + IWAN_HDR_LEN, len, snap.xor_key,
-                  sizeof snap.xor_key);
-    /* Deliberately NO sendto(ECONNREFUSED) teardown here: this socket is
-     * unconnected, so on Linux sendto never returns ECONNREFUSED — an
+        xor_crypt(ip_pkt, len, snap.xor_key, sizeof snap.xor_key);
+    /* Zero-copy send: the payload is XORed IN PLACE (the buffer belongs
+     * to the caller until this returns — the tun reader's scratch or a
+     * mirror stack buffer — and UDP datagrams are never retransmitted,
+     * so in-place crypto is safe) and sent as a 2-iovec message
+     * [outer header, payload]. This eliminates the full-packet memcpy
+     * the old sendto path did. */
+    {
+        struct iovec iov[2];
+        struct msghdr msg;
+        memset(&msg, 0, sizeof msg);
+        msg.msg_name = (struct sockaddr *)&snap.peer;
+        msg.msg_namelen = sizeof snap.peer;
+        iov[0].iov_base = hdr;
+        iov[0].iov_len = IWAN_HDR_LEN;
+        iov[1].iov_base = ip_pkt;
+        iov[1].iov_len = len;
+        msg.msg_iov = iov;
+        msg.msg_iovlen = 2;
+        if (port_sendmsg(sockfd, &msg, 0) < 0)
+            atomic_fetch_add(&g_send_drops, 1);
+    }
+    /* Deliberately NO sendmsg(ECONNREFUSED) teardown here: this socket is
+     * unconnected, so on Linux sendmsg never returns ECONNREFUSED — an
      * ICMP port-unreachable is queued and surfaces on the NEXT receive
      * (which the main loop treats as EAGAIN/drained). Identifying the
      * dead peer from the error queue would need MSG_ERRQUEUE plumbing;
      * sessions of dead peers are instead reaped by purge_expired (120s
      * idle timeout) or by the client's own CLOSE. */
-    (void)udp_send(sockfd, &snap.peer, out, IWAN_HDR_LEN + len);
     /* deliberately NO last_active refresh here: downlink is triggered by
      * third-party traffic (other clients, inbound routing), so refreshing
      * would let anyone keep a dead session alive past the idle purge */

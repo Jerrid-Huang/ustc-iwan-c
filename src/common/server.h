@@ -90,8 +90,10 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
 
 /* Send one IP packet from the TUN to the session owning dst IP.
  * Thread-safe: called from TUN reader threads. Takes a session snapshot
- * under the read lock and sends without holding the lock. */
-void handle_tun_downlink(struct server_ctx *ctx, const uint8_t *ip_pkt, size_t len,
+ * under the read lock and sends without holding the lock. The payload
+ * is XORed in place (the caller's scratch buffer), so ip_pkt must be
+ * writable. */
+void handle_tun_downlink(struct server_ctx *ctx, uint8_t *ip_pkt, size_t len,
                          int sockfd);
 
 /* Drop sessions idle for more than 120s; log each. Main thread only. */

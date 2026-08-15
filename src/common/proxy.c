@@ -351,7 +351,7 @@ static void pump_flush(pump_ctx_t *ctx, pump_tx_t *q)
 }
 
 /* tun_pool callback: one thread-local batch per reader thread */
-static void pump_tun_pkt(void *ud, const uint8_t *pkt, size_t len, bool last)
+static void pump_tun_pkt(void *ud, uint8_t *pkt, size_t len, bool last)
 {
     pump_ctx_t *ctx = ud;
     pump_tx_t *q = &g_tx;

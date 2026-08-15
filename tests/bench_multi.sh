@@ -32,7 +32,9 @@ fi
 if [ "${5:-}" = "m3" ]; then
     export IWAN_RP_MODEL=3   # TUN-proxy relay: 2 global direction threads
 fi
-if [ "${6:-}" = "down" ]; then
+# "down" may land on $5 (no m3 in the command line) or $6 (after m3);
+# an empty $3 still occupies its position, so both slots are checked
+if [ "${5:-}" = "down" ] || [ "${6:-}" = "down" ]; then
     export DIR=down
 fi
 

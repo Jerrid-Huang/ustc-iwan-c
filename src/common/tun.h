@@ -98,8 +98,10 @@ int tun_write_retry(int fd, const uint8_t *pkt, size_t len, int max_ms,
  * (after the final flush signal) — used to free thread-local batch
  * buffers (client pump's g_tx). */
 struct tun_pool;
-typedef void (*tun_pkt_fn)(void *ud, const uint8_t *pkt, size_t len,
-                           bool last);
+/* per-packet callback: pkt is a per-reader scratch buffer, owned by the
+ * caller only until the callback returns (a batch-oriented callback may
+ * copy it; in-place modification is allowed — the server XORs in place) */
+typedef void (*tun_pkt_fn)(void *ud, uint8_t *pkt, size_t len, bool last);
 typedef void (*tun_exit_fn)(void);
 
 /* tun_pool_tick must be called at (at most) this cadence for the AIMD
