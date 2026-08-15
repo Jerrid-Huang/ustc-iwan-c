@@ -33,13 +33,23 @@
 #include "tun.h"
 #include "util.h"
 
-/* net/if_utun.h is not part of the public SDK; the control name and the
- * option id are stable XNU ABI (bsd/net/if_utun.h). */
+/* net/if_utun.h is not part of the public SDK, and the kernel control
+ * socket constants below are kernel-private in the public sys headers
+ * (struct ctl_info / CTLIOCGINFO are public; SYSPROTO_CONTROL and
+ * AF_SYS_CONTROL are not). The values are stable XNU ABI
+ * (bsd/sys/kern_control.h), so define them locally like other utun
+ * users (OpenVPN, Apple samples). */
 #ifndef UTUN_CONTROL_NAME
 #define UTUN_CONTROL_NAME "com.apple.net.utun_control"
 #endif
 #ifndef UTUN_OPT_IFNAME
 #define UTUN_OPT_IFNAME 2
+#endif
+#ifndef SYSPROTO_CONTROL
+#define SYSPROTO_CONTROL 2
+#endif
+#ifndef AF_SYS_CONTROL
+#define AF_SYS_CONTROL 2
 #endif
 
 static char g_utun_name[IFNAMSIZ];   /* actual interface (utunN) */

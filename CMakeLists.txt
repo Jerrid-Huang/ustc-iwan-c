@@ -69,9 +69,11 @@ if(UNIX AND NOT APPLE)
   endif()
 elseif(APPLE)
   # -std=c11 (strict) defines __STRICT_ANSI__, which drops the SDK's
-  # __DARWIN_C_LEVEL to ANSI and hides BSD extensions (SYSPROTO_CONTROL,
-  # AF_SYS_CONTROL for the utun control socket, etc.); _DARWIN_C_SOURCE
-  # restores the full level like _GNU_SOURCE does on Linux.
+  # __DARWIN_C_LEVEL to ANSI and hides BSD extensions (sysctl,
+  # KERN_* constants, ...); _DARWIN_C_SOURCE restores the full level
+  # like _GNU_SOURCE does on Linux. (The utun control-socket constants
+  # SYSPROTO_CONTROL/AF_SYS_CONTROL are kernel-private in the public
+  # SDK and are defined locally in tun_mac.c.)
   add_compile_definitions(_DARWIN_C_SOURCE)
   add_compile_options(-fstack-protector-strong)
 elseif(WIN32)
