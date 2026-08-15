@@ -1301,7 +1301,11 @@ static bool handshake_greeting(Flow *f)
             return false;
         }
         buf_consume(&f->input, 2 + (size_t)f->input.data[1]);
-        if (tok) {
+        if (tok || method == 2) {
+            /* token mode: real RFC1929. Token-less mode with a client
+             * that offered only 0x02: accept the flow and validate
+             * nothing (courtesy — curl -U against a passwordless
+             * proxy). */
             uint8_t ok[2] = {5, 2};
             queue_flow_output(f, ok, 2);
             f->auth_pending = true;
@@ -1339,8 +1343,10 @@ static bool handshake_greeting(Flow *f)
     }
     const char *tok = g_socks_cfg ? g_socks_cfg->auth_token : NULL;
     size_t tlen = tok ? strlen(tok) : 0;
-    int ok = tok && plen == tlen &&
-             ct_eq(pass, (const uint8_t *)tok, tlen);
+    /* token-less mode validates nothing (the greeting already accepted
+     * the flow as a courtesy) */
+    int ok = !tok || (plen == tlen &&
+                      ct_eq(pass, (const uint8_t *)tok, tlen));
     buf_consume(&f->input, 2 + (size_t)f->input.data[1] + 1 + plen);
     f->auth_pending = false;
     if (!ok) {

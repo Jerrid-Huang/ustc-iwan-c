@@ -169,6 +169,11 @@ int pp_socks_greeting(const uint8_t *d, size_t n, bool have_token,
 {
     size_t nmethods;
     int want = have_token ? 2 : 0;
+    /* courtesy fallback: a token-less server normally selects 0x00, but
+     * a client that offers ONLY RFC1929 (0x02) — e.g. curl -U against a
+     * passwordless proxy — must not be rejected with 0xff; the server
+     * accepts the auth flow and validates nothing. */
+    int fallback = have_token ? -1 : 2;
 
     if (n < 2)
         return -1;
@@ -182,6 +187,14 @@ int pp_socks_greeting(const uint8_t *d, size_t n, bool have_token,
         if (d[2 + i] == want) {
             *method = (uint8_t)want;
             break;
+        }
+    }
+    if (*method == 0xff && fallback >= 0) {
+        for (size_t i = 0; i < nmethods; i++) {
+            if (d[2 + i] == (uint8_t)fallback) {
+                *method = (uint8_t)fallback;
+                break;
+            }
         }
     }
     return 0;

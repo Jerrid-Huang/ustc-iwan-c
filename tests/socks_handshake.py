@@ -230,6 +230,20 @@ def run_no_token(port, connect_timeout_ms):
             expect_silence(s, STALL_TIMEOUT, "stall_big_nmethods")
         with_conn(port, body)
 
+    def greeting_only_auth():
+        # client offers ONLY RFC1929 (0x02) against a token-less server
+        # (e.g. curl -U): the flow must be accepted ({5,2}), the auth
+        # frame validated as success ({1,0}), then CONNECT proceeds
+        def body(s):
+            s.sendall(b"\x05\x01\x02")
+            expect_prefix(s, b"\x05\x02", DEFAULT_READ_TIMEOUT)
+            s.sendall(b"\x01\x04test\x04pass")
+            expect_prefix(s, b"\x01\x00", DEFAULT_READ_TIMEOUT)
+            s.sendall(b"\x05\x01\x00\x01" b"\x0a\xff\xff\x01"
+                      b"\x00\x50")
+            expect_prefix(s, b"\x05\x04", ct_wait)
+        with_conn(port, body)
+
     cases = [
         ("greeting_ok", greeting_ok),
         ("greeting_badver", greeting_badver),
@@ -240,6 +254,7 @@ def run_no_token(port, connect_timeout_ms):
         ("domain_len0", domain_len0),
         ("atyp_ipv6", atyp_ipv6),
         ("stall_big_nmethods", stall_big_nmethods),
+        ("greeting_only_auth", greeting_only_auth),
     ]
     run_cases(cases)
 

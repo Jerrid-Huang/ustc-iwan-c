@@ -230,10 +230,12 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
         memmove(b, b + g, n - g);
         n -= g;
     }
-    if (token) {
+    if (token || method == 2) {
         uint8_t ok[2] = {5, 2};
         (void)port_send(fd, ok, 2, 0);
-        /* RFC1929: [1, ulen, user..., plen, pass...] */
+        /* RFC1929: [1, ulen, user..., plen, pass...]. Token-less mode
+         * accepts any well-formed frame (courtesy — a client that
+         * offered only 0x02, e.g. curl -U, must not be rejected). */
         char user[64];
         const uint8_t *pass;
         size_t plen;
@@ -241,11 +243,13 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
             int pr = pp_socks_auth_frame(b, n, user, sizeof user,
                                          &pass, &plen);
             if (pr > 0) {
-                size_t tlen = strlen(token);
                 uint8_t rr[2] = {1, 0};
-                if (plen != tlen ||
-                    rp_ct_eq(pass, (const uint8_t *)token, tlen) == 0)
-                    rr[1] = 1;
+                if (token) {
+                    size_t tlen = strlen(token);
+                    if (plen != tlen ||
+                        rp_ct_eq(pass, (const uint8_t *)token, tlen) == 0)
+                        rr[1] = 1;
+                }
                 (void)port_send(fd, rr, 2, 0);
                 if (rr[1] != 0)
                     return -1;
