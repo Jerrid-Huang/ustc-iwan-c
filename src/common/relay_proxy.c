@@ -571,7 +571,11 @@ static void *rp_dir_main(void *ud)
 {
     bool up_dir = ((intptr_t)ud != 0);
 #ifndef _WIN32
+#  ifdef __APPLE__
+    pthread_setname_np(up_dir ? "relay-up" : "relay-dn");
+#  else
     pthread_setname_np(pthread_self(), up_dir ? "relay-up" : "relay-dn");
+#  endif
 #endif
     struct rp_conn ***arrp = up_dir ? &g_rp_up : &g_rp_dn;
     size_t *np = up_dir ? &g_rp_up_n : &g_rp_dn_n;
@@ -868,7 +872,11 @@ static void *rp_accept_main(void *ud)
 {
     struct RelayProxy *rp = ud;
 #ifndef _WIN32
+#  ifdef __APPLE__
+    pthread_setname_np("rp-accept");
+#  else
     pthread_setname_np(pthread_self(), "rp-accept");
+#  endif
 #endif
     while (!atomic_load(&rp->stop)) {
         struct pollfd pfd = { .fd = rp->listener, .events = POLLIN };
