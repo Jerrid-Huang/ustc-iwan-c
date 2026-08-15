@@ -30,10 +30,6 @@
  * coordinated release of client AND server.
  * ========================================================================== */
 
-/* informational only, NOT on the wire: the wire has no version field.
- * A protocol version bump means a NEW FRAME LAYOUT, not a new constant. */
-#define IWAN_PROTO_VERSION 1
-
 /* shared "mw" magic used both as the key-derivation prefix (crypto.c) and
  * the ctrl-signature suffix (protocol.c): keep both in sync via one name */
 #define IWAN_MW "mw"

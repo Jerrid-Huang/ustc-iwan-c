@@ -101,10 +101,6 @@ typedef unsigned int nfds_t;
 #    define SIO_UDP_NETSEGMENT 0x98030005u
 #  endif
 
-   /* WSAPoll rejects negative timeouts (SOCKET_ERROR); callers use
-    * explicit positive timeouts, but normalize -1 to INFTIM anyway. */
-#  define PORT_POLL_INFTIM (-1)
-
 #else /* !_WIN32 */
 
 #  include <arpa/inet.h>
@@ -123,8 +119,6 @@ typedef unsigned int nfds_t;
 #  include <sys/uio.h>
 #  include <time.h>
 #  include <unistd.h>
-
-#  define PORT_POLL_INFTIM (-1)
 
    /* macOS lacks the mmsghdr type and the sendmmsg/recvmmsg syscalls
     * (Linux-only). Define the type like the Windows branch and emulate
@@ -210,7 +204,6 @@ struct mmsghdr;
 
 /* SIGPIPE is a no-op on Windows (winsock surfaces ECONNRESET) */
 void port_ignore_sigpipe(void);
-int  port_strcasecmp(const char *a, const char *b);
 int  port_strncasecmp(const char *a, const char *b, size_t n);
 
 /* ------------------------- fd helpers ------------------------------ */
@@ -230,10 +223,7 @@ ssize_t port_send(int fd, const void *buf, size_t len, int flags);
 ssize_t port_recv(int fd, void *buf, size_t len, int flags);
 ssize_t port_sendto(int fd, const void *buf, size_t len, int flags,
                     const struct sockaddr *to, socklen_t tolen);
-ssize_t port_recvfrom(int fd, void *buf, size_t len, int flags,
-                      struct sockaddr *from, socklen_t *fromlen);
 ssize_t port_sendmsg(int fd, const struct msghdr *msg, int flags);
-ssize_t port_recvmsg(int fd, struct msghdr *msg, int flags);
 int     port_sendmmsg(int fd, struct mmsghdr *msgvec, unsigned vlen,
                       int flags);
 int     port_recvmmsg(int fd, struct mmsghdr *msgvec, unsigned vlen,
@@ -288,13 +278,8 @@ static inline ssize_t port_sendto(int fd, const void *buf, size_t len,
                                   int flags, const struct sockaddr *to,
                                   socklen_t tolen)
 { return sendto(fd, buf, len, flags, to, tolen); }
-static inline ssize_t port_recvfrom(int fd, void *buf, size_t len, int flags,
-                                    struct sockaddr *from, socklen_t *fromlen)
-{ return recvfrom(fd, buf, len, flags, from, fromlen); }
 static inline ssize_t port_sendmsg(int fd, const struct msghdr *msg, int flags)
 { return sendmsg(fd, msg, flags); }
-static inline ssize_t port_recvmsg(int fd, struct msghdr *msg, int flags)
-{ return recvmsg(fd, msg, flags); }
 static inline int port_sendmmsg(int fd, struct mmsghdr *msgvec,
                                 unsigned vlen, int flags)
 {
@@ -394,8 +379,6 @@ static inline void port_ignore_sigpipe(void)
 {
     signal(SIGPIPE, SIG_IGN);
 }
-static inline int port_strcasecmp(const char *a, const char *b)
-{ return strcasecmp(a, b); }
 static inline int port_strncasecmp(const char *a, const char *b, size_t n)
 { return strncasecmp(a, b, n); }
 #endif /* !_WIN32 */

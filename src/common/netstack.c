@@ -58,13 +58,11 @@
 #define NS_DUP_ACK_THRESH 3       /* dup ACKs before fast retransmit */
 #define NS_RTT_MAX_MS     10000u  /* RTT sample clamp (bogus samples) */
 #define NS_FLOWDBG_THROTTLE_MS 500u /* min gap between NSSEND dumps */
-#define NS_TICK_DEFAULT_MS 100    /* ns_tick: poll interval when idle */
 #define NS_TICK_MAX_MS    10000   /* ns_tick: cap on the next-tick value */
 
 #define TCP_FIN 0x01
 #define TCP_SYN 0x02
 #define TCP_RST 0x04
-#define TCP_PSH 0x08
 #define TCP_ACK 0x10
 
 /* offset of the inner TCP flags byte in an inline control packet:
@@ -735,9 +733,9 @@ static void handle_rx(Netstack *ns, TcpConn *c, int idx, const uint8_t *t,
 }
 
 void ns_init(Netstack *ns, uint32_t inner_ip, uint32_t gw, uint16_t mtu) {
+    (void)gw;   /* kept for API compatibility; not stored */
     memset(ns, 0, sizeof *ns);
     ns->ip = inner_ip;
-    ns->gw = gw;
     ns->mtu = mtu;
     ns->last_conn = -1;   /* rx lookup cache starts empty (memset gave 0) */
     /* connect timeout: IWAN_NS_CONNECT_TIMEOUT_MS override for tests
@@ -826,10 +824,6 @@ TcpConn *ns_conn(Netstack *ns, int idx) {
     return &ns->conns[idx];
 }
 
-NsState ns_state(const TcpConn *c) {
-    return c->state;
-}
-
 /* diagnostic (IWAN_FLOWDBG=1): dump one conn's full send state, used to
  * identify backpressure deadlocks (zero remote window, ring full of
  * sealed-but-unsent segments, tx-queue overflow). Cheap when disabled. */
@@ -898,28 +892,6 @@ static void seg_seal(Netstack *ns, TcpConn *c, NsPriv *p, uint8_t extra)
         p->fin_sent = 1;
         c->snd_nxt += 1;
     }
-}
-
-uint8_t *ns_send_reserve(Netstack *ns, int idx, size_t *room)
-{
-    TcpConn *c;
-    NsPriv *p;
-    Seg *s;
-    *room = 0;
-    if (idx < 0 || idx >= NS_MAX_CONN)
-        return NULL;
-    c = &ns->conns[idx];
-    if (c->state == NS_CLOSED || c->state == NS_FIN_WAIT)
-        return NULL;
-    p = &ns->priv[idx];
-    if (p->nsegs >= NS_MAX_OUTSTANDING)
-        return NULL;
-    seg_maybe_compact(p);
-    s = seg_fill_slot(p);
-    if (s->len >= c->mss)
-        return NULL;                       /* full slot not yet sealed */
-    *room = c->mss - s->len;
-    return s->data + s->len;
 }
 
 int ns_send_reservev(Netstack *ns, int idx, struct iovec *iov, int maxn)

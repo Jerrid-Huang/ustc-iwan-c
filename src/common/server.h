@@ -58,7 +58,6 @@ struct server_ctx {
     uint32_t next_ip;        /* BE u32; next client IP to hand out */
     uint32_t ip_base;        /* BE u32; first usable host address */
     uint32_t ip_end;         /* BE u32; last usable host address (pre-broadcast) */
-    char tun_name[IFNAMSIZ];
     int tun_fd;              /* -1 when running in --no-tun mode */
     void *qpool;             /* struct tun_pool *, owned by main() */
 };

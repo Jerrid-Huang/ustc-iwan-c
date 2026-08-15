@@ -131,7 +131,7 @@ void oidc_urlenc(const char *s, buf_t *out)
     }
 }
 
-char *oidc_urldec(const char *s, size_t n)
+static char *oidc_urldec(const char *s, size_t n)
 {
     char *out = malloc(n + 1);
     size_t o = 0;

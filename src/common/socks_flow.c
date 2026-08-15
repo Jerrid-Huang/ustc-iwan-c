@@ -594,9 +594,7 @@ bool dns_try_handle_response(const uint8_t *pkt, size_t n)
     if (ip4_u32(pkt + 16) != g_ns.ip)          /* addressed to our inner IP */
         goto bad;
     dns = udp + 8;
-    dnslen = ulen - 8;
-    if (dnslen < 12)
-        goto bad;
+    dnslen = ulen - 8;   /* >= 12: the ulen >= 8+12 guard above */
     if (((dns[0] << 8) | dns[1]) != want_id)   /* transaction id */
         goto bad;
     {
@@ -1379,12 +1377,8 @@ static void handshake_request(Flow *f)
     if (pp_socks_request(f->input.data, f->input.len, &cmd, &rep, &t) != 0)
         return;                  /* frame incomplete: wait */
     if (rep != 0) {
-        if (f->input.data[0] != 5) {
-            /* RFC 1928: VER must be 5 (general failure) */
-            queue_socks_error(f, 1);
-            return;
-        }
-        /* unsupported command / bad RSV -> rep 7; unsupported or
+        /* VER is 5 here: pp_socks_request rejects anything else.
+         * unsupported command / bad RSV -> rep 7; unsupported or
          * empty address type -> rep 8 */
         queue_socks_error(f, rep);
         return;

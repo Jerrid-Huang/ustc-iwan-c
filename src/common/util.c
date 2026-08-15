@@ -4,21 +4,14 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <limits.h>
-#include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
-#include <time.h>
 
 #ifndef _WIN32
-#include <net/if.h>
-#ifdef __linux__
-#include <sys/random.h>
-#endif
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -52,7 +45,6 @@ bool debug_enabled(void)
     return debug_cached != 0;
 }
 
-/* argv with "ip" prepended; args[0] is "-4", "route", ... or already "ip" */
 /* Neutralize PATH and loader-injection environment before exec'ing helper
  * binaries: the daemon may run as root, and a hostile PATH entry (or
  * LD_PRELOAD) would execute attacker code with root privileges. */
@@ -70,7 +62,10 @@ void exec_sanitize(void)
 #endif
 }
 
-#ifndef _WIN32
+/* argv with "ip" prepended; args[0] is "-4", "route", ... or already "ip".
+ * The Windows port-layer helpers pass argv WITHOUT argv[0] (e.g.
+ * {"-4","route","show","default"}), while port_run_cmd/port_cmd_capture
+ * want argv[0] = program name. */
 static char **ip_argv(char *const args[])
 {
     size_t argc = 0;
@@ -87,6 +82,7 @@ static char **ip_argv(char *const args[])
     return argv;
 }
 
+#ifndef _WIN32
 static bool run_ip_child(char *const args[], bool quiet)
 {
     pid_t pid = fork();
@@ -117,24 +113,6 @@ static bool run_ip_child(char *const args[], bool quiet)
     return WEXITSTATUS(st) == 0;
 }
 #else /* _WIN32 */
-/* mirror ip_argv() for the port-layer subprocess helpers: callers pass
- * argv WITHOUT argv[0] (e.g. {"-4","route","show","default"}), while
- * port_run_cmd/port_cmd_capture want argv[0] = program name. */
-static char **win32_ip_argv(char *const args[])
-{
-    size_t argc = 0;
-    while (args[argc])
-        argc++;
-    char **argv = malloc((argc + 2) * sizeof(char *));
-    if (!argv)
-        return NULL;
-    size_t off = (argc > 0 && strcmp(args[0], "ip") == 0) ? 0 : 1;
-    argv[0] = "ip";
-    for (size_t i = 0; i < argc; i++)
-        argv[i + off] = args[i];
-    argv[argc + off] = NULL;
-    return argv;
-}
 #endif /* _WIN32 */
 
 bool ip_run(char *const args[])
@@ -142,7 +120,7 @@ bool ip_run(char *const args[])
 #ifndef _WIN32
     return run_ip_child(args, false);
 #else
-    char **argv = win32_ip_argv(args);
+    char **argv = ip_argv(args);
     if (!argv)
         return false;
     int rc = port_run_cmd(argv);
@@ -159,12 +137,7 @@ bool ip_run_quiet(char *const args[])
     /* Divergence: port_run_cmd cannot redirect the child's stdout/stderr,
      * so output is not swallowed on Windows (CREATE_NO_WINDOW keeps it off
      * the console). Callers treat ip_run_quiet as best-effort. */
-    char **argv = win32_ip_argv(args);
-    if (!argv)
-        return false;
-    int rc = port_run_cmd(argv);
-    free(argv);
-    return rc == 0;
+    return ip_run(args);
 #endif
 }
 
@@ -245,7 +218,7 @@ char *cmd_capture(char *const args[])
     out[len] = '\0';
     return out;
 #else
-    char **argv = win32_ip_argv(args);
+    char **argv = ip_argv(args);
     if (!argv)
         return NULL;
     /* consumers parse `ip route/addr` output (a few hundred bytes); the
@@ -491,15 +464,6 @@ int str_to_u16(const char *s, uint16_t *out)
     if (parse_uint(s, UINT16_MAX, &v) != 0)
         return -1;
     *out = (uint16_t)v;
-    return 0;
-}
-
-int str_to_u8(const char *s, uint8_t *out)
-{
-    uint64_t v;
-    if (parse_uint(s, UINT8_MAX, &v) != 0)
-        return -1;
-    *out = (uint8_t)v;
     return 0;
 }
 

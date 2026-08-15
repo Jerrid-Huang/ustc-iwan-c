@@ -138,7 +138,6 @@ typedef struct {
 
 typedef struct {
     uint32_t ip;            /* inner tun IP (host order) */
-    uint32_t gw;            /* gateway (host order) */
     uint16_t mtu;
     uint8_t  outer_hdr[8];  /* VPN outer header, filled after auth */
     uint8_t  xor_key[8];    /* payload cipher, filled after auth */
@@ -170,14 +169,9 @@ int  ns_connect(Netstack *ns, uint16_t lport, uint32_t rip, uint16_t rport);
 int  ns_connect6(Netstack *ns, uint16_t lport, const uint8_t rip6[16],
                  uint16_t rport);
 TcpConn *ns_conn(Netstack *ns, int idx);
-NsState ns_state(const TcpConn *c);
 /* diagnostic: dump conn send state (IWAN_FLOWDBG=1) */
 void ns_dump_conn(const Netstack *ns, int idx);
 
-/* zero-copy app-data path: reserve writable space in the pending segment
- * slot (read() straight into it), then commit what was filled. Returns
- * NULL/0 when the stack is full (backpressure). */
-uint8_t *ns_send_reserve(Netstack *ns, int idx, size_t *room);
 /* reserve up to maxn contiguous fill slots (linear, no wrap) into iov;
  * returns the number of slots. Pointers stay valid until the matching
  * ns_send_commit calls seal them. */

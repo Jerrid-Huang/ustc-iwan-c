@@ -21,7 +21,6 @@
 #ifndef TCP_FIN
 #define TCP_FIN 0x01
 #define TCP_SYN 0x02
-#define TCP_RST 0x04
 #define TCP_ACK 0x10
 #endif
 
@@ -463,18 +462,16 @@ static bool rate_token_zero(const struct sockaddr_in *peer, uint64_t now)
 }
 
 /* UDP send that can never block the loop; failures are counted, not
- * logged per packet (the socket is O_NONBLOCK, so EAGAIN drops).
- * Returns false when the datagram was not delivered. */
-static bool udp_send(int sockfd, const struct sockaddr_in *peer,
+ * logged per packet (the socket is O_NONBLOCK, so EAGAIN drops). */
+static void udp_send(int sockfd, const struct sockaddr_in *peer,
                      const void *data, size_t len)
 {
     if (sendto(sockfd, data, len, 0, (const struct sockaddr *)peer,
                sizeof *peer) < 0) {
         atomic_fetch_add(&g_send_drops, 1);
-        return false;
+        return;
     }
     atomic_fetch_add(&g_dl_pkts, 1);
-    return true;
 }
 
 uint64_t server_send_drops(void)
@@ -981,7 +978,9 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                     }
                 }
             }
-            if (ctx->tun_fd >= 0 && len > IWAN_HDR_LEN) {
+            /* len > IWAN_HDR_LEN guaranteed: the H1 guard above broke
+             * out on short frames */
+            if (ctx->tun_fd >= 0) {
                 /* device TX queue full: wait briefly for drain instead of
                  * silently dropping the segment. A dropped uplink segment
                  * makes the client RTO-retry; under a burst that can
@@ -1008,7 +1007,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                     tun_pool_note_stall(ctx->qpool);
                     g_up[tid].drop++;
                 }
-            } else if (ctx->tun_fd < 0 && len > IWAN_HDR_LEN) {
+            } else {
                 /* --no-tun test mode: echo the packet back (zero-latency
                  * lossless mirror) so tunnel + netstack throughput can
                  * be benchmarked without a TUN device or target network */
@@ -1375,7 +1374,7 @@ void handle_tun_downlink(struct server_ctx *ctx, uint8_t *ip_pkt, size_t len,
      * sessions match the derived ULA (fd00::/96 + assigned IPv4). */
     if ((ip_pkt[0] >> 4) == 6) {
         uint8_t s6[16], d6[16];
-        if (len < 40 || ip6_pkt_ok(ip_pkt, len, s6, d6) != 0) {
+        if (ip6_pkt_ok(ip_pkt, len, s6, d6) != 0) {   /* guards len < 40 itself */
             atomic_fetch_add(&g_dl_drops, 1);
             if (debug_enabled())
                 log_debug("downlink drop: bad inner IPv6 (%zuB) v=%u "

@@ -31,7 +31,7 @@ void route_teardown(const char *tun, const char *srv, const char *ogw,
  * alongside the IPv4 route_setup. Best-effort: IPv6 routing must never
  * take the tunnel down (the IPv4 path is the load-bearing one), so
  * failures are logged and skipped, never fatal. */
-bool route_setup6(const char *tun, const slist_t *routes6);
+void route_setup6(const char *tun, const slist_t *routes6);
 void route_teardown6(const char *tun, const char *tun_ip,
                      const slist_t *routes6);
 

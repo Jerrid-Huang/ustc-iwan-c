@@ -66,7 +66,6 @@ void oidc_rand_bytes(uint8_t *out, size_t n);
 void oidc_check_server_ip(const char *server);
 void oidc_hex_upper(const uint8_t *b, size_t n, char *out);
 void oidc_urlenc(const char *s, buf_t *out);
-char *oidc_urldec(const char *s, size_t n);
 void oidc_buf_cstr(buf_t *b);
 char *oidc_buf_to_cstr(buf_t *b);
 void oidc_esc_put(buf_t *b, const char *s);

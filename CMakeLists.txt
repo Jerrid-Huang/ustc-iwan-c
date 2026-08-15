@@ -129,6 +129,7 @@ set(IWAN_CORE_SRCS
   src/common/auth.c
   src/common/buffer.c
   src/common/cli.c
+  src/common/cli_common.c
   src/common/config.c
   src/common/crypto.c
   src/common/gcm.c

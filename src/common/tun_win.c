@@ -50,8 +50,6 @@ typedef void (WINAPI *wintun_close_adapter_fn)(WINTUN_ADAPTER_HANDLE adapter);
 typedef WINTUN_SESSION_HANDLE(WINAPI *wintun_start_session_fn)(
     WINTUN_ADAPTER_HANDLE adapter, DWORD capacity);
 typedef void (WINAPI *wintun_end_session_fn)(WINTUN_SESSION_HANDLE session);
-typedef BOOL (WINAPI *wintun_get_adapter_luid_fn)(WINTUN_ADAPTER_HANDLE adapter,
-                                                  NET_LUID *luid);
 typedef DWORD (WINAPI *wintun_get_running_driver_version_fn)(void);
 /* wintun >= 0.14: reserve ring space (blocks until room) then send the
  * reserved buffer (VOID — cannot fail); wintun <= 0.13 used a single
@@ -78,7 +76,6 @@ struct wintun_api {
     wintun_close_adapter_fn close_adapter;
     wintun_start_session_fn start_session;
     wintun_end_session_fn end_session;
-    wintun_get_adapter_luid_fn get_adapter_luid;
     wintun_get_running_driver_version_fn get_running_driver_version;
     wintun_allocate_send_packet_fn allocate_send_packet;
     wintun_send_packet_fn send_packet;
@@ -169,7 +166,6 @@ static bool wintun_load(void)
     WINTUN_LOAD_ONE(close_adapter, "WintunCloseAdapter");
     WINTUN_LOAD_ONE(start_session, "WintunStartSession");
     WINTUN_LOAD_ONE(end_session, "WintunEndSession");
-    WINTUN_LOAD_ONE(get_adapter_luid, "WintunGetAdapterLUID");
     WINTUN_LOAD_ONE(get_running_driver_version, "WintunGetRunningDriverVersion");
     /* 0.14+ exports WintunAllocateSendPacket; 0.13 and earlier do not
      * (there WintunSendPacket takes the packet size as the 3rd arg) */

@@ -144,7 +144,6 @@ static int bridge_output_parse(Netstack *ns, const struct pbuf *p,
          * generate extension headers) */
         if (h[6] != 6)
             return -1;
-        ihl = 40;
         tot = ((size_t)h[4] << 8) | h[5];   /* payload length */
         t = h + 40;
         thlen = (size_t)(t[12] >> 4) * 4;
@@ -309,7 +308,6 @@ void ns_init(Netstack *ns, uint32_t inner_ip, uint32_t gw, uint16_t mtu)
 
     memset(ns, 0, sizeof *ns);
     ns->ip = inner_ip;
-    ns->gw = gw;
     ns->mtu = mtu;
 
     ns->connect_timeout_ms = NS_CONNECT_TIMEOUT;
@@ -398,7 +396,6 @@ static int conn_slot_alloc(Netstack *ns, TcpConn **out)
 
     TcpConn *c = &ns->conns[idx];
     conn_slot_clear(c);
-    c->ns = ns;
     c->term_reason = NS_TERM_NONE;
     c->state_ms = now_ms();
     c->last_poll_ms = c->state_ms;
@@ -515,11 +512,6 @@ TcpConn *ns_conn(Netstack *ns, int idx)
     return &ns->conns[idx];
 }
 
-NsState ns_state(const TcpConn *c)
-{
-    return c->state;
-}
-
 void ns_dump_conn(const Netstack *ns, int idx)
 {
     if (!dbg_env("IWAN_FLOWDBG") || idx < 0 || idx >= NS_MAX_CONN)
@@ -557,14 +549,6 @@ void ns_dump_conn(const Netstack *ns, int idx)
             pcb ? (unsigned)pcb->cwnd : 0,
             pcb ? (unsigned)pcb->snd_wnd : 0,
             ns->q_used[idx]);
-}
-
-uint8_t *ns_send_reserve(Netstack *ns, int idx, size_t *room)
-{
-    struct iovec iov[1];
-    int n = ns_send_reservev(ns, idx, iov, 1);
-    *room = n ? iov[0].iov_len : 0;
-    return n ? (uint8_t *)iov[0].iov_base : NULL;
 }
 
 int ns_send_reservev(Netstack *ns, int idx, struct iovec *iov, int maxn)

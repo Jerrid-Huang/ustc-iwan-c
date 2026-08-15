@@ -502,10 +502,9 @@ void tun_pool_set_exit_cb(struct tun_pool *pool, tun_exit_fn cb)
 void tun_pool_destroy(struct tun_pool *pool)
 {
     int i;
-    int nq = atomic_load(&pool->nq);
-
     if (!pool)
-        return;
+        return;   /* must precede any deref: no-tun servers pass NULL */
+    int nq = atomic_load(&pool->nq);
     for (i = 0; i < nq; i++)
         pool->qs[i].stop = 1;
     for (i = 0; i < nq; i++)

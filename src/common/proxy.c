@@ -101,21 +101,33 @@ static int send_ctrl(pump_ctx_t *ctx, uint8_t typ, uint8_t enc, uint16_t sid,
  * check at all). 120s = 12 consecutive unanswered keepalives. */
 #define PUMP_RX_STALE_MS_DEFAULT 120000u
 
+/* parsed once per process: the pump loop would otherwise re-run
+ * getenv+strtoul on every iteration */
 static unsigned pump_rx_stale_ms(void)
 {
-    const char *v = getenv("IWAN_RX_STALE_MS");
+    static unsigned cached;
+    static int parsed;
+    const char *v;
     char *end;
     unsigned long n;
 
-    if (!v || !v[0])
-        return PUMP_RX_STALE_MS_DEFAULT;
+    if (parsed)
+        return cached;
+    parsed = 1;
+    v = getenv("IWAN_RX_STALE_MS");
+    if (!v || !v[0]) {
+        cached = PUMP_RX_STALE_MS_DEFAULT;
+        return cached;
+    }
     n = strtoul(v, &end, 10);
     if (end == v || *end != '\0' || n < 10000 || n > 86400000) {
         log_err("IWAN_RX_STALE_MS: invalid value '%s' (10s..24h); "
                 "using default", v);
-        return PUMP_RX_STALE_MS_DEFAULT;
+        cached = PUMP_RX_STALE_MS_DEFAULT;
+        return cached;
     }
-    return (unsigned)n;
+    cached = (unsigned)n;
+    return cached;
 }
 #define PUMP_POLL_CEIL_MS 1000  /* cap on the recvmmsg park timeout */
 #define RX_BATCH 64             /* recvmmsg batch size (iov/msgs arrays) */

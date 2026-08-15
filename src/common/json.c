@@ -438,7 +438,6 @@ static Json *parse_array(struct P *p, int depth)
             arr->u.a.cap = nc;
         }
         arr->u.a.arr[arr->u.a.len++] = v;
-        after_comma = 0;
         skip_ws(p);
         if (p->s[0] == ',') {
             p->s++;
@@ -498,7 +497,6 @@ static Json *parse_object(struct P *p, int depth)
             json_free(obj);
             return NULL;
         }
-        after_comma = 0;
         skip_ws(p);
         if (!p->s[0]) {
             p_fail(p, 0, 1, "EOF while parsing an object");
@@ -688,11 +686,6 @@ const char *json_str(const Json *j)
 double json_num(const Json *j)
 {
     return (j && j->type == JSON_NUM) ? j->u.num : 0;
-}
-
-int json_bool(const Json *j)
-{
-    return (j && j->type == JSON_BOOL) ? j->u.boolean : 0;
 }
 
 size_t json_arr_len(const Json *j)

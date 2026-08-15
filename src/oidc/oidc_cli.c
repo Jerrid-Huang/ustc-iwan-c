@@ -6,6 +6,7 @@
 
 #include "addr.h"
 #include "cli.h"
+#include "cli_common.h"
 #include "common.h"   /* port.h: sockaddr_in on both platforms */
 #include "oidc.h"
 #include "util.h"
@@ -160,26 +161,6 @@ static void print_help_long(void)
         "          Print version\n");
 }
 
-static bool valid_listen(const char *val, char *err, size_t errsz)
-{
-    struct sockaddr_in tmp;
-    if (parse_host_port(val, &tmp) == 0)
-        return true;
-    snprintf(err, errsz, "invalid socket address syntax");
-    return false;
-}
-
-/* RFC1929 (SOCKS5 username/password) carries the password in a
- * one-byte length field: longer tokens can never authenticate and
- * would silently deny every peer. Reject at parse time. */
-static bool validate_token_len(const char *val, char *err, size_t errsz)
-{
-    if (strlen(val) <= 255)
-        return true;
-    snprintf(err, errsz, "must be at most 255 bytes (RFC1929 limit)");
-    return false;
-}
-
 static void on_help(bool long_help)
 {
     if (long_help)
@@ -245,7 +226,6 @@ void oidc_parse_cli(int argc, char **argv, Opts *o, Cli *usage)
         .version_is_unknown = false,
         .usage_str = on_usage,
         .short_aliases = short_aliases,
-        .track_usage = true,
     };
     cli_parse(usage, argc, argv, 1, opts, sizeof opts / sizeof opts[0], &ctl);
 }

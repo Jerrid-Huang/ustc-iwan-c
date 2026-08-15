@@ -61,26 +61,43 @@ Flow *g_flows;            /* fixed MAX_FLOWS array, never NULL-terminated */
  * anything. */
 #define SOCKS_RX_STALE_MS_DEFAULT 120000u
 
+/* parsed once per process (the event loop would otherwise re-run
+ * getenv+strtoul every iteration); 0 disables the watchdog */
 static unsigned socks_rx_stale_ms(void)
 {
-    const char *v = getenv("IWAN_RX_STALE_MS");
+    static unsigned cached;
+    static int parsed;
+    const char *v;
     char *end;
     unsigned long n;
 
-    if (!v || !v[0])
-        return SOCKS_RX_STALE_MS_DEFAULT;
+    if (parsed)
+        return cached;
+    parsed = 1;
+    v = getenv("IWAN_RX_STALE_MS");
+    if (!v || !v[0]) {
+        cached = SOCKS_RX_STALE_MS_DEFAULT;
+        return cached;
+    }
     n = strtoul(v, &end, 10);
-    if (end == v || *end != '\0' || n == 0) {
-        log_err("IWAN_RX_STALE_MS: invalid value '%s' (10s..24h, or 0 to "
-                "disable); using default", v);
-        return SOCKS_RX_STALE_MS_DEFAULT;
+    if (end == v || *end != '\0') {
+        log_err("IWAN_RX_STALE_MS: invalid value '%s' (0 to disable, "
+                "10s..24h); using default", v);
+        cached = SOCKS_RX_STALE_MS_DEFAULT;
+        return cached;
+    }
+    if (n == 0) {   /* 0 disables (the documented contract) */
+        cached = 0;
+        return cached;
     }
     if (n < 10000 || n > 86400000) {
-        log_err("IWAN_RX_STALE_MS: invalid value '%s' (10s..24h, or 0 to "
-                "disable); using default", v);
-        return SOCKS_RX_STALE_MS_DEFAULT;
+        log_err("IWAN_RX_STALE_MS: invalid value '%s' (0 to disable, "
+                "10s..24h); using default", v);
+        cached = SOCKS_RX_STALE_MS_DEFAULT;
+        return cached;
     }
-    return (unsigned)n;
+    cached = (unsigned)n;
+    return cached;
 }
 #define LISTEN_BACKLOG   64
 #define SOCK_BUF_BYTES   (16 * 1024 * 1024)
@@ -714,8 +731,6 @@ int run_socks(int sockfd, SocksConfig *cfg) {
     cfg->last_rx = now_ms();
     cfg->ka_fail = 0;
     cfg->session_lost = false;
-    g_stop = 0;   /* a lost-session return set it; the caller's
-                   * reconnect loop must not inherit the flag */
     struct sockaddr_in laddr = cfg->listen_addr;
 
     g_socks_cfg = cfg;
@@ -836,14 +851,14 @@ int run_socks(int sockfd, SocksConfig *cfg) {
                   (cfg->gateway >> 8) & 0xff, cfg->gateway & 0xff, cfg->mtu);
 
     uint64_t last_ka = now_ms() - SOCKS_KEEPALIVE_MS;
+    unsigned stale_ms = socks_rx_stale_ms();   /* parsed once, cached */
 
     while (!g_stop) {
         /* downlink-silence watchdog: re-auth the tunnel in place (the
          * listener, flows and inner TCP survive); the old behavior —
          * declaring the session lost and exiting — only applies when no
-         * re-auth callback was provided */
-        if (socks_rx_stale_ms() > 0 &&
-            now_ms() - cfg->last_rx > socks_rx_stale_ms()) {
+         * re-auth callback was provided. stale_ms == 0 disables it. */
+        if (stale_ms != 0 && now_ms() - cfg->last_rx > stale_ms) {
             log_err("SOCKS: no downlink for %llu ms; re-authing tunnel",
                     (unsigned long long)(now_ms() - cfg->last_rx));
             int nfd = socks_reauth_tunnel(cfg);

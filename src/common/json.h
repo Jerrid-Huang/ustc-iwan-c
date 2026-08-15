@@ -15,7 +15,6 @@ void        json_free(Json *j);
 int         json_type(const Json *j);
 const char *json_str(const Json *j);    /* JSON_STR -> string, else NULL */
 double      json_num(const Json *j);    /* JSON_NUM -> value, else 0 */
-int         json_bool(const Json *j);   /* JSON_BOOL -> 1/0 */
 size_t      json_arr_len(const Json *j);
 Json       *json_arr_at(const Json *j, size_t i);
 /* NULL if missing; duplicate keys: last occurrence wins (serde_json Map

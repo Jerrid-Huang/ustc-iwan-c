@@ -47,7 +47,6 @@
 
 struct RelayProxy {
     int          listener;   /* -1 = stopped */
-    pthread_t    accept_th;
     atomic_bool  stop;
     char        *token;      /* RFC1929 password copy; NULL = no auth */
 };
@@ -916,6 +915,7 @@ int relay_proxy_start(const char *listen_str, const char *auth_token,
     struct RelayProxy *rp;
     struct sockaddr_in listen;
     int fd, one = 1;
+    pthread_t accept_th;
 
     *out = NULL;
     if (!listen_str || parse_host_port(listen_str, &listen) != 0) {
@@ -971,12 +971,12 @@ int relay_proxy_start(const char *listen_str, const char *auth_token,
     pthread_detach(tu);
     pthread_detach(td);
 
-    if (pthread_create(&rp->accept_th, NULL, rp_accept_main, rp) != 0) {
+    if (pthread_create(&accept_th, NULL, rp_accept_main, rp) != 0) {
         port_close(fd);
         rp->listener = -1;
         goto fail;
     }
-    pthread_detach(rp->accept_th);
+    pthread_detach(accept_th);
     log_info("SOCKS5+HTTP proxy on %s (follows TUN routes)", listen_str);
     *out = rp;
     return 0;

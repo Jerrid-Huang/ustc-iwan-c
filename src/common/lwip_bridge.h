@@ -77,7 +77,6 @@ struct TcpConn {
                              * update_tcp_states to map to a reply code */
     uint64_t last_dump_ms;
     /* ---- bridge-internal ---- */
-    struct Netstack *ns;    /* back-pointer for callbacks */
     struct tcp_pcb *pcb;    /* NULL when the slot is free */
     uint8_t  af;            /* 4 = IPv4 (rip), 6 = IPv6 (rip6) */
     uint32_t rip;
@@ -100,7 +99,6 @@ struct TcpConn {
 typedef struct Netstack {
     /* ---- public fields (read by socks_flow.c / socks.c) ---- */
     uint32_t ip;            /* inner tun IP, host order (MSB-first) */
-    uint32_t gw;
     uint16_t mtu;
     uint8_t  outer_hdr[8];
     uint8_t  xor_key[8];
@@ -112,7 +110,6 @@ typedef struct Netstack {
     FramedPkt pkt[NS_TX_MAX];       /* tx packet pool */
     uint8_t  pkt_refs[NS_TX_MAX];   /* 1 = slot referenced by a queue entry */
     uint8_t  q_used[NS_MAX_CONN];   /* per-conn tx-queue slots (fair share) */
-    int      last_conn;             /* rx lookup cache */
     uint32_t connect_timeout_ms;
     int      active_count;          /* live conns (idle sleep optimization) */
 } Netstack;
@@ -126,9 +123,7 @@ int  ns_connect(Netstack *ns, uint16_t lport, uint32_t rip, uint16_t rport);
 int  ns_connect6(Netstack *ns, uint16_t lport, const uint8_t rip6[16],
                  uint16_t rport);
 TcpConn *ns_conn(Netstack *ns, int idx);
-NsState ns_state(const TcpConn *c);
 void ns_dump_conn(const Netstack *ns, int idx);
-uint8_t *ns_send_reserve(Netstack *ns, int idx, size_t *room);
 int  ns_send_reservev(Netstack *ns, int idx, struct iovec *iov, int maxn);
 int  ns_send_commit(Netstack *ns, int idx, size_t n);
 void ns_close(Netstack *ns, int idx);

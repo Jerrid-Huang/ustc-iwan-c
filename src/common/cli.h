@@ -48,8 +48,6 @@ typedef struct cli_ctl {
     const char *(*usage_str)(void);
     /* Single-letter aliases, NULL-terminated {"short","--long"} pairs. */
     const char *const (*short_aliases)[2];
-    /* Collect unique flags in CLI order for "smart" usage (oidc). */
-    bool track_usage;
 } cli_ctl;
 
 typedef struct {

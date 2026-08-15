@@ -60,24 +60,6 @@ void buf_put_u8(buf_t *b, uint8_t v)
     buf_put(b, &v, 1);
 }
 
-void buf_put_be16(buf_t *b, uint16_t v)
-{
-    uint8_t tmp[2];
-    tmp[0] = (uint8_t)(v >> 8);
-    tmp[1] = (uint8_t)v;
-    buf_put(b, tmp, 2);
-}
-
-void buf_put_be32(buf_t *b, uint32_t v)
-{
-    uint8_t tmp[4];
-    tmp[0] = (uint8_t)(v >> 24);
-    tmp[1] = (uint8_t)(v >> 16);
-    tmp[2] = (uint8_t)(v >> 8);
-    tmp[3] = (uint8_t)v;
-    buf_put(b, tmp, 4);
-}
-
 void buf_put_str(buf_t *b, const char *s)
 {
     buf_put(b, s, strlen(s));

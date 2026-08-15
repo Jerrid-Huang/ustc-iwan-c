@@ -472,11 +472,6 @@ char *port_home_dir(void)
 }
 
 #ifdef _WIN32
-int port_strcasecmp(const char *a, const char *b)
-{
-    return _stricmp(a, b);
-}
-
 int port_strncasecmp(const char *a, const char *b, size_t n)
 {
     return _strnicmp(a, b, n);
@@ -802,21 +797,6 @@ ssize_t port_sendto(int fd, const void *buf, size_t len, int flags,
     return (ssize_t)r;
 }
 
-ssize_t port_recvfrom(int fd, void *buf, size_t len, int flags,
-                      struct sockaddr *from, socklen_t *fromlen)
-{
-    int r;
-    if ((flags & MSG_DONTWAIT) && ensure_nonblock(fd) != 0)
-        return -1;
-    r = recvfrom((SOCKET)fd, (char *)buf, (int)len, 0,
-                 (struct sockaddr *)from, (int *)fromlen);
-    if (r == SOCKET_ERROR) {
-        set_sock_errno(fd);
-        return -1;
-    }
-    return (ssize_t)r;
-}
-
 /* Convert an iovec array to WSABUF layout. NOTE: WSABUF is {ULONG len;
  * CHAR *buf} — the reverse field order of struct iovec {void *iov_base;
  * size_t iov_len} — so a direct cast is invalid (WSAEFAULT). Use the
@@ -873,48 +853,6 @@ ssize_t port_sendmsg(int fd, const struct msghdr *msg, int flags)
     if (heap)
         free(w);
     return (ssize_t)sent;
-}
-
-ssize_t port_recvmsg(int fd, struct msghdr *msg, int flags)
-{
-    DWORD got = 0;
-    DWORD wflags = 0;
-    int namelen = (int)msg->msg_namelen;
-    WSABUF stack[IOV_TO_WSABUF_STACK];
-    bool heap = false;
-    LPWSABUF w;
-
-    if ((flags & MSG_DONTWAIT) && ensure_nonblock(fd) != 0)
-        return -1;
-    w = iov_to_wsabuf(msg->msg_iov, msg->msg_iovlen, stack, &heap);
-    if (!w)
-        return -1;
-    /* Windows quirk: WSARecvFrom with lpFrom=NULL and a NON-NULL
-     * lpFromlen fails with WSAEFAULT even on connected datagram
-     * sockets (Linux accepts both). Pass both NULL when the caller
-     * does not want the source address. */
-    if (WSARecvFrom((SOCKET)fd, w, (DWORD)msg->msg_iovlen, &got, &wflags,
-                    (struct sockaddr *)msg->msg_name,
-                    msg->msg_name ? &namelen : NULL, NULL,
-                    NULL) == SOCKET_ERROR) {
-        int e = WSAGetLastError();
-        if (heap)
-            free(w);
-        if (e == WSAEMSGSIZE) {
-            /* datagram did not fit the buffers: report MSG_TRUNC like
-             * Linux so the caller drops it (see socks.c/proxy.c) */
-            msg->msg_flags |= MSG_TRUNC;
-            return (ssize_t)got;
-        }
-        errno = wsa_errno(e);
-            log_debug("port_sendto: winsock error %d -> errno %d", e, errno);
-        return -1;
-    }
-    if (heap)
-        free(w);
-    msg->msg_namelen = (socklen_t)namelen;
-    msg->msg_flags = 0;
-    return (ssize_t)got;
 }
 
 int port_sendmmsg(int fd, struct mmsghdr *msgvec, unsigned vlen, int flags)

@@ -998,10 +998,10 @@ void route_teardown(const char *tun, const char *srv, const char *ogw,
 #endif /* _WIN32 */
 
 /* IPv6 proxy routes through the tunnel (see route.h: best-effort) */
-bool route_setup6(const char *tun, const slist_t *routes6)
+void route_setup6(const char *tun, const slist_t *routes6)
 {
     if (routes6 == NULL)
-        return true;
+        return;
 #ifdef _WIN32
     char namea[32];
     snprintf(namea, sizeof namea, "name=%s", tun);
@@ -1035,7 +1035,6 @@ bool route_setup6(const char *tun, const slist_t *routes6)
             log_err("route_setup6: ip -6 route add %s dev %s failed", c, tun);
     }
 #endif
-    return true;
 }
 
 void route_teardown6(const char *tun, const char *tun_ip,

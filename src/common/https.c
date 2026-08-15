@@ -432,10 +432,9 @@ static int https_ctx_load_cas(SSL_CTX *ctx)
     };
     const char *ca = getenv("SSL_CERT_FILE");
 
-    if (ca && ca[0]) {
-        /* trust the env var even if the file is unreadable; the load
-         * below reports the failure */
-    } else {
+    /* SSL_CERT_FILE wins even if the file is unreadable; the load below
+     * reports the failure. Otherwise fall back to the bundle paths. */
+    if (!ca || !ca[0]) {
         ca = NULL;
         for (size_t i = 0; i < sizeof cands / sizeof cands[0]; i++)
             if (access(cands[i], R_OK) == 0) {

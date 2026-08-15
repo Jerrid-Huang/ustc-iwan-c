@@ -22,8 +22,6 @@ void buf_clear(buf_t *b);                 /* len = 0, keep capacity */
 void buf_ensure(buf_t *b, size_t extra);  /* ensure room for `extra` more bytes */
 void buf_put(buf_t *b, const void *p, size_t n);
 void buf_put_u8(buf_t *b, uint8_t v);
-void buf_put_be16(buf_t *b, uint16_t v);
-void buf_put_be32(buf_t *b, uint32_t v);
 void buf_put_str(buf_t *b, const char *s);
 /* remove from the front; memmoves remaining down */
 void buf_consume(buf_t *b, size_t n);
@@ -51,7 +49,6 @@ uint64_t now_ms(void);          /* monotonic, for timeouts */
  * -1 on empty/non-digit/overflow. Shared by cli.c and the str_to_u* */
 int      parse_uint(const char *s, uint64_t max, uint64_t *out);
 int      str_to_u16(const char *s, uint16_t *out);
-int      str_to_u8(const char *s, uint8_t *out);
 /* Rust-style "[::1]" -> "::1" for getaddrinfo; returns s when unbracketed */
 const char *unbracket_ipv6(const char *s, char *buf, size_t n);
 /* read proxy routes: one or more comma-separated entries per line, '#' comments.

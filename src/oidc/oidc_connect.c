@@ -16,6 +16,7 @@ extern char **environ;     /* macOS unistd.h does not declare it */
 
 #include "addr.h"
 #include "auth.h"
+#include "cli_common.h"
 #include "common.h"
 #include "crypto.h"
 #include "gcm.h"
@@ -26,25 +27,6 @@ extern char **environ;     /* macOS unistd.h does not declare it */
 #include "socks.h"
 #include "tun.h"
 #include "util.h"
-
-/* F8: cross-check the server-issued gateway against the server actually
- * connected to (same check as iwan_client's proxy/socks paths; the OIDC
- * entry missed it). A mismatch is legal in NAT setups, so this is a
- * warning only — but an unexpected mismatch may indicate a forged
- * OPEN_ACK. Skipped when either side is not an IPv4 literal. */
-static void check_gw_server(const char *server, const char *gw)
-{
-    uint8_t sb[4], gb[4];
-
-    if (!s2ip4(server, sb) || !s2ip4(gw, gb))
-        return;
-    if (memcmp(sb, gb, sizeof sb) != 0) {
-        log_err("WARNING: server-issued gateway %s differs from the "
-                "connected server %s (NAT setups are normal; an "
-                "unexpected mismatch may indicate a forged OPEN_ACK)",
-                gw, server);
-    }
-}
 
 /* in-place tunnel re-auth (socks.h): re-run the OIDC auth and refresh
  * the session fields of cfg. The SOCKS listener, flows and lwIP inner
@@ -228,22 +210,6 @@ void oidc_elevate_root(int argc, char **argv)
 #endif
 }
 
-static void collect_routes(const Opts *o, slist_t *routes)
-{
-    for (size_t i = 0; i < o->proxy_cidr.n; i++)
-        slist_push(routes, o->proxy_cidr.v[i]);
-    for (size_t i = 0; i < o->proxy_ip.n; i++)
-        slist_push(routes, o->proxy_ip.v[i]);
-    for (size_t i = 0; i < o->proxy_domain.n; i++)
-        slist_push(routes, o->proxy_domain.v[i]);
-}
-
-static void collect_routes6(const Opts *o, slist_t *routes6)
-{
-    for (size_t i = 0; i < o->proxy_cidr6.n; i++)
-        slist_push(routes6, o->proxy_cidr6.v[i]);
-}
-
 /* server "port" value from a server entry: 1 = valid (out set),
  * 0 = absent (caller uses OIDC_DEFAULT_PORT), -1 = not an integer in
  * 1..65535 (raw receives the offending value). */
@@ -330,10 +296,11 @@ void oidc_connect_server(const Opts *o, const Config *cf)
 
     slist_t routes;
     slist_init(&routes);
-    collect_routes(o, &routes);
+    collect_routes(&routes, &o->proxy_cidr, &o->proxy_ip,
+                   &o->proxy_domain);
     slist_t routes6;
     slist_init(&routes6);
-    collect_routes6(o, &routes6);
+    collect_routes6(&routes6, &o->proxy_cidr6);
 
     /* authenticate/run loop: a lost session (keepalive failure, no
      * downlink) re-authenticates and re-runs the pump instead of

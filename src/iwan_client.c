@@ -17,6 +17,7 @@
 #include "addr.h"
 #include "auth.h"
 #include "cli.h"
+#include "cli_common.h"
 #include "common.h"
 #include "crypto.h"
 #include "profile.h"
@@ -382,26 +383,6 @@ static void wipe(void *p, size_t n)
         *v++ = 0;
 }
 
-static bool valid_listen(const char *val, char *err, size_t errsz)
-{
-    struct sockaddr_in tmp;
-    if (parse_host_port(val, &tmp) == 0)
-        return true;
-    snprintf(err, errsz, "invalid socket address syntax");
-    return false;
-}
-
-/* RFC1929 (SOCKS5 username/password) carries the password in a
- * one-byte length field: longer tokens can never authenticate and
- * would silently deny every peer. Reject at parse time. */
-static bool validate_token_len(const char *val, char *err, size_t errsz)
-{
-    if (strlen(val) <= 255)
-        return true;
-    snprintf(err, errsz, "must be at most 255 bytes (RFC1929 limit)");
-    return false;
-}
-
 static void die_invalid_address(const char *ctx)
 {
     fprintf(stderr,
@@ -427,26 +408,6 @@ static void check_server_ip(const char *server, const char *ctx)
         die_invalid_address(ctx);
 }
 
-/* F8: cross-check the server-issued gateway against the --server the
- * client actually connected to. Both are dotted-quads; when --server is a
- * hostname (or any non-IPv4 literal) it resolves elsewhere, so there is
- * nothing to compare and the check is skipped silently. A mismatch is
- * legal in NAT setups, so this is a warning only — but an unexpected
- * mismatch may indicate a forged OPEN_ACK. */
-static void check_gw_server(const char *server, const char *gw)
-{
-    uint8_t sb[4], gb[4];
-
-    if (!s2ip4(server, sb) || !s2ip4(gw, gb))
-        return;
-    if (memcmp(sb, gb, sizeof sb) != 0) {
-        log_err("WARNING: server-issued gateway %s differs from the "
-                "connected server %s (NAT setups are normal; an "
-                "unexpected mismatch may indicate a forged OPEN_ACK)",
-                gw, server);
-    }
-}
-
 /* parse subcommand args; on -h/--help/errors the shared parser exits */
 static void parse_cmd(int argc, char **argv, int start, const char *sub,
                       const cli_opt *opts, size_t nopts)
@@ -458,7 +419,6 @@ static void parse_cmd(int argc, char **argv, int start, const char *sub,
         .on_help = on_help,
         .version_is_unknown = true,
         .usage_str = current_usage,
-        .track_usage = false,
     };
     cli_parse(&u, argc, argv, start, opts, nopts, &ctl);
 }
@@ -536,22 +496,6 @@ static int authenticate(const CmdOpts *o, int style, AuthResult *res)
                      res);
     buf_free(&open);
     return fd;
-}
-
-static void collect_routes(const CmdOpts *o, slist_t *routes)
-{
-    for (size_t i = 0; i < o->proxy_cidr.n; i++)
-        slist_push(routes, o->proxy_cidr.v[i]);
-    for (size_t i = 0; i < o->proxy_ip.n; i++)
-        slist_push(routes, o->proxy_ip.v[i]);
-    for (size_t i = 0; i < o->proxy_domain.n; i++)
-        slist_push(routes, o->proxy_domain.v[i]);
-}
-
-static void collect_routes6(const CmdOpts *o, slist_t *routes6)
-{
-    for (size_t i = 0; i < o->proxy_cidr6.n; i++)
-        slist_push(routes6, o->proxy_cidr6.v[i]);
 }
 
 static void free_route_opts(CmdOpts *o)
@@ -808,7 +752,8 @@ static int cmd_proxy(int argc, char **argv, int start)
 
     slist_t routes;
     slist_init(&routes);
-    collect_routes(&o, &routes);
+    collect_routes(&routes, &o.proxy_cidr, &o.proxy_ip,
+                   &o.proxy_domain);
 
     if (!tun_name_valid(o.tun)) {
         log_err("Error: invalid TUN device name '%s'", o.tun);
@@ -885,7 +830,7 @@ static int cmd_proxy(int argc, char **argv, int start)
 
         slist_t routes6;
         slist_init(&routes6);
-        collect_routes6(&o, &routes6);
+        collect_routes6(&routes6, &o.proxy_cidr6);
         rc = run_pump(tun_fd, o.tun, sockfd, sk, res.sid, res.tok,
                       1, o.server, &routes, &routes6,
                       res.tun, res.mtu);

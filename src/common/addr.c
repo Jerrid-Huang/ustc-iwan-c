@@ -9,8 +9,8 @@ int parse_host_port(const char *s, struct sockaddr_in *out)
     const char *colon = strchr(s, ':');
     if (!colon || colon == s || strchr(colon + 1, ':') != NULL)
         return -1;
-    size_t ilen = (size_t)(colon - s);
-    if (ilen == 0 || ilen >= 128)
+    size_t ilen = (size_t)(colon - s);   /* > 0: colon == s was rejected */
+    if (ilen >= 128)
         return -1;
     char ip[128];
     memcpy(ip, s, ilen);

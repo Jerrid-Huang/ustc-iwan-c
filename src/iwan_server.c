@@ -868,7 +868,6 @@ int main(int argc, char **argv)
     ctx.ip_base = subnet_base + 2;                 /* first usable host */
     ctx.ip_end = (subnet_base | ~(0xFFFFFFFFu << (32 - o.mask))) - 1; /* pre-broadcast */
     ctx.next_ip = ctx.ip_base;
-    snprintf(ctx.tun_name, sizeof ctx.tun_name, "%s", o.tun);
     ctx.tun_fd = -1;
 
     {
@@ -1007,8 +1006,8 @@ int main(int argc, char **argv)
          * count means the write-side fan-out is effective immediately
          * instead of waiting for the downlink-driven AIMD to grow the
          * pool (ACK-only downlink keeps it near 1 queue otherwise) */
-        ctx.qpool = tun_pool_create(o.tun, tun_fd, maxq,
-                                    recv_threads < maxq ? recv_threads : maxq,
+        int initq = recv_threads < maxq ? recv_threads : maxq;
+        ctx.qpool = tun_pool_create(o.tun, tun_fd, maxq, initq,
                                     srv_tun_pkt, &pu, &g_stop);
         if (!ctx.qpool) {
             fprintf(stderr, "error: cannot start TUN reader pool\n");
@@ -1016,7 +1015,8 @@ int main(int argc, char **argv)
                 server_cleanup_nat(); /* parent (root) undoes NAT */
             return 1;
         }
-        printf("tun reader pool: 1 queue (dynamic up to %d)\n", maxq);
+        printf("tun reader pool: %d queue%s (dynamic up to %d)\n",
+               initq, initq > 1 ? "s" : "", maxq);
         if (tun_steering_attach(tun_fd) == 0)
             printf("tun steering: eBPF flow hash attached\n");
     }
