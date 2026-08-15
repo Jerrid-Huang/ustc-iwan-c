@@ -20,6 +20,7 @@
 #include "common.h"
 #include "crypto.h"
 #include "ipv4.h"
+#include "profile.h"
 #include "protocol.h"
 #include "proxy.h"
 #include "route.h"
@@ -44,6 +45,8 @@ typedef struct {
                          * downlink); distinguishes failure from the
                          * user's Ctrl-C so run_pump can report it */
 } pump_ctx_t;
+
+atomic_uint_fast64_t g_prof_pump_tx, g_prof_pump_rx;   /* [prof] tunnel bytes */
 
 static void eprintf(const char *fmt, ...) {
     va_list ap;
@@ -398,6 +401,7 @@ static void pump_tun_pkt(void *ud, uint8_t *pkt, size_t len, bool last)
         memcpy(s, q->hdr, 8);
         memcpy(s + 8, pkt, len);   /* pool hands over its scratch buffer */
         xor_crypt(s + 8, len, ctx->xor_key, 8);
+        PROF_ADD(g_prof_pump_tx, len);
         q->iov[q->n].iov_base = s;
         q->iov[q->n].iov_len = len + 8;
         q->n++;
@@ -523,6 +527,11 @@ static void *udp2tun_thread(void *ud) {
             break;
         }
         last_rx = now_ms();   /* any datagram resets the stale clock */
+        {
+            static struct prof_state pst_rx, pst_tx;
+            if (prof_print("cli rx", &pst_rx, g_prof_pump_rx))
+                prof_print("cli tx", &pst_tx, g_prof_pump_tx);
+        }
         for (i = 0; i < v; i++) {
             ssize_t n = msgs[i].msg_len;
             uint8_t *m = batch + (size_t)i * slot;
@@ -567,6 +576,7 @@ static void *udp2tun_thread(void *ud) {
             }
             if (t == PT_DATA_ENC)
                 xor_crypt(m + 8, (size_t)(n - 8), ctx->xor_key, 8);
+            PROF_ADD(g_prof_pump_rx, (size_t)(n - 8));
             /* validate the inner IPv4 packet before injecting it into the
              * TUN device (same gate as the SOCKS path): a malformed frame
              * must not reach the kernel stack */

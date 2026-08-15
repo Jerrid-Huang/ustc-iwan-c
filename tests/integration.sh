@@ -16,14 +16,6 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."          # repo root
 
-# optional $1 = "m3": run the TUN-mode proxy with the M3 relay model
-# (two GLOBAL direction threads, poll event loop; A/B switch, see
-# relay_proxy.c). The proxy is launched by this script, so the export
-# reaches it even under sudo's env_reset.
-if [ "${1:-}" = "m3" ]; then
-    export IWAN_RP_MODEL=3
-fi
-
 if [ "$(id -u)" != 0 ]; then
     echo "error: integration test needs root (TUN devices); run with sudo" >&2
     exit 1

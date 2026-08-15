@@ -99,6 +99,11 @@ void handle_tun_downlink(struct server_ctx *ctx, uint8_t *ip_pkt, size_t len,
 /* Drop sessions idle for more than 120s; log each. Main thread only. */
 void purge_expired(struct server_ctx *ctx, uint64_t now_ms);
 
+/* [prof] server stage byte counters (IWAN_PROFILE=1); incremented by
+ * recv threads / tun readers, printed by the primary recv thread. */
+extern atomic_uint_fast64_t g_prof_srv_recv, g_prof_srv_tunw, g_prof_srv_tunr,
+    g_prof_srv_dlsend;
+
 /* Cumulative UDP send failures (nonblocking socket: EAGAIN drops). */
 uint64_t server_send_drops(void);
 

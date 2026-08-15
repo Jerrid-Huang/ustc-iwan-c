@@ -12,11 +12,11 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-# optional positional args: [THREADS] [CLIENTS_LIST] [debug] [proxy] [m3] [down]
+# optional positional args: [THREADS] [CLIENTS_LIST] [debug] [proxy] [down]
 # (like bench.sh; "proxy" = one TUN client with --listen proxy, and
-# CLIENTS_LIST means concurrent connections through it; "m3" selects
-# the relay's two-GLOBAL-thread A/B model; "down" benchmarks the
-# download direction. Positional because env vars don't pass sudo)
+# CLIENTS_LIST means concurrent connections through it; "down"
+# benchmarks the download direction. Positional because env vars
+# don't pass sudo)
 if [ -n "${1:-}" ]; then
     export IWAN_SRV_THREADS="$1"
 fi
@@ -29,13 +29,11 @@ fi
 if [ "${4:-}" = "proxy" ]; then
     PROXY_MODE=1
 fi
-if [ "${5:-}" = "m3" ]; then
-    export IWAN_RP_MODEL=3   # TUN-proxy relay: 2 global direction threads
-fi
-# "down" may land on $5 (no m3 in the command line) or $6 (after m3);
-# an empty $3 still occupies its position, so both slots are checked
-if [ "${5:-}" = "down" ] || [ "${6:-}" = "down" ]; then
+if [ "${5:-}" = "down" ]; then
     export DIR=down
+fi
+if [ "${5:-}" = "prof" ] || [ "${6:-}" = "prof" ]; then
+    export IWAN_PROFILE=1   # TEMP: stage instrumentation for the A/B (remove)
 fi
 
 CLIENTS_LIST=${CLIENTS_LIST:-"1 2 4 8"}
@@ -153,6 +151,9 @@ if [ "$PROXY_MODE" = 1 ]; then
     # routing table their routes would clobber each other and blackhole
     # the SYN; netns isolation is exactly what integration.sh mode 2
     # does for the same reason)
+    # stale proxy clients from an aborted run would hold the listener
+    # port and the netns; the script runs as root so this reaches them
+    pkill -f 'bin/iwan-client proxy' 2>/dev/null || true
     ip netns del "$TUN_NS" 2>/dev/null || true
     ip netns add "$TUN_NS"
     ip link add veth0 type veth peer name veth1
@@ -168,7 +169,7 @@ if [ "$PROXY_MODE" = 1 ]; then
         --server "$VETH_IP" --port "$PORT" --user u1 --pass s3cret \
         --tun "$CLI_TUN" --listen "127.0.0.1:$PROXY_PORT" \
         --proxy-cidr "$SUBNET" \
-        > "$WORK/proxycli.log" 2>&1 &
+        > >(tee /tmp/proxycli_prof.log) 2>&1 &
     CLI_PIDS="$!"
     for _ in $(seq 1 60); do
         ip netns exec "$TUN_NS" ss -tln 2>/dev/null | \

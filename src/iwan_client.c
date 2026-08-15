@@ -19,6 +19,7 @@
 #include "cli.h"
 #include "common.h"
 #include "crypto.h"
+#include "profile.h"
 #include "protocol.h"
 #include "proxy.h"
 #include "relay_proxy.h"
@@ -1107,6 +1108,7 @@ int main(int argc, char **argv)
 #endif
     port_socket_init();   /* WSAStartup on Windows; no-op on Linux */
     util_ignore_sigpipe();
+    prof_init();          /* IWAN_PROFILE=1: stage throughput prints */
     if (argc < 2) {
         /* clap arg_required_else_help: help on stderr, exit 2 */
         print_top_help(stderr);

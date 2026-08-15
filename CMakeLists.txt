@@ -159,6 +159,9 @@ else()
   message(FATAL_ERROR "IWAN_TCP_STACK must be 'lwip' or 'native' (got '${IWAN_TCP_STACK}')")
 endif()
 
+# throughput instrumentation (bottleneck profiling; IWAN_PROFILE=1)
+list(APPEND IWAN_CORE_SRCS src/common/profile.c)
+
 # ---------------------------------------------------------------------------
 # Vendored lwIP 2.2.1 (third_party/lwip): the userspace TCP stack behind the
 # SOCKS mode. NO_SYS=1 raw API, IPv4/TCP only, no socket layer — configured by

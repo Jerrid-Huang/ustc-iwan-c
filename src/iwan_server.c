@@ -22,6 +22,7 @@
 #include <unistd.h>
 
 #include "common.h"
+#include "profile.h"
 #include "protocol.h"
 
 #define UDP_RXBATCH 64 /* recvmmsg drain batch size */
@@ -444,6 +445,7 @@ static void srv_tun_pkt(void *ud, uint8_t *pkt, size_t len, bool last)
 {
     struct srv_pool_ud *pu = ud;
     (void)last;
+    PROF_ADD(g_prof_srv_tunr, len);
     handle_tun_downlink(pu->ctx, pkt, len, pu->udp_fd);
 }
 
@@ -667,6 +669,7 @@ static void *recv_thread_main(void *v)
                     for (int i = 0; i < v; i++) {
                         if (msgs[i].msg_len <= 0)
                             continue;
+                        PROF_ADD(g_prof_srv_recv, (size_t)msgs[i].msg_len);
                         handle_udp(a->ctx, a->users, a->nusers,
                                    (const uint8_t *)msgs[i].msg_hdr.msg_iov[0]
                                        .iov_base,
@@ -716,6 +719,14 @@ static void *recv_thread_main(void *v)
                 last_qctl = now;
             }
             if (now - last_purge >= 1000) {
+                {
+                    static struct prof_state ps_recv, ps_tunw, ps_tunr, ps_dl;
+                    if (prof_print("srv recv", &ps_recv, g_prof_srv_recv)) {
+                        prof_print("srv tunw", &ps_tunw, g_prof_srv_tunw);
+                        prof_print("srv tunr", &ps_tunr, g_prof_srv_tunr);
+                        prof_print("srv dlsend", &ps_dl, g_prof_srv_dlsend);
+                    }
+                }
                 purge_expired(a->ctx, now);
                 if (debug_enabled())
                     server_up_stats_print();
@@ -767,6 +778,7 @@ int main(int argc, char **argv)
     bool drop_child = false; /* A1: this process is the forked, de-privileged server */
 
     util_ignore_sigpipe();     /* EPIPE on a dead socket, not a SIGPIPE kill */
+    prof_init();               /* IWAN_PROFILE=1: stage throughput prints */
     server_rate_limits_init(); /* IWAN_RATE_OPEN_MAX / IWAN_RATE_ECHO_MAX */
 
     /* uplink recv threads: SO_REUSEPORT fan-out across `recv_threads`

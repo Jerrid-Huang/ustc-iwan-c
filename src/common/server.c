@@ -11,6 +11,7 @@
 #include "common.h"
 #include "crypto.h"
 #include "ipv4.h"
+#include "profile.h"
 #include "protocol.h"
 #include "server.h"
 #include "tun.h"
@@ -125,6 +126,9 @@ static int echo_mirror(struct server_ctx *ctx, uint8_t *p, size_t len,
 #define RATE_PROBE_MAX 8            /* linear-probe depth before eviction */
 
 static atomic_uint_fast64_t g_send_drops;
+/* [prof] server-side stage counters (exported for the recv thread print) */
+atomic_uint_fast64_t g_prof_srv_recv, g_prof_srv_tunw, g_prof_srv_tunr,
+    g_prof_srv_dlsend;
 static atomic_ullong g_dl_pkts;   /* UDP datagrams sent (incl. control
                                    * frames like OPEN_ACK/PING_RSP — the
                                    * counter is not a pure data metric) */
@@ -995,7 +999,9 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                         wfd = pf;
                 }
                 if (tun_write_retry(wfd, raw + IWAN_HDR_LEN,
-                                    len - IWAN_HDR_LEN, 1, NULL) != 0) {
+                                    len - IWAN_HDR_LEN, 1, NULL) == 0)
+                    PROF_ADD(g_prof_srv_tunw, len - IWAN_HDR_LEN);
+                else {
                     /* still full: drop, client retransmits. Also tell
                      * the pool the device queue is congested so its
                      * AIMD keeps the write fan-out (never shrinks). */
@@ -1465,6 +1471,8 @@ void handle_tun_downlink(struct server_ctx *ctx, uint8_t *ip_pkt, size_t len,
         msg.msg_iovlen = 2;
         if (port_sendmsg(sockfd, &msg, 0) < 0)
             atomic_fetch_add(&g_send_drops, 1);
+        else
+            PROF_ADD(g_prof_srv_dlsend, len);
     }
     /* Deliberately NO sendmsg(ECONNREFUSED) teardown here: this socket is
      * unconnected, so on Linux sendmsg never returns ECONNREFUSED — an
