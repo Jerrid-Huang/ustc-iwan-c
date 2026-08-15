@@ -68,6 +68,11 @@ if(UNIX AND NOT APPLE)
     add_compile_options(-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3)
   endif()
 elseif(APPLE)
+  # -std=c11 (strict) defines __STRICT_ANSI__, which drops the SDK's
+  # __DARWIN_C_LEVEL to ANSI and hides BSD extensions (SYSPROTO_CONTROL,
+  # AF_SYS_CONTROL for the utun control socket, etc.); _DARWIN_C_SOURCE
+  # restores the full level like _GNU_SOURCE does on Linux.
+  add_compile_definitions(_DARWIN_C_SOURCE)
   add_compile_options(-fstack-protector-strong)
 elseif(WIN32)
   # MinGW-w64 (and MSYS2). -D_GNU_SOURCE and -fPIE are ELF-isms and
