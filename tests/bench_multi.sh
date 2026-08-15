@@ -12,9 +12,11 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-# optional positional args: [THREADS] [CLIENTS_LIST] [debug] [proxy]
+# optional positional args: [THREADS] [CLIENTS_LIST] [debug] [proxy] [m3] [down]
 # (like bench.sh; "proxy" = one TUN client with --listen proxy, and
-# CLIENTS_LIST means concurrent connections through it)
+# CLIENTS_LIST means concurrent connections through it; "m3" selects
+# the relay's two-GLOBAL-thread A/B model; "down" benchmarks the
+# download direction. Positional because env vars don't pass sudo)
 if [ -n "${1:-}" ]; then
     export IWAN_SRV_THREADS="$1"
 fi
@@ -26,6 +28,12 @@ if [ "${3:-}" = "debug" ]; then
 fi
 if [ "${4:-}" = "proxy" ]; then
     PROXY_MODE=1
+fi
+if [ "${5:-}" = "m3" ]; then
+    export IWAN_RP_MODEL=3   # TUN-proxy relay: 2 global direction threads
+fi
+if [ "${6:-}" = "down" ]; then
+    export DIR=down
 fi
 
 CLIENTS_LIST=${CLIENTS_LIST:-"1 2 4 8"}

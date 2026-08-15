@@ -12,11 +12,13 @@
  *   request line is sent verbatim — RFC 7230 servers accept absolute
  *   URIs on a proxy connection)
  *
- * Thread model: one accept thread; two relay threads per connection
- * (one per direction, blocking recv/send so backpressure is handled by
- * the kernel buffers); the connection thread joins both and closes the
- * sockets. relay_proxy_stop closes the listener; live connections are
- * reaped when their sockets close at process exit.
+ * Thread model (M1, default): one accept thread; two relay threads per
+ * connection (one per direction, blocking recv/send so backpressure is
+ * handled by the kernel buffers); the connection thread joins both and
+ * closes the sockets. IWAN_RP_MODEL=3 selects the M3 A/B experiment:
+ * two GLOBAL direction threads (poll-based event loop) shared by all
+ * connections. relay_proxy_stop closes the listener; live connections
+ * are reaped when their sockets close at process exit.
  */
 
 #include <errno.h>
@@ -55,6 +57,12 @@ struct RelayProxy {
  * relay_proxy_stop deliberately does NOT free the struct: detached
  * connection threads may still be reading it. One proxy per process. */
 struct RelayProxy *g_rp_current;
+
+/* relay thread model (read once at start; M1 default):
+ *   1 = two blocking relay threads per connection
+ *   3 = M3 A/B: two GLOBAL direction threads (poll event loop)
+ * IWAN_RP_MODEL selects; kept as a runtime switch for A/B benches. */
+static int g_rp_model = 1;
 
 /* constant-time byte compare (auth token) */
 static int rp_ct_eq(const uint8_t *a, const uint8_t *b, size_t n)
@@ -423,6 +431,288 @@ out:
     return NULL;
 }
 
+/* ---- M3: two GLOBAL direction threads (event-loop relay) ----
+ * IWAN_RP_MODEL=3 selects this A/B model; the default stays M1.
+ *
+ * Up thread: client -> upstream. Down thread: upstream -> client.
+ * Each direction owns an array of entries and one poll() event loop:
+ *   - nonblocking recv, fully drained per readiness event
+ *   - nonblocking send with a lazily-allocated pending buffer per
+ *     entry; POLLOUT is registered while pending data exists
+ *   - POLLIN is dropped while more than RP3_PEND_LIMIT bytes are
+ *     pending, so a slow peer throttles the sender through the kernel
+ *     buffers (the same backpressure M1 gets from its blocking send)
+ *   - registration is picked up by a bounded poll timeout (100 ms):
+ *     the pollset is rebuilt every iteration, so a connection added
+ *     while the loop was parked is serviced within one timeout. An
+ *     evfd wakeup was tried first but two threads parked on one evfd
+ *     race on its counter (the first drain makes the second thread's
+ *     wakeup check fail and it sleeps forever), and one evfd per
+ *     thread breaks the Windows/macOS process-level singleton
+ *     substitute — the bounded timeout is portable and race-free.
+ * End semantics match M1: any end condition on one direction
+ * half-closes the other (SHUT_WR) and retires the entry; the sockets
+ * and the conn are closed when both direction threads retired
+ * (atomic dirs 2 -> 0). The handshake still runs in the per-connection
+ * thread (rp_conn_main); only the data relay is global. */
+
+#define RP3_PEND_LIMIT (1u << 20)   /* stop reading while >1MB pending */
+#define RP3_POLL_MS    100          /* registration pickup bound */
+
+struct rp3_ent {
+    int from, to;
+    uint8_t *pend;              /* read but not yet sent; lazy alloc */
+    size_t plen, pcap;
+    bool from_eof;              /* recv returned 0 / error on `from` */
+    bool wr_closed;             /* SHUT_WR already sent to `to` */
+};
+
+struct rp3_conn {
+    int c, u;
+    atomic_int dirs;            /* 2 -> 0: both threads retired */
+    struct rp3_ent up, dn;      /* up thread owns .up, down owns .dn */
+};
+
+static struct rp3_conn **g_rp3_up, **g_rp3_dn;
+static size_t g_rp3_up_n, g_rp3_up_cap, g_rp3_dn_n, g_rp3_dn_cap;
+static pthread_mutex_t g_rp3_mu = PTHREAD_MUTEX_INITIALIZER;
+static atomic_int g_rp3_stop;
+static bool rp3_arr_add(struct rp3_conn ***arr, size_t *n, size_t *cap,
+                        struct rp3_conn *cn)
+{
+    if (*n == *cap) {
+        size_t nc = *cap ? *cap * 2 : 16;
+        struct rp3_conn **na = realloc(*arr, nc * sizeof *na);
+        if (!na)
+            return false;
+        *arr = na;
+        *cap = nc;
+    }
+    (*arr)[(*n)++] = cn;
+    return true;
+}
+
+/* hand the connected pair to the global relay; on failure both sockets
+ * are closed here and the caller must not touch them again */
+static void rp3_add(int c, int u)
+{
+    struct rp3_conn *cn = calloc(1, sizeof *cn);
+    if (!cn) {
+        port_close(c);
+        port_close(u);
+        return;
+    }
+    cn->c = c;
+    cn->u = u;
+    cn->up.from = c;
+    cn->up.to = u;
+    cn->dn.from = u;
+    cn->dn.to = c;
+    atomic_store(&cn->dirs, 2);
+    port_set_nonblock(c, true);
+    port_set_nonblock(u, true);
+
+    pthread_mutex_lock(&g_rp3_mu);
+    bool ok = rp3_arr_add(&g_rp3_up, &g_rp3_up_n, &g_rp3_up_cap, cn);
+    if (ok)
+        ok = rp3_arr_add(&g_rp3_dn, &g_rp3_dn_n, &g_rp3_dn_cap, cn);
+    if (!ok) {
+        for (size_t i = 0; i < g_rp3_up_n; i++)
+            if (g_rp3_up[i] == cn) {
+                g_rp3_up[i] = g_rp3_up[--g_rp3_up_n];
+                break;
+            }
+        for (size_t i = 0; i < g_rp3_dn_n; i++)
+            if (g_rp3_dn[i] == cn) {
+                g_rp3_dn[i] = g_rp3_dn[--g_rp3_dn_n];
+                break;
+            }
+    }
+    pthread_mutex_unlock(&g_rp3_mu);
+    if (!ok) {
+        port_close(c);
+        port_close(u);
+        free(cn);
+        return;
+    }
+}
+
+/* one direction thread retires its entry: the sockets are closed and
+ * the conn freed when BOTH threads have retired. Must run under
+ * g_rp3_mu (the last release frees the conn, and the first release
+ * must not read the atomic after that free). */
+static void rp3_release(struct rp3_conn *cn)
+{
+    if (atomic_fetch_sub(&cn->dirs, 1) == 1) {
+        port_close(cn->c);
+        port_close(cn->u);
+        free(cn->up.pend);
+        free(cn->dn.pend);
+        free(cn);
+    }
+}
+
+static bool rp3_pend(struct rp3_ent *e, const uint8_t *p, size_t n)
+{
+    if (e->plen + n > e->pcap) {
+        size_t nc = e->pcap ? e->pcap : 65536;
+        while (nc < e->plen + n)
+            nc *= 2;
+        uint8_t *np = realloc(e->pend, nc);
+        if (!np)
+            return false;
+        e->pend = np;
+        e->pcap = nc;
+    }
+    memcpy(e->pend + e->plen, p, n);
+    e->plen += n;
+    return true;
+}
+
+/* flush the pending buffer; on a hard send error the remaining data is
+ * dropped and the entry is half-closed (M1 drops it the same way) */
+static void rp3_flush(struct rp3_ent *e)
+{
+    while (e->plen > 0) {
+        ssize_t w = port_send(e->to, e->pend, e->plen, 0);
+        if (w > 0) {
+            e->plen -= (size_t)w;
+            memmove(e->pend, e->pend + w, e->plen);
+            continue;
+        }
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK ||
+                      errno == EINTR))
+            return;             /* retry on the next POLLOUT */
+        e->plen = 0;            /* hard error: drop, half-close */
+        e->from_eof = true;
+        return;
+    }
+}
+
+static void *rp3_dir_main(void *ud)
+{
+    bool up_dir = ((intptr_t)ud != 0);
+    struct rp3_conn ***arrp = up_dir ? &g_rp3_up : &g_rp3_dn;
+    size_t *np = up_dir ? &g_rp3_up_n : &g_rp3_dn_n;
+    struct pollfd *pf = NULL;
+    size_t pfcap = 0;
+    struct rp3_conn **snap = NULL;
+    size_t snapcap = 0;
+    uint8_t buf[RP_BUF];
+
+    while (!atomic_load(&g_rp3_stop)) {
+        pthread_mutex_lock(&g_rp3_mu);
+        size_t n = *np;
+        if (n > snapcap) {
+            struct rp3_conn **ns = realloc(snap, n * sizeof *ns);
+            if (!ns) {
+                pthread_mutex_unlock(&g_rp3_mu);
+                return NULL;
+            }
+            snap = ns;
+            snapcap = n;
+        }
+        memcpy(snap, *arrp, n * sizeof *snap);
+        pthread_mutex_unlock(&g_rp3_mu);
+
+        if (n * 2 > pfcap) {
+            struct pollfd *n2 = realloc(pf, (n * 2) * sizeof *n2);
+            if (!n2)
+                return NULL;
+            pf = n2;
+            pfcap = n * 2;
+        }
+        size_t k = 0;
+        for (size_t i = 0; i < n; i++) {
+            struct rp3_ent *e = up_dir ? &snap[i]->up : &snap[i]->dn;
+            if (!e->from_eof && e->plen <= RP3_PEND_LIMIT) {
+                pf[k].fd = e->from;
+                pf[k].events = POLLIN;
+                pf[k].revents = 0;
+                k++;
+            }
+            if (e->plen > 0) {
+                pf[k].fd = e->to;
+                pf[k].events = POLLOUT;
+                pf[k].revents = 0;
+                k++;
+            }
+        }
+        int pr = port_poll(pf, k, RP3_POLL_MS);
+        if (pr < 0) {
+            if (errno == EINTR)
+                continue;
+            break;              /* poll failed: stop relaying */
+        }
+
+        for (size_t i = 0; i < n; i++) {
+            struct rp3_conn *cn = snap[i];
+            struct rp3_ent *e = up_dir ? &cn->up : &cn->dn;
+            bool in = false, out = false;
+            for (size_t j = 0; j < k; j++) {
+                if (pf[j].fd == e->from &&
+                    (pf[j].revents & (POLLIN | POLLHUP | POLLERR)))
+                    in = true;
+                if (pf[j].fd == e->to &&
+                    (pf[j].revents & (POLLOUT | POLLERR)))
+                    out = true;
+            }
+            if (in && !e->from_eof) {
+                for (;;) {
+                    ssize_t r = port_recv(e->from, buf, sizeof buf, 0);
+                    if (r > 0) {
+                        if (!rp3_pend(e, buf, (size_t)r)) {
+                            e->plen = 0;   /* OOM: drop, half-close */
+                            e->from_eof = true;
+                            break;
+                        }
+                        continue;
+                    }
+                    if (r == 0) {
+                        e->from_eof = true;
+                    } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        /* drained */
+                    } else if (errno == EINTR) {
+                        continue;
+                    } else {
+                        e->from_eof = true;   /* read error: half-close */
+                    }
+                    break;
+                }
+            }
+            if (out) {
+                rp3_flush(e);
+            }
+        }
+
+        /* retire entries whose direction is finished: half-close the
+         * peer side, drop from this thread's array, release under the
+         * lock so the last release (which frees the conn) can never
+         * race the first release's atomic read */
+        pthread_mutex_lock(&g_rp3_mu);
+        for (size_t i = 0; i < n; i++) {
+            struct rp3_conn *cn = snap[i];
+            struct rp3_ent *e = up_dir ? &cn->up : &cn->dn;
+            if (e->from_eof && e->plen == 0) {
+                if (!e->wr_closed) {
+                    port_shutdown(e->to, 1);
+                    e->wr_closed = true;
+                }
+                for (size_t j = 0; j < *np; j++)
+                    if ((*arrp)[j] == cn) {
+                        (*arrp)[j] = (*arrp)[--*np];
+                        break;
+                    }
+                rp3_release(cn);
+            }
+        }
+        pthread_mutex_unlock(&g_rp3_mu);
+    }
+    free(pf);
+    free(snap);
+    return NULL;
+}
+
 static void *rp_conn_main(void *ud)
 {
     int fd = (int)(intptr_t)ud;
@@ -444,6 +734,14 @@ static void *rp_conn_main(void *ud)
         up = rp_handle_http(fd, first, (size_t)n);
     if (up < 0)
         goto out;
+
+    if (g_rp_model == 3) {
+        /* M3: handshake done here, then hand the pair to the two
+         * GLOBAL direction threads (A/B model; see rp3_dir_main).
+         * rp3_add owns (or closed) both sockets from now on. */
+        rp3_add(fd, up);
+        return NULL;
+    }
 
     /* M1: two threads per connection (one per direction) */
     {
@@ -529,6 +827,11 @@ int relay_proxy_start(const char *listen_str, const char *auth_token,
     rp->listener = -1;
     if (auth_token)
         rp->token = xstrdup(auth_token);
+    {
+        const char *m = getenv("IWAN_RP_MODEL");
+        if (m && strcmp(m, "3") == 0)
+            g_rp_model = 3;
+    }
     fd = port_socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0)
         goto fail;
@@ -546,13 +849,29 @@ int relay_proxy_start(const char *listen_str, const char *auth_token,
     port_set_nonblock(fd, true);
     rp->listener = fd;
     g_rp_current = rp;
+
+    if (g_rp_model == 3) {
+        /* M3: start the two global direction threads up front */
+        atomic_store(&g_rp3_stop, 0);
+        pthread_t tu, td;
+        if (pthread_create(&tu, NULL, rp3_dir_main, (void *)(intptr_t)1) != 0 ||
+            pthread_create(&td, NULL, rp3_dir_main, (void *)(intptr_t)0) != 0) {
+            atomic_store(&g_rp3_stop, 1);
+            log_err("relay proxy: M3 threads: %s", strerror(errno));
+            goto fail;
+        }
+        pthread_detach(tu);
+        pthread_detach(td);
+    }
+
     if (pthread_create(&rp->accept_th, NULL, rp_accept_main, rp) != 0) {
         port_close(fd);
         rp->listener = -1;
         goto fail;
     }
     pthread_detach(rp->accept_th);
-    log_info("SOCKS5+HTTP proxy on %s (follows TUN routes)", listen_str);
+    log_info("SOCKS5+HTTP proxy on %s (follows TUN routes, relay model %d)",
+             listen_str, g_rp_model);
     *out = rp;
     return 0;
 
@@ -570,6 +889,11 @@ void relay_proxy_stop(struct RelayProxy *rp)
     if (rp->listener >= 0) {
         port_close(rp->listener);
         rp->listener = -1;
+    }
+    if (g_rp_model == 3) {
+        /* the global direction threads observe stop on their next
+         * poll timeout (RP3_POLL_MS) */
+        atomic_store(&g_rp3_stop, 1);
     }
     /* detached accept thread exits on its next poll; in-flight relay
      * threads keep their own sockets until process exit. The struct is
