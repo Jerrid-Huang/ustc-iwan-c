@@ -447,6 +447,7 @@ static atomic_int g_rp_stop;
 atomic_uint_fast64_t g_prof_rp_up_recv, g_prof_rp_up_send;
 atomic_uint_fast64_t g_prof_rp_dn_recv, g_prof_rp_dn_send;
 atomic_uint_fast64_t g_prof_rp_pend;   /* bytes appended to pend */
+atomic_uint_fast64_t g_prof_rp_iters, g_prof_rp_poll0;   /* TEMP loop */
 
 static bool rp_arr_add(struct rp_conn ***arr, size_t *n, size_t *cap,
                         struct rp_conn *cn)
@@ -575,7 +576,10 @@ static void *rp_dir_main(void *ud)
     struct rp_conn ***arrp = up_dir ? &g_rp_up : &g_rp_dn;
     size_t *np = up_dir ? &g_rp_up_n : &g_rp_dn_n;
     struct pollfd *pf = NULL;
-    size_t pfcap = 0;
+    size_t pfcap = 0, pf_n = 0;
+    int *slot_from = NULL, *slot_to = NULL;
+    size_t slotcap = 0;
+    bool pf_dirty = true;
     struct rp_conn **snap = NULL;
     size_t snapcap = 0;
     uint8_t buf[RP_BUF];
@@ -604,24 +608,53 @@ static void *rp_dir_main(void *ud)
             pf = n2;
             pfcap = n * 2;
         }
-        size_t k = 0;
-        for (size_t i = 0; i < n; i++) {
-            struct rp_ent *e = up_dir ? &snap[i]->up : &snap[i]->dn;
-            if (!e->from_eof &&
-                e->plen + (size_t)RP_BUF <= RP_PEND_LIMIT) {
-                pf[k].fd = e->from;
-                pf[k].events = POLLIN;
-                pf[k].revents = 0;
-                k++;
-            }
-            if (e->plen > 0) {
-                pf[k].fd = e->to;
-                pf[k].events = POLLOUT;
-                pf[k].revents = 0;
-                k++;
-            }
+        if (n > slotcap) {
+            int *ns = realloc(slot_from, n * sizeof *ns);
+            if (!ns)
+                return NULL;
+            slot_from = ns;
+            ns = realloc(slot_to, n * sizeof *ns);
+            if (!ns)
+                return NULL;
+            slot_to = ns;
+            slotcap = n;
+            pf_dirty = true;
         }
-        int pr = port_poll(pf, k, RP_POLL_MS);
+        /* cached pollset: rebuild only when an entry's registration
+         * state changed (from_eof, pend crossing the cap, add/retire).
+         * slot_from[i]/slot_to[i] map entry i to its pollfd index, so
+         * the per-entry event lookup is O(1) instead of an O(n*k)
+         * fd scan on every loop iteration. */
+        if (pf_dirty) {
+            size_t k = 0;
+            for (size_t i = 0; i < n; i++) {
+                struct rp_ent *e = up_dir ? &snap[i]->up : &snap[i]->dn;
+                slot_from[i] = slot_to[i] = -1;
+                if (!e->from_eof &&
+                    e->plen + (size_t)RP_BUF <= RP_PEND_LIMIT) {
+                    pf[k].fd = e->from;
+                    pf[k].events = POLLIN;
+                    pf[k].revents = 0;
+                    slot_from[i] = (int)k;
+                    k++;
+                }
+                if (e->plen > 0) {
+                    pf[k].fd = e->to;
+                    pf[k].events = POLLOUT;
+                    pf[k].revents = 0;
+                    slot_to[i] = (int)k;
+                    k++;
+                }
+            }
+            pf_n = k;
+            pf_dirty = false;
+        }
+        int pr = port_poll(pf, pf_n, RP_POLL_MS);
+        if (atomic_load_explicit(&g_prof_on, memory_order_relaxed)) {
+            atomic_fetch_add(&g_prof_rp_iters, 1);
+            if (pr == 0)
+                atomic_fetch_add(&g_prof_rp_poll0, 1);
+        }
         if (pr < 0) {
             if (errno == EINTR)
                 continue;
@@ -633,17 +666,19 @@ static void *rp_dir_main(void *ud)
             prof_print(up_dir ? "rp up send" : "rp dn send", &pst2,
                        up_dir ? g_prof_rp_up_send : g_prof_rp_dn_send);
             prof_print("rp pend", &pst3, g_prof_rp_pend);
+            fprintf(stderr, "[prof] loop iters=%llu poll0=%llu "
+                    "n=%zu pfn=%zu dirty=%d\n",
+                    (unsigned long long)g_prof_rp_iters,
+                    (unsigned long long)g_prof_rp_poll0,
+                    n, pf_n, (int)pf_dirty);
         }
 
         for (size_t i = 0; i < n; i++) {
             struct rp_conn *cn = snap[i];
             struct rp_ent *e = up_dir ? &cn->up : &cn->dn;
-            bool in = false;
-            for (size_t j = 0; j < k; j++) {
-                if (pf[j].fd == e->from &&
-                    (pf[j].revents & (POLLIN | POLLHUP | POLLERR)))
-                    in = true;
-            }
+            bool in = slot_from[i] >= 0 &&
+                      (pf[slot_from[i]].revents &
+                       (POLLIN | POLLHUP | POLLERR));
             if (in && !e->from_eof &&
                 e->plen + (size_t)sizeof buf <= RP_PEND_LIMIT) {
                 for (;;) {
@@ -749,10 +784,25 @@ static void *rp_dir_main(void *ud)
                 rp_flush(e, up_dir);
         }
 
-        /* retire entries whose direction is finished: half-close the
-         * peer side, drop from this thread's array, release under the
-         * lock so the last release (which frees the conn) can never
-         * race the first release's atomic read */
+        /* registration-state check: pend/EOF changes alter which fds
+         * need POLLIN/POLLOUT, so a stale pollset would miss POLLOUT
+         * wakeups (or spin on an EOF fd). O(n) compare, rebuild only
+         * on change. */
+        if (!pf_dirty) {
+            for (size_t i = 0; i < n; i++) {
+                struct rp_ent *e = up_dir ? &snap[i]->up : &snap[i]->dn;
+                bool f_need = !e->from_eof &&
+                              e->plen + (size_t)RP_BUF <= RP_PEND_LIMIT;
+                bool t_need = e->plen > 0;
+                if (f_need != (slot_from[i] >= 0) ||
+                    t_need != (slot_to[i] >= 0)) {
+                    pf_dirty = true;
+                    break;
+                }
+            }
+        }
+        if (n != pf_n)
+            pf_dirty = true;   /* array changed: pollset is stale */
         pthread_mutex_lock(&g_rp_mu);
         for (size_t i = 0; i < n; i++) {
             struct rp_conn *cn = snap[i];
@@ -774,6 +824,8 @@ static void *rp_dir_main(void *ud)
     }
     free(pf);
     free(snap);
+    free(slot_from);
+    free(slot_to);
     return NULL;
 }
 

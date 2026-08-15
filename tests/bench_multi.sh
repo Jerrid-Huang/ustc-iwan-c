@@ -152,8 +152,11 @@ if [ "$PROXY_MODE" = 1 ]; then
     # the SYN; netns isolation is exactly what integration.sh mode 2
     # does for the same reason)
     # stale proxy clients from an aborted run would hold the listener
-    # port and the netns; the script runs as root so this reaches them
-    pkill -f 'bin/iwan-client proxy' 2>/dev/null || true
+    # port and the netns; the script runs as root so this reaches them.
+    # -9 and the [i] bracket (never match this script's own cmdline);
+    # strace-wrapped leftovers need the explicit -x strace kill too.
+    pkill -9 -f '[i]wan-client proxy' 2>/dev/null || true
+    pkill -9 -x strace 2>/dev/null || true
     ip netns del "$TUN_NS" 2>/dev/null || true
     ip netns add "$TUN_NS"
     ip link add veth0 type veth peer name veth1
