@@ -29,6 +29,7 @@
 #include "common.h"
 #include "crypto.h"
 #include "ipv4.h"
+#include "proto_parse.h"
 #include "tcpstack.h"
 #include "protocol.h"
 #include "socks_internal.h"
@@ -1199,188 +1200,17 @@ static void greet_reject(Flow *f)
     set_flow_state(f, ST_CLOSING);
 }
 
-/* ---- HTTP proxy fallback ----
- * Browsers and the Windows system proxy speak HTTP CONNECT (and
- * absolute-URI GET/POST) to a plain proxy port; the SOCKS5-only
- * handshake rejected them with greet_reject. Detect an HTTP method
- * line in the greeting buffer and switch the flow into HTTP mode.
- */
-
-/* Probe the buffered greeting for an HTTP method line. Returns 1 when
- * the buffer starts with a known method token followed by a space, -1
- * when the first byte could still begin a method but the token is
- * incomplete (wait for more data), 0 otherwise (not HTTP). */
-static int greeting_http_probe(const uint8_t *d, size_t n)
-{
-    static const char *const methods[] = {
-        "CONNECT", "GET", "POST", "HEAD", "PUT", "DELETE",
-        "OPTIONS", "TRACE", "PATCH",
-    };
-    static const size_t lens[] = {7, 3, 4, 4, 3, 6, 7, 5, 5};
-
-    if (n == 0)
-        return -1;
-    for (int i = 0; i < (int)(sizeof lens / sizeof lens[0]); i++) {
-        if (n >= lens[i] && memcmp(d, methods[i], lens[i]) == 0) {
-            if (n > lens[i] && d[lens[i]] == ' ')
-                return 1;
-            return n == lens[i] ? -1 : 0;   /* wait / wrong delimiter */
-        }
-    }
-    /* first byte could still start a method whose token is incomplete */
-    if (d[0] == 'C' || d[0] == 'O' || d[0] == 'D' ||
-        (n < 3 && (d[0] == 'G' || d[0] == 'P' || d[0] == 'T')) ||
-        (n < 4 && d[0] == 'H'))
-        return -1;
-    return 0;
-}
-
-/* Parse an HTTP request target: for CONNECT an authority "host:port",
- * for other methods an absolute URI "http://host[:port]/path". IPv4
- * literals return 1 (ip4 filled), domains return 0 (domain filled),
- * anything malformed returns -1. */
-static int http_parse_target(const char *s, size_t n, bool is_connect,
-                             uint32_t *ip4_out, uint8_t ip6_out[16],
-                             char *domain, size_t dsz, uint16_t *port_out)
-{
-    size_t i;
-    const char *host;
-    size_t hn;
-    uint16_t port = is_connect ? 443 : 80;
-
-    if (n == 0)
-        return -1;
-    if (!is_connect) {
-        /* strip scheme for absolute-URI requests */
-        if (n >= 7 && strncasecmp(s, "http://", 7) == 0) {
-            s += 7;
-            n -= 7;
-        } else if (n >= 8 && strncasecmp(s, "https://", 8) == 0) {
-            s += 8;
-            n -= 8;
-        }
-        if (n == 0)
-            return -1;
-        /* host part ends at '/', '?' or '#' */
-        for (i = 0; i < n; i++) {
-            char c = s[i];
-            if (c == '/' || c == '?' || c == '#') {
-                n = i;
-                break;
-            }
-        }
-    }
-    if (n == 0)
-        return -1;
-    /* CONNECT: the authority is followed by a space and the HTTP
-     * version (CONNECT host:443 HTTP/1.1); cut at the space too */
-    for (i = 0; i < n; i++) {
-        if (s[i] == ' ') {
-            n = i;
-            break;
-        }
-    }
-    if (n == 0)
-        return -1;
-    if (s[0] == '[') {
-        /* bracketed IPv6 literal: [addr]:port (RFC 7230 authority) */
-        size_t close = 0;
-        while (close < n && s[close] != ']')
-            close++;
-        if (close == n || close < 3 || close > 45)
-            return -1;          /* ] must exist, addr 3..45 chars */
-        size_t hn6 = close - 1;
-        char buf[48];
-        if (hn6 >= sizeof buf)
-            return -1;
-        memcpy(buf, s + 1, hn6);
-        buf[hn6] = 0;
-        if (inet_pton(AF_INET6, buf, ip6_out) != 1)
-            return -1;
-        if (close + 1 >= n) {
-            *port_out = port;
-            return 2;           /* no port: use the method default */
-        }
-        if (s[close + 1] != ':')
-            return -1;
-        {
-            size_t pn = n - (close + 2);
-            unsigned long v = 0;
-            if (pn == 0)
-                return -1;
-            for (i = 0; i < pn; i++) {
-                if (s[close + 2 + i] < '0' || s[close + 2 + i] > '9')
-                    return -1;
-                v = v * 10 + (unsigned long)(s[close + 2 + i] - '0');
-                if (v > 65535)
-                    return -1;
-            }
-            *port_out = (uint16_t)v;
-        }
-        return 2;
-    }
-    /* split host:port at the (single) colon */
-    {
-        const char *colon = NULL;
-        for (i = 0; i < n; i++) {
-            if (s[i] == ':') {
-                if (i == n - 1 || colon)
-                    return -1;
-                colon = s + i;
-            }
-        }
-        if (colon) {
-            const char *ps = colon + 1;
-            size_t pn = n - (size_t)(colon + 1 - s);
-            unsigned long v = 0;
-            for (i = 0; i < pn; i++) {
-                if (ps[i] < '0' || ps[i] > '9')
-                    return -1;
-                v = v * 10 + (unsigned long)(ps[i] - '0');
-                if (v > 65535)
-                    return -1;
-            }
-            if (pn == 0)
-                return -1;
-            port = (uint16_t)v;
-            host = s;
-            hn = (size_t)(colon - s);
-        } else {
-            host = s;
-            hn = n;
-        }
-    }
-    if (hn == 0 || hn > dsz - 1)
-        return -1;
-    /* host charset: letters, digits, '.', '-', '_' */
-    for (i = 0; i < hn; i++) {
-        char c = host[i];
-        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-              (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '_'))
-            return -1;
-    }
-    memcpy(domain, host, hn);
-    domain[hn] = 0;
-    *port_out = port;
-    if (inet_pton(AF_INET, domain, ip4_out) == 1)
-        return 1;               /* IPv4 literal */
-    return 0;                   /* domain: async tunnel DNS */
-}
-
 /* ST_GREETING + http_mode: parse the HTTP request header block. For
  * CONNECT the header is consumed (post-header bytes stay in f->input
  * as tunnel data); absolute-URI methods forward the entire request
- * verbatim, so nothing is consumed. */
+ * verbatim, so nothing is consumed. Target parsing is delegated to
+ * proto_parse.c (shared with the TUN-mode relay proxy). */
 static void http_handshake(Flow *f)
 {
     uint8_t *d = f->input.data;
     size_t n = f->input.len;
     size_t hdr, eol, mn, ts;
-    char domain[256];
-    uint32_t ip4 = 0;
-    uint8_t ip6[16];
-    uint16_t port;
-    int r;
+    pp_target t;
 
     /* header block ends at \r\n\r\n (real clients always send CRLF) */
     for (hdr = 3; hdr < n; hdr++) {
@@ -1402,16 +1232,17 @@ static void http_handshake(Flow *f)
         ;
     if (ts >= eol)
         goto bad;
-    r = http_parse_target((const char *)d + ts, eol - ts, f->http_connect,
-                          &ip4, ip6, domain, sizeof domain, &port);
-    if (r < 0)
+    if (pp_http_target((const char *)d + ts, eol - ts, f->http_connect,
+                       &t) != 0)
         goto bad;
     if (f->http_connect)
         buf_consume(&f->input, hdr);
-    if (r == 1) {
+    if (t.af == 4) {
         f->target_af = 4;
-        open_tcp_connection(f, ip4, port);
-    } else if (r == 2) {
+        /* pp stores ip4 in network byte order; the netstack wants
+         * host-order MSB-first */
+        open_tcp_connection(f, ntohl(t.ip4), t.port);
+    } else if (t.af == 6) {
         if (!socks_v6_ok()) {
             /* IPv4-only relay assumption (--socks-ipv6 off): an IPv6
              * literal target cannot be relayed; 502 in HTTP mode */
@@ -1419,11 +1250,11 @@ static void http_handshake(Flow *f)
             return;
         }
         f->target_af = 6;
-        open_tcp_connection6(f, ip6, port);
+        open_tcp_connection6(f, t.ip6, t.port);
     } else {
         f->target_af = 0;
         set_flow_state(f, ST_RESOLVING);
-        spawn_dns((int)f->id, domain, port);
+        spawn_dns((int)f->id, t.host, t.port);
     }
     return;
 bad:
@@ -1432,7 +1263,9 @@ bad:
 
 /* ST_GREETING: version/method negotiation plus the RFC1929 sub-
  * negotiation when a token is configured; returns true when a CONNECT
- * request may already be buffered and should be parsed this round */
+ * request may already be buffered and should be parsed this round.
+ * Frame parsing is delegated to proto_parse.c (shared with the
+ * TUN-mode relay proxy). */
 static bool handshake_greeting(Flow *f)
 {
     if (!f->auth_pending) {
@@ -1445,7 +1278,7 @@ static bool handshake_greeting(Flow *f)
          * cated HTTP traffic, and HTTP clients cannot do RFC1929). */
         if (f->input.data[0] != 5 &&
             (!g_socks_cfg || !g_socks_cfg->auth_token)) {
-            int pr = greeting_http_probe(f->input.data, f->input.len);
+            int pr = pp_http_probe(f->input.data, f->input.len);
             if (pr == 1) {
                 f->http_mode = true;
                 http_handshake(f);
@@ -1455,20 +1288,19 @@ static bool handshake_greeting(Flow *f)
                 return false;    /* incomplete method token: wait */
             /* not HTTP and not SOCKS5: reject below */
         }
-        size_t nmethods = f->input.data[1];
-        if (f->input.len < 2 + nmethods)
+        uint8_t method = 0;
+        if (f->input.data[0] != 5) {
+            greet_reject(f);     /* not HTTP and not SOCKS5 */
             return false;
-        int want = tok ? 2 : 0;   /* RFC1929 when a token is set */
-        int has = 0;
-        for (size_t i = 0; i < nmethods; i++) {
-            if (f->input.data[2 + i] == want)
-                has = 1;
         }
-        if (f->input.data[0] != 5 || !has) {
+        if (pp_socks_greeting(f->input.data, f->input.len, tok != NULL,
+                              &method) != 0)
+            return false;        /* incomplete greeting: wait */
+        if (method == 0xff) {
             greet_reject(f);
             return false;
         }
-        buf_consume(&f->input, 2 + nmethods);
+        buf_consume(&f->input, 2 + (size_t)f->input.data[1]);
         if (tok) {
             uint8_t ok[2] = {5, 2};
             queue_flow_output(f, ok, 2);
@@ -1489,45 +1321,27 @@ static bool handshake_greeting(Flow *f)
      * partial frame waits for the next read. Zero-length fields, a
      * wrong version, or a complete frame that fails the check are
      * rejected. */
-    if (f->input.len < 2)
-        return false;              /* ulen not delivered yet: wait */
     char ipbuf[INET_ADDRSTRLEN] = "";
-    size_t ulen = f->input.data[1];
-    if (ulen == 0) {
+    char user[64];
+    const uint8_t *pass;
+    size_t plen;
+    int pr = pp_socks_auth_frame(f->input.data, f->input.len, user,
+                                 sizeof user, &pass, &plen);
+    if (pr < 0)
+        return false;              /* frame incomplete: wait */
+    if (pr == 0) {
         inet_ntop(AF_INET, &(struct in_addr){ .s_addr = f->peer_ip },
                   ipbuf, sizeof ipbuf);
-        log_debug("[flow %lu] RFC1929 auth frame malformed (ulen=0) "
-                  "from %s:%u", (unsigned long)f->id, ipbuf, f->peer_port);
-        auth_reject(f);            /* complete header, invalid length */
-        return false;
-    }
-    if (f->input.len < 2 + ulen + 1)
-        return false;              /* plen byte not delivered yet: wait */
-    size_t plen = f->input.data[2 + ulen];
-    if (plen == 0) {
-        inet_ntop(AF_INET, &(struct in_addr){ .s_addr = f->peer_ip },
-                  ipbuf, sizeof ipbuf);
-        log_debug("[flow %lu] RFC1929 auth frame malformed (plen=0) "
-                  "from %s:%u", (unsigned long)f->id, ipbuf, f->peer_port);
-        auth_reject(f);            /* complete frame, invalid length */
-        return false;
-    }
-    if (f->input.len < 2 + ulen + 1 + plen)
-        return false;              /* password not fully delivered: wait */
-    if (f->input.data[0] != 1) {
-        inet_ntop(AF_INET, &(struct in_addr){ .s_addr = f->peer_ip },
-                  ipbuf, sizeof ipbuf);
-        log_debug("[flow %lu] RFC1929 auth frame malformed (bad version) "
+        log_debug("[flow %lu] RFC1929 auth frame malformed "
                   "from %s:%u", (unsigned long)f->id, ipbuf, f->peer_port);
         auth_reject(f);
         return false;
     }
     const char *tok = g_socks_cfg ? g_socks_cfg->auth_token : NULL;
     size_t tlen = tok ? strlen(tok) : 0;
-    const uint8_t *pass = f->input.data + 2 + ulen + 1;
     int ok = tok && plen == tlen &&
              ct_eq(pass, (const uint8_t *)tok, tlen);
-    buf_consume(&f->input, 2 + ulen + 1 + plen);
+    buf_consume(&f->input, 2 + (size_t)f->input.data[1] + 1 + plen);
     f->auth_pending = false;
     if (!ok) {
         /* well-formed frame, wrong password: counts toward the source's
@@ -1548,48 +1362,36 @@ static bool handshake_greeting(Flow *f)
     return true;
 }
 
-/* ST_REQUEST: parse the CONNECT frame (IPv4 or domain); domains go
- * through the async tunnel-DNS path */
+/* ST_REQUEST: parse the CONNECT frame (IPv4, IPv6 or domain); domains
+ * go through the async tunnel-DNS path. Frame parsing is delegated to
+ * proto_parse.c (shared with the TUN-mode relay proxy). */
 static void handshake_request(Flow *f)
 {
-    if (f->input.len < 4)
-        return;
-    /* RFC 1928: the request header is [VER, CMD, RSV, ATYP]; VER must
-     * be 5 (any other version is a general failure, rep=1) */
-    if (f->input.data[0] != 5) {
-        queue_socks_error(f, 1);
-        return;
-    }
-    /* RFC 1928: only CONNECT(1) is implemented; other commands (BIND=2,
-     * UDP ASSOCIATE=3) are rejected with rep=7 (command not supported) */
-    if (f->input.data[1] != 1) {
-        queue_socks_error(f, 7);
-        return;
-    }
-    /* RFC 1928: RSV must be zero; a nonzero reserved byte is a malformed
-     * frame and gets the same rep=7 as an unsupported command */
-    if (f->input.data[2] != 0) {
-        queue_socks_error(f, 7);
-        return;
-    }
-    uint8_t atyp = f->input.data[3];
-    switch (atyp) {
-    case 1: { /* IPv4 */
-        if (f->input.len < 10)
+    uint8_t cmd, rep;
+    pp_target t;
+
+    if (pp_socks_request(f->input.data, f->input.len, &cmd, &rep, &t) != 0)
+        return;                  /* frame incomplete: wait */
+    if (rep != 0) {
+        if (f->input.data[0] != 5) {
+            /* RFC 1928: VER must be 5 (general failure) */
+            queue_socks_error(f, 1);
             return;
-        uint32_t rip =
-            ((uint32_t)f->input.data[4] << 24) |
-            ((uint32_t)f->input.data[5] << 16) |
-            ((uint32_t)f->input.data[6] << 8) | f->input.data[7];
-        uint16_t rport = (uint16_t)((f->input.data[8] << 8) | f->input.data[9]);
+        }
+        /* unsupported command / bad RSV -> rep 7; unsupported or
+         * empty address type -> rep 8 */
+        queue_socks_error(f, rep);
+        return;
+    }
+    if (t.af == 4) {
         buf_consume(&f->input, 10);
         f->target_af = 4;
-        open_tcp_connection(f, rip, rport);
+        /* pp stores ip4 in network byte order; the netstack wants
+         * host-order MSB-first */
+        open_tcp_connection(f, ntohl(t.ip4), t.port);
         return;
     }
-    case 4: { /* IPv6 (RFC 1928) */
-        if (f->input.len < 22)
-            return;
+    if (t.af == 6) {
         if (!socks_v6_ok()) {
             /* default: the server is assumed to be IPv4-only — an
              * ATYP=4 target cannot be relayed, so reject it like any
@@ -1599,19 +1401,14 @@ static void handshake_request(Flow *f)
             queue_socks_error(f, 8);
             return;
         }
-        uint8_t rip6[16];
-        memcpy(rip6, f->input.data + 4, 16);
-        uint16_t rport = (uint16_t)((f->input.data[20] << 8) |
-                                    f->input.data[21]);
         buf_consume(&f->input, 22);
         f->target_af = 6;
-        open_tcp_connection6(f, rip6, rport);
+        open_tcp_connection6(f, t.ip6, t.port);
         return;
     }
-    case 3: { /* domain */
-        if (f->input.len < 5)
-            return;
-        size_t dlen = f->input.data[4];
+    /* domain */
+    {
+        size_t dlen = (size_t)f->input.data[4];
         size_t req_len = 5 + dlen + 2;
         if (dlen == 0) {
             /* RFC 1928: a zero-length domain is an address-type error
@@ -1622,24 +1419,10 @@ static void handshake_request(Flow *f)
             queue_socks_error(f, 8);
             return;
         }
-        if (f->input.len < req_len)
-            return;
-        char domain[256];
-        size_t n = dlen;
-        if (n > sizeof domain - 1)
-            n = sizeof domain - 1;
-        memcpy(domain, f->input.data + 5, n);
-        domain[n] = 0;
-        uint16_t rport = (uint16_t)((f->input.data[5 + dlen] << 8) |
-                                    f->input.data[6 + dlen]);
         buf_consume(&f->input, req_len);
         f->target_af = 0;   /* domain: family decided by the DNS result */
         set_flow_state(f, ST_RESOLVING);
-        spawn_dns((int)f->id, domain, rport);
-        return;
-    }
-    default:
-        queue_socks_error(f, 8);
+        spawn_dns((int)f->id, t.host, t.port);
         return;
     }
 }

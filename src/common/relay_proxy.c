@@ -36,6 +36,7 @@
 #include "common.h"
 #include "crypto.h"
 #include "port.h"
+#include "proto_parse.h"
 #include "relay_proxy.h"
 #include "util.h"
 
@@ -194,190 +195,116 @@ static void rp_socks_reply(int fd, uint8_t rep)
     (void)port_send(fd, r, sizeof r, 0);
 }
 
-/* returns 0 on success with the upstream connected; -1 on failure */
+/* returns 0 on success with the upstream connected; -1 on failure.
+ * Frame parsing (greeting / RFC1929 / CONNECT) is delegated to
+ * proto_parse.c — the same parsers as SOCKS mode. */
 static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
                            const char *token)
 {
-    uint8_t b[300];
-    size_t n;
-    uint8_t nmeth, atyp, rep;
-    uint16_t port;
-    bool have4 = false, have6 = false;
-    uint8_t ip4[4], ip6[16];
-    char host[256];
+    uint8_t b[512];
+    size_t n = first_n;
+    pp_target t;
+    uint8_t method = 0, cmd = 0, rep = 0;
 
-    /* greeting: [5, nmethods, methods...] */
-    if (first_n < 2)
+    if (n < 2)
         return -1;
-    nmeth = first[1];
-    if (first_n < 2 + (size_t)nmeth) {
-        /* greeting may span reads: read the rest */
-        n = first_n;
-        memcpy(b, first, n);
-        if (!rp_read_full(fd, b + n, 2 + (size_t)nmeth - n))
+    memcpy(b, first, n);
+    if (pp_socks_greeting(b, n, token != NULL, &method) != 0) {
+        /* greeting may span reads: [5, nmethods, methods...] */
+        size_t want = 2 + (size_t)b[1];
+        if (want > sizeof b || !rp_read_full(fd, b + n, want - n))
             return -1;
-        n = 2 + (size_t)nmeth;
-    } else {
-        n = first_n;
-        memcpy(b, first, n);
+        n = want;
+        if (pp_socks_greeting(b, n, token != NULL, &method) != 0)
+            return -1;
     }
-    int want = token ? 2 : 0;
-    bool has = false;
-    for (size_t i = 0; i < nmeth; i++)
-        if (b[2 + i] == want)
-            has = true;
-    if (!has) {
+    if (method == 0xff) {
         uint8_t no[2] = {5, 0xff};
         (void)port_send(fd, no, 2, 0);
         return -1;
+    }
+    /* consume the greeting so a pipelined CONNECT frame is aligned */
+    {
+        size_t g = 2 + (size_t)b[1];
+        memmove(b, b + g, n - g);
+        n -= g;
     }
     if (token) {
         uint8_t ok[2] = {5, 2};
         (void)port_send(fd, ok, 2, 0);
         /* RFC1929: [1, ulen, user..., plen, pass...] */
-        uint8_t au[2];
-        if (!rp_read_full(fd, au, 2) || au[0] != 1 || au[1] == 0)
-            return -1;
-        size_t ulen = au[1];
-        uint8_t ab[256];
-        if (!rp_read_full(fd, ab, ulen + 1))
-            return -1;
-        size_t plen = ab[ulen];
-        if (plen == 0)
-            return -1;
-        uint8_t pb[256];
-        if (!rp_read_full(fd, pb, plen))
-            return -1;
-        size_t tlen = strlen(token);
-        uint8_t rr[2] = {1, 0};
-        if (plen != tlen || rp_ct_eq(pb, (const uint8_t *)token, tlen) == 0)
-            rr[1] = 1;
-        (void)port_send(fd, rr, 2, 0);
-        if (rr[1] != 0)
-            return -1;
+        char user[64];
+        const uint8_t *pass;
+        size_t plen;
+        for (;;) {
+            int pr = pp_socks_auth_frame(b, n, user, sizeof user,
+                                         &pass, &plen);
+            if (pr > 0) {
+                size_t tlen = strlen(token);
+                uint8_t rr[2] = {1, 0};
+                if (plen != tlen ||
+                    rp_ct_eq(pass, (const uint8_t *)token, tlen) == 0)
+                    rr[1] = 1;
+                (void)port_send(fd, rr, 2, 0);
+                if (rr[1] != 0)
+                    return -1;
+                /* consume the auth frame */
+                {
+                    size_t flen = 2 + (size_t)b[1] + 1 + plen;
+                    memmove(b, b + flen, n - flen);
+                    n -= flen;
+                }
+                break;
+            }
+            if (pr == 0)
+                return -1;      /* complete but malformed */
+            if (n >= sizeof b)
+                return -1;
+            {
+                ssize_t r = port_recv(fd, b + n, sizeof b - n, 0);
+                if (r <= 0)
+                    return -1;
+                n += (size_t)r;
+            }
+        }
     } else {
         uint8_t ok[2] = {5, 0};
         (void)port_send(fd, ok, 2, 0);
     }
 
-    /* CONNECT request: [5, CMD, RSV, ATYP, addr..., port] */
-    uint8_t rh[4];
-    if (!rp_read_full(fd, rh, 4) || rh[0] != 5)
-        return -1;
-    if (rh[1] != 1) {           /* only CONNECT */
-        rp_socks_reply(fd, 7);
-        return -1;
+    /* CONNECT request [5, CMD, RSV, ATYP, addr..., port] */
+    for (;;) {
+        if (pp_socks_request(b, n, &cmd, &rep, &t) == 0)
+            break;
+        if (n >= sizeof b)
+            return -1;
+        {
+            ssize_t r = port_recv(fd, b + n, sizeof b - n, 0);
+            if (r <= 0)
+                return -1;
+            n += (size_t)r;
+        }
     }
-    atyp = rh[3];
-    if (atyp == 1) {
-        if (!rp_read_full(fd, ip4, 4))
-            return -1;
-        have4 = true;
-    } else if (atyp == 4) {
-        if (!rp_read_full(fd, ip6, 16))
-            return -1;
-        have6 = true;
-    } else if (atyp == 3) {
-        uint8_t l;
-        /* l is a u8 (<=255) and host[] holds 255 + NUL: l==0 is the
-         * only invalid length */
-        if (!rp_read_full(fd, &l, 1) || l == 0)
-            return -1;
-        if (!rp_read_full(fd, (uint8_t *)host, l))
-            return -1;
-        host[l] = 0;
-    } else {
-        rp_socks_reply(fd, 8);
+    if (rep != 0) {
+        rp_socks_reply(fd, rep);
         return -1;
     }
     {
-        uint8_t pb[2];
-        if (!rp_read_full(fd, pb, 2))
-            return -1;
-        port = (uint16_t)((pb[0] << 8) | pb[1]);
-    }
-
-    int up = -1;
-    rep = 5;
-    if (rp_connect_target(&up, host, port, have4, ip4, have6, ip6) == 0) {
-        rep = 0;
+        int up = -1;
+        rep = 5;
+        if (rp_connect_target(&up, t.host, t.port, t.af == 4,
+                              (const uint8_t *)&t.ip4, t.af == 6,
+                              t.ip6) == 0) {
+            rep = 0;
+            rp_socks_reply(fd, rep);
+            return up;           /* caller relays on fd <-> up */
+        }
         rp_socks_reply(fd, rep);
-        return up;               /* caller relays on fd <-> up */
+        return -1;
     }
-    rp_socks_reply(fd, rep);
-    return -1;
 }
 
 /* ---- HTTP ---- */
-
-/* parse "host[:port]" (CONNECT authority or absolute-URI host part);
- * bracketed IPv6 supported. Returns 0 on success. */
-static int rp_http_host(const char *s, size_t n, uint16_t defport,
-                        char *host, size_t hsz, uint16_t *port_out,
-                        bool *have4, uint8_t ip4[4], bool *have6,
-                        uint8_t ip6[16])
-{
-    size_t i;
-    uint16_t port = defport;
-
-    /* cut authority at '/' '?' '#' (absolute URI) or ' ' (CONNECT) */
-    for (i = 0; i < n; i++) {
-        char c = s[i];
-        if (c == '/' || c == '?' || c == '#' || c == ' ')
-            break;
-    }
-    n = i;
-    if (n == 0)
-        return -1;
-    if (s[0] == '[') {
-        size_t close = 0;
-        while (close < n && s[close] != ']')
-            close++;
-        if (close == n || close < 3)
-            return -1;
-        char b6[48];
-        size_t hn6 = close - 1;
-        if (hn6 >= sizeof b6)
-            return -1;
-        memcpy(b6, s + 1, hn6);
-        b6[hn6] = 0;
-        if (inet_pton(AF_INET6, b6, ip6) != 1)
-            return -1;
-        *have6 = true;
-        if (close + 1 < n) {
-            if (s[close + 1] != ':')
-                return -1;
-            port = (uint16_t)strtoul(s + close + 2, NULL, 10);
-            if (port == 0)
-                return -1;
-        }
-    } else {
-        /* host[:port]; the host may be an IPv4 literal */
-        size_t colon = n;
-        for (i = 0; i < n; i++) {
-            if (s[i] == ':') {
-                colon = i;
-                break;
-            }
-        }
-        size_t hn = colon;
-        if (hn == 0 || hn > hsz - 1)
-            return -1;
-        memcpy(host, s, hn);
-        host[hn] = 0;
-        if (colon + 1 < n) {
-            port = (uint16_t)strtoul(s + colon + 1, NULL, 10);
-            if (port == 0)
-                return -1;
-        }
-        if (inet_pton(AF_INET, host, ip4) == 1) {
-            *have4 = true;
-            host[0] = 0;
-        }
-    }
-    *port_out = port;
-    return 0;
-}
 
 /* returns the connected upstream fd, or -1 */
 static int rp_handle_http(int fd, const uint8_t *first, size_t first_n)
@@ -435,28 +362,16 @@ static int rp_handle_http(int fd, const uint8_t *first, size_t first_n)
     if (tlen == 0)
         return -1;
 
-    char host[256];
-    uint16_t port;
-    bool have4 = false, have6 = false;
-    uint8_t ip4[4], ip6[16];
-    if (!is_connect) {
-        /* absolute URI: strip scheme */
-        if (tlen >= 7 && port_strncasecmp(tgt, "http://", 7) == 0) {
-            tgt += 7;
-            tlen -= 7;
-        } else if (tlen >= 8 && port_strncasecmp(tgt, "https://", 8) == 0) {
-            tgt += 8;
-            tlen -= 8;
-        } else {
-            return -1;   /* origin-form without CONNECT: cannot route */
-        }
-    }
-    if (rp_http_host(tgt, tlen, is_connect ? 443 : 80, host, sizeof host,
-                     &port, &have4, ip4, &have6, ip6) != 0)
+    /* target parsing (CONNECT authority / absolute URI with scheme
+     * stripped) is shared with SOCKS mode via proto_parse.c */
+    pp_target t;
+    if (pp_http_target(tgt, tlen, is_connect, &t) != 0)
         return -1;
 
     int up = -1;
-    if (rp_connect_target(&up, host, port, have4, ip4, have6, ip6) != 0) {
+    if (rp_connect_target(&up, t.host, t.port, t.af == 4,
+                          (const uint8_t *)&t.ip4, t.af == 6,
+                          t.ip6) != 0) {
         static const char bad[] = "HTTP/1.1 502 Bad Gateway\r\n\r\n";
         (void)port_send(fd, bad, sizeof bad - 1, 0);
         return -1;

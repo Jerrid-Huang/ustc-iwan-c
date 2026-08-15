@@ -130,6 +130,7 @@ set(IWAN_CORE_SRCS
   src/common/json.c
   src/common/port.c
   src/common/protocol.c
+  src/common/proto_parse.c
   src/common/proxy.c
   src/common/relay_proxy.c
   src/common/route.c
