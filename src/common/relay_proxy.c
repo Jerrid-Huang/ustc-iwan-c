@@ -635,18 +635,20 @@ static void *rp_dir_main(void *ud)
         for (size_t i = 0; i < n; i++) {
             struct rp_conn *cn = snap[i];
             struct rp_ent *e = up_dir ? &cn->up : &cn->dn;
-            bool in = false, out = false;
+            bool in = false;
             for (size_t j = 0; j < k; j++) {
                 if (pf[j].fd == e->from &&
                     (pf[j].revents & (POLLIN | POLLHUP | POLLERR)))
                     in = true;
-                if (pf[j].fd == e->to &&
-                    (pf[j].revents & (POLLOUT | POLLERR)))
-                    out = true;
             }
             if (in && !e->from_eof &&
                 e->plen + (size_t)sizeof buf <= RP_PEND_LIMIT) {
                 for (;;) {
+                    /* per-pass check: the loop reads multiple chunks;
+                     * stop BEFORE a read that could not fit in pend
+                     * (data would have nowhere to go) */
+                    if (e->plen + (size_t)sizeof buf > RP_PEND_LIMIT)
+                        break;
                     ssize_t r = port_recv(e->from, buf, sizeof buf, 0);
                     if (r > 0) {
                         if (atomic_load_explicit(&g_prof_on,
@@ -700,11 +702,12 @@ static void *rp_dir_main(void *ud)
                                     e->from_eof = true;
                                     break;
                                 }
-                                /* `to` is congested: stop reading this
-                                 * pass — the rest stays in the kernel
-                                 * buffer (backpressure), pend is
-                                 * bounded, POLLOUT will flush it */
-                                break;
+                                /* `to` is congested: the remainder
+                                 * goes to pend (bounded by the cap
+                                 * check) and we keep reading — one
+                                 * pass drains the kernel buffer, so
+                                 * the read rate no longer depends on
+                                 * the poll round frequency */
                             }
                         } else {
                             /* backlog: append in order, flush on
@@ -718,7 +721,6 @@ static void *rp_dir_main(void *ud)
                                 e->from_eof = true;
                                 break;
                             }
-                            break;
                         }
                         continue;
                     }
@@ -734,9 +736,14 @@ static void *rp_dir_main(void *ud)
                     break;
                 }
             }
-            if (out) {
+            /* rhythm optimization: flush pending data immediately
+             * after the drain instead of waiting for the next poll
+             * round's POLLOUT event — one poll round-trip saved per
+             * chunk whenever the peer is congested (the POLLOUT
+             * registration stays as the retry path for a still-full
+             * peer). */
+            if (e->plen > 0)
                 rp_flush(e, up_dir);
-            }
         }
 
         /* retire entries whose direction is finished: half-close the
