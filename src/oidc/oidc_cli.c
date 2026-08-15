@@ -56,7 +56,6 @@ static void print_help_short(void)
         "      --ustc                         Route USTC campus networks through the tunnel (shortcut for the usual --proxy-cidr list)\n"
         "      --proxy-ip <PROXY_IP>          IPv4 addresses to route through the tunnel. Can be repeated or comma-separated\n"
         "      --proxy-domain <PROXY_DOMAIN>  Domains to resolve and route through the tunnel. Can be repeated or comma-separated\n"
-        "      --encrypt <ENCRYPT>            Encryption method: 0=None, 1=XOR [default: 1]\n"
         "      --socks                        Use a rootless userspace SOCKS5 proxy instead of a TUN device\n"
         "      --socks-listen <SOCKS_LISTEN>  SOCKS5 proxy address (TUN mode: adds a SOCKS5+HTTP proxy following the TUN routes) [default: 127.0.0.1:1080]\n"
         "      --socks-mtu <SOCKS_MTU>        Maximum userspace inner IP MTU [default: 1380]\n"
@@ -117,11 +116,6 @@ static void print_help_long(void)
         "\n"
         "      --proxy-domain <PROXY_DOMAIN>\n"
         "          Domains to resolve and route through the tunnel. Can be repeated or comma-separated\n"
-        "\n"
-        "      --encrypt <ENCRYPT>\n"
-        "          Encryption method: 0=None, 1=XOR\n"
-        "          \n"
-        "          [default: 1]\n"
         "\n"
         "      --socks\n"
         "          Use a rootless userspace SOCKS5 proxy instead of a TUN device\n"
@@ -236,7 +230,6 @@ void oidc_parse_cli(int argc, char **argv, Opts *o, Cli *usage)
         { "proxy-ip",     CLI_OPT_CSV,  &o->proxy_ip,      "<PROXY_IP>",     NULL },
         { "proxy-domain", CLI_OPT_CSV,  &o->proxy_domain,  "<PROXY_DOMAIN>", NULL },
         { "proxy-cidr6",  CLI_OPT_CSV,  &o->proxy_cidr6,   "<PROXY_CIDR6>",  NULL },
-        { "encrypt",      CLI_OPT_U8,   &o->encrypt,       "<ENCRYPT>",      NULL },
         { "socks",        CLI_OPT_BOOL, &o->socks,         NULL,             NULL },
         { "socks-listen", CLI_OPT_STR,  &o->socks_listen,  "<SOCKS_LISTEN>", valid_listen },
         { "socks-mtu",    CLI_OPT_U16,  &o->socks_mtu,     "<SOCKS_MTU>",    NULL },

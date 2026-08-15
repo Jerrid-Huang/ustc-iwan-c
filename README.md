@@ -38,9 +38,8 @@ Usage: iwan-client-oidc [OPTIONS] --fetch | --list | --connect | --all
 | `--server <NAME\|HOST:PORT>` | 跳过线路选择，直接连接指定线路（配置名或地址） |
 | `--config-dir <DIR>` | 配置目录（默认 `~/.config/iwan`；Windows：`%USERPROFILE%\.config\iwan`） |
 | `--tun <TUN>` | TUN 设备名（默认 `iwan0`） |
-| `--encrypt <0\|1>` | 隧道加密开关（默认 `1`） |
-| `--socks` | 改用 SOCKS5 模式（免 root，无需 TUN 设备） |
-| `--socks-listen <ADDR:PORT>` | SOCKS5 / HTTP 代理监听地址（SOCKS 模式默认 `127.0.0.1:1080`） |
+| `--socks` | 改用纯 SOCKS5 模式（免 root，无需 TUN 设备） |
+| `--socks-listen <ADDR:PORT>` | SOCKS 模式：代理监听地址（默认 `127.0.0.1:1080`）；**TUN 模式：可选附加** SOCKS5+HTTP 代理（默认不启用） |
 | `--socks-mtu <MTU>` | SOCKS 模式下内层 TCP 的 MSS/MTU（默认 `1380`） |
 | `--socks-token <TOKEN>` | SOCKS5 RFC1929 密码认证（与 `--socks-no-token` 互斥） |
 | `--socks-no-token` | 显式允许无密码代理（配合 `--allow-remote`） |
@@ -86,7 +85,6 @@ sudo ./iwan-client-oidc --all
 | `--pass <PASS>` | 密码（与 `--pass-file` 二选一） |
 | `--pass-file <FILE>` | 从文件读密码（避免命令行泄露） |
 | `--ct-pass <PASS>` / `--ct-pass-file <FILE>` | 校内统一认证的"密保口令"（USTC 场景） |
-| `--encrypt <0\|1>` | 隧道加密开关（默认 `1`） |
 | `--mtu <MTU>` | 内层 TCP 的 MSS/MTU（默认 `1380`；`proxy` 模式使用 TUN 设备 MTU） |
 
 ### proxy（TUN 模式，需要 root）
@@ -94,6 +92,8 @@ sudo ./iwan-client-oidc --all
 ```
 Usage: iwan-client proxy [OPTIONS] --server <SERVER>
 ```
+
+**默认：纯 TUN 隧道**（本机路由走隧道的流量被转发，不提供任何本地代理端口）。仅当指定 `--listen` 时才**附加**一个 SOCKS5+HTTP 代理。
 
 公共认证参数 +：
 
@@ -104,7 +104,7 @@ Usage: iwan-client proxy [OPTIONS] --server <SERVER>
 | `--proxy-ip <IP>` | 走隧道的 IPv4 地址（可重复） |
 | `--proxy-domain <DOMAIN>` | 走隧道的域名（可重复，含子域） |
 | `--proxy-cidr6 <CIDR6\|IP6\|DOMAIN>` | 走隧道的 IPv6 条目（可重复） |
-| `--listen <ADDR:PORT>` | **同时开启本地 SOCKS5 + HTTP 代理**（内核栈转发，走 TUN 路由） |
+| `--listen <ADDR:PORT>` | **可选**：附加本地 SOCKS5 + HTTP 代理（默认不启用；内核栈转发，走 TUN 路由） |
 | `--socks-token <TOKEN>` | 代理的 RFC1929 密码认证（与 `--socks-no-token` 互斥） |
 | `--socks-no-token` | 显式允许无密码代理（配合 `--allow-remote`） |
 | `--allow-remote` | 允许监听非回环地址（默认仅 127.0.0.1） |

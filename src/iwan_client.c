@@ -43,7 +43,6 @@ typedef struct {
     const char *ct_pass;
     const char *pass_file;
     const char *ct_pass_file;
-    uint8_t     encrypt;
     uint16_t    mtu;
     const char *tun;
     slist_t     proxy_cidr;
@@ -144,7 +143,6 @@ static void print_sub_help(const char *sub)
             "      --pass-file <PASS_FILE>      \n"
             "      --ct-pass <CT_PASS>  \n"
             "      --ct-pass-file <CT_PASS_FILE>\n"
-            "      --encrypt <ENCRYPT>  [default: 1]\n"
             "      --mtu <MTU>          [default: 1400]\n"
             "  -h, --help               Print help\n");
     } else if (strcmp(sub, "proxy") == 0) {
@@ -161,7 +159,6 @@ static void print_sub_help(const char *sub)
             "      --pass-file <PASS_FILE>        \n"
             "      --ct-pass <CT_PASS>            \n"
             "      --ct-pass-file <CT_PASS_FILE>  \n"
-            "      --encrypt <ENCRYPT>            [default: 1]\n"
             "      --mtu <MTU>                    [default: 1400]\n"
             "      --tun <TUN>                    [default: iwan0]\n"
             "      --proxy-cidr <PROXY_CIDR>      \n"
@@ -187,7 +184,6 @@ static void print_sub_help(const char *sub)
             "      --pass-file <PASS_FILE>      \n"
             "      --ct-pass <CT_PASS>  \n"
             "      --ct-pass-file <CT_PASS_FILE>\n"
-            "      --encrypt <ENCRYPT>  [default: 1]\n"
             "      --mtu <MTU>          [default: 1380]\n"
             "      --listen <LISTEN>    Local SOCKS5 listen address [default: 127.0.0.1:1080]\n"
             "      --socks-token <TOKEN>\n"
@@ -491,9 +487,7 @@ static void add_auth_opts(cli_opt *opts, CmdOpts *o)
                          "<CT_PASS>", NULL };
     opts[6] = (cli_opt){ "ct-pass-file", CLI_OPT_STR, &o->ct_pass_file,
                          "<CT_PASS_FILE>", NULL };
-    opts[7] = (cli_opt){ "encrypt",      CLI_OPT_U8,  &o->encrypt,
-                         "<ENCRYPT>", NULL };
-    opts[8] = (cli_opt){ "mtu",          CLI_OPT_U16, &o->mtu,
+    opts[7] = (cli_opt){ "mtu",          CLI_OPT_U16, &o->mtu,
                          "<MTU>", NULL };
 }
 
@@ -532,7 +526,7 @@ static int authenticate(const CmdOpts *o, int style, AuthResult *res)
     uint32_t nonce = rand_u32();
     buf_t open;
     buf_init(&open);
-    if (build_open(&open, o->user, ct, o->mtu, o->encrypt, nonce) != 0) {
+    if (build_open(&open, o->user, ct, o->mtu, 1, nonce) != 0) {
         buf_free(&open);
         fprintf(stderr, "Error: username too long (max %d bytes)\n",
                 IWAN_TLV_VLEN_MAX);
@@ -720,7 +714,6 @@ static int cmd_auth(int argc, char **argv, int start)
     memset(&o, 0, sizeof o);
     o.port = 6001;
     o.user = "_rev_m_1";
-    o.encrypt = 1;
     o.mtu = IWAN_DEFAULT_MTU;
     cli_opt opts[9];
 
@@ -745,7 +738,7 @@ static int cmd_auth(int argc, char **argv, int start)
 
     buf_t cl;
     buf_init(&cl);
-    ctrl_hdr(&cl, PT_CLOSE, o.encrypt, res.sid, res.tok);
+    ctrl_hdr(&cl, PT_CLOSE, 1, res.sid, res.tok);
     (void)port_send(fd, cl.data, cl.len, 0);
     log_info("-> CLOSE");
     buf_free(&cl);
@@ -759,29 +752,28 @@ static int cmd_proxy(int argc, char **argv, int start)
     memset(&o, 0, sizeof o);
     o.port = 6001;
     o.user = "_rev_m_1";
-    o.encrypt = 1;
     o.mtu = IWAN_DEFAULT_MTU;
     o.tun = "iwan0";
-    cli_opt opts[18];
+    cli_opt opts[17];
 
     add_auth_opts(opts, &o);
-    opts[9] = (cli_opt){ "tun",          CLI_OPT_STR, &o.tun,
+    opts[8] = (cli_opt){ "tun",          CLI_OPT_STR, &o.tun,
                          "<TUN>", NULL };
-    opts[10] = (cli_opt){ "proxy-cidr",  CLI_OPT_CSV, &o.proxy_cidr,
-                          "<PROXY_CIDR>", NULL };
-    opts[11] = (cli_opt){ "proxy-ip",    CLI_OPT_CSV, &o.proxy_ip,
+    opts[9] = (cli_opt){ "proxy-cidr",  CLI_OPT_CSV, &o.proxy_cidr,
+                         "<PROXY_CIDR>", NULL };
+    opts[10] = (cli_opt){ "proxy-ip",    CLI_OPT_CSV, &o.proxy_ip,
                           "<PROXY_IP>", NULL };
-    opts[12] = (cli_opt){ "proxy-domain", CLI_OPT_CSV, &o.proxy_domain,
+    opts[11] = (cli_opt){ "proxy-domain", CLI_OPT_CSV, &o.proxy_domain,
                           "<PROXY_DOMAIN>", NULL };
-    opts[13] = (cli_opt){ "proxy-cidr6", CLI_OPT_CSV, &o.proxy_cidr6,
+    opts[12] = (cli_opt){ "proxy-cidr6", CLI_OPT_CSV, &o.proxy_cidr6,
                           "<PROXY_CIDR6>", NULL };
-    opts[14] = (cli_opt){ "listen",      CLI_OPT_STR, &o.listen_str,
+    opts[13] = (cli_opt){ "listen",      CLI_OPT_STR, &o.listen_str,
                           "<LISTEN>", valid_listen };
-    opts[15] = (cli_opt){ "socks-token", CLI_OPT_STR, &o.socks_token,
+    opts[14] = (cli_opt){ "socks-token", CLI_OPT_STR, &o.socks_token,
                           "<TOKEN>", validate_token_len };
-    opts[16] = (cli_opt){ "socks-no-token", CLI_OPT_BOOL, &o.socks_no_token,
+    opts[15] = (cli_opt){ "socks-no-token", CLI_OPT_BOOL, &o.socks_no_token,
                           NULL, NULL };
-    opts[17] = (cli_opt){ "allow-remote", CLI_OPT_BOOL, &o.allow_remote,
+    opts[16] = (cli_opt){ "allow-remote", CLI_OPT_BOOL, &o.allow_remote,
                           NULL, NULL };
     parse_cmd(argc, argv, start, "proxy", opts, sizeof opts / sizeof opts[0]);
     if (!o.server)
@@ -887,8 +879,6 @@ static int cmd_proxy(int argc, char **argv, int start)
             log_err("Error: set nonblock: %s", strerror(errno));
 #endif
 
-        if (o.encrypt != 1)
-            log_err("WARN: data-plane only XOR(1), got %d", o.encrypt);
 
         uint8_t sk[16];
         session_key(o.user, o.pass, sk);
@@ -897,7 +887,7 @@ static int cmd_proxy(int argc, char **argv, int start)
         slist_init(&routes6);
         collect_routes6(&o, &routes6);
         rc = run_pump(tun_fd, o.tun, sockfd, sk, res.sid, res.tok,
-                      o.encrypt, o.server, &routes, &routes6,
+                      1, o.server, &routes, &routes6,
                       res.tun, res.mtu);
         slist_free(&routes6);
         wipe(sk, sizeof sk);
@@ -963,7 +953,7 @@ static int socks_reauth_cb(void *ud, SocksConfig *cfg, int *out_fd)
     wipe(sk, sizeof sk);
     cfg->sid = res.sid;
     cfg->token = res.tok;
-    cfg->encryption = o->encrypt;
+    cfg->encryption = 1;
     snprintf(cfg->dns, sizeof cfg->dns, "%s", res.dns);
     *out_fd = fd;
     return 0;
@@ -975,21 +965,20 @@ static int cmd_socks(int argc, char **argv, int start)
     memset(&o, 0, sizeof o);
     o.port = 6001;
     o.user = "_rev_m_1";
-    o.encrypt = 1;
     o.mtu = 1380;
     o.listen_str = "127.0.0.1:1080";
-    cli_opt opts[14];
+    cli_opt opts[13];
 
     add_auth_opts(opts, &o);
-    opts[9] = (cli_opt){ "listen",       CLI_OPT_STR, &o.listen_str,
+    opts[8] = (cli_opt){ "listen",       CLI_OPT_STR, &o.listen_str,
                          "<LISTEN>",  valid_listen };
-    opts[10] = (cli_opt){ "socks-token", CLI_OPT_STR, &o.socks_token,
+    opts[9] = (cli_opt){ "socks-token", CLI_OPT_STR, &o.socks_token,
                           "<TOKEN>", validate_token_len };
-    opts[11] = (cli_opt){ "socks-no-token", CLI_OPT_BOOL, &o.socks_no_token,
+    opts[10] = (cli_opt){ "socks-no-token", CLI_OPT_BOOL, &o.socks_no_token,
                           NULL, NULL };
-    opts[12] = (cli_opt){ "allow-remote", CLI_OPT_BOOL, &o.allow_remote,
+    opts[11] = (cli_opt){ "allow-remote", CLI_OPT_BOOL, &o.allow_remote,
                           NULL, NULL };
-    opts[13] = (cli_opt){ "socks-ipv6", CLI_OPT_BOOL, &o.socks_ipv6,
+    opts[12] = (cli_opt){ "socks-ipv6", CLI_OPT_BOOL, &o.socks_ipv6,
                           NULL, NULL };
     parse_cmd(argc, argv, start, "socks", opts, sizeof opts / sizeof opts[0]);
     if (!o.server)
@@ -1035,8 +1024,6 @@ static int cmd_socks(int argc, char **argv, int start)
         if (port_set_nonblock(sockfd, true) != 0)
             log_err("Error: set nonblock: %s", strerror(errno));
 #endif
-        if (o.encrypt != 1)
-            log_err("WARN: data-plane only XOR(1), got %d", o.encrypt);
 
         uint8_t sk[16];
         session_key(o.user, o.pass, sk);
@@ -1076,7 +1063,7 @@ static int cmd_socks(int argc, char **argv, int start)
         wipe(sk, sizeof sk);
         cfg.sid = res.sid;
         cfg.token = res.tok;
-        cfg.encryption = o.encrypt;
+        cfg.encryption = 1;
         cfg.auth_token = o.socks_token;
         cfg.open_proxy = o.socks_no_token;
         cfg.allow_remote = o.allow_remote;

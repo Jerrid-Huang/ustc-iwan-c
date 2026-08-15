@@ -79,7 +79,7 @@ static int oidc_socks_reauth_cb(void *ud, SocksConfig *cfg, int *out_fd)
     uint32_t nonce = rand_u32();
     buf_t open;
     buf_init(&open);
-    if (build_open(&open, rc->user, ct, IWAN_DEFAULT_MTU, rc->o->encrypt,
+    if (build_open(&open, rc->user, ct, IWAN_DEFAULT_MTU, 1,
                    nonce) != 0) {
         buf_free(&open);
         OPENSSL_cleanse(password, strlen(password));
@@ -121,7 +121,7 @@ static int oidc_socks_reauth_cb(void *ud, SocksConfig *cfg, int *out_fd)
     OPENSSL_cleanse(sk, sizeof sk);
     cfg->sid = res.sid;
     cfg->token = res.tok;
-    cfg->encryption = rc->o->encrypt;
+    cfg->encryption = 1;
     snprintf(cfg->dns, sizeof cfg->dns, "%s", res.dns);
     *out_fd = fd;
     return 0;
@@ -157,7 +157,7 @@ static int run_socks_mode(const Opts *o, int fd, const uint8_t sk[16],
     memcpy(cfg.xor_key, sk, sizeof cfg.xor_key);
     cfg.sid = res->sid;
     cfg.token = res->tok;
-    cfg.encryption = o->encrypt;
+    cfg.encryption = 1;
     cfg.auth_token = o->socks_token;
     cfg.open_proxy = o->socks_no_token;
     cfg.allow_remote = o->allow_remote;
@@ -359,7 +359,7 @@ void oidc_connect_server(const Opts *o, const Config *cf)
         uint32_t nonce = rand_u32();
         buf_t open;
         buf_init(&open);
-        if (build_open(&open, user, ct, IWAN_DEFAULT_MTU, o->encrypt,
+        if (build_open(&open, user, ct, IWAN_DEFAULT_MTU, 1,
                        nonce) != 0) {
             buf_free(&open);
             OPENSSL_cleanse(password, strlen(password));
@@ -400,7 +400,7 @@ void oidc_connect_server(const Opts *o, const Config *cf)
             port_close(fd);
         } else {
             rc = run_pump(tun_fd, o->tun, fd, sk, res.sid, res.tok,
-                          o->encrypt, host, &routes, &routes6,
+                          1, host, &routes, &routes6,
                           res.tun, res.mtu);
             port_close(fd);
         }

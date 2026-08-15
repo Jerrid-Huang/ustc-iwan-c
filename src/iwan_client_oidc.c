@@ -37,7 +37,6 @@ int main(int argc, char **argv)
     memset(&o, 0, sizeof o);
     o.config_dir = "~/.config/iwan";
     o.tun = "iwan0";
-    o.encrypt = 1;
     o.socks_listen = "127.0.0.1:1080";
     o.socks_mtu = 1380;
     slist_init(&o.proxy_cidr);
