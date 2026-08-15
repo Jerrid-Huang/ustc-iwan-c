@@ -375,14 +375,6 @@ static void cleanse_str(const char *s)
         *v++ = 0;
 }
 
-/* best-effort scrub of a fixed-size secret, immune to optimizer elision */
-static void wipe(void *p, size_t n)
-{
-    volatile unsigned char *v = p;
-    while (n--)
-        *v++ = 0;
-}
-
 static void die_invalid_address(const char *ctx)
 {
     fprintf(stderr,
@@ -476,26 +468,20 @@ static void resolve_credentials(CmdOpts *o, const char *sub)
 /* OPEN/ACK handshake with the VPN server; returns fd or -1 */
 static int authenticate(const CmdOpts *o, int style, AuthResult *res)
 {
-    uint8_t ct[16];
-    if (get_ct(o->user, o->pass, o->ct_pass, ct) != 0) {
+    int r = authenticate_ex(o->user, o->pass, o->ct_pass, o->mtu,
+                            o->server, o->port, style, res);
+    if (r == -1) {
         log_err("Error: invalid --ct-pass hex (want exactly 32 hex digits)");
         cleanse_str(o->ct_pass);   /* last use of the ct pass */
         return -1;
     }
     cleanse_str(o->ct_pass);   /* last use of the ct pass */
-    uint32_t nonce = rand_u32();
-    buf_t open;
-    buf_init(&open);
-    if (build_open(&open, o->user, ct, o->mtu, 1, nonce) != 0) {
-        buf_free(&open);
+    if (r == -2) {
         fprintf(stderr, "Error: username too long (max %d bytes)\n",
                 IWAN_TLV_VLEN_MAX);
         return -1;
     }
-    int fd = do_auth(o->server, o->port, open.data, open.len, nonce, style,
-                     res);
-    buf_free(&open);
-    return fd;
+    return r;
 }
 
 static void free_route_opts(CmdOpts *o)
@@ -885,21 +871,17 @@ static int socks_reauth_cb(void *ud, SocksConfig *cfg, int *out_fd)
         port_close(fd);
         return -1;
     }
-    cfg->inner_ip = ip4_u32(b);
+    uint32_t inner_ip = ip4_u32(b);
     if (!s2ip4(res.gw, b)) {
         log_err("SOCKS re-auth: server returned invalid gw");
         wipe(sk, sizeof sk);
         port_close(fd);
         return -1;
     }
-    cfg->gateway = ip4_u32(b);
-    cfg->mtu = (int)(res.mtu < o->mtu ? res.mtu : o->mtu);
-    memcpy(cfg->xor_key, sk, sizeof cfg->xor_key);
+    uint32_t gateway = ip4_u32(b);
+    socks_cfg_from_auth(cfg, &res, inner_ip, gateway, sk,
+                        (int)(res.mtu < o->mtu ? res.mtu : o->mtu));
     wipe(sk, sizeof sk);
-    cfg->sid = res.sid;
-    cfg->token = res.tok;
-    cfg->encryption = 1;
-    snprintf(cfg->dns, sizeof cfg->dns, "%s", res.dns);
     *out_fd = fd;
     return 0;
 }
@@ -1001,19 +983,13 @@ static int cmd_socks(int argc, char **argv, int start)
         memset(&cfg, 0, sizeof cfg);
         cfg.listen_addr = listen;
         cfg.listen_str = o.listen_str;
-        cfg.inner_ip = inner_ip;
-        cfg.gateway = gateway;
-        cfg.mtu = (int)(res.mtu < o.mtu ? res.mtu : o.mtu);
-        memcpy(cfg.xor_key, sk, sizeof cfg.xor_key);
+        socks_cfg_from_auth(&cfg, &res, inner_ip, gateway, sk,
+                            (int)(res.mtu < o.mtu ? res.mtu : o.mtu));
         wipe(sk, sizeof sk);
-        cfg.sid = res.sid;
-        cfg.token = res.tok;
-        cfg.encryption = 1;
         cfg.auth_token = o.socks_token;
         cfg.open_proxy = o.socks_no_token;
         cfg.allow_remote = o.allow_remote;
         cfg.ipv6 = o.socks_ipv6;
-        snprintf(cfg.dns, sizeof cfg.dns, "%s", res.dns);
         cfg.reauth = socks_reauth_cb;   /* in-place tunnel re-auth */
         cfg.reauth_ud = &o;
 

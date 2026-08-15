@@ -12,6 +12,7 @@
 #include "cli.h"
 #include "common.h"
 #include "json.h"
+#include "util.h"   /* err_printf (oidc_eprintf alias below) */
 
 #define OIDC_VERSION "0.1.0"
 
@@ -61,7 +62,11 @@ typedef struct {
 void oidc_die(const char *fmt, ...);
 void oidc_die_with_cause(const char *msg, const char *cause);
 void oidc_pause_if_relaunched(void);
-void oidc_eprintf(const char *fmt, ...);
+/* oidc_eprintf is the raw-stderr printer (no newline, no flush) shared
+ * with the core CLI helpers: err_printf (util.h) has the identical
+ * contract, so this is a plain alias — a function wrapper could not
+ * forward the variadic args anyway. */
+#define oidc_eprintf err_printf
 void oidc_rand_bytes(uint8_t *out, size_t n);
 void oidc_check_server_ip(const char *server);
 void oidc_hex_upper(const uint8_t *b, size_t n, char *out);
@@ -72,8 +77,7 @@ void oidc_esc_put(buf_t *b, const char *s);
 /* pull a named query parameter out of a URL/query string; returns a
  * newly allocated URL-decoded value (caller frees) or NULL when absent */
 char *oidc_url_param(const char *s, const char *name);
-char *oidc_extract_code(const char *s);
-char *oidc_id_token_username(Json *tok);
+char *oidc_id_token_username(const char *jwt);
 
 /* oidc_cli.c */
 void oidc_parse_cli(int argc, char **argv, Opts *o, Cli *usage);

@@ -542,6 +542,30 @@ static size_t dns_skip_name(const uint8_t *p, size_t n, size_t off)
     }
 }
 
+/* consume a validated A/AAAA answer: the slot may have been recycled by
+ * the timed-out worker, so only clear (and push) when it is still OUR
+ * transaction. Lock order is identical for both families and matches
+ * the original branches statement-for-statement: take g_dns_wait_mu,
+ * re-validate slot ownership, clear in_use, release, then push (dns_push
+ * takes g_dns_mu — never held here). */
+static bool dns_consume_answer(int slot, uint16_t dport, uint16_t want_id,
+                               int flow_id, uint16_t fport,
+                               uint8_t af, uint32_t ip, const uint8_t *ip6)
+{
+    pthread_mutex_lock(&g_dns_wait_mu);
+    {
+        DnsWait *w = &g_dns_wait[slot];
+        if (w->in_use && w->sport == dport && w->dns_id == want_id) {
+            w->in_use = false;
+            pthread_mutex_unlock(&g_dns_wait_mu);
+            dns_push(flow_id, true, af, ip, ip6, fport);
+        } else {
+            pthread_mutex_unlock(&g_dns_wait_mu);
+        }
+    }
+    return true;
+}
+
 /* receive_vpn hook: consume inner IPv4 packets that are tunnel-DNS
  * responses. Returns true when the packet was taken (its dst port belongs
  * to a pending query). Validation failures are ignored and counted, so
@@ -641,36 +665,12 @@ bool dns_try_handle_response(const uint8_t *pkt, size_t n)
         if (typ == want_qtype && cls == 1) {
             if (want_qtype == 1 && rdlen == 4) {
                 uint32_t ip = ip4_u32(dns + off);
-                /* slot may have been recycled by the timed-out worker: only
-                 * consume (and push) when it is still OUR transaction */
-                pthread_mutex_lock(&g_dns_wait_mu);
-                {
-                    DnsWait *w = &g_dns_wait[slot];
-                    if (w->in_use && w->sport == dport &&
-                        w->dns_id == want_id) {
-                        w->in_use = false;
-                        pthread_mutex_unlock(&g_dns_wait_mu);
-                        dns_push(flow_id, true, 4, ip, NULL, fport);
-                    } else {
-                        pthread_mutex_unlock(&g_dns_wait_mu);
-                    }
-                }
-                return true;
+                return dns_consume_answer(slot, dport, want_id, flow_id,
+                                          fport, 4, ip, NULL);
             }
             if (want_qtype == 28 && rdlen == 16) {
-                pthread_mutex_lock(&g_dns_wait_mu);
-                {
-                    DnsWait *w = &g_dns_wait[slot];
-                    if (w->in_use && w->sport == dport &&
-                        w->dns_id == want_id) {
-                        w->in_use = false;
-                        pthread_mutex_unlock(&g_dns_wait_mu);
-                        dns_push(flow_id, true, 6, 0, dns + off, fport);
-                    } else {
-                        pthread_mutex_unlock(&g_dns_wait_mu);
-                    }
-                }
-                return true;
+                return dns_consume_answer(slot, dport, want_id, flow_id,
+                                          fport, 6, 0, dns + off);
             }
         }
         off += rdlen;
@@ -831,7 +831,9 @@ static void *dns_worker(void *arg) {
         DnsWait *w = &g_dns_wait[slot];
         if (!w->in_use || w->sport != sport || w->dns_id != id) {
             pthread_mutex_unlock(&g_dns_wait_mu);
-            slot = -1;                   /* consumed before our first send */
+            /* consumed before our first send: the response already
+             * cleared (and pushed) this slot, so this path retires
+             * nothing on the way out — the index is not read again */
             goto done;
         }
         ipid = w->ipid;
@@ -1090,81 +1092,79 @@ void flow_free(Flow *f) {
 
 /* ---- port allocation (shared alloc_ephemeral above) ---- */
 
-void open_tcp_connection(Flow *f, uint32_t rip, uint16_t rport) {
-    uint16_t lport = alloc_port();
-    if (lport == 0) {
-        queue_socks_error(f, 1);
-        return;
-    }
-    int idx = ns_connect(&g_ns, lport, rip, rport);
-    if (idx < 0) {
-        queue_socks_error(f, 1);
-        return;
-    }
-    f->ns_idx = idx;
-    f->lport = lport;
-    f->tgt_af = 4;
-    f->tgt_ip4 = rip;
-    f->tgt_port = rport;
-    set_flow_state(f, ST_CONNECTING);
-    if (debug_enabled()) {
-        uint8_t b[4];
-        u32_ip4(rip, b);
-        log_debug("[flow %lu] %d.%d.%d.%d:%u -> %d.%d.%d.%d:%u",
-                  (unsigned long)f->id, (g_ns.ip >> 24) & 0xff,
-                  (g_ns.ip >> 16) & 0xff, (g_ns.ip >> 8) & 0xff,
-                  g_ns.ip & 0xff, lport, b[0], b[1], b[2], b[3], rport);
-    }
-}
+/* shared connect implementation behind open_tcp_connection /
+ * open_tcp_connection6: family dispatch on the parsed target. The two
+ * public entry points stay as thin wrappers (both are called by name
+ * from socks.c's re-auth re-establish path and the handshake code), so
+ * the netstack connect / non-blocking / EINPROGRESS handling is
+ * unchanged — only the surrounding bookkeeping is unified. Per-
+ * connection, but still data plane. */
+static void open_tcp_conn_af(Flow *f, uint8_t af, uint32_t rip,
+                             const uint8_t rip6[16], uint16_t rport)
+{
+    uint16_t lport;
+    int idx;
 
-void open_tcp_connection6(Flow *f, const uint8_t rip6[16], uint16_t rport) {
-    if (!IWAN_NS_IPV6) {
+    if (af == 6 && !IWAN_NS_IPV6) {
         /* native rollback stack: honest "address type not supported" */
         queue_socks_error(f, 8);
         return;
     }
-    uint16_t lport = alloc_port();
+    lport = alloc_port();
     if (lport == 0) {
         queue_socks_error(f, 1);
         return;
     }
-    int idx = ns_connect6(&g_ns, lport, rip6, rport);
+    idx = (af == 6) ? ns_connect6(&g_ns, lport, rip6, rport)
+                    : ns_connect(&g_ns, lport, rip, rport);
     if (idx < 0) {
         queue_socks_error(f, 1);
         return;
     }
     f->ns_idx = idx;
     f->lport = lport;
-    f->tgt_af = 6;
-    memcpy(f->tgt_ip6, rip6, 16);
+    f->tgt_af = af;
+    if (af == 6)
+        memcpy(f->tgt_ip6, rip6, 16);
+    else
+        f->tgt_ip4 = rip;
     f->tgt_port = rport;
     set_flow_state(f, ST_CONNECTING);
     if (debug_enabled()) {
-        uint8_t b6[16];
-        ip6_derive_ula(g_ns.ip, b6);
-        log_debug("[flow %lu] [%02x%02x:%02x%02x:%02x%02x:%02x%02x:"
-                  "%02x%02x:%02x%02x:%02x%02x:%02x%02x]:%u -> "
-                  "[%02x%02x:%02x%02x:%02x%02x:%02x%02x:"
-                  "%02x%02x:%02x%02x:%02x%02x:%02x%02x]:%u",
-                  (unsigned long)f->id, b6[0], b6[1], b6[2], b6[3], b6[4],
-                  b6[5], b6[6], b6[7], b6[8], b6[9], b6[10], b6[11], b6[12],
-                  b6[13], b6[14], b6[15], lport, rip6[0], rip6[1], rip6[2],
-                  rip6[3], rip6[4], rip6[5], rip6[6], rip6[7], rip6[8],
-                  rip6[9], rip6[10], rip6[11], rip6[12], rip6[13], rip6[14],
-                  rip6[15], rport);
+        if (af == 6) {
+            uint8_t b6[16];
+            ip6_derive_ula(g_ns.ip, b6);
+            log_debug("[flow %lu] [%02x%02x:%02x%02x:%02x%02x:%02x%02x:"
+                      "%02x%02x:%02x%02x:%02x%02x:%02x%02x]:%u -> "
+                      "[%02x%02x:%02x%02x:%02x%02x:%02x%02x:"
+                      "%02x%02x:%02x%02x:%02x%02x:%02x%02x]:%u",
+                      (unsigned long)f->id, b6[0], b6[1], b6[2], b6[3], b6[4],
+                      b6[5], b6[6], b6[7], b6[8], b6[9], b6[10], b6[11], b6[12],
+                      b6[13], b6[14], b6[15], lport, rip6[0], rip6[1], rip6[2],
+                      rip6[3], rip6[4], rip6[5], rip6[6], rip6[7], rip6[8],
+                      rip6[9], rip6[10], rip6[11], rip6[12], rip6[13], rip6[14],
+                      rip6[15], rport);
+        } else {
+            uint8_t b[4];
+            u32_ip4(rip, b);
+            log_debug("[flow %lu] %d.%d.%d.%d:%u -> %d.%d.%d.%d:%u",
+                      (unsigned long)f->id, (g_ns.ip >> 24) & 0xff,
+                      (g_ns.ip >> 16) & 0xff, (g_ns.ip >> 8) & 0xff,
+                      g_ns.ip & 0xff, lport, b[0], b[1], b[2], b[3], rport);
+        }
     }
 }
 
-/* constant-time equality: both buffers are exactly n bytes (the caller
- * rejects length mismatches first), so the loop hides the comparison
- * shape from timing */
-static int ct_eq(const uint8_t *a, const uint8_t *b, size_t n)
-{
-    uint8_t d = 0;
-    for (size_t i = 0; i < n; i++)
-        d |= a[i] ^ b[i];
-    return d == 0;
+void open_tcp_connection(Flow *f, uint32_t rip, uint16_t rport) {
+    open_tcp_conn_af(f, 4, rip, NULL, rport);
 }
+
+void open_tcp_connection6(Flow *f, const uint8_t rip6[16], uint16_t rport) {
+    open_tcp_conn_af(f, 6, 0, rip6, rport);
+}
+
+/* constant-time equality: the shared implementation from crypto.h
+ * (ct_eq, same comparison shape) replaced the local copy */
 
 /* RFC 1929 sub-negotiation failure: reply (ver=1, status=1) and close */
 static void auth_reject(Flow *f)
@@ -1196,6 +1196,40 @@ static void greet_reject(Flow *f)
     }
     queue_flow_output(f, r, 2);
     set_flow_state(f, ST_CLOSING);
+}
+
+/* CONNECT target dispatch shared by the HTTP and SOCKS5 handshakes: an
+ * IPv4 literal goes straight to open_tcp_connection, an IPv6 literal is
+ * relayed only under the IPv6 relay assumption (--socks-ipv6), a domain
+ * goes through the async tunnel-DNS path (family decided by the result).
+ * The SOCKS5 caller consumes its request frame from f->input BEFORE
+ * calling this (the per-branch lengths differ — 10/22/req_len — and a
+ * zero-length domain errors without consuming), so the shared part is
+ * exactly this family dispatch; error handling is identical at both
+ * call sites (rep=8 for an unrelayable IPv6 target). */
+static void flow_start_target(Flow *f, const pp_target *t)
+{
+    if (t->af == 4) {
+        f->target_af = 4;
+        /* pp stores ip4 in network byte order; the netstack wants
+         * host-order MSB-first */
+        open_tcp_connection(f, ntohl(t->ip4), t->port);
+    } else if (t->af == 6) {
+        if (!socks_v6_ok()) {
+            /* IPv4-only relay assumption (--socks-ipv6 off): an IPv6
+             * literal target cannot be relayed, so reject it like any
+             * other unsupported address type instead of blackholing the
+             * SYN for ~6.5s */
+            queue_socks_error(f, 8);
+            return;
+        }
+        f->target_af = 6;
+        open_tcp_connection6(f, t->ip6, t->port);
+    } else {
+        f->target_af = 0;   /* domain: family decided by the DNS result */
+        set_flow_state(f, ST_RESOLVING);
+        spawn_dns((int)f->id, t->host, t->port);
+    }
 }
 
 /* ST_GREETING + http_mode: parse the HTTP request header block. For
@@ -1235,25 +1269,7 @@ static void http_handshake(Flow *f)
         goto bad;
     if (f->http_connect)
         buf_consume(&f->input, hdr);
-    if (t.af == 4) {
-        f->target_af = 4;
-        /* pp stores ip4 in network byte order; the netstack wants
-         * host-order MSB-first */
-        open_tcp_connection(f, ntohl(t.ip4), t.port);
-    } else if (t.af == 6) {
-        if (!socks_v6_ok()) {
-            /* IPv4-only relay assumption (--socks-ipv6 off): an IPv6
-             * literal target cannot be relayed; 502 in HTTP mode */
-            queue_socks_error(f, 8);
-            return;
-        }
-        f->target_af = 6;
-        open_tcp_connection6(f, t.ip6, t.port);
-    } else {
-        f->target_af = 0;
-        set_flow_state(f, ST_RESOLVING);
-        spawn_dns((int)f->id, t.host, t.port);
-    }
+    flow_start_target(f, &t);   /* IPv4 / IPv6 (gate) / domain dispatch */
     return;
 bad:
     queue_socks_error(f, 5);     /* http_mode -> 502 Bad Gateway */
@@ -1385,25 +1401,14 @@ static void handshake_request(Flow *f)
     }
     if (t.af == 4) {
         buf_consume(&f->input, 10);
-        f->target_af = 4;
-        /* pp stores ip4 in network byte order; the netstack wants
-         * host-order MSB-first */
-        open_tcp_connection(f, ntohl(t.ip4), t.port);
+        flow_start_target(f, &t);
         return;
     }
     if (t.af == 6) {
-        if (!socks_v6_ok()) {
-            /* default: the server is assumed to be IPv4-only — an
-             * ATYP=4 target cannot be relayed, so reject it like any
-             * other unsupported address type instead of blackholing
-             * the SYN for ~6.5s */
-            buf_consume(&f->input, 22);
-            queue_socks_error(f, 8);
-            return;
-        }
+        /* consume the frame first: the reply must not be raced by a
+         * re-parse of the same request on the next round */
         buf_consume(&f->input, 22);
-        f->target_af = 6;
-        open_tcp_connection6(f, t.ip6, t.port);
+        flow_start_target(f, &t);   /* gates IPv6 on --socks-ipv6 */
         return;
     }
     /* domain */
@@ -1420,9 +1425,7 @@ static void handshake_request(Flow *f)
             return;
         }
         buf_consume(&f->input, req_len);
-        f->target_af = 0;   /* domain: family decided by the DNS result */
-        set_flow_state(f, ST_RESOLVING);
-        spawn_dns((int)f->id, t.host, t.port);
+        flow_start_target(f, &t);
         return;
     }
 }

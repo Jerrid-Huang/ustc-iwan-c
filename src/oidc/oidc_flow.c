@@ -19,6 +19,7 @@
 #include "https.h"
 #include "json.h"
 #include "oidc.h"
+#include "util.h"   /* oidc_eprintf is err_printf (oidc.h) */
 
 /* JSON-escaped request body for /m/auth, /m/keepalive, /m/config */
 char *oidc_build_dev_body(const char *type, const char *device_id,
@@ -256,8 +257,10 @@ static Json *exchange_code(const char *code, const char *code_verifier)
 
 /* the id_token is the client's proof of authentication: verify its
  * signature against the issuer's JWKS and its aud/iss/exp claims
- * before trusting any of its contents (fail-closed) */
-static void verify_id_token(Json *tok)
+ * before trusting any of its contents (fail-closed). Returns the
+ * verified id_token string (points into tok), so oidc_login does not
+ * fetch it a second time for username extraction. */
+static const char *verify_id_token(Json *tok)
 {
     const char *id_token = json_get_str(tok, "id_token");
     if (!id_token)
@@ -265,6 +268,7 @@ static void verify_id_token(Json *tok)
     if (oidc_jwt_verify(id_token, OIDC_CLIENT_ID,
                         "https://" OIDC_AUTH_HOST) != 0)
         oidc_die("id_token verification failed");
+    return id_token;
 }
 
 /* OIDC Core 3.1.2.1 (CSRF): the authorization response must echo back
@@ -287,6 +291,13 @@ static char *take_access_token(Json *tok)
     if (!at)
         oidc_die("no access_token");
     return xstrdup(at);
+}
+
+/* pull "code=..." out of an OAuth redirect URL/query string (moved here
+ * from oidc_util.c: the only caller is oidc_login) */
+static char *oidc_extract_code(const char *s)
+{
+    return oidc_url_param(s, "code");
 }
 
 void oidc_login(char **kp_out, char **user_out)
@@ -333,9 +344,9 @@ void oidc_login(char **kp_out, char **user_out)
     free(code_verifier);
 
     char *kp = take_access_token(tok);
-    verify_id_token(tok);
+    const char *id_token = verify_id_token(tok);
 
-    char *username = oidc_id_token_username(tok);
+    char *username = oidc_id_token_username(id_token);
     json_free(tok);
     if (!username)
         username = xstrdup("unknown");

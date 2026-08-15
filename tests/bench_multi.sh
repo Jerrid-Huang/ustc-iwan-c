@@ -44,8 +44,8 @@ PROXY_MODE=${PROXY_MODE:-0}    # 1 = one TUN client with --listen proxy;
                                # CLIENTS_LIST then means concurrent conns
                                # through the proxy (thread-model bench)
 PORT=16001                     # VPN UDP port
-BASE_SOCKS=18080               # first local SOCKS listener
-PROXY_PORT=18080               # TUN-mode proxy listener (PROXY_MODE)
+BASE_SOCKS=${BASE_SOCKS:-18083}           # first local SOCKS listener (18080 is the user's supervised proxy)
+PROXY_PORT=${PROXY_PORT:-18083}           # TUN-mode proxy listener (PROXY_MODE)
 SINK_PORT=17010                # upload discard target
 SOURCE_PORT=17011              # download data source
 SRV_IP=100.64.0.1

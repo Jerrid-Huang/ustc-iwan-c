@@ -23,7 +23,7 @@ fi
 
 PORT=16001            # VPN UDP port
 ECHO_PORT=17000       # echo server TCP port
-SOCKS_PORT=18080      # local SOCKS5 listener (17080 collides with a
+SOCKS_PORT=${SOCKS_PORT:-18083}   # local SOCKS5 listener (18080 is the user's
                       # pre-existing service on some hosts)
 # Test subnet: 172.16.0.0/16 instead of the production 198.18.0.0/16
 # (a pre-existing iWAN setup on the host may already own 198.18.0.1/16).

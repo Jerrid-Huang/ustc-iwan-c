@@ -637,6 +637,36 @@ void port_socket_init(void)
 }
 #endif
 
+/* Shared drain skeleton for the Windows/macOS eventfd substitutes
+ * (both platform branches below): loop recv() until the socket reports
+ * would-block (all wake bytes consumed); only the error query differs
+ * (WSAGetLastError / WSAEWOULDBLOCK vs errno / EAGAIN+EWOULDBLOCK).
+ * Linux uses the native eventfd inline in port.h. */
+#if defined(_WIN32) || defined(__APPLE__)
+static int evfd_drain_loop(int fd)
+{
+    char buf[64];
+    for (;;) {
+#ifdef _WIN32
+        int r = recv((SOCKET)fd, buf, sizeof buf, 0);
+        if (r == SOCKET_ERROR) {
+            int e = WSAGetLastError();
+            if (e == WSAEWOULDBLOCK)
+                return 0;
+            return -1;
+        }
+#else
+        ssize_t r = recv(fd, buf, sizeof buf, 0);
+        if (r < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                return 0;
+            return -1;
+        }
+#endif
+    }
+}
+#endif /* _WIN32 || __APPLE__ */
+
 /* ================================================================== */
 /* Windows-only winsock wrappers. On POSIX these are static inline     */
 /* passthroughs in port.h, so everything below is _WIN32-gated.        */
@@ -1223,16 +1253,7 @@ int port_evfd_wake(int fd)
 
 int port_evfd_drain(int fd)
 {
-    char buf[64];
-    for (;;) {
-        int r = recv((SOCKET)fd, buf, sizeof buf, 0);
-        if (r == SOCKET_ERROR) {
-            int e = WSAGetLastError();
-            if (e == WSAEWOULDBLOCK)
-                return 0;
-            return -1;
-        }
-    }
+    return evfd_drain_loop(fd);
 }
 
 void port_evfd_close(int fd)
@@ -1322,15 +1343,7 @@ int port_evfd_wake(int fd)
 
 int port_evfd_drain(int fd)
 {
-    char buf[64];
-    for (;;) {
-        ssize_t r = recv(fd, buf, sizeof buf, 0);
-        if (r < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
-                return 0;
-            return -1;
-        }
-    }
+    return evfd_drain_loop(fd);
 }
 
 void port_evfd_close(int fd)

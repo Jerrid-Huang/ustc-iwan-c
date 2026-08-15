@@ -29,7 +29,7 @@ if [ "$(id -u)" != 0 ]; then
 fi
 
 PORT=16001            # VPN UDP port
-SOCKS_PORT=18080      # local SOCKS5 listener
+SOCKS_PORT=${SOCKS_PORT:-18083}   # local SOCKS5 listener (18080 is the user's supervised proxy)
 SINK_PORT=17010       # upload discard target
 SOURCE_PORT=17011     # download data source
 SRV_IP=100.64.0.1

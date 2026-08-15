@@ -46,7 +46,8 @@ char *xstrdup(const char *s);
 uint32_t rand_u32(void);
 uint64_t now_ms(void);          /* monotonic, for timeouts */
 /* strict decimal parse (digits only, bounds-checked). 0 on success,
- * -1 on empty/non-digit/overflow. Shared by cli.c and the str_to_u* */
+ * -1 on empty/non-digit, -2 on overflow. Shared by cli.c and the
+ * str_to_u* */
 int      parse_uint(const char *s, uint64_t max, uint64_t *out);
 int      str_to_u16(const char *s, uint16_t *out);
 /* Rust-style "[::1]" -> "::1" for getaddrinfo; returns s when unbracketed */

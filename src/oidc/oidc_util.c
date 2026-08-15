@@ -13,6 +13,7 @@
 #include "crypto.h"
 #include "json.h"
 #include "oidc.h"
+#include "util.h"   /* hex_nibble; oidc_eprintf is err_printf (oidc.h) */
 
 #ifdef _WIN32
 #include <conio.h>   /* _getch: hold the UAC-relaunched window open */
@@ -56,14 +57,6 @@ void oidc_die_with_cause(const char *msg, const char *cause)
     exit(1);
 }
 
-void oidc_eprintf(const char *fmt, ...)
-{
-    va_list ap;
-    va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
-    va_end(ap);
-}
-
 void oidc_rand_bytes(uint8_t *out, size_t n)
 {
     while (n > 0) {
@@ -101,17 +94,6 @@ void oidc_hex_upper(const uint8_t *b, size_t n, char *out)
     }
 }
 
-static int hexval(int c)
-{
-    if (c >= '0' && c <= '9')
-        return c - '0';
-    if (c >= 'a' && c <= 'f')
-        return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F')
-        return c - 'A' + 10;
-    return -1;
-}
-
 void oidc_urlenc(const char *s, buf_t *out)
 {
     static const char hex[] = "0123456789ABCDEF";
@@ -137,8 +119,8 @@ static char *oidc_urldec(const char *s, size_t n)
     size_t o = 0;
     for (size_t i = 0; i < n; i++) {
         if (s[i] == '%' && i + 2 < n) {
-            int hi = hexval((unsigned char)s[i + 1]);
-            int lo = hexval((unsigned char)s[i + 2]);
+            int hi = hex_nibble(s[i + 1]);
+            int lo = hex_nibble(s[i + 2]);
             if (hi >= 0 && lo >= 0) {
                 out[o++] = (char)((hi << 4) | lo);
                 i += 2;
@@ -194,16 +176,11 @@ char *oidc_url_param(const char *s, const char *name)
     return NULL;
 }
 
-/* pull "code=..." out of an OAuth redirect URL/query string */
-char *oidc_extract_code(const char *s)
+/* decode the "name"/"preferred_username"/"sub" claim from the id_token
+ * JWT (the caller supplies the token string; the only caller,
+ * oidc_login, passes the string verify_id_token already fetched) */
+char *oidc_id_token_username(const char *jwt)
 {
-    return oidc_url_param(s, "code");
-}
-
-/* decode the "name"/"preferred_username"/"sub" claim from the id_token JWT */
-char *oidc_id_token_username(Json *tok)
-{
-    const char *jwt = json_get_str(tok, "id_token");
     char *txt, *out;
     Json *claims;
     const char *nm;

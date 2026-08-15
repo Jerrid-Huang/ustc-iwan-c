@@ -512,6 +512,15 @@ static bool conn_fin_done(const TcpConn *c, const NsPriv *p, uint32_t acked)
            (int32_t)(acked - c->snd_nxt) >= 0;
 }
 
+/* close completed: free the rxq now — b_reset is idempotent, so a later
+ * conn_clear on slot reuse frees NULL and can never double-free the
+ * buffer */
+static void conn_close_done(TcpConn *c)
+{
+    b_reset(&c->rxq);
+    c->state = NS_CLOSED;
+}
+
 /* SYN-SENT: accept the peer's SYN+ACK (RFC 793 rules), enter the
  * established state and deliver any piggybacked payload */
 static void handle_rx_syn_sent(Netstack *ns, TcpConn *c, int idx,
@@ -722,11 +731,7 @@ static void handle_rx(Netstack *ns, TcpConn *c, int idx, const uint8_t *t,
      * free the conn and let the reply be RST'd away. Stay in FIN_WAIT
      * until the peer's FIN is seen (remote_fin). */
     if (conn_fin_done(c, p, ack)) {
-        /* close completed: free the rxq now — b_reset is idempotent, so
-         * a later conn_clear on slot reuse frees NULL and can never
-         * double-free the buffer */
-        b_reset(&c->rxq);
-        c->state = NS_CLOSED;
+        conn_close_done(c);
         return;
     }
     handle_rx_data(ns, c, idx, flags, seq, payload, paylen);
@@ -894,19 +899,31 @@ static void seg_seal(Netstack *ns, TcpConn *c, NsPriv *p, uint8_t extra)
     }
 }
 
+/* shared bounds/state/outstanding guard for the ns_send_* entry points:
+ * a stale idx after ns_abort/slot reuse must not land on an unrelated
+ * conn (see the sibling comment in ns_send_commit), and a closed or
+ * outstanding-full conn must not accept new data. Returns false when the
+ * caller must return 0 without touching the conn. */
+static bool ns_send_guard(Netstack *ns, int idx, TcpConn **c, NsPriv **p)
+{
+    if (idx < 0 || idx >= NS_MAX_CONN)
+        return false;
+    *c = &ns->conns[idx];
+    if ((*c)->state == NS_CLOSED || (*c)->state == NS_FIN_WAIT)
+        return false;
+    *p = &ns->priv[idx];
+    if ((*p)->nsegs >= NS_MAX_OUTSTANDING)
+        return false;
+    return true;
+}
+
 int ns_send_reservev(Netstack *ns, int idx, struct iovec *iov, int maxn)
 {
     TcpConn *c;
     NsPriv *p;
     int n = 0;
 
-    if (idx < 0 || idx >= NS_MAX_CONN)
-        return 0;
-    c = &ns->conns[idx];
-    if (c->state == NS_CLOSED || c->state == NS_FIN_WAIT)
-        return 0;
-    p = &ns->priv[idx];
-    if (p->nsegs >= NS_MAX_OUTSTANDING)
+    if (!ns_send_guard(ns, idx, &c, &p))
         return 0;
     seg_maybe_compact(p);
     {
@@ -933,15 +950,7 @@ int ns_send_commit(Netstack *ns, int idx, size_t n)
     Seg *s;
     size_t room;
 
-    /* same bounds/state guards as every sibling entry point: a stale idx
-     * after ns_abort/slot reuse must not land on an unrelated conn */
-    if (idx < 0 || idx >= NS_MAX_CONN)
-        return 0;
-    c = &ns->conns[idx];
-    if (c->state == NS_CLOSED || c->state == NS_FIN_WAIT)
-        return 0;
-    p = &ns->priv[idx];
-    if (p->nsegs >= NS_MAX_OUTSTANDING)
+    if (!ns_send_guard(ns, idx, &c, &p))
         return 0;
     s = seg_fill_slot(p);
     room = c->mss - s->len;
@@ -1359,11 +1368,7 @@ static int64_t conn_tick(Netstack *ns, int i, uint64_t now)
             return 0;       /* tries exhausted: conn was aborted */
     } else {
         if (conn_fin_done(c, p, c->snd_una)) {
-            /* close completed: free the rxq now — b_reset is idempotent,
-             * so a later conn_clear on slot reuse frees NULL and can
-             * never double-free the buffer */
-            b_reset(&c->rxq);
-            c->state = NS_CLOSED;
+            conn_close_done(c);
             return 0;
         }
         drop_acked(c, p);

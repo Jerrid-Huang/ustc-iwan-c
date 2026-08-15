@@ -27,19 +27,11 @@ void buf_clear(buf_t *b)
 
 void buf_ensure(buf_t *b, size_t extra)
 {
-    if (extra > SIZE_MAX - b->len)
+    size_t ncap;
+    if (!grow_cap(b->len, extra, b->cap, 64, 1, &ncap))
         oom_abort();   /* length overflow: no representable buffer */
-    size_t need = b->len + extra;
-    if (need <= b->cap)
+    if (ncap == b->cap)
         return;
-    size_t ncap = b->cap ? b->cap : 64;
-    while (ncap < need) {
-        if (ncap > SIZE_MAX / 2) {
-            ncap = need;
-            break;
-        }
-        ncap *= 2;
-    }
     b->data = realloc(b->data, ncap);
     if (!b->data)
         oom_abort();

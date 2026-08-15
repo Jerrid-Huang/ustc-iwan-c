@@ -20,15 +20,8 @@
 #endif
 #include "crypto.h"
 #include "protocol.h"
-#include "util.h"
-
-static void eprintf(const char *fmt, ...)
-{
-    va_list ap;
-    va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
-    va_end(ap);
-}
+#include "util.h"   /* err_printf: the shared stderr printf (replaces the
+                     * per-module eprintf this file used to carry) */
 
 static void set_err(char *errmsg, size_t sz, const char *fmt, ...)
 {
@@ -354,9 +347,9 @@ int do_auth(const char *server, uint16_t port, const uint8_t *open_pkt, size_t o
             return -1;
         }
         if (style == DO_AUTH_AUTH)
-            eprintf("[%d] -> OPEN (%zuB) nonce=%08x\n", i, open_len, nonce);
+            err_printf("[%d] -> OPEN (%zuB) nonce=%08x\n", i, open_len, nonce);
         else if (style == DO_AUTH_PUMP)
-            eprintf("[%d] -> OPEN\n", i);
+            err_printf("[%d] -> OPEN\n", i);
 
         ssize_t n = port_recv(fd, buf, sizeof buf, 0);
         if (n >= 0) {
@@ -364,17 +357,17 @@ int do_auth(const char *server, uint16_t port, const uint8_t *open_pkt, size_t o
             if (parse_ack(buf, (size_t)n, nonce, r, errmsg, sizeof errmsg))
                 return fd;
             if (style == DO_AUTH_AUTH)
-                eprintf("  err: %s\n", errmsg);
+                err_printf("  err: %s\n", errmsg);
             else if (style == DO_AUTH_PUMP)
-                eprintf("[%d] invalid reply: %s\n", i, errmsg);
+                err_printf("[%d] invalid reply: %s\n", i, errmsg);
             else
-                eprintf("  [%d] err: %s\n", i, errmsg);
+                err_printf("  [%d] err: %s\n", i, errmsg);
             break;   /* deterministic reject: do not retry */
         } else {
             if (style == DO_AUTH_AUTH)
-                eprintf("  timeout: %s (os error %d)\n", strerror(errno), errno);
+                err_printf("  timeout: %s (os error %d)\n", strerror(errno), errno);
             else
-                eprintf("  [%d] timeout: %s (os error %d)\n", i, strerror(errno),
+                err_printf("  [%d] timeout: %s (os error %d)\n", i, strerror(errno),
                         errno);
         }
         if (i < AUTH_SEND_MAX - 1)

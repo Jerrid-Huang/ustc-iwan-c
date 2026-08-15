@@ -65,18 +65,10 @@ struct jbuf {
 
 static void jbuf_app(struct jbuf *b, const void *p, size_t n)
 {
-    if (n > SIZE_MAX - b->len - 1)
+    size_t nc;
+    if (!grow_cap(b->len, n + 1, b->cap, 64, 1, &nc))
         oom_abort();   /* length overflow: no representable buffer */
-    size_t need = b->len + n + 1;
-    if (need > b->cap) {
-        size_t nc = b->cap ? b->cap * 2 : 64;
-        while (nc < need) {
-            if (nc > SIZE_MAX / 2) {
-                nc = need;
-                break;
-            }
-            nc *= 2;
-        }
+    if (nc > b->cap) {
         b->d = realloc(b->d, nc);
         if (!b->d)
             oom_abort();
@@ -95,24 +87,30 @@ static void skip_ws(struct P *p)
         p->s++;
 }
 
+/* hex4 result: the three states the \uXXXX scan must distinguish (see
+ * parse_string) — OK with the value, EOF when the input ends inside the
+ * 4-char window, BAD for a non-hex character. EOF wins over BAD: serde
+ * reports EOF when the window runs off the input even if an earlier char
+ * was invalid. */
+enum { HEX4_OK = 1, HEX4_EOF = 0, HEX4_BAD = -1 };
+
 static int hex4(const char *s, uint32_t *out)
 {
     uint32_t v = 0;
+    int bad = 0;
     for (int i = 0; i < 4; i++) {
-        int h;
-        char c = s[i];
-        if (c >= '0' && c <= '9')
-            h = c - '0';
-        else if (c >= 'a' && c <= 'f')
-            h = c - 'a' + 10;
-        else if (c >= 'A' && c <= 'F')
-            h = c - 'A' + 10;
+        int h = hex_nibble(s[i]);
+        if (s[i] == '\0')
+            return HEX4_EOF;
+        if (h < 0)
+            bad = 1;
         else
-            return 0;
-        v = (v << 4) | (uint32_t)h;
+            v = (v << 4) | (uint32_t)h;
     }
+    if (bad)
+        return HEX4_BAD;
     *out = v;
-    return 1;
+    return HEX4_OK;
 }
 
 static size_t utf8_encode(uint32_t cp, uint8_t out[4])
@@ -205,31 +203,21 @@ static Json *parse_string(struct P *p)
                 uint32_t cp = 0;
                 uint8_t enc[4];
                 size_t elen;
-                int bad = 0, eof = 0;
+                int r;
                 /* serde reads 4 chars; EOF on the 4th read -> EOF error,
                  * any non-hex -> invalid escape; position is always the end */
-                for (int k = 0; k < 4; k++) {
-                    unsigned char h = (unsigned char)p->s[2 + k];
-                    if (h == '\0') {
-                        eof = 1;
-                        break;
-                    }
-                    if (!((h >= '0' && h <= '9') || (h >= 'a' && h <= 'f') ||
-                          (h >= 'A' && h <= 'F')))
-                        bad = 1;
-                }
-                if (eof) {
+                r = hex4(p->s + 2, &cp);
+                if (r == HEX4_EOF) {
                     p_fail(p, 0, 1, "EOF while parsing a string");
                     free(b.d);
                     return NULL;
                 }
-                if (bad) {
+                if (r == HEX4_BAD) {
                     /* position = right after the 4-char hex window */
                     p_fail(p, 5, 0, "invalid escape");
                     free(b.d);
                     return NULL;
                 }
-                hex4(p->s + 2, &cp);
                 /* a high surrogate (U+D800-U+DBFF) must be immediately
                  * followed by a \uXXXX low surrogate (U+DC00-U+DFFF) to
                  * spell one supplementary code point; merge the pair into
@@ -239,36 +227,23 @@ static Json *parse_string(struct P *p)
                 if (cp >= 0xD800 && cp <= 0xDBFF &&
                     p->s[6] == '\\' && p->s[7] == 'u') {
                     uint32_t lo = 0;
-                    int lbad = 0, leof = 0;
-                    for (int k = 0; k < 4; k++) {
-                        unsigned char h = (unsigned char)p->s[8 + k];
-                        if (h == '\0') {
-                            leof = 1;
-                            break;
-                        }
-                        if (!((h >= '0' && h <= '9') || (h >= 'a' && h <= 'f') ||
-                              (h >= 'A' && h <= 'F')))
-                            lbad = 1;
-                    }
-                    if (leof) {
+                    int lr = hex4(p->s + 8, &lo);
+                    if (lr == HEX4_EOF) {
                         p_fail(p, 0, 1, "EOF while parsing a string");
                         free(b.d);
                         return NULL;
                     }
-                    if (!lbad) {
-                        hex4(p->s + 8, &lo);
-                        if (lo >= 0xDC00 && lo <= 0xDFFF) {
-                            cp = 0x10000 + ((cp - 0xD800) << 10) +
-                                 (lo - 0xDC00);
-                            elen = utf8_encode(cp, enc);
-                            jbuf_app(&b, enc, elen);
-                            p->s += 12; /* consumed both escapes */
-                            break;
-                        }
+                    if (lr == HEX4_OK && lo >= 0xDC00 && lo <= 0xDFFF) {
+                        cp = 0x10000 + ((cp - 0xD800) << 10) +
+                             (lo - 0xDC00);
+                        elen = utf8_encode(cp, enc);
+                        jbuf_app(&b, enc, elen);
+                        p->s += 12; /* consumed both escapes */
+                        break;
                     }
-                    /* not a low surrogate: leave \uXXXX for the next loop
-                     * iteration, so the pair-decoding only ever goes
-                     * forward */
+                    /* not a low surrogate (bad hex or out of range): leave
+                     * \uXXXX for the next loop iteration, so the
+                     * pair-decoding only ever goes forward */
                 }
                 elen = utf8_encode(cp, enc);
                 jbuf_app(&b, enc, elen);
@@ -425,13 +400,10 @@ static Json *parse_array(struct P *p, int depth)
             return NULL;
         }
         if (arr->u.a.len == arr->u.a.cap) {
-            size_t nc = arr->u.a.cap ? arr->u.a.cap * 2 : 8;
-            /* guard the *2 and the byte-size multiply at the size ceiling */
-            if (nc < arr->u.a.cap || nc > SIZE_MAX / sizeof(Json *)) {
-                if (arr->u.a.len == SIZE_MAX)
-                    oom_abort();
-                nc = arr->u.a.len + 1;
-            }
+            size_t nc;
+            if (!grow_cap(arr->u.a.len, 1, arr->u.a.cap, 8,
+                          sizeof(Json *), &nc))
+                oom_abort();   /* len == SIZE_MAX: no representable array */
             arr->u.a.arr = realloc(arr->u.a.arr, nc * sizeof(Json *));
             if (!arr->u.a.arr)
                 oom_abort();
@@ -518,15 +490,12 @@ static Json *parse_object(struct P *p, int depth)
             return NULL;
         }
         if (obj->u.o.len == obj->u.o.cap) {
-            size_t nc = obj->u.o.cap ? obj->u.o.cap * 2 : 8;
-            /* guard the *2 and the byte-size multiply at the size ceiling */
-            if (nc < obj->u.o.cap ||
-                nc > SIZE_MAX / sizeof *obj->u.o.items) {
-                if (obj->u.o.len == SIZE_MAX)
-                    oom_abort();
-                nc = obj->u.o.len + 1;
-            }
-            obj->u.o.items = realloc(obj->u.o.items, nc * sizeof *obj->u.o.items);
+            size_t nc;
+            if (!grow_cap(obj->u.o.len, 1, obj->u.o.cap, 8,
+                          sizeof *obj->u.o.items, &nc))
+                oom_abort();   /* len == SIZE_MAX: no representable array */
+            obj->u.o.items = realloc(obj->u.o.items,
+                                     nc * sizeof *obj->u.o.items);
             if (!obj->u.o.items)
                 oom_abort();
             obj->u.o.cap = nc;

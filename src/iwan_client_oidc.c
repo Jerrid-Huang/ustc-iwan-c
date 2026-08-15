@@ -65,7 +65,9 @@ int main(int argc, char **argv)
                     "password: pass --socks-token <PASS>, or "
                     "--socks-no-token to confirm an open (passwordless) "
                     "proxy");
-    if (do_connect && !o.socks && !port_is_admin())
+    /* oidc_elevate_root checks the privilege itself (Windows: admin ->
+     * no-op; POSIX: euid 0 -> no-op) */
+    if (do_connect && !o.socks)
         oidc_elevate_root(argc, argv);
 
     char *dir = resolve_config_dir(o.config_dir);

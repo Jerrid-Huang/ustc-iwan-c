@@ -91,6 +91,48 @@ static struct echo_conn *echo_lookup(uint8_t af, const uint32_t *c4,
     return NULL;
 }
 
+/* shared echo state machine (--no-tun mirror): locate/create the
+ * per-4-tuple mirror state and advance the emit seq — SYN opens at
+ * ISN 0 (next emit seq 1), data advances by the payload length, FIN
+ * consumes one extra sequence number. Returns 0 with *seq_out set, or
+ * -1 when the connection table is full. */
+static int echo_seq_advance(uint8_t af, const uint32_t *c4,
+                            const uint8_t c6[16], uint16_t sport,
+                            const uint32_t *t4, const uint8_t t6[16],
+                            uint16_t dport, uint8_t flags,
+                            size_t paylen, uint32_t *seq_out)
+{
+    struct echo_conn *ec = echo_lookup(af, c4, c6, sport, t4, t6, dport,
+                                       (flags & TCP_SYN) != 0);
+    if (!ec)
+        return -1;           /* table full */
+    *seq_out = ec->seq;
+    if (flags & TCP_SYN)
+        ec->seq = 1;
+    else if (flags & TCP_FIN)
+        ec->seq += (uint32_t)paylen + 1;
+    else if (paylen > 0)
+        ec->seq += (uint32_t)paylen;
+    return 0;
+}
+
+/* shared echo ack/flags rules: the mirrored ack advances past the
+ * client's bytes — SYN and FIN each consume one sequence number — and
+ * SYN/FIN echoes carry the ACK flag. Returns the ack; *flags is
+ * updated in place (the caller writes it to the packet). */
+static uint32_t echo_mirror_ack(uint32_t s_orig, size_t paylen, uint8_t *flags)
+{
+    if (*flags & TCP_SYN) {
+        *flags |= TCP_ACK;
+        return s_orig + 1;
+    } else if (*flags & TCP_FIN) {
+        *flags |= TCP_ACK;
+        return s_orig + (uint32_t)paylen + 1;
+    } else {
+        return s_orig + (uint32_t)paylen;
+    }
+}
+
 static int echo_mirror(struct server_ctx *ctx, uint8_t *p, size_t len,
                        int sockfd);
 
@@ -242,12 +284,7 @@ void server_up_stats_print(void)
 }
 
 /* best-effort scrub of secrets, immune to optimizer elision */
-static void wipe(void *p, size_t n)
-{
-    volatile unsigned char *v = p;
-    while (n--)
-        *v++ = 0;
-}
+/* wipe: shared constant-time erasure from crypto.h */
 
 /* printable-only copy of an attacker-controlled string for logging */
 static void log_escape(const char *in, char out[], size_t outsz)
@@ -358,6 +395,20 @@ static void rate_bucket_touch(struct rate_bucket *b, uint32_t ip, uint64_t now)
     }
 }
 
+/* shared skeleton for the per-source rate paths below: lock the rate
+ * table, (re)locate the source's bucket, (re)start its window, and
+ * hand the bucket back with the lock STILL HELD — the caller does its
+ * per-type accounting and then unlocks (the counter read-modify-write
+ * must stay inside the critical section; see g_rate_mu). Small enough
+ * that the compiler inlines it on the per-packet path. */
+static struct rate_bucket *rate_bucket_enter(uint32_t ip, uint64_t now)
+{
+    pthread_mutex_lock(&g_rate_mu);
+    struct rate_bucket *b = rate_bucket_find(ip);
+    rate_bucket_touch(b, ip, now);
+    return b;
+}
+
 /* Per-source token limits on unauthenticated control paths. Over-limit
  * sources are silently dropped (no reject, no log; each drop is counted
  * in g_rate_drops for the per-second stats line) so a single host
@@ -385,9 +436,7 @@ static bool rate_allow(const struct sockaddr_in *peer, uint8_t typ, uint64_t now
      * threads; the mutex is taken on the unauthenticated control types
      * above and on the F4 DATA/CLOSE token-mismatch checks below
      * (rate_token_over/mismatch/zero) */
-    pthread_mutex_lock(&g_rate_mu);
-    b = rate_bucket_find(ip);
-    rate_bucket_touch(b, ip, now);
+    b = rate_bucket_enter(ip, now);
     /* independent per-type counters: a PING flood cannot eat the ECHO
      * budget (or vice versa); OPEN keeps its own, tighter limit */
     cnt = (typ == PT_OPEN) ? &b->open_cnt :
@@ -415,9 +464,7 @@ static bool rate_token_over(const struct sockaddr_in *peer, uint64_t now)
     struct rate_bucket *b;
     bool over;
 
-    pthread_mutex_lock(&g_rate_mu);
-    b = rate_bucket_find(ip);
-    rate_bucket_touch(b, ip, now);
+    b = rate_bucket_enter(ip, now);
     over = b->tok_mis_cnt >= RATE_TOKEN_MISMATCH_MAX;
     pthread_mutex_unlock(&g_rate_mu);
     if (over)
@@ -433,9 +480,7 @@ static void rate_token_mismatch(const struct sockaddr_in *peer, uint64_t now)
     uint32_t ip = (uint32_t)peer->sin_addr.s_addr;
     struct rate_bucket *b;
 
-    pthread_mutex_lock(&g_rate_mu);
-    b = rate_bucket_find(ip);
-    rate_bucket_touch(b, ip, now);
+    b = rate_bucket_enter(ip, now);
     if (b->tok_mis_cnt < RATE_TOKEN_MISMATCH_MAX)
         b->tok_mis_cnt++;
     pthread_mutex_unlock(&g_rate_mu);
@@ -453,9 +498,7 @@ static bool rate_token_zero(const struct sockaddr_in *peer, uint64_t now)
     struct rate_bucket *b;
     bool zero;
 
-    pthread_mutex_lock(&g_rate_mu);
-    b = rate_bucket_find(ip);
-    rate_bucket_touch(b, ip, now);
+    b = rate_bucket_enter(ip, now);
     zero = b->tok_mis_cnt == 0;
     pthread_mutex_unlock(&g_rate_mu);
     return zero;
@@ -582,6 +625,20 @@ static void send_reject(int sockfd, const struct sockaddr_in *peer, const char *
     buf_free(&b);
 }
 
+/* shared OPEN-reject exit: peer string + rate-limited reject log +
+ * reject frame, in that order — identical at every handle_open
+ * rejection. The two "server full" exits unlock ctx->sess_lock BEFORE
+ * calling (the reject must never run under the session-table lock). */
+static void open_reject(int sockfd, const struct sockaddr_in *peer,
+                        const char *user, const char *reason)
+{
+    char peerstr[INET_ADDRSTRLEN + 8];
+
+    peer_to_string(peer, peerstr);
+    log_reject(peerstr, user, reason);
+    send_reject(sockfd, peer, reason);
+}
+
 /* 4 random bytes; cryptographically strong entropy, fail-closed (F6).
  * A guessable token is a session-hijack hole, so there is no acceptable
  * fallback: an RNG failure means the kernel entropy source is broken and
@@ -673,25 +730,19 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
     a.mtu = IWAN_DEFAULT_MTU;
     if (parse_tlvs(raw + IWAN_CTRL_LEN, len - IWAN_CTRL_LEN, open_tlv,
                    &a) != 0) {
-        peer_to_string(peer, peerstr);
-        log_reject(peerstr, a.user, "malformed TLVs");
-        send_reject(sockfd, peer, "malformed TLVs");
+        open_reject(sockfd, peer, a.user, "malformed TLVs");
         return;
     }
 
     if (a.user_too_long) {
         /* an over-long name can never match a users-file entry; reject
          * loudly instead of silently truncating to 63 bytes */
-        peer_to_string(peer, peerstr);
-        log_reject(peerstr, a.user, "username too long");
-        send_reject(sockfd, peer, "username too long");
+        open_reject(sockfd, peer, a.user, "username too long");
         return;
     }
 
     if (!a.have_av) {
-        peer_to_string(peer, peerstr);
-        log_reject(peerstr, a.user, "missing AV");
-        send_reject(sockfd, peer, "missing AV");
+        open_reject(sockfd, peer, a.user, "missing AV");
         return;
     }
 
@@ -702,17 +753,13 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
         }
     }
     if (!pass) {
-        peer_to_string(peer, peerstr);
-        log_reject(peerstr, a.user, "invalid credentials");
-        send_reject(sockfd, peer, "invalid credentials");
+        open_reject(sockfd, peer, a.user, "invalid credentials");
         return;
     }
 
     encrypt_password(pass, a.user, expect);
     if (CRYPTO_memcmp(expect, a.ct, sizeof a.ct) != 0) {
-        peer_to_string(peer, peerstr);
-        log_reject(peerstr, a.user, "invalid credentials");
-        send_reject(sockfd, peer, "invalid credentials");
+        open_reject(sockfd, peer, a.user, "invalid credentials");
         return;
     }
 
@@ -741,9 +788,7 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
     }
     if (slot < 0) {
         pthread_rwlock_unlock(&ctx->sess_lock);
-        peer_to_string(peer, peerstr);
-        log_reject(peerstr, a.user, "server full");
-        send_reject(sockfd, peer, "server full");
+        open_reject(sockfd, peer, a.user, "server full");
         return;
     }
 
@@ -770,9 +815,7 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
         }
         if (i == (int)pool || i == 65536) {
             pthread_rwlock_unlock(&ctx->sess_lock);
-            peer_to_string(peer, peerstr);
-            log_reject(peerstr, a.user, "server full");
-            send_reject(sockfd, peer, "server full");
+            open_reject(sockfd, peer, a.user, "server full");
             return;
         }
         ipu = probe;
@@ -1055,6 +1098,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
         break;
 
     case PT_PING_REQ:
+    case PT_ECHO_REQ:
         if (!verify_sig(raw, len))
             return;
         /* Common path (same peer, valid token) takes only the read
@@ -1063,8 +1107,9 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
          * A peer change (rebind) upgrades to the write lock — gated on
          * the source's token-mismatch history (F4) so a guessed token
          * cannot claim the session from an address that has been
-         * spraying. PING_RSP is still sent regardless: it is a liveness
-         * oracle by design and must not become a token oracle. */
+         * spraying. The PING_RSP / ECHO_RES reply is still sent
+         * regardless: it is a liveness oracle by design and must not
+         * become a token oracle. */
         pthread_rwlock_rdlock(&ctx->sess_lock);
         s = find_session_unlocked(ctx, sid);
         if (s && CRYPTO_memcmp(&s->token, &tok, sizeof tok) == 0) {
@@ -1086,37 +1131,10 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
             pthread_rwlock_unlock(&ctx->sess_lock);
         }
         buf_init(&b);
-        ctrl_hdr(&b, PT_PING_RSP, 0, IWAN_PING_SID, IWAN_PING_TOK);
-        udp_send(sockfd, peer, b.data, b.len);
-        buf_free(&b);
-        break;
-
-    case PT_ECHO_REQ:
-        if (!verify_sig(raw, len))
-            return;
-        /* same read-lock fast path / write-lock rebind as PING_REQ */
-        pthread_rwlock_rdlock(&ctx->sess_lock);
-        s = find_session_unlocked(ctx, sid);
-        if (s && CRYPTO_memcmp(&s->token, &tok, sizeof tok) == 0) {
-            if (memcmp(&s->peer, peer, sizeof *peer) == 0) {
-                atomic_store(&s->last_active_ms, now_ms()); /* keepalive */
-                pthread_rwlock_unlock(&ctx->sess_lock);
-            } else {
-                pthread_rwlock_unlock(&ctx->sess_lock);
-                pthread_rwlock_wrlock(&ctx->sess_lock);
-                s = find_session_unlocked(ctx, sid);
-                if (s && CRYPTO_memcmp(&s->token, &tok, sizeof tok) == 0 &&
-                    rate_token_zero(peer, now)) {
-                    s->peer = *peer;
-                    atomic_store(&s->last_active_ms, now_ms());
-                }
-                pthread_rwlock_unlock(&ctx->sess_lock);
-            }
-        } else {
-            pthread_rwlock_unlock(&ctx->sess_lock);
-        }
-        buf_init(&b);
-        ctrl_hdr(&b, PT_ECHO_RES, raw[1], sid, tok);
+        if (typ == PT_PING_REQ)
+            ctrl_hdr(&b, PT_PING_RSP, 0, IWAN_PING_SID, IWAN_PING_TOK);
+        else
+            ctrl_hdr(&b, PT_ECHO_RES, raw[1], sid, tok);
         udp_send(sockfd, peer, b.data, b.len);
         buf_free(&b);
         break;
@@ -1175,20 +1193,9 @@ static int echo_mirror6(struct server_ctx *ctx, uint8_t *p, size_t len,
     flags = p[53];
     paylen = len - 40 - thlen;
 
-    {
-        struct echo_conn *ec = echo_lookup(6, NULL, p + 8, sport,
-                                           NULL, p + 24, dport,
-                                           (flags & TCP_SYN) != 0);
-        if (!ec)
-            return -1;           /* table full */
-        seq = ec->seq;
-        if (flags & TCP_SYN)
-            ec->seq = 1;
-        else if (flags & TCP_FIN)
-            ec->seq += (uint32_t)paylen + 1;
-        else if (paylen > 0)
-            ec->seq += (uint32_t)paylen;
-    }
+    if (echo_seq_advance(6, NULL, p + 8, sport, NULL, p + 24, dport,
+                         flags, paylen, &seq) != 0)
+        return -1;           /* table full */
     /* swap addresses byte-wise */
     memcpy(tmp16, p + 8, 16);
     memcpy(p + 8, p + 24, 16);
@@ -1199,15 +1206,7 @@ static int echo_mirror6(struct server_ctx *ctx, uint8_t *p, size_t len,
     p[42] = (uint8_t)(sport >> 8);
     p[43] = (uint8_t)sport;
     /* mirrored ack advances past the client's bytes; seq from the table */
-    if (flags & TCP_SYN) {
-        ack = s_orig + 1;
-        flags |= TCP_ACK;
-    } else if (flags & TCP_FIN) {
-        ack = s_orig + (uint32_t)paylen + 1;
-        flags |= TCP_ACK;
-    } else {
-        ack = s_orig + (uint32_t)paylen;
-    }
+    ack = echo_mirror_ack(s_orig, paylen, &flags);
     p[53] = flags;
     p[44] = (uint8_t)(seq >> 24);
     p[45] = (uint8_t)(seq >> 16);
@@ -1295,20 +1294,9 @@ int echo_mirror(struct server_ctx *ctx, uint8_t *p, size_t len,
     /* per-connection mirror state: SYN opens at ISN 0, data and FIN
      * advance our emit seq (a stateless swap would repeat the same seq
      * and the client would discard every mirrored segment as OOO) */
-    {
-        struct echo_conn *ec = echo_lookup(4, &nsrc, NULL, sport,
-                                           &ndst, NULL, dport,
-                                           (flags & TCP_SYN) != 0);
-        if (!ec)
-            return -1;           /* table full */
-        seq = ec->seq;
-        if (flags & TCP_SYN)
-            ec->seq = 1;
-        else if (flags & TCP_FIN)
-            ec->seq += (uint32_t)paylen + 1;
-        else if (paylen > 0)
-            ec->seq += (uint32_t)paylen;
-    }
+    if (echo_seq_advance(4, &nsrc, NULL, sport, &ndst, NULL, dport,
+                         flags, paylen, &seq) != 0)
+        return -1;           /* table full */
     /* swap addresses byte-wise (never through a host-endian u32: the
      * little-endian memcpy round-trip would byte-reverse them) */
     memcpy(tmp4, p + 12, 4);
@@ -1321,15 +1309,7 @@ int echo_mirror(struct server_ctx *ctx, uint8_t *p, size_t len,
     p[ihl + 3] = (uint8_t)sport;
     /* mirrored ack advances past the client's bytes (SYN/FIN each
      * consume one sequence number); mirrored seq came from the table */
-    if (flags & TCP_SYN) {
-        ack = s_orig + 1;
-        flags |= TCP_ACK;
-    } else if (flags & TCP_FIN) {
-        ack = s_orig + (uint32_t)paylen + 1;
-        flags |= TCP_ACK;
-    } else {
-        ack = s_orig + (uint32_t)paylen;
-    }
+    ack = echo_mirror_ack(s_orig, paylen, &flags);
     p[ihl + 13] = flags;
     p[ihl + 4] = (uint8_t)(seq >> 24);
     p[ihl + 5] = (uint8_t)(seq >> 16);

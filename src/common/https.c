@@ -1,5 +1,4 @@
 #include <stdbool.h>
-#include <ctype.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdint.h>
@@ -46,18 +45,10 @@ __attribute__((noinline))
 #endif
 static void sbuf_app(struct sbuf *s, const void *p, size_t n)
 {
-    if (n > SIZE_MAX - s->len - 1)
+    size_t nc;
+    if (!grow_cap(s->len, n + 1, s->cap, 256, 1, &nc))
         oom_abort();   /* length overflow: no representable buffer */
-    size_t need = s->len + n + 1;
-    if (need > s->cap) {
-        size_t nc = s->cap ? s->cap * 2 : 256;
-        while (nc < need) {
-            if (nc > SIZE_MAX / 2) {
-                nc = need;
-                break;
-            }
-            nc *= 2;
-        }
+    if (nc > s->cap) {
         s->d = realloc(s->d, nc);
         if (!s->d)
             oom_abort();
@@ -75,15 +66,8 @@ static long hex_parse_sz(const char *s, size_t n)
 {
     long v = 0;
     for (size_t i = 0; i < n; i++) {
-        int h;
-        char c = s[i];
-        if (c >= '0' && c <= '9')
-            h = c - '0';
-        else if (c >= 'a' && c <= 'f')
-            h = c - 'a' + 10;
-        else if (c >= 'A' && c <= 'F')
-            h = c - 'A' + 10;
-        else
+        int h = hex_nibble(s[i]);
+        if (h < 0)
             return -1;
         if (v > (HTTPS_CHUNK_SZ_CAP - h) / 16)
             return -1;

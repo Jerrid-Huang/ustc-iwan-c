@@ -56,16 +56,59 @@ struct RelayProxy {
  * connection threads may still be reading it. One proxy per process. */
 struct RelayProxy *g_rp_current;
 
-/* constant-time byte compare (auth token) */
-static int rp_ct_eq(const uint8_t *a, const uint8_t *b, size_t n)
-{
-    uint8_t d = 0;
-    for (size_t i = 0; i < n; i++)
-        d |= a[i] ^ b[i];
-    return d == 0;
-}
-
 /* ---- target resolution/connect (kernel stack) ---- */
+
+/* literal IPv4/IPv6: connect directly, no resolution. The connect is
+ * synchronous: immediate success is taken, EINPROGRESS is polled for
+ * writability within RP_CONNECT_TIMEOUT_MS and then SO_ERROR is
+ * checked. NOTE: no port_set_nonblock here — the literal paths are
+ * blocking-style (the domain path below sets nonblock because it must
+ * try many addresses). */
+static int rp_connect_literal(int af, const void *addr, uint16_t port,
+                              int *fd_out)
+{
+    struct sockaddr_storage ss;
+    socklen_t salen;
+    int fd = port_socket(af, SOCK_STREAM, 0);
+
+    if (fd < 0)
+        return -1;
+    memset(&ss, 0, sizeof ss);
+    if (af == AF_INET) {
+        struct sockaddr_in *sa = (struct sockaddr_in *)&ss;
+        sa->sin_family = AF_INET;
+        memcpy(&sa->sin_addr, addr, 4);
+        sa->sin_port = htons(port);
+        salen = sizeof *sa;
+    } else {
+        struct sockaddr_in6 *sa = (struct sockaddr_in6 *)&ss;
+        sa->sin6_family = AF_INET6;
+        memcpy(&sa->sin6_addr, addr, 16);
+        sa->sin6_port = htons(port);
+        salen = sizeof *sa;
+    }
+    if (port_connect(fd, (struct sockaddr *)&ss, salen) == 0 ||
+        errno == EINPROGRESS) {
+        struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+        if (errno == EINPROGRESS) {
+            if (port_poll(&pfd, 1, RP_CONNECT_TIMEOUT_MS) <= 0) {
+                port_close(fd);
+                return -1;
+            }
+            int soerr = 0;
+            socklen_t sl = sizeof soerr;
+            if (port_getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr,
+                                &sl) != 0 || soerr != 0) {
+                port_close(fd);
+                return -1;
+            }
+        }
+        *fd_out = fd;
+        return 0;
+    }
+    port_close(fd);
+    return -1;
+}
 
 static int rp_connect_target(int *fd_out, const char *host, uint16_t port,
                              bool have_ip4, const uint8_t ip4[4],
@@ -82,66 +125,10 @@ static int rp_connect_target(int *fd_out, const char *host, uint16_t port,
 
     if (have_ip4) {
         /* literal IPv4: connect directly, no resolution */
-        int fd = port_socket(AF_INET, SOCK_STREAM, 0);
-        if (fd >= 0) {
-            struct sockaddr_in sa;
-            memset(&sa, 0, sizeof sa);
-            sa.sin_family = AF_INET;
-            memcpy(&sa.sin_addr, ip4, 4);
-            sa.sin_port = htons(port);
-            if (port_connect(fd, (struct sockaddr *)&sa, sizeof sa) == 0 ||
-                errno == EINPROGRESS) {
-                struct pollfd pfd = { .fd = fd, .events = POLLOUT };
-                if (errno == EINPROGRESS) {
-                    if (port_poll(&pfd, 1, RP_CONNECT_TIMEOUT_MS) <= 0) {
-                        port_close(fd);
-                        return -1;
-                    }
-                    int soerr = 0;
-                    socklen_t sl = sizeof soerr;
-                    if (port_getsockopt(fd, SOL_SOCKET, SO_ERROR,
-                                        &soerr, &sl) != 0 || soerr != 0) {
-                        port_close(fd);
-                        return -1;
-                    }
-                }
-                *fd_out = fd;
-                return 0;
-            }
-            port_close(fd);
-        }
-        return -1;
+        return rp_connect_literal(AF_INET, ip4, port, fd_out);
     }
     if (have_ip6) {
-        int fd = port_socket(AF_INET6, SOCK_STREAM, 0);
-        if (fd >= 0) {
-            struct sockaddr_in6 sa;
-            memset(&sa, 0, sizeof sa);
-            sa.sin6_family = AF_INET6;
-            memcpy(&sa.sin6_addr, ip6, 16);
-            sa.sin6_port = htons(port);
-            if (port_connect(fd, (struct sockaddr *)&sa, sizeof sa) == 0 ||
-                errno == EINPROGRESS) {
-                struct pollfd pfd = { .fd = fd, .events = POLLOUT };
-                if (errno == EINPROGRESS) {
-                    if (port_poll(&pfd, 1, RP_CONNECT_TIMEOUT_MS) <= 0) {
-                        port_close(fd);
-                        return -1;
-                    }
-                    int soerr = 0;
-                    socklen_t sl = sizeof soerr;
-                    if (port_getsockopt(fd, SOL_SOCKET, SO_ERROR,
-                                        &soerr, &sl) != 0 || soerr != 0) {
-                        port_close(fd);
-                        return -1;
-                    }
-                }
-                *fd_out = fd;
-                return 0;
-            }
-            port_close(fd);
-        }
-        return -1;
+        return rp_connect_literal(AF_INET6, ip6, port, fd_out);
     }
     /* domain: resolve, then try every address (v4 and v6) */
     if (getaddrinfo(host, port_s, &hints, &res) != 0)
@@ -246,7 +233,7 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
                 if (token) {
                     size_t tlen = strlen(token);
                     if (plen != tlen ||
-                        rp_ct_eq(pass, (const uint8_t *)token, tlen) == 0)
+                        ct_eq(pass, (const uint8_t *)token, tlen) == 0)
                         rr[1] = 1;
                 }
                 (void)port_send(fd, rr, 2, 0);

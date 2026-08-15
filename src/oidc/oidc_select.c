@@ -7,6 +7,7 @@
 #include "common.h"
 #include "json.h"
 #include "oidc.h"
+#include "util.h"   /* oidc_eprintf is err_printf (oidc.h) */
 
 /* display width: East Asian wide/fullwidth codepoints count as 2 columns */
 static int utf8_width(const char *s)

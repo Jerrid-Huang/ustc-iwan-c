@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "common.h"
+#include "util.h"
 
 static void usage_exit(const cli_ctl *ctl)
 {
@@ -52,20 +53,21 @@ static void err_bool_value(const cli_ctl *ctl, const char *name,
 
 /* validate and parse an unsigned value; returns it, or exits with a
  * clap-style error. The actual parsing lives in the shared parse_uint
- * (common.h); here we only classify the failure into a message. */
+ * (common.h); here we only classify the failure into a message, using
+ * parse_uint's three-state return instead of re-scanning the string. */
 static uint64_t check_uint(const cli_ctl *ctl, const char *name,
                            const char *valname, const char *val,
                            uint64_t max, const char *maxstr)
 {
     uint64_t v;
-    if (parse_uint(val, max, &v) != 0) {
+    int rc = parse_uint(val, max, &v);
+    if (rc != PARSE_UINT_OK) {
         if (*val == '\0')
             err_bad_value(ctl, name, valname, val,
                           "cannot parse integer from empty string");
-        for (const char *p = val; *p; p++)
-            if (*p < '0' || *p > '9')
-                err_bad_value(ctl, name, valname, val,
-                              "invalid digit found in string");
+        if (rc == PARSE_UINT_BAD)
+            err_bad_value(ctl, name, valname, val,
+                          "invalid digit found in string");
         char msg[96];
         snprintf(msg, sizeof msg, "%s is not in 0..=%s", val, maxstr);
         err_bad_value(ctl, name, valname, val, msg);

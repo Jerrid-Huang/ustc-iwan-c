@@ -3,6 +3,7 @@
 
 #include <stdatomic.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 bool debug_enabled(void);
@@ -25,10 +26,51 @@ void oom_abort(void);
 void log_info(const char *fmt, ...);   /* -> stdout */
 void log_err(const char *fmt, ...);    /* -> stderr */
 void log_debug(const char *fmt, ...);  /* -> stderr if IWAN_DEBUG */
+/* raw stderr printf (no newline, no flush): the shared implementation
+ * behind the eprintf/oidc_eprintf helpers (log_err appends a newline
+ * instead) */
+void err_printf(const char *fmt, ...);
 
 /* diagnostic env flags (IWAN_RXDBG / IWAN_RETX / IWAN_FLOWDBG): parsed
  * once per name and cached; any value other than 0/false/off enables */
 bool dbg_env(const char *name);
+
+/* ---------------- shared parsing / buffer-growth helpers ---------------- */
+
+/* 0-15 for a hex digit ('0'-'9', 'a'-'f', 'A'-'F'), else -1 */
+static inline int hex_nibble(char c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+/* Grow a heap buffer's capacity. `used` is the current fill, `extra` the
+ * additional capacity that must become representable, `cap` the current
+ * capacity, `init` the capacity of a fresh empty buffer (used when
+ * cap==0), `esize` the size of one element in bytes (1 for a byte
+ * buffer). Doubles from the current capacity until `used + extra` fits,
+ * degrading to the exact needed size at the size_t ceiling (both the *2
+ * and the byte-size multiply are guarded). Returns the new capacity
+ * (stored in *newcap; == cap when nothing needed to grow), or 0 when
+ * `used + extra` is not representable (callers abort: allocation failure
+ * is fatal in this codebase). */
+size_t grow_cap(size_t used, size_t extra, size_t cap, size_t init,
+                size_t esize, size_t *newcap);
+
+/* parse_uint result codes (the function itself is declared in common.h;
+ * the three-state contract below supersedes its "0/-1" doc comment):
+ * 0 on success; on failure the code tells check_uint (cli.c) which clap
+ * message to emit without re-scanning the string. */
+enum {
+    PARSE_UINT_OK = 0,     /* parsed; *out holds the value */
+    PARSE_UINT_BAD = -1,   /* empty string or a non-digit character */
+    PARSE_UINT_RANGE = -2, /* all digits, but the value exceeds max */
+};
 
 /* ---------------- process-wide signal state ---------------- */
 

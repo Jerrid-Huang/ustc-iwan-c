@@ -225,6 +225,35 @@ void accept_connections(int listener) {
  * seg_compact() memmoves the retransmit slots and retransmit re-seals
  * them in place, both illegal while a zerocopy notification is
  * outstanding. This GSO+sendmmsg shape is the local optimum. */
+
+/* One transient EAGAIN/ENOBUFS/EPERM drain stall (EINTR is handled by
+ * the caller before this runs): emit a throttled diagnostic — one per
+ * second per drain path, each call site keeps its own last_diag static,
+ * so a GSO stall and a sendmmsg stall within the same second are both
+ * reported — then wait up to 1ms for the socket to become writable
+ * (writable means the buffer drained, so resend immediately; the old
+ * poll-then-usleep inverted this and slept AFTER a writable poll).
+ * Returns 1 to retry, or 0 when the bounded retry budget (shared by the
+ * whole socks_send_batch2 drain via retry_t0) is exhausted: the caller
+ * then returns whatever it has sent so far, giving the event loop its
+ * receive turn (see the function comment). Same retry shape as proxy.c
+ * send_gso / send_batch. */
+static int socks_send_stall_wait(int sockfd, uint64_t retry_t0,
+                                 uint64_t *last_diag, const char *diag_fmt,
+                                 int npk, unsigned sent)
+{
+    uint64_t nowd = now_ms();
+    if (nowd - *last_diag >= 1000) {
+        *last_diag = nowd;
+        log_err(diag_fmt, strerror(errno), npk, sent);
+    }
+    struct pollfd pfd = { .fd = sockfd, .events = POLLOUT };
+    (void)port_poll(&pfd, 1, 1);
+    if (now_ms() - retry_t0 >= SOCKS_SEND_RETRY_MS)
+        return 0;
+    return 1;
+}
+
 static int socks_send_batch2(int sockfd, SocksConfig *cfg,
                              struct iovec *iovs, struct mmsghdr *msgs,
                              int npk, size_t total, size_t mss)
@@ -277,25 +306,10 @@ static int socks_send_batch2(int sockfd, SocksConfig *cfg,
                         /* throttled diagnostic: identify which error
                          * wedges the drain under burst load */
                         static uint64_t last_diag;
-                        uint64_t nowd = now_ms();
-                        if (nowd - last_diag >= 1000) {
-                            last_diag = nowd;
-                            log_err("SOCKS GSO EAGAIN: %s (npk=%d)",
-                                    strerror(errno), npk);
-                        }
-                        /* wait up to 1ms for the socket to become
-                         * writable, then retry immediately: writable
-                         * means the buffer drained, so resend now (the
-                         * old poll-then-usleep inverted this and slept
-                         * AFTER a writable poll). Bounded: beyond the
-                         * budget, give the event loop its receive turn
-                         * (see the function comment). The items stay
-                         * queued — the caller only pops what was sent.
-                         * Same retry shape as proxy.c send_gso. */
-                        struct pollfd pfd = { .fd = sockfd,
-                                              .events = POLLOUT };
-                        (void)port_poll(&pfd, 1, 1);
-                        if (now_ms() - retry_t0 >= SOCKS_SEND_RETRY_MS)
+                        if (!socks_send_stall_wait(sockfd, retry_t0,
+                                                   &last_diag,
+                                                   "SOCKS GSO EAGAIN: %s (npk=%d)",
+                                                   npk, 0))
                             return 0;
                     }
                     continue;
@@ -364,15 +378,9 @@ per_msg:
                  * and let the main loop cycle (see the function
                  * comment). */
                 static uint64_t last_diag;
-                uint64_t nowd = now_ms();
-                if (nowd - last_diag >= 1000) {
-                    last_diag = nowd;
-                    log_err("SOCKS sendmmsg EAGAIN: %s (npk=%d sent=%u)",
-                            strerror(errno), npk, sent);
-                }
-                struct pollfd pfd = { .fd = sockfd, .events = POLLOUT };
-                (void)port_poll(&pfd, 1, 1);
-                if (now_ms() - retry_t0 >= SOCKS_SEND_RETRY_MS)
+                if (!socks_send_stall_wait(sockfd, retry_t0, &last_diag,
+                                           "SOCKS sendmmsg EAGAIN: %s (npk=%d sent=%u)",
+                                           npk, sent))
                     return (int)sent;
                 continue;
             }
@@ -723,6 +731,16 @@ static int socks_reauth_tunnel(SocksConfig *cfg)
     return newfd;
 }
 
+/* re-auth succeeded: swap the tunnel socket in place */
+static void socks_reauth_swap(int *sockfd, int nfd)
+{
+    if (nfd < 0)
+        return;
+    port_close(*sockfd);
+    *sockfd = nfd;
+    g_sockfd = nfd;
+}
+
 int run_socks(int sockfd, SocksConfig *cfg) {
     int listener;
 
@@ -862,11 +880,8 @@ int run_socks(int sockfd, SocksConfig *cfg) {
             log_err("SOCKS: no downlink for %llu ms; re-authing tunnel",
                     (unsigned long long)(now_ms() - cfg->last_rx));
             int nfd = socks_reauth_tunnel(cfg);
-            if (nfd >= 0) {
-                port_close(sockfd);
-                sockfd = nfd;
-                g_sockfd = nfd;
-            } else if (!cfg->reauth) {
+            socks_reauth_swap(&sockfd, nfd);
+            if (nfd < 0 && !cfg->reauth) {
                 cfg->session_lost = true;
                 g_stop = 1;
                 break;
@@ -875,11 +890,7 @@ int run_socks(int sockfd, SocksConfig *cfg) {
         /* a failed re-auth retries on this schedule */
         if (cfg->reauth_at != 0 && now_ms() >= cfg->reauth_at) {
             int nfd = socks_reauth_tunnel(cfg);
-            if (nfd >= 0) {
-                port_close(sockfd);
-                sockfd = nfd;
-                g_sockfd = nfd;
-            }
+            socks_reauth_swap(&sockfd, nfd);
         }
         /* flush leftover tx items first: their segment pointers stay
          * valid only until receive_vpn's handle_rx drop/compact moves
@@ -892,13 +903,10 @@ int run_socks(int sockfd, SocksConfig *cfg) {
              * success; on failure it stays cleared so the retry runs
              * on the reauth_at schedule instead of every loop round. */
             int nfd = socks_reauth_tunnel(cfg);
-            if (nfd >= 0) {
-                port_close(sockfd);
-                sockfd = nfd;
-                g_sockfd = nfd;
-            } else if (!cfg->reauth) {
+            socks_reauth_swap(&sockfd, nfd);
+            if (nfd < 0 && !cfg->reauth) {
                 break;
-            } else {
+            } else if (nfd < 0) {
                 cfg->session_lost = false;
             }
         }
@@ -909,11 +917,8 @@ int run_socks(int sockfd, SocksConfig *cfg) {
             log_err("SOCKS: %d consecutive keepalive send failures; "
                     "re-authing tunnel", cfg->ka_fail);
             int nfd = socks_reauth_tunnel(cfg);
-            if (nfd >= 0) {
-                port_close(sockfd);
-                sockfd = nfd;
-                g_sockfd = nfd;
-            } else if (!cfg->reauth) {
+            socks_reauth_swap(&sockfd, nfd);
+            if (nfd < 0 && !cfg->reauth) {
                 cfg->session_lost = true;
                 g_stop = 1;
                 break;
@@ -924,12 +929,9 @@ int run_socks(int sockfd, SocksConfig *cfg) {
             /* server CLOSE / hard recv error: re-auth in place when a
              * callback exists, else legacy exit for the caller loop */
             int nfd = socks_reauth_tunnel(cfg);
-            if (nfd >= 0) {
-                port_close(sockfd);
-                sockfd = nfd;
-                g_sockfd = nfd;
+            socks_reauth_swap(&sockfd, nfd);
+            if (nfd >= 0)
                 continue;
-            }
             if (!cfg->reauth) {
                 cfg->session_lost = true;
                 g_stop = 1;

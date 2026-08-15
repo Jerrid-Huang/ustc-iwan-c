@@ -416,15 +416,25 @@ static struct tcp_pcb *conn_pcb_new(TcpConn *c)
     return pcb;
 }
 
-int ns_connect(Netstack *ns, uint16_t lport, uint32_t rip, uint16_t rport)
+/* shared connect path: slot allocation, per-af endpoint setup, bind/
+ * connect and the abort-first failure cleanup are identical between the
+ * IPv4 and IPv6 entry points; only the address-family handling differs */
+static int conn_connect_af(Netstack *ns, uint16_t lport, uint8_t af,
+                           uint32_t rip, const uint8_t rip6[16],
+                           uint16_t rport)
 {
     TcpConn *c;
     int idx = conn_slot_alloc(ns, &c);
     if (idx < 0)
         return -1;
 
-    c->af = 4;
-    c->rip = rip;
+    if (af == 6) {
+        c->af = 6;
+        memcpy(c->rip6, rip6, 16);
+    } else {
+        c->af = 4;
+        c->rip = rip;
+    }
     c->lport = lport;
     c->rport = rport;
 
@@ -433,9 +443,19 @@ int ns_connect(Netstack *ns, uint16_t lport, uint32_t rip, uint16_t rport)
         return -1;
 
     ip_addr_t ip;
-    /* _val variant: with LWIP_IPV6=1 the plain macro wraps the set in
-     * if(ipaddr){...}, and &ip is an lvalue -> -Waddress under -Werror */
-    ip_addr_set_ip4_u32_val(ip, lwip_htonl(rip));
+    if (af == 6) {
+        /* ip6_addr_t stores the raw wire bytes (packed form, see ns_init) */
+        ip6_addr_t a6;
+        memset(&a6, 0, sizeof a6);
+        memcpy(a6.addr, rip6, 16);
+        memset(&ip, 0, sizeof ip);
+        ip.type = IPADDR_TYPE_V6;
+        ip.u_addr.ip6 = a6;
+    } else {
+        /* _val variant: with LWIP_IPV6=1 the plain macro wraps the set in
+         * if(ipaddr){...}, and &ip is an lvalue -> -Waddress under -Werror */
+        ip_addr_set_ip4_u32_val(ip, lwip_htonl(rip));
+    }
 
     if (tcp_bind(pcb, IP_ADDR_ANY, lport) != ERR_OK)
         goto fail;
@@ -458,51 +478,15 @@ fail:
     return -1;
 }
 
+int ns_connect(Netstack *ns, uint16_t lport, uint32_t rip, uint16_t rport)
+{
+    return conn_connect_af(ns, lport, 4, rip, NULL, rport);
+}
+
 int ns_connect6(Netstack *ns, uint16_t lport, const uint8_t rip6[16],
                 uint16_t rport)
 {
-    TcpConn *c;
-    int idx = conn_slot_alloc(ns, &c);
-    if (idx < 0)
-        return -1;
-
-    c->af = 6;
-    memcpy(c->rip6, rip6, 16);
-    c->lport = lport;
-    c->rport = rport;
-
-    struct tcp_pcb *pcb = conn_pcb_new(c);
-    if (pcb == NULL)
-        return -1;
-
-    /* ip6_addr_t stores the raw wire bytes (packed form, see ns_init) */
-    ip6_addr_t a6;
-    memset(&a6, 0, sizeof a6);
-    memcpy(a6.addr, rip6, 16);
-    ip_addr_t ip;
-    memset(&ip, 0, sizeof ip);
-    ip.type = IPADDR_TYPE_V6;
-    ip.u_addr.ip6 = a6;
-
-    if (tcp_bind(pcb, IP_ADDR_ANY, lport) != ERR_OK)
-        goto fail;
-    if (tcp_connect(pcb, &ip, rport, bridge_connected) != ERR_OK)
-        goto fail;
-    tcp_nagle_disable(pcb);
-
-    c->pcb = pcb;
-    c->state = NS_SYN_SENT;
-    return idx;
-
-fail:
-    /* abort FIRST, while the arg is still the conn: tcp_abort fires the
-     * err callback synchronously, and bridge_err early-returns on a NULL
-     * pcb (c->pcb is not assigned until success). Nulling the arg first
-     * would make bridge_err dereference a NULL conn (crash). */
-    tcp_abort(pcb);
-    tcp_arg(pcb, NULL);
-    c->pcb = NULL;
-    return -1;
+    return conn_connect_af(ns, lport, 6, 0, rip6, rport);
 }
 
 TcpConn *ns_conn(Netstack *ns, int idx)

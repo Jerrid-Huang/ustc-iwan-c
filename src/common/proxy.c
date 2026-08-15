@@ -48,13 +48,6 @@ typedef struct {
 
 atomic_uint_fast64_t g_prof_pump_tx, g_prof_pump_rx;   /* [prof] tunnel bytes */
 
-static void eprintf(const char *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
-    va_end(ap);
-}
-
 /* send one control frame on the shared socket. Must hold send_lock and
  * clear any lingering UDP_SEGMENT first: with GSO active and an mss
  * smaller than the frame, the kernel would split the 24-byte control
@@ -144,6 +137,23 @@ static unsigned pump_rx_stale_ms(void)
 #define PUMP_MAX_LAT_US 20
 #endif
 
+/* EAGAIN/ENOBUFS backpressure wait shared by the two TX paths: sleep
+ * for the remaining retry budget (poll for writability; with the 5ms
+ * budget the remaining-time cap always binds), then report whether the
+ * budget is spent. Returns 1 when the caller should retry the send, 0
+ * when it must give up and yield to the receive path (which drains the
+ * socket and clears the backpressure). NOTE: mirrors the retry skeleton
+ * of socks.c socks_send_batch2 — keep the two in sync. */
+static int pump_send_retry(pump_ctx_t *ctx, uint64_t retry_t0)
+{
+    uint64_t el = now_ms() - retry_t0;
+    if (el >= PUMP_SEND_RETRY_MS)
+        return 0;
+    struct pollfd pfd = { .fd = ctx->sockfd, .events = POLLOUT };
+    port_poll(&pfd, 1, (int)(PUMP_SEND_RETRY_MS - el));
+    return 1;
+}
+
 /* send a packet batch; retry partial sends and EAGAIN instead of dropping.
  * A full socket buffer backpressures the TUN read loop (kernel TCP then
  * throttles the app); only fatal errors stop the pump.
@@ -177,22 +187,18 @@ static void send_batch(pump_ctx_t *ctx, struct mmsghdr *msgs, unsigned n)
             errno == ENOBUFS || errno == EPERM) {
             /* EPERM: netfilter OUTPUT DROP returns EPERM for the
              * dropped datagram — transient per-packet, retry like
-             * EAGAIN (poll must never outlive the retry budget: cap
-             * the wait at the remaining budget (min(100ms, budget-left);
-             * with the 5ms budget the remaining time always binds) and
-             * stop retrying once it is spent — an unbounded retry here
-             * wedges the pump, while the receive thread (udp2tun) keeps
-             * draining the socket so backpressure clears once we stop
-             * hammering it. poll() already waited for writability, so
-             * no post-poll usleep. */
-            uint64_t el = now_ms() - retry_t0;
-            if (el >= PUMP_SEND_RETRY_MS)
+             * EAGAIN. The wait lives in pump_send_retry: poll at most
+             * the remaining retry budget (with the 5ms budget the
+             * remaining time always binds), then stop retrying once it
+             * is spent — an unbounded retry here wedges the pump, while
+             * the receive thread (udp2tun) keeps draining the socket so
+             * backpressure clears once we stop hammering it. poll()
+             * already waited for writability, so no post-poll usleep. */
+            if (!pump_send_retry(ctx, retry_t0))
                 return;
-            struct pollfd pfd = { .fd = ctx->sockfd, .events = POLLOUT };
-            port_poll(&pfd, 1, (int)(PUMP_SEND_RETRY_MS - el));
             continue;
         }
-        eprintf("[TUN->UDP] sendmmsg: %s\n", strerror(errno));
+        err_printf("[TUN->UDP] sendmmsg: %s\n", strerror(errno));
         g_stop = 1;
         return;
     }
@@ -222,7 +228,7 @@ static int send_gso(pump_ctx_t *ctx, struct iovec *iov, unsigned n,
         ctx->gso_ok = port_setsockopt(ctx->sockfd, SOL_UDP, UDP_SEGMENT,
                                       &m, sizeof m) == 0;
         if (!ctx->gso_ok) {
-            eprintf("[TUN->UDP] UDP_SEGMENT unsupported, using sendmmsg\n");
+            err_printf("[TUN->UDP] UDP_SEGMENT unsupported, using sendmmsg\n");
             return 0;
         }
         ctx->gso_mss = mss;
@@ -275,14 +281,11 @@ static int send_gso(pump_ctx_t *ctx, struct iovec *iov, unsigned n,
              * EAGAIN (same budget-bounded wait as send_batch: poll at
              * most the remaining retry budget, then yield to the
              * receive path) */
-            uint64_t el = now_ms() - retry_t0;
-            if (el >= PUMP_SEND_RETRY_MS)
+            if (!pump_send_retry(ctx, retry_t0))
                 return 1;   /* bounded: let the receive path drain */
-            struct pollfd pfd = { .fd = ctx->sockfd, .events = POLLOUT };
-            port_poll(&pfd, 1, (int)(PUMP_SEND_RETRY_MS - el));
             continue;
         }
-        eprintf("[TUN->UDP] sendmsg GSO failed: %s; disabling "
+        err_printf("[TUN->UDP] sendmsg GSO failed: %s; disabling "
                 "UDP_SEGMENT\n", strerror(errno));
         /* a hard GSO error means the feature is unusable on this
          * socket, not that the tunnel died: disable it and fall back
@@ -507,7 +510,7 @@ static void *udp2tun_thread(void *ud) {
                     g_stop = 1;
                     break;
                 }
-                eprintf("[UDP->TUN] keepalive send err: %s (retry "
+                err_printf("[UDP->TUN] keepalive send err: %s (retry "
                         "%d/%d)\n", strerror(e), ka_fail,
                         PUMP_KA_FAIL_MAX);
             } else {
@@ -527,7 +530,7 @@ static void *udp2tun_thread(void *ud) {
                 struct pollfd pfd = { .fd = ctx->sockfd, .events = POLLIN };
                 int pr = port_poll(&pfd, 1, to);
                 if (pr < 0 && errno != EINTR) {
-                    eprintf("[UDP->TUN] poll err\n");
+                    err_printf("[UDP->TUN] poll err\n");
                     ctx->session_lost = true;   /* abnormal: reconnect */
                     g_stop = 1;   /* any pump-fatal error stops the tunnel */
                     break;
@@ -590,7 +593,7 @@ static void *udp2tun_thread(void *ud) {
             if (t != PT_DATA && t != PT_DATA_ENC)
                 continue;
             if (t == PT_DATA && ctx->enc) {
-                eprintf("[UDP->TUN] plaintext data on encrypted session, drop\n");
+                err_printf("[UDP->TUN] plaintext data on encrypted session, drop\n");
                 continue;
             }
             if (t == PT_DATA_ENC)
@@ -626,7 +629,7 @@ static void *udp2tun_thread(void *ud) {
 
 static void on_signal(int sig) {
     if (sig == SIGINT)
-        eprintf("\nSIGINT -- shutting down...\n");
+        err_printf("\nSIGINT -- shutting down...\n");
     g_stop = 1;
     g_user_stop = 1;
 }
@@ -933,12 +936,7 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
                                    pump_tun_pkt, &ctx, &g_stop);
         if (!ctx.pool) {
             log_err("cannot start TUN reader pool");
-            teardown_routes(tun_name, auth_tun_ip, server, ogw, odev,
-                            ogw_metric, &routes, had_routes, &routes6);
-            slist_free(&routes);
-            slist_free(&routes6);
-            pthread_mutex_destroy(&ctx.send_lock);
-            return -1;
+            goto fail;
         }
         /* each reader thread frees its TLS batch on exit (tun.c invokes
          * this on the exiting thread, after the final flush) */
@@ -955,12 +953,7 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
     if (pthread_create(&t2, NULL, udp2tun_thread, &ctx) != 0) {
         g_stop = 1;
         tun_pool_destroy(ctx.pool);
-        teardown_routes(tun_name, auth_tun_ip, server, ogw, odev,
-                        ogw_metric, &routes, had_routes, &routes6);
-        slist_free(&routes);
-        slist_free(&routes6);
-        pthread_mutex_destroy(&ctx.send_lock);
-        return -1;
+        goto fail;
     }
 
     log_info("TUN proxy running -- press Ctrl-C to stop");
@@ -975,7 +968,7 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
 
     send_ctrl(&ctx, PT_CLOSE, enc, sid, tok);
     if (debug_enabled())
-        eprintf("CLOSE sent\n");
+        err_printf("CLOSE sent\n");
 
     pthread_mutex_destroy(&ctx.send_lock);
     slist_free(&routes);
@@ -983,4 +976,17 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
     /* 1 = session lost (keepalive failures / no downlink): the caller
      * may re-authenticate and re-run the pump; 0 = user stopped it */
     return ctx.session_lost ? 1 : 0;
+
+fail:
+    /* shared failure cleanup: undo routes, free the route lists, destroy
+     * the TX lock. The failing site handles its own prefix first (the
+     * pthread_create path destroys the live pool and sets g_stop; the
+     * pool-create path has no pool to destroy) — the tail below is
+     * identical in both. */
+    teardown_routes(tun_name, auth_tun_ip, server, ogw, odev,
+                    ogw_metric, &routes, had_routes, &routes6);
+    slist_free(&routes);
+    slist_free(&routes6);
+    pthread_mutex_destroy(&ctx.send_lock);
+    return -1;
 }

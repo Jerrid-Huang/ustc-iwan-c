@@ -144,6 +144,28 @@ void xor_crypt(uint8_t *data, size_t len, const uint8_t *key, size_t klen)
         data[i] ^= key[i % klen];
 }
 
+/* constant-time equality: both buffers are exactly n bytes (the caller
+ * rejects length mismatches first), so the loop hides the comparison
+ * shape from timing */
+int ct_eq(const void *a, const void *b, size_t n)
+{
+    const uint8_t *pa = a;
+    const uint8_t *pb = b;
+    uint8_t d = 0;
+    for (size_t i = 0; i < n; i++)
+        d |= pa[i] ^ pb[i];
+    return d == 0;
+}
+
+/* best-effort scrub of secrets, immune to optimizer elision (volatile
+ * store loop, same strength as the per-module wipes it replaces) */
+void wipe(void *p, size_t n)
+{
+    volatile unsigned char *v = p;
+    while (n--)
+        *v++ = 0;
+}
+
 static const char HEX_DIGITS[] = "0123456789abcdef";
 
 void hex_encode(const uint8_t *bytes, size_t n, char *out)
@@ -155,17 +177,7 @@ void hex_encode(const uint8_t *bytes, size_t n, char *out)
     out[2 * n] = '\0';
 }
 
-static int hex_nibble(int c)
-{
-    if (c >= '0' && c <= '9')
-        return c - '0';
-    if (c >= 'a' && c <= 'f')
-        return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F')
-        return c - 'A' + 10;
-    return -1;
-}
-
+/* hex digit parsing: shared static inline hex_nibble from util.h */
 int hex_decode(const char *hex, size_t hexlen, uint8_t *out, size_t outcap)
 {
     size_t n;

@@ -261,6 +261,14 @@ void log_debug(const char *fmt, ...)
     fputc('\n', stderr);
 }
 
+void err_printf(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+}
+
 bool dbg_env(const char *name)
 {
     static const char *names[3];
@@ -303,13 +311,9 @@ void slist_free(slist_t *s)
 void slist_push(slist_t *s, const char *str)
 {
     if (s->n == s->cap) {
-        size_t ncap = s->cap ? s->cap * 2 : 4;
-        /* guard the *2 and the byte-size multiply at the size ceiling */
-        if (ncap < s->cap || ncap > SIZE_MAX / sizeof(char *)) {
-            if (s->n == SIZE_MAX)
-                oom_abort();
-            ncap = s->n + 1;
-        }
+        size_t ncap;
+        if (!grow_cap(s->n, 1, s->cap, 4, sizeof(char *), &ncap))
+            oom_abort();   /* n == SIZE_MAX: no representable array */
         s->v = realloc(s->v, ncap * sizeof(char *));
         if (!s->v)
             oom_abort();
@@ -353,6 +357,37 @@ char *xstrdup(const char *s)
         oom_abort();   /* matches the "never NULL-halts on OOM" contract */
     memcpy(out, s, n);
     return out;
+}
+
+/* See util.h. The growth strategy is the repository-wide one: double
+ * from the current capacity until the needed total fits; at the size_t
+ * ceiling degrade to the exact needed size instead of overflowing. */
+size_t grow_cap(size_t used, size_t extra, size_t cap, size_t init,
+                size_t esize, size_t *newcap)
+{
+    if (extra > SIZE_MAX - used)
+        return 0;   /* no representable total */
+    size_t need = used + extra;
+    if (need <= cap) {
+        *newcap = cap;
+        return cap;
+    }
+    size_t ncap = cap ? cap * 2 : init;
+    if (ncap < cap) {
+        ncap = need;   /* the *2 wrapped: no power-of-two growth */
+    } else {
+        while (ncap < need) {
+            if (ncap > SIZE_MAX / 2) {
+                ncap = need;
+                break;
+            }
+            ncap *= 2;
+        }
+        if (ncap > SIZE_MAX / esize)
+            ncap = need;   /* byte-size overflow: exact fit */
+    }
+    *newcap = ncap;
+    return ncap;
 }
 
 uint32_t rand_u32(void)
@@ -438,11 +473,11 @@ void pace_take(pace_bucket *b, int npk)
 int parse_uint(const char *s, uint64_t max, uint64_t *out)
 {
     if (!s || !*s)
-        return -1;
+        return PARSE_UINT_BAD;
     const char *p = s;
     while (*p) {
         if (*p < '0' || *p > '9')
-            return -1;
+            return PARSE_UINT_BAD;
         p++;
     }
     uint64_t v = 0;
@@ -451,11 +486,11 @@ int parse_uint(const char *s, uint64_t max, uint64_t *out)
         /* d > max would underflow max - d below (unsigned wrap) and
          * admit out-of-range values when max < 9 */
         if (d > max || v > (max - d) / 10)
-            return -1;
+            return PARSE_UINT_RANGE;
         v = v * 10 + d;
     }
     *out = v;
-    return 0;
+    return PARSE_UINT_OK;
 }
 
 int str_to_u16(const char *s, uint16_t *out)

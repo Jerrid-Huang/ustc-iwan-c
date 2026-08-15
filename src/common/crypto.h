@@ -18,6 +18,15 @@ void session_key(const char *username, const char *password, uint8_t out[16]);
 
 void xor_crypt(uint8_t *data, size_t len, const uint8_t *key, size_t klen);
 
+/* constant-time equality: timing-safe byte compare of n bytes (callers
+ * must reject length mismatches before calling). Returns nonzero when
+ * the buffers are equal. */
+int ct_eq(const void *a, const void *b, size_t n);
+/* best-effort scrub of secrets (volatile store loop), immune to
+ * optimizer elision; wipe() is the shared replacement for the per-module
+ * wipes. */
+void wipe(void *p, size_t n);
+
 /* hex encode (lowercase) into out (>= 2*n+1), NUL-terminated */
 void hex_encode(const uint8_t *bytes, size_t n, char *out);
 

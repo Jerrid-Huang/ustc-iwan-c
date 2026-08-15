@@ -353,27 +353,38 @@ static int run_cmd(char *const argv[])
     return -1;
 }
 
+/* iptables rule ensure: "-C" check first (already present -> nothing
+ * to do), otherwise add. Returns 1 when WE added the rule (so exit
+ * cleanup removes exactly it, not a pre-existing one), 0 when it was
+ * already present, -1 when the add failed (caller logs its own
+ * warning). */
+static int iptables_ensure(char *const chk[], char *const add[])
+{
+    if (run_cmd(chk) == 0)
+        return 0;
+    return run_cmd(add) == 0 ? 1 : -1;
+}
+
 static void setup_nat(const char *subnet, const char *nat_if)
 {
+    int rc;
     char *chk[] = { "iptables", "-t", "nat", "-C", "POSTROUTING", "-s",
                     (char *)subnet, "-o", (char *)nat_if, "-j", "MASQUERADE", NULL };
     char *add[] = { "iptables", "-t", "nat", "-A", "POSTROUTING", "-s",
                     (char *)subnet, "-o", (char *)nat_if, "-j", "MASQUERADE", NULL };
 
-    /* -C first: rule already present -> nothing to do */
-    if (run_cmd(chk) != 0) {
-        if (run_cmd(add) == 0) {
-            /* remember what we added so exit cleanup can remove exactly
-             * this rule (C3); a rule that was already present is not ours
-             * to remove */
-            snprintf(nat_subnet_saved, sizeof nat_subnet_saved, "%s", subnet);
-            snprintf(nat_if_saved, sizeof nat_if_saved, "%s", nat_if);
-            nat_rule_added = true;
-            printf("iptables: MASQUERADE %s -> %s\n", subnet, nat_if);
-        } else {
-            fprintf(stderr,
-                    "warning: iptables MASQUERADE failed (need root and iptables?)\n");
-        }
+    rc = iptables_ensure(chk, add);
+    if (rc == 1) {
+        /* remember what we added so exit cleanup can remove exactly
+         * this rule (C3); a rule that was already present is not ours
+         * to remove */
+        snprintf(nat_subnet_saved, sizeof nat_subnet_saved, "%s", subnet);
+        snprintf(nat_if_saved, sizeof nat_if_saved, "%s", nat_if);
+        nat_rule_added = true;
+        printf("iptables: MASQUERADE %s -> %s\n", subnet, nat_if);
+    } else if (rc < 0) {
+        fprintf(stderr,
+                "warning: iptables MASQUERADE failed (need root and iptables?)\n");
     }
 
     /* FORWARD 放行:host 防火墙(Tailscale/UFW 等)可能 DROP 转发流量,
@@ -384,14 +395,13 @@ static void setup_nat(const char *subnet, const char *nat_if)
                          "-j", "ACCEPT", NULL };
         char *fadd[] = { "iptables", "-I", "FORWARD", "-s", (char *)subnet,
                          "-j", "ACCEPT", NULL };
-        if (run_cmd(fchk) != 0) {
-            if (run_cmd(fadd) == 0) {
-                fwd_rule_added = true;
-                printf("iptables: FORWARD %s ACCEPT\n", subnet);
-            } else {
-                fprintf(stderr, "warning: iptables FORWARD ACCEPT failed "
-                        "(tunnel forwarding may be firewalled)\n");
-            }
+        rc = iptables_ensure(fchk, fadd);
+        if (rc == 1) {
+            fwd_rule_added = true;
+            printf("iptables: FORWARD %s ACCEPT\n", subnet);
+        } else if (rc < 0) {
+            fprintf(stderr, "warning: iptables FORWARD ACCEPT failed "
+                    "(tunnel forwarding may be firewalled)\n");
         }
     }
 }
@@ -455,11 +465,8 @@ static int setup_tun(const char *name, const char *server_ip, int mask)
     int fd;
     char addr[64];
 
-    if (!tun_name_valid(name)) {
-        fprintf(stderr, "error: invalid tun device name '%s'\n", name);
-        server_cleanup_nat();
-        exit(1);
-    }
+    /* no tun_name_valid precheck here: main() validates the CLI value
+     * and open_tun() re-validates at its API boundary */
     (void)ip_run_quiet((char *[]){"link", "del", (char *)name, NULL});
     fd = open_tun(name);
     if (fd < 0) {

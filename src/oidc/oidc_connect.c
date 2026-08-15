@@ -51,32 +51,18 @@ static int oidc_socks_reauth_cb(void *ud, SocksConfig *cfg, int *out_fd)
         log_err("SOCKS re-auth: cannot decrypt password");
         return -1;
     }
-    uint8_t ct[16];
-    if (get_ct(rc->user, password, NULL, ct) != 0) {
-        OPENSSL_cleanse(password, strlen(password));
-        free(password);
-        log_err("SOCKS re-auth: cannot derive password");
-        return -1;
-    }
-    uint32_t nonce = rand_u32();
-    buf_t open;
-    buf_init(&open);
-    if (build_open(&open, rc->user, ct, IWAN_DEFAULT_MTU, 1,
-                   nonce) != 0) {
-        buf_free(&open);
-        OPENSSL_cleanse(password, strlen(password));
-        free(password);
-        log_err("SOCKS re-auth: username too long");
-        return -1;
-    }
     AuthResult res;
-    int fd = do_auth(rc->host, rc->port, open.data, open.len, nonce,
-                     DO_AUTH_OIDC, &res);
-    buf_free(&open);
+    int fd = authenticate_ex(rc->user, password, NULL, IWAN_DEFAULT_MTU,
+                             rc->host, rc->port, DO_AUTH_OIDC, &res);
     if (fd < 0) {
         OPENSSL_cleanse(password, strlen(password));
         free(password);
-        log_err("SOCKS re-auth: auth failed");
+        if (fd == -1)
+            log_err("SOCKS re-auth: cannot derive password");
+        else if (fd == -2)
+            log_err("SOCKS re-auth: username too long");
+        else
+            log_err("SOCKS re-auth: auth failed");
         return -1;
     }
     uint8_t sk[16];
@@ -90,21 +76,17 @@ static int oidc_socks_reauth_cb(void *ud, SocksConfig *cfg, int *out_fd)
         port_close(fd);
         return -1;
     }
-    cfg->inner_ip = ip4_u32(b);
+    uint32_t inner_ip = ip4_u32(b);
     if (!s2ip4(res.gw, b)) {
         log_err("SOCKS re-auth: server returned invalid gw");
         OPENSSL_cleanse(sk, sizeof sk);
         port_close(fd);
         return -1;
     }
-    cfg->gateway = ip4_u32(b);
-    cfg->mtu = res.mtu < rc->o->socks_mtu ? res.mtu : rc->o->socks_mtu;
-    memcpy(cfg->xor_key, sk, sizeof cfg->xor_key);
+    uint32_t gateway = ip4_u32(b);
+    socks_cfg_from_auth(cfg, &res, inner_ip, gateway, sk,
+                        res.mtu < rc->o->socks_mtu ? res.mtu : rc->o->socks_mtu);
     OPENSSL_cleanse(sk, sizeof sk);
-    cfg->sid = res.sid;
-    cfg->token = res.tok;
-    cfg->encryption = 1;
-    snprintf(cfg->dns, sizeof cfg->dns, "%s", res.dns);
     *out_fd = fd;
     return 0;
 }
@@ -133,18 +115,12 @@ static int run_socks_mode(const Opts *o, int fd, const uint8_t sk[16],
     memset(&cfg, 0, sizeof cfg);
     cfg.listen_addr = listen;
     cfg.listen_str = o->socks_listen;
-    cfg.inner_ip = inner_ip;
-    cfg.gateway = gateway;
-    cfg.mtu = res->mtu < o->socks_mtu ? res->mtu : o->socks_mtu;
-    memcpy(cfg.xor_key, sk, sizeof cfg.xor_key);
-    cfg.sid = res->sid;
-    cfg.token = res->tok;
-    cfg.encryption = 1;
+    socks_cfg_from_auth(&cfg, res, inner_ip, gateway, sk,
+                        res->mtu < o->socks_mtu ? res->mtu : o->socks_mtu);
     cfg.auth_token = o->socks_token;
     cfg.open_proxy = o->socks_no_token;
     cfg.allow_remote = o->allow_remote;
     cfg.ipv6 = o->socks_ipv6;
-    snprintf(cfg.dns, sizeof cfg.dns, "%s", res->dns);
     cfg.reauth = oidc_socks_reauth_cb;   /* in-place tunnel re-auth */
     cfg.reauth_ud = (void *)rc;
 
@@ -172,6 +148,10 @@ void oidc_elevate_root(int argc, char **argv)
         exit(1);
     }
 #else
+    /* already root: nothing to re-exec (mirrors the _WIN32 guard above;
+     * the oidc main calls this unconditionally for --connect) */
+    if (geteuid() == 0)
+        return;
     char self[4096];
     const char *exe = argv[0];
 #ifdef __APPLE__
@@ -271,8 +251,8 @@ void oidc_connect_server(const Opts *o, const Config *cf)
     int tun_fd = -1;
     struct RelayProxy *rp = NULL;
     if (!o->socks) {
-        if (!tun_name_valid(o->tun))
-            oidc_die("invalid TUN device name '%s'", o->tun);
+        /* no tun_name_valid precheck here: the CLI validates the value
+         * and open_tun() re-validates at its API boundary */
 #ifndef _WIN32
         /* Linux: pre-delete a stale tun device by name. Windows: wintun's
          * open_tun (tun_win.c) deletes an existing adapter with the same
@@ -317,29 +297,16 @@ void oidc_connect_server(const Opts *o, const Config *cf)
                                           srv_user ? srv_user : "");
         if (!password)
             oidc_die("cannot decrypt password");
-        uint8_t ct[16];
-        if (get_ct(user, password, NULL, ct) != 0) {
-            OPENSSL_cleanse(password, strlen(password));
-            free(password);
-            oidc_die("cannot derive password");
-        }
-        uint32_t nonce = rand_u32();
-        buf_t open;
-        buf_init(&open);
-        if (build_open(&open, user, ct, IWAN_DEFAULT_MTU, 1,
-                       nonce) != 0) {
-            buf_free(&open);
-            OPENSSL_cleanse(password, strlen(password));
-            free(password);
-            oidc_die("username too long (max 255 bytes)");
-        }
         AuthResult res;
-        int fd = do_auth(host, port, open.data, open.len, nonce, DO_AUTH_OIDC,
-                         &res);
-        buf_free(&open);
+        int fd = authenticate_ex(user, password, NULL, IWAN_DEFAULT_MTU,
+                                 host, port, DO_AUTH_OIDC, &res);
         if (fd < 0) {
             OPENSSL_cleanse(password, strlen(password));
             free(password);
+            if (fd == -1)
+                oidc_die("cannot derive password");
+            else if (fd == -2)
+                oidc_die("username too long (max 255 bytes)");
             if (!reconnecting)
                 oidc_die("auth failed");
             /* a reconnect hit the same loss window that killed the
