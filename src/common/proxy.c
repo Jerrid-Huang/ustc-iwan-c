@@ -429,6 +429,9 @@ static void pump_reader_exit(void)
 
 static void *udp2tun_thread(void *ud) {
     pump_ctx_t *ctx = ud;
+#ifndef _WIN32
+    pthread_setname_np(pthread_self(), "udp2tun");
+#endif
     /* recvmmsg with MSG_DONTWAIT drains whatever is queued (zero latency
      * tail), then poll() parks until data or the keepalive deadline.
      * A non-NULL timeout argument must NOT be passed to recvmmsg: the

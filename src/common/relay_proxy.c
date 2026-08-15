@@ -569,6 +569,9 @@ static void rp_flush(struct rp_ent *e, bool up_dir)
 static void *rp_dir_main(void *ud)
 {
     bool up_dir = ((intptr_t)ud != 0);
+#ifndef _WIN32
+    pthread_setname_np(pthread_self(), up_dir ? "relay-up" : "relay-dn");
+#endif
     struct rp_conn ***arrp = up_dir ? &g_rp_up : &g_rp_dn;
     size_t *np = up_dir ? &g_rp_up_n : &g_rp_dn_n;
     struct pollfd *pf = NULL;
@@ -812,6 +815,9 @@ out:
 static void *rp_accept_main(void *ud)
 {
     struct RelayProxy *rp = ud;
+#ifndef _WIN32
+    pthread_setname_np(pthread_self(), "rp-accept");
+#endif
     while (!atomic_load(&rp->stop)) {
         struct pollfd pfd = { .fd = rp->listener, .events = POLLIN };
         int pr = port_poll(&pfd, 1, 1000);
