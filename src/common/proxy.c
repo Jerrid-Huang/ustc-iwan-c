@@ -410,13 +410,6 @@ static void pump_tun_pkt(void *ud, uint8_t *pkt, size_t len, bool last)
     }
     if (g_stop)
         return;
-    if (debug_enabled()) {
-        log_debug("pump tx: %zuB v=%u proto=%u src=%u.%u.%u.%u dst=%u.%u.%u.%u\n",
-                  len, (unsigned)(pkt[0] >> 4), (unsigned)pkt[9],
-                  (unsigned)pkt[12], (unsigned)pkt[13], (unsigned)pkt[14],
-                  (unsigned)pkt[15], (unsigned)pkt[16], (unsigned)pkt[17],
-                  (unsigned)pkt[18], (unsigned)pkt[19]);
-    }
     {
         const size_t slot = 8 + PUMP_SLOT;
         uint8_t *s = q->batch + (size_t)q->n * slot;
