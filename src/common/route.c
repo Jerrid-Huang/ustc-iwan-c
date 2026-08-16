@@ -50,15 +50,17 @@ static bool tun_ula_str(const char *tun_ip, char out[64])
 static void tun_iface_up6(const char *tun, const char *tun_ip)
 {
 #ifdef _WIN32
-    char ula[64], ula96[72], namea[32];
+    char ula[64], ula96[72], ifa[32];
     if (!tun_ula_str(tun_ip, ula))
         return;
     /* netsh would default a bare address to no /96 prefix, breaking the
      * client-pool on-link semantics; pass the explicit /96 like Linux.
-     * ula96[72] is provably enough: ula holds at most 63 chars + "/96" */
+     * ula96[72] is provably enough: ula holds at most 63 chars + "/96".
+     * "interface=" not "name=": netsh ipv6 add address takes
+     * interface= (the ipv4 set address family takes name=). */
     snprintf(ula96, sizeof ula96, "%s/96", ula);
-    snprintf(namea, sizeof namea, "name=%s", tun);
-    char *a[] = { "netsh", "interface", "ipv6", "add", "address", namea,
+    snprintf(ifa, sizeof ifa, "interface=%s", tun);
+    char *a[] = { "netsh", "interface", "ipv6", "add", "address", ifa,
                   ula96, NULL };
     (void)port_run_cmd(a);   /* idempotent; best-effort */
 #elif defined(__APPLE__)
@@ -111,16 +113,20 @@ static void prefix_str(uint32_t net, int prefix, char out[24])
 #ifdef _WIN32
 bool route_iface_up(const char *tun, const char *tun_ip, uint16_t mtu)
 {
-    char namea[32], mtu_s[8], mtuarg[24];
+    char namea[32], ifa[32], mtu_s[8], mtuarg[24];
     snprintf(namea, sizeof namea, "name=%s", tun);
+    snprintf(ifa, sizeof ifa, "interface=%s", tun);
     snprintf(mtu_s, sizeof mtu_s, "%u", (unsigned)mtu);
     snprintf(mtuarg, sizeof mtuarg, "mtu=%s", mtu_s);
     char *a1[] = { "netsh", "interface", "ipv4", "set", "address", namea,
                    "static", (char *)tun_ip, "255.255.255.0", NULL };
     if (!netsh_run(a1, "iface up: set address"))
         return false;
+    /* set subinterface takes "interface=" (unlike set address, which
+     * takes "name="); "name=" here is rejected by netsh and silently
+     * leaves the MTU at its default (65535 on wintun) */
     char *a2[] = { "netsh", "interface", "ipv4", "set", "subinterface",
-                   namea, mtuarg, NULL };
+                   ifa, mtuarg, NULL };
     if (!netsh_run(a2, "iface up: set mtu"))
         return false;
     tun_iface_up6(tun, tun_ip);   /* best-effort IPv6 side */
@@ -1003,12 +1009,12 @@ void route_setup6(const char *tun, const slist_t *routes6)
     if (routes6 == NULL)
         return;
 #ifdef _WIN32
-    char namea[32];
-    snprintf(namea, sizeof namea, "name=%s", tun);
+    char ifa[32];
+    snprintf(ifa, sizeof ifa, "interface=%s", tun);
     for (size_t i = 0; i < routes6->n; i++) {
         const char *c = routes6->v[i];
         char *a[] = { "netsh", "interface", "ipv6", "add", "route",
-                      (char *)c, namea, NULL };
+                      (char *)c, ifa, NULL };
         if (netsh_run(a, "route_setup6: add route"))
             continue;
         log_err("route_setup6: add %s failed", c);
@@ -1043,12 +1049,12 @@ void route_teardown6(const char *tun, const char *tun_ip,
     if (routes6 == NULL)
         return;
 #ifdef _WIN32
-    char namea[32];
-    snprintf(namea, sizeof namea, "name=%s", tun);
+    char ifa[32];
+    snprintf(ifa, sizeof ifa, "interface=%s", tun);
     for (size_t i = 0; i < routes6->n; i++) {
         const char *c = routes6->v[i];
         char *d[] = { "netsh", "interface", "ipv6", "delete", "route",
-                      (char *)c, namea, NULL };
+                      (char *)c, ifa, NULL };
         if (netsh_run(d, "route_teardown6: delete route"))
             continue;
         log_debug("route_teardown6: del %s: not present", c);
@@ -1060,7 +1066,7 @@ void route_teardown6(const char *tun, const char *tun_ip,
     char ula[64];
     if (tun_ula_str(tun_ip, ula)) {
         char *u[] = { "netsh", "interface", "ipv6", "delete", "address",
-                      namea, ula, NULL };
+                      ifa, ula, NULL };
         if (port_run_cmd(u) != 0)
             log_debug("route_teardown6: delete ULA %s: not present", ula);
     }

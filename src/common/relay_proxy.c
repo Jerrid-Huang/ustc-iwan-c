@@ -164,14 +164,25 @@ static int rp_connect_target(int *fd_out, const char *host, uint16_t port,
 
 /* ---- SOCKS5 ---- */
 
+/* read exactly `want` bytes, waiting through EAGAIN. Windows accept()
+ * inherits the listener's nonblocking mode (unlike Linux), so the
+ * handshake reads must poll instead of treating EAGAIN as fatal. */
 static bool rp_read_full(int fd, uint8_t *buf, size_t want)
 {
     size_t got = 0;
     while (got < want) {
         ssize_t r = port_recv(fd, buf + got, want - got, 0);
-        if (r <= 0)
-            return false;
-        got += (size_t)r;
+        if (r > 0) {
+            got += (size_t)r;
+            continue;
+        }
+        if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            struct pollfd pfd = { .fd = fd, .events = POLLIN };
+            if (port_poll(&pfd, 1, RP_HANDSHAKE_TIMEOUT_MS) <= 0)
+                return false;
+            continue;
+        }
+        return false;
     }
     return true;
 }
@@ -179,7 +190,9 @@ static bool rp_read_full(int fd, uint8_t *buf, size_t want)
 static void rp_socks_reply(int fd, uint8_t rep)
 {
     uint8_t r[10] = {5, rep, 0, 1, 0, 0, 0, 0, 0, 0};
-    (void)port_send(fd, r, sizeof r, 0);
+    if (port_send(fd, r, sizeof r, 0) != (ssize_t)sizeof r)
+        err_printf("rp_socks_reply send failed rep=%u errno=%d\n", rep,
+                   errno);
 }
 
 /* returns 0 on success with the upstream connected; -1 on failure.
@@ -253,9 +266,17 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
                 return -1;
             {
                 ssize_t r = port_recv(fd, b + n, sizeof b - n, 0);
-                if (r <= 0)
-                    return -1;
-                n += (size_t)r;
+                if (r > 0) {
+                    n += (size_t)r;
+                    continue;
+                }
+                if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+                    if (port_poll(&pfd, 1, RP_HANDSHAKE_TIMEOUT_MS) <= 0)
+                        return -1;
+                    continue;
+                }
+                return -1;
             }
         }
     } else {
@@ -265,15 +286,26 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
 
     /* CONNECT request [5, CMD, RSV, ATYP, addr..., port] */
     for (;;) {
-        if (pp_socks_request(b, n, &cmd, &rep, &t) == 0)
+        if (pp_socks_request(b, n, &cmd, &rep, &t) == 0) {
+            err_printf("socks: request ok cmd=%u af=%u port=%u\n", cmd,
+                       t.af, t.port);
             break;
+        }
         if (n >= sizeof b)
             return -1;
         {
             ssize_t r = port_recv(fd, b + n, sizeof b - n, 0);
-            if (r <= 0)
-                return -1;
-            n += (size_t)r;
+            if (r > 0) {
+                n += (size_t)r;
+                continue;
+            }
+            if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                struct pollfd pfd = { .fd = fd, .events = POLLIN };
+                if (port_poll(&pfd, 1, RP_HANDSHAKE_TIMEOUT_MS) <= 0)
+                    return -1;
+                continue;
+            }
+            return -1;
         }
     }
     if (rep != 0) {
@@ -321,9 +353,17 @@ static int rp_handle_http(int fd, const uint8_t *first, size_t first_n)
         if (hdr_end != (size_t)-1)
             break;
         r = port_recv(fd, buf + n, sizeof buf - 1 - n, 0);
-        if (r <= 0)
-            return -1;
-        n += (size_t)r;
+        if (r > 0) {
+            n += (size_t)r;
+            continue;
+        }
+        if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            struct pollfd pfd = { .fd = fd, .events = POLLIN };
+            if (port_poll(&pfd, 1, RP_HANDSHAKE_TIMEOUT_MS) <= 0)
+                return -1;
+            continue;
+        }
+        return -1;
     }
     if (hdr_end == (size_t)-1)
         return -1;

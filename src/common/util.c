@@ -267,6 +267,10 @@ void err_printf(const char *fmt, ...)
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
     va_end(ap);
+    /* stderr becomes fully buffered when redirected to a file on the
+     * MinGW CRT; a hard kill (TerminateProcess) then loses the buffer.
+     * Errors must be visible even for daemons killed with -Force. */
+    fflush(stderr);
 }
 
 bool dbg_env(const char *name)
