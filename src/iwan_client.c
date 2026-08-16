@@ -529,9 +529,10 @@ static int cleanup_stale_tun(const char *name)
                 strerror(e));
     return 0;   /* absent (or uninspectable): leave it to open_tun */
 #else
-    /* no /sys on Windows: wintun's open_tun (tun_win.c) deletes a stale
-     * adapter with the same name as part of open-or-create, so there is
-     * nothing to pre-clean here. */
+    /* no /sys on Windows: wintun's open_tun (tun_win.c) reuses a stale
+     * adapter with the same name and, when the stale adapter refuses a
+     * session (left wedged by a killed previous run), deletes and
+     * recreates it, so there is nothing to pre-clean here. */
     (void)name;
     return 0;
 #endif
@@ -755,7 +756,13 @@ static int cmd_proxy(int argc, char **argv, int start)
 
     int tun_fd = open_tun(o.tun);
     if (tun_fd < 0) {
-        log_err("Error: open tun (must be root)");
+#ifdef _WIN32
+        log_err("Error: open tun failed (see earlier log; wintun.dll must "
+                "sit next to the executable and the wintun driver must be "
+                "installed)");
+#else
+        log_err("Error: open tun (must be root or CAP_NET_ADMIN)");
+#endif
         slist_free(&routes);
         free_route_opts(&o);
         return 1;

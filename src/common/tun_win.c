@@ -47,6 +47,7 @@ typedef WINTUN_ADAPTER_HANDLE(WINAPI *wintun_create_adapter_fn)(
 typedef WINTUN_ADAPTER_HANDLE(WINAPI *wintun_open_adapter_fn)(
     const WCHAR *name, const WCHAR *tunnel_type);
 typedef void (WINAPI *wintun_close_adapter_fn)(WINTUN_ADAPTER_HANDLE adapter);
+typedef BOOL (WINAPI *wintun_delete_adapter_fn)(WINTUN_ADAPTER_HANDLE adapter);
 typedef WINTUN_SESSION_HANDLE(WINAPI *wintun_start_session_fn)(
     WINTUN_ADAPTER_HANDLE adapter, DWORD capacity);
 typedef void (WINAPI *wintun_end_session_fn)(WINTUN_SESSION_HANDLE session);
@@ -74,6 +75,7 @@ struct wintun_api {
     wintun_create_adapter_fn create_adapter;
     wintun_open_adapter_fn open_adapter;
     wintun_close_adapter_fn close_adapter;
+    wintun_delete_adapter_fn delete_adapter;
     wintun_start_session_fn start_session;
     wintun_end_session_fn end_session;
     wintun_get_running_driver_version_fn get_running_driver_version;
@@ -164,6 +166,7 @@ static bool wintun_load(void)
     WINTUN_LOAD_ONE(create_adapter, "WintunCreateAdapter");
     WINTUN_LOAD_ONE(open_adapter, "WintunOpenAdapter");
     WINTUN_LOAD_ONE(close_adapter, "WintunCloseAdapter");
+    WINTUN_LOAD_ONE(delete_adapter, "WintunDeleteAdapter");
     WINTUN_LOAD_ONE(start_session, "WintunStartSession");
     WINTUN_LOAD_ONE(end_session, "WintunEndSession");
     WINTUN_LOAD_ONE(get_running_driver_version, "WintunGetRunningDriverVersion");
@@ -282,10 +285,34 @@ int open_tun(const char *name)
 
     session = iwan_wintun.start_session(adapter, IWAN_WINTUN_RING_CAPACITY);
     if (session == NULL) {
-        log_err("tun: WintunStartSession failed (error %lu)",
-                (unsigned long)GetLastError());
-        iwan_wintun.close_adapter(adapter);
-        return -1;
+        DWORD serr = GetLastError();
+
+        /* A reused adapter can be left wedged by a crashed or killed
+         * previous run (e.g. its process was terminated while holding
+         * the session, leaving the adapter in a state where
+         * WintunStartSession fails with ERROR_DEVICE_NOT_CONNECTED,
+         * 1247). Deleting and recreating the adapter once clears that
+         * state; a freshly created adapter has no stale state to clear,
+         * so only the reused path retries. */
+        if (!created && iwan_wintun.delete_adapter(adapter)) {
+            log_err("tun: WintunStartSession failed on reused adapter "
+                    "(error %lu); deleting stale adapter and retrying "
+                    "once", (unsigned long)serr);
+            adapter = iwan_wintun.create_adapter(name16, IWAN_WINTUN_POOL,
+                                                 &IWAN_WINTUN_GUID);
+            if (adapter != NULL) {
+                created = TRUE;
+                session = iwan_wintun.start_session(
+                    adapter, IWAN_WINTUN_RING_CAPACITY);
+            }
+        }
+        if (session == NULL) {
+            log_err("tun: WintunStartSession failed (error %lu)",
+                    (unsigned long)GetLastError());
+            if (adapter != NULL)
+                iwan_wintun.close_adapter(adapter);
+            return -1;
+        }
     }
     read_ev = iwan_wintun.get_read_wait_event(session);
     if (read_ev == NULL) {

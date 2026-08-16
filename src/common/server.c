@@ -25,11 +25,20 @@
 #endif
 
 /* ---- --no-tun echo mirror: per-connection mirror state ----
- * A pure stateless swap would emit every mirrored data segment with the
- * same seq (the client's ack), which the client netstack discards as
- * out-of-order. Track the seq we emit per 4-tuple instead: SYN starts
- * at ISN 0, data advances it by the payload length. Locked: handle_udp
- * runs on several SO_REUSEPORT recv threads. */
+ * Every inner TCP packet is swapped (addresses, ports, seq/ack, flags,
+ * checksums) and sent back. Two counters per 4-tuple make the mirror
+ * correct under both delayed ACKs and retransmits:
+ *   client_max — the highest contiguous client seq+len seen (dedup);
+ *   emit_seq   — the next seq our mirrored stream will use.
+ * A new segment is echoed at emit_seq and advances both counters; a
+ * retransmit (client seq behind client_max) is re-echoed at the
+ * position its content was originally mirrored to (emit_seq minus the
+ * lag) WITHOUT advancing either counter. A pure stateless swap fails
+ * under delayed ACKs (every mirror uses the client's stale ACK, so the
+ * client discards almost all echoes), and a naive advance-on-seen table
+ * fails on the first lost echo (the retransmit advances the table a
+ * second time and every later mirror is discarded as out-of-order).
+ * Locked: handle_udp runs on several SO_REUSEPORT recv threads. */
 #define ECHO_MAX_CONN 64
 struct echo_conn {
     uint8_t  af;                 /* 4 or 6 */
@@ -39,7 +48,8 @@ struct echo_conn {
     uint32_t t_ip;               /* target IP (BE) — af == 4 */
     uint8_t  t6[16];             /* target address — af == 6 */
     uint16_t t_port;
-    uint32_t seq;                /* next seq to emit */
+    uint32_t client_max;         /* highest client seq+len seen */
+    uint32_t emit_seq;           /* next seq our mirrors will use */
     uint64_t last_ms;            /* idle reclamation */
 };
 static struct echo_conn g_echo[ECHO_MAX_CONN];
@@ -82,7 +92,8 @@ static struct echo_conn *echo_lookup(uint8_t af, const uint32_t *c4,
             memcpy(free_slot->c6, c6, 16);
             memcpy(free_slot->t6, t6, 16);
         }
-        free_slot->seq = 0;
+        free_slot->client_max = 0;
+        free_slot->emit_seq = 0;
         free_slot->last_ms = now;
         pthread_mutex_unlock(&g_echo_mu);
         return free_slot;
@@ -92,30 +103,37 @@ static struct echo_conn *echo_lookup(uint8_t af, const uint32_t *c4,
 }
 
 /* shared echo state machine (--no-tun mirror): locate/create the
- * per-4-tuple mirror state and advance the emit seq — SYN opens at
- * ISN 0 (next emit seq 1), data advances by the payload length, FIN
- * consumes one extra sequence number. Returns 0 with *seq_out set, or
- * -1 when the connection table is full. */
+ * per-4-tuple mirror state and compute the seq for this segment (see
+ * the block comment above). Returns 0 with *seq_out set, or -1 when
+ * the connection table is full. */
 static int echo_seq_advance(uint8_t af, const uint32_t *c4,
                             const uint8_t c6[16], uint16_t sport,
                             const uint32_t *t4, const uint8_t t6[16],
                             uint16_t dport, uint8_t flags,
-                            size_t paylen, uint32_t *seq_out)
+                            uint32_t s_orig, size_t paylen,
+                            uint32_t *seq_out)
 {
     struct echo_conn *ec = echo_lookup(af, c4, c6, sport, t4, t6, dport,
                                        (flags & TCP_SYN) != 0);
     if (!ec)
         return -1;           /* table full */
-    *seq_out = ec->seq;
-    if (flags & TCP_SYN)
-        ec->seq = 1;
-    else if (flags & TCP_FIN)
-        ec->seq += (uint32_t)paylen + 1;
-    else if (paylen > 0)
-        ec->seq += (uint32_t)paylen;
+    uint32_t len = (uint32_t)paylen;
+    if (flags & (TCP_SYN | TCP_FIN))
+        len++;               /* SYN/FIN each consume one sequence number */
+    /* unsigned subtraction: back is small when s_orig lags client_max
+     * (retransmit), huge (wrapped) when s_orig is at or past it */
+    uint32_t back = (uint32_t)(ec->client_max - s_orig);
+    if (back != 0 && back < 0x80000000u) {
+        /* retransmit: re-echo at the position this content was first
+         * mirrored to; counters do not move */
+        *seq_out = ec->emit_seq - back;
+        return 0;
+    }
+    *seq_out = ec->emit_seq;
+    ec->client_max = s_orig + len;
+    ec->emit_seq += len;
     return 0;
 }
-
 /* shared echo ack/flags rules: the mirrored ack advances past the
  * client's bytes — SYN and FIN each consume one sequence number — and
  * SYN/FIN echoes carry the ACK flag. Returns the ack; *flags is
@@ -1194,7 +1212,7 @@ static int echo_mirror6(struct server_ctx *ctx, uint8_t *p, size_t len,
     paylen = len - 40 - thlen;
 
     if (echo_seq_advance(6, NULL, p + 8, sport, NULL, p + 24, dport,
-                         flags, paylen, &seq) != 0)
+                         flags, s_orig, paylen, &seq) != 0)
         return -1;           /* table full */
     /* swap addresses byte-wise */
     memcpy(tmp16, p + 8, 16);
@@ -1291,11 +1309,10 @@ int echo_mirror(struct server_ctx *ctx, uint8_t *p, size_t len,
            ((uint32_t)p[14] << 8) | p[15];
     ndst = ((uint32_t)p[16] << 24) | ((uint32_t)p[17] << 16) |
            ((uint32_t)p[18] << 8) | p[19];
-    /* per-connection mirror state: SYN opens at ISN 0, data and FIN
-     * advance our emit seq (a stateless swap would repeat the same seq
-     * and the client would discard every mirrored segment as OOO) */
+    /* mirrored seq from the per-connection state machine (new data
+     * advances emit_seq; retransmits re-echo at their original spot) */
     if (echo_seq_advance(4, &nsrc, NULL, sport, &ndst, NULL, dport,
-                         flags, paylen, &seq) != 0)
+                         flags, s_orig, paylen, &seq) != 0)
         return -1;           /* table full */
     /* swap addresses byte-wise (never through a host-endian u32: the
      * little-endian memcpy round-trip would byte-reverse them) */
@@ -1308,7 +1325,7 @@ int echo_mirror(struct server_ctx *ctx, uint8_t *p, size_t len,
     p[ihl + 2] = (uint8_t)(sport >> 8);
     p[ihl + 3] = (uint8_t)sport;
     /* mirrored ack advances past the client's bytes (SYN/FIN each
-     * consume one sequence number); mirrored seq came from the table */
+     * consume one sequence number); mirrored seq from the table */
     ack = echo_mirror_ack(s_orig, paylen, &flags);
     p[ihl + 13] = flags;
     p[ihl + 4] = (uint8_t)(seq >> 24);
