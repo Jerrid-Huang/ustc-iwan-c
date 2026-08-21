@@ -45,6 +45,7 @@ option(IWAN_LINUX_STATIC "Linux: link fully static binaries" OFF)
 option(IWAN_STATIC       "Windows: statically link OpenSSL + runtime libs" OFF)
 option(IWAN_BPF          "Linux: compile and embed the tun steering eBPF program" ON)
 option(IWAN_WERROR       "Treat compiler warnings as errors" OFF)
+option(IWAN_WIN_PUMP_SINGLE "Windows: single-thread zero-copy TUN uplink (instead of SPSC + sender thread)" OFF)
 set(IWAN_OPENSSL_DIR "" CACHE PATH "OpenSSL sysroot (include/ + lib/ or lib64/)")
 # ---------------------------------------------------------------------------
 # Global flags — the old Makefile's CFLAGS/LDFLAGS, split per platform.
@@ -144,6 +145,9 @@ if(WIN32)
   # tun_win.c replaces tun.c (wintun backend; tun.c is Linux TUN ioctls),
   # and server.c is Linux-only (TUN/iptables/BPF, see src/common/server.c).
   list(APPEND IWAN_CORE_SRCS src/common/tun_win.c)
+  if(IWAN_WIN_PUMP_SINGLE)
+    list(APPEND IWAN_CORE_SRCS src/common/pump_win_single.c)
+  endif()
 elseif(APPLE)
   # macOS client: tun.c holds the generic code (reader pool, write
   # retry, close; its Linux-only ioctl/BPF parts are #ifdef __linux__),
@@ -219,6 +223,9 @@ add_library(iwan_core STATIC ${IWAN_CORE_SRCS})
 target_include_directories(iwan_core PUBLIC src/common)
 target_link_libraries(iwan_core PUBLIC lwip)
 target_compile_definitions(iwan_core PUBLIC IWAN_TCP_STACK_LWIP=1)
+if(WIN32 AND IWAN_WIN_PUMP_SINGLE)
+  target_compile_definitions(iwan_core PUBLIC IWAN_WIN_PUMP_SINGLE=1)
+endif()
 # Threads::Threads is linked LAST: on MinGW it resolves to -lpthread, and
 # in the IWAN_STATIC build it must come after the -Bstatic winpthread group
 # (whose archive then satisfies the pthread refs and the trailing -lpthread

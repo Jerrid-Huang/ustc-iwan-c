@@ -23,6 +23,7 @@
 #include "profile.h"
 #include "protocol.h"
 #include "proxy.h"
+#include "proxy_internal.h"
 #include "route.h"
 #include "tun.h"
 #include "udp_send.h"
@@ -33,102 +34,17 @@ struct pump_tx_buf;   /* Windows send-thread batch-buffer pool (defined below) *
 /* [prof] per-stage timing accumulators (whole-run; printed at teardown).
  * IWAN_PUMP_PROF=1 enables the printout. PP_SEND_SYS/RETRY/PACE are
  * sub-stages of PP_SEND (send time minus them = lock/build overhead). */
-#define PUMP_PROF_N 11
-enum {
-    PP_COPY_XOR = 0,  /* uplink: per-packet copy + XOR into batch */
-    PP_ENQ,           /* uplink: per-batch SPSC enqueue */
-    PP_SEND,          /* uplink: per-batch UDP send (incl. lock/GSO) */
-    PP_RECV,          /* downlink: recvmmsg batch drain */
-    PP_TUNWRITE,      /* downlink: per-packet wintun write */
-    PP_SEND_SYS,      /* send sub: time inside port_sendmmsg/port_sendmsg */
-    PP_SEND_RETRY,    /* send sub: time inside pump_send_retry (EAGAIN wait) */
-    PP_SEND_PACE,     /* send sub: time inside pace_take */
-    PP_SENDWAIT,      /* sender sub: blocked on ready_sem (idle/starve) */
-    PP_POLLWAIT,      /* recv sub: parked in port_poll (no downlink) */
-    PP_DLPKT,         /* downlink: whole per-packet loop (incl tun_write) */
-};
-typedef struct { uint64_t us; uint64_t n; } pump_prof_t;
-
-/* [prof] send-path accounting: datagrams sent, sendmmsg/sendmsg call
- * count, and EAGAIN/ENOBUFS backpressure hits (tell whether PP_SEND's
- * time is syscalls, retry-waits, or lock/build overhead) */
+/* [prof] counters (extern declarations in proxy_internal.h; the
+ * single-thread pump variant shares them) */
 atomic_uint_fast64_t g_prof_send_dgrams;    /* datagrams inside PP_SEND */
 atomic_uint_fast64_t g_prof_send_syscalls;  /* port_sendmmsg/port_sendmsg */
 atomic_uint_fast64_t g_prof_send_eagain;    /* EAGAIN/ENOBUFS/EPERM hits */
-/* [prof] recv-loop accounting: recvmmsg call count is PP_RECV.n; these
- * split it into real datagrams vs empty spins, and count auth failures */
 atomic_uint_fast64_t g_prof_recv_dgrams;    /* sum of v over recvmmsg calls */
 atomic_uint_fast64_t g_prof_recv_empty;     /* EAGAIN (no data) iterations */
 atomic_uint_fast64_t g_prof_recv_badtok;    /* datagrams with bad sid/token */
-/* [prof] wintun read-side GSO probe: if the kernel TSO'd into wintun we
- * would see packets > 1508B (up to 64KB); current slots only hold
- * PUMP_SLOT=2048 so oversized candidates get dropped and counted here */
 atomic_uint_fast64_t g_prof_tun_rbig;       /* wintun packets > 1508B */
 atomic_uint_fast64_t g_prof_tun_rdrop;      /* wintun packets > PUMP_SLOT */
-static uint32_t g_prof_tun_rmax;            /* max wintun packet len (B),
-                                             * written by single reader */
-/* [prof] wintun reader-thread accounting (defined in tun_win.c):
- * wait = parked in WaitForSingleObject (idle + wake latency),
- * timeouts = WAIT_TIMEOUT idle wakes, wakeups = signaled wakes,
- * pkts = packets drained, drain = drain-loop time, allocfail =
- * tun_write AllocateSendPacket first-try failures (TX ring full) */
-#ifdef _WIN32
-extern atomic_uint_fast64_t g_tun_wait_us, g_tun_timeouts, g_tun_wakeups,
-                            g_tun_pkts, g_tun_drain_us, g_tun_allocfail;
-#endif
-
-static inline void pump_prof_add(pump_prof_t *p, uint64_t us)
-{
-    p->us += us;
-    p->n++;
-}
-
-#ifdef _WIN32
-#define PUMP_TX_POOL 4
-#define PUMP_SPSC_CAP 16
-typedef struct {
-    volatile unsigned head;  /* consumer-owned pop index */
-    volatile unsigned tail;  /* producer-owned push index */
-    unsigned mask;           /* PUMP_SPSC_CAP - 1 */
-    struct pump_tx_buf *slots[PUMP_SPSC_CAP];
-} pump_spsc_ring_t;
-#endif
-
-typedef struct {
-    int      tun_fd;   /* downlink write fd (queue 0, device owner) */
-    int      sockfd;
-    uint8_t  xor_key[8];
-    uint16_t sid;
-    uint32_t tok;
-    uint8_t  enc;
-    size_t   gso_mss;   /* last UDP_SEGMENT value set, 0 = none */
-    int      gso_ok;    /* 1 = UDP_SEGMENT usable, 0 = failed, -1 = untried */
-    pthread_mutex_t send_lock; /* serializes GSO/sendmmsg on the shared socket */
-    struct tun_pool *pool;
-    pace_bucket pace;   /* aggregate send pacing (util.h); serialized by
-                         * send_lock — the bucket is not thread-safe */
-    bool session_lost;  /* set by udp2tun_thread when the tunnel is
-                         * considered dead (keepalive failures / no
-                         * downlink); distinguishes failure from the
-                         * user's Ctrl-C so run_pump can report it */
-    pump_prof_t prof[PUMP_PROF_N];   /* [prof] stage timers (whole-run) */
-#ifdef _WIN32
-    /* Windows dedicated UDP sender thread: the wintun reader builds
-     * GSO batches in a pool of buffers, enqueues the finished batch,
-     * and this thread does the actual send syscalls — so the per-batch
-     * WSASend/GSO cost no longer stalls wintun reads. The single sender
-     * keeps the batch intact (no per-worker fragmentation). The reader
-     * and sender are strictly 1:1, so two SPSC pointer rings + counting
-     * semaphores replace the mutex/cond queue. */
-    pump_spsc_ring_t free_ring;   /* consumer -> producer (free buffers) */
-    pump_spsc_ring_t ready_ring;  /* producer -> consumer (batches) */
-    HANDLE free_sem;              /* count of free buffers */
-    HANDLE ready_sem;             /* count of ready batches */
-    struct pump_tx_buf *tx_pool[PUMP_TX_POOL]; /* batch buffer pool */
-    pthread_t sender_thread;
-    int sender_stop;
-#endif
-} pump_ctx_t;
+uint32_t g_prof_tun_rmax;                   /* max wintun packet len (B) */
 
 static void pump_prof_print(const pump_ctx_t *ctx)
 {
@@ -250,8 +166,6 @@ static unsigned pump_rx_stale_ms(void)
 }
 #define PUMP_POLL_CEIL_MS 1000  /* cap on the recvmmsg park timeout */
 #define RX_BATCH 64             /* recvmmsg batch size (iov/msgs arrays) */
-#define PUMP_SEND_RETRY_MS  5    /* EAGAIN/ENOBUFS retry budget per flush:
-                                  * beyond it, yield to the receive path */
 
 /* aggregate send-rate pacing: shared token bucket from util.h
  * (pace_bucket / pace_bucket_init / pace_take), same policy as socks.c.
@@ -259,10 +173,10 @@ static unsigned pump_rx_stale_ms(void)
 
 /* flush a TX batch after this much time instead of always waiting for it
  * to fill: bounds the added latency under sustained load (batch fill) */
-#ifndef PUMP_MAX_LAT_US
-#define PUMP_MAX_LAT_US 20
-#endif
 
+static _Thread_local pump_tx_t g_tx;   /* Linux per-reader batch */
+
+#if !defined(_WIN32) || !defined(IWAN_WIN_PUMP_SINGLE)
 /* EAGAIN/ENOBUFS backpressure wait shared by the two TX paths: sleep
  * for the remaining retry budget (poll for writability; with the 5ms
  * budget the remaining-time cap always binds), then report whether the
@@ -438,26 +352,6 @@ static int send_gso(pump_ctx_t *ctx, struct iovec *iov, unsigned n,
  * socket must not interleave). On Windows a dedicated sender thread runs
  * the send syscalls (see pump_tx_send below); the batch is enqueued whole
  * so GSO batching is never fragmented across workers. */
-typedef struct {
-    uint8_t *batch;
-    struct iovec iov[PUMP_BATCH];
-    struct mmsghdr msgs[PUMP_BATCH];
-    uint8_t hdr[8];
-    unsigned n;
-    uint64_t t0;
-} pump_tx_t;
-
-#ifdef _WIN32
-/* one pool-owned batch buffer: filled by the wintun reader, sent by the
- * dedicated sender thread, then returned to the free list */
-struct pump_tx_buf {
-    struct pump_tx_buf *next;
-    pump_tx_t tx;
-};
-#endif
-
-static _Thread_local pump_tx_t g_tx;   /* Linux per-reader batch */
-
 /* Build the msgs[] iovec entries and send one finished batch under
  * send_lock; GSO fast path when uniform. q->n is left untouched (the
  * caller/Linux path resets it, the Windows sender releases the buffer). */
@@ -518,6 +412,8 @@ static void pump_tx_send(pump_ctx_t *ctx, pump_tx_t *q)
     pthread_mutex_unlock(&ctx->send_lock);
     pump_prof_add(&ctx->prof[PP_SEND], now_us() - t0);
 }
+#endif /* !_WIN32 || !IWAN_WIN_PUMP_SINGLE */
+
 
 #ifndef _WIN32
 /* flush one batch to the socket inline (Linux: the reader thread owns
@@ -592,6 +488,14 @@ static void pump_tun_pkt(void *ud, uint8_t *pkt, size_t len, bool last)
     if (q->n == PUMP_BATCH || now_us() - q->t0 >= PUMP_MAX_LAT_US)
         pump_flush(ctx, q);
 }
+#elif defined(_WIN32) && defined(IWAN_WIN_PUMP_SINGLE)
+#include "pump_win_single.h"
+/* Single-thread uplink: wintun reader -> inline zero-copy WSASend.
+ * The SPSC producer/consumer pair is compiled out. */
+#define pump_tun_pkt       pump_win_single_pkt
+#define pump_sender_start  pump_win_single_start
+#define pump_sender_stop   pump_win_single_stop
+#define pump_sender_free   pump_win_single_free
 #else /* _WIN32 */
 
 /* ---------- dedicated UDP sender thread (SPSC) ---------- */
