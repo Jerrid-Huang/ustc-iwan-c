@@ -109,3 +109,38 @@ void socks_cfg_from_auth(SocksConfig *cfg, const AuthResult *res,
     cfg->encryption = 1;
     snprintf(cfg->dns, sizeof cfg->dns, "%s", res->dns);
 }
+
+bool check_server_ip(const char *server, char *errmsg, size_t errsz)
+{
+    char buf[64];
+    const char *ip = server;
+    struct in_addr a4;
+    struct in6_addr a6;
+    if (ip[0] == '[') {
+        ip = unbracket_ipv6(server, buf, sizeof buf);
+    } else if (strchr(ip, ':') != NULL) {
+        /* Rust SocketAddr rejects unbracketed IPv6 ("::1:6001" is
+         * ambiguous) */
+        snprintf(errmsg, errsz, "%s", "invalid socket address syntax");
+        return false;
+    }
+    if (inet_pton(AF_INET, ip, &a4) != 1 &&
+        inet_pton(AF_INET6, ip, &a6) != 1) {
+        snprintf(errmsg, errsz, "%s", "invalid socket address syntax");
+        return false;
+    }
+    return true;
+}
+
+int auth_result_addrs(const AuthResult *res, uint32_t *inner_ip,
+                      uint32_t *gateway)
+{
+    uint8_t b[4];
+    if (!s2ip4(res->tun, b))
+        return 0;
+    *inner_ip = ip4_u32(b);
+    if (!s2ip4(res->gw, b))
+        return -1;
+    *gateway = ip4_u32(b);
+    return 1;
+}

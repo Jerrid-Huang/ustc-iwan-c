@@ -57,4 +57,17 @@ void socks_cfg_from_auth(SocksConfig *cfg, const AuthResult *res,
                          uint32_t inner_ip, uint32_t gateway,
                          const uint8_t sk[16], int mtu);
 
+/* validate a server address literal (uses common.h's unbracket_ipv6).
+ * On false, errmsg carries the reason (NUL-terminated) for the caller's
+ * own error style. shared by iwan-client (die_invalid_address) and
+ * iwan-client-oidc (oidc_die_with_cause("invalid address", ...)). */
+bool check_server_ip(const char *server, char *errmsg, size_t errsz);
+
+/* parse and validate res->tun/res->gw into uint32 host order.
+ * Returns 1 on success, 0 when the tunnel address is invalid, -1 when
+ * the gateway address is invalid (each caller keeps its own error
+ * message). Shared by the four construction/re-auth sites. */
+int auth_result_addrs(const AuthResult *res, uint32_t *inner_ip,
+                      uint32_t *gateway);
+
 #endif

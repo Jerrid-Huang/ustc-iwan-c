@@ -68,7 +68,6 @@ void oidc_pause_if_relaunched(void);
  * forward the variadic args anyway. */
 #define oidc_eprintf err_printf
 void oidc_rand_bytes(uint8_t *out, size_t n);
-void oidc_check_server_ip(const char *server);
 void oidc_hex_upper(const uint8_t *b, size_t n, char *out);
 void oidc_urlenc(const char *s, buf_t *out);
 void oidc_buf_cstr(buf_t *b);

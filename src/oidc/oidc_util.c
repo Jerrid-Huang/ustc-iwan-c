@@ -68,23 +68,6 @@ void oidc_rand_bytes(uint8_t *out, size_t n)
     }
 }
 
-void oidc_check_server_ip(const char *server)
-{
-    char buf[64];
-    const char *ip = server;
-    struct in_addr a4;
-    struct in6_addr a6;
-    if (ip[0] == '[') {
-        ip = unbracket_ipv6(server, buf, sizeof buf);
-    } else if (strchr(ip, ':') != NULL) {
-        oidc_die_with_cause("invalid address", "invalid socket address syntax");
-    }
-    if (inet_pton(AF_INET, ip, &a4) != 1 &&
-        inet_pton(AF_INET6, ip, &a6) != 1) {
-        oidc_die_with_cause("invalid address", "invalid socket address syntax");
-    }
-}
-
 void oidc_hex_upper(const uint8_t *b, size_t n, char *out)
 {
     hex_encode(b, n, out);

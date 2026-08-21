@@ -69,22 +69,18 @@ static int oidc_socks_reauth_cb(void *ud, SocksConfig *cfg, int *out_fd)
     session_key(rc->user, password, sk);
     OPENSSL_cleanse(password, strlen(password));
     free(password);
-    uint8_t b[4];
-    if (!s2ip4(res.tun, b)) {
+    uint32_t inner_ip_v, gateway_v;
+    int sar = auth_result_addrs(&res, &inner_ip_v, &gateway_v);
+    if (sar == 0)
         log_err("SOCKS re-auth: server returned invalid tun");
-        OPENSSL_cleanse(sk, sizeof sk);
-        port_close(fd);
-        return -1;
-    }
-    uint32_t inner_ip = ip4_u32(b);
-    if (!s2ip4(res.gw, b)) {
+    else if (sar < 0)
         log_err("SOCKS re-auth: server returned invalid gw");
+    if (sar != 1) {
         OPENSSL_cleanse(sk, sizeof sk);
         port_close(fd);
         return -1;
     }
-    uint32_t gateway = ip4_u32(b);
-    socks_cfg_from_auth(cfg, &res, inner_ip, gateway, sk,
+    socks_cfg_from_auth(cfg, &res, inner_ip_v, gateway_v, sk,
                         res.mtu < rc->o->socks_mtu ? res.mtu : rc->o->socks_mtu);
     OPENSSL_cleanse(sk, sizeof sk);
     *out_fd = fd;
@@ -95,17 +91,14 @@ static int run_socks_mode(const Opts *o, int fd, const uint8_t sk[16],
                           const AuthResult *res,
                           const struct oidc_reauth_ctx *rc)
 {
-    uint8_t b[4];
-    if (!s2ip4(res->tun, b)) {
+    uint32_t inner_ip, gateway;
+    int sar = auth_result_addrs(res, &inner_ip, &gateway);
+    if (sar == 0)
         log_err("server returned invalid tunnel IPv4 address");
-        return -1;
-    }
-    uint32_t inner_ip = ip4_u32(b);
-    if (!s2ip4(res->gw, b)) {
+    else if (sar < 0)
         log_err("server returned invalid gateway IPv4 address");
+    if (sar != 1)
         return -1;
-    }
-    uint32_t gateway = ip4_u32(b);
 
     struct sockaddr_in listen;
     if (parse_host_port(o->socks_listen, &listen) != 0)
@@ -241,7 +234,11 @@ void oidc_connect_server(const Opts *o, const Config *cf)
     oidc_eprintf("  Connecting to %s (%s:%u)...\n", name ? name : "", host,
                  (unsigned)port);
 
-    oidc_check_server_ip(host);
+    {
+        char eb[64];
+        if (!check_server_ip(host, eb, sizeof eb))
+            oidc_die_with_cause("invalid address", eb);
+    }
 
     const char *user = srv_user ? srv_user : "";
 

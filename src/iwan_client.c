@@ -385,22 +385,6 @@ static void die_invalid_address(const char *ctx)
     exit(2);   /* argument-validation error: same code as the CLI parser */
 }
 
-static void check_server_ip(const char *server, const char *ctx)
-{
-    char buf[64];
-    const char *ip = server;
-    struct in_addr a4;
-    struct in6_addr a6;
-    if (ip[0] == '[') {
-        ip = unbracket_ipv6(server, buf, sizeof buf);
-    } else if (strchr(ip, ':') != NULL) {
-        /* Rust SocketAddr rejects unbracketed IPv6 ("::1:6001" is ambiguous) */
-        die_invalid_address(ctx);
-    }
-    if (inet_pton(AF_INET, ip, &a4) != 1 &&
-        inet_pton(AF_INET6, ip, &a6) != 1)
-        die_invalid_address(ctx);
-}
 
 /* parse subcommand args; on -h/--help/errors the shared parser exits */
 static void parse_cmd(int argc, char **argv, int start, const char *sub,
@@ -595,7 +579,9 @@ static int cmd_ping(int argc, char **argv, int start)
     parse_cmd(argc, argv, start, "ping", opts, sizeof opts / sizeof opts[0]);
     if (!o.server)
         err_required("ping");
-    check_server_ip(o.server, "invalid server address");
+    char eb[64];
+    if (!check_server_ip(o.server, eb, sizeof eb))
+        die_invalid_address("invalid server address");
 
     int fd = udp_connect(o.server, o.port, PING_TIMEOUT_MS);
     if (fd < 0) {
@@ -655,7 +641,9 @@ static int cmd_auth(int argc, char **argv, int start)
     if (!o.server)
         err_required("auth");
     resolve_credentials(&o, "auth");
-    check_server_ip(o.server, "invalid server address");
+    char eb[64];
+    if (!check_server_ip(o.server, eb, sizeof eb))
+        die_invalid_address("invalid server address");
 
     AuthResult res;
     int fd = authenticate(&o, DO_AUTH_AUTH, &res);
@@ -712,7 +700,9 @@ static int cmd_proxy(int argc, char **argv, int start)
     if (!o.server)
         err_required("proxy");
     resolve_credentials(&o, "proxy");
-    check_server_ip(o.server, "invalid server address");
+    char eb[64];
+    if (!check_server_ip(o.server, eb, sizeof eb))
+        die_invalid_address("invalid server address");
     if (o.socks_token && o.socks_no_token) {
         fprintf(stderr,
                 "error: --socks-token and --socks-no-token are "
@@ -873,21 +863,17 @@ static int socks_reauth_cb(void *ud, SocksConfig *cfg, int *out_fd)
     }
     uint8_t sk[16];
     session_key(o->user, o->pass, sk);
-    uint8_t b[4];
-    if (!s2ip4(res.tun, b)) {
+    uint32_t inner_ip, gateway;
+    int ar = auth_result_addrs(&res, &inner_ip, &gateway);
+    if (ar == 0)
         log_err("SOCKS re-auth: server returned invalid tun");
-        wipe(sk, sizeof sk);
-        port_close(fd);
-        return -1;
-    }
-    uint32_t inner_ip = ip4_u32(b);
-    if (!s2ip4(res.gw, b)) {
+    else if (ar < 0)
         log_err("SOCKS re-auth: server returned invalid gw");
+    if (ar != 1) {
         wipe(sk, sizeof sk);
         port_close(fd);
         return -1;
     }
-    uint32_t gateway = ip4_u32(b);
     socks_cfg_from_auth(cfg, &res, inner_ip, gateway, sk,
                         (int)(res.mtu < o->mtu ? res.mtu : o->mtu));
     wipe(sk, sizeof sk);
@@ -920,7 +906,9 @@ static int cmd_socks(int argc, char **argv, int start)
     if (!o.server)
         err_required("socks");
     resolve_credentials(&o, "socks");
-    check_server_ip(o.server, "invalid server address");
+    char eb[64];
+    if (!check_server_ip(o.server, eb, sizeof eb))
+        die_invalid_address("invalid server address");
     if (o.socks_token && o.socks_no_token) {
         fprintf(stderr,
                 "error: --socks-token and --socks-no-token are "
@@ -964,23 +952,18 @@ static int cmd_socks(int argc, char **argv, int start)
         uint8_t sk[16];
         session_key(o.user, o.pass, sk);
 
-        uint8_t b[4];
-        if (!s2ip4(res.tun, b)) {
+        uint32_t inner_ip, gateway;
+        int sar = auth_result_addrs(&res, &inner_ip, &gateway);
+        if (sar == 0)
             log_err("Error: server returned invalid tunnel IPv4 address");
-            wipe(sk, sizeof sk);
-            port_close(sockfd);
-            cleanse_str(o.pass);
-            return 1;
-        }
-        uint32_t inner_ip = ip4_u32(b);
-        if (!s2ip4(res.gw, b)) {
+        else if (sar < 0)
             log_err("Error: server returned invalid gateway IPv4 address");
+        if (sar != 1) {
             wipe(sk, sizeof sk);
             port_close(sockfd);
             cleanse_str(o.pass);
             return 1;
         }
-        uint32_t gateway = ip4_u32(b);
         check_gw_server(o.server, res.gw);   /* F8 */
 
         /* valid_listen already validated the syntax at parse time; this
