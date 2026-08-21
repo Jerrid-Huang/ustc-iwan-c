@@ -798,6 +798,30 @@ src/common/tun.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/iwan_core.dir/build.make CMakeFiles/iwan_core.dir/src/common/tun.c.s
 .PHONY : src/common/tun.c.s
 
+src/common/udp_send.o: src/common/udp_send.c.o
+.PHONY : src/common/udp_send.o
+
+# target to build an object file
+src/common/udp_send.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/iwan_core.dir/build.make CMakeFiles/iwan_core.dir/src/common/udp_send.c.o
+.PHONY : src/common/udp_send.c.o
+
+src/common/udp_send.i: src/common/udp_send.c.i
+.PHONY : src/common/udp_send.i
+
+# target to preprocess a source file
+src/common/udp_send.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/iwan_core.dir/build.make CMakeFiles/iwan_core.dir/src/common/udp_send.c.i
+.PHONY : src/common/udp_send.c.i
+
+src/common/udp_send.s: src/common/udp_send.c.s
+.PHONY : src/common/udp_send.s
+
+# target to generate assembly for a file
+src/common/udp_send.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/iwan_core.dir/build.make CMakeFiles/iwan_core.dir/src/common/udp_send.c.s
+.PHONY : src/common/udp_send.c.s
+
 src/common/util.o: src/common/util.c.o
 .PHONY : src/common/util.o
 
@@ -1749,6 +1773,9 @@ help:
 	@echo "... src/common/tun.o"
 	@echo "... src/common/tun.i"
 	@echo "... src/common/tun.s"
+	@echo "... src/common/udp_send.o"
+	@echo "... src/common/udp_send.i"
+	@echo "... src/common/udp_send.s"
 	@echo "... src/common/util.o"
 	@echo "... src/common/util.i"
 	@echo "... src/common/util.s"

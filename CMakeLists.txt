@@ -138,6 +138,7 @@ set(IWAN_CORE_SRCS
   src/common/route.c
   src/common/socks.c
   src/common/socks_flow.c
+  src/common/udp_send.c
   src/common/util.c)
 if(WIN32)
   # tun_win.c replaces tun.c (wintun backend; tun.c is Linux TUN ioctls),

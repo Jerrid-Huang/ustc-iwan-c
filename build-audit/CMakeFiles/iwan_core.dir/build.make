@@ -348,10 +348,24 @@ CMakeFiles/iwan_core.dir/src/common/socks_flow.c.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/iwan_core.dir/src/common/socks_flow.c.s"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/uker/my/software/ustc-iwan-c/src/common/socks_flow.c -o CMakeFiles/iwan_core.dir/src/common/socks_flow.c.s
 
+CMakeFiles/iwan_core.dir/src/common/udp_send.c.o: CMakeFiles/iwan_core.dir/flags.make
+CMakeFiles/iwan_core.dir/src/common/udp_send.c.o: /home/uker/my/software/ustc-iwan-c/src/common/udp_send.c
+CMakeFiles/iwan_core.dir/src/common/udp_send.c.o: CMakeFiles/iwan_core.dir/compiler_depend.ts
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/uker/my/software/ustc-iwan-c/build-audit/CMakeFiles --progress-num=$(CMAKE_PROGRESS_22) "Building C object CMakeFiles/iwan_core.dir/src/common/udp_send.c.o"
+	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/iwan_core.dir/src/common/udp_send.c.o -MF CMakeFiles/iwan_core.dir/src/common/udp_send.c.o.d -o CMakeFiles/iwan_core.dir/src/common/udp_send.c.o -c /home/uker/my/software/ustc-iwan-c/src/common/udp_send.c
+
+CMakeFiles/iwan_core.dir/src/common/udp_send.c.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/iwan_core.dir/src/common/udp_send.c.i"
+	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/uker/my/software/ustc-iwan-c/src/common/udp_send.c > CMakeFiles/iwan_core.dir/src/common/udp_send.c.i
+
+CMakeFiles/iwan_core.dir/src/common/udp_send.c.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/iwan_core.dir/src/common/udp_send.c.s"
+	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/uker/my/software/ustc-iwan-c/src/common/udp_send.c -o CMakeFiles/iwan_core.dir/src/common/udp_send.c.s
+
 CMakeFiles/iwan_core.dir/src/common/util.c.o: CMakeFiles/iwan_core.dir/flags.make
 CMakeFiles/iwan_core.dir/src/common/util.c.o: /home/uker/my/software/ustc-iwan-c/src/common/util.c
 CMakeFiles/iwan_core.dir/src/common/util.c.o: CMakeFiles/iwan_core.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/uker/my/software/ustc-iwan-c/build-audit/CMakeFiles --progress-num=$(CMAKE_PROGRESS_22) "Building C object CMakeFiles/iwan_core.dir/src/common/util.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/uker/my/software/ustc-iwan-c/build-audit/CMakeFiles --progress-num=$(CMAKE_PROGRESS_23) "Building C object CMakeFiles/iwan_core.dir/src/common/util.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/iwan_core.dir/src/common/util.c.o -MF CMakeFiles/iwan_core.dir/src/common/util.c.o.d -o CMakeFiles/iwan_core.dir/src/common/util.c.o -c /home/uker/my/software/ustc-iwan-c/src/common/util.c
 
 CMakeFiles/iwan_core.dir/src/common/util.c.i: cmake_force
@@ -365,7 +379,7 @@ CMakeFiles/iwan_core.dir/src/common/util.c.s: cmake_force
 CMakeFiles/iwan_core.dir/src/common/server.c.o: CMakeFiles/iwan_core.dir/flags.make
 CMakeFiles/iwan_core.dir/src/common/server.c.o: /home/uker/my/software/ustc-iwan-c/src/common/server.c
 CMakeFiles/iwan_core.dir/src/common/server.c.o: CMakeFiles/iwan_core.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/uker/my/software/ustc-iwan-c/build-audit/CMakeFiles --progress-num=$(CMAKE_PROGRESS_23) "Building C object CMakeFiles/iwan_core.dir/src/common/server.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/uker/my/software/ustc-iwan-c/build-audit/CMakeFiles --progress-num=$(CMAKE_PROGRESS_24) "Building C object CMakeFiles/iwan_core.dir/src/common/server.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/iwan_core.dir/src/common/server.c.o -MF CMakeFiles/iwan_core.dir/src/common/server.c.o.d -o CMakeFiles/iwan_core.dir/src/common/server.c.o -c /home/uker/my/software/ustc-iwan-c/src/common/server.c
 
 CMakeFiles/iwan_core.dir/src/common/server.c.i: cmake_force
@@ -379,7 +393,7 @@ CMakeFiles/iwan_core.dir/src/common/server.c.s: cmake_force
 CMakeFiles/iwan_core.dir/src/common/tun.c.o: CMakeFiles/iwan_core.dir/flags.make
 CMakeFiles/iwan_core.dir/src/common/tun.c.o: /home/uker/my/software/ustc-iwan-c/src/common/tun.c
 CMakeFiles/iwan_core.dir/src/common/tun.c.o: CMakeFiles/iwan_core.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/uker/my/software/ustc-iwan-c/build-audit/CMakeFiles --progress-num=$(CMAKE_PROGRESS_24) "Building C object CMakeFiles/iwan_core.dir/src/common/tun.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/uker/my/software/ustc-iwan-c/build-audit/CMakeFiles --progress-num=$(CMAKE_PROGRESS_25) "Building C object CMakeFiles/iwan_core.dir/src/common/tun.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/iwan_core.dir/src/common/tun.c.o -MF CMakeFiles/iwan_core.dir/src/common/tun.c.o.d -o CMakeFiles/iwan_core.dir/src/common/tun.c.o -c /home/uker/my/software/ustc-iwan-c/src/common/tun.c
 
 CMakeFiles/iwan_core.dir/src/common/tun.c.i: cmake_force
@@ -393,7 +407,7 @@ CMakeFiles/iwan_core.dir/src/common/tun.c.s: cmake_force
 CMakeFiles/iwan_core.dir/src/common/lwip_bridge.c.o: CMakeFiles/iwan_core.dir/flags.make
 CMakeFiles/iwan_core.dir/src/common/lwip_bridge.c.o: /home/uker/my/software/ustc-iwan-c/src/common/lwip_bridge.c
 CMakeFiles/iwan_core.dir/src/common/lwip_bridge.c.o: CMakeFiles/iwan_core.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/uker/my/software/ustc-iwan-c/build-audit/CMakeFiles --progress-num=$(CMAKE_PROGRESS_25) "Building C object CMakeFiles/iwan_core.dir/src/common/lwip_bridge.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/uker/my/software/ustc-iwan-c/build-audit/CMakeFiles --progress-num=$(CMAKE_PROGRESS_26) "Building C object CMakeFiles/iwan_core.dir/src/common/lwip_bridge.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/iwan_core.dir/src/common/lwip_bridge.c.o -MF CMakeFiles/iwan_core.dir/src/common/lwip_bridge.c.o.d -o CMakeFiles/iwan_core.dir/src/common/lwip_bridge.c.o -c /home/uker/my/software/ustc-iwan-c/src/common/lwip_bridge.c
 
 CMakeFiles/iwan_core.dir/src/common/lwip_bridge.c.i: cmake_force
@@ -407,7 +421,7 @@ CMakeFiles/iwan_core.dir/src/common/lwip_bridge.c.s: cmake_force
 CMakeFiles/iwan_core.dir/src/common/profile.c.o: CMakeFiles/iwan_core.dir/flags.make
 CMakeFiles/iwan_core.dir/src/common/profile.c.o: /home/uker/my/software/ustc-iwan-c/src/common/profile.c
 CMakeFiles/iwan_core.dir/src/common/profile.c.o: CMakeFiles/iwan_core.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/uker/my/software/ustc-iwan-c/build-audit/CMakeFiles --progress-num=$(CMAKE_PROGRESS_26) "Building C object CMakeFiles/iwan_core.dir/src/common/profile.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/uker/my/software/ustc-iwan-c/build-audit/CMakeFiles --progress-num=$(CMAKE_PROGRESS_27) "Building C object CMakeFiles/iwan_core.dir/src/common/profile.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/iwan_core.dir/src/common/profile.c.o -MF CMakeFiles/iwan_core.dir/src/common/profile.c.o.d -o CMakeFiles/iwan_core.dir/src/common/profile.c.o -c /home/uker/my/software/ustc-iwan-c/src/common/profile.c
 
 CMakeFiles/iwan_core.dir/src/common/profile.c.i: cmake_force
@@ -421,7 +435,7 @@ CMakeFiles/iwan_core.dir/src/common/profile.c.s: cmake_force
 CMakeFiles/iwan_core.dir/steer/steer_bpf_data.c.o: CMakeFiles/iwan_core.dir/flags.make
 CMakeFiles/iwan_core.dir/steer/steer_bpf_data.c.o: steer/steer_bpf_data.c
 CMakeFiles/iwan_core.dir/steer/steer_bpf_data.c.o: CMakeFiles/iwan_core.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/uker/my/software/ustc-iwan-c/build-audit/CMakeFiles --progress-num=$(CMAKE_PROGRESS_27) "Building C object CMakeFiles/iwan_core.dir/steer/steer_bpf_data.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/uker/my/software/ustc-iwan-c/build-audit/CMakeFiles --progress-num=$(CMAKE_PROGRESS_28) "Building C object CMakeFiles/iwan_core.dir/steer/steer_bpf_data.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/iwan_core.dir/steer/steer_bpf_data.c.o -MF CMakeFiles/iwan_core.dir/steer/steer_bpf_data.c.o.d -o CMakeFiles/iwan_core.dir/steer/steer_bpf_data.c.o -c /home/uker/my/software/ustc-iwan-c/build-audit/steer/steer_bpf_data.c
 
 CMakeFiles/iwan_core.dir/steer/steer_bpf_data.c.i: cmake_force
@@ -453,6 +467,7 @@ iwan_core_OBJECTS = \
 "CMakeFiles/iwan_core.dir/src/common/route.c.o" \
 "CMakeFiles/iwan_core.dir/src/common/socks.c.o" \
 "CMakeFiles/iwan_core.dir/src/common/socks_flow.c.o" \
+"CMakeFiles/iwan_core.dir/src/common/udp_send.c.o" \
 "CMakeFiles/iwan_core.dir/src/common/util.c.o" \
 "CMakeFiles/iwan_core.dir/src/common/server.c.o" \
 "CMakeFiles/iwan_core.dir/src/common/tun.c.o" \
@@ -482,6 +497,7 @@ lib/libiwan_core.a: CMakeFiles/iwan_core.dir/src/common/relay_proxy.c.o
 lib/libiwan_core.a: CMakeFiles/iwan_core.dir/src/common/route.c.o
 lib/libiwan_core.a: CMakeFiles/iwan_core.dir/src/common/socks.c.o
 lib/libiwan_core.a: CMakeFiles/iwan_core.dir/src/common/socks_flow.c.o
+lib/libiwan_core.a: CMakeFiles/iwan_core.dir/src/common/udp_send.c.o
 lib/libiwan_core.a: CMakeFiles/iwan_core.dir/src/common/util.c.o
 lib/libiwan_core.a: CMakeFiles/iwan_core.dir/src/common/server.c.o
 lib/libiwan_core.a: CMakeFiles/iwan_core.dir/src/common/tun.c.o
@@ -490,7 +506,7 @@ lib/libiwan_core.a: CMakeFiles/iwan_core.dir/src/common/profile.c.o
 lib/libiwan_core.a: CMakeFiles/iwan_core.dir/steer/steer_bpf_data.c.o
 lib/libiwan_core.a: CMakeFiles/iwan_core.dir/build.make
 lib/libiwan_core.a: CMakeFiles/iwan_core.dir/link.txt
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --bold --progress-dir=/home/uker/my/software/ustc-iwan-c/build-audit/CMakeFiles --progress-num=$(CMAKE_PROGRESS_28) "Linking C static library lib/libiwan_core.a"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --bold --progress-dir=/home/uker/my/software/ustc-iwan-c/build-audit/CMakeFiles --progress-num=$(CMAKE_PROGRESS_29) "Linking C static library lib/libiwan_core.a"
 	$(CMAKE_COMMAND) -P CMakeFiles/iwan_core.dir/cmake_clean_target.cmake
 	$(CMAKE_COMMAND) -E cmake_link_script CMakeFiles/iwan_core.dir/link.txt --verbose=$(VERBOSE)
 

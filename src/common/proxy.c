@@ -25,6 +25,7 @@
 #include "proxy.h"
 #include "route.h"
 #include "tun.h"
+#include "udp_send.h"
 #include "util.h"
 
 struct pump_tx_buf;   /* Windows send-thread batch-buffer pool (defined below) */
@@ -124,7 +125,6 @@ typedef struct {
     HANDLE free_sem;              /* count of free buffers */
     HANDLE ready_sem;             /* count of ready batches */
     struct pump_tx_buf *tx_pool[PUMP_TX_POOL]; /* batch buffer pool */
-    struct pump_tx_buf *cur_buf;  /* reader's in-progress batch */
     pthread_t sender_thread;
     int sender_stop;
 #endif
@@ -272,12 +272,8 @@ static unsigned pump_rx_stale_ms(void)
  * of socks.c socks_send_batch2 — keep the two in sync. */
 static int pump_send_retry(pump_ctx_t *ctx, uint64_t retry_t0)
 {
-    uint64_t el = now_ms() - retry_t0;
-    if (el >= PUMP_SEND_RETRY_MS)
-        return 0;
-    struct pollfd pfd = { .fd = ctx->sockfd, .events = POLLOUT };
-    port_poll(&pfd, 1, (int)(PUMP_SEND_RETRY_MS - el));
-    return 1;
+    return udp_send_stall_wait(ctx->sockfd, retry_t0,
+                               PUMP_SEND_RETRY_MS);
 }
 
 /* send a packet batch; retry partial sends and EAGAIN instead of dropping.
@@ -301,11 +297,7 @@ static int send_batch(pump_ctx_t *ctx, struct mmsghdr *msgs, unsigned n)
 
     /* a lingering UDP_SEGMENT value would silently split any datagram
      * longer than the mss, so disable it before the per-message path */
-    if (ctx->gso_mss != 0) {
-        int z = 0;
-        port_setsockopt(ctx->sockfd, SOL_UDP, UDP_SEGMENT, &z, sizeof z);
-        ctx->gso_mss = 0;
-    }
+    udp_gso_clear(ctx->sockfd, &ctx->gso_ok, &ctx->gso_mss);
 
     while (sent < n && !g_stop) {
         atomic_fetch_add(&g_prof_send_syscalls, 1);
@@ -363,29 +355,21 @@ static int send_gso(pump_ctx_t *ctx, struct iovec *iov, unsigned n,
         total += iov[i].iov_len;
 
     if (ctx->gso_ok == -1) {
-        int m = (int)mss;
-        /* port_setsockopt translates UDP_SEGMENT to WSAIoctl
-         * (SIO_UDP_NETSEGMENT) on Windows and fails with EOPNOTSUPP on
-         * older systems, so the sendmmsg fallback below works unchanged */
-        ctx->gso_ok = port_setsockopt(ctx->sockfd, SOL_UDP, UDP_SEGMENT,
-                                      &m, sizeof m) == 0;
-        if (!ctx->gso_ok) {
-            err_printf("[TUN->UDP] UDP_SEGMENT unsupported, using sendmmsg\n");
+        /* first use: probe; port_setsockopt translates UDP_SEGMENT to
+         * WSAIoctl(SIO_UDP_NETSEGMENT) on Windows and fails with
+         * EOPNOTSUPP on older systems, so the sendmmsg fallback below
+         * works unchanged */
+        if (!udp_gso_prepare(ctx->sockfd, mss, &ctx->gso_ok,
+                             &ctx->gso_mss)) {
+            err_printf("[TUN->UDP] UDP_SEGMENT unsupported, using "
+                       "sendmmsg\n");
             return TX_FALLBACK;
         }
-        ctx->gso_mss = mss;
-    } else if (ctx->gso_ok && ctx->gso_mss != mss) {
-        /* re-arm a WORKING GSO socket for a new mss; once GSO is known
-         * unavailable (e.g. SIO_UDP_NETSEGMENT rejected on Windows)
-         * re-probing on every distinct batch size would just spam
-         * WSAEOPNOTSUPP — stay on the sendmmsg fallback */
-        int m = (int)mss;
-        if (port_setsockopt(ctx->sockfd, SOL_UDP, UDP_SEGMENT, &m,
-                            sizeof m) != 0) {
-            ctx->gso_ok = 0;
-            return TX_FALLBACK;
-        }
-        ctx->gso_mss = mss;
+    } else if (!udp_gso_prepare(ctx->sockfd, mss, &ctx->gso_ok,
+                                &ctx->gso_mss)) {
+        /* re-arm a WORKING GSO socket failed (or GSO was already known
+         * unavailable) — fall back to sendmmsg */
+        return TX_FALLBACK;
     }
     if (!ctx->gso_ok)
         return TX_FALLBACK;
@@ -440,13 +424,8 @@ static int send_gso(pump_ctx_t *ctx, struct iovec *iov, unsigned n,
          * socket, not that the tunnel died: disable it and fall back
          * to the per-message sendmmsg path (send_batch) for this batch
          * and all future ones */
-        ctx->gso_ok = 0;
-        ctx->gso_mss = 0;
-        {
-            int z = 0;
-            port_setsockopt(ctx->sockfd, SOL_UDP, UDP_SEGMENT, &z,
-                            sizeof z);
-        }
+        udp_gso_clear(ctx->sockfd, &ctx->gso_ok, &ctx->gso_mss);
+        ctx->gso_ok = 0;   /* latch the disabled state */
         return TX_FALLBACK;
     }
     return TX_DONE;
@@ -695,18 +674,20 @@ static void pump_flush_w(pump_ctx_t *ctx, struct pump_tx_buf *b)
     pump_prof_add(&ctx->prof[PP_ENQ], now_us() - t0);
 }
 
-/* tun_pool callback on Windows: the (single) wintun reader fills a batch
- * buffer from the pool, then hands the whole batch to the sender thread */
+/* tun_pool callback on Windows: per-packet send path.
+ * Windows has no sendmmsg and no UDP_SEGMENT (SIO_UDP_NETSEGMENT is
+ * rejected on the tiny11/virtio target), so batching would not reduce
+ * system calls — it would only add up to PUMP_MAX_LAT_US of latency per
+ * packet. Each inner packet is therefore enqueued immediately as its
+ * own n=1 batch; the dedicated sender thread still moves the WSASend
+ * off the wintun reader so a slow socket cannot stall TUN reads. The
+ * pool (4 buffers) provides the backpressure when the sender lags. */
 static void pump_tun_pkt(void *ud, uint8_t *pkt, size_t len, bool last)
 {
     pump_ctx_t *ctx = ud;
 
-    if (last) {
-        if (ctx->cur_buf != NULL && ctx->cur_buf->tx.n > 0)
-            pump_flush_w(ctx, ctx->cur_buf);
-        ctx->cur_buf = NULL;
-        return;
-    }
+    if (last)
+        return;   /* every packet was enqueued immediately; nothing pending */
     if (len > (uint32_t)g_prof_tun_rmax)
         g_prof_tun_rmax = (uint32_t)len;   /* single reader thread */
     if (len > 1508)
@@ -718,33 +699,29 @@ static void pump_tun_pkt(void *ud, uint8_t *pkt, size_t len, bool last)
                   PUMP_SLOT);
         return;
     }
-    if (ctx->cur_buf == NULL) {
-        ctx->cur_buf = pump_tx_acquire(ctx);
-        if (ctx->cur_buf == NULL)
-            return;   /* stopped */
-        ctx->cur_buf->tx.n = 0;
-        ctx->cur_buf->tx.t0 = now_us();
-    }
-    pump_tx_t *q = &ctx->cur_buf->tx;
-    if (g_stop)
+    struct pump_tx_buf *b = pump_tx_acquire(ctx);
+    if (b == NULL)
+        return;   /* stopped */
+    pump_tx_t *q = &b->tx;
+    q->n = 0;
+    q->t0 = now_us();
+    if (g_stop) {
+        pump_tx_release(ctx, b);
         return;
+    }
     {
-        const size_t slot = 8 + PUMP_SLOT;
-        uint8_t *s = q->batch + (size_t)q->n * slot;
+        uint8_t *s = q->batch;   /* single packet: slot 0 */
         uint64_t t0 = now_us();
         memcpy(s, q->hdr, 8);
         memcpy(s + 8, pkt, len);   /* wintun scratch, copied out */
         xor_crypt(s + 8, len, ctx->xor_key, 8);
         pump_prof_add(&ctx->prof[PP_COPY_XOR], now_us() - t0);
         PROF_ADD(g_prof_pump_tx, len);
-        q->iov[q->n].iov_base = s;
-        q->iov[q->n].iov_len = len + 8;
-        q->n++;
+        q->iov[0].iov_base = s;
+        q->iov[0].iov_len = len + 8;
+        q->n = 1;
     }
-    if (q->n == PUMP_BATCH || now_us() - q->t0 >= PUMP_MAX_LAT_US) {
-        pump_flush_w(ctx, ctx->cur_buf);
-        ctx->cur_buf = NULL;
-    }
+    pump_flush_w(ctx, b);
 }
 
 static void pump_sender_free(pump_ctx_t *ctx);   /* fwd: used by start's err path */
@@ -773,7 +750,6 @@ static int pump_sender_start(pump_ctx_t *ctx)
     ctx->ready_ring.head = 0;
     ctx->ready_ring.tail = 0;
     ctx->ready_ring.mask = PUMP_SPSC_CAP - 1;
-    ctx->cur_buf = NULL;
     ctx->sender_stop = 0;
 
     ctx->free_sem = CreateSemaphore(NULL, 0, PUMP_SPSC_CAP, NULL);

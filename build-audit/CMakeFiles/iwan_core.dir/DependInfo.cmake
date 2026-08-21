@@ -31,6 +31,7 @@ set(CMAKE_DEPENDS_DEPENDENCY_FILES
   "/home/uker/my/software/ustc-iwan-c/src/common/socks.c" "CMakeFiles/iwan_core.dir/src/common/socks.c.o" "gcc" "CMakeFiles/iwan_core.dir/src/common/socks.c.o.d"
   "/home/uker/my/software/ustc-iwan-c/src/common/socks_flow.c" "CMakeFiles/iwan_core.dir/src/common/socks_flow.c.o" "gcc" "CMakeFiles/iwan_core.dir/src/common/socks_flow.c.o.d"
   "/home/uker/my/software/ustc-iwan-c/src/common/tun.c" "CMakeFiles/iwan_core.dir/src/common/tun.c.o" "gcc" "CMakeFiles/iwan_core.dir/src/common/tun.c.o.d"
+  "/home/uker/my/software/ustc-iwan-c/src/common/udp_send.c" "CMakeFiles/iwan_core.dir/src/common/udp_send.c.o" "gcc" "CMakeFiles/iwan_core.dir/src/common/udp_send.c.o.d"
   "/home/uker/my/software/ustc-iwan-c/src/common/util.c" "CMakeFiles/iwan_core.dir/src/common/util.c.o" "gcc" "CMakeFiles/iwan_core.dir/src/common/util.c.o.d"
   "/home/uker/my/software/ustc-iwan-c/build-audit/steer/steer_bpf_data.c" "CMakeFiles/iwan_core.dir/steer/steer_bpf_data.c.o" "gcc" "CMakeFiles/iwan_core.dir/steer/steer_bpf_data.c.o.d"
   )

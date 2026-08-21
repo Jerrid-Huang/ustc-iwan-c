@@ -166,4 +166,5 @@ CMakeFiles/iwan_core.dir/src/common/proxy.c.o: \
  /home/uker/my/software/ustc-iwan-c/src/common/proxy.h \
  /home/uker/my/software/ustc-iwan-c/src/common/route.h \
  /home/uker/my/software/ustc-iwan-c/src/common/tun.h \
+ /home/uker/my/software/ustc-iwan-c/src/common/udp_send.h \
  /home/uker/my/software/ustc-iwan-c/src/common/util.h

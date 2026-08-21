@@ -45,6 +45,8 @@ file(REMOVE_RECURSE
   "CMakeFiles/iwan_core.dir/src/common/socks_flow.c.o.d"
   "CMakeFiles/iwan_core.dir/src/common/tun.c.o"
   "CMakeFiles/iwan_core.dir/src/common/tun.c.o.d"
+  "CMakeFiles/iwan_core.dir/src/common/udp_send.c.o"
+  "CMakeFiles/iwan_core.dir/src/common/udp_send.c.o.d"
   "CMakeFiles/iwan_core.dir/src/common/util.c.o"
   "CMakeFiles/iwan_core.dir/src/common/util.c.o.d"
   "CMakeFiles/iwan_core.dir/steer/steer_bpf_data.c.o"
