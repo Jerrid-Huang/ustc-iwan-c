@@ -46,12 +46,6 @@ option(IWAN_STATIC       "Windows: statically link OpenSSL + runtime libs" OFF)
 option(IWAN_BPF          "Linux: compile and embed the tun steering eBPF program" ON)
 option(IWAN_WERROR       "Treat compiler warnings as errors" OFF)
 set(IWAN_OPENSSL_DIR "" CACHE PATH "OpenSSL sysroot (include/ + lib/ or lib64/)")
-# SOCKS-mode userspace TCP stack. lwip = vendored lwIP 2.2.1 (default);
-# native = the hand-rolled netstack.c, retained one release cycle as a
-# rollback target.
-set(IWAN_TCP_STACK "lwip" CACHE STRING "SOCKS-mode TCP stack (lwip | native)")
-set_property(CACHE IWAN_TCP_STACK PROPERTY STRINGS lwip native)
-
 # ---------------------------------------------------------------------------
 # Global flags — the old Makefile's CFLAGS/LDFLAGS, split per platform.
 # ---------------------------------------------------------------------------
@@ -158,14 +152,9 @@ else()
   list(APPEND IWAN_CORE_SRCS src/common/server.c src/common/tun.c)
 endif()
 
-# Userspace TCP stack for the SOCKS mode (exactly one implementation).
-if(IWAN_TCP_STACK STREQUAL "lwip")
-  list(APPEND IWAN_CORE_SRCS src/common/lwip_bridge.c)
-elseif(IWAN_TCP_STACK STREQUAL "native")
-  list(APPEND IWAN_CORE_SRCS src/common/netstack.c)
-else()
-  message(FATAL_ERROR "IWAN_TCP_STACK must be 'lwip' or 'native' (got '${IWAN_TCP_STACK}')")
-endif()
+# Userspace TCP stack for the SOCKS mode: the vendored lwIP bridge is
+# the only implementation (the native netstack.c rollback was removed).
+list(APPEND IWAN_CORE_SRCS src/common/lwip_bridge.c)
 
 # throughput instrumentation (bottleneck profiling; IWAN_PROFILE=1)
 list(APPEND IWAN_CORE_SRCS src/common/profile.c)
@@ -174,8 +163,7 @@ list(APPEND IWAN_CORE_SRCS src/common/profile.c)
 # Vendored lwIP 2.2.1 (third_party/lwip): the userspace TCP stack behind the
 # SOCKS mode. NO_SYS=1 raw API, IPv4/TCP only, no socket layer — configured by
 # third_party/lwip/lwipopts.h and third_party/lwip/port/arch/cc.h. Built as a
-# standalone static lib; iwan_core links it (native netstack.c remains the
-# IWAN_TCP_STACK=native alternative).
+# standalone static lib; iwan_core links it.
 # ---------------------------------------------------------------------------
 set(IWAN_LWIP_SRCS
   third_party/lwip/src/core/def.c
@@ -229,9 +217,7 @@ target_compile_options(lwip PRIVATE -Wno-array-bounds)
 add_library(iwan_core STATIC ${IWAN_CORE_SRCS})
 target_include_directories(iwan_core PUBLIC src/common)
 target_link_libraries(iwan_core PUBLIC lwip)
-if(IWAN_TCP_STACK STREQUAL "lwip")
-  target_compile_definitions(iwan_core PUBLIC IWAN_TCP_STACK_LWIP=1)
-endif()
+target_compile_definitions(iwan_core PUBLIC IWAN_TCP_STACK_LWIP=1)
 # Threads::Threads is linked LAST: on MinGW it resolves to -lpthread, and
 # in the IWAN_STATIC build it must come after the -Bstatic winpthread group
 # (whose archive then satisfies the pthread refs and the trailing -lpthread

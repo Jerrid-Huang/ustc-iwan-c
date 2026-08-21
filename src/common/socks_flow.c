@@ -1104,7 +1104,7 @@ void flow_free(Flow *f) {
  * open_tcp_connection6: family dispatch on the parsed target. The two
  * public entry points stay as thin wrappers (both are called by name
  * from socks.c's re-auth re-establish path and the handshake code), so
- * the netstack connect / non-blocking / EINPROGRESS handling is
+ * the bridge connect / non-blocking / EINPROGRESS handling is
  * unchanged — only the surrounding bookkeeping is unified. Per-
  * connection, but still data plane. */
 static void open_tcp_conn_af(Flow *f, uint8_t af, uint32_t rip,
@@ -1113,11 +1113,6 @@ static void open_tcp_conn_af(Flow *f, uint8_t af, uint32_t rip,
     uint16_t lport;
     int idx;
 
-    if (af == 6 && !IWAN_NS_IPV6) {
-        /* native rollback stack: honest "address type not supported" */
-        queue_socks_error(f, 8);
-        return;
-    }
     lport = alloc_port();
     if (lport == 0) {
         queue_socks_error(f, 1);

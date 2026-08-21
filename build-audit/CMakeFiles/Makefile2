@@ -237,8 +237,8 @@ CMakeFiles/iwan-client.dir/clean:
 # Target rules for target CMakeFiles/iwan-client-oidc.dir
 
 # All Build rule for target.
-CMakeFiles/iwan-client-oidc.dir/all: CMakeFiles/iwan_core.dir/all
 CMakeFiles/iwan-client-oidc.dir/all: CMakeFiles/iwan_oidc.dir/all
+CMakeFiles/iwan-client-oidc.dir/all: CMakeFiles/iwan_core.dir/all
 CMakeFiles/iwan-client-oidc.dir/all: CMakeFiles/lwip.dir/all
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/iwan-client-oidc.dir/build.make CMakeFiles/iwan-client-oidc.dir/depend
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/iwan-client-oidc.dir/build.make CMakeFiles/iwan-client-oidc.dir/build
