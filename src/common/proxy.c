@@ -286,7 +286,15 @@ static int pump_send_retry(pump_ctx_t *ctx, uint64_t retry_t0)
  * NOTE: structurally identical to socks.c socks_send_batch2 (GSO +
  * sendmmsg + EAGAIN budget) — keep the two in sync when changing retry
  * or pacing semantics. */
-static void send_batch(pump_ctx_t *ctx, struct mmsghdr *msgs, unsigned n)
+/* TX path return contract shared by send_batch and send_gso:
+ * TX_DONE = batch handled (sent, or yielded to the receive path after
+ *           the retry budget),
+ * TX_FALLBACK = this path cannot send; use the other one (GSO ->
+ *           sendmmsg; send_batch never returns this),
+ * TX_FATAL = the tunnel socket is broken; stop the pump. */
+enum { TX_DONE = 1, TX_FALLBACK = 0, TX_FATAL = -1 };
+
+static int send_batch(pump_ctx_t *ctx, struct mmsghdr *msgs, unsigned n)
 {
     unsigned sent = 0;
     uint64_t retry_t0 = now_ms();
@@ -309,7 +317,7 @@ static void send_batch(pump_ctx_t *ctx, struct mmsghdr *msgs, unsigned n)
             continue;
         }
         if (sm == 0)
-            return;   /* cannot happen for UDP; guard against a busy loop */
+            return TX_DONE;   /* cannot happen for UDP; guard against a busy loop */
         if (errno == EINTR)
             continue;
         if (errno == EAGAIN || errno == EWOULDBLOCK ||
@@ -328,13 +336,14 @@ static void send_batch(pump_ctx_t *ctx, struct mmsghdr *msgs, unsigned n)
             int rv = pump_send_retry(ctx, retry_t0);
             pump_prof_add(&ctx->prof[PP_SEND_RETRY], now_us() - r0);
             if (!rv)
-                return;
+                return TX_DONE;   /* bounded: yield to the receive path */
             continue;
         }
         err_printf("[TUN->UDP] sendmmsg: %s\n", strerror(errno));
         g_stop = 1;
-        return;
+        return TX_FATAL;
     }
+    return TX_DONE;
 }
 
 /* send one GSO unit: the kernel splits the (contiguous) payload into
@@ -362,7 +371,7 @@ static int send_gso(pump_ctx_t *ctx, struct iovec *iov, unsigned n,
                                       &m, sizeof m) == 0;
         if (!ctx->gso_ok) {
             err_printf("[TUN->UDP] UDP_SEGMENT unsupported, using sendmmsg\n");
-            return 0;
+            return TX_FALLBACK;
         }
         ctx->gso_mss = mss;
     } else if (ctx->gso_ok && ctx->gso_mss != mss) {
@@ -374,12 +383,12 @@ static int send_gso(pump_ctx_t *ctx, struct iovec *iov, unsigned n,
         if (port_setsockopt(ctx->sockfd, SOL_UDP, UDP_SEGMENT, &m,
                             sizeof m) != 0) {
             ctx->gso_ok = 0;
-            return 0;
+            return TX_FALLBACK;
         }
         ctx->gso_mss = mss;
     }
     if (!ctx->gso_ok)
-        return 0;
+        return TX_FALLBACK;
 
     struct msghdr mh;
     memset(&mh, 0, sizeof mh);
@@ -391,7 +400,7 @@ static int send_gso(pump_ctx_t *ctx, struct iovec *iov, unsigned n,
         ssize_t r = port_sendmsg(ctx->sockfd, &mh, 0);
         pump_prof_add(&ctx->prof[PP_SEND_SYS], now_us() - s0);
         if (r == (ssize_t)total)
-            return 1;
+            return TX_DONE;
         if (r >= 0) {
             /* partial (unexpected for UDP GSO): skip what was sent */
             size_t skip = (size_t)r;
@@ -401,10 +410,10 @@ static int send_gso(pump_ctx_t *ctx, struct iovec *iov, unsigned n,
                 n--;
             }
             if (n == 0)
-                return 1;
+                return TX_DONE;
             if (skip > 0) {
                 /* cannot resume mid-packet; drop the partial unit */
-                return 1;
+                return TX_DONE;
             }
             continue;
         }
@@ -422,7 +431,7 @@ static int send_gso(pump_ctx_t *ctx, struct iovec *iov, unsigned n,
             int rv = pump_send_retry(ctx, retry_t0);
             pump_prof_add(&ctx->prof[PP_SEND_RETRY], now_us() - r0);
             if (!rv)
-                return 1;   /* bounded: let the receive path drain */
+                return TX_DONE;   /* bounded: let the receive path drain */
             continue;
         }
         err_printf("[TUN->UDP] sendmsg GSO failed: %s; disabling "
@@ -438,9 +447,9 @@ static int send_gso(pump_ctx_t *ctx, struct iovec *iov, unsigned n,
             port_setsockopt(ctx->sockfd, SOL_UDP, UDP_SEGMENT, &z,
                             sizeof z);
         }
-        return 0;
+        return TX_FALLBACK;
     }
-    return 1;
+    return TX_DONE;
 }
 
 /* ---- uplink: one pool reader thread per queue, shared TX socket ----
@@ -510,10 +519,14 @@ static void pump_tx_send(pump_ctx_t *ctx, pump_tx_t *q)
     }
     uint64_t t0 = now_us();
     pthread_mutex_lock(&ctx->send_lock);
-    if (use_gso && send_gso(ctx, q->iov, n, q->iov[0].iov_len) == 0)
+    if (use_gso && send_gso(ctx, q->iov, n, q->iov[0].iov_len) == TX_FALLBACK)
         use_gso = 0;   /* UDP_SEGMENT unavailable: fall back */
-    if (!use_gso)
-        send_batch(ctx, q->msgs, n);
+    if (!use_gso) {
+        if (send_batch(ctx, q->msgs, n) == TX_FATAL) {
+            pthread_mutex_unlock(&ctx->send_lock);
+            return;   /* g_stop already set by send_batch */
+        }
+    }
     /* aggregate send pacing (util.h). MUST hold send_lock: multiple
      * reader threads share the bucket, which is not thread-safe; the
      * pacing sleep under the lock is exactly the aggregate-pacing
