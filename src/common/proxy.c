@@ -71,8 +71,10 @@ static uint32_t g_prof_tun_rmax;            /* max wintun packet len (B),
  * timeouts = WAIT_TIMEOUT idle wakes, wakeups = signaled wakes,
  * pkts = packets drained, drain = drain-loop time, allocfail =
  * tun_write AllocateSendPacket first-try failures (TX ring full) */
+#ifdef _WIN32
 extern atomic_uint_fast64_t g_tun_wait_us, g_tun_timeouts, g_tun_wakeups,
                             g_tun_pkts, g_tun_drain_us, g_tun_allocfail;
+#endif
 
 static inline void pump_prof_add(pump_prof_t *p, uint64_t us)
 {
@@ -162,6 +164,7 @@ static void pump_prof_print(const pump_ctx_t *ctx)
             g_prof_tun_rmax,
             (unsigned long long)atomic_load(&g_prof_tun_rbig),
             (unsigned long long)atomic_load(&g_prof_tun_rdrop));
+#ifdef _WIN32
     {
         unsigned long long wk =
             (unsigned long long)atomic_load(&g_tun_wakeups);
@@ -178,6 +181,7 @@ static void pump_prof_print(const pump_ctx_t *ctx)
                 wk ? (double)pk / (double)wk : 0.0,
                 (unsigned long long)atomic_load(&g_tun_allocfail));
     }
+#endif
 }
 
 atomic_uint_fast64_t g_prof_pump_tx, g_prof_pump_rx;   /* [prof] tunnel bytes */
