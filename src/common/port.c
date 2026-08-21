@@ -1429,53 +1429,83 @@ int port_poll(struct pollfd *fds, nfds_t nfds, int timeout_ms)
  * on process exit. The returned fd is a normal socket: pollable with
  * WSAPoll and closed with port_evfd_close. */
 
-static SOCKET g_evfd_peer = INVALID_SOCKET;
+#endif /* _WIN32 */
+
+#if defined(_WIN32) || defined(__APPLE__)
+/* ---- eventfd substitute: self-connected UDP socketpair ---- */
+/* One shared implementation for Windows and macOS (they differ only in
+ * SOCKET vs int, closesocket vs close, and the nonblocking call); the
+ * contract is documented in port.h: the wake side is a static peer
+ * socket — only one evfd exists per process in practice (the SOCKS DNS
+ * wakeup) — and the returned fd is a normal socket: poll-able and
+ * closed with port_evfd_close. */
+
+#ifdef _WIN32
+typedef SOCKET evfd_peer_t;
+#define EVFD_INVALID INVALID_SOCKET
+#else
+typedef int evfd_peer_t;
+#define EVFD_INVALID (-1)
+#endif
+
+static evfd_peer_t g_evfd_peer = EVFD_INVALID;
+
+static void evfd_close_fd(int fd)
+{
+#ifdef _WIN32
+    closesocket((SOCKET)fd);
+#else
+    close(fd);
+#endif
+}
 
 int port_evfd_create(void)
 {
     struct sockaddr_in a;
     socklen_t alen = sizeof a;
-    SOCKET s, peer;
+    evfd_peer_t s, peer;
     int one = 1;
 
     /* process-level singleton: only one evfd exists per process (the
      * SOCKS DNS wakeup). A second create would otherwise silently
      * redirect the first one's wakeups; retire the old peer first. */
-    if (g_evfd_peer != INVALID_SOCKET) {
-        closesocket(g_evfd_peer);
-        g_evfd_peer = INVALID_SOCKET;
+    if (g_evfd_peer != EVFD_INVALID) {
+        evfd_close_fd((int)g_evfd_peer);
+        g_evfd_peer = EVFD_INVALID;
     }
 
     s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (s == INVALID_SOCKET)
+    if (s == EVFD_INVALID)
         return -1;
     peer = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (peer == INVALID_SOCKET) {
-        closesocket(s);
+    if (peer == EVFD_INVALID) {
+        evfd_close_fd((int)s);
         return -1;
     }
     memset(&a, 0, sizeof a);
     a.sin_family = AF_INET;
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     a.sin_port = 0;
-    if (bind(s, (struct sockaddr *)&a, sizeof a) == SOCKET_ERROR ||
-        getsockname(s, (struct sockaddr *)&a, &alen) == SOCKET_ERROR) {
-        closesocket(s);
-        closesocket(peer);
+    if (bind(s, (struct sockaddr *)&a, sizeof a) == -1 ||
+        getsockname(s, (struct sockaddr *)&a, &alen) == -1) {
+        evfd_close_fd((int)s);
+        evfd_close_fd((int)peer);
         return -1;
     }
-    if (connect(peer, (struct sockaddr *)&a, sizeof a) == SOCKET_ERROR) {
-        closesocket(s);
-        closesocket(peer);
+    if (connect(peer, (struct sockaddr *)&a, sizeof a) == -1) {
+        evfd_close_fd((int)s);
+        evfd_close_fd((int)peer);
         return -1;
     }
     /* the read side must never block the drain; the peer side is only
      * ever written to */
-    {
-        u_long nb = 1;
-        ioctlsocket(s, FIONBIO, &nb);
+    if (port_set_nonblock((int)s, true) != 0) {
+        evfd_close_fd((int)s);
+        evfd_close_fd((int)peer);
+        return -1;
     }
-    setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char *)&one, sizeof one);
+    (void)setsockopt((int)s, SOL_SOCKET, SO_RCVBUF, (const char *)&one,
+                     sizeof one);
     /* loopback rcvbuf: a wake byte is tiny; keep defaults otherwise */
     g_evfd_peer = peer;
     return (int)s;
@@ -1485,9 +1515,9 @@ int port_evfd_wake(int fd)
 {
     char c = 1;
     (void)fd;   /* the wake side is the static peer socket */
-    if (g_evfd_peer == INVALID_SOCKET)
+    if (g_evfd_peer == EVFD_INVALID)
         return -1;
-    if (send(g_evfd_peer, &c, 1, 0) == SOCKET_ERROR)
+    if (send((int)g_evfd_peer, &c, 1, 0) != 1)
         return -1;
     return 0;
 }
@@ -1499,12 +1529,15 @@ int port_evfd_drain(int fd)
 
 void port_evfd_close(int fd)
 {
-    closesocket((SOCKET)fd);
-    if (g_evfd_peer != INVALID_SOCKET) {
-        closesocket(g_evfd_peer);
-        g_evfd_peer = INVALID_SOCKET;
+    evfd_close_fd(fd);
+    if (g_evfd_peer != EVFD_INVALID) {
+        evfd_close_fd((int)g_evfd_peer);
+        g_evfd_peer = EVFD_INVALID;
     }
 }
+#endif /* _WIN32 || __APPLE__ */
+
+#ifdef _WIN32
 
 void port_ignore_sigpipe(void)
 {
@@ -1513,86 +1546,4 @@ void port_ignore_sigpipe(void)
 
 #endif /* _WIN32 */
 
-#ifdef __APPLE__
-/* ---- macOS eventfd substitute: self-connected UDP socketpair ---- */
-/* Identical shape to the Windows substitute (port.h documents the
- * contract): the wake side is a static peer socket — only one evfd
- * exists per process in practice (the SOCKS DNS wakeup) — and the
- * returned fd is a normal socket: poll-able and closed with
- * port_evfd_close. */
 
-static int g_evfd_peer = -1;
-
-int port_evfd_create(void)
-{
-    struct sockaddr_in a;
-    socklen_t alen = sizeof a;
-    int s, peer;
-    int one = 1;
-
-    /* process-level singleton, same reasoning as the winsock version */
-    if (g_evfd_peer >= 0) {
-        close(g_evfd_peer);
-        g_evfd_peer = -1;
-    }
-
-    s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (s < 0)
-        return -1;
-    peer = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (peer < 0) {
-        close(s);
-        return -1;
-    }
-    memset(&a, 0, sizeof a);
-    a.sin_family = AF_INET;
-    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    a.sin_port = 0;
-    if (bind(s, (struct sockaddr *)&a, sizeof a) != 0 ||
-        getsockname(s, (struct sockaddr *)&a, &alen) != 0) {
-        close(s);
-        close(peer);
-        return -1;
-    }
-    if (connect(peer, (struct sockaddr *)&a, sizeof a) != 0) {
-        close(s);
-        close(peer);
-        return -1;
-    }
-    /* the read side must never block the drain; the peer side is only
-     * ever written to */
-    if (port_set_nonblock(s, true) != 0) {
-        close(s);
-        close(peer);
-        return -1;
-    }
-    (void)setsockopt(s, SOL_SOCKET, SO_RCVBUF, &one, sizeof one);
-    g_evfd_peer = peer;
-    return s;
-}
-
-int port_evfd_wake(int fd)
-{
-    char c = 1;
-    (void)fd;   /* the wake side is the static peer socket */
-    if (g_evfd_peer < 0)
-        return -1;
-    if (send(g_evfd_peer, &c, 1, 0) != 1)
-        return -1;
-    return 0;
-}
-
-int port_evfd_drain(int fd)
-{
-    return evfd_drain_loop(fd);
-}
-
-void port_evfd_close(int fd)
-{
-    close(fd);
-    if (g_evfd_peer >= 0) {
-        close(g_evfd_peer);
-        g_evfd_peer = -1;
-    }
-}
-#endif /* __APPLE__ */

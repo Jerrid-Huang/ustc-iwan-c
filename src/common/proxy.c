@@ -1061,7 +1061,17 @@ static void push_unique(slist_t *s, const char *str) {
         slist_push(s, str);
 }
 
-static int expand_route_targets(const slist_t *targets, slist_t *out) {
+/* Expand route targets into the concrete CIDR list handed to the
+ * platform router: "default" (v4 only) stays verbatim, CIDR strings are
+ * validated, bare addresses become /32 (v4) or /128 (v6), and domains
+ * are resolved to per-address /32|/128 entries. AF_INET and AF_INET6
+ * share this skeleton; the family-specific parts are kept in the
+ * branches so error text and validation rules stay identical to the
+ * two originals. Returns 0 on success, -1 on a malformed target. */
+static int expand_route_targets_fam(const slist_t *targets, slist_t *out,
+                                    int family)
+{
+    const int v6 = family == AF_INET6;
     if (targets == NULL)
         return 0;
     for (size_t i = 0; i < targets->n; i++) {
@@ -1078,21 +1088,48 @@ static int expand_route_targets(const slist_t *targets, slist_t *out) {
             free(t);
             continue;
         }
-        if (strcmp(p, "default") == 0) {
+        if (!v6 && strcmp(p, "default") == 0) {
             push_unique(out, p);
         } else if (strchr(p, '/') != NULL) {
-            /* --proxy-cidr entries must be well-formed A.B.C.D/n; a bad
-             * prefix used to reach `ip route` verbatim and fail silently,
-             * so reject it here instead */
-            uint32_t net;
-            int prefix;
-            if (cidr_parse(p, &net, &prefix) != 0) {
-                log_err("invalid CIDR route target '%s'", p);
-                free(t);
-                return -1;
+            if (!v6) {
+                /* --proxy-cidr entries must be well-formed A.B.C.D/n; a
+                 * bad prefix used to reach `ip route` verbatim and fail
+                 * silently, so reject it here instead */
+                uint32_t net;
+                int prefix;
+                if (cidr_parse(p, &net, &prefix) != 0) {
+                    log_err("invalid CIDR route target '%s'", p);
+                    free(t);
+                    return -1;
+                }
+                push_unique(out, p);
+            } else {
+                char addr[64];
+                size_t an = (size_t)(strchr(p, '/') - p);
+                long plen;
+                char *end;
+                if (an == 0 || an >= sizeof addr) {
+                    log_err("invalid IPv6 CIDR route target '%s'", p);
+                    free(t);
+                    return -1;
+                }
+                memcpy(addr, p, an);
+                addr[an] = '\0';
+                struct in6_addr a6;
+                if (inet_pton(AF_INET6, addr, &a6) != 1) {
+                    log_err("invalid IPv6 CIDR route target '%s'", p);
+                    free(t);
+                    return -1;
+                }
+                plen = strtol(p + an + 1, &end, 10);
+                if (*end != '\0' || plen < 0 || plen > 128) {
+                    log_err("invalid IPv6 CIDR route target '%s'", p);
+                    free(t);
+                    return -1;
+                }
+                push_unique(out, p);
             }
-            push_unique(out, p);
-        } else {
+        } else if (!v6) {
             struct in_addr a4;
             if (inet_pton(AF_INET, p, &a4) == 1) {
                 char r32[64];
@@ -1130,64 +1167,11 @@ static int expand_route_targets(const slist_t *targets, slist_t *out) {
                     return -1;
                 }
             }
-        }
-        free(t);
-    }
-    return 0;
-}
-
-/* IPv6 route targets: "<v6-cidr>" or a bare IPv6 address (-> /128), or
- * a domain resolved AF_INET6 (-> /128 per address). Returns 0 on
- * success, -1 on a malformed target (rejected before it reaches
- * `ip -6 route` verbatim). */
-static int expand_route_targets6(const slist_t *targets, slist_t *out)
-{
-    if (targets == NULL)
-        return 0;
-    for (size_t i = 0; i < targets->n; i++) {
-        const char *p = targets->v[i];
-        char *t = xstrdup(p == NULL ? "" : p);
-        char *q = t;
-        while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n')
-            q++;
-        size_t l = strlen(q);
-        while (l > 0 && (q[l - 1] == ' ' || q[l - 1] == '\t' ||
-                         q[l - 1] == '\r' || q[l - 1] == '\n'))
-            q[--l] = '\0';
-        if (*q == '\0') {
-            free(t);
-            continue;
-        }
-        if (strchr(q, '/') != NULL) {
-            char addr[64];
-            size_t an = (size_t)(strchr(q, '/') - q);
-            long plen;
-            char *end;
-            if (an == 0 || an >= sizeof addr) {
-                log_err("invalid IPv6 CIDR route target '%s'", q);
-                free(t);
-                return -1;
-            }
-            memcpy(addr, q, an);
-            addr[an] = '\0';
-            struct in6_addr a6;
-            if (inet_pton(AF_INET6, addr, &a6) != 1) {
-                log_err("invalid IPv6 CIDR route target '%s'", q);
-                free(t);
-                return -1;
-            }
-            plen = strtol(q + an + 1, &end, 10);
-            if (*end != '\0' || plen < 0 || plen > 128) {
-                log_err("invalid IPv6 CIDR route target '%s'", q);
-                free(t);
-                return -1;
-            }
-            push_unique(out, q);
         } else {
             struct in6_addr a6;
-            if (inet_pton(AF_INET6, q, &a6) == 1) {
+            if (inet_pton(AF_INET6, p, &a6) == 1) {
                 char r128[64];
-                snprintf(r128, sizeof r128, "%s/128", q);
+                snprintf(r128, sizeof r128, "%s/128", p);
                 push_unique(out, r128);
             } else {
                 /* domain: resolve AF_INET6 */
@@ -1196,9 +1180,9 @@ static int expand_route_targets6(const slist_t *targets, slist_t *out)
                 hints.ai_family = AF_INET6;
                 hints.ai_socktype = SOCK_STREAM;
                 struct addrinfo *res = NULL;
-                int rc = getaddrinfo(q, NULL, &hints, &res);
+                int rc = getaddrinfo(p, NULL, &hints, &res);
                 if (rc != 0) {
-                    log_err("resolve domain %s: %s", q, gai_strerror(rc));
+                    log_err("resolve domain %s: %s", p, gai_strerror(rc));
                     free(t);
                     return -1;
                 }
@@ -1220,7 +1204,7 @@ static int expand_route_targets6(const slist_t *targets, slist_t *out)
                 }
                 freeaddrinfo(res);
                 if (!found) {
-                    log_err("domain has no IPv6 address: %s", q);
+                    log_err("domain has no IPv6 address: %s", p);
                     free(t);
                     return -1;
                 }
@@ -1229,6 +1213,16 @@ static int expand_route_targets6(const slist_t *targets, slist_t *out)
         free(t);
     }
     return 0;
+}
+
+static int expand_route_targets(const slist_t *targets, slist_t *out)
+{
+    return expand_route_targets_fam(targets, out, AF_INET);
+}
+
+static int expand_route_targets6(const slist_t *targets, slist_t *out)
+{
+    return expand_route_targets_fam(targets, out, AF_INET6);
 }
 
 static void teardown_routes(const char *tun, const char *tun_ip,
