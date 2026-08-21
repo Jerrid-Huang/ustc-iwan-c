@@ -67,36 +67,13 @@ static unsigned socks_rx_stale_ms(void)
 {
     static unsigned cached;
     static int parsed;
-    const char *v;
-    char *end;
-    unsigned long n;
 
     if (parsed)
         return cached;
     parsed = 1;
-    v = getenv("IWAN_RX_STALE_MS");
-    if (!v || !v[0]) {
-        cached = SOCKS_RX_STALE_MS_DEFAULT;
-        return cached;
-    }
-    n = strtoul(v, &end, 10);
-    if (end == v || *end != '\0') {
-        log_err("IWAN_RX_STALE_MS: invalid value '%s' (0 to disable, "
-                "10s..24h); using default", v);
-        cached = SOCKS_RX_STALE_MS_DEFAULT;
-        return cached;
-    }
-    if (n == 0) {   /* 0 disables (the documented contract) */
-        cached = 0;
-        return cached;
-    }
-    if (n < 10000 || n > 86400000) {
-        log_err("IWAN_RX_STALE_MS: invalid value '%s' (0 to disable, "
-                "10s..24h); using default", v);
-        cached = SOCKS_RX_STALE_MS_DEFAULT;
-        return cached;
-    }
-    cached = (unsigned)n;
+    cached = (unsigned)env_ms_range("IWAN_RX_STALE_MS",
+                                    SOCKS_RX_STALE_MS_DEFAULT, 10000,
+                                    86400000, 1);
     return cached;
 }
 #define LISTEN_BACKLOG   64

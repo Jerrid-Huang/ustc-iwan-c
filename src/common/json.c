@@ -57,27 +57,9 @@ static void p_fail(struct P *p, size_t off, int eof, const char *msg)
              (unsigned long long)line, (unsigned long long)col);
 }
 
-struct jbuf {
-    char  *d;
-    size_t len;
-    size_t cap;
-};
-
-static void jbuf_app(struct jbuf *b, const void *p, size_t n)
-{
-    size_t nc;
-    if (!grow_cap(b->len, n + 1, b->cap, 64, 1, &nc))
-        oom_abort();   /* length overflow: no representable buffer */
-    if (nc > b->cap) {
-        b->d = realloc(b->d, nc);
-        if (!b->d)
-            oom_abort();
-        b->cap = nc;
-    }
-    memcpy(b->d + b->len, p, n);
-    b->len += n;
-    b->d[b->len] = '\0';
-}
+/* the serializer's old local jbuf/jbuf_app now live in util.c as
+ * sbuf/sbuf_app (shared with https.c; initial-capacity hint grew from
+ * 64 to 256, which is only an allocation hint) */
 
 static Json *parse_value(struct P *p, int depth);
 
@@ -143,7 +125,7 @@ static size_t utf8_encode(uint32_t cp, uint8_t out[4])
 
 static Json *parse_string(struct P *p)
 {
-    struct jbuf b = {0};
+    sbuf b = {0};
     Json *j;
 
     p->s++; /* '"' */
@@ -163,40 +145,40 @@ static Json *parse_string(struct P *p)
             unsigned char map;
             switch (e) {
             case '"':
-                jbuf_app(&b, "\"", 1);
+                sbuf_app(&b, "\"", 1);
                 p->s += 2;
                 break;
             case '\\':
-                jbuf_app(&b, "\\", 1);
+                sbuf_app(&b, "\\", 1);
                 p->s += 2;
                 break;
             case '/':
-                jbuf_app(&b, "/", 1);
+                sbuf_app(&b, "/", 1);
                 p->s += 2;
                 break;
             case 'b':
                 map = '\b';
-                jbuf_app(&b, &map, 1);
+                sbuf_app(&b, &map, 1);
                 p->s += 2;
                 break;
             case 'f':
                 map = '\f';
-                jbuf_app(&b, &map, 1);
+                sbuf_app(&b, &map, 1);
                 p->s += 2;
                 break;
             case 'n':
                 map = '\n';
-                jbuf_app(&b, &map, 1);
+                sbuf_app(&b, &map, 1);
                 p->s += 2;
                 break;
             case 'r':
                 map = '\r';
-                jbuf_app(&b, &map, 1);
+                sbuf_app(&b, &map, 1);
                 p->s += 2;
                 break;
             case 't':
                 map = '\t';
-                jbuf_app(&b, &map, 1);
+                sbuf_app(&b, &map, 1);
                 p->s += 2;
                 break;
             case 'u': {
@@ -237,7 +219,7 @@ static Json *parse_string(struct P *p)
                         cp = 0x10000 + ((cp - 0xD800) << 10) +
                              (lo - 0xDC00);
                         elen = utf8_encode(cp, enc);
-                        jbuf_app(&b, enc, elen);
+                        sbuf_app(&b, enc, elen);
                         p->s += 12; /* consumed both escapes */
                         break;
                     }
@@ -246,7 +228,7 @@ static Json *parse_string(struct P *p)
                      * pair-decoding only ever goes forward */
                 }
                 elen = utf8_encode(cp, enc);
-                jbuf_app(&b, enc, elen);
+                sbuf_app(&b, enc, elen);
                 p->s += 6;
                 break;
             }
@@ -265,7 +247,7 @@ static Json *parse_string(struct P *p)
             free(b.d);
             return NULL;
         } else {
-            jbuf_app(&b, p->s, 1);
+            sbuf_app(&b, p->s, 1);
             p->s++;
         }
     }

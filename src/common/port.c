@@ -828,10 +828,20 @@ static int ensure_nonblock(int fd)
     return 0;
 }
 
+/* When MSG_DONTWAIT is requested, make the socket nonblocking first.
+ * Returns 0 on success (including when MSG_DONTWAIT is not set) and -1
+ * when making the socket nonblocking failed (errno/last-error set). */
+static int ensure_dontwait(int fd, int flags)
+{
+    if ((flags & MSG_DONTWAIT) && ensure_nonblock(fd) != 0)
+        return -1;
+    return 0;
+}
+
 ssize_t port_send(int fd, const void *buf, size_t len, int flags)
 {
     int r;
-    if ((flags & MSG_DONTWAIT) && ensure_nonblock(fd) != 0)
+    if (ensure_dontwait(fd, flags) != 0)
         return -1;
     r = send((SOCKET)fd, (const char *)buf, (int)len, 0);
     if (r == SOCKET_ERROR) {
@@ -844,7 +854,7 @@ ssize_t port_send(int fd, const void *buf, size_t len, int flags)
 ssize_t port_recv(int fd, void *buf, size_t len, int flags)
 {
     int r;
-    if ((flags & MSG_DONTWAIT) && ensure_nonblock(fd) != 0)
+    if (ensure_dontwait(fd, flags) != 0)
         return -1;
     r = recv((SOCKET)fd, (char *)buf, (int)len, 0);
     if (r == SOCKET_ERROR) {
@@ -858,7 +868,7 @@ ssize_t port_sendto(int fd, const void *buf, size_t len, int flags,
                     const struct sockaddr *to, socklen_t tolen)
 {
     int r;
-    if ((flags & MSG_DONTWAIT) && ensure_nonblock(fd) != 0)
+    if (ensure_dontwait(fd, flags) != 0)
         return -1;
     r = sendto((SOCKET)fd, (const char *)buf, (int)len, 0,
                (const struct sockaddr *)to, (int)tolen);
@@ -907,7 +917,7 @@ ssize_t port_sendmsg(int fd, const struct msghdr *msg, int flags)
     bool heap = false;
     LPWSABUF w;
 
-    if ((flags & MSG_DONTWAIT) && ensure_nonblock(fd) != 0)
+    if (ensure_dontwait(fd, flags) != 0)
         return -1;
     /* WSASendTo with a WSABUF array sends ONE datagram (concatenated
      * buffers), exactly the Linux sendmsg contract for SOCK_DGRAM. */
@@ -943,7 +953,7 @@ ssize_t port_sendmsg(int fd, const struct msghdr *msg, int flags)
 int port_sendmmsg(int fd, struct mmsghdr *msgvec, unsigned vlen, int flags)
 {
     unsigned sent = 0;
-    if ((flags & MSG_DONTWAIT) && ensure_nonblock(fd) != 0)
+    if (ensure_dontwait(fd, flags) != 0)
         return -1;
     /* Fast path: every caller in this project builds sendmmsg entries
      * with exactly one iovec. Convert the whole batch to WSABUF once
@@ -1038,7 +1048,7 @@ int port_recvmmsg(int fd, struct mmsghdr *msgvec, unsigned vlen, int flags,
     unsigned got = 0;
     (void)timeout;   /* Linux's timeout bounds only the first wait; the
                       * callers here use MSG_DONTWAIT + poll instead */
-    if ((flags & MSG_DONTWAIT) && ensure_nonblock(fd) != 0)
+    if (ensure_dontwait(fd, flags) != 0)
         return -1;
     /* Fast path: our recvmmsg callers use one iovec per message and
      * stable static buffers. Convert the whole batch to WSABUF once,

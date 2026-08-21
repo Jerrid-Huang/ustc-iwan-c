@@ -217,21 +217,23 @@ static void err_usage_exit(const char *usage)
     exit(2);
 }
 
-static void err_required(const char *sub)
+static void err_required_msg(const char *sub, const char *detail)
 {
     fprintf(stderr,
-            "error: the following required arguments were not provided:\n"
-            "  --server <SERVER>");
+            "error: the following required arguments were not provided:\n  %s",
+            detail);
     err_usage_exit(usage_required(sub));
+}
+
+static void err_required(const char *sub)
+{
+    err_required_msg(sub, "--server <SERVER>");
 }
 
 /* --pass has no built-in default: refuse to run without it. */
 static void err_required_pass(const char *sub)
 {
-    fprintf(stderr,
-            "error: the following required arguments were not provided:\n"
-            "  --pass <PASS> or --pass-file <FILE>");
-    err_usage_exit(usage_required(sub));
+    err_required_msg(sub, "--pass <PASS> or --pass-file <FILE>");
 }
 
 /* --allow-remote without an explicit proxy password is an open proxy

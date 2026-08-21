@@ -327,6 +327,14 @@ static pthread_mutex_t g_dns_wait_mu = PTHREAD_MUTEX_INITIALIZER;
  * closed (and possibly reused by another open()). */
 static atomic_uint g_dns_gen = 1;
 
+/* true when the session generation changed since this job was spawned,
+ * i.e. the tunnel session was torn down and workers must stop (see the
+ * g_dns_gen comment above) */
+static bool dns_stale(const DnsJob *j)
+{
+    return atomic_load(&g_dns_gen) != j->gen;
+}
+
 /* tunnel-DNS variant of alloc_ephemeral: collision scan over the
  * pending-query wait table (under its lock) */
 static int dns_sport_in_use(uint16_t p)
@@ -477,7 +485,7 @@ static size_t dns_wrap_outer(const uint8_t *inner, size_t inlen,
 static int dns_register(uint16_t id, uint16_t sport, const DnsJob *j)
 {
     for (int spin = 0; spin < 200; spin++) {  /* up to 2s for a free slot */
-        if (atomic_load(&g_dns_gen) != j->gen)
+        if (dns_stale(j))
             return -1;   /* session torn down: stop claiming slots */
         pthread_mutex_lock(&g_dns_wait_mu);
         for (int i = 0; i < DNS_WAIT_MAX; i++) {
@@ -797,7 +805,7 @@ static void *dns_worker(void *arg) {
      * (or whose session was torn down) must not register, send, or
      * push — the flow table is gone and the socket may be closed and
      * reused by another open() */
-    if (atomic_load(&g_dns_gen) != j->gen)
+    if (dns_stale(j))
         goto done;
     if (g_dns_server_ip4 == 0 || j->qtype == 0) {
         /* no tunnel DNS (dns=0.0.0.0) or a local-fallback worker:
@@ -837,7 +845,7 @@ static void *dns_worker(void *arg) {
             goto done;
         }
         ipid = w->ipid;
-        if (atomic_load(&g_dns_gen) != j->gen) {
+        if (dns_stale(j)) {
             /* session torn down while we registered: retire the slot */
             dns_retire_slot_locked(slot, sport, id);
             pthread_mutex_unlock(&g_dns_wait_mu);
@@ -858,7 +866,7 @@ static void *dns_worker(void *arg) {
      * send can never race a close — and a reused fd can never receive
      * tunnel-DNS bytes from a retired session */
     pthread_mutex_lock(&g_dns_wait_mu);
-    if (atomic_load(&g_dns_gen) != j->gen) {
+    if (dns_stale(j)) {
         dns_retire_slot_locked(slot, sport, id);
         pthread_mutex_unlock(&g_dns_wait_mu);
         goto done;
@@ -881,7 +889,7 @@ static void *dns_worker(void *arg) {
         port_sleep_us(DNS_POLL_MS * 1000);
         now = now_ms();
         pthread_mutex_lock(&g_dns_wait_mu);
-        if (atomic_load(&g_dns_gen) != j->gen) {
+        if (dns_stale(j)) {
             /* session over: stop polling and resending */
             dns_retire_slot_locked(slot, sport, id);
             pthread_mutex_unlock(&g_dns_wait_mu);

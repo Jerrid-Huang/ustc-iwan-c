@@ -233,31 +233,19 @@ static int send_ctrl(pump_ctx_t *ctx, uint8_t typ, uint8_t enc, uint16_t sid,
 #define PUMP_RX_STALE_MS_DEFAULT 120000u
 
 /* parsed once per process: the pump loop would otherwise re-run
- * getenv+strtoul on every iteration */
+ * getenv+strtoul on every iteration; 0 disables the watchdog (aligned
+ * with the README contract and socks.c) */
 static unsigned pump_rx_stale_ms(void)
 {
     static unsigned cached;
     static int parsed;
-    const char *v;
-    char *end;
-    unsigned long n;
 
     if (parsed)
         return cached;
     parsed = 1;
-    v = getenv("IWAN_RX_STALE_MS");
-    if (!v || !v[0]) {
-        cached = PUMP_RX_STALE_MS_DEFAULT;
-        return cached;
-    }
-    n = strtoul(v, &end, 10);
-    if (end == v || *end != '\0' || n < 10000 || n > 86400000) {
-        log_err("IWAN_RX_STALE_MS: invalid value '%s' (10s..24h); "
-                "using default", v);
-        cached = PUMP_RX_STALE_MS_DEFAULT;
-        return cached;
-    }
-    cached = (unsigned)n;
+    cached = (unsigned)env_ms_range("IWAN_RX_STALE_MS",
+                                    PUMP_RX_STALE_MS_DEFAULT, 10000,
+                                    86400000, 1);
     return cached;
 }
 #define PUMP_POLL_CEIL_MS 1000  /* cap on the recvmmsg park timeout */
@@ -890,7 +878,7 @@ static void *udp2tun_thread(void *ud) {
     }
     while (!g_stop) {
         uint64_t now = now_ms();
-        if (now - last_rx > pump_rx_stale_ms()) {
+        if (pump_rx_stale_ms() != 0 && now - last_rx > pump_rx_stale_ms()) {
             /* the server answers our ECHO_REQ keepalives, so a live
              * session always produces downlink within ~10s; 60s of
              * silence means the session is gone (server purge/reboot)

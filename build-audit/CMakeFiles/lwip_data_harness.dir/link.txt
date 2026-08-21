@@ -1,0 +1,1 @@
+/usr/bin/cc -O3 -DNDEBUG -Wl,-z,now -Wl,-z,relro -Wl,-z,noexecstack -pie -Wl,--dependency-file=CMakeFiles/lwip_data_harness.dir/link.d CMakeFiles/lwip_data_harness.dir/tests/lwip_data_harness.c.o -o /home/uker/my/software/ustc-iwan-c/bin/lwip_data_harness  lib/libiwan_core.a lib/liblwip.a /usr/lib/x86_64-linux-gnu/libssl.so /usr/lib/x86_64-linux-gnu/libcrypto.so

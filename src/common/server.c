@@ -658,22 +658,6 @@ static void open_reject(int sockfd, const struct sockaddr_in *peer,
     send_reject(sockfd, peer, reason);
 }
 
-/* 4 random bytes; cryptographically strong entropy, fail-closed (F6).
- * A guessable token is a session-hijack hole, so there is no acceptable
- * fallback: an RNG failure means the kernel entropy source is broken and
- * aborting is correct (this runs per-session at OPEN time). */
-static uint32_t random_token(void)
-{
-    uint32_t tok;
-
-    if (port_rand_bytes(&tok, sizeof tok) != 0) {
-        log_err("random_token: cannot obtain secure randomness "
-                "(port_rand_bytes failed); aborting");
-        abort();
-    }
-    return tok;
-}
-
 struct open_ctx {
     char user[SERVER_USER_MAX + 1];
     uint8_t ct[16];      /* 16-byte md5 digest of the encrypted password */
@@ -840,7 +824,7 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
         ipu = probe;
         ctx->next_ip = (ipu == ctx->ip_end) ? ctx->ip_base : ipu + 1;
     }
-    tok = random_token();
+    tok = rand_u32();
 
     /* replace any existing session with the same sid */
     for (i = 0; i < SERVER_MAX_SESSIONS; i++)

@@ -35,6 +35,12 @@ void err_printf(const char *fmt, ...);
  * once per name and cached; any value other than 0/false/off enables */
 bool dbg_env(const char *name);
 
+/* parse a millisecond duration from env var `name`; see util.c. Returns
+ * defval when unset/empty/unparseable/out-of-range (with a warning);
+ * allow_zero lets an explicit 0 (the "disabled" sentinel) pass through. */
+long long env_ms_range(const char *name, long long defval, long long min,
+                       long long max, int allow_zero);
+
 /* ---------------- shared parsing / buffer-growth helpers ---------------- */
 
 /* 0-15 for a hex digit ('0'-'9', 'a'-'f', 'A'-'F'), else -1 */
@@ -61,6 +67,22 @@ static inline int hex_nibble(char c)
  * is fatal in this codebase). */
 size_t grow_cap(size_t used, size_t extra, size_t cap, size_t init,
                 size_t esize, size_t *newcap);
+
+/* ---------- shared NUL-terminated growable byte buffer ---------- */
+
+/* Growable string buffer that is always kept NUL-terminated (one byte
+ * past len). `d` may be NULL while empty {0} is still NUL-terminatable;
+ * callers treat d+len as the contents. Single shared definition: json.c
+ * (jbuf) and https.c (sbuf) used to carry verbatim local copies. */
+typedef struct sbuf {
+    char  *d;
+    size_t len;
+    size_t cap;
+} sbuf;
+
+/* append n bytes from p to s, growing as needed; s remains NUL-terminated.
+ * Allocation failure is fatal (oom_abort). */
+void sbuf_app(sbuf *s, const void *p, size_t n);
 
 /* parse_uint result codes (the function itself is declared in common.h;
  * the three-state contract below supersedes its "0/-1" doc comment):

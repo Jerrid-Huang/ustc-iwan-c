@@ -294,6 +294,38 @@ bool dbg_env(const char *name)
     }
 }
 
+/* Parse an environment variable as a millisecond duration. Returns defval
+ * when the variable is unset/empty, when it fails to parse, or when it is
+ * out of [min, max]; a warning is logged for the bad-value cases. When
+ * allow_zero is nonzero, an explicit 0 is returned unvalidated — the
+ * "watchdog disabled" sentinel. Wrapper callers that must parse once per
+ * process cache the result themselves. */
+long long env_ms_range(const char *name, long long defval, long long min,
+                       long long max, int allow_zero)
+{
+    const char *v = getenv(name);
+    char *end;
+    long long n;
+
+    if (!v || !v[0])
+        return defval;
+    errno = 0;
+    n = strtoll(v, &end, 10);
+    if (errno != 0 || end == v || *end != '\0') {
+        log_err("%s: invalid value '%s' (0 to disable, 10s..24h); "
+                "using default", name, v);
+        return defval;
+    }
+    if (n == 0 && allow_zero)
+        return 0;
+    if (n < min || n > max) {
+        log_err("%s: invalid value '%s' (0 to disable, 10s..24h); "
+                "using default", name, v);
+        return defval;
+    }
+    return n;
+}
+
 /* ---------- string list ---------- */
 void slist_init(slist_t *s)
 {
@@ -392,6 +424,34 @@ size_t grow_cap(size_t used, size_t extra, size_t cap, size_t init,
     }
     *newcap = ncap;
     return ncap;
+}
+
+/* shared append-and-NUL-terminate implementation behind json.c's jbuf
+ * and https.c's sbuf. memmove (not memcpy) + noinline: gcc >= 16
+ * -Wrestrict cannot prove the caller buffer does not alias the buffer
+ * and errors on the (in practice impossible) huge-length path; noinline
+ * keeps IPA from folding caller arguments into a -Wstringop-overflow
+ * false positive (observed on riscv64/i686 musl cross builds). */
+#if defined(__GNUC__) && __GNUC__ >= 12
+__attribute__((noinline))
+#endif
+void sbuf_app(sbuf *s, const void *p, size_t n)
+{
+    size_t nc;
+    if (!grow_cap(s->len, n + 1, s->cap, 256, 1, &nc))
+        oom_abort();   /* length overflow: no representable buffer */
+    if (nc > s->cap) {
+        s->d = realloc(s->d, nc);
+        if (!s->d)
+            oom_abort();
+        s->cap = nc;
+    }
+    /* memmove, not memcpy: gcc >= 16 -Wrestrict cannot prove the caller
+     * buffer does not alias the buffer and errors on the (in practice
+     * impossible) huge-length path */
+    memmove(s->d + s->len, p, n);
+    s->len += n;
+    s->d[s->len] = '\0';
 }
 
 uint32_t rand_u32(void)

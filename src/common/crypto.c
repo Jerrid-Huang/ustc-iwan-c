@@ -12,22 +12,35 @@
 /* 64-bit word usable on uint8_t storage without strict-aliasing UB */
 typedef uint64_t u64_may_alias __attribute__((may_alias));
 
-void md5(const void *data, size_t len, uint8_t out[16])
+/* shared EVP one-shot digest with fatal-on-failure semantics (all hashing
+ * here is fail-closed: a failed digest would silently corrupt auth, so
+ * aborting is correct). `name` only feeds the error message. Callers
+ * whose output buffer is smaller than EVP_MAX_MD_SIZE go through a
+ * local full-size staging buffer: gcc -Wstringop-overflow (a warning on
+ * this cross-build configuration) cannot prove the EVP call writes only
+ * the algorithm's digest length. */
+static void digest(const EVP_MD *md, const char *name, const void *data,
+                   size_t len, uint8_t out[EVP_MAX_MD_SIZE])
 {
     unsigned int n = 0;
-    if (EVP_Digest(data, len, out, &n, EVP_md5(), NULL) != 1) {
-        log_err("md5: EVP_Digest failed");
+    if (EVP_Digest(data, len, out, &n, md, NULL) != 1) {
+        log_err("%s: EVP_Digest failed", name);
         abort();
     }
 }
 
+void md5(const void *data, size_t len, uint8_t out[16])
+{
+    uint8_t tmp[EVP_MAX_MD_SIZE];
+    digest(EVP_md5(), "md5", data, len, tmp);
+    memcpy(out, tmp, 16);
+}
+
 void sha256(const void *data, size_t len, uint8_t out[32])
 {
-    unsigned int n = 0;
-    if (EVP_Digest(data, len, out, &n, EVP_sha256(), NULL) != 1) {
-        log_err("sha256: EVP_Digest failed");
-        abort();
-    }
+    uint8_t tmp[EVP_MAX_MD_SIZE];
+    digest(EVP_sha256(), "sha256", data, len, tmp);
+    memcpy(out, tmp, 32);
 }
 
 void hmac_sha256(const uint8_t *key, size_t klen,

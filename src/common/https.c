@@ -29,38 +29,10 @@
  * is hex; anything above INT_MAX is rejected as absurd) */
 #define HTTPS_CHUNK_SZ_CAP  0x7FFFFFFFL
 
-struct sbuf {
-    char  *d;
-    size_t len;
-    size_t cap;
-};
-
-/* memmove, not memcpy: gcc >= 16 -Wrestrict cannot prove the caller
- * buffer does not alias the sbuf and errors on the (in practice
- * impossible) huge-length path. noinline: gcc 16's IPA then cannot
- * fold caller arguments into a -Wstringop-overflow false positive
- * either (observed on riscv64/i686 musl cross builds). */
-#if defined(__GNUC__) && __GNUC__ >= 12
-__attribute__((noinline))
-#endif
-static void sbuf_app(struct sbuf *s, const void *p, size_t n)
-{
-    size_t nc;
-    if (!grow_cap(s->len, n + 1, s->cap, 256, 1, &nc))
-        oom_abort();   /* length overflow: no representable buffer */
-    if (nc > s->cap) {
-        s->d = realloc(s->d, nc);
-        if (!s->d)
-            oom_abort();
-        s->cap = nc;
-    }
-    /* memmove, not memcpy: gcc >= 16 -Wrestrict cannot prove the caller
-     * buffer does not alias the sbuf and errors on the (in practice
-     * impossible) huge-length path */
-    memmove(s->d + s->len, p, n);
-    s->len += n;
-    s->d[s->len] = '\0';
-}
+/* sbuf/sbuf_app come from util.h (single shared definition). The local
+ * copy that used to live here carried the gcc noinline/-Wrestrict
+ * workarounds for riscv64/i686 musl cross builds; those attributes now
+ * live on the shared implementation in util.c. */
 
 static long hex_parse_sz(const char *s, size_t n)
 {

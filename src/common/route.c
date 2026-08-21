@@ -44,6 +44,13 @@ static bool tun_ula_str(const char *tun_ip, char out[64])
     return true;
 }
 
+/* true when `c` names the IPv4 default route (either spelling); used when
+ * splitting the routes with/without the default to handle it specially. */
+static bool is_default_v4(const char *c)
+{
+    return strcmp(c, "default") == 0 || strcmp(c, "0.0.0.0/0") == 0;
+}
+
 /* best-effort: give the tunnel interface its IPv6 side (the derived
  * ULA/96). The /96 makes the whole client pool on-link, so the kernel
  * routes v6 return traffic into the tunnel without extra routes. */
@@ -658,7 +665,7 @@ bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
 
     for (size_t i = 0; i < routes_with_default->n; i++) {
         const char *c = routes_with_default->v[i];
-        if (strcmp(c, "default") == 0 || strcmp(c, "0.0.0.0/0") == 0) {
+        if (is_default_v4(c)) {
             /* replace the default: a metric-0 route via the tunnel
              * outranks the physical default, which is never removed */
             char *del[] = { "netsh", "interface", "ipv4", "delete",
@@ -733,7 +740,7 @@ bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
 
     for (size_t i = 0; i < routes_with_default->n; i++) {
         const char *c = routes_with_default->v[i];
-        if (strcmp(c, "default") == 0 || strcmp(c, "0.0.0.0/0") == 0) {
+        if (is_default_v4(c)) {
             /* the physical default is never removed: add ours
              * alongside (macOS convention, cf. OpenVPN/WireGuard).
              * Delete-then-add keeps setup idempotent. */
@@ -806,7 +813,7 @@ bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
 
     for (size_t i = 0; i < routes_with_default->n; i++) {
         const char *c = routes_with_default->v[i];
-        if (strcmp(c, "default") == 0 || strcmp(c, "0.0.0.0/0") == 0) {
+        if (is_default_v4(c)) {
             char loc[24];
             if (local_subnet(odev, loc)) {
                 char *r1[] = { "route", "replace", loc, "dev", (char *)odev,
@@ -868,7 +875,7 @@ void route_teardown(const char *tun, const char *srv, const char *ogw,
     snprintf(tun_if, sizeof tun_if, "interface=%s", tun);
     for (size_t i = 0; i < routes->n; i++) {
         const char *c = routes->v[i];
-        if (strcmp(c, "default") == 0 || strcmp(c, "0.0.0.0/0") == 0) {
+        if (is_default_v4(c)) {
             /* the physical default was never removed, so deleting our
              * own 0.0.0.0/0 restores the pre-VPN routing automatically */
             char *d1[] = { "netsh", "interface", "ipv4", "delete",
@@ -912,7 +919,7 @@ void route_teardown(const char *tun, const char *srv, const char *ogw,
     const char *ifn = tun_ifname(tun);
     for (size_t i = 0; i < routes->n; i++) {
         const char *c = routes->v[i];
-        if (strcmp(c, "default") == 0 || strcmp(c, "0.0.0.0/0") == 0) {
+        if (is_default_v4(c)) {
             /* only OUR default is removed (interface-scoped); the
              * physical default was never touched */
             char *d1[] = { "route", "-n", "delete", "default",
@@ -940,7 +947,7 @@ void route_teardown(const char *tun, const char *srv, const char *ogw,
                     const slist_t *routes) {
     for (size_t i = 0; i < routes->n; i++) {
         const char *c = routes->v[i];
-        if (strcmp(c, "default") == 0 || strcmp(c, "0.0.0.0/0") == 0) {
+        if (is_default_v4(c)) {
             char *d1[] = { "route", "del", "default", NULL };
             if (!ip_run(d1)) {
                 /* the default route was not ours to remove (never

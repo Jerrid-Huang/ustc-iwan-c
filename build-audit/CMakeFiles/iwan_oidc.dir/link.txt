@@ -1,0 +1,2 @@
+/usr/bin/ar qc lib/libiwan_oidc.a CMakeFiles/iwan_oidc.dir/src/oidc/oidc_cli.c.o CMakeFiles/iwan_oidc.dir/src/oidc/oidc_config.c.o CMakeFiles/iwan_oidc.dir/src/oidc/oidc_connect.c.o CMakeFiles/iwan_oidc.dir/src/oidc/oidc_flow.c.o CMakeFiles/iwan_oidc.dir/src/oidc/oidc_jwt.c.o CMakeFiles/iwan_oidc.dir/src/oidc/oidc_select.c.o CMakeFiles/iwan_oidc.dir/src/oidc/oidc_util.c.o
+/usr/bin/ranlib lib/libiwan_oidc.a

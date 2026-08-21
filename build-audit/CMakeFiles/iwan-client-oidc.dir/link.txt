@@ -1,0 +1,1 @@
+/usr/bin/cc -O3 -DNDEBUG -Wl,-z,now -Wl,-z,relro -Wl,-z,noexecstack -pie -Wl,--dependency-file=CMakeFiles/iwan-client-oidc.dir/link.d "CMakeFiles/iwan-client-oidc.dir/src/iwan_client_oidc.c.o" -o /home/uker/my/software/ustc-iwan-c/bin/iwan-client-oidc  lib/libiwan_oidc.a lib/libiwan_core.a lib/liblwip.a /usr/lib/x86_64-linux-gnu/libssl.so /usr/lib/x86_64-linux-gnu/libcrypto.so

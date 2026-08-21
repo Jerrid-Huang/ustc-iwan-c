@@ -1,0 +1,12 @@
+/home/uker/my/software/ustc-iwan-c/build-audit/CMakeFiles/lwip.dir
+/home/uker/my/software/ustc-iwan-c/build-audit/CMakeFiles/iwan_core.dir
+/home/uker/my/software/ustc-iwan-c/build-audit/CMakeFiles/iwan_oidc.dir
+/home/uker/my/software/ustc-iwan-c/build-audit/CMakeFiles/iwan-client.dir
+/home/uker/my/software/ustc-iwan-c/build-audit/CMakeFiles/iwan-client-oidc.dir
+/home/uker/my/software/ustc-iwan-c/build-audit/CMakeFiles/socks_handshake_harness.dir
+/home/uker/my/software/ustc-iwan-c/build-audit/CMakeFiles/lwip_data_harness.dir
+/home/uker/my/software/ustc-iwan-c/build-audit/CMakeFiles/lwip_fairness_harness.dir
+/home/uker/my/software/ustc-iwan-c/build-audit/CMakeFiles/iwan-server.dir
+/home/uker/my/software/ustc-iwan-c/build-audit/CMakeFiles/test.dir
+/home/uker/my/software/ustc-iwan-c/build-audit/CMakeFiles/edit_cache.dir
+/home/uker/my/software/ustc-iwan-c/build-audit/CMakeFiles/rebuild_cache.dir

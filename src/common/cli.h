@@ -35,8 +35,6 @@ typedef struct {
 
 #define CLI_MAX_USAGE 16
 
-#define CLI_INIT_CTL { 0 }
-
 typedef struct cli_ctl {
     /* -h/--help; long_help distinguishes "--help" from "-h". Must exit. */
     void (*on_help)(bool long_help);
