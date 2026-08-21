@@ -17,6 +17,7 @@
  */
 
 #include <errno.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -45,6 +46,94 @@
 #define NS_TICK_MAX_MS     10000
 #define NS_POLL_DEAD_MS    1000u           /* poll stopped => pcb in TIME_WAIT
                                              * or freed; safe to reclaim */
+
+/* ------------------------------------------------------------------ */
+/* zero-copy RX buffer pool                                            */
+/* ------------------------------------------------------------------ */
+/* lwIP PBUF_REF custom pbufs reference these buffers; the VPN recv
+ * loop (socks.c receive_vpn) fills them directly with one datagram, so
+ * the rx_buf -> pbuf memcpy is gone. A buffer returns to the pool only
+ * when lwIP frees the pbuf (custom_free_function), which is safe: the
+ * recv loop cannot reuse it while lwIP still holds a reference. */
+#define NS_RX_SLOT 2048
+#define NS_RX_POOL 256
+
+struct ns_rx_slot {
+    struct pbuf_custom pc;   /* first member: pbuf* -> pbuf_custom* -> slot */
+    _Alignas(8) uint8_t data[NS_RX_SLOT];
+    struct ns_rx_slot *next;
+};
+
+static struct ns_rx_slot g_rx_slots[NS_RX_POOL];
+static struct ns_rx_slot *g_rx_free;
+static int g_rx_pool_init;
+
+static void ns_rx_slot_free(struct pbuf *p)
+{
+    struct pbuf_custom *pc = (struct pbuf_custom *)p;
+    struct ns_rx_slot *s = (struct ns_rx_slot *)pc;
+    s->next = g_rx_free;
+    g_rx_free = s;
+}
+
+static void ns_rx_pool_init_once(void)
+{
+    if (g_rx_pool_init)
+        return;
+    g_rx_pool_init = 1;
+    for (int i = 0; i < NS_RX_POOL; i++) {
+        struct ns_rx_slot *s = &g_rx_slots[i];
+        s->pc.custom_free_function = ns_rx_slot_free;
+        s->next = g_rx_free;
+        g_rx_free = s;
+    }
+}
+
+int ns_rx_buf_acquire(void **bufs, int max)
+{
+    int n = 0;
+    ns_rx_pool_init_once();
+    while (n < max && g_rx_free != NULL) {
+        struct ns_rx_slot *s = g_rx_free;
+        g_rx_free = s->next;
+        bufs[n++] = s->data;
+    }
+    return n;
+}
+
+void ns_rx_buf_release(void *data)
+{
+    struct ns_rx_slot *s =
+        (struct ns_rx_slot *)((char *)data - offsetof(struct ns_rx_slot,
+                                                     data));
+    s->next = g_rx_free;
+    g_rx_free = s;
+}
+
+void ns_rx_packet_ref(Netstack *ns, void *slot_data, size_t outer_len)
+{
+    if (outer_len <= IWAN_HDR_LEN ||
+        outer_len - IWAN_HDR_LEN > 1500) {
+        ns_rx_buf_release(slot_data);
+        return;
+    }
+    const uint8_t *inner = (const uint8_t *)slot_data + IWAN_HDR_LEN;
+    size_t inlen = outer_len - IWAN_HDR_LEN;
+    struct ns_rx_slot *s =
+        (struct ns_rx_slot *)((char *)slot_data -
+                              offsetof(struct ns_rx_slot, data));
+    struct pbuf *p = pbuf_alloced_custom(PBUF_RAW, (u16_t)inlen, PBUF_REF,
+                                         &s->pc, s->data + IWAN_HDR_LEN,
+                                         NS_RX_SLOT - IWAN_HDR_LEN);
+    if (p == NULL) {
+        ns_rx_buf_release(slot_data);
+        return;
+    }
+    if ((inner[0] >> 4) == 6)
+        ip6_input(p, ns->netif);
+    else
+        ip4_input(p, ns->netif);
+}
 
 /* ------------------------------------------------------------------ */
 /* lwIP port glue                                                      */

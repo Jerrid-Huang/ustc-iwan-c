@@ -71,7 +71,15 @@
  * batches is negligible (~8% CPU at 2.6 Gbit/s), so cap every unit at
  * one page and let oversized batches fall back to sendmmsg (still one
  * syscall per batch). */
+#ifdef _WIN32
+/* Windows has no sendmmsg/recvmmsg; SIO_UDP_NETSEGMENT can batch many
+ * segments into one WSASendTo. Use the full UDP payload ceiling there.
+ * Linux keeps the conservative 4KB cap because its software GSO drops
+ * larger units on some loopback/veth paths. */
+#define IWAN_GSO_UNIT_SAFE 65507
+#else
 #define IWAN_GSO_UNIT_SAFE 4096
+#endif
 
 /* floor for ONE GSO unit (mss) in the uniform-batch fast path. The
  * session socket is shared with non-batch senders: the tunnel-DNS

@@ -484,8 +484,10 @@ void send_vpn_keepalive(int sockfd, const SocksConfig *cfg,
 }
 
 /* inner DATA dispatch: decrypt, validate, and inject a frame into the
- * netstack (or consume it as a tunnel-DNS response) */
-static void vpn_handle_data(SocksConfig *cfg, uint8_t *b, size_t n)
+ * netstack (or consume it as a tunnel-DNS response).
+ * Returns 1 when the buffer was handed to lwIP (the RX pool owns it
+ * until lwIP frees the pbuf), 0 when the caller must release it. */
+static int vpn_handle_data(SocksConfig *cfg, uint8_t *b, size_t n)
 {
     uint8_t t = b[0];
     size_t plen = n - 8;
@@ -494,7 +496,7 @@ static void vpn_handle_data(SocksConfig *cfg, uint8_t *b, size_t n)
     else if (cfg->encryption) {
         /* encrypted session must not accept plaintext frames */
         log_err("VPN plaintext data on encrypted session, drop");
-        return;
+        return 0;
     }
     if (debug_enabled() && t == PT_DATA_ENC) {
         char hex[100] = "";
@@ -505,28 +507,31 @@ static void vpn_handle_data(SocksConfig *cfg, uint8_t *b, size_t n)
     }
     uint32_t saddr, daddr;
     if (plen < 20 || plen > (size_t)cfg->mtu)
-        return;
+        return 0;
     if ((b[8] >> 4) == 6) {
         /* inner IPv6 (SOCKS targets over IPv6): structural check only —
          * spoof protection is the server's job (its H1 gate binds the
          * source to the session's derived ULA) */
         uint8_t s6[16], d6[16];
         if (plen < 40 || ip6_pkt_ok(b + 8, plen, s6, d6) != 0)
-            return;
+            return 0;
     } else if (ipv4_pkt_ok(b + 8, plen, &saddr, &daddr) != 0) {
-        return;
+        return 0;
     }
     /* M1: inner UDP packets whose dst port belongs to a pending
      * tunnel DNS query are responses — consume them here, never
      * hand them to the TCP stack */
     if (dns_try_handle_response(b + 8, plen))
-        return;
-    ns_rx_packet(&g_ns, b + 8, plen);
+        return 0;
+    ns_rx_packet_ref(&g_ns, b, n);
+    return 1;
 }
 
 /* one received VPN datagram: outer-header validation (type/sid/token),
  * control frames (CLOSE / ECHO_REQ), and inner-packet dispatch.
- * Returns -1 when the session must stop (server CLOSE), 0 otherwise. */
+ * Returns -1 when the session must stop (server CLOSE), 0 when the
+ * caller must release the RX buffer, 1 when the buffer was handed to
+ * lwIP (RX pool owns it). */
 static int vpn_handle_datagram(int sockfd, SocksConfig *cfg, uint8_t *b,
                                size_t n)
 {
@@ -567,8 +572,7 @@ static int vpn_handle_datagram(int sockfd, SocksConfig *cfg, uint8_t *b,
     }
     if (t != PT_DATA && t != PT_DATA_ENC)
         return 0;
-    vpn_handle_data(cfg, b, n);
-    return 0;
+    return vpn_handle_data(cfg, b, n);
 }
 
 /* recvmmsg drain: one syscall per up-to-64 datagrams, MSG_DONTWAIT so
@@ -591,22 +595,15 @@ static int vpn_handle_datagram(int sockfd, SocksConfig *cfg, uint8_t *b,
  * kernel io_ring_buffer_select). Keep recvmmsg + poll. */
 int receive_vpn(int sockfd, SocksConfig *cfg) {
     enum { RX_VLEN = 64, RX_SLOT = 2048 };
-    static _Alignas(8) uint8_t rx_buf[RX_VLEN][RX_SLOT];
     static struct iovec rx_iov[RX_VLEN];
     static struct mmsghdr rx_msgs[RX_VLEN];
+    void *rx_bufs[RX_VLEN];
     static int rx_init;
 
     if (!rx_init) {
-        /* static: zero once, then set the iovecs; recvmmsg only writes
-         * msg_len/msg_flags, so the array must NOT be re-zeroed per call
-         * (that would clear msg_iov and truncate every datagram) */
+        /* static: zero once; the iov bases are re-pointed at the pool
+         * buffers on every drain below */
         memset(rx_msgs, 0, sizeof rx_msgs);
-        for (int i = 0; i < RX_VLEN; i++) {
-            rx_iov[i].iov_base = rx_buf[i];
-            rx_iov[i].iov_len = RX_SLOT;
-            rx_msgs[i].msg_hdr.msg_iov = &rx_iov[i];
-            rx_msgs[i].msg_hdr.msg_iovlen = 1;
-        }
         rx_init = 1;
     }
 
@@ -617,29 +614,58 @@ int receive_vpn(int sockfd, SocksConfig *cfg) {
          * loop starves local reads and TX (echo-mode livelock) */
         if (budget <= 0)
             return 0;
-        int v = port_recvmmsg(sockfd, rx_msgs, RX_VLEN, MSG_DONTWAIT, NULL);
+        int got = ns_rx_buf_acquire(rx_bufs, RX_VLEN);
+        if (got == 0)
+            return 0;   /* pool exhausted: lwIP still holds buffers */
+        for (int i = 0; i < got; i++) {
+            rx_iov[i].iov_base = rx_bufs[i];
+            rx_iov[i].iov_len = RX_SLOT;
+            rx_msgs[i].msg_hdr.msg_iov = &rx_iov[i];
+            rx_msgs[i].msg_hdr.msg_iovlen = 1;
+        }
+        int v = port_recvmmsg(sockfd, rx_msgs, (unsigned)got,
+                              MSG_DONTWAIT, NULL);
         if (v > 0)
             cfg->last_rx = now_ms();   /* downlink resets the stale clock */
-        if (v <= 0) {
-            if (v == 0 || errno == EAGAIN || errno == EWOULDBLOCK ||
-                errno == ECONNREFUSED)
-                return 0;   /* ECONNREFUSED: one-shot connected-UDP ICMP
-                             * artifact; keepalives detect real loss */
+        if (v < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+            errno != ECONNREFUSED) {
+            for (int i = 0; i < got; i++)
+                ns_rx_buf_release(rx_bufs[i]);
             log_err("receive_vpn: recvmmsg: %s", strerror(errno));
             cfg->session_lost = true;   /* abnormal: reconnect, not a
                                          * clean user stop (run_socks
                                          * returns 1) */
             return -1;
         }
+        if (v <= 0) {
+            for (int i = 0; i < got; i++)
+                ns_rx_buf_release(rx_bufs[i]);
+            return 0;   /* drained (ECONNREFUSED: connected-UDP ICMP
+                         * artifact; keepalives detect real loss) */
+        }
         budget -= v;
         for (int i = 0; i < v; i++) {
             ssize_t n = rx_msgs[i].msg_len;
-            if (n < 8 || (rx_msgs[i].msg_hdr.msg_flags & MSG_TRUNC))
+            if (n < 8 || (rx_msgs[i].msg_hdr.msg_flags & MSG_TRUNC)) {
+                ns_rx_buf_release(rx_bufs[i]);
                 continue;
-            if (vpn_handle_datagram(sockfd, cfg, rx_buf[i], (size_t)n) < 0)
+            }
+            int r = vpn_handle_datagram(sockfd, cfg, rx_bufs[i], (size_t)n);
+            if (r < 0) {
+                for (int j = i + 1; j < got; j++)
+                    ns_rx_buf_release(rx_bufs[j]);
                 return -1;
+            }
+            if (r == 0)
+                ns_rx_buf_release(rx_bufs[i]);
+            /* r == 1: the RX pool owns the buffer until lwIP frees it */
         }
+        for (int i = v; i < got; i++)
+            ns_rx_buf_release(rx_bufs[i]);
+        if (v < got)
+            break;   /* partial batch: drained */
     }
+    return 0;
 }
 
 /* Re-establish every active flow on a rebuilt netstack (only used when

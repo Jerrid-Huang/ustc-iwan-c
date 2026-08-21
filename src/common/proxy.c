@@ -27,6 +27,70 @@
 #include "tun.h"
 #include "util.h"
 
+struct pump_tx_buf;   /* Windows send-thread batch-buffer pool (defined below) */
+
+/* [prof] per-stage timing accumulators (whole-run; printed at teardown).
+ * IWAN_PUMP_PROF=1 enables the printout. PP_SEND_SYS/RETRY/PACE are
+ * sub-stages of PP_SEND (send time minus them = lock/build overhead). */
+#define PUMP_PROF_N 11
+enum {
+    PP_COPY_XOR = 0,  /* uplink: per-packet copy + XOR into batch */
+    PP_ENQ,           /* uplink: per-batch SPSC enqueue */
+    PP_SEND,          /* uplink: per-batch UDP send (incl. lock/GSO) */
+    PP_RECV,          /* downlink: recvmmsg batch drain */
+    PP_TUNWRITE,      /* downlink: per-packet wintun write */
+    PP_SEND_SYS,      /* send sub: time inside port_sendmmsg/port_sendmsg */
+    PP_SEND_RETRY,    /* send sub: time inside pump_send_retry (EAGAIN wait) */
+    PP_SEND_PACE,     /* send sub: time inside pace_take */
+    PP_SENDWAIT,      /* sender sub: blocked on ready_sem (idle/starve) */
+    PP_POLLWAIT,      /* recv sub: parked in port_poll (no downlink) */
+    PP_DLPKT,         /* downlink: whole per-packet loop (incl tun_write) */
+};
+typedef struct { uint64_t us; uint64_t n; } pump_prof_t;
+
+/* [prof] send-path accounting: datagrams sent, sendmmsg/sendmsg call
+ * count, and EAGAIN/ENOBUFS backpressure hits (tell whether PP_SEND's
+ * time is syscalls, retry-waits, or lock/build overhead) */
+atomic_uint_fast64_t g_prof_send_dgrams;    /* datagrams inside PP_SEND */
+atomic_uint_fast64_t g_prof_send_syscalls;  /* port_sendmmsg/port_sendmsg */
+atomic_uint_fast64_t g_prof_send_eagain;    /* EAGAIN/ENOBUFS/EPERM hits */
+/* [prof] recv-loop accounting: recvmmsg call count is PP_RECV.n; these
+ * split it into real datagrams vs empty spins, and count auth failures */
+atomic_uint_fast64_t g_prof_recv_dgrams;    /* sum of v over recvmmsg calls */
+atomic_uint_fast64_t g_prof_recv_empty;     /* EAGAIN (no data) iterations */
+atomic_uint_fast64_t g_prof_recv_badtok;    /* datagrams with bad sid/token */
+/* [prof] wintun read-side GSO probe: if the kernel TSO'd into wintun we
+ * would see packets > 1508B (up to 64KB); current slots only hold
+ * PUMP_SLOT=2048 so oversized candidates get dropped and counted here */
+atomic_uint_fast64_t g_prof_tun_rbig;       /* wintun packets > 1508B */
+atomic_uint_fast64_t g_prof_tun_rdrop;      /* wintun packets > PUMP_SLOT */
+static uint32_t g_prof_tun_rmax;            /* max wintun packet len (B),
+                                             * written by single reader */
+/* [prof] wintun reader-thread accounting (defined in tun_win.c):
+ * wait = parked in WaitForSingleObject (idle + wake latency),
+ * timeouts = WAIT_TIMEOUT idle wakes, wakeups = signaled wakes,
+ * pkts = packets drained, drain = drain-loop time, allocfail =
+ * tun_write AllocateSendPacket first-try failures (TX ring full) */
+extern atomic_uint_fast64_t g_tun_wait_us, g_tun_timeouts, g_tun_wakeups,
+                            g_tun_pkts, g_tun_drain_us, g_tun_allocfail;
+
+static inline void pump_prof_add(pump_prof_t *p, uint64_t us)
+{
+    p->us += us;
+    p->n++;
+}
+
+#ifdef _WIN32
+#define PUMP_TX_POOL 4
+#define PUMP_SPSC_CAP 16
+typedef struct {
+    volatile unsigned head;  /* consumer-owned pop index */
+    volatile unsigned tail;  /* producer-owned push index */
+    unsigned mask;           /* PUMP_SPSC_CAP - 1 */
+    struct pump_tx_buf *slots[PUMP_SPSC_CAP];
+} pump_spsc_ring_t;
+#endif
+
 typedef struct {
     int      tun_fd;   /* downlink write fd (queue 0, device owner) */
     int      sockfd;
@@ -44,7 +108,77 @@ typedef struct {
                          * considered dead (keepalive failures / no
                          * downlink); distinguishes failure from the
                          * user's Ctrl-C so run_pump can report it */
+    pump_prof_t prof[PUMP_PROF_N];   /* [prof] stage timers (whole-run) */
+#ifdef _WIN32
+    /* Windows dedicated UDP sender thread: the wintun reader builds
+     * GSO batches in a pool of buffers, enqueues the finished batch,
+     * and this thread does the actual send syscalls — so the per-batch
+     * WSASend/GSO cost no longer stalls wintun reads. The single sender
+     * keeps the batch intact (no per-worker fragmentation). The reader
+     * and sender are strictly 1:1, so two SPSC pointer rings + counting
+     * semaphores replace the mutex/cond queue. */
+    pump_spsc_ring_t free_ring;   /* consumer -> producer (free buffers) */
+    pump_spsc_ring_t ready_ring;  /* producer -> consumer (batches) */
+    HANDLE free_sem;              /* count of free buffers */
+    HANDLE ready_sem;             /* count of ready batches */
+    struct pump_tx_buf *tx_pool[PUMP_TX_POOL]; /* batch buffer pool */
+    struct pump_tx_buf *cur_buf;  /* reader's in-progress batch */
+    pthread_t sender_thread;
+    int sender_stop;
+#endif
 } pump_ctx_t;
+
+static void pump_prof_print(const pump_ctx_t *ctx)
+{
+    static const char *const names[PUMP_PROF_N] = {
+        "copy+xor", "enqueue", "send", "recv", "tun_write",
+        "send_sys", "send_retry", "send_pace",
+        "send_wait", "poll_wait", "dl_pkt"
+    };
+    if (!getenv("IWAN_PUMP_PROF"))
+        return;
+    for (int i = 0; i < PUMP_PROF_N; i++) {
+        if (ctx->prof[i].n == 0)
+            continue;
+        fprintf(stderr, "[pump-prof] %-10s n=%-10llu avg_us=%.3f total_ms=%.1f\n",
+                names[i], (unsigned long long)ctx->prof[i].n,
+                (double)ctx->prof[i].us / (double)ctx->prof[i].n,
+                (double)ctx->prof[i].us / 1000.0);
+    }
+    fprintf(stderr,
+            "[pump-prof] send-ctr  dgrams=%-8llu syscalls=%-8llu "
+            "eagain=%-8llu\n",
+            (unsigned long long)atomic_load(&g_prof_send_dgrams),
+            (unsigned long long)atomic_load(&g_prof_send_syscalls),
+            (unsigned long long)atomic_load(&g_prof_send_eagain));
+    fprintf(stderr,
+            "[pump-prof] recv-ctr  dgrams=%-8llu empty=%-8llu "
+            "badtok=%-8llu\n",
+            (unsigned long long)atomic_load(&g_prof_recv_dgrams),
+            (unsigned long long)atomic_load(&g_prof_recv_empty),
+            (unsigned long long)atomic_load(&g_prof_recv_badtok));
+    fprintf(stderr,
+            "[pump-prof] tun-rx    rmax=%-5u rbig=%-8llu rdrop=%-8llu\n",
+            g_prof_tun_rmax,
+            (unsigned long long)atomic_load(&g_prof_tun_rbig),
+            (unsigned long long)atomic_load(&g_prof_tun_rdrop));
+    {
+        unsigned long long wk =
+            (unsigned long long)atomic_load(&g_tun_wakeups);
+        unsigned long long pk =
+            (unsigned long long)atomic_load(&g_tun_pkts);
+        fprintf(stderr,
+                "[pump-prof] tun-read  wait_ms=%-8llu drain_ms=%-7llu "
+                "wake=%-8llu to=%-7llu pkts=%-9llu rpc=%.2f afail=%llu\n",
+                (unsigned long long)atomic_load(&g_tun_wait_us) / 1000,
+                (unsigned long long)atomic_load(&g_tun_drain_us) / 1000,
+                wk,
+                (unsigned long long)atomic_load(&g_tun_timeouts),
+                pk,
+                wk ? (double)pk / (double)wk : 0.0,
+                (unsigned long long)atomic_load(&g_tun_allocfail));
+    }
+}
 
 atomic_uint_fast64_t g_prof_pump_tx, g_prof_pump_rx;   /* [prof] tunnel bytes */
 
@@ -174,7 +308,10 @@ static void send_batch(pump_ctx_t *ctx, struct mmsghdr *msgs, unsigned n)
     }
 
     while (sent < n && !g_stop) {
+        atomic_fetch_add(&g_prof_send_syscalls, 1);
+        uint64_t s0 = now_us();
         ssize_t sm = port_sendmmsg(ctx->sockfd, msgs + sent, n - sent, 0);
+        pump_prof_add(&ctx->prof[PP_SEND_SYS], now_us() - s0);
         if (sm > 0) {
             sent += (unsigned)sm;
             continue;
@@ -194,7 +331,11 @@ static void send_batch(pump_ctx_t *ctx, struct mmsghdr *msgs, unsigned n)
              * the receive thread (udp2tun) keeps draining the socket so
              * backpressure clears once we stop hammering it. poll()
              * already waited for writability, so no post-poll usleep. */
-            if (!pump_send_retry(ctx, retry_t0))
+            atomic_fetch_add(&g_prof_send_eagain, 1);
+            uint64_t r0 = now_us();
+            int rv = pump_send_retry(ctx, retry_t0);
+            pump_prof_add(&ctx->prof[PP_SEND_RETRY], now_us() - r0);
+            if (!rv)
                 return;
             continue;
         }
@@ -253,7 +394,10 @@ static int send_gso(pump_ctx_t *ctx, struct iovec *iov, unsigned n,
     mh.msg_iov = iov;
     mh.msg_iovlen = n;
     while (!g_stop) {
+        atomic_fetch_add(&g_prof_send_syscalls, 1);
+        uint64_t s0 = now_us();
         ssize_t r = port_sendmsg(ctx->sockfd, &mh, 0);
+        pump_prof_add(&ctx->prof[PP_SEND_SYS], now_us() - s0);
         if (r == (ssize_t)total)
             return 1;
         if (r >= 0) {
@@ -281,7 +425,11 @@ static int send_gso(pump_ctx_t *ctx, struct iovec *iov, unsigned n,
              * EAGAIN (same budget-bounded wait as send_batch: poll at
              * most the remaining retry budget, then yield to the
              * receive path) */
-            if (!pump_send_retry(ctx, retry_t0))
+            atomic_fetch_add(&g_prof_send_eagain, 1);
+            uint64_t r0 = now_us();
+            int rv = pump_send_retry(ctx, retry_t0);
+            pump_prof_add(&ctx->prof[PP_SEND_RETRY], now_us() - r0);
+            if (!rv)
                 return 1;   /* bounded: let the receive path drain */
             continue;
         }
@@ -307,7 +455,9 @@ static int send_gso(pump_ctx_t *ctx, struct iovec *iov, unsigned n,
  * The tun_pool hands each reader its own packet stream (kernel flow-hash
  * steering); packets are XOR'd into a thread-local batch and flushed to
  * the shared UDP socket under send_lock (UDP_SEGMENT and sendmmsg on one
- * socket must not interleave). */
+ * socket must not interleave). On Windows a dedicated sender thread runs
+ * the send syscalls (see pump_tx_send below); the batch is enqueued whole
+ * so GSO batching is never fragmented across workers. */
 typedef struct {
     uint8_t *batch;
     struct iovec iov[PUMP_BATCH];
@@ -317,15 +467,26 @@ typedef struct {
     uint64_t t0;
 } pump_tx_t;
 
-static _Thread_local pump_tx_t g_tx;
+#ifdef _WIN32
+/* one pool-owned batch buffer: filled by the wintun reader, sent by the
+ * dedicated sender thread, then returned to the free list */
+struct pump_tx_buf {
+    struct pump_tx_buf *next;
+    pump_tx_t tx;
+};
+#endif
 
-/* flush one batch to the socket; GSO fast path when uniform */
-static void pump_flush(pump_ctx_t *ctx, pump_tx_t *q)
+static _Thread_local pump_tx_t g_tx;   /* Linux per-reader batch */
+
+/* Build the msgs[] iovec entries and send one finished batch under
+ * send_lock; GSO fast path when uniform. q->n is left untouched (the
+ * caller/Linux path resets it, the Windows sender releases the buffer). */
+static void pump_tx_send(pump_ctx_t *ctx, pump_tx_t *q)
 {
     unsigned n = q->n;
     if (n == 0)
         return;
-    q->n = 0;
+    atomic_fetch_add(&g_prof_send_dgrams, n);
     for (unsigned i = 0; i < n; i++) {
         q->msgs[i].msg_hdr.msg_iov = &q->iov[i];
         q->msgs[i].msg_hdr.msg_iovlen = 1;
@@ -355,6 +516,7 @@ static void pump_flush(pump_ctx_t *ctx, pump_tx_t *q)
                   (size_t)n * l0 <= IWAN_UDP_GSO_UNIT &&
                   (size_t)n * l0 <= IWAN_GSO_UNIT_SAFE;
     }
+    uint64_t t0 = now_us();
     pthread_mutex_lock(&ctx->send_lock);
     if (use_gso && send_gso(ctx, q->iov, n, q->iov[0].iov_len) == 0)
         use_gso = 0;   /* UDP_SEGMENT unavailable: fall back */
@@ -364,8 +526,25 @@ static void pump_flush(pump_ctx_t *ctx, pump_tx_t *q)
      * reader threads share the bucket, which is not thread-safe; the
      * pacing sleep under the lock is exactly the aggregate-pacing
      * semantic (see util.h pace_bucket). */
-    pace_take(&ctx->pace, (int)n);
+    {
+        uint64_t p0 = now_us();
+        pace_take(&ctx->pace, (int)n);
+        pump_prof_add(&ctx->prof[PP_SEND_PACE], now_us() - p0);
+    }
     pthread_mutex_unlock(&ctx->send_lock);
+    pump_prof_add(&ctx->prof[PP_SEND], now_us() - t0);
+}
+
+#ifndef _WIN32
+/* flush one batch to the socket inline (Linux: the reader thread owns
+ * the thread-local batch and there is no dedicated sender) */
+static void pump_flush(pump_ctx_t *ctx, pump_tx_t *q)
+{
+    unsigned n = q->n;
+    if (n == 0)
+        return;
+    pump_tx_send(ctx, q);
+    q->n = 0;
 }
 
 /* tun_pool callback: one thread-local batch per reader thread */
@@ -413,9 +592,11 @@ static void pump_tun_pkt(void *ud, uint8_t *pkt, size_t len, bool last)
     {
         const size_t slot = 8 + PUMP_SLOT;
         uint8_t *s = q->batch + (size_t)q->n * slot;
+        uint64_t t0 = now_us();
         memcpy(s, q->hdr, 8);
         memcpy(s + 8, pkt, len);   /* pool hands over its scratch buffer */
         xor_crypt(s + 8, len, ctx->xor_key, 8);
+        pump_prof_add(&ctx->prof[PP_COPY_XOR], now_us() - t0);
         PROF_ADD(g_prof_pump_tx, len);
         q->iov[q->n].iov_base = s;
         q->iov[q->n].iov_len = len + 8;
@@ -427,12 +608,232 @@ static void pump_tun_pkt(void *ud, uint8_t *pkt, size_t len, bool last)
     if (q->n == PUMP_BATCH || now_us() - q->t0 >= PUMP_MAX_LAT_US)
         pump_flush(ctx, q);
 }
+#else /* _WIN32 */
+
+/* ---------- dedicated UDP sender thread (SPSC) ---------- */
+/* Strictly one producer (wintun reader) and one consumer (sender):
+ * two pointer rings + counting semaphores, no mutex/cond on the hot
+ * path. The pool has 4 batch buffers and the rings hold 16 slots, so
+ * the ready ring can never fill (pool < ring capacity). */
+static inline int pump_spsc_push(pump_spsc_ring_t *r,
+                                 struct pump_tx_buf *b)
+{
+    unsigned t = r->tail;
+    unsigned next = (t + 1) & r->mask;
+    if (next == r->head)   /* full */
+        return 0;
+    r->slots[t] = b;
+    __sync_synchronize();   /* release: slot before tail */
+    r->tail = next;
+    return 1;
+}
+
+static inline struct pump_tx_buf *pump_spsc_pop(pump_spsc_ring_t *r)
+{
+    unsigned h = r->head;
+    if (h == r->tail)
+        return NULL;
+    struct pump_tx_buf *b = r->slots[h];
+    __sync_synchronize();   /* acquire: slot before head */
+    r->head = (h + 1) & r->mask;
+    return b;
+}
+
+static struct pump_tx_buf *pump_tx_acquire(pump_ctx_t *ctx)
+{
+    WaitForSingleObject(ctx->free_sem, INFINITE);
+    return pump_spsc_pop(&ctx->free_ring);
+}
+
+static void pump_tx_release(pump_ctx_t *ctx, struct pump_tx_buf *b)
+{
+    b->tx.n = 0;
+    pump_spsc_push(&ctx->free_ring, b);
+    ReleaseSemaphore(ctx->free_sem, 1, NULL);
+}
+
+static int pump_tx_enqueue(pump_ctx_t *ctx, struct pump_tx_buf *b)
+{
+    if (!pump_spsc_push(&ctx->ready_ring, b))
+        return -1;   /* cannot happen: pool(4) < ring cap(16) */
+    ReleaseSemaphore(ctx->ready_sem, 1, NULL);
+    return 0;
+}
+
+static struct pump_tx_buf *pump_tx_dequeue(pump_ctx_t *ctx)
+{
+    for (;;) {
+        if (ctx->sender_stop) {
+            /* stop requested: drain whatever is left, then exit */
+            return pump_spsc_pop(&ctx->ready_ring);
+        }
+        uint64_t w0 = now_us();
+        WaitForSingleObject(ctx->ready_sem, INFINITE);
+        pump_prof_add(&ctx->prof[PP_SENDWAIT], now_us() - w0);
+        struct pump_tx_buf *b = pump_spsc_pop(&ctx->ready_ring);
+        if (b != NULL)
+            return b;
+        /* spurious token (stop wake): loop */
+    }
+}
+
+/* reader finished a batch: hand it to the sender thread whole */
+static void pump_flush_w(pump_ctx_t *ctx, struct pump_tx_buf *b)
+{
+    if (b->tx.n == 0) {
+        pump_tx_release(ctx, b);
+        return;
+    }
+    uint64_t t0 = now_us();
+    if (pump_tx_enqueue(ctx, b) != 0)
+        pump_tx_release(ctx, b);
+    pump_prof_add(&ctx->prof[PP_ENQ], now_us() - t0);
+}
+
+/* tun_pool callback on Windows: the (single) wintun reader fills a batch
+ * buffer from the pool, then hands the whole batch to the sender thread */
+static void pump_tun_pkt(void *ud, uint8_t *pkt, size_t len, bool last)
+{
+    pump_ctx_t *ctx = ud;
+
+    if (last) {
+        if (ctx->cur_buf != NULL && ctx->cur_buf->tx.n > 0)
+            pump_flush_w(ctx, ctx->cur_buf);
+        ctx->cur_buf = NULL;
+        return;
+    }
+    if (len > (uint32_t)g_prof_tun_rmax)
+        g_prof_tun_rmax = (uint32_t)len;   /* single reader thread */
+    if (len > 1508)
+        atomic_fetch_add(&g_prof_tun_rbig, 1);
+    if (len == 0 || len > PUMP_SLOT) {
+        if (len > PUMP_SLOT)
+            atomic_fetch_add(&g_prof_tun_rdrop, 1);
+        log_debug("pump: drop packet, len %zu out of [1, %d]", len,
+                  PUMP_SLOT);
+        return;
+    }
+    if (ctx->cur_buf == NULL) {
+        ctx->cur_buf = pump_tx_acquire(ctx);
+        if (ctx->cur_buf == NULL)
+            return;   /* stopped */
+        ctx->cur_buf->tx.n = 0;
+        ctx->cur_buf->tx.t0 = now_us();
+    }
+    pump_tx_t *q = &ctx->cur_buf->tx;
+    if (g_stop)
+        return;
+    {
+        const size_t slot = 8 + PUMP_SLOT;
+        uint8_t *s = q->batch + (size_t)q->n * slot;
+        uint64_t t0 = now_us();
+        memcpy(s, q->hdr, 8);
+        memcpy(s + 8, pkt, len);   /* wintun scratch, copied out */
+        xor_crypt(s + 8, len, ctx->xor_key, 8);
+        pump_prof_add(&ctx->prof[PP_COPY_XOR], now_us() - t0);
+        PROF_ADD(g_prof_pump_tx, len);
+        q->iov[q->n].iov_base = s;
+        q->iov[q->n].iov_len = len + 8;
+        q->n++;
+    }
+    if (q->n == PUMP_BATCH || now_us() - q->t0 >= PUMP_MAX_LAT_US) {
+        pump_flush_w(ctx, ctx->cur_buf);
+        ctx->cur_buf = NULL;
+    }
+}
+
+static void pump_sender_free(pump_ctx_t *ctx);   /* fwd: used by start's err path */
+
+static void *pump_sender_main(void *ud)
+{
+    pump_ctx_t *ctx = ud;
+    for (;;) {
+        struct pump_tx_buf *b = pump_tx_dequeue(ctx);
+        if (b == NULL)
+            break;   /* stopped and drained */
+        pump_tx_send(ctx, &b->tx);
+        pump_tx_release(ctx, b);
+    }
+    return NULL;
+}
+
+static int pump_sender_start(pump_ctx_t *ctx)
+{
+    int pooln = (int)(sizeof ctx->tx_pool / sizeof ctx->tx_pool[0]);
+    const size_t slot = 8 + PUMP_SLOT;
+
+    ctx->free_ring.head = 0;
+    ctx->free_ring.tail = 0;
+    ctx->free_ring.mask = PUMP_SPSC_CAP - 1;
+    ctx->ready_ring.head = 0;
+    ctx->ready_ring.tail = 0;
+    ctx->ready_ring.mask = PUMP_SPSC_CAP - 1;
+    ctx->cur_buf = NULL;
+    ctx->sender_stop = 0;
+
+    ctx->free_sem = CreateSemaphore(NULL, 0, PUMP_SPSC_CAP, NULL);
+    ctx->ready_sem = CreateSemaphore(NULL, 0, PUMP_SPSC_CAP, NULL);
+    if (ctx->free_sem == NULL || ctx->ready_sem == NULL)
+        goto err;
+
+    for (int i = 0; i < pooln; i++) {
+        struct pump_tx_buf *b = calloc(1, sizeof *b);
+        if (b == NULL)
+            goto err;
+        b->tx.batch = malloc((size_t)PUMP_BATCH * slot);
+        if (b->tx.batch == NULL) {
+            free(b);
+            goto err;
+        }
+        memset(b->tx.msgs, 0, sizeof b->tx.msgs);
+        pkt_hdr(ctx->enc ? PT_DATA_ENC : PT_DATA, ctx->enc, ctx->sid,
+                ctx->tok, b->tx.hdr);
+        ctx->tx_pool[i] = b;
+        pump_spsc_push(&ctx->free_ring, b);
+        ReleaseSemaphore(ctx->free_sem, 1, NULL);
+    }
+    if (pthread_create(&ctx->sender_thread, NULL, pump_sender_main, ctx) != 0)
+        goto err;
+    return 0;
+err:
+    pump_sender_free(ctx);
+    return -1;
+}
+
+static void pump_sender_stop(pump_ctx_t *ctx)
+{
+    ctx->sender_stop = 1;
+    ReleaseSemaphore(ctx->ready_sem, 1, NULL);   /* wake if blocked */
+    pthread_join(ctx->sender_thread, NULL);
+}
+
+static void pump_sender_free(pump_ctx_t *ctx)
+{
+    int pooln = (int)(sizeof ctx->tx_pool / sizeof ctx->tx_pool[0]);
+    for (int i = 0; i < pooln; i++) {
+        if (ctx->tx_pool[i] != NULL) {
+            free(ctx->tx_pool[i]->tx.batch);
+            free(ctx->tx_pool[i]);
+            ctx->tx_pool[i] = NULL;
+        }
+    }
+    if (ctx->free_sem != NULL) {
+        CloseHandle(ctx->free_sem);
+        ctx->free_sem = NULL;
+    }
+    if (ctx->ready_sem != NULL) {
+        CloseHandle(ctx->ready_sem);
+        ctx->ready_sem = NULL;
+    }
+}
+#endif /* _WIN32 */
+
 
 /* Free this reader thread's TLS batch on thread exit (registered via
  * tun_pool_set_exit_cb). Runs on the exiting reader thread itself, so
  * the g_tx access is genuinely thread-local; tun.c invokes it strictly
  * after the final flush callback, so no pending pump_flush can touch
- * the freed buffer. */
+ * the freed buffer. (Windows: g_tx is unused, this is a no-op.) */
 static void pump_reader_exit(void)
 {
     if (g_tx.batch) {
@@ -518,17 +919,24 @@ static void *udp2tun_thread(void *ud) {
             }
             last_ka = now_ms();
         }
+        uint64_t t_recv = now_us();
         int v = port_recvmmsg(ctx->sockfd, msgs, (unsigned)rxbatch,
                               MSG_DONTWAIT, NULL);
+        pump_prof_add(&ctx->prof[PP_RECV], now_us() - t_recv);
+        if (v > 0)
+            atomic_fetch_add(&g_prof_recv_dgrams, (uint64_t)v);
         if (v < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                atomic_fetch_add(&g_prof_recv_empty, 1);
                 uint64_t ka_ms = last_ka + PUMP_KEEPALIVE_MS;
                 uint64_t now_msv = now_ms();
                 int to = ka_ms > now_msv ? (int)(ka_ms - now_msv) : 1;
                 if (to > PUMP_POLL_CEIL_MS)
                     to = PUMP_POLL_CEIL_MS;
                 struct pollfd pfd = { .fd = ctx->sockfd, .events = POLLIN };
+                uint64_t pw0 = now_us();
                 int pr = port_poll(&pfd, 1, to);
+                pump_prof_add(&ctx->prof[PP_POLLWAIT], now_us() - pw0);
                 if (pr < 0 && errno != EINTR) {
                     err_printf("[UDP->TUN] poll err\n");
                     ctx->session_lost = true;   /* abnormal: reconnect */
@@ -554,6 +962,7 @@ static void *udp2tun_thread(void *ud) {
             if (prof_print("cli rx", &pst_rx, g_prof_pump_rx))
                 prof_print("cli tx", &pst_tx, g_prof_pump_tx);
         }
+        uint64_t dl0 = now_us();
         for (i = 0; i < v; i++) {
             ssize_t n = msgs[i].msg_len;
             uint8_t *m = batch + (size_t)i * slot;
@@ -566,8 +975,10 @@ static void *udp2tun_thread(void *ud) {
             /* mirror receive_vpn: sid/token must match BEFORE any
              * control action — an unauthenticated PT_CLOSE must not be
              * able to tear the tunnel down */
-            if (psid != ctx->sid || ptok != ctx->tok)
+            if (psid != ctx->sid || ptok != ctx->tok) {
+                atomic_fetch_add(&g_prof_recv_badtok, 1);
                 continue;
+            }
             if (t == PT_CLOSE) {
                 /* control packets carry the 16-byte header sig */
                 if (!verify_sig(m, (size_t)n))
@@ -610,8 +1021,11 @@ static void *udp2tun_thread(void *ud) {
             }
             /* write with unbounded EAGAIN retry: silent loss here costs
              * inner TCP retransmits */
-            if (tun_write_retry(ctx->tun_fd, m + 8, (size_t)(n - 8), 0,
-                                &g_stop) != 0) {
+            uint64_t tw0 = now_us();
+            int wr = tun_write_retry(ctx->tun_fd, m + 8, (size_t)(n - 8), 0,
+                                     &g_stop);
+            pump_prof_add(&ctx->prof[PP_TUNWRITE], now_us() - tw0);
+            if (wr != 0) {
                 if (!g_stop)
                     log_err("tun write: %s", strerror(errno));
                 /* device gone (ENODEV/EIO): the session is unrecoverable
@@ -622,6 +1036,7 @@ static void *udp2tun_thread(void *ud) {
                 break;
             }
         }
+        pump_prof_add(&ctx->prof[PP_DLPKT], now_us() - dl0);
     }
     free(batch);
     return NULL;
@@ -905,6 +1320,7 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
     install_signals();
 
     pump_ctx_t ctx;
+    memset(ctx.prof, 0, sizeof ctx.prof);
     ctx.tun_fd = tun_fd;
     ctx.sockfd = sockfd;
     ctx.sid = sid;
@@ -915,6 +1331,18 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
     memcpy(ctx.xor_key, xor_key, 8);
     pthread_mutex_init(&ctx.send_lock, NULL);
     pace_bucket_init(&ctx.pace);
+#ifdef _WIN32
+    int sender_started = 0;
+    /* The wintun reader may start producing the moment the pool is
+     * created, so the sender queue/pool must exist first. */
+    if (pump_sender_start(&ctx) != 0) {
+        log_err("cannot start TUN UDP sender thread");
+        g_stop = 1;
+        goto fail;
+    }
+    sender_started = 1;
+    log_info("TUN UDP sender thread started");
+#endif
 
     {
         /* multiqueue uplink: attach min(ncpu, TUN_POOL_MAX) queues up
@@ -957,11 +1385,28 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
     }
 
     log_info("TUN proxy running -- press Ctrl-C to stop");
-    while (!g_stop)
-        port_sleep_us(100 * 1000);
+    {
+        uint64_t prof_last = now_ms();
+        while (!g_stop) {
+            port_sleep_us(100 * 1000);
+            uint64_t nm = now_ms();
+            if (getenv("IWAN_PUMP_PROF") && nm - prof_last >= 1000) {
+                pump_prof_print(&ctx);
+                prof_last = nm;
+            }
+        }
+    }
 
+#ifdef _WIN32
+    tun_pool_destroy(ctx.pool);   /* stop the wintun reader first */
+    pump_sender_stop(&ctx);       /* then drain + stop the sender */
+#else
     tun_pool_destroy(ctx.pool);
+#endif
     pthread_join(t2, NULL);
+#ifdef _WIN32
+    pump_sender_free(&ctx);
+#endif
 
     teardown_routes(tun_name, auth_tun_ip, server, ogw, odev,
                     ogw_metric, &routes, had_routes, &routes6);
@@ -970,6 +1415,7 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
     if (debug_enabled())
         err_printf("CLOSE sent\n");
 
+    pump_prof_print(&ctx);
     pthread_mutex_destroy(&ctx.send_lock);
     slist_free(&routes);
     slist_free(&routes6);
@@ -983,6 +1429,13 @@ fail:
      * pthread_create path destroys the live pool and sets g_stop; the
      * pool-create path has no pool to destroy) — the tail below is
      * identical in both. */
+#ifdef _WIN32
+    if (sender_started) {
+        pump_sender_stop(&ctx);
+        pump_sender_free(&ctx);
+    }
+#endif
+    pump_prof_print(&ctx);
     teardown_routes(tun_name, auth_tun_ip, server, ogw, odev,
                     ogw_metric, &routes, had_routes, &routes6);
     slist_free(&routes);

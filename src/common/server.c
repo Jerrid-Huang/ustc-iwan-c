@@ -21,6 +21,7 @@
 #ifndef TCP_FIN
 #define TCP_FIN 0x01
 #define TCP_SYN 0x02
+#define TCP_RST 0x04
 #define TCP_ACK 0x10
 #endif
 
@@ -1214,6 +1215,19 @@ static int echo_mirror6(struct server_ctx *ctx, uint8_t *p, size_t len,
     if (echo_seq_advance(6, NULL, p + 8, sport, NULL, p + 24, dport,
                          flags, s_orig, paylen, &seq) != 0)
         return -1;           /* table full */
+    /* Do not mirror a pure ACK (no payload, no SYN/FIN/RST). Echoing it
+     * back puts the client's own ACK in front of it again; Windows
+     * reacts with another ACK, the mirror echoes that too, and the two
+     * sides ping-pong pure ACKs forever while data stalls. The echo
+     * table is still refreshed above (ACKs keep the connection from
+     * being reclaimed), and data echoes already carry the ACK that
+     * advances the client's send window. */
+    if (paylen == 0 && (flags & TCP_ACK) &&
+        !(flags & (TCP_SYN | TCP_FIN | TCP_RST))) {
+        if (debug_enabled())
+            log_debug("echo6: drop pure ACK");
+        return -1;
+    }
     /* swap addresses byte-wise */
     memcpy(tmp16, p + 8, 16);
     memcpy(p + 8, p + 24, 16);
@@ -1314,6 +1328,17 @@ int echo_mirror(struct server_ctx *ctx, uint8_t *p, size_t len,
     if (echo_seq_advance(4, &nsrc, NULL, sport, &ndst, NULL, dport,
                          flags, s_orig, paylen, &seq) != 0)
         return -1;           /* table full */
+    /* Do not mirror a pure ACK: echoing the client's ACK back makes
+     * Windows send another ACK, which is echoed again — a self-
+     * sustaining ACK storm that stalls data. The table lookup above
+     * still refreshes the connection, and data echoes already carry
+     * the ACK that advances the client's send window. */
+    if (paylen == 0 && (flags & TCP_ACK) &&
+        !(flags & (TCP_SYN | TCP_FIN | TCP_RST))) {
+        if (debug_enabled())
+            log_debug("echo: drop pure ACK");
+        return -1;
+    }
     /* swap addresses byte-wise (never through a host-endian u32: the
      * little-endian memcpy round-trip would byte-reverse them) */
     memcpy(tmp4, p + 12, 4);

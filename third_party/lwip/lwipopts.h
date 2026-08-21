@@ -145,6 +145,9 @@
 #define MEMP_NUM_PBUF     16384              /* struct pbuf for PBUF_RAM/ROM */
 #define PBUF_POOL_SIZE    4096               /* RX pbufs (short-lived + OOS) */
 #define PBUF_POOL_BUFSIZE 1600               /* one full inner IP packet (MTU 1500) */
+/* Zero-copy RX: the SOCKS bridge wraps pool-owned receive buffers in
+ * PBUF_REF custom pbufs (see lwip_bridge.c). */
+#define LWIP_SUPPORT_CUSTOM_PBUF 1
 
 /* ---- diagnostics (off in release; LWIP_DEBUGF compiles out) ---- */
 #define LWIP_STATS        0

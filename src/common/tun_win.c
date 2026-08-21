@@ -31,6 +31,8 @@
 
 #include "common.h"   /* port.h: winsock2.h + windows.h + errno.h first */
 #include "iphlpapi.h" /* NET_LUID for WintunGetAdapterLuid's signature */
+#include <setupapi.h> /* SP_DEVINFO_DATA / DIF_REMOVE for adapter deletion */
+#include <devguid.h>  /* GUID_DEVCLASS_NET */
 #include "tun.h"
 #include "util.h"
 
@@ -47,7 +49,6 @@ typedef WINTUN_ADAPTER_HANDLE(WINAPI *wintun_create_adapter_fn)(
 typedef WINTUN_ADAPTER_HANDLE(WINAPI *wintun_open_adapter_fn)(
     const WCHAR *name, const WCHAR *tunnel_type);
 typedef void (WINAPI *wintun_close_adapter_fn)(WINTUN_ADAPTER_HANDLE adapter);
-typedef BOOL (WINAPI *wintun_delete_adapter_fn)(WINTUN_ADAPTER_HANDLE adapter);
 typedef WINTUN_SESSION_HANDLE(WINAPI *wintun_start_session_fn)(
     WINTUN_ADAPTER_HANDLE adapter, DWORD capacity);
 typedef void (WINAPI *wintun_end_session_fn)(WINTUN_SESSION_HANDLE session);
@@ -75,7 +76,6 @@ struct wintun_api {
     wintun_create_adapter_fn create_adapter;
     wintun_open_adapter_fn open_adapter;
     wintun_close_adapter_fn close_adapter;
-    wintun_delete_adapter_fn delete_adapter;
     wintun_start_session_fn start_session;
     wintun_end_session_fn end_session;
     wintun_get_running_driver_version_fn get_running_driver_version;
@@ -92,10 +92,21 @@ static struct wintun_api iwan_wintun;
 static int iwan_wintun_loaded;
 
 #define IWAN_WINTUN_POOL L"iWAN"
-/* 4 MiB ring: matches the 4 MiB SO_RCVBUF the Linux backend gives the
- * TUN fd, so burst behavior (pacing, batch flush) stays comparable */
-#define IWAN_WINTUN_RING_CAPACITY 0x400000u
+/* 8 MiB ring: matches Xray-core's wintun session capacity
+ * (StartSession(0x800000)); the larger ring absorbs the send/recv
+ * bursts from the pump's GSO batches without the kernel stalling the
+ * session under load. */
+#define IWAN_WINTUN_RING_CAPACITY 0x800000u
 #define TUN_WIN_POLL_MS 100   /* reader wait cadence (tun.c TUN_POLL_MS) */
+
+/* [prof] reader/write accounting, printed by the client pump profiler
+ * (proxy.c declares these extern): wait = reader parked in
+ * WaitForSingleObject (idle park + wake latency), timeouts = idle
+ * WAIT_TIMEOUT wakes, wakeups = signaled wakes, pkts = packets drained,
+ * drain = drain-loop time (cb + release), allocfail = tun_write
+ * AllocateSendPacket first-try misses (TX ring full backpressure) */
+atomic_uint_fast64_t g_tun_wait_us, g_tun_timeouts, g_tun_wakeups,
+                     g_tun_pkts, g_tun_drain_us, g_tun_allocfail;
 
 /* Fixed adapter GUID: one stable identity for every run and every
  * machine, so Windows tracks the adapter as "the" iwan adapter. Random
@@ -166,7 +177,6 @@ static bool wintun_load(void)
     WINTUN_LOAD_ONE(create_adapter, "WintunCreateAdapter");
     WINTUN_LOAD_ONE(open_adapter, "WintunOpenAdapter");
     WINTUN_LOAD_ONE(close_adapter, "WintunCloseAdapter");
-    WINTUN_LOAD_ONE(delete_adapter, "WintunDeleteAdapter");
     WINTUN_LOAD_ONE(start_session, "WintunStartSession");
     WINTUN_LOAD_ONE(end_session, "WintunEndSession");
     WINTUN_LOAD_ONE(get_running_driver_version, "WintunGetRunningDriverVersion");
@@ -232,6 +242,38 @@ static bool utf8_to_wchar(const char *s, wchar_t *out, size_t cap)
     return MultiByteToWideChar(CP_UTF8, 0, s, -1, out, (int)cap) > 0;
 }
 
+/* wintun >= 0.14 removed WintunDeleteAdapter from the DLL, so a wedged
+ * stale adapter is deleted through SetupDi (DIF_REMOVE) by matching the
+ * adapter's friendly name. Returns 1 when a device was removed. */
+static int wintun_delete_adapter_by_name(const wchar_t *name)
+{
+    HDEVINFO devs;
+    SP_DEVINFO_DATA devinfo;
+    wchar_t dn[256];
+    DWORD i;
+    int removed = 0;
+
+    devs = SetupDiGetClassDevsW(&GUID_DEVCLASS_NET, NULL, NULL,
+                                DIGCF_PRESENT);
+    if (devs == INVALID_HANDLE_VALUE)
+        return 0;
+    devinfo.cbSize = sizeof devinfo;
+    for (i = 0; SetupDiEnumDeviceInfo(devs, i, &devinfo); i++) {
+        DWORD n = 0;
+        if (!SetupDiGetDeviceRegistryPropertyW(devs, &devinfo,
+                                               SPDRP_FRIENDLYNAME, NULL,
+                                               (PBYTE)dn, sizeof dn, &n))
+            continue;
+        if (wcsstr(dn, name) != NULL) {
+            if (SetupDiCallClassInstaller(DIF_REMOVE, devs, &devinfo))
+                removed = 1;
+            break;
+        }
+    }
+    SetupDiDestroyDeviceInfoList(devs);
+    return removed;
+}
+
 /* ------------------------- tun.h API ------------------------------- */
 
 /* tun_ifname: the interface name to hand to ifconfig/route.
@@ -286,6 +328,16 @@ int open_tun(const char *name)
     session = iwan_wintun.start_session(adapter, IWAN_WINTUN_RING_CAPACITY);
     if (session == NULL) {
         DWORD serr = GetLastError();
+        int attempt;
+
+        /* A freshly created/reused adapter can need a moment before
+         * WintunStartSession succeeds (driver state settling); retry a
+         * few times before declaring failure. */
+        for (attempt = 0; attempt < 4 && session == NULL; attempt++) {
+            Sleep(500);
+            session = iwan_wintun.start_session(adapter,
+                                                IWAN_WINTUN_RING_CAPACITY);
+        }
 
         /* A reused adapter can be left wedged by a crashed or killed
          * previous run (e.g. its process was terminated while holding
@@ -293,17 +345,32 @@ int open_tun(const char *name)
          * WintunStartSession fails with ERROR_DEVICE_NOT_CONNECTED,
          * 1247). Deleting and recreating the adapter once clears that
          * state; a freshly created adapter has no stale state to clear,
-         * so only the reused path retries. */
-        if (!created && iwan_wintun.delete_adapter(adapter)) {
+         * so only the reused path retries. wintun >= 0.14 has no
+         * WintunDeleteAdapter export, so the stale adapter is removed
+         * through SetupDi by name. */
+        if (session == NULL && !created) {
             log_err("tun: WintunStartSession failed on reused adapter "
-                    "(error %lu); deleting stale adapter and retrying "
-                    "once", (unsigned long)serr);
-            adapter = iwan_wintun.create_adapter(name16, IWAN_WINTUN_POOL,
-                                                 &IWAN_WINTUN_GUID);
+                    "(error %lu); deleting stale adapter and retrying",
+                    (unsigned long)serr);
+            iwan_wintun.close_adapter(adapter);
+            adapter = NULL;
+            wintun_delete_adapter_by_name(name16);
+            for (attempt = 0; attempt < 8 && adapter == NULL; attempt++) {
+                adapter = iwan_wintun.create_adapter(name16,
+                                                     IWAN_WINTUN_POOL,
+                                                     &IWAN_WINTUN_GUID);
+                if (adapter == NULL)
+                    Sleep(500);
+            }
             if (adapter != NULL) {
                 created = TRUE;
-                session = iwan_wintun.start_session(
-                    adapter, IWAN_WINTUN_RING_CAPACITY);
+                for (attempt = 0; attempt < 4 && session == NULL;
+                     attempt++) {
+                    session = iwan_wintun.start_session(
+                        adapter, IWAN_WINTUN_RING_CAPACITY);
+                    if (session == NULL)
+                        Sleep(500);
+                }
             }
         }
         if (session == NULL) {
@@ -382,10 +449,19 @@ ptrdiff_t tun_write(int fd, const void *buf, size_t len)
     if (iwan_wintun.allocate_send_packet) {
         /* wintun 0.14+: reserve ring space (blocks until room — that is
          * the backpressure), copy, then send the reserved buffer; the
-         * send itself cannot fail. A NULL alloc means the session is
-         * gone (or the packet exceeds WINTUN_MAX_IP_PACKET_SIZE). */
-        BYTE *dst = iwan_wintun.allocate_send_packet(s->session,
-                                                     (DWORD)len);
+         * send itself cannot fail. A NULL alloc normally means the
+         * session is gone (or the packet exceeds WINTUN_MAX_IP_PACKET_SIZE),
+         * but on real Windows it can also be a transient driver stall
+         * under load; retry briefly before declaring the session dead. */
+        BYTE *dst = NULL;
+        for (int i = 0; i < 20 && dst == NULL; i++) {
+            dst = iwan_wintun.allocate_send_packet(s->session,
+                                                   (DWORD)len);
+            if (dst == NULL) {
+                atomic_fetch_add(&g_tun_allocfail, 1);
+                Sleep(10);
+            }
+        }
         if (dst == NULL) {
             errno = EIO;
             return -1;
@@ -394,7 +470,14 @@ ptrdiff_t tun_write(int fd, const void *buf, size_t len)
         iwan_wintun.send_packet(s->session, dst);
     } else {
         /* wintun <= 0.13: BOOL send(Session, Packet, PacketSize) */
-        if (!iwan_wintun.send_packet_old(s->session, buf, (DWORD)len)) {
+        BOOL ok = FALSE;
+        for (int i = 0; i < 20 && !ok; i++) {
+            ok = iwan_wintun.send_packet_old(s->session, buf,
+                                             (DWORD)len);
+            if (!ok)
+                Sleep(10);
+        }
+        if (!ok) {
             errno = EIO;
             return -1;
         }
@@ -449,16 +532,25 @@ static unsigned __stdcall tun_reader_main(void *ud)
 
     if (s != NULL) {
         while (!pool->stop && (pool->abort == NULL || !*pool->abort)) {
-            if (WaitForSingleObject(s->read_ev, TUN_WIN_POLL_MS) ==
-                WAIT_TIMEOUT)
+            uint64_t w0 = now_us();
+            DWORD wr = WaitForSingleObject(s->read_ev, TUN_WIN_POLL_MS);
+            uint64_t wdt = now_us() - w0;
+            atomic_fetch_add(&g_tun_wait_us, wdt);
+            if (wr == WAIT_TIMEOUT) {
+                atomic_fetch_add(&g_tun_timeouts, 1);
                 continue;   /* idle wake, like tun.c's poll timeout */
+            }
+            atomic_fetch_add(&g_tun_wakeups, 1);
+            uint64_t d0 = now_us();
             DWORD sz;
             BYTE *pkt;
             while ((pkt = iwan_wintun.receive_packet(s->session, &sz)) !=
                    NULL) {
+                atomic_fetch_add(&g_tun_pkts, 1);
                 pool->cb(pool->ud, pkt, (size_t)sz, false);
                 iwan_wintun.release_receive_packet(s->session, pkt);
             }
+            atomic_fetch_add(&g_tun_drain_us, now_us() - d0);
             /* flush signal: batch-oriented callbacks send their partial
              * batch instead of holding it until the next wake */
             pool->cb(pool->ud, NULL, 0, true);

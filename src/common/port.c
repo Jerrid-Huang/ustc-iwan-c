@@ -15,6 +15,7 @@
 #include <shellapi.h>   /* ShellExecuteW (port_elevate_self) */
 #include <winnetwk.h>   /* WNetGetConnectionW (UNC for elevation) */
 #include <conio.h>      /* _getch (crash filter window hold) */
+#include <intrin.h>     /* __rdtsc (profiling clock, see port_now_us) */
 #endif
 
 #ifdef _WIN32
@@ -58,15 +59,7 @@ void port_install_crash_handler(void)
 uint64_t port_now_ms(void)
 {
 #ifdef _WIN32
-    static LARGE_INTEGER freq;
-    static int have_freq;
-    LARGE_INTEGER c;
-    if (!have_freq) {
-        QueryPerformanceFrequency(&freq);
-        have_freq = 1;
-    }
-    QueryPerformanceCounter(&c);
-    return (uint64_t)(c.QuadPart * 1000 / freq.QuadPart);
+    return port_now_us() / 1000u;
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -74,18 +67,67 @@ uint64_t port_now_ms(void)
 #endif
 }
 
+/* Windows µs clock: RDTSC, calibrated once against QPC.
+ *
+ * Why not QPC?  In virtual machines QPC's backing clock is chosen
+ * *per-processor* and can flip at runtime: on some vCPUs it is the
+ * invariant TSC (a few ns per call), on others a hypervisor-emulated
+ * 100MHz counter costing microseconds per call.  The hot paths here
+ * (profiling stage timers, pacing, batch latency caps) call it once
+ * per packet, so a worst-case QPC makes the profiler itself the
+ * dominant cost and falsifies every stage number (measured: 3.8µs vs
+ * 13ns per call on the same guest, same binary, at the same time).
+ * RDTSC on a modern x86 (KVM/QEMU `-cpu host` included) is invariant,
+ * globally monotonic and ~13ns per call.  Calibrate its frequency once
+ * at first use against QPC (QPC is still the right clock for a one-off
+ * 5ms calibration) and cache the ticks-per-µs factor.
+ *
+ * Caveat: if the process is live-migrated to a host with a different
+ * TSC frequency the factor goes stale and timers drift.  Acceptable
+ * for a VPN client's diagnostic clocks; the s_vm_alert path in the
+ * client warns the user on VM migration anyway. */
 uint64_t port_now_us(void)
 {
 #ifdef _WIN32
-    static LARGE_INTEGER freq;
-    static int have_freq;
-    LARGE_INTEGER c;
-    if (!have_freq) {
+    static double tsc_per_us;   /* TSC ticks per microsecond */
+    static int have;
+    if (!have) {
+        static LARGE_INTEGER freq;
+        double rates[9];
+        int n = 0;
         QueryPerformanceFrequency(&freq);
-        have_freq = 1;
+        /* several 5ms windows: one preempted/glitched sample must not
+         * poison the factor, so take the median rate */
+        for (int i = 0; i < 9; i++) {
+            LARGE_INTEGER a, b;
+            uint64_t t0 = __rdtsc();
+            QueryPerformanceCounter(&a);
+            Sleep(5);
+            uint64_t t1 = __rdtsc();
+            QueryPerformanceCounter(&b);
+            double dt_us = (double)(b.QuadPart - a.QuadPart) * 1e6 /
+                           (double)freq.QuadPart;
+            if (dt_us > 0.0)
+                rates[n++] = (double)(t1 - t0) / dt_us;
+        }
+        if (n == 0)
+            tsc_per_us = 1.0;   /* cannot happen */
+        else {
+            /* insertion sort; take the middle */
+            for (int i = 1; i < n; i++) {
+                double v = rates[i];
+                int j = i - 1;
+                while (j >= 0 && rates[j] > v) {
+                    rates[j + 1] = rates[j];
+                    j--;
+                }
+                rates[j + 1] = v;
+            }
+            tsc_per_us = rates[n / 2];
+        }
+        have = 1;
     }
-    QueryPerformanceCounter(&c);
-    return (uint64_t)(c.QuadPart * 1000000 / freq.QuadPart);
+    return (uint64_t)((double)__rdtsc() / tsc_per_us);
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -872,13 +914,26 @@ ssize_t port_sendmsg(int fd, const struct msghdr *msg, int flags)
     w = iov_to_wsabuf(msg->msg_iov, msg->msg_iovlen, stack, &heap);
     if (!w)
         return -1;
-    if (WSASendTo((SOCKET)fd, w, (DWORD)msg->msg_iovlen, &sent, 0,
-                  (const struct sockaddr *)msg->msg_name,
-                  (int)msg->msg_namelen, NULL, NULL) == SOCKET_ERROR) {
-        if (heap)
-            free(w);
-        set_sock_errno(fd);
-        return -1;
+    /* Our VPN UDP socket is connected, so msg_name is NULL; use WSASend
+     * (no address) instead of WSASendTo to skip address processing. For
+     * callers that do supply a peer address, keep WSASendTo. */
+    if (msg->msg_name == NULL) {
+        if (WSASend((SOCKET)fd, w, (DWORD)msg->msg_iovlen, &sent, 0, NULL,
+                    NULL) == SOCKET_ERROR) {
+            if (heap)
+                free(w);
+            set_sock_errno(fd);
+            return -1;
+        }
+    } else {
+        if (WSASendTo((SOCKET)fd, w, (DWORD)msg->msg_iovlen, &sent, 0,
+                      (const struct sockaddr *)msg->msg_name,
+                      (int)msg->msg_namelen, NULL, NULL) == SOCKET_ERROR) {
+            if (heap)
+                free(w);
+            set_sock_errno(fd);
+            return -1;
+        }
     }
     if (heap)
         free(w);
@@ -890,6 +945,60 @@ int port_sendmmsg(int fd, struct mmsghdr *msgvec, unsigned vlen, int flags)
     unsigned sent = 0;
     if ((flags & MSG_DONTWAIT) && ensure_nonblock(fd) != 0)
         return -1;
+    /* Fast path: every caller in this project builds sendmmsg entries
+     * with exactly one iovec. Convert the whole batch to WSABUF once
+     * instead of re-doing iov_to_wsabuf + stack setup per datagram.
+     * Windows still performs one WSASendTo per datagram (no native
+     * sendmmsg), but the per-call conversion overhead is eliminated. */
+    {
+        int single = 1;
+        for (unsigned i = 0; i < vlen; i++) {
+            if (msgvec[i].msg_hdr.msg_iovlen != 1) {
+                single = 0;
+                break;
+            }
+        }
+        if (single) {
+            WSABUF stack[IOV_TO_WSABUF_STACK];
+            WSABUF *w = stack;
+            bool heap = false;
+            if (vlen > IOV_TO_WSABUF_STACK) {
+                w = calloc(vlen, sizeof *w);
+                if (!w)
+                    return -1;
+                heap = true;
+            }
+            for (unsigned i = 0; i < vlen; i++) {
+                w[i].len = (ULONG)msgvec[i].msg_hdr.msg_iov[0].iov_len;
+                w[i].buf = (CHAR *)msgvec[i].msg_hdr.msg_iov[0].iov_base;
+            }
+            for (; sent < vlen; sent++) {
+                DWORD n = 0;
+                if ((msgvec[sent].msg_hdr.msg_name == NULL &&
+                     WSASend((SOCKET)fd, &w[sent], 1, &n, 0, NULL, NULL) ==
+                         SOCKET_ERROR) ||
+                    (msgvec[sent].msg_hdr.msg_name != NULL &&
+                     WSASendTo((SOCKET)fd, &w[sent], 1, &n, 0,
+                               (const struct sockaddr *)
+                                   msgvec[sent].msg_hdr.msg_name,
+                               (int)msgvec[sent].msg_hdr.msg_namelen, NULL,
+                               NULL) == SOCKET_ERROR)) {
+                    int e = WSAGetLastError();
+                    if (heap)
+                        free(w);
+                    if (sent > 0)
+                        return (int)sent;   /* partial batch */
+                    errno = wsa_errno(e);
+                    log_debug("port_sendmmsg: winsock error %d -> errno %d",
+                              e, errno);
+                    return -1;
+                }
+            }
+            if (heap)
+                free(w);
+            return (int)sent;
+        }
+    }
     for (; sent < vlen; sent++) {
         DWORD n = 0;
         WSABUF stack[IOV_TO_WSABUF_STACK];
@@ -899,11 +1008,15 @@ int port_sendmmsg(int fd, struct mmsghdr *msgvec, unsigned vlen, int flags)
                                    &heap);
         if (!w)
             return -1;
-        if (WSASendTo((SOCKET)fd, w,
-                      (DWORD)msgvec[sent].msg_hdr.msg_iovlen, &n, 0,
-                      (const struct sockaddr *)msgvec[sent].msg_hdr.msg_name,
-                      (int)msgvec[sent].msg_hdr.msg_namelen, NULL,
-                      NULL) == SOCKET_ERROR) {
+        if ((msgvec[sent].msg_hdr.msg_name == NULL &&
+             WSASend((SOCKET)fd, w, (DWORD)msgvec[sent].msg_hdr.msg_iovlen,
+                     &n, 0, NULL, NULL) == SOCKET_ERROR) ||
+            (msgvec[sent].msg_hdr.msg_name != NULL &&
+             WSASendTo((SOCKET)fd, w,
+                       (DWORD)msgvec[sent].msg_hdr.msg_iovlen, &n, 0,
+                       (const struct sockaddr *)msgvec[sent].msg_hdr.msg_name,
+                       (int)msgvec[sent].msg_hdr.msg_namelen, NULL,
+                       NULL) == SOCKET_ERROR)) {
             int e = WSAGetLastError();
             if (heap)
                 free(w);
@@ -927,10 +1040,84 @@ int port_recvmmsg(int fd, struct mmsghdr *msgvec, unsigned vlen, int flags,
                       * callers here use MSG_DONTWAIT + poll instead */
     if ((flags & MSG_DONTWAIT) && ensure_nonblock(fd) != 0)
         return -1;
+    /* Fast path: our recvmmsg callers use one iovec per message and
+     * stable static buffers. Convert the whole batch to WSABUF once,
+     * then loop WSARecvFrom — still one syscall per datagram (Windows
+     * has no native recvmmsg), but no per-datagram conversion cost. */
+    {
+        int single = 1;
+        for (unsigned i = 0; i < vlen; i++) {
+            if (msgvec[i].msg_hdr.msg_iovlen != 1) {
+                single = 0;
+                break;
+            }
+        }
+        if (single) {
+            WSABUF stack[IOV_TO_WSABUF_STACK];
+            WSABUF *w = stack;
+            bool heap = false;
+            if (vlen > IOV_TO_WSABUF_STACK) {
+                w = calloc(vlen, sizeof *w);
+                if (!w)
+                    return -1;
+                heap = true;
+            }
+            for (unsigned i = 0; i < vlen; i++) {
+                w[i].len = (ULONG)msgvec[i].msg_hdr.msg_iov[0].iov_len;
+                w[i].buf = (CHAR *)msgvec[i].msg_hdr.msg_iov[0].iov_base;
+            }
+            for (; got < vlen; got++) {
+                DWORD n = 0;
+                DWORD wflags = 0;
+                if ((msgvec[got].msg_hdr.msg_name == NULL &&
+                     WSARecv((SOCKET)fd, &w[got], 1, &n, &wflags, NULL,
+                             NULL) == SOCKET_ERROR) ||
+                    (msgvec[got].msg_hdr.msg_name != NULL &&
+                     WSARecvFrom((SOCKET)fd, &w[got], 1, &n, &wflags,
+                                 (struct sockaddr *)
+                                     msgvec[got].msg_hdr.msg_name,
+                                 &(int){ (int)msgvec[got].msg_hdr.msg_namelen },
+                                 NULL, NULL) == SOCKET_ERROR)) {
+                    int e = WSAGetLastError();
+                    if (heap)
+                        free(w);
+                    if (e == WSAEMSGSIZE) {
+                        msgvec[got].msg_len = n;
+                        msgvec[got].msg_hdr.msg_flags |= MSG_TRUNC;
+                        got++;
+                        return (int)got;
+                    }
+                    if (e == WSAEWOULDBLOCK) {
+                        /* empty queue: Linux recvmmsg(MSG_DONTWAIT)
+                         * returns -1/EAGAIN, and the pump's receive loop
+                         * ONLY parks on v < 0 — returning 0 here made it
+                         * busy-spin a full core. A partial batch (got>0)
+                         * is still returned as messages received. */
+                        if (got > 0)
+                            return (int)got;
+                        errno = EAGAIN;
+                        return -1;
+                    }
+                    if (e == WSAEINTR || e == WSAECONNRESET)
+                        return (int)got;   /* drained / rare ICMP artifact */
+                    if (got > 0)
+                        return (int)got;
+                    errno = wsa_errno(e);
+                    log_debug("port_recvmmsg: winsock error %d -> errno %d",
+                              e, errno);
+                    return -1;
+                }
+                msgvec[got].msg_len = n;
+                msgvec[got].msg_hdr.msg_flags = 0;
+            }
+            if (heap)
+                free(w);
+            return (int)got;
+        }
+    }
     for (; got < vlen; got++) {
         DWORD n = 0;
         DWORD wflags = 0;
-        int namelen = (int)msgvec[got].msg_hdr.msg_namelen;
         WSABUF stack[IOV_TO_WSABUF_STACK];
         bool heap = false;
         LPWSABUF w = iov_to_wsabuf(msgvec[got].msg_hdr.msg_iov,
@@ -938,11 +1125,16 @@ int port_recvmmsg(int fd, struct mmsghdr *msgvec, unsigned vlen, int flags,
                                    &heap);
         if (!w)
             return -1;
-        if (WSARecvFrom((SOCKET)fd, w,
-                        (DWORD)msgvec[got].msg_hdr.msg_iovlen, &n, &wflags,
-                        (struct sockaddr *)msgvec[got].msg_hdr.msg_name,
-                        msgvec[got].msg_hdr.msg_name ? &namelen : NULL,
-                        NULL, NULL) == SOCKET_ERROR) {
+        if ((msgvec[got].msg_hdr.msg_name == NULL &&
+             WSARecv((SOCKET)fd, w,
+                     (DWORD)msgvec[got].msg_hdr.msg_iovlen, &n, &wflags,
+                     NULL, NULL) == SOCKET_ERROR) ||
+            (msgvec[got].msg_hdr.msg_name != NULL &&
+             WSARecvFrom((SOCKET)fd, w,
+                         (DWORD)msgvec[got].msg_hdr.msg_iovlen, &n, &wflags,
+                         (struct sockaddr *)msgvec[got].msg_hdr.msg_name,
+                         &(int){ (int)msgvec[got].msg_hdr.msg_namelen },
+                         NULL, NULL) == SOCKET_ERROR)) {
             int e = WSAGetLastError();
             if (heap)
                 free(w);
@@ -952,13 +1144,17 @@ int port_recvmmsg(int fd, struct mmsghdr *msgvec, unsigned vlen, int flags,
                 got++;
                 return (int)got;
             }
-            if (e == WSAEWOULDBLOCK || e == WSAEINTR ||
-                e == WSAECONNRESET)
-                return (int)got;   /* drained: 0 messages is not an
-                                    * error; WSAECONNRESET is the
-                                    * connected-UDP ICMP artifact
-                                    * (SIO_UDP_CONNRESET disables it at
-                                    * the socket, this is the backstop) */
+            if (e == WSAEWOULDBLOCK) {
+                /* empty queue: Linux recvmmsg(MSG_DONTWAIT) returns
+                 * -1/EAGAIN; the pump's receive loop parks on v < 0.
+                 * Returning 0 here would busy-spin a full core. */
+                if (got > 0)
+                    return (int)got;
+                errno = EAGAIN;
+                return -1;
+            }
+            if (e == WSAEINTR || e == WSAECONNRESET)
+                return (int)got;   /* drained / rare ICMP artifact */
             if (got > 0)
                 return (int)got;
             errno = wsa_errno(e);
@@ -981,7 +1177,10 @@ ssize_t port_readv(int fd, const struct iovec *iov, int iovcnt)
      * (10014) for scatter/gather buffers located in the module's static
      * data on an otherwise healthy accepted TCP socket — while plain
      * recv() on the same socket works (the SOCKS handshake proves it).
-     * recv() has no gather: bounce through a stack buffer and copy out. */
+     * recv() has no gather, but our hot path (ns_send_reservev) hands
+     * back contiguous slices of one scratch array, so a single recv()
+     * directly into that scratch is both legal and copy-free. Only fall
+     * back to the bounce buffer for genuinely non-contiguous iovs. */
     char bounce[READV_BOUNCE_BYTES];
     size_t total = 0;
     int i;
@@ -998,6 +1197,28 @@ ssize_t port_readv(int fd, const struct iovec *iov, int iovcnt)
     }
     if (total == 0)
         return 0;
+    /* Fast path: the iovs are contiguous slices of one buffer. recv()
+     * into the first slice fills the whole range in one syscall with no
+     * bounce copy. */
+    {
+        int contiguous = 1;
+        for (i = 1; i < iovcnt; i++) {
+            if ((const char *)iov[i].iov_base !=
+                (const char *)iov[i - 1].iov_base +
+                    iov[i - 1].iov_len) {
+                contiguous = 0;
+                break;
+            }
+        }
+        if (contiguous) {
+            n = recv((SOCKET)fd, iov[0].iov_base, (int)total, 0);
+            if (n == SOCKET_ERROR) {
+                set_sock_errno(fd);
+                return -1;
+            }
+            return (ssize_t)n;
+        }
+    }
     n = recv((SOCKET)fd, bounce, (int)total, 0);
     if (n == SOCKET_ERROR) {
         set_sock_errno(fd);
@@ -1172,6 +1393,16 @@ int port_setsockopt(int fd, int level, int optname, const void *optval,
 
 int port_poll(struct pollfd *fds, nfds_t nfds, int timeout_ms)
 {
+    /* POSIX poll(NULL, 0, t) is a timed sleep, but WSAPoll rejects an
+     * empty pollset with WSAEINVAL. Several callers rely on the timeout
+     * wakeup (the relay proxy direction threads park here before the
+     * first connection arrives), so emulate the sleep. 0xFFFFFFFF ms is
+     * INFINITE — matches WSAPoll's -1 timeout. */
+    if (nfds == 0) {
+        port_sleep_ms(timeout_ms < 0 ? (unsigned)-1
+                                      : (unsigned)timeout_ms);
+        return 0;
+    }
     int r = WSAPoll(fds, nfds, timeout_ms < 0 ? -1 : timeout_ms);
     if (r == SOCKET_ERROR) {
         int e = WSAGetLastError();

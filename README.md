@@ -201,7 +201,7 @@ OpenSSL 需先交叉构建：`ci/build-openssl.sh mingw64 x86_64-w64-mingw32- /p
 
 运行依赖：TUN 模式需要与 exe 同目录的 `wintun.dll`（架构匹配：x86_64→amd64，i686→x86，arm64→arm64，下载 https://www.wintun.net/）；SOCKS5 模式不需要。发布 zip 内已附 README/LICENSE/WINTUN.txt 说明。
 
-> Windows TUN 模式的 netsh 路由命令已通过 wine 冒烟与代码审查，但尚未在真实 Windows 10/11 上验证。
+> Windows TUN 模式已在真实 Windows 11（tiny11 VM）上全量验证：wintun 适配器创建/复用/删除恢复、netsh IPv4 路由与服务器 pin 路由、IPv6 ULA /96、优雅停止清理，以及 `--listen` 附加 SOCKS5+HTTP 代理均通过 `win-test.ps1`。
 
 ## 致谢
 

@@ -129,6 +129,15 @@ int  ns_send_commit(Netstack *ns, int idx, size_t n);
 void ns_close(Netstack *ns, int idx);
 void ns_abort(Netstack *ns, int idx);
 void ns_rx_packet(Netstack *ns, const uint8_t *pkt, size_t n);
+/* Zero-copy RX path: acquire() hands out receive buffers that the VPN
+ * recv loop fills directly with a datagram (outer header first); pass the
+ * buffer base + outer length to ns_rx_packet_ref, which wraps the inner
+ * packet in a lwIP PBUF_REF custom pbuf and returns the buffer to the
+ * pool only when lwIP frees it. Callers that drop a datagram must call
+ * ns_rx_buf_release() themselves. */
+int  ns_rx_buf_acquire(void **bufs, int max);
+void ns_rx_buf_release(void *data);
+void ns_rx_packet_ref(Netstack *ns, void *slot_data, size_t outer_len);
 int  ns_tick(Netstack *ns, uint64_t now);
 const struct TxItem *ns_tx_peek(Netstack *ns);
 const struct TxItem *ns_tx_pop(Netstack *ns);

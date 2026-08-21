@@ -215,9 +215,10 @@ int port_close(int fd);
 int port_set_nonblock(int fd, bool nb);
 
 /* ---------------------- datagram / stream I/O ---------------------- */
-/* All wrappers set errno on failure and return -1 (or 0 messages for
- * recvmmsg with nothing available, mirroring Linux). send/recv len is
- * size_t; winsock's int limit is irrelevant (<= 64 KiB frames). */
+/* All wrappers set errno on failure and return -1 (recvmmsg with
+ * nothing available also returns -1/EAGAIN, mirroring Linux — callers
+ * poll on that). send/recv len is size_t; winsock's int limit is
+ * irrelevant (<= 64 KiB frames). */
 
 ssize_t port_send(int fd, const void *buf, size_t len, int flags);
 ssize_t port_recv(int fd, void *buf, size_t len, int flags);
