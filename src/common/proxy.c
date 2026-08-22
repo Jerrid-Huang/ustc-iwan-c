@@ -736,6 +736,22 @@ static void *udp2tun_thread(void *ud) {
 #  else
     pthread_setname_np(pthread_self(), "udp2tun");
 #  endif
+#else
+    /* experimental pinning (IWAN_WIN_THREAD_PIN=1): downlink recv ->
+     * CPU 2, ABOVE_NORMAL — pairs with the uplink reader on CPU 1 and
+     * stays off CPU 0 (virtio/wintun DPCs). */
+    {
+        const char *pin = getenv("IWAN_WIN_THREAD_PIN");
+        if (pin && pin[0] != '0') {
+            SYSTEM_INFO si;
+            GetSystemInfo(&si);
+            if (si.dwNumberOfProcessors > 2)
+                SetThreadAffinityMask(GetCurrentThread(),
+                                      (DWORD_PTR)1 << 2);
+            SetThreadPriority(GetCurrentThread(),
+                              THREAD_PRIORITY_ABOVE_NORMAL);
+        }
+    }
 #endif
     /* recvmmsg with MSG_DONTWAIT drains whatever is queued (zero latency
      * tail), then poll() parks until data or the keepalive deadline.

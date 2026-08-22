@@ -530,6 +530,22 @@ static unsigned __stdcall tun_reader_main(void *ud)
     struct tun_pool *pool = ud;
     struct tun_slot *s = tun_slot_get(pool->fd);
 
+    /* experimental pinning (IWAN_WIN_THREAD_PIN=1): uplink reader ->
+     * CPU 1, ABOVE_NORMAL. Avoids vCPU migration (L1/L2 cold) and
+     * stays off CPU 0, where the virtio/wintun DPCs land. */
+    {
+        const char *pin = getenv("IWAN_WIN_THREAD_PIN");
+        if (pin && pin[0] != '0') {
+            SYSTEM_INFO si;
+            GetSystemInfo(&si);
+            if (si.dwNumberOfProcessors > 1)
+                SetThreadAffinityMask(GetCurrentThread(),
+                                      (DWORD_PTR)1 << 1);
+            SetThreadPriority(GetCurrentThread(),
+                              THREAD_PRIORITY_ABOVE_NORMAL);
+        }
+    }
+
     if (s != NULL) {
         while (!pool->stop && (pool->abort == NULL || !*pool->abort)) {
             uint64_t w0 = now_us();
