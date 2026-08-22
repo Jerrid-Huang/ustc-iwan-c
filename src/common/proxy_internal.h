@@ -115,6 +115,7 @@ typedef struct {
     uint8_t  xor_key[8];
     uint16_t sid;
     uint32_t tok;
+    uint32_t inner_ip; /* session IP, host order: downlink addr filter */
     uint8_t  enc;
     size_t   gso_mss;   /* last UDP_SEGMENT value set, 0 = none */
     int      gso_ok;    /* 1 = UDP_SEGMENT usable, 0 = failed, -1 = untried */

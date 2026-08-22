@@ -281,7 +281,7 @@ endif()
 # only when ld reaches these import libs (a plain archive pass would
 # leave __imp_WSACleanup & co. undefined).
 if(WIN32)
-  target_link_libraries(iwan_core PUBLIC ws2_32 iphlpapi bcrypt crypt32 shell32 mpr setupapi)
+  target_link_libraries(iwan_core PUBLIC ws2_32 iphlpapi bcrypt crypt32 shell32 mpr setupapi wintrust)
 endif()
 target_link_libraries(iwan_core PUBLIC Threads::Threads)
 
@@ -375,6 +375,7 @@ endif()
 add_library(iwan_oidc STATIC
   src/oidc/oidc_cli.c
   src/oidc/oidc_config.c
+  src/oidc/oidc_pwsecret.c
   src/oidc/oidc_connect.c
   src/oidc/oidc_flow.c
   src/oidc/oidc_jwt.c

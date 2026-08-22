@@ -111,6 +111,8 @@ Usage: iwan-client proxy [OPTIONS] --server <SERVER>
 
 > `--listen` 代理的连接走本机内核栈，**与 TUN 路由规则一致**（默认路由全走隧道；`--proxy-cidr` 模式下仅 CIDR 内目标走隧道）。同一端口同时接受 SOCKS5 与 HTTP 握手（设置 `--socks-token` 后 HTTP 代理关闭）。
 
+> 安全提示：多用户共机时不设 `--socks-token` 意味着本机任何账号都可使用这个无密码代理；`--socks-token` 经命令行传入，本机其他用户可在进程列表中看到明文口令 —— 敏感环境建议改用仅回环监听（默认）并自行评估。
+
 ```bash
 sudo ./iwan-client proxy --server <IP> --port 6001 --user <USER> \
   --pass '<PASSWORD>' --proxy-ip 1.1.1.1 \

@@ -18,6 +18,7 @@
 #include "crypto.h"
 #include "json.h"
 #include "oidc.h"
+#include "oidc_pwsecret.h"
 #include "util.h"
 
 static long server_port(Json *s)
@@ -133,7 +134,14 @@ void oidc_fetch_config(Config *cf)
         buf_put_str(&b, "      \"username\": \"");
         oidc_esc_put(&b, json_get_str(s, "userName"));
         buf_put_str(&b, "\",\n      \"passWord\": \"");
-        oidc_esc_put(&b, json_get_str(s, "passWord"));
+        {
+            /* platform at-rest wrapping (audit M8): DPAPI / Keychain */
+            char *pw = oidc_wrap_password(
+                json_get_str(s, "passWord"), OIDC_DOMAIN,
+                json_get_str(s, "userName"));
+            oidc_esc_put(&b, pw ? pw : json_get_str(s, "passWord"));
+            free(pw);
+        }
         buf_put_str(&b, "\"\n    }");
         if (i + 1 < n)
             buf_put_str(&b, ",");
@@ -211,11 +219,17 @@ void oidc_save_config(const char *path, const Config *cf)
     char *tmp = malloc(tlen);
     snprintf(tmp, tlen, "%s.tmp", path);
 #ifdef _WIN32
-    /* O_NOFOLLOW has no Windows equivalent; the temp path is created
-     * fresh by this process (0600, O_CREAT|O_TRUNC) and rename() then
-     * replaces the target atomically — a pre-planted symlink at the
-     * temp name would simply be overwritten by the open. */
-    int fd = _open(tmp, _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY, 0600);
+    /* unpredictable temp name + exclusive create (audit L13): a fixed
+     * servers.json.tmp is a predictable pre-plant/race target; rand_u32
+     * is CSPRNG-backed. rename() still replaces the target atomically. */
+    tmp = realloc(tmp, tlen + 16);
+    if (!tmp)
+        oom_abort();
+    int fd = -1;
+    for (int attempt = 0; attempt < 8 && fd < 0; attempt++) {
+        snprintf(tmp, tlen + 16, "%s.tmp.%08x", path, rand_u32());
+        fd = _open(tmp, _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY, 0600);
+    }
 #else
     int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
 #endif

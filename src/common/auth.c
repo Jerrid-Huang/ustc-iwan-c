@@ -190,10 +190,20 @@ bool parse_ack(const uint8_t *buf, size_t len, uint32_t expect_nonce,
         return false;
     }
     if (t != PT_OPEN_ACK) {
-        char *hex = malloc(2 * (len - IWAN_CTRL_LEN) + 1);
-        hex_encode(buf + IWAN_CTRL_LEN, len - IWAN_CTRL_LEN, hex);
+        size_t tl = len > IWAN_CTRL_LEN ? (size_t)(len - IWAN_CTRL_LEN) : 0;
+        char *hex = malloc(2 * tl + 1);
+        if (!hex)
+            oom_abort();
+        hex_encode(buf + IWAN_CTRL_LEN, tl, hex);
         set_err(errmsg, errmsg_sz, "unexpected type 0x%02x tlvs=%s", t, hex);
         free(hex);
+        return false;
+    }
+    /* ACK is exactly 49-55 bytes on the wire (PROTOCOL.md): header 8 +
+     * sig 16 + TLVs 25-31. Anything larger is malformed rather than an
+     * extension, so cap it before trusting the TLVs. */
+    if (len > IWAN_CTRL_LEN + 31) {
+        set_err(errmsg, errmsg_sz, "oversized ACK");
         return false;
     }
     if (!verify_sig(buf, len)) {

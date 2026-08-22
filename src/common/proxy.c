@@ -908,6 +908,12 @@ static void *udp2tun_thread(void *ud) {
                 err_printf("[UDP->TUN] plaintext data on encrypted session, drop\n");
                 continue;
             }
+            if (t == PT_DATA_ENC && !ctx->enc) {
+                /* symmetric gate (audit L14): keep the session's
+                 * encryption state a two-way check */
+                err_printf("[UDP->TUN] encrypted data on plaintext session, drop\n");
+                continue;
+            }
             if (t == PT_DATA_ENC)
                 xor_crypt(m + 8, (size_t)(n - 8), ctx->xor_key, 8);
             PROF_ADD(g_prof_pump_rx, (size_t)(n - 8));
@@ -918,6 +924,16 @@ static void *udp2tun_thread(void *ud) {
             if (ipv4_pkt_ok(m + 8, (size_t)(n - 8), &saddr, &daddr) != 0) {
                 log_debug("drop inner packet: bad IPv4 header (%zu bytes)",
                           (size_t)(n - 8));
+                continue;
+            }
+            /* ingress filter (audit M5): a downlink frame must be
+             * addressed to THIS session's IP and must never claim our
+             * own address as source — anything else is an injector's
+             * forgery (reflection / self-spoof), not traffic the guest
+             * solicited */
+            if (daddr != ctx->inner_ip || saddr == ctx->inner_ip) {
+                log_debug("drop inner packet: addr filter (%08x->%08x)",
+                          saddr, daddr);
                 continue;
             }
             /* write with unbounded EAGAIN retry: silent loss here costs
@@ -1220,6 +1236,15 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
     ctx.sockfd = sockfd;
     ctx.sid = sid;
     ctx.tok = tok;
+    {
+        uint8_t b4[4];
+        if (!s2ip4(auth_tun_ip, b4)) {
+            log_err("invalid auth tunnel IP '%s'", auth_tun_ip);
+            slist_free(&routes);
+            return -1;
+        }
+        ctx.inner_ip = ip4_u32(b4);
+    }
     ctx.enc = enc;
     ctx.gso_mss = 0;
     ctx.gso_ok = -1;

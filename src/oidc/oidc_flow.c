@@ -15,6 +15,7 @@
 #endif
 
 #include "common.h"
+#include <openssl/crypto.h>
 #include "crypto.h"
 #include "https.h"
 #include "json.h"
@@ -212,7 +213,12 @@ static char *read_redirect_url(void)
     char *rp = rline;
     while (*rp == ' ' || *rp == '\t')
         rp++;
-    if (strncmp(rp, OIDC_REDIRECT, strlen(OIDC_REDIRECT)) != 0)
+    /* prefix match must end at a scheme boundary: without this,
+     * "com.panabit.mobile://oauth2redirect.evil.com" would also pass */
+    size_t rl = strlen(OIDC_REDIRECT);
+    if (strncmp(rp, OIDC_REDIRECT, rl) != 0 ||
+        (rp[rl] != '\0' && rp[rl] != '?' && rp[rl] != '/' &&
+         rp[rl] != ' ' && rp[rl] != '\t'))
         oidc_die("redirect URL must start with "
                  "com.panabit.mobile://oauth2redirect");
     return xstrdup(rline);
@@ -340,7 +346,11 @@ void oidc_login(char **kp_out, char **user_out)
         oidc_die("no authorization code in redirect URL");
 
     Json *tok = exchange_code(code, code_verifier);
+    /* secrets live in heap strings; scrub them like every other key
+     * material in this codebase before releasing the memory */
+    OPENSSL_cleanse(code, strlen(code));
     free(code);
+    OPENSSL_cleanse(code_verifier, strlen(code_verifier));
     free(code_verifier);
 
     char *kp = take_access_token(tok);

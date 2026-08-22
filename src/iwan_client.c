@@ -800,6 +800,19 @@ static int cmd_proxy(int argc, char **argv, int start)
         }
 
         check_gw_server(o.server, res.gw);   /* F8 */
+        {
+            /* L17: pre-validate what route_setup turns into kernel
+             * configuration; a malformed response dies with a clear
+             * error instead of a baffling netsh failure */
+            uint8_t b4[4];
+            if (!s2ip4(res.tun, b4) || !s2ip4(res.gw, b4)) {
+                log_err("Error: server returned invalid tunnel/gateway "
+                        "IPv4 address");
+                port_close(sockfd);
+                rc = 1;
+                break;
+            }
+        }
 
 #ifdef _WIN32
         /* Windows sockets default to blocking; the pump paths expect a

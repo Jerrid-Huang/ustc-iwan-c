@@ -21,6 +21,7 @@ extern char **environ;     /* macOS unistd.h does not declare it */
 #include "crypto.h"
 #include "gcm.h"
 #include "oidc.h"
+#include "oidc_pwsecret.h"
 #include "protocol.h"
 #include "proxy.h"
 #include "relay_proxy.h"
@@ -44,9 +45,17 @@ struct oidc_reauth_ctx {
 static int oidc_socks_reauth_cb(void *ud, SocksConfig *cfg, int *out_fd)
 {
     const struct oidc_reauth_ctx *rc = ud;
-    char *password = decrypt_password(rc->encrypted_pw ? rc->encrypted_pw : "",
-                                      OIDC_APP_SECRET, rc->cf->domain,
+    const char *stored = rc->encrypted_pw ? rc->encrypted_pw : "";
+    char *blob = oidc_unwrap_password(stored, rc->cf->domain,
                                       rc->srv_user ? rc->srv_user : "");
+    if (!blob) {
+        log_err("SOCKS re-auth: cannot recover password (Keychain)");
+        return -1;
+    }
+    char *password = decrypt_password(blob, OIDC_APP_SECRET,
+                                      rc->cf->domain,
+                                      rc->srv_user ? rc->srv_user : "");
+    free(blob);
     if (!password) {
         log_err("SOCKS re-auth: cannot decrypt password");
         return -1;

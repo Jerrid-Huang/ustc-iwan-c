@@ -1306,6 +1306,18 @@ static bool https_roundtrip(const char *host, const char *path,
                          st == 307 || st == 308;
             char *loc = NULL;
 
+            /* sensitive non-GET (token endpoint POST) must never follow
+             * a redirect: 307/308 preserve the body, leaking the
+             * code+code_verifier to whatever host the IdP points at
+             * (audit L9) */
+            if (follow && !is_get) {
+                log_err("HTTPS request failed: refusing to follow HTTP %d "
+                        "redirect for a non-GET request", st);
+                status = st;
+                free(resp.d);
+                failed = 1;
+                break;
+            }
             if (follow) {
                 const char *hs, *bd;
                 https_hdr_body(resp.d, resp.len, &hs, &bd);

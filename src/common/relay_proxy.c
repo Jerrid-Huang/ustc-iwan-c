@@ -44,6 +44,10 @@
 #define RP_HANDSHAKE_TIMEOUT_MS 30000u
 #define RP_CONNECT_TIMEOUT_MS   10000u
 #define RP_BUF                  65536
+/* M6a: cap on concurrent per-connection threads. Each accepted
+ * connection runs its handshake on its own thread; beyond this cap
+ * the accept thread sheds the new connection (close, no thread). */
+#define RP_MAX_CONNS            256
 
 struct RelayProxy {
     int          listener;   /* -1 = stopped */
@@ -55,6 +59,205 @@ struct RelayProxy {
  * relay_proxy_stop deliberately does NOT free the struct: detached
  * connection threads may still be reading it. One proxy per process. */
 struct RelayProxy *g_rp_current;
+
+/* M6a: number of live per-connection threads (incremented by the
+ * accept thread before the thread is spawned, decremented by
+ * rp_conn_main on EVERY exit path). */
+static atomic_int g_rp_conn_n;
+
+/* ---- handshake watchdog (M6b) ----
+ * RP_HANDSHAKE_TIMEOUT_MS remains the ceiling for a SINGLE poll, but
+ * a slow sender could previously renew that window forever and pin a
+ * connection thread indefinitely. Every handshake poll now draws from
+ * an absolute budget of RP_HS_TOTAL_MS that starts when the
+ * connection enters rp_conn_main; once the budget is gone the poll
+ * fails and the connection is closed. Handshake input is additionally
+ * capped at RP_HS_INPUT_MAX cumulative bytes (a handshake never needs
+ * anywhere near this; the cap bounds parser-facing memory churn). */
+#define RP_HS_TOTAL_MS  30000u
+#define RP_HS_INPUT_MAX 65536u
+
+struct rp_hs {
+    uint64_t deadline;      /* absolute now_ms() deadline */
+    size_t   in;            /* cumulative handshake bytes read */
+};
+
+static void rp_hs_init(struct rp_hs *hs)
+{
+    hs->deadline = now_ms() + RP_HS_TOTAL_MS;
+    hs->in = 0;
+}
+
+/* Wait for readability within the handshake: the poll timeout is the
+ * remaining absolute budget capped at RP_HANDSHAKE_TIMEOUT_MS (the
+ * per-poll ceiling still applies — the total budget is independent).
+ * Returns 1 when the fd is readable, 0 on timeout or exhausted
+ * budget (the caller must close). */
+static int rp_hs_poll(const struct rp_hs *hs, int fd)
+{
+    uint64_t now = now_ms();
+    uint64_t left = hs->deadline > now ? hs->deadline - now : 0;
+    struct pollfd pfd;
+
+    if (left == 0)
+        return 0;
+    if (left > RP_HANDSHAKE_TIMEOUT_MS)
+        left = RP_HANDSHAKE_TIMEOUT_MS;
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    return port_poll(&pfd, 1, (int)left) > 0 ? 1 : 0;
+}
+
+/* recv with the handshake input cap: behaves like port_recv, but a
+ * read that pushes the cumulative handshake input past RP_HS_INPUT_MAX
+ * fails with EMSGSIZE. Callers treat any non-EAGAIN error as fatal,
+ * so the over-cap case closes the connection. */
+static ssize_t rp_hs_recv(struct rp_hs *hs, int fd, void *buf, size_t len)
+{
+    ssize_t r = port_recv(fd, buf, len, 0);
+    if (r > 0) {
+        hs->in += (size_t)r;
+        if (hs->in > RP_HS_INPUT_MAX) {
+            errno = EMSGSIZE;
+            return -1;
+        }
+    }
+    return r;
+}
+
+/* ---- RFC1929 brute-force lockout (M6c/L6) ----
+ * Same semantics as the SOCKS-mode table in socks_flow.c: only
+ * WELL-FORMED RFC1929 frames that fail the token check count
+ * (protocol violations are not auth attempts, so a probe flood cannot
+ * lock a legitimate user out); RP_FAIL_MAX failures inside
+ * RP_FAIL_WINDOW_MS lock the source out for another window; a
+ * successful auth clears the source; locked sources are dropped at
+ * accept() time. Two differences: the table holds 64 entries (L6:
+ * the SOCKS table's 16 was too small for a shared-NAT world), and it
+ * is mutex-guarded — unlike the single-threaded SOCKS event loop,
+ * every relay proxy connection runs on its own thread.
+ *
+ * Key: the peer IPv4 as-is; an IPv6 peer is merged to its /64 prefix
+ * so one subnet cannot fill the table with 2^64 /128 aliases. The
+ * listener is IPv4-only today, so the v6 path is defensive only. */
+#define RP_FAIL_TRACK_MAX  64
+#define RP_FAIL_MAX        5
+#define RP_FAIL_WINDOW_MS  60000u
+
+typedef struct {
+    uint8_t  v6;                /* key is an IPv6 /64 prefix */
+    uint32_t k0, k1;            /* opaque key words (see rp_fail_key_of) */
+} rp_fail_key;
+
+typedef struct {
+    rp_fail_key key;
+    int      fail;
+    uint64_t first_fail_ms;
+    uint64_t blocked_until_ms;  /* 0 = not blocked */
+} rp_fail_rec;
+
+static rp_fail_rec g_rp_fail[RP_FAIL_TRACK_MAX];
+static pthread_mutex_t g_rp_fail_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static bool rp_key_eq(const rp_fail_key *a, const rp_fail_key *b)
+{
+    return a->v6 == b->v6 && a->k0 == b->k0 && a->k1 == b->k1;
+}
+
+/* Extract the lockout key from a peer address. Byte-order is
+ * irrelevant: the words are used only as an opaque comparison key.
+ * Returns false for unknown families (no tracking for that peer). */
+static bool rp_fail_key_of(const struct sockaddr_storage *ss,
+                           rp_fail_key *k)
+{
+    memset(k, 0, sizeof *k);
+    if (ss->ss_family == AF_INET) {
+        const struct sockaddr_in *a = (const struct sockaddr_in *)ss;
+        memcpy(&k->k0, &a->sin_addr, 4);
+        return true;
+    }
+    if (ss->ss_family == AF_INET6) {
+        const struct sockaddr_in6 *a = (const struct sockaddr_in6 *)ss;
+        /* first 8 bytes = /64 prefix (not s6_addr: mingw's IN6_ADDR
+         * lacks the POSIX member name) */
+        memcpy(&k->k0, &a->sin6_addr, 4);
+        memcpy(&k->k1, (const uint8_t *)&a->sin6_addr + 4, 4);
+        k->v6 = 1;
+        return true;
+    }
+    return false;
+}
+
+static void rp_fail_note(const rp_fail_key *key, bool success)
+{
+    rp_fail_rec *e = NULL, *oldest = &g_rp_fail[0];
+    uint64_t now;
+
+    if (!key)
+        return;             /* getpeername failed: nothing to track */
+    now = now_ms();
+    pthread_mutex_lock(&g_rp_fail_mu);
+    if (success) {
+        for (int i = 0; i < RP_FAIL_TRACK_MAX; i++) {
+            if (rp_key_eq(&g_rp_fail[i].key, key)) {
+                memset(&g_rp_fail[i], 0, sizeof g_rp_fail[i]);
+                break;
+            }
+        }
+        pthread_mutex_unlock(&g_rp_fail_mu);
+        return;
+    }
+    for (int i = 0; i < RP_FAIL_TRACK_MAX; i++) {
+        rp_fail_rec *r = &g_rp_fail[i];
+        if (rp_key_eq(&r->key, key)) {
+            e = r;
+            break;
+        }
+        /* empty slot wins; otherwise keep the oldest first_fail_ms
+         * (the entry that would age out first) */
+        if (r->first_fail_ms == 0 ||
+            r->first_fail_ms < oldest->first_fail_ms)
+            oldest = r;
+    }
+    if (!e)
+        e = oldest;
+    /* fresh entry, or the previous burst aged out of the window */
+    if (e->first_fail_ms == 0 ||
+        now - e->first_fail_ms > RP_FAIL_WINDOW_MS) {
+        e->key = *key;
+        e->fail = 1;
+        e->first_fail_ms = now;
+        e->blocked_until_ms = 0;
+        pthread_mutex_unlock(&g_rp_fail_mu);
+        return;
+    }
+    e->key = *key;
+    e->fail++;
+    if (e->fail >= RP_FAIL_MAX)
+        e->blocked_until_ms = now + RP_FAIL_WINDOW_MS;
+    pthread_mutex_unlock(&g_rp_fail_mu);
+}
+
+static bool rp_fail_blocked(const rp_fail_key *key)
+{
+    uint64_t now;
+
+    if (!key)
+        return false;
+    now = now_ms();
+    pthread_mutex_lock(&g_rp_fail_mu);
+    for (int i = 0; i < RP_FAIL_TRACK_MAX; i++) {
+        const rp_fail_rec *r = &g_rp_fail[i];
+        if (rp_key_eq(&r->key, key) && r->blocked_until_ms != 0 &&
+            r->blocked_until_ms > now) {
+            pthread_mutex_unlock(&g_rp_fail_mu);
+            return true;
+        }
+    }
+    pthread_mutex_unlock(&g_rp_fail_mu);
+    return false;
+}
 
 /* ---- target resolution/connect (kernel stack) ---- */
 
@@ -110,13 +313,51 @@ static int rp_connect_literal(int af, const void *addr, uint16_t port,
     return -1;
 }
 
+/* M7: the SSRF gate is on by default; IWAN_RELAY_ALLOW_LOOPBACK=1 is
+ * an explicit operator opt-out for deployments that must reach host-
+ * local services through the relay. Read once in relay_proxy_start
+ * before any connection thread exists (plain static: no race). */
+static bool g_rp_ssrf_off;
+
+/* M7 (SSRF gate): true when the target address (literal or resolved)
+ * points at the proxy host's own loopback or a link-local range. An
+ * authenticated NON-loopback peer must not use the relay as a
+ * springboard into services bound to the local host; a loopback peer
+ * (local user) is exempt, keeping today's local usage unchanged. */
+static bool rp_target_blocked(bool guard, int af, const uint8_t *p)
+{
+    if (!guard)
+        return false;
+    if (af == 4)
+        return p[0] == 127 ||              /* 127.0.0.0/8 */
+               (p[0] == 169 && p[1] == 254);   /* 169.254.0.0/16 */
+    if (af == 6) {
+        static const uint8_t lo[16] = { 0, 0, 0, 0, 0, 0, 0, 0,
+                                        0, 0, 0, 0, 0, 0, 0, 1 };
+        static const uint8_t v4map[12] = { 0, 0, 0, 0, 0, 0, 0, 0,
+                                           0, 0, 0xff, 0xff };
+        if (memcmp(p, lo, 16) == 0)
+            return true;                    /* ::1 */
+        if (p[0] == 0xfe && (p[1] & 0xc0) == 0x80)
+            return true;                    /* fe80::/10 */
+        /* ::ffff:a.b.c.d: the mapped v4 address obeys the v4 rules,
+         * else a crafted AAAA ::ffff:127.0.0.1 would bypass the gate */
+        if (memcmp(p, v4map, 12) == 0)
+            return p[12] == 127 ||
+                   (p[12] == 169 && p[13] == 254);
+    }
+    return false;
+}
+
 static int rp_connect_target(int *fd_out, const char *host, uint16_t port,
                              bool have_ip4, const uint8_t ip4[4],
-                             bool have_ip6, const uint8_t ip6[16])
+                             bool have_ip6, const uint8_t ip6[16],
+                             bool guard)
 {
     struct addrinfo hints, *res = NULL, *ai;
     char port_s[8];
     int last = -1;
+    bool blocked = false;   /* a candidate was refused by the gate */
 
     memset(&hints, 0, sizeof hints);
     hints.ai_socktype = SOCK_STREAM;
@@ -124,17 +365,42 @@ static int rp_connect_target(int *fd_out, const char *host, uint16_t port,
     snprintf(port_s, sizeof port_s, "%u", (unsigned)port);
 
     if (have_ip4) {
-        /* literal IPv4: connect directly, no resolution */
+        /* literal IPv4: connect directly, no resolution. The gate
+         * sees the literal bytes before any connect attempt. */
+        if (rp_target_blocked(guard, 4, ip4))
+            return -2;
         return rp_connect_literal(AF_INET, ip4, port, fd_out);
     }
     if (have_ip6) {
+        if (rp_target_blocked(guard, 6, ip6))
+            return -2;
         return rp_connect_literal(AF_INET6, ip6, port, fd_out);
     }
-    /* domain: resolve, then try every address (v4 and v6) */
+    /* domain: resolve, then try every address (v4 and v6). The gate
+     * must judge each RESOLVED address — checking only the hostname
+     * would let DNS rebinding slip through. */
     if (getaddrinfo(host, port_s, &hints, &res) != 0)
         return -1;
     for (ai = res; ai != NULL; ai = ai->ai_next) {
-        int fd = port_socket(ai->ai_family, SOCK_STREAM, 0);
+        int fd;
+        if (ai->ai_family == AF_INET) {
+            const struct sockaddr_in *sa =
+                (const struct sockaddr_in *)ai->ai_addr;
+            if (rp_target_blocked(guard, 4,
+                                  (const uint8_t *)&sa->sin_addr)) {
+                blocked = true;
+                continue;
+            }
+        } else if (ai->ai_family == AF_INET6) {
+            const struct sockaddr_in6 *sa =
+                (const struct sockaddr_in6 *)ai->ai_addr;
+            if (rp_target_blocked(guard, 6,
+                                  (const uint8_t *)&sa->sin6_addr)) {
+                blocked = true;
+                continue;
+            }
+        }
+        fd = port_socket(ai->ai_family, SOCK_STREAM, 0);
         if (fd < 0)
             continue;
         port_set_nonblock(fd, true);
@@ -156,7 +422,7 @@ static int rp_connect_target(int *fd_out, const char *host, uint16_t port,
     }
     freeaddrinfo(res);
     if (last < 0)
-        return -1;
+        return blocked ? -2 : -1;
     port_set_nonblock(last, false);   /* relay threads want blocking */
     *fd_out = last;
     return 0;
@@ -166,19 +432,21 @@ static int rp_connect_target(int *fd_out, const char *host, uint16_t port,
 
 /* read exactly `want` bytes, waiting through EAGAIN. Windows accept()
  * inherits the listener's nonblocking mode (unlike Linux), so the
- * handshake reads must poll instead of treating EAGAIN as fatal. */
-static bool rp_read_full(int fd, uint8_t *buf, size_t want)
+ * handshake reads must poll instead of treating EAGAIN as fatal.
+ * Polls draw from the handshake budget (M6b) and reads count toward
+ * the handshake input cap. */
+static bool rp_read_full(int fd, uint8_t *buf, size_t want,
+                         struct rp_hs *hs)
 {
     size_t got = 0;
     while (got < want) {
-        ssize_t r = port_recv(fd, buf + got, want - got, 0);
+        ssize_t r = rp_hs_recv(hs, fd, buf + got, want - got);
         if (r > 0) {
             got += (size_t)r;
             continue;
         }
         if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            struct pollfd pfd = { .fd = fd, .events = POLLIN };
-            if (port_poll(&pfd, 1, RP_HANDSHAKE_TIMEOUT_MS) <= 0)
+            if (rp_hs_poll(hs, fd) <= 0)
                 return false;
             continue;
         }
@@ -197,11 +465,22 @@ static void rp_socks_reply(int fd, uint8_t rep)
 
 /* returns 0 on success with the upstream connected; -1 on failure.
  * Frame parsing (greeting / RFC1929 / CONNECT) is delegated to
- * proto_parse.c — the same parsers as SOCKS mode. */
+ * proto_parse.c — the same parsers as SOCKS mode.
+ *
+ * fk: peer lockout key (NULL when getpeername failed — no tracking);
+ * hs: handshake watchdog state; guard: SSRF gate armed for this
+ * connection (M7). */
 static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
-                           const char *token)
+                           const char *token, struct rp_hs *hs,
+                           const rp_fail_key *fk, bool guard)
 {
-    uint8_t b[512];
+    /* L7: 512 could not hold a maximal legal exchange (RFC1929 frame
+     * with 255-byte user + 255-byte pass alone is 513 bytes) plus a
+     * pipelined greeting/CONNECT, so legitimate clients could never
+     * finish auth. 2048 covers greeting (257) + auth (513) + CONNECT
+     * (262) with slack. The `n > sizeof b` entry bound below follows
+     * the new size automatically. */
+    uint8_t b[2048];
     size_t n = first_n;
     pp_target t;
     uint8_t method = 0, cmd = 0, rep = 0;
@@ -209,7 +488,7 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
     if (n < 2)
         return -1;
     /* pre-auth bound: `first` holds up to a full 4096B read but every
-     * parser below works out of b[512] (later reads all guard
+     * parser below works out of b[2048] (later reads all guard
      * n >= sizeof b). An oversized first packet is not a valid SOCKS5
      * greeting — refuse it before the copy. */
     if (n > sizeof b)
@@ -218,7 +497,7 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
     if (pp_socks_greeting(b, n, token != NULL, &method) != 0) {
         /* greeting may span reads: [5, nmethods, methods...] */
         size_t want = 2 + (size_t)b[1];
-        if (want > sizeof b || !rp_read_full(fd, b + n, want - n))
+        if (want > sizeof b || !rp_read_full(fd, b + n, want - n, hs))
             return -1;
         n = want;
         if (pp_socks_greeting(b, n, token != NULL, &method) != 0)
@@ -252,12 +531,18 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
                 if (token) {
                     size_t tlen = strlen(token);
                     if (plen != tlen ||
-                        ct_eq(pass, (const uint8_t *)token, tlen) == 0)
+                        ct_eq(pass, (const uint8_t *)token, tlen) == 0) {
                         rr[1] = 1;
+                        /* M6c: a well-formed frame with the wrong
+                         * token is a counted auth failure */
+                        rp_fail_note(fk, false);
+                    }
                 }
                 (void)port_send(fd, rr, 2, 0);
                 if (rr[1] != 0)
                     return -1;
+                if (token)
+                    rp_fail_note(fk, true);   /* success clears */
                 /* consume the auth frame */
                 {
                     size_t flen = 2 + (size_t)b[1] + 1 + plen;
@@ -271,14 +556,13 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
             if (n >= sizeof b)
                 return -1;
             {
-                ssize_t r = port_recv(fd, b + n, sizeof b - n, 0);
+                ssize_t r = rp_hs_recv(hs, fd, b + n, sizeof b - n);
                 if (r > 0) {
                     n += (size_t)r;
                     continue;
                 }
                 if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                    struct pollfd pfd = { .fd = fd, .events = POLLIN };
-                    if (port_poll(&pfd, 1, RP_HANDSHAKE_TIMEOUT_MS) <= 0)
+                    if (rp_hs_poll(hs, fd) <= 0)
                         return -1;
                     continue;
                 }
@@ -293,21 +577,22 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
     /* CONNECT request [5, CMD, RSV, ATYP, addr..., port] */
     for (;;) {
         if (pp_socks_request(b, n, &cmd, &rep, &t) == 0) {
-            err_printf("socks: request ok cmd=%u af=%u port=%u\n", cmd,
-                       t.af, t.port);
+            /* L5: per-connection metadata is too noisy for the
+             * unconditional error log — debug only */
+            log_debug("socks: request ok cmd=%u af=%u port=%u\n", cmd,
+                      t.af, t.port);
             break;
         }
         if (n >= sizeof b)
             return -1;
         {
-            ssize_t r = port_recv(fd, b + n, sizeof b - n, 0);
+            ssize_t r = rp_hs_recv(hs, fd, b + n, sizeof b - n);
             if (r > 0) {
                 n += (size_t)r;
                 continue;
             }
             if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                struct pollfd pfd = { .fd = fd, .events = POLLIN };
-                if (port_poll(&pfd, 1, RP_HANDSHAKE_TIMEOUT_MS) <= 0)
+                if (rp_hs_poll(hs, fd) <= 0)
                     return -1;
                 continue;
             }
@@ -320,15 +605,16 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
     }
     {
         int up = -1;
-        rep = 5;
-        if (rp_connect_target(&up, t.host, t.port, t.af == 4,
-                              (const uint8_t *)&t.ip4, t.af == 6,
-                              t.ip6) == 0) {
-            rep = 0;
-            rp_socks_reply(fd, rep);
+        int rc = rp_connect_target(&up, t.host, t.port, t.af == 4,
+                                   (const uint8_t *)&t.ip4, t.af == 6,
+                                   t.ip6, guard);
+        if (rc == 0) {
+            rp_socks_reply(fd, 0);
             return up;           /* caller relays on fd <-> up */
         }
-        rp_socks_reply(fd, rep);
+        /* M7: a gate refusal is "not allowed" (rep 2), everything
+         * else stays a general failure */
+        rp_socks_reply(fd, rc == -2 ? 2 : 5);
         return -1;
     }
 }
@@ -336,7 +622,8 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
 /* ---- HTTP ---- */
 
 /* returns the connected upstream fd, or -1 */
-static int rp_handle_http(int fd, const uint8_t *first, size_t first_n)
+static int rp_handle_http(int fd, const uint8_t *first, size_t first_n,
+                          struct rp_hs *hs, bool guard)
 {
     uint8_t buf[8192];
     size_t n = first_n, hdr_end;
@@ -358,14 +645,13 @@ static int rp_handle_http(int fd, const uint8_t *first, size_t first_n)
         }
         if (hdr_end != (size_t)-1)
             break;
-        r = port_recv(fd, buf + n, sizeof buf - 1 - n, 0);
+        r = rp_hs_recv(hs, fd, buf + n, sizeof buf - 1 - n);
         if (r > 0) {
             n += (size_t)r;
             continue;
         }
         if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            struct pollfd pfd = { .fd = fd, .events = POLLIN };
-            if (port_poll(&pfd, 1, RP_HANDSHAKE_TIMEOUT_MS) <= 0)
+            if (rp_hs_poll(hs, fd) <= 0)
                 return -1;
             continue;
         }
@@ -406,9 +692,11 @@ static int rp_handle_http(int fd, const uint8_t *first, size_t first_n)
         return -1;
 
     int up = -1;
+    /* the gate also covers absolute-URI forwards: same SSRF surface,
+     * same target-connection path */
     if (rp_connect_target(&up, t.host, t.port, t.af == 4,
                           (const uint8_t *)&t.ip4, t.af == 6,
-                          t.ip6) != 0) {
+                          t.ip6, guard) != 0) {
         static const char bad[] = "HTTP/1.1 502 Bad Gateway\r\n\r\n";
         (void)port_send(fd, bad, sizeof bad - 1, 0);
         return -1;
@@ -872,30 +1160,47 @@ static void *rp_dir_main(void *ud)
     return NULL;
 }
 
+/* per-connection accept handoff: the fd plus what the accept thread
+ * already knows about the peer (heap-owned; rp_conn_main frees it on
+ * every exit path) */
+struct rp_conn_arg {
+    int         fd;
+    bool        peer_loop;   /* peer is loopback: exempt from M7 gate */
+    bool        have_key;    /* fk valid (getpeername + known family) */
+    rp_fail_key fk;
+};
+
 static void *rp_conn_main(void *ud)
 {
-    int fd = (int)(intptr_t)ud;
+    struct rp_conn_arg *ca = ud;
+    int fd = ca->fd;
     struct RelayProxy *rp = g_rp_current;
+    bool guard = !g_rp_ssrf_off && !ca->peer_loop;
+    struct rp_hs hs;
     uint8_t first[4096];
     ssize_t n;
     int up = -1;
 
-    struct pollfd pfd = { .fd = fd, .events = POLLIN };
-    if (port_poll(&pfd, 1, RP_HANDSHAKE_TIMEOUT_MS) <= 0)
+    /* M6b: the whole handshake draws from one absolute budget that
+     * starts here (connection entry), not per read */
+    rp_hs_init(&hs);
+
+    if (rp_hs_poll(&hs, fd) <= 0)
         goto out;
-    n = port_recv(fd, first, sizeof first, 0);
+    n = rp_hs_recv(&hs, fd, first, sizeof first);
     if (n <= 0)
         goto out;
 
     if (first[0] == 5) {
-        up = rp_handle_socks(fd, first, (size_t)n, rp->token);
+        up = rp_handle_socks(fd, first, (size_t)n, rp->token, &hs,
+                             ca->have_key ? &ca->fk : NULL, guard);
     } else {
         /* parity with socks_flow: a token-requiring relay must not
          * silently accept unauthenticated HTTP traffic (HTTP clients
          * cannot do RFC1929) */
         if (rp->token)
             goto out;
-        up = rp_handle_http(fd, first, (size_t)n);
+        up = rp_handle_http(fd, first, (size_t)n, &hs, guard);
     }
     if (up < 0)
         goto out;
@@ -904,13 +1209,39 @@ static void *rp_conn_main(void *ud)
      * direction threads. rp_add owns (or closed) both sockets from
      * now on. */
     rp_add(fd, up);
+    /* M6a: success exit — this thread stops tracking the connection
+     * (the global relay owns it now) */
+    atomic_fetch_sub(&g_rp_conn_n, 1);
+    free(ca);
     return NULL;
 
 out:
+    /* M6a: failure exit — every path through here decrements exactly
+     * once (the accept thread's increment is consumed below) */
     if (up >= 0)
         port_close(up);
     port_close(fd);
+    atomic_fetch_sub(&g_rp_conn_n, 1);
+    free(ca);
     return NULL;
+}
+
+/* M7: is the proxy CLIENT itself on loopback? Local users keep today's
+ * unfiltered behavior; only remote peers get the target gate. */
+static bool rp_peer_is_loopback(const struct sockaddr_storage *ss)
+{
+    if (ss->ss_family == AF_INET) {
+        const struct sockaddr_in *a = (const struct sockaddr_in *)ss;
+        const uint8_t *p = (const uint8_t *)&a->sin_addr;
+        return p[0] == 127;
+    }
+    if (ss->ss_family == AF_INET6) {
+        static const uint8_t lo[16] = { 0, 0, 0, 0, 0, 0, 0, 0,
+                                        0, 0, 0, 0, 0, 0, 0, 1 };
+        const struct sockaddr_in6 *a = (const struct sockaddr_in6 *)ss;
+        return memcmp(&a->sin6_addr, lo, 16) == 0;
+    }
+    return false;
 }
 
 static void *rp_accept_main(void *ud)
@@ -936,10 +1267,50 @@ static void *rp_accept_main(void *ud)
                 continue;
             break;
         }
-        pthread_t th;
-        if (pthread_create(&th, NULL, rp_conn_main,
-                           (void *)(intptr_t)fd) != 0) {
+
+        /* M6c/L6: drop sources locked out for RFC1929 brute force
+         * before spending a thread or a byte on them */
+        struct sockaddr_storage pss;
+        socklen_t pslen = sizeof pss;
+        rp_fail_key fk;
+        memset(&pss, 0, sizeof pss);
+        bool have_key =
+            getpeername(fd, (struct sockaddr *)&pss, &pslen) == 0 &&
+            rp_fail_key_of(&pss, &fk);
+        if (have_key && rp_fail_blocked(&fk)) {
+            log_debug("rp: dropping peer (auth failure lockout)");
             port_close(fd);
+            continue;
+        }
+
+        /* M6a: shed new connections once the per-connection thread
+         * cap is hit — close immediately, no reply, no thread */
+        if (atomic_load(&g_rp_conn_n) >= RP_MAX_CONNS) {
+            log_debug("rp: connection cap %d reached, dropping",
+                      RP_MAX_CONNS);
+            port_close(fd);
+            continue;
+        }
+
+        struct rp_conn_arg *ca = malloc(sizeof *ca);
+        if (!ca) {
+            port_close(fd);
+            continue;
+        }
+        ca->fd = fd;
+        ca->peer_loop = have_key && rp_peer_is_loopback(&pss);
+        ca->have_key = have_key;
+        ca->fk = fk;
+
+        /* M6a: count before the spawn so concurrent accepts cannot
+         * overshoot the cap; rp_conn_main decrements on every exit */
+        atomic_fetch_add(&g_rp_conn_n, 1);
+
+        pthread_t th;
+        if (pthread_create(&th, NULL, rp_conn_main, ca) != 0) {
+            atomic_fetch_sub(&g_rp_conn_n, 1);
+            port_close(fd);
+            free(ca);
             continue;
         }
         pthread_detach(th);
@@ -972,6 +1343,13 @@ int relay_proxy_start(const char *listen_str, const char *auth_token,
         log_err("relay proxy: --allow-remote requires --socks-token or "
                 "--socks-no-token");
         return -1;
+    }
+
+    /* M7: SSRF gate opt-out (IWAN_RELAY_ALLOW_LOOPBACK=1). Read once,
+     * here, strictly before any connection thread exists. */
+    {
+        const char *v = getenv("IWAN_RELAY_ALLOW_LOOPBACK");
+        g_rp_ssrf_off = v != NULL && strcmp(v, "1") == 0;
     }
 
     rp = calloc(1, sizeof *rp);

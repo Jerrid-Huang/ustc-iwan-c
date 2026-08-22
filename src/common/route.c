@@ -298,10 +298,12 @@ bool capture_default(char gw[16], char dev[16], char metric[16])
             continue;
         found = true;
         /* friendly name -> UTF-8; names longer than 15 bytes fall back
-         * to a stable if<index> handle (still usable with netsh) */
+         * to the decimal interface index, which netsh accepts in the
+         * interface= parameter (the historical "if<index>" spelling is
+         * iproute2 syntax and netsh rejects it) */
         if (!WideCharToMultiByte(CP_UTF8, 0, p->FriendlyName, -1, dev, 16,
                                  NULL, NULL) || dev[0] == '\0')
-            snprintf(dev, 16, "if%lu", (unsigned long)p->IfIndex);
+            snprintf(dev, 16, "%lu", (unsigned long)p->IfIndex);
         if (gw[0] == '\0') {
             /* on-link default (nexthop 0.0.0.0): the gateway is the
              * interface's own address */
@@ -473,9 +475,13 @@ bool local_subnet(const char *dev, char out[24])
     for (IP_ADAPTER_ADDRESSES *p = aa; p != NULL; p = p->Next) {
         char d16[16];
         d16[0] = '\0';
-        WideCharToMultiByte(CP_UTF8, 0, p->FriendlyName, -1, d16,
-                            sizeof d16, NULL, NULL);
-        if (strcmp(d16, dev) != 0)
+        if (WideCharToMultiByte(CP_UTF8, 0, p->FriendlyName, -1, d16,
+                                sizeof d16, NULL, NULL) <= 0)
+            continue;   /* conversion failed: cannot match by name */
+        /* dev is either the friendly name or the decimal interface
+         * index produced by the fallback above */
+        if (strcmp(d16, dev) != 0 &&
+            (unsigned long)p->IfIndex != strtoul(dev, NULL, 10))
             continue;
         for (IP_ADAPTER_UNICAST_ADDRESS *u = p->FirstUnicastAddress;
              u != NULL; u = u->Next) {
@@ -613,12 +619,52 @@ done:
 #endif /* _WIN32 */
 
 #ifdef _WIN32
+/* Sweep stale routes still bound to OUR adapter (audit M2): a crash,
+ * force-kill or power loss leaves the metric-0 default route and the
+ * server /32 pin alive until the next reboot, because the wintun
+ * adapter intentionally persists and the stack never reclaims them —
+ * the machine would keep routing its default into a dead tunnel.
+ * Runs at every setup, BEFORE new routes are added; the on-link
+ * connected route the stack manages for the interface address is kept. */
+static void sweep_stale_routes(const char *tun)
+{
+    wchar_t wname[128];
+    if (MultiByteToWideChar(CP_UTF8, 0, tun, -1, wname, 128) <= 0)
+        return;
+    NET_LUID luid;
+    if (ConvertInterfaceAliasToLuid(wname, &luid) != NO_ERROR)
+        return;
+    PMIB_IPFORWARD_TABLE2 tbl;
+    if (GetIpForwardTable2(AF_INET, &tbl) != NO_ERROR)
+        return;
+    ULONG removed = 0;
+    for (ULONG i = 0; i < tbl->NumEntries; i++) {
+        MIB_IPFORWARD_ROW2 *r = &tbl->Table[i];
+        if (r->InterfaceLuid.Value != luid.Value)
+            continue;
+        /* keep the on-link connected route (nexthop unset, prefix >=
+         * /24): the stack manages it for the interface address */
+        if (r->NextHop.si_family == AF_INET &&
+            r->NextHop.Ipv4.sin_addr.s_addr == 0 &&
+            r->DestinationPrefix.PrefixLength >= 24)
+            continue;
+        if (DeleteIpForwardEntry2(r) == NO_ERROR)
+            removed++;
+    }
+    FreeMibTable(tbl);
+    if (removed)
+        log_info("route_setup: swept %lu stale route(s) from %s",
+                 removed, tun);
+}
+
 bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
                  const char *srv, const char *ogw, const char *odev,
                  const char *metric, const slist_t *routes_with_default)
 {
     char tun_if[32], nh[40];
     struct in_addr s4;
+
+    sweep_stale_routes(tun);   /* audit M2: crash leftover cleanup */
 
     (void)metric;   /* Windows keeps the physical default in the table;
                      * teardown deletes only our own route, so there is

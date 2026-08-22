@@ -319,6 +319,13 @@ static size_t win_join_argv(char *const argv[], int start, wchar_t *out,
 {
     size_t n = 0;
 
+    /* CmdLineToArgvW rules: a run of `bs` backslashes directly before a
+     * quote is emitted as 2*bs+1 backslashes (the quote is escaped); a
+     * run directly before the closing quote (end of argument) as 2*bs.
+     * The historical version only prefixed quotes with one backslash
+     * and did not double backslashes, misparsing arguments containing
+     * \" sequences. Overflow now fails loudly (SIZE_MAX) instead of
+     * silently truncating. */
     for (int i = start; argv[i]; i++) {
         const char *a = argv[i];
         size_t alen = strlen(a);
@@ -331,7 +338,8 @@ static size_t win_join_argv(char *const argv[], int start, wchar_t *out,
             size_t wcap = 2 * (alen + 1);
             w = malloc(wcap * sizeof *w);
             if (w != NULL) {
-                wlen = MultiByteToWideChar(CP_UTF8, 0, a, -1, w, (int)wcap);
+                wlen = MultiByteToWideChar(CP_UTF8, 0, a, -1, w,
+                                           (int)wcap);
                 if (wlen <= 0) {
                     /* invalid UTF-8 (defensive; not expected): fall back
                      * to the historical byte-for-byte cast */
@@ -342,40 +350,60 @@ static size_t win_join_argv(char *const argv[], int start, wchar_t *out,
             }
         }
         if (w == NULL) {
-            /* allocation failure: write the raw bytes directly */
-            int quote = strchr(a, ' ') != NULL || strchr(a, '\t') != NULL;
-            if (i > start && n < outsz - 1)
-                out[n++] = L' ';
-            if (quote)
-                out[n++] = L'"';
-            while (*a && n < outsz - 2) {
-                if (*a == '"')
-                    out[n++] = L'\\';
-                out[n++] = (wchar_t)(unsigned char)*a;
-                a++;
-            }
-            if (quote)
-                out[n++] = L'"';
-            continue;
+            free(w);
+            if (n < outsz)
+                out[n] = L'\0';
+            return (size_t)-1;
         }
         int quote = 0;
         for (int k = 0; k < wlen - 1; k++) {
-            if (w[k] == L' ' || w[k] == L'\t') {
+            if (w[k] == L' ' || w[k] == L'\t' || w[k] == L'"') {
                 quote = 1;
                 break;
             }
         }
-        if (i > start && n < outsz - 1)
+        /* helper: append up to cnt chars or fail */
+        if (n + (size_t)(i > start) + (quote ? 2u : 0u) > outsz - 1) {
+            free(w);
+            if (n < outsz)
+                out[n] = L'\0';
+            return (size_t)-1;
+        }
+        if (i > start)
             out[n++] = L' ';
         if (quote)
             out[n++] = L'"';
-        for (int k = 0; k < wlen - 1 && n < outsz - 2; k++) {
-            if (w[k] == L'"')
+        size_t bs = 0;
+        for (int k = 0; k < wlen - 1; k++) {
+            if (w[k] == L'\\') {
+                bs++;
+                if (n + 1 > outsz - 1) { free(w); return (size_t)-1; }
                 out[n++] = L'\\';
+                continue;
+            }
+            if (w[k] == L'"') {
+                /* the backslashes already emitted must be doubled, plus
+                 * one to escape the quote: emit bs extra backslashes
+                 * and a backslash-quote pair */
+                if (n + bs + 2 > outsz - 1) { free(w); return (size_t)-1; }
+                for (size_t z = 0; z < bs; z++)
+                    out[n++] = L'\\';
+                out[n++] = L'\\';
+                out[n++] = L'"';
+                bs = 0;
+                continue;
+            }
+            if (n + 1 > outsz - 1) { free(w); return (size_t)-1; }
             out[n++] = w[k];
+            bs = 0;
         }
-        if (quote)
+        /* trailing backslashes before the closing quote: doubled */
+        if (quote) {
+            if (n + bs + 1 > outsz - 1) { free(w); return (size_t)-1; }
+            for (size_t z = 0; z < bs; z++)
+                out[n++] = L'\\';
             out[n++] = L'"';
+        }
         free(w);
     }
     if (n < outsz)
@@ -433,6 +461,10 @@ int port_elevate_self(int argc, char **argv)
         }
     }
     n = win_join_argv(argv, 1, args, sizeof args / sizeof args[0]);
+    if (n == (size_t)-1) {
+        log_err("elevation: command line too long/undecodable");
+        return -1;
+    }
     /* Try the launch path first, then the UNC form. lpDirectory is set
      * explicitly: the current directory (the Z: prompt) is exactly the
      * kind of path the elevated context cannot resolve, and an
@@ -566,7 +598,9 @@ int port_run_cmd(char *const argv[])
     si.cb = sizeof si;
     memset(&pi, 0, sizeof pi);
 
-    win_join_argv(argv, 0, cmdline, sizeof cmdline / sizeof cmdline[0]);
+    if (win_join_argv(argv, 0, cmdline, sizeof cmdline / sizeof cmdline[0])
+            == (size_t)-1)
+        return -1;
 
     /* Resolve a bare helper name (netsh/route) against System32 and use
      * it as lpApplicationName: CreateProcessW(NULL, cmdline) with a
@@ -591,12 +625,18 @@ int port_run_cmd(char *const argv[])
     if (!CreateProcessW(appname, cmdline, NULL, NULL, FALSE,
                         CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
         return -1;
-    WaitForSingleObject(pi.hProcess, INFINITE);
+    /* bounded wait (audit L2): a hung netsh must not wedge the pump in
+     * a half-configured state forever */
+    bool timed_out = WaitForSingleObject(pi.hProcess, 60000) == WAIT_TIMEOUT;
+    if (timed_out) {
+        TerminateProcess(pi.hProcess, 1);
+        log_err("port_run_cmd: %s timed out after 60s", argv[0]);
+    }
     DWORD code = 1;
     GetExitCodeProcess(pi.hProcess, &code);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
-    return (int)code;
+    return timed_out ? -1 : (int)code;
 #else
     pid_t pid = fork();
     if (pid < 0)
@@ -680,7 +720,11 @@ char *port_cmd_capture(char *const argv[], size_t max)
         got += r;
     out[got] = '\0';
     CloseHandle(rd);
-    WaitForSingleObject(pi.hProcess, INFINITE);
+    if (WaitForSingleObject(pi.hProcess, 60000) == WAIT_TIMEOUT) {
+        TerminateProcess(pi.hProcess, 1);
+        CloseHandle(pi.hProcess);
+        return out;   /* partial output beats an indefinite wedge */
+    }
     CloseHandle(pi.hProcess);
     return out;
 #else

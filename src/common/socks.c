@@ -468,6 +468,12 @@ static int vpn_handle_data(SocksConfig *cfg, uint8_t *b, size_t n)
 {
     uint8_t t = b[0];
     size_t plen = n - 8;
+    if (t == PT_DATA_ENC && !cfg->encryption) {
+        /* symmetric gate (audit L14): plaintext session must not
+         * accept encrypted frames either */
+        log_err("VPN encrypted data on plaintext session, drop");
+        return 0;
+    }
     if (t == PT_DATA_ENC)
         xor_crypt(b + 8, plen, cfg->xor_key, 8);
     else if (cfg->encryption) {
@@ -494,6 +500,13 @@ static int vpn_handle_data(SocksConfig *cfg, uint8_t *b, size_t n)
             return 0;
     } else if (ipv4_pkt_ok(b + 8, plen, &saddr, &daddr) != 0) {
         return 0;
+    } else {
+        /* ingress filter (audit M5): a downlink frame must be
+         * addressed to THIS session's IP and must never claim our own
+         * address as source — anything else is an injector's forgery,
+         * not traffic the stack solicited */
+        if (daddr != cfg->inner_ip || saddr == cfg->inner_ip)
+            return 0;
     }
     /* M1: inner UDP packets whose dst port belongs to a pending
      * tunnel DNS query are responses — consume them here, never

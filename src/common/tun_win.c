@@ -33,6 +33,8 @@
 #include "iphlpapi.h" /* NET_LUID for WintunGetAdapterLuid's signature */
 #include <setupapi.h> /* SP_DEVINFO_DATA / DIF_REMOVE for adapter deletion */
 #include <devguid.h>  /* GUID_DEVCLASS_NET */
+#include <wintrust.h> /* WinVerifyTrust: Authenticode check for wintun.dll */
+#include <softpub.h>  /* WINTRUST_ACTION_GENERIC_VERIFY_V2 */
 #include "tun.h"
 #include "util.h"
 
@@ -118,17 +120,50 @@ static const GUID IWAN_WINTUN_GUID = {
     { 0x9c, 0x6e, 0x3d, 0x8b, 0x1a, 0x2c, 0x7d, 0x4e }
 };
 
+/* Authenticode verification via WinVerifyTrust (no UI, no network
+ * revocation checks: offline-friendly). Returns true for a valid
+ * signature chain back to a CA the system trusts. */
+static bool wintun_verify(const wchar_t *path)
+{
+    WINTRUST_FILE_INFO fi;
+    WINTRUST_DATA wd;
+    GUID act = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+
+    memset(&fi, 0, sizeof fi);
+    fi.cbStruct = sizeof fi;
+    fi.pcwszFilePath = path;
+    fi.hFile = NULL;
+    fi.pgKnownSubject = NULL;
+
+    memset(&wd, 0, sizeof wd);
+    wd.cbStruct = sizeof wd;
+    wd.dwUIChoice = WTD_UI_NONE;
+    wd.fdwRevocationChecks = WTD_REVOKE_NONE;
+    wd.dwUnionChoice = WTD_CHOICE_FILE;
+    wd.pFile = &fi;
+    wd.dwStateAction = WTD_STATEACTION_VERIFY;
+    wd.dwProvFlags = WTD_SAFER_FLAG;
+
+    LONG st = WinVerifyTrust(NULL, &act, &wd);
+
+    wd.dwStateAction = WTD_STATEACTION_CLOSE;
+    (void)WinVerifyTrust(NULL, &act, &wd);
+
+    return st == ERROR_SUCCESS;
+}
+
 static bool wintun_load(void)
 {
     if (iwan_wintun_loaded != 0)
         return iwan_wintun_loaded > 0;
+
     /* Load from the exe's own directory by absolute path first: that
      * directory is by definition readable (the exe itself runs from
      * it), and this sidesteps loader search-order quirks when running
-     * from network shares. Fall back to the bare name (system/PATH
-     * search). Both error codes are reported so policy blocks
-     * (AppLocker DLL rules -> 1260) are distinguishable from a missing
-     * file (126). */
+     * from network shares. Then System32 only. The CWD/PATH search is
+     * deliberately NOT used: an attacker-writable directory earlier in
+     * the order would inject a hostile wintun.dll into this process
+     * (audit M1). Both candidates are Authenticode-verified first. */
     {
         wchar_t dllpath[MAX_PATH * 2];
         DWORD n = GetModuleFileNameW(NULL, dllpath,
@@ -140,23 +175,42 @@ static bool wintun_load(void)
 
             if (slash) {
                 wcscpy(slash + 1, L"wintun.dll");
-                iwan_wintun.dll = LoadLibraryW(dllpath);
-                /* NOTE: no early return here — the GetProcAddress
-                 * resolution below MUST run for every successful load,
-                 * or the API pointers stay NULL and open_tun calls
-                 * through a NULL function pointer (0xC0000005 at 0x0). */
+                if (wintun_verify(dllpath)) {
+                    iwan_wintun.dll = LoadLibraryW(dllpath);
+                    /* NOTE: no early return here — the GetProcAddress
+                     * resolution below MUST run for every successful
+                     * load, or the API pointers stay NULL and open_tun
+                     * calls through a NULL function pointer. */
+                } else {
+                    log_err("wintun.dll failed Authenticode "
+                            "verification (exe dir); refusing to load "
+                            "an unverified driver shim");
+                }
             }
         }
     }
     if (iwan_wintun.dll == NULL) {
         DWORD dir_err = GetLastError();
 
-        iwan_wintun.dll = LoadLibraryA("wintun.dll");
+        /* system-wide install (WireGuard et al): System32 only */
+        wchar_t sysdll[MAX_PATH];
+        DWORD sn = GetSystemDirectoryW(sysdll,
+                                       (UINT)(MAX_PATH - 16));
+        if (sn > 0 && sn < MAX_PATH - 16) {
+            wcscpy(sysdll + sn, L"\\wintun.dll");
+            if (wintun_verify(sysdll)) {
+                iwan_wintun.dll = LoadLibraryW(sysdll);
+            } else {
+                log_err("wintun.dll failed Authenticode "
+                        "verification (System32); refusing to load an "
+                        "unverified driver shim");
+            }
+        }
         if (iwan_wintun.dll == NULL) {
             log_err("wintun.dll not found or blocked — install the "
                     "wintun driver from wintun.net (or WireGuard) and "
                     "place wintun.dll next to the executable "
-                    "(exe-dir load error %lu, name load error %lu)",
+                    "(exe-dir load error %lu, system load error %lu)",
                     dir_err, GetLastError());
             iwan_wintun_loaded = -1;
             return false;
@@ -264,11 +318,30 @@ static int wintun_delete_adapter_by_name(const wchar_t *name)
                                                SPDRP_FRIENDLYNAME, NULL,
                                                (PBYTE)dn, sizeof dn, &n))
             continue;
-        if (wcsstr(dn, name) != NULL) {
-            if (SetupDiCallClassInstaller(DIF_REMOVE, devs, &devinfo))
-                removed = 1;
-            break;
+        /* exact FriendlyName match only: a substring match could remove
+         * an unrelated adapter whose name merely contains ours */
+        if (wcscmp(dn, name) != 0)
+            continue;
+        /* and it must really be a wintun device (hardware ID starts
+         * with SWD\WINTUN) so a non-wintun NIC that happens to share
+         * the name is never removed */
+        wchar_t hw[512];
+        int is_wintun = 0;
+        if (!SetupDiGetDeviceRegistryPropertyW(devs, &devinfo,
+                                               SPDRP_HARDWAREID, NULL,
+                                               (PBYTE)hw, sizeof hw, &n))
+            continue;
+        for (const wchar_t *q = hw; *q; q += wcslen(q) + 1) {
+            if (wcsncmp(q, L"SWD\\WINTUN", 11) == 0) {
+                is_wintun = 1;
+                break;
+            }
         }
+        if (!is_wintun)
+            continue;
+        if (SetupDiCallClassInstaller(DIF_REMOVE, devs, &devinfo))
+            removed = 1;
+        break;
     }
     SetupDiDestroyDeviceInfoList(devs);
     return removed;
