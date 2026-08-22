@@ -45,7 +45,7 @@ option(IWAN_LINUX_STATIC "Linux: link fully static binaries" OFF)
 option(IWAN_STATIC       "Windows: statically link OpenSSL + runtime libs" OFF)
 option(IWAN_BPF          "Linux: compile and embed the tun steering eBPF program" ON)
 option(IWAN_WERROR       "Treat compiler warnings as errors" OFF)
-option(IWAN_WIN_PUMP_SINGLE "Windows: single-thread zero-copy TUN uplink (instead of SPSC + sender thread)" OFF)
+option(IWAN_WIN_PUMP_SINGLE "Windows: single-thread zero-copy TUN uplink (instead of SPSC + sender thread)" ON)
 set(IWAN_OPENSSL_DIR "" CACHE PATH "OpenSSL sysroot (include/ + lib/ or lib64/)")
 # ---------------------------------------------------------------------------
 # Global flags — the old Makefile's CFLAGS/LDFLAGS, split per platform.

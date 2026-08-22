@@ -127,7 +127,19 @@ uint64_t port_now_us(void)
         }
         have = 1;
     }
-    return (uint64_t)((double)__rdtsc() / tsc_per_us);
+    /* per-thread monotonic clamp: on a multi-vCPU guest the TSC is not
+     * guaranteed synchronized across cores, and a migration can move
+     * the thread to a core whose TSC reads BEHIND the previous core
+     * (measured as a -5.7s jump on tiny11/QEMU). Clamping keeps each
+     * thread's clock monotonic, which is what the staleness watchdog
+     * arithmetic requires; profiler spans that straddle a migration
+     * degrade to ~0 instead of corrupting state. */
+    static _Thread_local uint64_t last_us;
+    uint64_t now = (uint64_t)((double)__rdtsc() / tsc_per_us);
+    if (now < last_us)
+        now = last_us;
+    last_us = now;
+    return now;
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
