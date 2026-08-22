@@ -278,7 +278,7 @@ int udp_connect(const char *host, uint16_t port, int timeout_ms)
      * The kernel may clamp SO_RCVBUF to rmem_max — nonfatal, but note it
      * for diagnostics. (No explicit bind needed: connect() binds the
      * local address implicitly.) */
-    int bufsz = 4 * 1024 * 1024;
+    int bufsz = 16 * 1024 * 1024;
     if (port_setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bufsz, sizeof bufsz) < 0)
         log_debug("SO_RCVBUF: %s", strerror(errno));
     if (port_setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufsz, sizeof bufsz) < 0)
