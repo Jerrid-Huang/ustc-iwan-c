@@ -383,6 +383,10 @@ add_library(iwan_oidc STATIC
   src/oidc/oidc_util.c)
 target_include_directories(iwan_oidc PUBLIC src/oidc)
 target_link_libraries(iwan_oidc PUBLIC iwan_core)
+if(APPLE)
+  # the Keychain at-rest wrapper (oidc_pwsecret.c) needs Security
+  target_link_libraries(iwan_oidc PUBLIC "-Wl,-framework,Security")
+endif()
 
 # ---------------------------------------------------------------------------
 # Executables
