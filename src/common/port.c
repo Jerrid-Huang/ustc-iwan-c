@@ -88,7 +88,10 @@ uint64_t port_now_ms(void)
  * client warns the user on VM migration anyway. */
 uint64_t port_now_us(void)
 {
-#ifdef _WIN32
+#if defined(_WIN32) && (defined(_M_IX86) || defined(_M_X64))
+    /* x86/x64 only: __rdtsc is an x86 instruction (aarch64 Windows has
+     * no TSC). The invariant TSC reads in ~13ns here vs QPC's 3.8us on
+     * some vCPUs of the tiny11 guest, so it is worth the calibration. */
     static double tsc_per_us;   /* TSC ticks per microsecond */
     static int have;
     if (!have) {
@@ -127,6 +130,28 @@ uint64_t port_now_us(void)
         }
         have = 1;
     }
+    uint64_t now = (uint64_t)((double)__rdtsc() / tsc_per_us);
+#elif defined(_WIN32)
+    /* ARM64 Windows: no TSC instruction — use QPC (monotonic, high
+     * resolution; its per-call cost is fine on native ARM hardware). */
+    static LARGE_INTEGER qpc_freq;
+    static int qpc_have;
+    if (!qpc_have) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        qpc_freq = f;
+        qpc_have = 1;
+    }
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    uint64_t now =
+        (uint64_t)((double)c.QuadPart * 1e6 / (double)qpc_freq.QuadPart);
+#else
+    uint64_t now;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    now = (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+#endif
     /* per-thread monotonic clamp: on a multi-vCPU guest the TSC is not
      * guaranteed synchronized across cores, and a migration can move
      * the thread to a core whose TSC reads BEHIND the previous core
@@ -135,16 +160,10 @@ uint64_t port_now_us(void)
      * arithmetic requires; profiler spans that straddle a migration
      * degrade to ~0 instead of corrupting state. */
     static _Thread_local uint64_t last_us;
-    uint64_t now = (uint64_t)((double)__rdtsc() / tsc_per_us);
     if (now < last_us)
         now = last_us;
     last_us = now;
     return now;
-#else
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
-#endif
 }
 
 int port_rand_bytes(void *out, size_t n)
