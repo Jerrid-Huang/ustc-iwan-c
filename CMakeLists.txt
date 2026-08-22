@@ -71,6 +71,12 @@ elseif(APPLE)
   # SDK and are defined locally in tun_mac.c.)
   add_compile_definitions(_DARWIN_C_SOURCE)
   add_compile_options(-fstack-protector-strong)
+  # oidc_pwsecret.c's Keychain branch needs Security. CMAKE_EXE_LINKER_FLAGS
+  # guarantees the flag reaches every executable link line on this
+  # platform (framework resolution is position-independent for dylibs).
+  set(CMAKE_EXE_LINKER_FLAGS
+      "${CMAKE_EXE_LINKER_FLAGS} -framework Security")
+  message(STATUS "macOS: linker flags now '${CMAKE_EXE_LINKER_FLAGS}'")
 elseif(WIN32)
   # MinGW-w64 (and MSYS2). -D_GNU_SOURCE and -fPIE are ELF-isms and
   # mingw's FORTIFY_SOURCE support is unreliable, so drop all three;
@@ -393,12 +399,6 @@ target_link_libraries(iwan-client PRIVATE iwan_core)
 
 add_executable(iwan-client-oidc src/iwan_client_oidc.c)
 target_link_libraries(iwan-client-oidc PRIVATE iwan_oidc)
-if(APPLE)
-  # the Keychain at-rest wrapper (oidc_pwsecret.c) needs Security.
-  # LINK_OPTIONS pass items verbatim (no -l mangling) and land after
-  # the objects, which is what framework resolution requires.
-  target_link_options(iwan-client-oidc PRIVATE "-framework" "Security")
-endif()
 
 # SOCKS5 handshake test harness (root-free: drives the real accept/handshake/
 # netstack code with a loopback listener; see tests/socks_handshake.py).
