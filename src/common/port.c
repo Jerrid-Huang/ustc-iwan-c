@@ -568,7 +568,27 @@ int port_run_cmd(char *const argv[])
 
     win_join_argv(argv, 0, cmdline, sizeof cmdline / sizeof cmdline[0]);
 
-    if (!CreateProcessW(NULL, cmdline, NULL, NULL, FALSE,
+    /* Resolve a bare helper name (netsh/route) against System32 and use
+     * it as lpApplicationName: CreateProcessW(NULL, cmdline) with a
+     * bare name searches the exe dir and the CWD BEFORE System32, so a
+     * local binary dropped into either could hijack an elevated
+     * routing operation. Both helpers used on this path (netsh, route)
+     * live in System32. */
+    wchar_t appbuf[MAX_PATH];
+    const wchar_t *appname = NULL;
+    if (strchr(argv[0], '\\') == NULL && strchr(argv[0], '/') == NULL) {
+        wchar_t sysdir[MAX_PATH];
+        UINT sn = GetSystemDirectoryW(sysdir, MAX_PATH);
+        wchar_t wname[64];
+        if (sn > 0 && sn < MAX_PATH - 16 &&
+            MultiByteToWideChar(CP_UTF8, 0, argv[0], -1, wname, 64) > 0) {
+            _snwprintf(appbuf, MAX_PATH, L"%s\\%s.exe", sysdir, wname);
+            appbuf[MAX_PATH - 1] = L'\0';
+            appname = appbuf;
+        }
+    }
+
+    if (!CreateProcessW(appname, cmdline, NULL, NULL, FALSE,
                         CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
         return -1;
     WaitForSingleObject(pi.hProcess, INFINITE);

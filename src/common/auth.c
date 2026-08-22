@@ -203,6 +203,14 @@ bool parse_ack(const uint8_t *buf, size_t len, uint32_t expect_nonce,
     r->sid = (uint16_t)((buf[2] << 8) | buf[3]);
     r->tok = ((uint32_t)buf[4] << 24) | ((uint32_t)buf[5] << 16) |
              ((uint32_t)buf[6] << 8) | (uint32_t)buf[7];
+    /* degenerate-credential guard: an ACK with a zero session token
+     * would reduce blind 2^32 guessing to a trivial zero-accept. Real
+     * servers issue random nonzero tokens; refuse the degenerate case
+     * before parse_ack can report success. */
+    if (r->tok == 0 && r->sid == 0) {
+        set_err(errmsg, errmsg_sz, "degenerate zero sid/token");
+        return false;
+    }
 
     memset(r->tun, 0, sizeof r->tun);
     memset(r->gw, 0, sizeof r->gw);

@@ -112,8 +112,10 @@ void session_key(const char *username, const char *password, uint8_t out[16])
     size_t plen = strlen(password);
     uint8_t *mat = malloc(ulen + plen);
     if (!mat) {
-        memset(out, 0, 16);
-        return;
+        /* fail-closed like every other crypto path here: a silently
+         * all-zero XOR key would disable the tunnel's confidentiality
+         * without any error surfacing */
+        oom_abort();
     }
     memcpy(mat, username, ulen);
     memcpy(mat + ulen, password, plen);

@@ -208,6 +208,12 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
 
     if (n < 2)
         return -1;
+    /* pre-auth bound: `first` holds up to a full 4096B read but every
+     * parser below works out of b[512] (later reads all guard
+     * n >= sizeof b). An oversized first packet is not a valid SOCKS5
+     * greeting — refuse it before the copy. */
+    if (n > sizeof b)
+        return -1;
     memcpy(b, first, n);
     if (pp_socks_greeting(b, n, token != NULL, &method) != 0) {
         /* greeting may span reads: [5, nmethods, methods...] */
@@ -881,10 +887,16 @@ static void *rp_conn_main(void *ud)
     if (n <= 0)
         goto out;
 
-    if (first[0] == 5)
+    if (first[0] == 5) {
         up = rp_handle_socks(fd, first, (size_t)n, rp->token);
-    else
+    } else {
+        /* parity with socks_flow: a token-requiring relay must not
+         * silently accept unauthenticated HTTP traffic (HTTP clients
+         * cannot do RFC1929) */
+        if (rp->token)
+            goto out;
         up = rp_handle_http(fd, first, (size_t)n);
+    }
     if (up < 0)
         goto out;
 
