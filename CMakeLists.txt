@@ -384,8 +384,9 @@ add_library(iwan_oidc STATIC
 target_include_directories(iwan_oidc PUBLIC src/oidc)
 target_link_libraries(iwan_oidc PUBLIC iwan_core)
 if(APPLE)
-  # the Keychain at-rest wrapper (oidc_pwsecret.c) needs Security
-  target_link_libraries(iwan_oidc PUBLIC "-Wl,-framework,Security")
+  # the Keychain at-rest wrapper (oidc_pwsecret.c) needs Security;
+  # a bare framework name makes CMake place it after the objects
+  target_link_libraries(iwan_oidc PUBLIC Security)
 endif()
 
 # ---------------------------------------------------------------------------
