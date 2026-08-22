@@ -394,6 +394,15 @@ target_link_libraries(iwan-client PRIVATE iwan_core)
 add_executable(iwan-client-oidc src/iwan_client_oidc.c)
 target_link_libraries(iwan-client-oidc PRIVATE iwan_oidc)
 
+if(APPLE)
+  # Keychain branch: SecItem* from Security, CF* helpers from CoreFoundation.
+  # SHELL: keeps each "-framework X" as one argument and stops CMake from
+  # translating the framework names into -lSecurity / -lCoreFoundation.
+  target_link_options(iwan-client-oidc PRIVATE
+    "SHELL:-framework Security"
+    "SHELL:-framework CoreFoundation")
+endif()
+
 # SOCKS5 handshake test harness (root-free: drives the real accept/handshake/
 # netstack code with a loopback listener; see tests/socks_handshake.py).
 # Built only when testing is enabled so release binaries don't ship it.
