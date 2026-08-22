@@ -383,13 +383,6 @@ add_library(iwan_oidc STATIC
   src/oidc/oidc_util.c)
 target_include_directories(iwan_oidc PUBLIC src/oidc)
 target_link_libraries(iwan_oidc PUBLIC iwan_core)
-if(APPLE)
-  # the Keychain at-rest wrapper (oidc_pwsecret.c) needs Security.
-  # find_library returns the full .framework path, which links
-  # unambiguously (bare names get -l-prefixed and mis-ordered).
-  find_library(SECURITY_FRAMEWORK Security REQUIRED)
-  target_link_libraries(iwan_oidc PUBLIC ${SECURITY_FRAMEWORK})
-endif()
 
 # ---------------------------------------------------------------------------
 # Executables
@@ -400,6 +393,12 @@ target_link_libraries(iwan-client PRIVATE iwan_core)
 
 add_executable(iwan-client-oidc src/iwan_client_oidc.c)
 target_link_libraries(iwan-client-oidc PRIVATE iwan_oidc)
+if(APPLE)
+  # the Keychain at-rest wrapper (oidc_pwsecret.c) needs Security.
+  # LINK_OPTIONS pass items verbatim (no -l mangling) and land after
+  # the objects, which is what framework resolution requires.
+  target_link_options(iwan-client-oidc PRIVATE "-framework" "Security")
+endif()
 
 # SOCKS5 handshake test harness (root-free: drives the real accept/handshake/
 # netstack code with a loopback listener; see tests/socks_handshake.py).
