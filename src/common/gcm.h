@@ -8,12 +8,6 @@
 #define GCM_NONCE_LEN 12
 #define GCM_TAG_LEN   16
 
-/* AES-256-GCM. ct_tag = ciphertext || GCM_TAG_LEN-byte tag.
- * Returns false on bad tag. */
-bool gcm_decrypt(const uint8_t key[32], const uint8_t nonce[GCM_NONCE_LEN],
-                 const uint8_t *ct_tag, size_t ct_tag_len,
-                 const uint8_t *aad, size_t aad_len,
-                 uint8_t *plain_out, size_t *plain_len);
 
 /* decrypt the iWAN passWord field. Returns malloc'd UTF-8 password, or NULL. */
 char *decrypt_password(const char *encrypted_b64, const char *app_secret,

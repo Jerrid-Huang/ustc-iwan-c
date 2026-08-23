@@ -45,7 +45,6 @@ option(IWAN_LINUX_STATIC "Linux: link fully static binaries" OFF)
 option(IWAN_STATIC       "Windows: statically link OpenSSL + runtime libs" OFF)
 option(IWAN_BPF          "Linux: compile and embed the tun steering eBPF program" ON)
 option(IWAN_WERROR       "Treat compiler warnings as errors" OFF)
-option(IWAN_WIN_PUMP_SINGLE "Windows: single-thread zero-copy TUN uplink (instead of SPSC + sender thread)" ON)
 set(IWAN_OPENSSL_DIR "" CACHE PATH "OpenSSL sysroot (include/ + lib/ or lib64/)")
 # ---------------------------------------------------------------------------
 # Global flags — the old Makefile's CFLAGS/LDFLAGS, split per platform.
@@ -131,6 +130,7 @@ set(IWAN_CORE_SRCS
   src/common/https.c
   src/common/ipv4.c
   src/common/json.c
+  src/common/lockout.c
   src/common/port.c
   src/common/protocol.c
   src/common/proto_parse.c
@@ -144,10 +144,10 @@ set(IWAN_CORE_SRCS
 if(WIN32)
   # tun_win.c replaces tun.c (wintun backend; tun.c is Linux TUN ioctls),
   # and server.c is Linux-only (TUN/iptables/BPF, see src/common/server.c).
-  list(APPEND IWAN_CORE_SRCS src/common/tun_win.c)
-  if(IWAN_WIN_PUMP_SINGLE)
-    list(APPEND IWAN_CORE_SRCS src/common/pump_win_single.c)
-  endif()
+  # single-thread zero-copy uplink (the SPSC + sender-thread variant
+  # was removed; pump_win_single.c is the only Windows pump)
+  list(APPEND IWAN_CORE_SRCS src/common/tun_win.c
+    src/common/pump_win_single.c)
 elseif(APPLE)
   # macOS client: tun.c holds the generic code (reader pool, write
   # retry, close; its Linux-only ioctl/BPF parts are #ifdef __linux__),
@@ -223,9 +223,6 @@ add_library(iwan_core STATIC ${IWAN_CORE_SRCS})
 target_include_directories(iwan_core PUBLIC src/common)
 target_link_libraries(iwan_core PUBLIC lwip)
 target_compile_definitions(iwan_core PUBLIC IWAN_TCP_STACK_LWIP=1)
-if(WIN32 AND IWAN_WIN_PUMP_SINGLE)
-  target_compile_definitions(iwan_core PUBLIC IWAN_WIN_PUMP_SINGLE=1)
-endif()
 # Threads::Threads is linked LAST: on MinGW it resolves to -lpthread, and
 # in the IWAN_STATIC build it must come after the -Bstatic winpthread group
 # (whose archive then satisfies the pthread refs and the trailing -lpthread
@@ -405,10 +402,11 @@ endif()
 
 # SOCKS5 handshake test harness (root-free: drives the real accept/handshake/
 # netstack code with a loopback listener; see tests/socks_handshake.py).
-# Built only when testing is enabled so release binaries don't ship it.
+# Off by default so release binaries don't ship it; CI passes
+# -DBUILD_TESTING=ON wherever tests/socks_handshake.py runs.
 # Plain option() — NOT include(CTest), whose enable_testing() defines a
 # `test` target that collides with the integration-suite target below.
-option(BUILD_TESTING "Build the SOCKS5 handshake test harness" ON)
+option(BUILD_TESTING "Build the SOCKS5 handshake test harness" OFF)
 if(BUILD_TESTING)
   add_executable(socks_handshake_harness tests/socks_handshake_harness.c)
   target_link_libraries(socks_handshake_harness PRIVATE iwan_core)

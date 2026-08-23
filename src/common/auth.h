@@ -19,10 +19,6 @@ typedef struct {
 int build_open(buf_t *out, const char *user, const uint8_t ct[16],
                uint16_t mtu, uint8_t enc, uint32_t nonce);
 
-/* parse OPEN_ACK. On success fills r and returns true; errmsg (if set) on failure. */
-bool parse_ack(const uint8_t *buf, size_t len, uint32_t expect_nonce,
-               AuthResult *r, char *errmsg, size_t errmsg_sz);
-
 /* connected IPv4 UDP socket with recv timeout. Returns fd or -1. */
 int udp_connect(const char *host, uint16_t port, int timeout_ms);
 

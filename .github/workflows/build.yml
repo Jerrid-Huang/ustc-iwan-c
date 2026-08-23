@@ -143,6 +143,7 @@ jobs:
         run: |
           set -o pipefail
           cmake -B build-sanitize \
+            -DBUILD_TESTING=ON \
             -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
             -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
           cmake --build build-sanitize -j"$(nproc)" 2>&1 | tee build-sanitize.log
@@ -459,6 +460,7 @@ jobs:
       - name: Configure
         run: |
           cmake -B build \
+            -DBUILD_TESTING=ON \
             -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/${{ matrix.toolchain }} \
             -DIWAN_OPENSSL_DIR=/opt/ossl-${{ matrix.arch }} \
             -DIWAN_STATIC=ON -DIWAN_WERROR=ON
@@ -719,6 +721,7 @@ jobs:
       - name: Configure
         run: |
           cmake -B build \
+            -DBUILD_TESTING=ON \
             -DOPENSSL_ROOT_DIR=/opt/ossl-${{ matrix.arch }} \
             -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \

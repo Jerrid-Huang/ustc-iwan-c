@@ -39,7 +39,8 @@ bool dbg_env(const char *name);
  * defval when unset/empty/unparseable/out-of-range (with a warning);
  * allow_zero lets an explicit 0 (the "disabled" sentinel) pass through. */
 long long env_ms_range(const char *name, long long defval, long long min,
-                       long long max, int allow_zero);
+                       long long max, int allow_zero,
+                       const char *range_desc);
 
 /* ---------------- shared parsing / buffer-growth helpers ---------------- */
 

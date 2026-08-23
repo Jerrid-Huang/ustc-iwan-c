@@ -78,7 +78,6 @@ void server_ctx_destroy(struct server_ctx *ctx);
 void server_rate_limits_init(void);
 
 /* Multithread-safe printf (server log lines). */
-void srv_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
 /* Handle one UDP packet from peer. May write decrypted data to the TUN
  * (only when ctx->tun_fd >= 0, else dropped). Called from the uplink
@@ -108,7 +107,6 @@ uint64_t server_send_drops(void);
 
 /* Cumulative UDP datagrams sent to clients (includes control frames
  * such as OPEN_ACK/PING_RSP, not only tunnel data). */
-uint64_t server_dl_pkts(void);
 
 /* IWAN_DEBUG=1: print per-step uplink timing averages once per second. */
 void server_up_stats_print(void);

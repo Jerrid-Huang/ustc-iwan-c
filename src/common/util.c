@@ -307,7 +307,8 @@ bool dbg_env(const char *name)
  * "watchdog disabled" sentinel. Wrapper callers that must parse once per
  * process cache the result themselves. */
 long long env_ms_range(const char *name, long long defval, long long min,
-                       long long max, int allow_zero)
+                       long long max, int allow_zero,
+                       const char *range_desc)
 {
     const char *v = getenv(name);
     char *end;
@@ -318,15 +319,15 @@ long long env_ms_range(const char *name, long long defval, long long min,
     errno = 0;
     n = strtoll(v, &end, 10);
     if (errno != 0 || end == v || *end != '\0') {
-        log_err("%s: invalid value '%s' (0 to disable, 10s..24h); "
-                "using default", name, v);
+        log_err("%s: invalid value '%s' (%s); using default",
+                name, v, range_desc);
         return defval;
     }
     if (n == 0 && allow_zero)
         return 0;
     if (n < min || n > max) {
-        log_err("%s: invalid value '%s' (0 to disable, 10s..24h); "
-                "using default", name, v);
+        log_err("%s: invalid value '%s' (%s); using default",
+                name, v, range_desc);
         return defval;
     }
     return n;

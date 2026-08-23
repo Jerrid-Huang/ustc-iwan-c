@@ -76,19 +76,6 @@ static inline void pump_prof_add(pump_prof_t *p, uint64_t us)
     p->n++;
 }
 
-/* ---------------- Windows SPSC sender (two-thread variant) ---------------- */
-#ifdef _WIN32
-#define PUMP_TX_POOL 4
-#define PUMP_SPSC_CAP 16
-typedef struct pump_tx_buf pump_tx_buf_t;   /* fwd, defined below */
-typedef struct {
-    volatile unsigned head;  /* consumer-owned pop index */
-    volatile unsigned tail;  /* producer-owned push index */
-    unsigned mask;           /* PUMP_SPSC_CAP - 1 */
-    struct pump_tx_buf *slots[PUMP_SPSC_CAP];
-} pump_spsc_ring_t;
-#endif
-
 /* ---------------- TX batch ---------------- */
 typedef struct {
     uint8_t *batch;
@@ -98,15 +85,6 @@ typedef struct {
     unsigned n;
     uint64_t t0;
 } pump_tx_t;
-
-#ifdef _WIN32
-/* one pool-owned batch buffer: filled by the wintun reader, sent by the
- * dedicated sender thread, then returned to the free list */
-struct pump_tx_buf {
-    struct pump_tx_buf *next;
-    pump_tx_t tx;
-};
-#endif
 
 /* ---------------- pump context ---------------- */
 typedef struct {
@@ -128,18 +106,6 @@ typedef struct {
                          * downlink); distinguishes failure from the
                          * user's Ctrl-C so run_pump can report it */
     pump_prof_t prof[PUMP_PROF_N];   /* [prof] stage timers (whole-run) */
-#ifdef _WIN32
-    /* Two-thread variant: the wintun reader enqueues per-packet n=1
-     * buffers through the SPSC rings and a dedicated sender thread does
-     * the WSASend. Single-thread variant leaves these unused. */
-    pump_spsc_ring_t free_ring;   /* consumer -> producer (free buffers) */
-    pump_spsc_ring_t ready_ring;  /* producer -> consumer (batches) */
-    HANDLE free_sem;              /* count of free buffers */
-    HANDLE ready_sem;             /* count of ready batches */
-    struct pump_tx_buf *tx_pool[PUMP_TX_POOL]; /* batch buffer pool */
-    pthread_t sender_thread;
-    int sender_stop;
-#endif
 } pump_ctx_t;
 
 #endif /* IWAN_PROXY_INTERNAL_H */

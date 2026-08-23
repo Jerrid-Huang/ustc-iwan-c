@@ -19,7 +19,7 @@ void pkt_hdr(uint8_t typ, uint8_t enc, uint16_t sid, uint32_t tok,
     out[7] = (uint8_t)tok;
 }
 
-void pkt_sig(const uint8_t h8[IWAN_HDR_LEN], uint8_t out[IWAN_SIG_LEN])
+static void pkt_sig(const uint8_t h8[IWAN_HDR_LEN], uint8_t out[IWAN_SIG_LEN])
 {
     uint8_t x[IWAN_HDR_LEN + 2];
     memcpy(x, h8, IWAN_HDR_LEN);

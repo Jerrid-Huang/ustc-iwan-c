@@ -649,7 +649,7 @@ Json *json_arr_at(const Json *j, size_t i)
     return (j && j->type == JSON_ARR && i < j->u.a.len) ? j->u.a.arr[i] : NULL;
 }
 
-Json *json_obj_get(const Json *j, const char *key)
+static Json *json_obj_get(const Json *j, const char *key)
 {
     Json *found = NULL;
     if (!j || j->type != JSON_OBJ)

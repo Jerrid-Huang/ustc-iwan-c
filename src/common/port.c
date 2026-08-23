@@ -959,21 +959,6 @@ ssize_t port_recv(int fd, void *buf, size_t len, int flags)
     return (ssize_t)r;
 }
 
-ssize_t port_sendto(int fd, const void *buf, size_t len, int flags,
-                    const struct sockaddr *to, socklen_t tolen)
-{
-    int r;
-    if (ensure_dontwait(fd, flags) != 0)
-        return -1;
-    r = sendto((SOCKET)fd, (const char *)buf, (int)len, 0,
-               (const struct sockaddr *)to, (int)tolen);
-    if (r == SOCKET_ERROR) {
-        set_sock_errno(fd);
-        return -1;
-    }
-    return (ssize_t)r;
-}
-
 /* Convert an iovec array to WSABUF layout. NOTE: WSABUF is {ULONG len;
  * CHAR *buf} — the reverse field order of struct iovec {void *iov_base;
  * size_t iov_len} — so a direct cast is invalid (WSAEFAULT). Use the

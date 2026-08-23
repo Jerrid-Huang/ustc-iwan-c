@@ -73,7 +73,8 @@ static unsigned socks_rx_stale_ms(void)
     parsed = 1;
     cached = (unsigned)env_ms_range("IWAN_RX_STALE_MS",
                                     SOCKS_RX_STALE_MS_DEFAULT, 10000,
-                                    86400000, 1);
+                                    86400000, 1, "(0 to disable, "
+                                                 "10s..24h)");
     return cached;
 }
 #define LISTEN_BACKLOG   64

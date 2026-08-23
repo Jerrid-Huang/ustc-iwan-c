@@ -19,7 +19,6 @@ size_t      json_arr_len(const Json *j);
 Json       *json_arr_at(const Json *j, size_t i);
 /* NULL if missing; duplicate keys: last occurrence wins (serde_json Map
  * semantics) */
-Json       *json_obj_get(const Json *j, const char *key);
 /* deep lookup path "a.b.0.c": numeric segments index arrays */
 Json       *json_get(const Json *root, const char *path);
 /* convenience: string at path or NULL */

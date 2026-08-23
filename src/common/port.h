@@ -222,8 +222,6 @@ int port_set_nonblock(int fd, bool nb);
 
 ssize_t port_send(int fd, const void *buf, size_t len, int flags);
 ssize_t port_recv(int fd, void *buf, size_t len, int flags);
-ssize_t port_sendto(int fd, const void *buf, size_t len, int flags,
-                    const struct sockaddr *to, socklen_t tolen);
 ssize_t port_sendmsg(int fd, const struct msghdr *msg, int flags);
 int     port_sendmmsg(int fd, struct mmsghdr *msgvec, unsigned vlen,
                       int flags);
@@ -275,10 +273,6 @@ static inline ssize_t port_send(int fd, const void *buf, size_t len, int flags)
 { return send(fd, buf, len, flags); }
 static inline ssize_t port_recv(int fd, void *buf, size_t len, int flags)
 { return recv(fd, buf, len, flags); }
-static inline ssize_t port_sendto(int fd, const void *buf, size_t len,
-                                  int flags, const struct sockaddr *to,
-                                  socklen_t tolen)
-{ return sendto(fd, buf, len, flags, to, tolen); }
 static inline ssize_t port_sendmsg(int fd, const struct msghdr *msg, int flags)
 { return sendmsg(fd, msg, flags); }
 static inline int port_sendmmsg(int fd, struct mmsghdr *msgvec,

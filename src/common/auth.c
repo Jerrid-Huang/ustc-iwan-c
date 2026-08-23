@@ -135,7 +135,7 @@ static bool ack_tlv(uint8_t typ, const uint8_t *val, uint8_t vlen, void *ud)
     return true;
 }
 
-bool parse_ack(const uint8_t *buf, size_t len, uint32_t expect_nonce,
+static bool parse_ack(const uint8_t *buf, size_t len, uint32_t expect_nonce,
                AuthResult *r, char *errmsg, size_t errmsg_sz)
 {
     uint8_t t;

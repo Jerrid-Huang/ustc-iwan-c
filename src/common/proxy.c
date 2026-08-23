@@ -161,7 +161,8 @@ static unsigned pump_rx_stale_ms(void)
     parsed = 1;
     cached = (unsigned)env_ms_range("IWAN_RX_STALE_MS",
                                     PUMP_RX_STALE_MS_DEFAULT, 10000,
-                                    86400000, 1);
+                                    86400000, 1, "(0 to disable, "
+                                                 "10s..24h)");
     return cached;
 }
 #define PUMP_POLL_CEIL_MS 1000  /* cap on the recvmmsg park timeout */
@@ -176,7 +177,7 @@ static unsigned pump_rx_stale_ms(void)
 
 static _Thread_local pump_tx_t g_tx;   /* Linux per-reader batch */
 
-#if !defined(_WIN32) || !defined(IWAN_WIN_PUMP_SINGLE)
+#ifndef _WIN32
 /* EAGAIN/ENOBUFS backpressure wait shared by the two TX paths: sleep
  * for the remaining retry budget (poll for writability; with the 5ms
  * budget the remaining-time cap always binds), then report whether the
@@ -412,7 +413,7 @@ static void pump_tx_send(pump_ctx_t *ctx, pump_tx_t *q)
     pthread_mutex_unlock(&ctx->send_lock);
     pump_prof_add(&ctx->prof[PP_SEND], now_us() - t0);
 }
-#endif /* !_WIN32 || !IWAN_WIN_PUMP_SINGLE */
+#endif /* !_WIN32 */
 
 
 #ifndef _WIN32
@@ -488,7 +489,7 @@ static void pump_tun_pkt(void *ud, uint8_t *pkt, size_t len, bool last)
     if (q->n == PUMP_BATCH || now_us() - q->t0 >= PUMP_MAX_LAT_US)
         pump_flush(ctx, q);
 }
-#elif defined(_WIN32) && defined(IWAN_WIN_PUMP_SINGLE)
+#elif defined(_WIN32)
 #include "pump_win_single.h"
 /* Single-thread uplink: wintun reader -> inline zero-copy WSASend.
  * The SPSC producer/consumer pair is compiled out. */
@@ -496,221 +497,6 @@ static void pump_tun_pkt(void *ud, uint8_t *pkt, size_t len, bool last)
 #define pump_sender_start  pump_win_single_start
 #define pump_sender_stop   pump_win_single_stop
 #define pump_sender_free   pump_win_single_free
-#else /* _WIN32 */
-
-/* ---------- dedicated UDP sender thread (SPSC) ---------- */
-/* Strictly one producer (wintun reader) and one consumer (sender):
- * two pointer rings + counting semaphores, no mutex/cond on the hot
- * path. The pool has 4 batch buffers and the rings hold 16 slots, so
- * the ready ring can never fill (pool < ring capacity). */
-static inline int pump_spsc_push(pump_spsc_ring_t *r,
-                                 struct pump_tx_buf *b)
-{
-    unsigned t = r->tail;
-    unsigned next = (t + 1) & r->mask;
-    if (next == r->head)   /* full */
-        return 0;
-    r->slots[t] = b;
-    __sync_synchronize();   /* release: slot before tail */
-    r->tail = next;
-    return 1;
-}
-
-static inline struct pump_tx_buf *pump_spsc_pop(pump_spsc_ring_t *r)
-{
-    unsigned h = r->head;
-    if (h == r->tail)
-        return NULL;
-    struct pump_tx_buf *b = r->slots[h];
-    __sync_synchronize();   /* acquire: slot before head */
-    r->head = (h + 1) & r->mask;
-    return b;
-}
-
-static struct pump_tx_buf *pump_tx_acquire(pump_ctx_t *ctx)
-{
-    WaitForSingleObject(ctx->free_sem, INFINITE);
-    return pump_spsc_pop(&ctx->free_ring);
-}
-
-static void pump_tx_release(pump_ctx_t *ctx, struct pump_tx_buf *b)
-{
-    b->tx.n = 0;
-    pump_spsc_push(&ctx->free_ring, b);
-    ReleaseSemaphore(ctx->free_sem, 1, NULL);
-}
-
-static int pump_tx_enqueue(pump_ctx_t *ctx, struct pump_tx_buf *b)
-{
-    if (!pump_spsc_push(&ctx->ready_ring, b))
-        return -1;   /* cannot happen: pool(4) < ring cap(16) */
-    ReleaseSemaphore(ctx->ready_sem, 1, NULL);
-    return 0;
-}
-
-static struct pump_tx_buf *pump_tx_dequeue(pump_ctx_t *ctx)
-{
-    for (;;) {
-        if (ctx->sender_stop) {
-            /* stop requested: drain whatever is left, then exit */
-            return pump_spsc_pop(&ctx->ready_ring);
-        }
-        uint64_t w0 = now_us();
-        WaitForSingleObject(ctx->ready_sem, INFINITE);
-        pump_prof_add(&ctx->prof[PP_SENDWAIT], now_us() - w0);
-        struct pump_tx_buf *b = pump_spsc_pop(&ctx->ready_ring);
-        if (b != NULL)
-            return b;
-        /* spurious token (stop wake): loop */
-    }
-}
-
-/* reader finished a batch: hand it to the sender thread whole */
-static void pump_flush_w(pump_ctx_t *ctx, struct pump_tx_buf *b)
-{
-    if (b->tx.n == 0) {
-        pump_tx_release(ctx, b);
-        return;
-    }
-    uint64_t t0 = now_us();
-    if (pump_tx_enqueue(ctx, b) != 0)
-        pump_tx_release(ctx, b);
-    pump_prof_add(&ctx->prof[PP_ENQ], now_us() - t0);
-}
-
-/* tun_pool callback on Windows: per-packet send path.
- * Windows has no sendmmsg and no UDP_SEGMENT (SIO_UDP_NETSEGMENT is
- * rejected on the tiny11/virtio target), so batching would not reduce
- * system calls — it would only add up to PUMP_MAX_LAT_US of latency per
- * packet. Each inner packet is therefore enqueued immediately as its
- * own n=1 batch; the dedicated sender thread still moves the WSASend
- * off the wintun reader so a slow socket cannot stall TUN reads. The
- * pool (4 buffers) provides the backpressure when the sender lags. */
-static void pump_tun_pkt(void *ud, uint8_t *pkt, size_t len, bool last)
-{
-    pump_ctx_t *ctx = ud;
-
-    if (last)
-        return;   /* every packet was enqueued immediately; nothing pending */
-    if (len > (uint32_t)g_prof_tun_rmax)
-        g_prof_tun_rmax = (uint32_t)len;   /* single reader thread */
-    if (len > 1508)
-        atomic_fetch_add(&g_prof_tun_rbig, 1);
-    if (len == 0 || len > PUMP_SLOT) {
-        if (len > PUMP_SLOT)
-            atomic_fetch_add(&g_prof_tun_rdrop, 1);
-        log_debug("pump: drop packet, len %zu out of [1, %d]", len,
-                  PUMP_SLOT);
-        return;
-    }
-    struct pump_tx_buf *b = pump_tx_acquire(ctx);
-    if (b == NULL)
-        return;   /* stopped */
-    pump_tx_t *q = &b->tx;
-    q->n = 0;
-    q->t0 = now_us();
-    if (g_stop) {
-        pump_tx_release(ctx, b);
-        return;
-    }
-    {
-        uint8_t *s = q->batch;   /* single packet: slot 0 */
-        uint64_t t0 = now_us();
-        memcpy(s, q->hdr, 8);
-        memcpy(s + 8, pkt, len);   /* wintun scratch, copied out */
-        xor_crypt(s + 8, len, ctx->xor_key, 8);
-        pump_prof_add(&ctx->prof[PP_COPY_XOR], now_us() - t0);
-        PROF_ADD(g_prof_pump_tx, len);
-        q->iov[0].iov_base = s;
-        q->iov[0].iov_len = len + 8;
-        q->n = 1;
-    }
-    pump_flush_w(ctx, b);
-}
-
-static void pump_sender_free(pump_ctx_t *ctx);   /* fwd: used by start's err path */
-
-static void *pump_sender_main(void *ud)
-{
-    pump_ctx_t *ctx = ud;
-    for (;;) {
-        struct pump_tx_buf *b = pump_tx_dequeue(ctx);
-        if (b == NULL)
-            break;   /* stopped and drained */
-        pump_tx_send(ctx, &b->tx);
-        pump_tx_release(ctx, b);
-    }
-    return NULL;
-}
-
-static int pump_sender_start(pump_ctx_t *ctx)
-{
-    int pooln = (int)(sizeof ctx->tx_pool / sizeof ctx->tx_pool[0]);
-    const size_t slot = 8 + PUMP_SLOT;
-
-    ctx->free_ring.head = 0;
-    ctx->free_ring.tail = 0;
-    ctx->free_ring.mask = PUMP_SPSC_CAP - 1;
-    ctx->ready_ring.head = 0;
-    ctx->ready_ring.tail = 0;
-    ctx->ready_ring.mask = PUMP_SPSC_CAP - 1;
-    ctx->sender_stop = 0;
-
-    ctx->free_sem = CreateSemaphore(NULL, 0, PUMP_SPSC_CAP, NULL);
-    ctx->ready_sem = CreateSemaphore(NULL, 0, PUMP_SPSC_CAP, NULL);
-    if (ctx->free_sem == NULL || ctx->ready_sem == NULL)
-        goto err;
-
-    for (int i = 0; i < pooln; i++) {
-        struct pump_tx_buf *b = calloc(1, sizeof *b);
-        if (b == NULL)
-            goto err;
-        b->tx.batch = malloc((size_t)PUMP_BATCH * slot);
-        if (b->tx.batch == NULL) {
-            free(b);
-            goto err;
-        }
-        memset(b->tx.msgs, 0, sizeof b->tx.msgs);
-        pkt_hdr(ctx->enc ? PT_DATA_ENC : PT_DATA, ctx->enc, ctx->sid,
-                ctx->tok, b->tx.hdr);
-        ctx->tx_pool[i] = b;
-        pump_spsc_push(&ctx->free_ring, b);
-        ReleaseSemaphore(ctx->free_sem, 1, NULL);
-    }
-    if (pthread_create(&ctx->sender_thread, NULL, pump_sender_main, ctx) != 0)
-        goto err;
-    return 0;
-err:
-    pump_sender_free(ctx);
-    return -1;
-}
-
-static void pump_sender_stop(pump_ctx_t *ctx)
-{
-    ctx->sender_stop = 1;
-    ReleaseSemaphore(ctx->ready_sem, 1, NULL);   /* wake if blocked */
-    pthread_join(ctx->sender_thread, NULL);
-}
-
-static void pump_sender_free(pump_ctx_t *ctx)
-{
-    int pooln = (int)(sizeof ctx->tx_pool / sizeof ctx->tx_pool[0]);
-    for (int i = 0; i < pooln; i++) {
-        if (ctx->tx_pool[i] != NULL) {
-            free(ctx->tx_pool[i]->tx.batch);
-            free(ctx->tx_pool[i]);
-            ctx->tx_pool[i] = NULL;
-        }
-    }
-    if (ctx->free_sem != NULL) {
-        CloseHandle(ctx->free_sem);
-        ctx->free_sem = NULL;
-    }
-    if (ctx->ready_sem != NULL) {
-        CloseHandle(ctx->ready_sem);
-        ctx->ready_sem = NULL;
-    }
-}
 #endif /* _WIN32 */
 
 

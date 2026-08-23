@@ -19,4 +19,10 @@ bool https_post(const char *host, const char *path,
 bool https_get(const char *host, const char *path,
                int *status_out, char **body_out);
 
+/* Split an absolute https:// URL into malloc'd host and path (caller
+ * frees; oom_abort on allocation failure). Returns 1 on success; 0 when
+ * the URL is not an absolute https URL (other schemes, userinfo, or an
+ * explicit port are rejected). Shared with the OIDC JWKS parser. */
+int https_url_split(const char *url, char **host_out, char **path_out);
+
 #endif

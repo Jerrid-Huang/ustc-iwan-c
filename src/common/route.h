@@ -12,7 +12,6 @@ int cidr_parse(const char *s, uint32_t *net, int *prefix);
  * metric ("" when the default has none; all buffers >= 16 bytes). */
 bool capture_default(char gw[16], char dev[16], char metric[16]);
 /* first IPv4 subnet on dev as "a.b.c.d/plen", or false. */
-bool local_subnet(const char *dev, char out[24]);
 
 /* Apply the VPN routes: flush/up/mtu/addr on tun, then install the
  * proxy routes (default replaced onto tun). Returns true on success;

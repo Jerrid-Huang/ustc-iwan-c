@@ -460,63 +460,9 @@ bool capture_default(char gw[16], char dev[16], char metric[16]) {
 }
 #endif /* _WIN32 */
 
-#ifdef _WIN32
-bool local_subnet(const char *dev, char out[24])
-{
-    ULONG buflen = 0;
-    IP_ADAPTER_ADDRESSES *aa = NULL;
-    DWORD rc;
-    bool found = false;
-
-    out[0] = '\0';
-    rc = GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_PREFIX, NULL, NULL,
-                              &buflen);
-    if (rc != NO_ERROR && rc != ERROR_BUFFER_OVERFLOW)
-        return false;
-    if (buflen == 0)
-        return false;
-    aa = malloc(buflen);
-    if (aa == NULL)
-        oom_abort();
-    rc = GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_PREFIX, NULL, aa,
-                              &buflen);
-    if (rc != NO_ERROR) {
-        free(aa);
-        return false;
-    }
-    for (IP_ADAPTER_ADDRESSES *p = aa; p != NULL; p = p->Next) {
-        char d16[16];
-        d16[0] = '\0';
-        if (WideCharToMultiByte(CP_UTF8, 0, p->FriendlyName, -1, d16,
-                                sizeof d16, NULL, NULL) <= 0)
-            continue;   /* conversion failed: cannot match by name */
-        /* dev is either the friendly name or the decimal interface
-         * index produced by the fallback above */
-        if (strcmp(d16, dev) != 0 &&
-            (unsigned long)p->IfIndex != strtoul(dev, NULL, 10))
-            continue;
-        for (IP_ADAPTER_UNICAST_ADDRESS *u = p->FirstUnicastAddress;
-             u != NULL; u = u->Next) {
-            if (u->Address.lpSockaddr->sa_family != AF_INET)
-                continue;
-            const struct sockaddr_in *sin =
-                (const struct sockaddr_in *)u->Address.lpSockaddr;
-            char ip[16];
-            inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof ip);
-            unsigned plen = u->OnLinkPrefixLength;
-            if (plen > 32)
-                plen = 32;
-            snprintf(out, 24, "%s/%u", ip, plen);
-            found = true;
-            goto done;
-        }
-    }
-done:
-    free(aa);
-    return found;
-}
-#elif defined(__APPLE__)
-bool local_subnet(const char *dev, char out[24])
+#ifndef _WIN32   /* only the macOS teardown and the Linux setup call it */
+#if defined(__APPLE__)
+static bool local_subnet(const char *dev, char out[24])
 {
     char *args[] = { "ifconfig", (char *)dev, NULL };
     char *cap = port_cmd_capture(args, 8192);
@@ -565,7 +511,7 @@ bool local_subnet(const char *dev, char out[24])
     return ok;
 }
 #else
-bool local_subnet(const char *dev, char out[24]) {
+static bool local_subnet(const char *dev, char out[24]) {
     char *args[] = { "-4", "addr", "show", "dev", (char *)dev, NULL };
     char *cap = cmd_capture(args);
     if (cap == NULL)
@@ -628,7 +574,8 @@ done:
     free(cap);
     return ok;
 }
-#endif /* _WIN32 */
+#endif /* __APPLE__ || linux */
+#endif /* !_WIN32 */
 
 #ifdef _WIN32
 /* Sweep stale routes still bound to OUR adapter (audit M2): a crash,

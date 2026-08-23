@@ -94,50 +94,6 @@ char *oidc_jwt_segment(const char *jwt, int idx)
     return seg_decode(seg, seg_len);
 }
 
-/* split "https://host[:port]/path..." into host and path (path always
- * starts with '/', query/fragment stripped); 1 on success */
-static int split_https_url(const char *url, char *host, size_t hostsz,
-                           char *path, size_t pathsz)
-{
-    const char *u = url;
-    const char *slash;
-    const char *end;
-    const char *q, *f;
-    size_t n;
-
-    if (strncmp(u, "https://", 8) != 0)
-        return 0;
-    u += 8;
-    slash = strchr(u, '/');
-    n = slash ? (size_t)(slash - u) : strlen(u);
-    if (n == 0 || n >= hostsz || memchr(u, '@', n) != NULL)
-        return 0;
-    memcpy(host, u, n);
-    host[n] = '\0';
-    if (!slash) {
-        if (pathsz < 2)
-            return 0;
-        strcpy(path, "/");
-        return 1;
-    }
-    /* path runs from the first '/' to the end of the URL (or to a
-     * '?'/'#' if present); end must default to the URL end, not to
-     * slash — otherwise any URL without a query/fragment yields an
-     * empty path and is rejected (e.g. jwks_uri) */
-    end = slash + strlen(slash);
-    q = strchr(slash, '?');
-    f = strchr(slash, '#');
-    if (q && (!f || q < f))
-        end = q;
-    else if (f)
-        end = f;
-    n = (size_t)(end - slash);
-    if (n == 0 || n >= pathsz)
-        return 0;
-    memcpy(path, slash, n);
-    path[n] = '\0';
-    return 1;
-}
 
 /* GET host+path, parse the JSON body; NULL on any failure (reported) */
 static Json *fetch_json(const char *host, const char *path, const char *what)
@@ -351,8 +307,7 @@ static Json *fetch_jwks(const char *iss)
                             "OIDC discovery document");
     Json *jwks = NULL;
     const char *dis_iss, *jwks_uri;
-    char host[256] = {0};
-    char path[1024] = {0};
+    char *jhost = NULL, *jpath = NULL;
 
     if (!disc)
         return NULL;
@@ -368,12 +323,14 @@ static Json *fetch_jwks(const char *iss)
                      "jwks_uri\n");
         goto out;
     }
-    if (split_https_url(jwks_uri, host, sizeof host, path, sizeof path) == 0) {
+    if (!https_url_split(jwks_uri, &jhost, &jpath)) {
         oidc_eprintf("oidc_jwt_verify: invalid jwks_uri \"%s\"\n", jwks_uri);
         goto out;
     }
-    jwks = fetch_json(host, path, "JWKS");
+    jwks = fetch_json(jhost, jpath, "JWKS");
 out:
+    free(jhost);
+    free(jpath);
     json_free(disc);
     return jwks;
 }

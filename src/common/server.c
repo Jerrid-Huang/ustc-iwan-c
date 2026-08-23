@@ -198,7 +198,8 @@ static unsigned g_rate_open_max = RATE_OPEN_MAX_DEFAULT;
 static unsigned g_rate_echo_max = RATE_ECHO_MAX_DEFAULT;
 static pthread_mutex_t g_log_lock = PTHREAD_MUTEX_INITIALIZER;
 
-void srv_log(const char *fmt, ...)
+static uint64_t server_dl_pkts(void);
+static void srv_log(const char *fmt, ...)
 {
     va_list ap;
 
@@ -542,7 +543,7 @@ uint64_t server_send_drops(void)
 }
 
 /* downlink counter: packets forwarded tun->udp (python's ACKs etc.) */
-uint64_t server_dl_pkts(void)
+static uint64_t server_dl_pkts(void)
 {
     return atomic_load(&g_dl_pkts);
 }

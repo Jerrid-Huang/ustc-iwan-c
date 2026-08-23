@@ -38,6 +38,7 @@
 #include "port.h"
 #include "profile.h"
 #include "proto_parse.h"
+#include "lockout.h"
 #include "relay_proxy.h"
 #include "util.h"
 
@@ -146,23 +147,20 @@ static ssize_t rp_hs_recv(struct rp_hs *hs, int fd, void *buf, size_t len)
 #define RP_FAIL_WINDOW_MS  60000u
 
 typedef struct {
-    uint8_t  v6;                /* key is an IPv6 /64 prefix */
-    uint32_t k0, k1;            /* opaque key words (see rp_fail_key_of) */
+    uint8_t v6;                 /* key is an IPv6 /64 prefix */
+    uint8_t k[8];               /* address words (opaque comparison key) */
 } rp_fail_key;
 
-typedef struct {
-    rp_fail_key key;
-    int      fail;
-    uint64_t first_fail_ms;
-    uint64_t blocked_until_ms;  /* 0 = not blocked */
-} rp_fail_rec;
-
-static rp_fail_rec g_rp_fail[RP_FAIL_TRACK_MAX];
+static lockout_rec g_rp_fail[RP_FAIL_TRACK_MAX];
 static pthread_mutex_t g_rp_fail_mu = PTHREAD_MUTEX_INITIALIZER;
 
-static bool rp_key_eq(const rp_fail_key *a, const rp_fail_key *b)
+static size_t rp_fail_key_bytes(const rp_fail_key *k,
+                                uint8_t out[LOCKOUT_KEY_MAX])
 {
-    return a->v6 == b->v6 && a->k0 == b->k0 && a->k1 == b->k1;
+    memset(out, 0, LOCKOUT_KEY_MAX);
+    out[0] = k->v6;
+    memcpy(&out[1], k->k, 8);
+    return 9;
 }
 
 /* Extract the lockout key from a peer address. Byte-order is
@@ -174,15 +172,14 @@ static bool rp_fail_key_of(const struct sockaddr_storage *ss,
     memset(k, 0, sizeof *k);
     if (ss->ss_family == AF_INET) {
         const struct sockaddr_in *a = (const struct sockaddr_in *)ss;
-        memcpy(&k->k0, &a->sin_addr, 4);
+        memcpy(k->k, &a->sin_addr, 4);
         return true;
     }
     if (ss->ss_family == AF_INET6) {
         const struct sockaddr_in6 *a = (const struct sockaddr_in6 *)ss;
         /* first 8 bytes = /64 prefix (not s6_addr: mingw's IN6_ADDR
          * lacks the POSIX member name) */
-        memcpy(&k->k0, &a->sin6_addr, 4);
-        memcpy(&k->k1, (const uint8_t *)&a->sin6_addr + 4, 4);
+        memcpy(k->k, &a->sin6_addr, 8);
         k->v6 = 1;
         return true;
     }
@@ -191,72 +188,24 @@ static bool rp_fail_key_of(const struct sockaddr_storage *ss,
 
 static void rp_fail_note(const rp_fail_key *key, bool success)
 {
-    rp_fail_rec *e = NULL, *oldest = &g_rp_fail[0];
-    uint64_t now;
+    uint8_t b[LOCKOUT_KEY_MAX];
+    size_t n = rp_fail_key_bytes(key, b);
 
     if (!key)
         return;             /* getpeername failed: nothing to track */
-    now = now_ms();
-    pthread_mutex_lock(&g_rp_fail_mu);
-    if (success) {
-        for (int i = 0; i < RP_FAIL_TRACK_MAX; i++) {
-            if (rp_key_eq(&g_rp_fail[i].key, key)) {
-                memset(&g_rp_fail[i], 0, sizeof g_rp_fail[i]);
-                break;
-            }
-        }
-        pthread_mutex_unlock(&g_rp_fail_mu);
-        return;
-    }
-    for (int i = 0; i < RP_FAIL_TRACK_MAX; i++) {
-        rp_fail_rec *r = &g_rp_fail[i];
-        if (rp_key_eq(&r->key, key)) {
-            e = r;
-            break;
-        }
-        /* empty slot wins; otherwise keep the oldest first_fail_ms
-         * (the entry that would age out first) */
-        if (r->first_fail_ms == 0 ||
-            r->first_fail_ms < oldest->first_fail_ms)
-            oldest = r;
-    }
-    if (!e)
-        e = oldest;
-    /* fresh entry, or the previous burst aged out of the window */
-    if (e->first_fail_ms == 0 ||
-        now - e->first_fail_ms > RP_FAIL_WINDOW_MS) {
-        e->key = *key;
-        e->fail = 1;
-        e->first_fail_ms = now;
-        e->blocked_until_ms = 0;
-        pthread_mutex_unlock(&g_rp_fail_mu);
-        return;
-    }
-    e->key = *key;
-    e->fail++;
-    if (e->fail >= RP_FAIL_MAX)
-        e->blocked_until_ms = now + RP_FAIL_WINDOW_MS;
-    pthread_mutex_unlock(&g_rp_fail_mu);
+    lockout_note(g_rp_fail, RP_FAIL_TRACK_MAX, b, n, success,
+                 RP_FAIL_MAX, RP_FAIL_WINDOW_MS, &g_rp_fail_mu);
 }
 
 static bool rp_fail_blocked(const rp_fail_key *key)
 {
-    uint64_t now;
+    uint8_t b[LOCKOUT_KEY_MAX];
+    size_t n = rp_fail_key_bytes(key, b);
 
     if (!key)
         return false;
-    now = now_ms();
-    pthread_mutex_lock(&g_rp_fail_mu);
-    for (int i = 0; i < RP_FAIL_TRACK_MAX; i++) {
-        const rp_fail_rec *r = &g_rp_fail[i];
-        if (rp_key_eq(&r->key, key) && r->blocked_until_ms != 0 &&
-            r->blocked_until_ms > now) {
-            pthread_mutex_unlock(&g_rp_fail_mu);
-            return true;
-        }
-    }
-    pthread_mutex_unlock(&g_rp_fail_mu);
-    return false;
+    return lockout_blocked(g_rp_fail, RP_FAIL_TRACK_MAX, b, n,
+                           &g_rp_fail_mu);
 }
 
 /* ---- target resolution/connect (kernel stack) ---- */

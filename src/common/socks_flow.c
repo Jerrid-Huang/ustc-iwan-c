@@ -32,6 +32,7 @@
 #include "proto_parse.h"
 #include "tcpstack.h"
 #include "protocol.h"
+#include "lockout.h"
 #include "socks_internal.h"
 #include "util.h"
 
@@ -97,112 +98,43 @@ int g_flow_len;         /* active count */
 #define AUTH_FAIL_MAX_DEFAULT 5
 #define AUTH_FAIL_WINDOW_MS_DEFAULT 60000u
 #define AUTH_FAIL_TRACK_MAX 16
-typedef struct {
-    uint32_t ip;               /* peer IPv4, network byte order */
-    int      fail;
-    uint64_t first_fail_ms;
-    uint64_t blocked_until_ms; /* 0 = not blocked */
-} AuthFailRec;
-static AuthFailRec g_auth_fail[AUTH_FAIL_TRACK_MAX];
-
 static unsigned auth_fail_max(void)
 {
-    const char *v = getenv("IWAN_AUTH_FAIL_MAX");
-    char *end;
-    unsigned long n;
     static int cached = -1;
 
-    if (cached >= 0)
-        return (unsigned)cached;
-    if (!v || !v[0]) {
-        cached = (int)AUTH_FAIL_MAX_DEFAULT;
-        return AUTH_FAIL_MAX_DEFAULT;
-    }
-    n = strtoul(v, &end, 10);
-    if (end == v || *end != '\0' || n < 1 || n > 100) {
-        log_err("IWAN_AUTH_FAIL_MAX: invalid value '%s' (1..100); "
-                "using default", v);
-        cached = (int)AUTH_FAIL_MAX_DEFAULT;
-        return AUTH_FAIL_MAX_DEFAULT;
-    }
-    cached = (int)n;
-    return (unsigned)n;
+    if (cached < 0)
+        cached = (int)env_ms_range("IWAN_AUTH_FAIL_MAX",
+                                   AUTH_FAIL_MAX_DEFAULT, 1, 100, 0,
+                                   "1..100");
+    return (unsigned)cached;
 }
 
 static unsigned auth_fail_window_ms(void)
 {
-    const char *v = getenv("IWAN_AUTH_FAIL_WINDOW_MS");
-    char *end;
-    unsigned long n;
     static int cached = -1;
 
-    if (cached >= 0)
-        return (unsigned)cached;
-    if (!v || !v[0]) {
-        cached = (int)AUTH_FAIL_WINDOW_MS_DEFAULT;
-        return AUTH_FAIL_WINDOW_MS_DEFAULT;
-    }
-    n = strtoul(v, &end, 10);
-    if (end == v || *end != '\0' || n < 100 || n > 86400000) {
-        log_err("IWAN_AUTH_FAIL_WINDOW_MS: invalid value '%s' "
-                "(100..86400000); using default", v);
-        cached = (int)AUTH_FAIL_WINDOW_MS_DEFAULT;
-        return AUTH_FAIL_WINDOW_MS_DEFAULT;
-    }
-    cached = (int)n;
-    return (unsigned)n;
+    if (cached < 0)
+        cached = (int)env_ms_range("IWAN_AUTH_FAIL_WINDOW_MS",
+                                   AUTH_FAIL_WINDOW_MS_DEFAULT, 100,
+                                   86400000, 0, "100..86400000");
+    return (unsigned)cached;
 }
+
+/* Auth-failure lockout: fixed-slot table, key = peer IPv4. Params via
+ * IWAN_AUTH_FAIL_MAX / IWAN_AUTH_FAIL_WINDOW_MS (tests shrink them);
+ * the algorithm lives in lockout.c, shared with relay_proxy. */
+static lockout_rec g_auth_fail[AUTH_FAIL_TRACK_MAX];
 
 void auth_fail_note(uint32_t ip, bool success)
 {
-    uint64_t now = now_ms();
-    AuthFailRec *e = NULL;
-    AuthFailRec *oldest = &g_auth_fail[0];
-
-    if (success) {
-        for (int i = 0; i < AUTH_FAIL_TRACK_MAX; i++) {
-            if (g_auth_fail[i].ip == ip) {
-                memset(&g_auth_fail[i], 0, sizeof g_auth_fail[i]);
-                return;
-            }
-        }
-        return;
-    }
-    for (int i = 0; i < AUTH_FAIL_TRACK_MAX; i++) {
-        AuthFailRec *r = &g_auth_fail[i];
-        if (r->ip == ip) {
-            e = r;
-            break;
-        }
-        /* empty slot wins; otherwise keep the oldest first_fail_ms
-         * (the entry that would age out first) */
-        if (r->ip == 0 || r->first_fail_ms < oldest->first_fail_ms)
-            oldest = r;
-    }
-    if (!e)
-        e = oldest;
-    /* fresh entry, or the previous burst aged out of the window */
-    if (e->first_fail_ms == 0 ||
-        now - e->first_fail_ms > auth_fail_window_ms()) {
-        e->ip = ip;
-        e->fail = 1;
-        e->first_fail_ms = now;
-        e->blocked_until_ms = 0;
-        return;
-    }
-    e->ip = ip;
-    e->fail++;
-    if (e->fail >= (int)auth_fail_max())
-        e->blocked_until_ms = now + auth_fail_window_ms();
+    lockout_note(g_auth_fail, AUTH_FAIL_TRACK_MAX, &ip, sizeof ip,
+                 success, auth_fail_max(), auth_fail_window_ms(), NULL);
 }
 
 bool auth_fail_blocked(uint32_t ip)
 {
-    for (int i = 0; i < AUTH_FAIL_TRACK_MAX; i++) {
-        if (g_auth_fail[i].ip == ip && g_auth_fail[i].blocked_until_ms != 0)
-            return g_auth_fail[i].blocked_until_ms > now_ms();
-    }
-    return false;
+    return lockout_blocked(g_auth_fail, AUTH_FAIL_TRACK_MAX, &ip,
+                           sizeof ip, NULL);
 }
 
 /* ---- DNS result queue ---- */

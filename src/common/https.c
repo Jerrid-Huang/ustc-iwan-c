@@ -189,7 +189,7 @@ static int https_te_is_chunked(const char *val)
    success; 0 when the URL is not an absolute https URL (other schemes,
    userinfo, or an explicit port are rejected). The authority ends at the
    first '/', '?' or '#': a query must never leak into the Host header. */
-static int https_url_split(const char *url, char **host_out, char **path_out)
+int https_url_split(const char *url, char **host_out, char **path_out)
 {
     static const char scheme[] = "https://";
     const char *auth, *slash, *at, *cut;

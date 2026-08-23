@@ -137,7 +137,6 @@ enum {
 void pkt_hdr(uint8_t typ, uint8_t enc, uint16_t sid, uint32_t tok,
              uint8_t out[IWAN_HDR_LEN]);
 /* md5(h8 + IWAN_MW) */
-void pkt_sig(const uint8_t h8[IWAN_HDR_LEN], uint8_t out[IWAN_SIG_LEN]);
 /* append header WITH sig (for ctrl). out grows. */
 void ctrl_hdr(buf_t *out, uint8_t typ, uint8_t enc, uint16_t sid, uint32_t tok);
 /* append one TLV (len includes the 2 header bytes). */
