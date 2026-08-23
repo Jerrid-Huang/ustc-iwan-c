@@ -460,57 +460,7 @@ bool capture_default(char gw[16], char dev[16], char metric[16]) {
 }
 #endif /* _WIN32 */
 
-#ifndef _WIN32   /* only the macOS teardown and the Linux setup call it */
-#if defined(__APPLE__)
-static bool local_subnet(const char *dev, char out[24])
-{
-    char *args[] = { "ifconfig", (char *)dev, NULL };
-    char *cap = port_cmd_capture(args, 8192);
-    if (cap == NULL)
-        return false;
-    bool ok = false;
-    char *lsave = NULL;
-    for (char *line = strtok_r(cap, "\n", &lsave); line != NULL;
-         line = strtok_r(NULL, "\n", &lsave)) {
-        char *save = NULL;
-        char *tok = strtok_r(line, " \t\r", &save);
-        if (tok == NULL || strcmp(tok, "inet") != 0)
-            continue;
-        char *ip = strtok_r(NULL, " \t\r", &save);
-        if (ip == NULL)
-            continue;
-        uint8_t b[4];
-        if (!s2ip4(ip, b))
-            continue;
-        /* "netmask 0xffffff00" (hex, host order after strtoul) */
-        uint32_t mask = 0;
-        char *t;
-        while ((t = strtok_r(NULL, " \t\r", &save)) != NULL) {
-            if (strcmp(t, "netmask") == 0) {
-                char *mv = strtok_r(NULL, " \t\r", &save);
-                if (mv != NULL)
-                    mask = (uint32_t)strtoul(mv, NULL, 0);
-                break;
-            }
-        }
-        unsigned plen = 0;
-        for (uint32_t m = mask; m; m >>= 1)
-            plen += (unsigned)(m & 1u);   /* popcount of the netmask */
-        /* netmask 0xffffffff -> 32; sanity guard for weird output */
-        if (mask == 0)
-            plen = 24;
-        uint32_t net = ip4_u32(b) & mask;
-        uint8_t nb[4];
-        u32_ip4(net, nb);
-        snprintf(out, 24, "%u.%u.%u.%u/%u", nb[0], nb[1], nb[2], nb[3],
-                 plen);
-        ok = true;
-        break;
-    }
-    free(cap);
-    return ok;
-}
-#else
+#ifndef _WIN32
 static bool local_subnet(const char *dev, char out[24]) {
     char *args[] = { "-4", "addr", "show", "dev", (char *)dev, NULL };
     char *cap = cmd_capture(args);
@@ -574,8 +524,7 @@ done:
     free(cap);
     return ok;
 }
-#endif /* __APPLE__ || linux */
-#endif /* !_WIN32 */
+#endif /* _WIN32 */
 
 #ifdef _WIN32
 /* Sweep stale routes still bound to OUR adapter (audit M2): a crash,
