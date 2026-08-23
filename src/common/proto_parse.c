@@ -12,6 +12,7 @@
 #include <arpa/inet.h>
 #endif
 
+#include "crypto.h"
 #include "port.h"
 #include "proto_parse.h"
 
@@ -198,6 +199,23 @@ int pp_socks_greeting(const uint8_t *d, size_t n, bool have_token,
         }
     }
     return 0;
+}
+
+uint8_t pp_socks_pick_method(bool have_token, uint8_t method)
+{
+    if (method == 0xff)
+        return 0xff;
+    if (have_token || method == 2)
+        return 0x02;
+    return 0x00;
+}
+
+bool pp_socks_auth_ok(const uint8_t *pass, size_t plen, const char *token)
+{
+    if (!token)
+        return true;   /* courtesy mode validates nothing */
+    size_t tlen = strlen(token);
+    return plen == tlen && ct_eq(pass, (const uint8_t *)token, tlen) != 0;
 }
 
 /* ---- RFC1929 auth frame ---- */

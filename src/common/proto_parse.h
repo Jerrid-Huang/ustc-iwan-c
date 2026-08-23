@@ -39,6 +39,17 @@ int pp_http_target(const char *s, size_t n, bool is_connect,
  * 0 when the full frame is present and *method holds the negotiated
  * method (0xff when the client offered no acceptable one); -1 when
  * the frame is incomplete (caller waits for more bytes). */
+/* Method-selection verdict after pp_socks_greeting: 0x00 (no auth),
+ * 0x02 (run RFC1929 next), or 0xff (no acceptable method -> reject).
+ * Encodes the courtesy rule in ONE place: a token-less server accepts a
+ * client that offers only 0x02 and then validates nothing. */
+uint8_t pp_socks_pick_method(bool have_token, uint8_t method);
+
+/* RFC1929 verdict for a parsed auth frame: a token-less server accepts
+ * any well-formed frame; otherwise the password is compared against the
+ * token in constant time. */
+bool pp_socks_auth_ok(const uint8_t *pass, size_t plen, const char *token);
+
 int pp_socks_greeting(const uint8_t *d, size_t n, bool have_token,
                       uint8_t *method);
 

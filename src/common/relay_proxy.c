@@ -452,6 +452,7 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
         if (pp_socks_greeting(b, n, token != NULL, &method) != 0)
             return -1;
     }
+    method = pp_socks_pick_method(token != NULL, method);
     if (method == 0xff) {
         uint8_t no[2] = {5, 0xff};
         (void)port_send(fd, no, 2, 0);
@@ -476,19 +477,14 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
             int pr = pp_socks_auth_frame(b, n, user, sizeof user,
                                          &pass, &plen);
             if (pr > 0) {
-                uint8_t rr[2] = {1, 0};
-                if (token) {
-                    size_t tlen = strlen(token);
-                    if (plen != tlen ||
-                        ct_eq(pass, (const uint8_t *)token, tlen) == 0) {
-                        rr[1] = 1;
-                        /* M6c: a well-formed frame with the wrong
-                         * token is a counted auth failure */
-                        rp_fail_note(fk, false);
-                    }
-                }
+                /* M6c: a well-formed frame with the wrong token is
+                 * a counted auth failure */
+                bool ok = pp_socks_auth_ok(pass, plen, token);
+                uint8_t rr[2] = {1, ok ? 0 : 1};
+                if (!ok)
+                    rp_fail_note(fk, false);
                 (void)port_send(fd, rr, 2, 0);
-                if (rr[1] != 0)
+                if (!ok)
                     return -1;
                 if (token)
                     rp_fail_note(fk, true);   /* success clears */
