@@ -56,6 +56,12 @@ void exec_sanitize(void)
     unsetenv("LD_LIBRARY_PATH");
     unsetenv("LD_AUDIT");
     unsetenv("GLIBC_TUNABLES");
+    /* macOS loader-injection equivalents (sudo's env_reset usually
+     * covers these too; keep the hardening symmetric) */
+    unsetenv("DYLD_INSERT_LIBRARIES");
+    unsetenv("DYLD_LIBRARY_PATH");
+    unsetenv("DYLD_FRAMEWORK_PATH");
+    unsetenv("DYLD_FALLBACK_LIBRARY_PATH");
 #else
     /* no exec of helper binaries on Windows (port_run_cmd uses
      * CreateProcess); kept as a defined no-op so callers compile */

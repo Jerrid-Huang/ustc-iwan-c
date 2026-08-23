@@ -259,16 +259,18 @@ void oidc_connect_server(const Opts *o, const Config *cf)
     if (!o->socks) {
         /* no tun_name_valid precheck here: the CLI validates the value
          * and open_tun() re-validates at its API boundary */
-#ifndef _WIN32
-        /* Linux: pre-delete a stale tun device by name. Windows: wintun's
-         * open_tun (tun_win.c) deletes an existing adapter with the same
-         * name as part of open-or-create, so nothing to do here. */
+#ifdef __linux__
+        /* Linux: pre-delete a stale tun device by name. macOS: utun
+         * units are created fresh per connect() and vanish on close;
+         * Windows: wintun's open_tun (tun_win.c) deletes an existing
+         * adapter with the same name as part of open-or-create, so
+         * nothing to do on either. */
         char *const del[] = { "link", "del", (char *)o->tun, NULL };
         ip_run_quiet(del);
 #endif
         tun_fd = open_tun(o->tun);
         if (tun_fd < 0)
-            oidc_die("open tun (must be root or CAP_NET_ADMIN)");
+            oidc_die("open tun (must be root)");
         set_nonblock(tun_fd);
         if (debug_enabled())
             oidc_eprintf("  tun %s fd=%d\n", o->tun, tun_fd);
@@ -301,8 +303,16 @@ void oidc_connect_server(const Opts *o, const Config *cf)
         char *password = decrypt_password(encrypted_pw ? encrypted_pw : "",
                                           OIDC_APP_SECRET, cf->domain,
                                           srv_user ? srv_user : "");
-        if (!password)
+        if (!password) {
+#if defined(__APPLE__)
+            oidc_die("cannot read password from the login Keychain "
+                     "(locked keychain or SSH session? run "
+                     "`security unlock-keychain`, then retry; or "
+                     "re-run --fetch)");
+#else
             oidc_die("cannot decrypt password");
+#endif
+        }
         AuthResult res;
         int fd = authenticate_ex(user, password, NULL, IWAN_DEFAULT_MTU,
                                  host, port, DO_AUTH_OIDC, &res);

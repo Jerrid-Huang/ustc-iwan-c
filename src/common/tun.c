@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>   /* AF_INET/AF_INET6 (utun framing, macOS) */
 #include <unistd.h>
 
 #include "common.h"
@@ -223,7 +224,30 @@ void set_nonblock(int fd) {
 }
 
 ptrdiff_t tun_write(int fd, const void *buf, size_t len) {
+#if defined(__APPLE__)
+    /* utun frames carry a 4-byte address-family header on BOTH
+     * directions. XNU if_utun.c bcopy's the first 4 bytes into an
+     * u_int32_t and compares it numerically against AF_INET/AF_INET6,
+     * so the header is NATIVE byte order (02 00 00 00 for IPv4 on
+     * little-endian Macs) — NOT network byte order; wireguard-go's
+     * nativeEndian does the same. The datagram is all-or-nothing, so
+     * report only the payload length consumed to keep
+     * tun_write_retry's partial-write arithmetic intact. */
+    static _Thread_local uint8_t wbuf[4 + 65536];
+    if (len == 0 || len > 65536) {
+        errno = len ? EMSGSIZE : EINVAL;
+        return -1;
+    }
+    uint32_t fam = (((const uint8_t *)buf)[0] >> 4) == 6
+                       ? (uint32_t)AF_INET6
+                       : (uint32_t)AF_INET;
+    memcpy(wbuf, &fam, sizeof fam);
+    memcpy(wbuf + sizeof fam, buf, len);
+    ssize_t w = write(fd, wbuf, len + sizeof fam);
+    return w < 0 ? (ptrdiff_t)-1 : (ptrdiff_t)len;
+#else
     return (ptrdiff_t)write(fd, buf, len);
+#endif
 }
 
 int tun_write_retry(int fd, const uint8_t *pkt, size_t len, int max_ms,
@@ -324,6 +348,15 @@ static void *tun_reader_main(void *ud)
             uint64_t woke = now_ms();
             int npk = 0;
             while ((r = read(q->fd, buf, sizeof buf)) > 0) {
+#if defined(__APPLE__)
+                /* strip utun's 4-byte address-family header here,
+                 * before any downstream slot-size guard can see the
+                 * inflated length (see tun_write for the framing) */
+                if ((size_t)r <= 4)
+                    continue;
+                r -= 4;
+                memmove(buf, buf + 4, (size_t)r);
+#endif
                 pool->cb(pool->ud, buf, (size_t)r, false);
                 npk++;
             }
@@ -368,6 +401,12 @@ static void *tun_reader_main(void *ud)
         ssize_t r = read(q->fd, buf, sizeof buf);
         if (r <= 0)
             break;
+#if defined(__APPLE__)
+        if ((size_t)r <= 4)
+            continue;
+        r -= 4;
+        memmove(buf, buf + 4, (size_t)r);
+#endif
         pool->cb(pool->ud, buf, (size_t)r, false);
     }
     if (!(pool->abort != NULL && *pool->abort))

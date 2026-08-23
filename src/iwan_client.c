@@ -487,7 +487,7 @@ static void free_route_opts(CmdOpts *o)
  * interface (the caller must abort). */
 static int cleanup_stale_tun(const char *name)
 {
-#ifndef _WIN32
+#ifdef __linux__
     char p[256];
     int fd;
 
@@ -515,10 +515,10 @@ static int cleanup_stale_tun(const char *name)
                 strerror(e));
     return 0;   /* absent (or uninspectable): leave it to open_tun */
 #else
-    /* no /sys on Windows: wintun's open_tun (tun_win.c) reuses a stale
-     * adapter with the same name and, when the stale adapter refuses a
-     * session (left wedged by a killed previous run), deletes and
-     * recreates it, so there is nothing to pre-clean here. */
+    /* non-Linux: the /sys probe is meaningless. wintun's open_tun
+     * (tun_win.c) reuses a stale adapter with the same name (and
+     * deletes/recreates it when wedged); macOS utun units are created
+     * fresh per connect() and vanish on close — nothing to pre-clean. */
     (void)name;
     return 0;
 #endif
@@ -753,7 +753,7 @@ static int cmd_proxy(int argc, char **argv, int start)
                 "sit next to the executable and the wintun driver must be "
                 "installed)");
 #else
-        log_err("Error: open tun (must be root or CAP_NET_ADMIN)");
+        log_err("Error: open tun (must be root)");
 #endif
         slist_free(&routes);
         free_route_opts(&o);

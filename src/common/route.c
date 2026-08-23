@@ -363,7 +363,7 @@ bool capture_default(char gw[16], char dev[16], char metric[16])
 bool capture_default(char gw[16], char dev[16], char metric[16])
 {
     char *args[] = { "netstat", "-rn", "-f", "inet", NULL };
-    char *out = port_cmd_capture(args, 8192);
+    char *out = port_cmd_capture(args, 65536);
     if (out == NULL)
         return false;
     gw[0] = dev[0] = metric[0] = '\0';   /* metric: "" when absent */
@@ -393,6 +393,18 @@ bool capture_default(char gw[16], char dev[16], char metric[16])
         size_t llen = strlen(last);
         if (llen > 0 && last[llen - 1] == '!')
             last[llen - 1] = '\0';
+        /* the gateway must be a real IPv4 address: on-link defaults
+         * (USB NICs, phone tethering) print "default link#14 ..." and
+         * route(8) would reject the pin with an obscure error later */
+        struct in_addr gwt;
+        if (inet_pton(AF_INET, gt, &gwt) != 1) {
+            log_err("capture_default: default gateway '%s' is not an "
+                    "IPv4 address (on-link default via %s?); refusing "
+                    "to hijack blindly",
+                    gt, last);
+            free(out);
+            return false;
+        }
         copy_token(gw, 16, gt);
         copy_token(dev, 16, last);
         ok = true;
@@ -776,6 +788,12 @@ bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
     /* pin the server route via the physical gateway so the session
      * never loops back through the tunnel */
     if (srv_v4 && !srv_lo) {
+        /* delete-then-add: a crashed previous run leaves the pin in
+         * place and a bare add fails EEXIST (route(8) has no replace
+         * verb) — keep setup idempotent like every other step here */
+        char *pin_del[] = { "route", "-n", "delete", "-host", srv32,
+                            NULL };
+        port_run_cmd(pin_del);   /* best-effort */
         char *pin[] = { "route", "-n", "add", "-host", srv32,
                         (char *)ogw, NULL };
         if (!mac_run(pin, "route_setup: pin server route")) {
@@ -804,10 +822,22 @@ bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
                 log_err("route_setup: invalid route target '%s'", c);
                 goto rollback;
             }
-            char *d3[] = { "route", "-n", "delete", "-net", (char *)c,
+            /* canonical network address (host bits cleared): BSD radix
+             * stores the literal address as the route key while lookups
+             * match the MASKED key, so an unmasked target like
+             * "10.0.1.5/24" installs a route that can never hit */
+            uint32_t mask = prefix == 0
+                                ? 0
+                                : ~((1u << (32 - prefix)) - 1);
+            uint32_t canon = net & mask;
+            char netstr[24];
+            snprintf(netstr, sizeof netstr, "%u.%u.%u.%u/%d",
+                     (canon >> 24) & 0xFF, (canon >> 16) & 0xFF,
+                     (canon >> 8) & 0xFF, canon & 0xFF, prefix);
+            char *d3[] = { "route", "-n", "delete", "-net", netstr,
                            "-interface", (char *)ifn, NULL };
             port_run_cmd(d3);   /* idempotent setup */
-            char *r3[] = { "route", "-n", "add", "-net", (char *)c,
+            char *r3[] = { "route", "-n", "add", "-net", netstr,
                            "-interface", (char *)ifn, NULL };
             if (!mac_run(r3, "route_setup: add route"))
                 goto rollback;
@@ -972,9 +1002,33 @@ void route_teardown(const char *tun, const char *srv, const char *ogw,
                            "-interface", (char *)ifn, NULL };
             port_run_cmd(d1);   /* best-effort */
         } else {
-            char *d3[] = { "route", "-n", "delete", "-net", (char *)c,
+            /* match route_setup's canonical form (host bits cleared):
+             * deleting the raw user string can miss the installed key.
+             * Also delete the raw string when it differs — a pre-fix
+             * run may have stored an unmasked target. */
+            uint32_t net;
+            int prefix;
+            const char *target = c;
+            char netstr[24];
+            if (cidr_parse(c, &net, &prefix) == 0) {
+                uint32_t mask = prefix == 0
+                                    ? 0
+                                    : ~((1u << (32 - prefix)) - 1);
+                uint32_t canon = net & mask;
+                snprintf(netstr, sizeof netstr, "%u.%u.%u.%u/%d",
+                         (canon >> 24) & 0xFF, (canon >> 16) & 0xFF,
+                         (canon >> 8) & 0xFF, canon & 0xFF, prefix);
+                target = netstr;
+            }
+            char *d3[] = { "route", "-n", "delete", "-net", target,
                            "-interface", (char *)ifn, NULL };
             port_run_cmd(d3);   /* best-effort */
+            if (strcmp(target, c) != 0) {
+                char *d3b[] = { "route", "-n", "delete", "-net",
+                                (char *)c, "-interface", (char *)ifn,
+                                NULL };
+                port_run_cmd(d3b);   /* legacy residue, best-effort */
+            }
         }
     }
     char srv32[64];

@@ -1203,10 +1203,11 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
             slist_free(&routes6);
             return -1;
         }
-        log_info("tun %s ready: %zu route%s", tun_name, routes.n,
-                 routes.n == 1 ? "" : "s");
+        log_info("tun %s ready: %zu route%s", tun_ifname(tun_name),
+                 routes.n, routes.n == 1 ? "" : "s");
         for (size_t i = 0; i < routes.n; i++)
-            log_debug("route %s -> dev %s", routes.v[i], tun_name);
+            log_debug("route %s -> dev %s", routes.v[i],
+                      tun_ifname(tun_name));
     } else {
         if (!route_iface_up(tun_name, auth_tun_ip, auth_mtu)) {
             /* address/MTU assignment failed: undo the partial bring-up
@@ -1216,15 +1217,16 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
             slist_free(&routes6);
             return -1;
         }
-        log_info("tun %s up with IP %s/24 (no route hijack)", tun_name,
-                 auth_tun_ip);
+        log_info("tun %s up with IP %s/24 (no route hijack)",
+                 tun_ifname(tun_name), auth_tun_ip);
     }
     /* IPv6 policy routes through the tunnel (best-effort; the derived
      * ULA/96 on the interface was added by route_iface_up) */
     if (routes6.n > 0) {
         route_setup6(tun_name, &routes6);
         for (size_t i = 0; i < routes6.n; i++)
-            log_debug("route6 %s -> dev %s", routes6.v[i], tun_name);
+            log_debug("route6 %s -> dev %s", routes6.v[i],
+                      tun_ifname(tun_name));
     }
 
     g_stop = 0;
