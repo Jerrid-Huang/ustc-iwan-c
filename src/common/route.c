@@ -1008,17 +1008,17 @@ void route_teardown(const char *tun, const char *srv, const char *ogw,
              * run may have stored an unmasked target. */
             uint32_t net;
             int prefix;
-            const char *target = c;
-            char netstr[24];
+            char target[24];
             if (cidr_parse(c, &net, &prefix) == 0) {
                 uint32_t mask = prefix == 0
                                     ? 0
                                     : ~((1u << (32 - prefix)) - 1);
                 uint32_t canon = net & mask;
-                snprintf(netstr, sizeof netstr, "%u.%u.%u.%u/%d",
+                snprintf(target, sizeof target, "%u.%u.%u.%u/%d",
                          (canon >> 24) & 0xFF, (canon >> 16) & 0xFF,
                          (canon >> 8) & 0xFF, canon & 0xFF, prefix);
-                target = netstr;
+            } else {
+                snprintf(target, sizeof target, "%s", c);
             }
             char *d3[] = { "route", "-n", "delete", "-net", target,
                            "-interface", (char *)ifn, NULL };
