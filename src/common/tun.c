@@ -6,6 +6,7 @@
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
 #endif
+#include <arpa/inet.h>    /* htonl (utun family header) */
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -226,21 +227,22 @@ void set_nonblock(int fd) {
 ptrdiff_t tun_write(int fd, const void *buf, size_t len) {
 #if defined(__APPLE__)
     /* utun frames carry a 4-byte address-family header on BOTH
-     * directions. XNU if_utun.c bcopy's the first 4 bytes into an
-     * u_int32_t and compares it numerically against AF_INET/AF_INET6,
-     * so the header is NATIVE byte order (02 00 00 00 for IPv4 on
-     * little-endian Macs) — NOT network byte order; wireguard-go's
-     * nativeEndian does the same. The datagram is all-or-nothing, so
-     * report only the payload length consumed to keep
-     * tun_write_retry's partial-write arithmetic intact. */
+     * directions, in NETWORK byte order (AF_INET=2 -> 00 00 00 02).
+     * Verified empirically on a macOS 14 runner: a native-order family
+     * is silently discarded by the kernel while the network-order one
+     * delivers (the common "native order" claim, wireguard-go's
+     * nativeEndian included, does not hold for the utun control
+     * socket). The datagram is all-or-nothing, so report only the
+     * payload length consumed to keep tun_write_retry's partial-write
+     * arithmetic intact. */
     static _Thread_local uint8_t wbuf[4 + 65536];
     if (len == 0 || len > 65536) {
         errno = len ? EMSGSIZE : EINVAL;
         return -1;
     }
-    uint32_t fam = (((const uint8_t *)buf)[0] >> 4) == 6
-                       ? (uint32_t)AF_INET6
-                       : (uint32_t)AF_INET;
+    uint32_t fam = htonl((((const uint8_t *)buf)[0] >> 4) == 6
+                             ? (uint32_t)AF_INET6
+                             : (uint32_t)AF_INET);
     memcpy(wbuf, &fam, sizeof fam);
     memcpy(wbuf + sizeof fam, buf, len);
     ssize_t w = write(fd, wbuf, len + sizeof fam);
