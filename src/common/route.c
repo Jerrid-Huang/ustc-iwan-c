@@ -460,7 +460,7 @@ bool capture_default(char gw[16], char dev[16], char metric[16]) {
 }
 #endif /* _WIN32 */
 
-#ifndef _WIN32
+#ifdef __linux__
 static bool local_subnet(const char *dev, char out[24]) {
     char *args[] = { "-4", "addr", "show", "dev", (char *)dev, NULL };
     char *cap = cmd_capture(args);
@@ -524,7 +524,7 @@ done:
     free(cap);
     return ok;
 }
-#endif /* _WIN32 */
+#endif /* __linux__ */
 
 #ifdef _WIN32
 /* Sweep stale routes still bound to OUR adapter (audit M2): a crash,
