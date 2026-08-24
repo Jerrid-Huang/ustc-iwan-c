@@ -1,9 +1,0 @@
-/home/uker/my/software/ustc-iwan-c/build-dbg/CMakeFiles/lwip.dir
-/home/uker/my/software/ustc-iwan-c/build-dbg/CMakeFiles/iwan_core.dir
-/home/uker/my/software/ustc-iwan-c/build-dbg/CMakeFiles/iwan_oidc.dir
-/home/uker/my/software/ustc-iwan-c/build-dbg/CMakeFiles/iwan-client.dir
-/home/uker/my/software/ustc-iwan-c/build-dbg/CMakeFiles/iwan-client-oidc.dir
-/home/uker/my/software/ustc-iwan-c/build-dbg/CMakeFiles/iwan-server.dir
-/home/uker/my/software/ustc-iwan-c/build-dbg/CMakeFiles/test.dir
-/home/uker/my/software/ustc-iwan-c/build-dbg/CMakeFiles/edit_cache.dir
-/home/uker/my/software/ustc-iwan-c/build-dbg/CMakeFiles/rebuild_cache.dir
