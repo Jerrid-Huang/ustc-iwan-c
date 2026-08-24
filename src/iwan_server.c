@@ -726,8 +726,10 @@ static void *recv_thread_main(void *v)
                 last_qctl = now;
             }
             if (now - last_purge >= 1000) {
-                {
-                    static struct prof_state ps_recv, ps_tunw, ps_tunr, ps_dl;
+                if (atomic_load_explicit(&g_prof_on,
+                                         memory_order_relaxed)) {
+                    static struct prof_state ps_recv, ps_tunw, ps_tunr,
+                        ps_dl;
                     if (prof_print("srv recv", &ps_recv, g_prof_srv_recv)) {
                         prof_print("srv tunw", &ps_tunw, g_prof_srv_tunw);
                         prof_print("srv tunr", &ps_tunr, g_prof_srv_tunr);

@@ -933,7 +933,8 @@ static void *rp_dir_main(void *ud)
                 continue;
             break;              /* poll failed: stop relaying */
         }
-        if (prof_print(tag, &pst,
+        if (atomic_load_explicit(&g_prof_on, memory_order_relaxed) &&
+            prof_print(tag, &pst,
                        up_dir ? g_prof_rp_up_recv : g_prof_rp_dn_recv)) {
             static _Thread_local struct prof_state pst2, pst3;
             prof_print(up_dir ? "rp up send" : "rp dn send", &pst2,
