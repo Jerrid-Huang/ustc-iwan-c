@@ -6,12 +6,15 @@
 
 atomic_int g_prof_on;
 
+#ifndef IWAN_DEBUG_STRIP
 void prof_init(void)
 {
     if (getenv("IWAN_PROFILE"))
         atomic_store(&g_prof_on, 1);
 }
+#endif
 
+#ifndef IWAN_DEBUG_STRIP
 int prof_print(const char *tag, struct prof_state *st, uint64_t counter)
 {
     uint64_t now = now_us();
@@ -30,3 +33,4 @@ int prof_print(const char *tag, struct prof_state *st, uint64_t counter)
             (double)counter / 1e9);
     return 1;
 }
+#endif

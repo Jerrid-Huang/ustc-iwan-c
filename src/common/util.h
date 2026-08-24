@@ -6,7 +6,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef IWAN_DEBUG_STRIP
+#define log_debug(...) ((void)0)
+static inline bool debug_enabled(void) { return false; }
+#else
 bool debug_enabled(void);
+#endif
 /* reset PATH to a safe default and clear loader-injection vars; call in
  * the child before exec of helper binaries (root daemon hardening) */
 void exec_sanitize(void);
@@ -25,7 +30,9 @@ void oom_abort(void);
 
 void log_info(const char *fmt, ...);   /* -> stdout */
 void log_err(const char *fmt, ...);    /* -> stderr */
+#ifndef IWAN_DEBUG_STRIP
 void log_debug(const char *fmt, ...);  /* -> stderr if IWAN_DEBUG */
+#endif
 /* raw stderr printf (no newline, no flush): the shared implementation
  * behind the eprintf/oidc_eprintf helpers (log_err appends a newline
  * instead) */

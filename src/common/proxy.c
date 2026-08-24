@@ -46,6 +46,15 @@ atomic_uint_fast64_t g_prof_tun_rbig;       /* wintun packets > 1508B */
 atomic_uint_fast64_t g_prof_tun_rdrop;      /* wintun packets > PUMP_SLOT */
 uint32_t g_prof_tun_rmax;                   /* max wintun packet len (B) */
 
+static bool pump_prof_wanted(void)
+{
+#ifdef IWAN_DEBUG_STRIP
+    return false;   /* stripped build: the env var is never parsed */
+#else
+    return getenv("IWAN_PUMP_PROF") != NULL;
+#endif
+}
+
 static void pump_prof_print(const pump_ctx_t *ctx)
 {
     static const char *const names[PUMP_PROF_N] = {
@@ -644,11 +653,13 @@ static void *udp2tun_thread(void *ud) {
             break;
         }
         last_rx = now_ms();   /* any datagram resets the stale clock */
-        if (atomic_load_explicit(&g_prof_on, memory_order_relaxed)) {
+#ifndef IWAN_DEBUG_STRIP
+        {
             static struct prof_state pst_rx, pst_tx;
             if (prof_print("cli rx", &pst_rx, g_prof_pump_rx))
                 prof_print("cli tx", &pst_tx, g_prof_pump_tx);
         }
+#endif
         uint64_t dl0 = now_us();
         for (i = 0; i < v; i++) {
             ssize_t n = msgs[i].msg_len;
@@ -1099,7 +1110,7 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
     while (!g_stop) {
         port_sleep_us(100 * 1000);
         uint64_t nm = now_ms();
-        if (getenv("IWAN_PUMP_PROF") && nm - prof_last >= 1000) {
+        if (pump_prof_wanted() && nm - prof_last >= 1000) {
             pump_prof_print(&ctx);
             prof_last = nm;
         }
@@ -1123,7 +1134,7 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
     if (debug_enabled())
         err_printf("CLOSE sent\n");
 
-    if (getenv("IWAN_PUMP_PROF"))
+    if (pump_prof_wanted())
         pump_prof_print(&ctx);
     pthread_mutex_destroy(&ctx.send_lock);
     slist_free(&routes);
@@ -1144,7 +1155,7 @@ fail:
         pump_sender_free(&ctx);
     }
 #endif
-    if (getenv("IWAN_PUMP_PROF"))
+    if (pump_prof_wanted())
         pump_prof_print(&ctx);
     teardown_routes(tun_name, auth_tun_ip, server, ogw, odev,
                     ogw_metric, &routes, had_routes, &routes6);

@@ -36,6 +36,19 @@ project(iwan VERSION 0.1.1 LANGUAGES C)
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
+# Non-Debug builds compile out the whole debug tier: log_debug calls and
+# their format strings never reach the binary, and IWAN_DEBUG /
+# IWAN_PUMP_PROF / IWAN_PROFILE are not parsed at all. A Debug build
+# keeps everything for field diagnosis.
+if(CMAKE_BUILD_TYPE MATCHES "Debug")
+  set(_IWAN_STRIP_DEFAULT OFF)
+else()
+  set(_IWAN_STRIP_DEFAULT ON)
+endif()
+option(IWAN_DEBUG_STRIP "Compile out debug logging and diagnostic env vars" ${_IWAN_STRIP_DEFAULT})
+if(IWAN_DEBUG_STRIP)
+  add_compile_definitions(IWAN_DEBUG_STRIP=1)
+endif()
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)          # -std=c11 (strict, as before)

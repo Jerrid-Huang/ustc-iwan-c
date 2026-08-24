@@ -16,7 +16,9 @@
 #include <unistd.h>
 #endif
 
+#ifndef IWAN_DEBUG_STRIP
 static int debug_cached = -1;
+#endif
 
 /* process-wide stop flag (see util.h). atomic_bool is lock-free on every
  * supported target, so the relaxed store below is legal in a signal
@@ -35,6 +37,7 @@ void oom_abort(void)
     abort();
 }
 
+#ifndef IWAN_DEBUG_STRIP
 bool debug_enabled(void)
 {
     if (debug_cached < 0) {
@@ -44,6 +47,7 @@ bool debug_enabled(void)
     }
     return debug_cached != 0;
 }
+#endif
 
 /* Neutralize PATH and loader-injection environment before exec'ing helper
  * binaries: the daemon may run as root, and a hostile PATH entry (or
@@ -256,6 +260,7 @@ void log_err(const char *fmt, ...)
     fputc('\n', stderr);
 }
 
+#ifndef IWAN_DEBUG_STRIP
 void log_debug(const char *fmt, ...)
 {
     if (!debug_enabled())
@@ -266,6 +271,7 @@ void log_debug(const char *fmt, ...)
     va_end(ap);
     fputc('\n', stderr);
 }
+#endif
 
 void err_printf(const char *fmt, ...)
 {

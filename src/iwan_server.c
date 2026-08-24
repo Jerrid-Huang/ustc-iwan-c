@@ -726,8 +726,8 @@ static void *recv_thread_main(void *v)
                 last_qctl = now;
             }
             if (now - last_purge >= 1000) {
-                if (atomic_load_explicit(&g_prof_on,
-                                         memory_order_relaxed)) {
+#ifndef IWAN_DEBUG_STRIP
+                {
                     static struct prof_state ps_recv, ps_tunw, ps_tunr,
                         ps_dl;
                     if (prof_print("srv recv", &ps_recv, g_prof_srv_recv)) {
@@ -736,6 +736,7 @@ static void *recv_thread_main(void *v)
                         prof_print("srv dlsend", &ps_dl, g_prof_srv_dlsend);
                     }
                 }
+#endif
                 purge_expired(a->ctx, now);
                 if (debug_enabled())
                     server_up_stats_print();

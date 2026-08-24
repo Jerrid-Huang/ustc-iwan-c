@@ -857,6 +857,8 @@ static int wsa_errno(int e)
 
 static void set_sock_errno_fn(int fd, const char *who)
 {
+    (void)fd; (void)who;   /* consumed only by log_debug (stripped in
+                            * release builds -- hence the void casts) */
     int e = WSAGetLastError();
     errno = wsa_errno(e);
     /* WSAEWOULDBLOCK / WSAEINTR are routine conditions on nonblocking

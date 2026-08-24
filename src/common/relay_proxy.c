@@ -807,8 +807,10 @@ static bool rp_pend(struct rp_ent *e, const uint8_t *p, size_t n)
     }
     memcpy(e->pend + e->plen, p, n);
     e->plen += n;
+#ifndef IWAN_DEBUG_STRIP
     if (atomic_load_explicit(&g_prof_on, memory_order_relaxed))
         atomic_fetch_add(&g_prof_rp_pend, (uint64_t)n);
+#endif
     return true;
 }
 
@@ -816,13 +818,16 @@ static bool rp_pend(struct rp_ent *e, const uint8_t *p, size_t n)
  * dropped and the entry is half-closed */
 static void rp_flush(struct rp_ent *e, bool up_dir)
 {
+    (void)up_dir;   /* only consumed by the prof counters (stripped) */
     while (e->plen > 0) {
         ssize_t w = port_send(e->to, e->pend, e->plen, 0);
         if (w > 0) {
+#ifndef IWAN_DEBUG_STRIP
             if (atomic_load_explicit(&g_prof_on, memory_order_relaxed))
                 atomic_fetch_add(up_dir ? &g_prof_rp_up_send
                                         : &g_prof_rp_dn_send,
                                  (uint64_t)w);
+#endif
             e->plen -= (size_t)w;
             memmove(e->pend, e->pend + w, e->plen);
             continue;
@@ -923,18 +928,19 @@ static void *rp_dir_main(void *ud)
             pf_dirty = false;
         }
         int pr = port_poll(pf, pf_n, RP_POLL_MS);
+#ifndef IWAN_DEBUG_STRIP
         if (atomic_load_explicit(&g_prof_on, memory_order_relaxed)) {
             atomic_fetch_add(&g_prof_rp_iters, 1);
             if (pr == 0)
                 atomic_fetch_add(&g_prof_rp_poll0, 1);
         }
+#endif
         if (pr < 0) {
             if (errno == EINTR)
                 continue;
             break;              /* poll failed: stop relaying */
         }
-        if (atomic_load_explicit(&g_prof_on, memory_order_relaxed) &&
-            prof_print(tag, &pst,
+        if (prof_print(tag, &pst,
                        up_dir ? g_prof_rp_up_recv : g_prof_rp_dn_recv)) {
             static _Thread_local struct prof_state pst2, pst3;
             prof_print(up_dir ? "rp up send" : "rp dn send", &pst2,
@@ -966,11 +972,13 @@ static void *rp_dir_main(void *ud)
                         break;
                     ssize_t r = port_recv(e->from, buf, sizeof buf, 0);
                     if (r > 0) {
+#ifndef IWAN_DEBUG_STRIP
                         if (atomic_load_explicit(&g_prof_on,
                                                  memory_order_relaxed))
                             atomic_fetch_add(up_dir ? &g_prof_rp_up_recv
                                                     : &g_prof_rp_dn_recv,
                                              (uint64_t)r);
+#endif
                         if (e->plen == 0) {
                             /* fast path, zero pend: write straight
                              * through. Only a partial/EAGAIN send
@@ -984,6 +992,7 @@ static void *rp_dir_main(void *ud)
                                                       (size_t)r - off, 0);
                                 if (w > 0) {
                                     off += (size_t)w;
+#ifndef IWAN_DEBUG_STRIP
                                     if (atomic_load_explicit(
                                             &g_prof_on,
                                             memory_order_relaxed))
@@ -991,6 +1000,7 @@ static void *rp_dir_main(void *ud)
                                             up_dir ? &g_prof_rp_up_send
                                                    : &g_prof_rp_dn_send,
                                             (uint64_t)w);
+#endif
                                     if (off == (size_t)r)
                                         break;
                                     continue;
