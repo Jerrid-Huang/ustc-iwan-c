@@ -10,6 +10,7 @@
  * come from port.h (ws2tcpip), UDP_SEGMENT is defined locally there. */
 #ifndef _WIN32
 #include <arpa/inet.h>
+#include <net/if.h>   /* if_nametoindex (TUN-vanished sentinel) */
 #include <netdb.h>
 #include <netinet/udp.h>
 #include <poll.h>
@@ -1114,6 +1115,20 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
             pump_prof_print(&ctx);
             prof_last = nm;
         }
+#ifndef _WIN32
+        /* TUN interface removed under us (ip link del, netns teardown,
+         * driver unload): writes into the old descriptor succeed
+         * silently into the void and reads never come, so nothing else
+         * notices. Probe the interface index every tick -- gone means
+         * session lost so the caller reconnects and recreates it. */
+        if (!ctx.session_lost && tun_fd >= 0 &&
+            if_nametoindex(tun_ifname(tun_name)) == 0) {
+            log_err("TUN device %s vanished -- session lost",
+                    tun_ifname(tun_name));
+            ctx.session_lost = true;
+            g_stop = 1;
+        }
+#endif
     }
 
 #ifdef _WIN32
