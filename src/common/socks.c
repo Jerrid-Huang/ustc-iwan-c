@@ -106,8 +106,14 @@ void wait_events(int listener, int sockfd, int dns_evfd, int timeout_ms)
         /* rx_paused (netstack ring full): do NOT register POLLIN — the
          * socket stays readable, so polling it would return instantly
          * and busy-spin the loop; the next netstack tick (<=100ms)
-         * retries the reserve and clears the pause when room frees */
-        fds[n].events = f->rx_paused ? 0 : POLLIN;
+         * retries the reserve and clears the pause when room frees.
+         * local_eof: the EOF/RST has already been consumed, so the
+         * socket is ALSO permanently readable while nobody will ever
+         * read it again (the client half-closed; upstream data keeps
+         * flowing via service_local_outputs, which is unconditional).
+         * Same busy-spin trap — leave events empty; the flow is reaped
+         * by the peer FIN or the NS_FIN_WAIT timeout, whichever first. */
+        fds[n].events = (f->rx_paused || f->local_eof) ? 0 : POLLIN;
         if (f->output.len > 0)
             fds[n].events |= POLLOUT;
         n++;

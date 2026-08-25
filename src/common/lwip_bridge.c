@@ -42,6 +42,7 @@
 #include "lwip/timeouts.h"
 
 #define NS_CONNECT_TIMEOUT 30000u
+#define NS_FIN_WAIT_TIMEOUT 30000u      /* half-closed, no peer FIN: abort */
 #define NS_MSS             1460u
 #define NS_TICK_MAX_MS     10000
 #define NS_POLL_DEAD_MS    1000u           /* poll stopped => pcb in TIME_WAIT
@@ -713,6 +714,7 @@ void ns_close(Netstack *ns, int idx)
      * closing the receive side. */
     if (c->state == NS_ESTABLISHED) {
         c->state = NS_FIN_WAIT;
+        c->state_ms = now_ms();   /* NS_FIN_WAIT_TIMEOUT measures from here */
         tcp_shutdown(c->pcb, 0, 1);
     } else if (c->state == NS_CLOSE_WAIT) {
         /* peer already FIN'd: our FIN completes the close -> LAST_ACK */
@@ -787,11 +789,23 @@ int ns_tick(Netstack *ns, uint64_t now)
             tcp_abort(c->pcb);   /* bridge_err -> NS_CLOSED + reap_pending */
             continue;
         }
+        /* half-closed (our FIN sent, local client gone): if the peer never
+         * FINs back (keep-alive server, hung upstream), the pcb/slot/flow
+         * triple would hang forever — bound it like the connect timeout */
+        if (c->state == NS_FIN_WAIT &&
+            now - c->state_ms > NS_FIN_WAIT_TIMEOUT) {
+            c->term_reason = NS_TERM_TIMEOUT;
+            tcp_abort(c->pcb);   /* bridge_err -> NS_CLOSED + reap_pending */
+            continue;
+        }
         conn_reap_if_dead(ns, i, now);
 
         /* bound the sleep so lwIP's own timers (tcp_tmr 250ms) run in time */
-        if (c->state == NS_SYN_SENT) {
-            int64_t d = (int64_t)(c->state_ms + ns->connect_timeout_ms) - (int64_t)now;
+        if (c->state == NS_SYN_SENT || c->state == NS_FIN_WAIT) {
+            uint32_t tmo = (c->state == NS_SYN_SENT)
+                               ? ns->connect_timeout_ms
+                               : (uint32_t)NS_FIN_WAIT_TIMEOUT;
+            int64_t d = (int64_t)(c->state_ms + tmo) - (int64_t)now;
             if (d < next)
                 next = d;
         }
