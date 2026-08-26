@@ -207,7 +207,8 @@ int wintun_ensure(void)
     ps_capture(cmd);
 
     char src[MAX_PATH];
-    snprintf(src, sizeof src, "%s\\bin\\%s\\wintun.dll", tmpdir, arch);
+    /* Expand-Archive preserves the zip's top-level wintun/ folder */
+    snprintf(src, sizeof src, "%s\\wintun\\bin\\%s\\wintun.dll", tmpdir, arch);
     if (!file_exists(src)) {
         log_err("wintun-%s.zip does not contain bin\\%s\\wintun.dll",
                 ver, arch);
@@ -223,10 +224,13 @@ int wintun_ensure(void)
     DeleteFileA(zip);
     {
         char sub[MAX_PATH];
-        snprintf(sub, sizeof sub, "%s\\bin\\%s", tmpdir, arch);
+        snprintf(sub, sizeof sub, "%s\\wintun\\bin\\%s", tmpdir, arch);
         DeleteFileA(sub);          /* fails while dirs exist; ignore */
+        snprintf(sub, sizeof sub, "%s\\wintun\\bin\\%s", tmpdir, arch);
         RemoveDirectoryA(sub);
-        snprintf(sub, sizeof sub, "%s\\bin", tmpdir);
+        snprintf(sub, sizeof sub, "%s\\wintun\\bin", tmpdir);
+        RemoveDirectoryA(sub);
+        snprintf(sub, sizeof sub, "%s\\wintun", tmpdir);
         RemoveDirectoryA(sub);
         RemoveDirectoryA(tmpdir);
     }

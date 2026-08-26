@@ -930,8 +930,10 @@ jobs:
             "https://www.wintun.net/builds/wintun-0.14.1.zip" \
             -o /tmp/wintun.zip
           mkdir -p /tmp/wintun && cd /tmp/wintun && unzip -oq /tmp/wintun.zip
-          [ -f bin/amd64/wintun.dll ] && [ -f bin/x86/wintun.dll ] && \
-            [ -f bin/arm64/wintun.dll ]
+          # zip 布局：顶层 wintun/ 目录 -> wintun/bin/<arch>/wintun.dll
+          [ -f wintun/bin/amd64/wintun.dll ] && \
+            [ -f wintun/bin/x86/wintun.dll ] && \
+            [ -f wintun/bin/arm64/wintun.dll ]
           cd "$OLDPWD"
 
           for d in win32/*/; do
@@ -945,7 +947,7 @@ jobs:
             esac
             mkdir -p "dist/windows/${arch}"
             cp "$d/bin/iwan-client.exe" "$d/bin/iwan-client-oidc.exe" "dist/windows/${arch}/"
-            cp "/tmp/wintun/bin/${wt}/wintun.dll" "dist/windows/${arch}/wintun.dll"
+            cp "/tmp/wintun/wintun/bin/${wt}/wintun.dll" "dist/windows/${arch}/wintun.dll"
             cp README.md LICENSE ci/WINTUN.txt "dist/windows/${arch}/"
             if [ "$arch" = "x86_64" ]; then
               (cd "dist/windows/${arch}" && zip -qr "../../iwan-windows-x86_64.zip" .)
