@@ -921,12 +921,31 @@ jobs:
             fi
           done
 
-          # Windows static exes (win32/iwan-win32-<arch>/bin/*.exe)
+          # Windows static exes (win32/iwan-win32-<arch>/bin/*.exe).
+          # Bundle the official wintun.dll per arch so the archive runs
+          # out of the box; pinned 0.14.1 (current upstream build) — bump
+          # deliberately, not by drift. Redistribution is permitted by
+          # the wintun license; WINTUN.txt documents it.
+          curl -sL --retry 3 --max-time 300 \
+            "https://www.wintun.net/builds/wintun-0.14.1.zip" \
+            -o /tmp/wintun.zip
+          mkdir -p /tmp/wintun && cd /tmp/wintun && unzip -oq /tmp/wintun.zip
+          [ -f bin/amd64/wintun.dll ] && [ -f bin/x86/wintun.dll ] && \
+            [ -f bin/arm64/wintun.dll ]
+          cd "$OLDPWD"
+
           for d in win32/*/; do
             artifact="$(basename "$d")"
             arch="${artifact#iwan-win32-}"
+            case "$arch" in
+              x86_64) wt=amd64 ;;
+              i686)   wt=x86 ;;
+              arm64)  wt=arm64 ;;
+              *) echo "::error::unknown win32 arch $arch"; exit 1 ;;
+            esac
             mkdir -p "dist/windows/${arch}"
             cp "$d/bin/iwan-client.exe" "$d/bin/iwan-client-oidc.exe" "dist/windows/${arch}/"
+            cp "/tmp/wintun/bin/${wt}/wintun.dll" "dist/windows/${arch}/wintun.dll"
             cp README.md LICENSE ci/WINTUN.txt "dist/windows/${arch}/"
             if [ "$arch" = "x86_64" ]; then
               (cd "dist/windows/${arch}" && zip -qr "../../iwan-windows-x86_64.zip" .)
@@ -961,10 +980,11 @@ jobs:
               exit 1
             fi
           done
-          # Windows zips: every archive must carry the exes plus the
-          # README/LICENSE/wintun note
+          # Windows zips: every archive must carry the exes, the
+          # arch-matching wintun.dll, plus README/LICENSE/wintun note
           for z in dist/iwan-windows-*.zip; do
-            for f in iwan-client.exe iwan-client-oidc.exe README.md LICENSE WINTUN.txt; do
+            for f in iwan-client.exe iwan-client-oidc.exe wintun.dll \
+                     README.md LICENSE WINTUN.txt; do
               unzip -l "$z" | grep -q "$f" || {
                 echo "::error::$z is missing $f"
                 exit 1

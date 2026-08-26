@@ -14,6 +14,10 @@
 #include <unistd.h>
 #endif
 
+#ifdef _WIN32
+#include "wintun_fetch.h"
+#endif
+
 #include "addr.h"
 #include "auth.h"
 #include "cli.h"
@@ -745,6 +749,16 @@ static int cmd_proxy(int argc, char **argv, int start)
         free_route_opts(&o);
         return 1;
     }
+
+#ifdef _WIN32
+    /* wintun.dll missing? ask (interactive) and auto-download the latest
+     * wintun build before open_tun so the first run just works */
+    if (wintun_ensure() != 0) {
+        slist_free(&routes);
+        free_route_opts(&o);
+        return 1;
+    }
+#endif
 
     int tun_fd = open_tun(o.tun);
     if (tun_fd < 0) {
