@@ -1759,8 +1759,10 @@ void service_local_outputs(void) {
                          * at 4+ conns (socks-down collapsed to
                          * ~1800 Mbit/s aggregate) */
                         buf_clear(&c->rxq);
+                        f->rxq_waiting = false;
                     } else {
                         buf_consume(&c->rxq, (size_t)n);  /* partial */
+                        f->rxq_waiting = true;
                     }
                 } else if (n < 0 && errno != EAGAIN &&
                            errno != EWOULDBLOCK) {
@@ -1768,7 +1770,13 @@ void service_local_outputs(void) {
                     ns_abort(&g_ns, f->ns_idx);
                     set_flow_state(f, ST_CLOSING);
                     continue;
+                } else {
+                    f->rxq_waiting = true;
                 }
+            } else {
+                /* nothing pending toward the client: cancel the POLLOUT
+                 * wake, otherwise a stale flag would spin the loop */
+                f->rxq_waiting = false;
             }
         }
 

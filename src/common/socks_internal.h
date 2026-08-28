@@ -55,6 +55,10 @@ typedef struct {
     bool     rx_paused;        /* uplink backpressure: netstack ring full,
                                 * stop registering POLLIN until the next
                                 * tick (wait_events reads this) */
+    bool     rxq_waiting;      /* netstack->client rxq has pending bytes but
+                                * the local socket was not writable: keep
+                                * POLLOUT registered so the loop wakes when
+                                * the client drains (wait_events reads this) */
     uint8_t  target_af;        /* request target family: 0 unknown (domain),
                                 * 4 = IPv4, 6 = IPv6 (SOCKS5 reply BND.ADDR
                                 * and the reply-format decision) */

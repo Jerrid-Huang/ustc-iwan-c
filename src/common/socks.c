@@ -114,7 +114,7 @@ void wait_events(int listener, int sockfd, int dns_evfd, int timeout_ms)
          * Same busy-spin trap — leave events empty; the flow is reaped
          * by the peer FIN or the NS_FIN_WAIT timeout, whichever first. */
         fds[n].events = (f->rx_paused || f->local_eof) ? 0 : POLLIN;
-        if (f->output.len > 0)
+        if (f->output.len > 0 || f->rxq_waiting)
             fds[n].events |= POLLOUT;
         n++;
     }
