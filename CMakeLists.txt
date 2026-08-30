@@ -28,7 +28,7 @@ cmake_minimum_required(VERSION 3.16)
 #   IWAN_BPF           Linux: compile+embed the tun steering eBPF program.
 #   IWAN_WERROR        Treat compiler warnings as errors (CI).
 
-project(iwan VERSION 0.7.1 LANGUAGES C)
+project(iwan VERSION 0.7.2 LANGUAGES C)
 
 # Release-by-default (CMAKE_C_FLAGS_RELEASE = -O3; no -DNDEBUG: the
 # code has no runtime assert()s, only _Static_assert, which is
