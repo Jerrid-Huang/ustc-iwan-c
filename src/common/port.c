@@ -498,8 +498,28 @@ int port_elevate_self(int argc, char **argv)
          * on exit, so error paths hold it open (oidc_pause_if_relaunched) */
         SetEnvironmentVariableW(L"IWAN_ELEVATED_RELAUNCH", L"1");
         if (ShellExecuteExW(&sei)) {
-            if (sei.hProcess)
+            if (sei.hProcess) {
+                /* brief handshake against a fire-and-forget relaunch:
+                 * if the elevated instance died within a short window
+                 * (config error, missing driver, bad args), report the
+                 * failure instead of returning success and leaving the
+                 * caller convinced it is connected. The timeout is long
+                 * enough to catch an immediate exit and short enough
+                 * that an interactive tunnel does not block us. */
+                DWORD wr = WaitForSingleObject(sei.hProcess, 1500);
+                if (wr == WAIT_OBJECT_0) {
+                    DWORD code = 0;
+                    if (GetExitCodeProcess(sei.hProcess, &code) &&
+                        code != 0) {
+                        CloseHandle(sei.hProcess);
+                        log_err("elevated instance exited immediately "
+                                "(code %lu); not running",
+                                (unsigned long)code);
+                        return -1;
+                    }
+                }
                 CloseHandle(sei.hProcess);
+            }
             return 0;
         }
         log_err("UAC elevation refused for %ls (error %d)", file,

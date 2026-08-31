@@ -214,8 +214,19 @@ bool pp_socks_auth_ok(const uint8_t *pass, size_t plen, const char *token)
 {
     if (!token)
         return true;   /* courtesy mode validates nothing */
+    /* length oracle fix: never short-circuit on length. Compare over
+     * max(plen, tlen) with the absent side padded to zero, folding the
+     * length difference in so a wrong-length guess and a wrong-content
+     * guess take indistinguishable time. */
     size_t tlen = strlen(token);
-    return plen == tlen && ct_eq(pass, (const uint8_t *)token, tlen) != 0;
+    size_t n = plen > tlen ? plen : tlen;
+    unsigned diff = (unsigned)(plen ^ tlen);
+    for (size_t i = 0; i < n; i++) {
+        uint8_t a = i < plen ? pass[i] : 0;
+        uint8_t b = i < tlen ? (uint8_t)token[i] : 0;
+        diff |= a ^ b;
+    }
+    return diff == 0;
 }
 
 /* ---- RFC1929 auth frame ---- */
