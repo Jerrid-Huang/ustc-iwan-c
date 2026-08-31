@@ -257,22 +257,14 @@ void oidc_connect_server(const Opts *o, const Config *cf)
     int tun_fd = -1;
     struct RelayProxy *rp = NULL;
     if (!o->socks) {
-        /* Validate the TUN name up front: open_tun() re-checks at its
-         * boundary, but we run `ip link del` BEFORE that — feeding an
-         * unvalidated name into it lets an unprivileged caller delete an
-         * arbitrary interface as root. tun_name_valid() rejects option
-         * separators and other shell/ip metacharacters. */
+        /* Validate the name shape up front. We deliberately do NOT
+         * pre-delete: the TUN devices we create are non-persistent
+         * (open_tun never sets TUNSETPERSIST), so the kernel removes
+         * them when the fd closes — at shutdown and on any crash. If
+         * `o->tun` is occupied by an interface we do not own, TUNSETIFF
+         * fails below and we abort instead of deleting it. */
         if (!tun_name_valid(o->tun))
             oidc_die("invalid TUN device name '%s'", o->tun);
-#ifdef __linux__
-        /* Linux: pre-delete a stale tun device by name. macOS: utun
-         * units are created fresh per connect() and vanish on close;
-         * Windows: wintun's open_tun (tun_win.c) deletes an existing
-         * adapter with the same name as part of open-or-create, so
-         * nothing to do on either. */
-        char *const del[] = { "link", "del", (char *)o->tun, NULL };
-        ip_run_quiet(del);
-#endif
         tun_fd = open_tun(o->tun);
         if (tun_fd < 0)
             oidc_die("open tun (must be root)");

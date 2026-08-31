@@ -482,52 +482,6 @@ static void free_route_opts(CmdOpts *o)
     slist_free(&o->proxy_cidr6);
 }
 
-/* Pre-open cleanup of a stale TUN device. cmd_proxy runs as root, so
- * never `ip link del` a name we cannot prove is a TUN device — a
- * guessed --tun value could otherwise remove a physical NIC. The tun
- * driver exposes /sys/class/net/<name>/tun_flags only for tun devices.
- * Returns 1 when a tun device existed and deletion was attempted, 0
- * when no device exists (skip delete), -1 when the name is a non-tun
- * interface (the caller must abort). */
-static int cleanup_stale_tun(const char *name)
-{
-#ifdef __linux__
-    char p[256];
-    int fd;
-
-    snprintf(p, sizeof p, "/sys/class/net/%s/tun_flags", name);
-    fd = open(p, O_RDONLY);
-    if (fd >= 0) {
-        close(fd);
-        char *const del[] = { "link", "del", (char *)name, NULL };
-        if (!ip_run_quiet(del))
-            log_err("Error: failed to delete stale tun device '%s'", name);
-        /* keep going: open_tun attaches to an existing device */
-        return 1;
-    }
-    int e = errno;
-    snprintf(p, sizeof p, "/sys/class/net/%s", name);
-    fd = open(p, O_RDONLY);
-    if (fd >= 0) {
-        close(fd);
-        log_err("Error: '%s' exists but is not a tun device; refusing to "
-                "delete it", name);
-        return -1;
-    }
-    if (e != ENOENT)
-        log_err("Error: cannot inspect tun device '%s': %s", name,
-                strerror(e));
-    return 0;   /* absent (or uninspectable): leave it to open_tun */
-#else
-    /* non-Linux: the /sys probe is meaningless. wintun's open_tun
-     * (tun_win.c) reuses a stale adapter with the same name (and
-     * deletes/recreates it when wedged); macOS utun units are created
-     * fresh per connect() and vanish on close — nothing to pre-clean. */
-    (void)name;
-    return 0;
-#endif
-}
-
 /* ---- commands ---- */
 
 static void fmt_duration(char *out, size_t sz, uint64_t ns)
@@ -744,11 +698,12 @@ static int cmd_proxy(int argc, char **argv, int start)
         return 1;
     }
 
-    if (cleanup_stale_tun(o.tun) < 0) {
-        slist_free(&routes);
-        free_route_opts(&o);
-        return 1;
-    }
+    /* No pre-delete here: the TUN devices we create are non-persistent
+     * (open_tun never sets TUNSETPERSIST), so the kernel removes them
+     * when the owning fd closes — at shutdown and on any crash. If the
+     * name is already taken (any interface type), TUNSETIFF fails with
+     * EBUSY/EEXIST below and we report the error instead of touching a
+     * device we do not own. */
 
 #ifdef _WIN32
     /* wintun.dll missing? ask (interactive) and auto-download the latest

@@ -459,15 +459,18 @@ static void srv_tun_pkt(void *ud, uint8_t *pkt, size_t len, bool last)
     handle_tun_downlink(pu->ctx, pkt, len, pu->udp_fd);
 }
 
-/* remove stale device, open, configure. Exits on failure. */
+/* open and configure the tun. Exits on failure. */
 static int setup_tun(const char *name, const char *server_ip, int mask)
 {
     int fd;
     char addr[64];
 
-    /* no tun_name_valid precheck here: main() validates the CLI value
-     * and open_tun() re-validates at its API boundary */
-    (void)ip_run_quiet((char *[]){"link", "del", (char *)name, NULL});
+    /* No pre-delete: our TUN devices are non-persistent (open_tun never
+     * sets TUNSETPERSIST), so the kernel removes them when we exit —
+     * including on a crash. If `name` is occupied by any interface type,
+     * TUNSETIFF fails with EBUSY/EEXIST below and startup aborts instead
+     * of touching a device we do not own. main() already validated the
+     * name shape (tun_name_valid). */
     fd = open_tun(name);
     if (fd < 0) {
         fprintf(stderr, "error: cannot open tun device %s: %s (run as root?)\n",
