@@ -1098,6 +1098,75 @@ void open_tcp_connection6(Flow *f, const uint8_t rip6[16], uint16_t rport) {
     open_tcp_conn_af(f, 6, 0, rip6, rport);
 }
 
+/* ---- SSRF gate for the standalone SOCKS5/HTTP proxy ----
+ * Mirrors the TUN-mode relay gate (relay_proxy.c M7): a non-loopback
+ * peer must not use this proxy to reach the host's own loopback or
+ * link-local services. Loopback peers keep today's local usage, and
+ * IWAN_SOCKS_ALLOW_LOOPBACK=1 is an explicit operator opt-out. */
+static bool socks_ssrf_off(void)
+{
+    static int loaded, off;
+    if (!loaded) {
+        loaded = 1;
+        const char *v = getenv("IWAN_SOCKS_ALLOW_LOOPBACK");
+        off = v && strcmp(v, "1") == 0;
+    }
+    return off;
+}
+
+static bool socks_peer_is_loopback(const Flow *f)
+{
+    /* peer_ip is sin_addr.s_addr (network byte order) */
+    return (f->peer_ip & htonl(0xFF000000u)) == htonl(0x7F000000u);
+}
+
+static bool socks_target_blocked(const Flow *f, int af, const uint8_t *p)
+{
+    if (socks_ssrf_off() || socks_peer_is_loopback(f))
+        return false;
+    if (af == 4)
+        return p[0] == 127 ||                        /* 127.0.0.0/8 */
+               (p[0] == 169 && p[1] == 254);         /* 169.254.0.0/16 */
+    if (af == 6) {
+        static const uint8_t lo[16] = {
+            0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,1 };
+        static const uint8_t v4map[12] = {
+            0,0,0,0,0,0,0,0, 0,0,0xff,0xff };
+        if (memcmp(p, lo, 16) == 0)
+            return true;                              /* ::1 */
+        if (p[0] == 0xfe && (p[1] & 0xc0) == 0x80)
+            return true;                              /* fe80::/10 */
+        if (memcmp(p, v4map, 12) == 0)
+            return p[12] == 127 ||                    /* ::ffff:127/8 */
+                   (p[12] == 169 && p[13] == 254);    /* ::ffff:169.254 */
+    }
+    return false;
+}
+
+/* gate, then open. rip is host-order MSB-first (open_tcp_connection's
+ * own contract); rip6 is network byte order. Returns false when the
+ * gate refused the target and queued a SOCKS error reply. */
+static bool flow_open_gated(Flow *f, int af, uint32_t rip,
+                            const uint8_t rip6[16], uint16_t port)
+{
+    uint8_t b4[4];
+    if (af == 6) {
+        if (socks_target_blocked(f, 6, rip6)) {
+            queue_socks_error(f, 2);   /* connection not allowed by ruleset */
+            return false;
+        }
+        open_tcp_connection6(f, rip6, port);
+    } else {
+        u32_ip4(rip, b4);
+        if (socks_target_blocked(f, 4, b4)) {
+            queue_socks_error(f, 2);
+            return false;
+        }
+        open_tcp_connection(f, rip, port);
+    }
+    return true;
+}
+
 /* constant-time equality: the shared implementation from crypto.h
  * (ct_eq, same comparison shape) replaced the local copy */
 
@@ -1148,7 +1217,7 @@ static void flow_start_target(Flow *f, const pp_target *t)
         f->target_af = 4;
         /* pp stores ip4 in network byte order; the netstack wants
          * host-order MSB-first */
-        open_tcp_connection(f, ntohl(t->ip4), t->port);
+        flow_open_gated(f, 4, ntohl(t->ip4), NULL, t->port);
     } else if (t->af == 6) {
         if (!socks_v6_ok()) {
             /* IPv4-only relay assumption (--socks-ipv6 off): an IPv6
@@ -1159,7 +1228,7 @@ static void flow_start_target(Flow *f, const pp_target *t)
             return;
         }
         f->target_af = 6;
-        open_tcp_connection6(f, t->ip6, t->port);
+        flow_open_gated(f, 6, 0, t->ip6, t->port);
     } else {
         f->target_af = 0;   /* domain: family decided by the DNS result */
         set_flow_state(f, ST_RESOLVING);
@@ -1400,14 +1469,14 @@ void handle_dns_results(void) {
                                   q[k].ip6[7], q[k].ip6[8], q[k].ip6[9],
                                   q[k].ip6[10], q[k].ip6[11], q[k].ip6[12],
                                   q[k].ip6[13], q[k].ip6[14], q[k].ip6[15]);
-                    open_tcp_connection6(f, q[k].ip6, q[k].port);
+                    flow_open_gated(f, 6, 0, q[k].ip6, q[k].port);
                 } else {
                     if (debug_enabled())
                         log_debug("[flow %lu] DNS -> %d.%d.%d.%d",
                                   (unsigned long)f->id, (q[k].ip >> 24) & 0xff,
                                   (q[k].ip >> 16) & 0xff,
                                   (q[k].ip >> 8) & 0xff, q[k].ip & 0xff);
-                    open_tcp_connection(f, q[k].ip, q[k].port);
+                    flow_open_gated(f, 4, q[k].ip, NULL, q[k].port);
                 }
             } else {
                 /* A dual query (AAAA+A) may still be pending: fail the
@@ -1735,6 +1804,7 @@ void service_local_outputs(void) {
                 if (f->ns_idx >= 0)
                     ns_abort(&g_ns, f->ns_idx);
                 buf_clear(&f->output);
+                f->rxq_waiting = false;   /* dead client: no POLLOUT wake */
                 set_flow_state(f, ST_CLOSING);
                 break;
             }
@@ -1768,6 +1838,7 @@ void service_local_outputs(void) {
                            errno != EWOULDBLOCK) {
                     f->local_eof = true;
                     ns_abort(&g_ns, f->ns_idx);
+                    f->rxq_waiting = false; /* dead client: no POLLOUT wake */
                     set_flow_state(f, ST_CLOSING);
                     continue;
                 } else {
