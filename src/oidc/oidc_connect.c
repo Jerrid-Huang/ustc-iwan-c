@@ -257,8 +257,13 @@ void oidc_connect_server(const Opts *o, const Config *cf)
     int tun_fd = -1;
     struct RelayProxy *rp = NULL;
     if (!o->socks) {
-        /* no tun_name_valid precheck here: the CLI validates the value
-         * and open_tun() re-validates at its API boundary */
+        /* Validate the TUN name up front: open_tun() re-checks at its
+         * boundary, but we run `ip link del` BEFORE that — feeding an
+         * unvalidated name into it lets an unprivileged caller delete an
+         * arbitrary interface as root. tun_name_valid() rejects option
+         * separators and other shell/ip metacharacters. */
+        if (!tun_name_valid(o->tun))
+            oidc_die("invalid TUN device name '%s'", o->tun);
 #ifdef __linux__
         /* Linux: pre-delete a stale tun device by name. macOS: utun
          * units are created fresh per connect() and vanish on close;

@@ -31,8 +31,14 @@ static long server_port(Json *s)
     return 0;
 }
 
-static void mkdir_p(const char *path)
+static bool mkdir_p(const char *path)
 {
+    /* returns true when at least one directory component was actually
+     * created (i.e. did not already exist) — the caller uses this to
+     * decide whether it is safe to chown a directory it made vs one
+     * that predates the run (chowning a pre-existing system dir such as
+     * /etc/cron.d would be a local privilege-escalation primitive) */
+    bool created = false;
     char tmp[4096];
     size_t n = strlen(path);
     if (n == 0 || n >= sizeof tmp)
@@ -54,6 +60,8 @@ static void mkdir_p(const char *path)
             if (mkdir(tmp, 0700) != 0 && errno != EEXIST)
 #endif
                 oidc_die("cannot create dir %s: %s", tmp, strerror(errno));
+            else if (errno != EEXIST)
+                created = true;
             *p = sep;
         }
     }
@@ -63,6 +71,9 @@ static void mkdir_p(const char *path)
     if (mkdir(tmp, 0700) != 0 && errno != EEXIST)
 #endif
         oidc_die("cannot create dir %s: %s", tmp, strerror(errno));
+    else if (errno != EEXIST)
+        created = true;
+    return created;
 }
 
 void oidc_fetch_config(Config *cf)
@@ -135,11 +146,16 @@ void oidc_fetch_config(Config *cf)
         oidc_esc_put(&b, json_get_str(s, "userName"));
         buf_put_str(&b, "\",\n      \"passWord\": \"");
         {
-            /* platform at-rest wrapping (audit M8): DPAPI / Keychain */
-            char *pw = oidc_wrap_password(
-                json_get_str(s, "passWord"), OIDC_DOMAIN,
-                json_get_str(s, "userName"));
-            oidc_esc_put(&b, pw ? pw : json_get_str(s, "passWord"));
+            /* platform at-rest wrapping (audit M8): DPAPI / Keychain.
+             * json_get_str returns NULL for a missing field, and the
+             * wrap routine feeds it to strlen(); a malicious /m/config
+             * entry without passWord/userName must not crash the whole
+             * (possibly root) process — treat missing as empty. */
+            const char *pw_raw = json_get_str(s, "passWord");
+            const char *un_raw = json_get_str(s, "userName");
+            char *pw = oidc_wrap_password(pw_raw ? pw_raw : "",
+                                          OIDC_DOMAIN, un_raw ? un_raw : "");
+            oidc_esc_put(&b, pw ? pw : (pw_raw ? pw_raw : ""));
             free(pw);
         }
         buf_put_str(&b, "\"\n    }");
@@ -166,7 +182,7 @@ void oidc_fetch_config(Config *cf)
 /* --all re-execs via sudo, so the fresh file (and any dir we just
  * created) are root-owned; hand both back to the invoking user, or
  * the next non-sudo run cannot read or rewrite the config */
-static void restore_owner(const char *path, const char *dir)
+static void restore_owner(const char *path, const char *dir, bool dir_created)
 {
 #ifndef _WIN32
     const char *su = getenv("SUDO_UID");
@@ -176,7 +192,10 @@ static void restore_owner(const char *path, const char *dir)
         gid_t gid = (gid_t)strtoul(sg, NULL, 10);
         if (chown(path, uid, gid) != 0)
             oidc_die("cannot chown config %s: %s", path, strerror(errno));
-        if (dir && chown(dir, uid, gid) != 0)
+        /* only chown a directory we actually created this run: chowning
+         * a pre-existing directory (e.g. --config-dir /etc/cron.d) would
+         * hand ownership of that tree to the invoking user */
+        if (dir_created && dir && chown(dir, uid, gid) != 0)
             oidc_die("cannot chown config dir %s: %s", dir,
                      strerror(errno));
     }
@@ -185,6 +204,7 @@ static void restore_owner(const char *path, const char *dir)
      * (and there is no sudo re-exec to undo) */
     (void)path;
     (void)dir;
+    (void)dir_created;
 #endif
 }
 
@@ -203,11 +223,12 @@ void oidc_save_config(const char *path, const Config *cf)
     if (bslash && (!slash || bslash > slash))
         slash = bslash;
     char *dir = NULL;
+    bool dir_created = false;
     if (slash && slash != path) {
         dir = malloc((size_t)(slash - path) + 1);
         memcpy(dir, path, (size_t)(slash - path));
         dir[slash - path] = '\0';
-        mkdir_p(dir);
+        dir_created = mkdir_p(dir);
     }
     /* write a sibling temp file, then rename() over the target so the
      * config is replaced atomically: a concurrent reader never sees a
@@ -286,7 +307,7 @@ void oidc_save_config(const char *path, const Config *cf)
 #endif
     free(tmp);
 
-    restore_owner(path, dir);
+    restore_owner(path, dir, dir_created);
     free(dir);
     oidc_eprintf("  Saved %zu server(s) to %s\n", json_arr_len(cf->servers),
                  path);
