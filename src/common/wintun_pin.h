@@ -9,7 +9,7 @@
 
 #ifdef _WIN32
 
-#include <windows.h> /* wchar_t */
+#include <stddef.h> /* wchar_t */
 #include <stdbool.h>
 #include <stdint.h>
 

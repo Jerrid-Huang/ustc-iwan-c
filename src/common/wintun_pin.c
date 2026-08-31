@@ -1,10 +1,9 @@
 /* wintun_pin.c — SHA-256 pin verification (Windows only; see .h) */
+#include "crypto.h"   /* -> common.h -> winsock2 before windows.h */
 #include "wintun_pin.h"
 
 #ifdef _WIN32
 
-#include <windows.h>
-#include <bcrypt.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -41,11 +40,8 @@ bool wintun_pin_ok(const wchar_t *path)
     CloseHandle(f);
 
     uint8_t hash[32];
-    NTSTATUS st = BCryptHash(BCRYPT_SHA256_ALGORITHM, NULL, 0,
-                             (PUCHAR)buf, total, (PUCHAR)hash, sizeof hash);
+    sha256(buf, total, hash);
     free(buf);
-    if (st != 0)
-        return false;
 
     char hex[65];
     for (int i = 0; i < 32; i++)
