@@ -21,6 +21,7 @@
 #include <stdlib.h>
 
 #include "util.h"
+#include "wintun_pin.h"
 
 #define WINTUN_PAGE_URL "https://www.wintun.net/"
 #define WINTUN_ZIP_FMT  "https://www.wintun.net/builds/wintun-%s.zip"
@@ -52,9 +53,26 @@ static int file_exists(const char *path)
     return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
 }
 
-/* run a command and capture its stdout (line-oriented use only) */
-static char *ps_capture(const char *ps_expr)
+/* Escape a value for a PowerShell single-quoted literal: embedded
+ * single quotes are doubled. The exe dir is attacker-influenceable
+ * (install path), so every interpolated path goes through here. */
+static void ps_squote(char *out, size_t cap, const char *src)
 {
+    size_t o = 0;
+    char q = 39;
+    for (size_t i = 0; src && src[i] && o + 1 < cap; i++) {
+        if (src[i] == q) {
+            if (o + 1 < cap) out[o++] = q;
+            if (o + 1 < cap) out[o++] = q;
+        } else {
+            out[o++] = src[i];
+        }
+    }
+    out[o] = 0;
+}
+
+/* run a command and capture its stdout (line-oriented use only) */
+static char *ps_capture(const char *ps_expr){
     char cmd[PS_CMD_MAX];
     snprintf(cmd, sizeof cmd,
              "powershell -NoProfile -Command \"%s\"", ps_expr);
@@ -195,15 +213,18 @@ int wintun_ensure(void)
              dir[0] && dir[strlen(dir) - 1] == '\\' ? "" : "\\");
 
     char cmd[PS_CMD_MAX];
+    char zipq[PS_CMD_MAX], tmpq[PS_CMD_MAX];
+    ps_squote(zipq, sizeof zipq, zip);
+    ps_squote(tmpq, sizeof tmpq, tmpdir);
     snprintf(cmd, sizeof cmd,
              "(Invoke-WebRequest -UseBasicParsing '" WINTUN_ZIP_FMT "')"
-             " -OutFile '%s'", zip, ver);
+             " -OutFile '%s'", zipq, ver);
     log_info("downloading wintun-%s.zip ...", ver);
     ps_capture(cmd);
 
     snprintf(cmd, sizeof cmd,
              "Expand-Archive -Path '%s' -DestinationPath '%s' -Force",
-             zip, tmpdir);
+             zipq, tmpq);
     ps_capture(cmd);
 
     char src[MAX_PATH];
@@ -212,6 +233,16 @@ int wintun_ensure(void)
     if (!file_exists(src)) {
         log_err("wintun-%s.zip does not contain bin\\%s\\wintun.dll",
                 ver, arch);
+        return -1;
+    }
+    /* the fetched artifact must match the pinned official build before
+     * it lands next to the exe — the download is over TLS but a pinned
+     * hash also protects against a compromised mirror / on-disk tamper */
+    if (!wintun_pin_ok_a(src)) {
+        log_err("downloaded wintun.dll does not match the pinned build; "
+                "deleting it");
+        DeleteFileA(src);
+        DeleteFileA(zip);
         return -1;
     }
     if (!MoveFileA(src, dll)) {

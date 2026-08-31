@@ -161,6 +161,7 @@ if(WIN32)
   # was removed; pump_win_single.c is the only Windows pump)
   list(APPEND IWAN_CORE_SRCS src/common/tun_win.c
     src/common/wintun_fetch.c
+    src/common/wintun_pin.c
     src/common/pump_win_single.c)
 elseif(APPLE)
   # macOS client: tun.c holds the generic code (reader pool, write

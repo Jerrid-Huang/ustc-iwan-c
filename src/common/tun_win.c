@@ -35,6 +35,7 @@
 #include <devguid.h>  /* GUID_DEVCLASS_NET */
 #include <wintrust.h> /* WinVerifyTrust: Authenticode check for wintun.dll */
 #include <softpub.h>  /* WINTRUST_ACTION_GENERIC_VERIFY_V2 */
+#include "wintun_pin.h"
 #include "tun.h"
 #include "util.h"
 
@@ -175,16 +176,15 @@ static bool wintun_load(void)
 
             if (slash) {
                 wcscpy(slash + 1, L"wintun.dll");
-                if (wintun_verify(dllpath)) {
+                if (wintun_verify(dllpath) && wintun_pin_ok(dllpath)) {
                     iwan_wintun.dll = LoadLibraryW(dllpath);
                     /* NOTE: no early return here — the GetProcAddress
                      * resolution below MUST run for every successful
                      * load, or the API pointers stay NULL and open_tun
                      * calls through a NULL function pointer. */
                 } else {
-                    log_err("wintun.dll failed Authenticode "
-                            "verification (exe dir); refusing to load "
-                            "an unverified driver shim");
+                    log_err("wintun.dll failed verification (exe dir); "
+                            "refusing to load an unverified driver shim");
                 }
             }
         }
@@ -198,12 +198,11 @@ static bool wintun_load(void)
                                        (UINT)(MAX_PATH - 16));
         if (sn > 0 && sn < MAX_PATH - 16) {
             wcscpy(sysdll + sn, L"\\wintun.dll");
-            if (wintun_verify(sysdll)) {
+            if (wintun_verify(sysdll) && wintun_pin_ok(sysdll)) {
                 iwan_wintun.dll = LoadLibraryW(sysdll);
             } else {
-                log_err("wintun.dll failed Authenticode "
-                        "verification (System32); refusing to load an "
-                        "unverified driver shim");
+                log_err("wintun.dll failed verification (System32); "
+                        "refusing to load an unverified driver shim");
             }
         }
         if (iwan_wintun.dll == NULL) {
