@@ -809,6 +809,19 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
     } else {
         uint32_t probe = ctx->next_ip;
         uint32_t pool = ctx->ip_end - ctx->ip_base + 1;
+        /* sid carries only the low 16 bits of the assigned IP: with a
+         * pool wider than 65536, two distinct IPs share one sid and the
+         * "replace same sid" step below would evict a live session that
+         * is actually a different user. Reject the impossible config
+         * instead of corrupting the session table. */
+        if (pool > 65536) {
+            pthread_rwlock_unlock(&ctx->sess_lock);
+            log_err("server subnet wider than /16 (%u addresses): "
+                    "session id space exhausted; use a /16 or narrower "
+                    "subnet", (unsigned)pool);
+            open_reject(sockfd, peer, a.user, "server full");
+            return;
+        }
         for (i = 0; i < (int)pool && i < 65536; i++) {
             if (probe > ctx->ip_end)
                 probe = ctx->ip_base;
