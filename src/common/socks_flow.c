@@ -252,6 +252,11 @@ typedef struct {
 
 static DnsWait g_dns_wait[DNS_WAIT_MAX];
 static pthread_mutex_t g_dns_wait_mu = PTHREAD_MUTEX_INITIALIZER;
+/* number of in_use wait slots (fast path for dns_try_handle_response:
+ * the downlink must not take the wait-table lock for every UDP packet
+ * when no tunnel-DNS query is pending). Incremented after in_use=true,
+ * decremented after in_use=false, both under g_dns_wait_mu. */
+static atomic_int g_dns_wait_n;
 
 /* session generation: bumped by dns_reset()/dns_stop() (run_socks).
  * Workers capture it at spawn and stop registering/sending once it
@@ -435,6 +440,7 @@ static int dns_register(uint16_t id, uint16_t sport, const DnsJob *j)
             w->qtype = j->qtype;
             snprintf(w->domain, sizeof w->domain, "%s", j->domain);
             w->in_use = true;
+            atomic_fetch_add_explicit(&g_dns_wait_n, 1, memory_order_release);
             pthread_mutex_unlock(&g_dns_wait_mu);
             return i;
         }
@@ -497,6 +503,7 @@ static bool dns_consume_answer(int slot, uint16_t dport, uint16_t want_id,
         DnsWait *w = &g_dns_wait[slot];
         if (w->in_use && w->sport == dport && w->dns_id == want_id) {
             w->in_use = false;
+            atomic_fetch_sub_explicit(&g_dns_wait_n, 1, memory_order_release);
             pthread_mutex_unlock(&g_dns_wait_mu);
             dns_push(flow_id, true, af, ip, ip6, fport);
         } else {
@@ -524,6 +531,8 @@ bool dns_try_handle_response(const uint8_t *pkt, size_t n)
 
     if (n < 20 + 8 + 12 || pkt[9] != 17)
         return false;
+    if (atomic_load_explicit(&g_dns_wait_n, memory_order_acquire) == 0)
+        return false;   /* no pending tunnel-DNS query: skip lock + scan */
     ihl = (size_t)(pkt[0] & 0x0f) * 4;
     if (ihl < 20 || n < ihl + 8 + 12)
         return false;
@@ -630,8 +639,10 @@ static void dns_retire_slot_locked(int slot, uint16_t sport, uint16_t id)
     if (slot < 0)
         return;
     DnsWait *w = &g_dns_wait[slot];
-    if (w->in_use && w->sport == sport && w->dns_id == id)
+    if (w->in_use && w->sport == sport && w->dns_id == id) {
         w->in_use = false;
+        atomic_fetch_sub_explicit(&g_dns_wait_n, 1, memory_order_release);
+    }
 }
 
 /* run_socks setup: clear any state a previous session left behind —
@@ -646,6 +657,7 @@ void dns_reset(void)
     pthread_mutex_lock(&g_dns_wait_mu);
     for (int i = 0; i < DNS_WAIT_MAX; i++)
         g_dns_wait[i].in_use = false;
+    atomic_store_explicit(&g_dns_wait_n, 0, memory_order_release);
     atomic_fetch_add(&g_dns_gen, 1);
     pthread_mutex_unlock(&g_dns_wait_mu);
 }
@@ -834,6 +846,7 @@ static void *dns_worker(void *arg) {
                 act = 3;         /* response already handled */
             else if (now >= w->deadline) {
                 w->in_use = false;
+                atomic_fetch_sub_explicit(&g_dns_wait_n, 1, memory_order_release);
                 act = 2;
             } else if (now - last_send >= DNS_POLL_MS && w->resends > 0) {
                 w->resends--;
@@ -1248,14 +1261,25 @@ static void http_handshake(Flow *f)
     size_t hdr, eol, mn, ts;
     pp_target t;
 
-    /* header block ends at \r\n\r\n (real clients always send CRLF) */
-    for (hdr = 3; hdr < n; hdr++) {
-        if (d[hdr - 3] == '\r' && d[hdr - 2] == '\n' &&
-            d[hdr - 1] == '\r' && d[hdr] == '\n')
-            break;
+    /* header block ends at \r\n\r\n (real clients always send CRLF).
+     * Resume the scan where the previous round stopped: input only grows
+     * during the handshake, and the re-checked 3-byte overlap makes the
+     * window boundaries safe, so a trickled large header (64KB of cookies)
+     * costs O(n) total instead of O(n^2). */
+    {
+        size_t start = f->http_scan_off;
+        if (start < 3 || start > n)
+            start = 3;
+        for (hdr = start; hdr < n; hdr++) {
+            if (d[hdr - 3] == '\r' && d[hdr - 2] == '\n' &&
+                d[hdr - 1] == '\r' && d[hdr] == '\n')
+                break;
+        }
     }
-    if (hdr >= n)
+    if (hdr >= n) {
+        f->http_scan_off = n >= 3 ? n - 3 : 0;
         return;                  /* header not complete: wait for more */
+    }
     hdr += 1;                    /* index past the final \n */
     for (eol = 0; eol < n && d[eol] != '\r' && d[eol] != '\n'; eol++)
         ;

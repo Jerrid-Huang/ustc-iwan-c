@@ -109,6 +109,11 @@ typedef struct Netstack {
     int      tx_head, tx_count;
     FramedPkt pkt[NS_TX_MAX];       /* tx packet pool */
     uint8_t  pkt_refs[NS_TX_MAX];   /* 1 = slot referenced by a queue entry */
+    uint64_t tx_free_mask[(NS_TX_MAX + 63) / 64]; /* 1 bit = free slot */
+    int8_t   lport_map[65536];      /* inner lport -> conn index (-1 = none);
+                                     * a dirty hint: always validated against
+                                     * c->lport/c->rport/pcb before use, so a
+                                     * stale entry can never mis-route */
     uint8_t  q_used[NS_MAX_CONN];   /* per-conn tx-queue slots (fair share) */
     uint32_t connect_timeout_ms;
     int      active_count;          /* live conns (idle sleep optimization) */

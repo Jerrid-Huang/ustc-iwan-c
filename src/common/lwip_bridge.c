@@ -187,11 +187,26 @@ static void conn_reconcile_rxq(TcpConn *c)
 /* netif output: frame [8B outer][inner IP] into a tx slot             */
 /* ------------------------------------------------------------------ */
 
+static int tx_find_free_bit(uint64_t m)
+{
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_ctzll(m);
+#else
+    int i = 0;
+    while ((m & 1ULL) == 0) {
+        m >>= 1;
+        i++;
+    }
+    return i;
+#endif
+}
+
 static FramedPkt *tx_find_free_slot(Netstack *ns)
 {
-    for (int i = 0; i < NS_TX_MAX; i++) {
-        if (ns->pkt_refs[i] == 0)
-            return &ns->pkt[i];
+    for (int w = 0; w < (int)((NS_TX_MAX + 63) / 64); w++) {
+        uint64_t m = ns->tx_free_mask[w];
+        if (m)
+            return &ns->pkt[w * 64 + tx_find_free_bit(m)];
     }
     return NULL;
 }
@@ -206,7 +221,11 @@ static int tx_enqueue(Netstack *ns, FramedPkt *fp, uint8_t conn)
     it->clen = fp->len;
     it->conn = conn;
     ns->tx_count++;
-    ns->pkt_refs[(int)(fp - ns->pkt)]++;
+    {
+        int pidx = (int)(fp - ns->pkt);
+        if (ns->pkt_refs[pidx]++ == 0)
+            ns->tx_free_mask[pidx >> 6] &= ~(1ULL << (pidx & 63));
+    }
     if (conn != NS_TX_CONN_CTL)
         ns->q_used[conn]++;
     return 1;
@@ -256,6 +275,19 @@ static int bridge_output_parse(Netstack *ns, const struct pbuf *p,
         *has_payload = tot > ihl + thlen;
         sport = (uint16_t)((t[0] << 8) | t[1]);
         dport = (uint16_t)((t[2] << 8) | t[3]);
+    }
+    /* O(1) fast path: the lport_map hint is validated against the slot's
+     * actual lport/rport/pcb, so a stale entry can never mis-route and we
+     * only fall back to the linear scan on a miss. lport is unique among
+     * active conns (alloc_port in socks_flow.c), so every active conn is
+     * found here on the first try. */
+    {
+        int8_t hint = ns->lport_map[sport];
+        if (hint >= 0) {
+            TcpConn *c = &ns->conns[hint];
+            if (c->pcb != NULL && c->lport == sport && c->rport == dport)
+                return hint;
+        }
     }
     for (int i = 0; i < NS_MAX_CONN; i++) {
         TcpConn *c = &ns->conns[i];
@@ -397,6 +429,10 @@ void ns_init(Netstack *ns, uint32_t inner_ip, uint32_t gw, uint16_t mtu)
     struct netif *old_netif = ns->netif;   /* save before the memset */
 
     memset(ns, 0, sizeof *ns);
+    /* every tx slot starts free; the lport_map hint starts empty */
+    for (int w = 0; w < (int)((NS_TX_MAX + 63) / 64); w++)
+        ns->tx_free_mask[w] = ~0ULL;
+    memset(ns->lport_map, 0xFF, sizeof ns->lport_map);
     ns->ip = inner_ip;
     ns->mtu = mtu;
 
@@ -555,6 +591,7 @@ static int conn_connect_af(Netstack *ns, uint16_t lport, uint8_t af,
 
     c->pcb = pcb;
     c->state = NS_SYN_SENT;
+    ns->lport_map[lport] = (int8_t)idx;   /* O(1) output-parse hint */
     return idx;
 
 fail:
@@ -842,7 +879,9 @@ const TxItem *ns_tx_pop(Netstack *ns)
         return NULL;
     const TxItem *it = &ns->tx_queue[ns->tx_head];
     if (it->seg != NULL) {
-        ns->pkt_refs[(int)((const FramedPkt *)it->seg - ns->pkt)]--;
+        int pidx = (int)((const FramedPkt *)it->seg - ns->pkt);
+        if (--ns->pkt_refs[pidx] == 0)
+            ns->tx_free_mask[pidx >> 6] |= 1ULL << (pidx & 63);
         if (it->conn != NS_TX_CONN_CTL)
             ns->q_used[it->conn]--;
     }

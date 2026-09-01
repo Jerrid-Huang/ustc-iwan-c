@@ -826,6 +826,19 @@ int run_socks(int sockfd, SocksConfig *cfg) {
         int rbuf = SOCK_BUF_BYTES;
         port_setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &rbuf, sizeof rbuf);
         port_setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &rbuf, sizeof rbuf);
+        {
+            /* Linux silently caps SO_RCVBUF at net.core.rmem_max, so the
+             * 16MB request is a no-op on an unprivileged default system;
+             * detect it and tell the operator instead of pretending. */
+            int got = 0;
+            socklen_t gl = sizeof got;
+            if (port_getsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &got, &gl) == 0 &&
+                got < rbuf / 2) {
+                log_err("SO_RCVBUF capped at %d (requested %d): raise "
+                        "net.core.rmem_max/wmem_max for the high-BDP buffer",
+                        got, rbuf);
+            }
+        }
     }
 
     /* M1: tunnel DNS shares the session socket and the server-assigned
