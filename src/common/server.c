@@ -184,6 +184,17 @@ static int echo_mirror(struct server_ctx *ctx, uint8_t *p, size_t len,
 #define RATE_HASH_MUL 2654435761u
 #define RATE_HASH_SHIFT 22          /* keep top 10 hashed bits -> 1024 buckets */
 #define RATE_PROBE_MAX 8            /* linear-probe depth before eviction */
+/* F2: the per-source rate table is sharded by source-IP hash. Each shard
+ * has its own lock + 64-bucket table; a given source always lands in the
+ * SAME shard, so the per-source budget semantics are exactly preserved
+ * (one source cannot earn N budgets by fanning flows across threads) while
+ * contention on the old single global lock drops by RATE_SHARDS. The hash
+ * keeps the Knuth top-bit spread: shard = top 4 hashed bits (28..31),
+ * bucket = next 6 (22..27). RATE_BUCKETS must stay a multiple of
+ * RATE_SHARDS. */
+#define RATE_SHARDS             16
+#define RATE_SHARD_BITS          6   /* log2(buckets per shard) */
+#define RATE_BUCKETS_PER_SHARD  (RATE_BUCKETS / RATE_SHARDS)
 
 static atomic_uint_fast64_t g_send_drops;
 /* [prof] server-side stage counters (exported for the recv thread print) */
@@ -336,17 +347,23 @@ struct rate_bucket {
     uint32_t tok_mis_cnt;
 };
 
-static struct rate_bucket g_rates[RATE_BUCKETS];
+struct rate_shard {
+    struct rate_bucket buckets[RATE_BUCKETS_PER_SHARD];
+    pthread_mutex_t mu;
+};
 
-/* guards g_rates: the multi-threaded uplink recv threads share the
- * rate table; the lock is taken for the unauthenticated control types
- * (rate_allow) and for the F4 DATA/CLOSE token-mismatch accounting
- * (rate_token_over/mismatch/zero). Sections are short and, per flow,
- * effectively uncontended (SO_REUSEPORT pins one client flow to one
- * recv thread). Lock order is always sess_lock (outer) -> g_rate_mu
- * (inner) when both are held; the DATA path releases sess_lock before
- * touching the rate table. */
-static pthread_mutex_t g_rate_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct rate_shard g_rate_shards[RATE_SHARDS];
+
+/* guards g_rate_shards: each shard has its own lock, taken for the
+ * unauthenticated control types (rate_allow) and for the F4 DATA/CLOSE
+ * token-mismatch accounting (rate_token_over/mismatch/zero). Sections
+ * are short and, per flow, effectively uncontended (SO_REUSEPORT pins
+ * one client flow to one recv thread), but independent flows now spread
+ * over RATE_SHARDS locks instead of one global one. Lock order is always
+ * sess_lock (outer) -> shard lock (inner) when both are held; the DATA
+ * path releases sess_lock before touching the rate table. A source's
+ * shard follows from its IP, so no code path holds two shard locks. */
+static int g_rate_shards_init;
 
 /* IWAN_RATE_* limits are read once at startup (server_rate_limits_init);
  * malformed or out-of-range values fall back to the defaults with a
@@ -371,27 +388,54 @@ static unsigned rate_limit_env(const char *name, unsigned dflt)
 
 void server_rate_limits_init(void)
 {
+    /* one-time init of the per-shard locks (called once before the recv
+     * threads are spawned; guarded so a second call is a no-op) */
+    if (!g_rate_shards_init) {
+        for (int i = 0; i < RATE_SHARDS; i++)
+            pthread_mutex_init(&g_rate_shards[i].mu, NULL);
+        g_rate_shards_init = 1;
+    }
     g_rate_open_max = rate_limit_env("IWAN_RATE_OPEN_MAX",
                                      RATE_OPEN_MAX_DEFAULT);
     g_rate_echo_max = rate_limit_env("IWAN_RATE_ECHO_MAX",
                                      RATE_ECHO_MAX_DEFAULT);
 }
 
-/* locate (or claim) the rate bucket for ip; caller must hold g_rate_mu.
- * Linear probing: the hashed slot may belong to another source, so scan
- * up to RATE_PROBE_MAX slots for a bucket of this IP or a never-used one
- * instead of clobbering a neighbour's counters (that would let one
- * source reset another's window or dodge the limit by rehashing). Only
- * when the whole probe window is occupied by other sources do we evict
- * the slot whose window started longest ago. */
-static struct rate_bucket *rate_bucket_find(uint32_t ip)
+/* source address -> owning shard. Top 4 hashed bits select the shard, so
+ * sequential IPs spread evenly over all 16 shards (same Knuth hash as the
+ * bucket index below). */
+static inline unsigned rate_ip_shard(uint32_t ip)
 {
-    unsigned h = (unsigned)((ip * RATE_HASH_MUL) >> RATE_HASH_SHIFT); /* top 10 bits */
+    unsigned h = (unsigned)((ip * RATE_HASH_MUL) >> RATE_HASH_SHIFT);
+    return (h >> RATE_SHARD_BITS) & (RATE_SHARDS - 1);
+}
+
+/* release the lock rate_bucket_enter took; pass the SAME ip that was
+ * passed to enter (it selects the shard). */
+static inline void rate_shard_unlock(uint32_t ip)
+{
+    pthread_mutex_unlock(&g_rate_shards[rate_ip_shard(ip)].mu);
+}
+
+/* locate (or claim) the rate bucket for ip inside its shard; caller must
+ * hold that shard's lock. Linear probing: the hashed slot may belong to
+ * another source, so scan up to RATE_PROBE_MAX slots for a bucket of this
+ * IP or a never-used one instead of clobbering a neighbour's counters
+ * (that would let one source reset another's window or dodge the limit by
+ * rehashing). Only when the whole probe window is occupied by other
+ * sources do we evict the slot whose window started longest ago. */
+static struct rate_bucket *rate_bucket_find(struct rate_shard *sh,
+                                            uint32_t ip)
+{
+    /* low 6 hashed bits within the shard: bits 22..27 (the shard took
+     * 28..31), still evenly spread for packet-flood neighbour IPs */
+    unsigned h = (unsigned)((ip * RATE_HASH_MUL) >> RATE_HASH_SHIFT) &
+                 (RATE_BUCKETS_PER_SHARD - 1);
     unsigned evict = 0;
     uint64_t oldest = UINT64_MAX;
 
     for (unsigned i = 0; i < RATE_PROBE_MAX; i++) {
-        struct rate_bucket *c = &g_rates[(h + i) % RATE_BUCKETS];
+        struct rate_bucket *c = &sh->buckets[(h + i) % RATE_BUCKETS_PER_SHARD];
         if (c->win < oldest) {
             oldest = c->win;
             evict = i;
@@ -400,11 +444,11 @@ static struct rate_bucket *rate_bucket_find(uint32_t ip)
             return c;
         }
     }
-    return &g_rates[(h + evict) % RATE_BUCKETS];
+    return &sh->buckets[(h + evict) % RATE_BUCKETS_PER_SHARD];
 }
 
 /* (re)start the source's window when the bucket is stale or was just
- * evicted from another source; caller must hold g_rate_mu. */
+ * evicted from another source; caller must hold the shard lock. */
 static void rate_bucket_touch(struct rate_bucket *b, uint32_t ip, uint64_t now)
 {
     if (b->ip != ip || now - b->win >= RATE_WINDOW_MS) {
@@ -415,16 +459,17 @@ static void rate_bucket_touch(struct rate_bucket *b, uint32_t ip, uint64_t now)
     }
 }
 
-/* shared skeleton for the per-source rate paths below: lock the rate
- * table, (re)locate the source's bucket, (re)start its window, and
- * hand the bucket back with the lock STILL HELD — the caller does its
- * per-type accounting and then unlocks (the counter read-modify-write
- * must stay inside the critical section; see g_rate_mu). Small enough
- * that the compiler inlines it on the per-packet path. */
+/* shared skeleton for the per-source rate paths below: lock the source's
+ * shard, (re)locate its bucket, (re)start its window, and hand the bucket
+ * back with the lock STILL HELD — the caller does its per-type accounting
+ * and then calls rate_shard_unlock(ip) (the counter read-modify-write must
+ * stay inside the critical section). Small enough that the compiler
+ * inlines it on the per-packet path. */
 static struct rate_bucket *rate_bucket_enter(uint32_t ip, uint64_t now)
 {
-    pthread_mutex_lock(&g_rate_mu);
-    struct rate_bucket *b = rate_bucket_find(ip);
+    struct rate_shard *sh = &g_rate_shards[rate_ip_shard(ip)];
+    pthread_mutex_lock(&sh->mu);
+    struct rate_bucket *b = rate_bucket_find(sh, ip);
     rate_bucket_touch(b, ip, now);
     return b;
 }
@@ -452,10 +497,10 @@ static bool rate_allow(const struct sockaddr_in *peer, uint8_t typ, uint64_t now
     default:
         return true; /* authenticated or negligible-cost paths */
     }
-    /* the rate table is shared by the multi-threaded uplink recv
-     * threads; the mutex is taken on the unauthenticated control types
-     * above and on the F4 DATA/CLOSE token-mismatch checks below
-     * (rate_token_over/mismatch/zero) */
+    /* the sharded rate tables are shared by the multi-threaded uplink
+     * recv threads; the per-shard mutex is taken on the unauthenticated
+     * control types above and on the F4 DATA/CLOSE token-mismatch checks
+     * below (rate_token_over/mismatch/zero) */
     b = rate_bucket_enter(ip, now);
     /* independent per-type counters: a PING flood cannot eat the ECHO
      * budget (or vice versa); OPEN keeps its own, tighter limit */
@@ -465,7 +510,7 @@ static bool rate_allow(const struct sockaddr_in *peer, uint8_t typ, uint64_t now
         ok = false;
     else
         (*cnt)++;
-    pthread_mutex_unlock(&g_rate_mu);
+    rate_shard_unlock(ip);
     if (!ok)
         atomic_fetch_add(&g_rate_drops, 1);
     return ok;
@@ -486,7 +531,7 @@ static bool rate_token_over(const struct sockaddr_in *peer, uint64_t now)
 
     b = rate_bucket_enter(ip, now);
     over = b->tok_mis_cnt >= RATE_TOKEN_MISMATCH_MAX;
-    pthread_mutex_unlock(&g_rate_mu);
+    rate_shard_unlock(ip);
     if (over)
         atomic_fetch_add(&g_rate_drops, 1);
     return over;
@@ -503,7 +548,7 @@ static void rate_token_mismatch(const struct sockaddr_in *peer, uint64_t now)
     b = rate_bucket_enter(ip, now);
     if (b->tok_mis_cnt < RATE_TOKEN_MISMATCH_MAX)
         b->tok_mis_cnt++;
-    pthread_mutex_unlock(&g_rate_mu);
+    rate_shard_unlock(ip);
 }
 
 /* true when the source has accumulated zero token mismatches in the
@@ -520,7 +565,7 @@ static bool rate_token_zero(const struct sockaddr_in *peer, uint64_t now)
 
     b = rate_bucket_enter(ip, now);
     zero = b->tok_mis_cnt == 0;
-    pthread_mutex_unlock(&g_rate_mu);
+    rate_shard_unlock(ip);
     return zero;
 }
 
