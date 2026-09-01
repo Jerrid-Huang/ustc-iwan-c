@@ -24,11 +24,22 @@
 static long server_port(Json *s)
 {
     Json *p = json_get(s, "serverPort");
-    if (p && json_type(p) == JSON_NUM)
-        return (long)json_num(p);
-    if (p && json_type(p) == JSON_STR)
-        return atol(json_str(p));
-    return 0;
+    long v = 0;
+    if (p && json_type(p) == JSON_NUM) {
+        v = (long)json_num(p);
+    } else if (p && json_type(p) == JSON_STR) {
+        /* strtol + full-consumption: reject "80http", whitespace and
+         * overflow instead of atol's silent clamp / partial parse */
+        char *end = NULL;
+        errno = 0;
+        v = strtol(json_str(p), &end, 10);
+        if (errno != 0 || end == json_str(p) || *end != '\0')
+            return 0;
+    } else {
+        return 0;
+    }
+    /* 0 == "omit"; the connect path then applies its own default */
+    return (v >= 1 && v <= 65535) ? v : 0;
 }
 
 static bool mkdir_p(const char *path)
@@ -55,24 +66,28 @@ static bool mkdir_p(const char *path)
 #ifdef _WIN32
             /* _mkdir ignores the mode argument (Windows has no 0700;
              * ACLs govern access) */
-            if (_mkdir(tmp) != 0 && errno != EEXIST)
+            if (_mkdir(tmp) == 0)
+                created = true;
+            else if (errno != EEXIST)
 #else
-            if (mkdir(tmp, 0700) != 0 && errno != EEXIST)
+            if (mkdir(tmp, 0700) == 0)
+                created = true;
+            else if (errno != EEXIST)
 #endif
                 oidc_die("cannot create dir %s: %s", tmp, strerror(errno));
-            else if (errno != EEXIST)
-                created = true;
             *p = sep;
         }
     }
 #ifdef _WIN32
-    if (_mkdir(tmp) != 0 && errno != EEXIST)
+    if (_mkdir(tmp) == 0)
+        created = true;
+    else if (errno != EEXIST)
 #else
-    if (mkdir(tmp, 0700) != 0 && errno != EEXIST)
+    if (mkdir(tmp, 0700) == 0)
+        created = true;
+    else if (errno != EEXIST)
 #endif
         oidc_die("cannot create dir %s: %s", tmp, strerror(errno));
-    else if (errno != EEXIST)
-        created = true;
     return created;
 }
 
@@ -239,21 +254,24 @@ void oidc_save_config(const char *path, const Config *cf)
     size_t tlen = strlen(path) + sizeof ".tmp";
     char *tmp = malloc(tlen);
     snprintf(tmp, tlen, "%s.tmp", path);
-#ifdef _WIN32
-    /* unpredictable temp name + exclusive create (audit L13): a fixed
-     * servers.json.tmp is a predictable pre-plant/race target; rand_u32
-     * is CSPRNG-backed. rename() still replaces the target atomically. */
+    /* unpredictable temp name + exclusive create on BOTH platforms:
+     * O_NOFOLLOW alone cannot stop a pre-planted HARDLINK, and a fixed
+     * name with O_TRUNC would let anyone who can write the config dir
+     * make this (sudo re-exec'd, root) process truncate an arbitrary
+     * same-filesystem file. rand_u32 is CSPRNG-backed. rename() still
+     * replaces the target atomically. */
     tmp = realloc(tmp, tlen + 16);
     if (!tmp)
         oom_abort();
     int fd = -1;
     for (int attempt = 0; attempt < 8 && fd < 0; attempt++) {
         snprintf(tmp, tlen + 16, "%s.tmp.%08x", path, rand_u32());
+#ifdef _WIN32
         fd = _open(tmp, _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY, 0600);
-    }
 #else
-    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+        fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
 #endif
+    }
     if (fd < 0)
         oidc_die("cannot write config to %s", path);
     FILE *f = fdopen(fd, "wb");

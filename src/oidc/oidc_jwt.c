@@ -268,6 +268,18 @@ static int validate_claims(Json *pay_j, const char *aud, const char *iss)
             return -1;
         }
     }
+    {
+        /* issued-at must not be in the future (same 60s skew window as
+         * nbf): a future iat means either a forged token or a badly
+         * skewed clock, both of which should fail closed */
+        Json *iat = json_get(pay_j, "iat");
+        if (iat && json_type(iat) == JSON_NUM &&
+            json_num(iat) > (double)(now + 60)) {
+            oidc_eprintf("oidc_jwt_verify: id_token issued in the future "
+                         "(iat)\n");
+            return -1;
+        }
+    }
     if (!aud_matches(pay_j, aud)) {
         oidc_eprintf("oidc_jwt_verify: id_token aud does not include "
                      "\"%s\"\n", aud);
