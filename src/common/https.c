@@ -6,6 +6,10 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifndef _WIN32
+#include <netinet/tcp.h>   /* TCP_NODELAY (E3) */
+#endif
+
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
@@ -605,6 +609,14 @@ static int https_connect_tcp(const char *host, uint16_t port,
             port_close(fd);
             fd = -1;
             continue;
+        }
+        {
+            /* E3: Nagle delays the small TLS handshake records behind
+             * each other (40-200ms per hop with delayed ACK); the tunnel
+             * sockets all disable it */
+            int nd = 1;
+            (void)port_setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nd,
+                                  sizeof nd);
         }
         if (port_connect(fd, ai->ai_addr, ai->ai_addrlen) != 0) {
             /* nonblocking connect: WSAEWOULDBLOCK -> EAGAIN on Windows,

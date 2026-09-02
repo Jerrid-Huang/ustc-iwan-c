@@ -123,6 +123,11 @@ int tun_pool_write_fd(const struct tun_pool *p, unsigned tid);
 /* uplink write hit the device queue: prevents the AIMD shrink for the
  * next tick (write fan-out must not collapse under upload congestion) */
 void tun_pool_note_stall(struct tun_pool *p);
+/* queue index of the calling reader thread (0-based, set at thread
+ * start): lets a per-queue consumer (server downlink fd + batch state)
+ * pick its own state inside the packet callback without changing the
+ * callback signature. Always 0 on Windows (single-queue wintun pool). */
+int tun_reader_qid(void);
 void tun_pool_set_exit_cb(struct tun_pool *p, tun_exit_fn cb);
 void tun_pool_tick(struct tun_pool *p);
 void tun_pool_destroy(struct tun_pool *p);

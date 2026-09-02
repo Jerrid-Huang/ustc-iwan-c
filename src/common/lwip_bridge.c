@@ -391,9 +391,14 @@ static err_t bridge_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p,
 
     /* copy the (possibly chained) payload into the downlink buffer. Do NOT
      * tcp_recved here: the window reopens only when the socks layer drains
-     * rxq (conn_reconcile_rxq). Track the delivered-but-unrecved count. */
-    for (struct pbuf *q = p; q != NULL; q = q->next)
-        buf_put(&c->rxq, q->payload, q->len);
+     * rxq (conn_reconcile_rxq). Track the delivered-but-unrecved count.
+     * Pre-size once for the whole pbuf chain: buf_put's per-segment
+     * grow_cap check is repeated work for a multi-segment pbuf. */
+    buf_ensure(&c->rxq, p->tot_len);
+    for (struct pbuf *q = p; q != NULL; q = q->next) {
+        memcpy(c->rxq.data + c->rxq.len, q->payload, q->len);
+        c->rxq.len += q->len;
+    }
     c->rxq_unrecved += p->tot_len;
     pbuf_free(p);
     return ERR_OK;

@@ -93,6 +93,14 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
  * writable. */
 void handle_tun_downlink(struct server_ctx *ctx, uint8_t *ip_pkt, size_t len,
                          int sockfd);
+/* gate + session snapshot + outer header + in-place XOR; false when the
+ * packet was dropped or consumed locally. Shared by the direct-send
+ * path (handle_tun_downlink) and the TUN reader pool's per-queue
+ * sendmmsg batching (iwan_server.c). */
+bool tun_prep_downlink(struct server_ctx *ctx, uint8_t *ip_pkt, size_t len,
+                       struct server_sess_snap *snap_out, uint8_t *hdr_out);
+/* count n failed downlink sends (batch remainder; see server.c) */
+void server_add_send_drops(unsigned long long n);
 
 /* Drop sessions idle for more than 120s; log each. Main thread only. */
 void purge_expired(struct server_ctx *ctx, uint64_t now_ms);

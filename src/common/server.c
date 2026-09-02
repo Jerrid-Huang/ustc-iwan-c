@@ -593,6 +593,14 @@ static uint64_t server_dl_pkts(void)
     return atomic_load(&g_dl_pkts);
 }
 
+/* count n downlink sends that failed (sendmmsg batch remainder): the
+ * caller (iwan_server.c's per-queue batch) drops the rest of a batch on
+ * the first error, same contract as the per-packet path */
+void server_add_send_drops(unsigned long long n)
+{
+    atomic_fetch_add(&g_send_drops, n);
+}
+
 /* rate-limited reject logging: at most REJECT_LOG_MAX lines per second,
  * attacker-controlled username rendered printable-only. The throttle
  * counters are atomic: multiple recv threads may log rejects. */
@@ -1422,15 +1430,20 @@ int echo_mirror(struct server_ctx *ctx, uint8_t *p, size_t len,
     return 0;
 }
 
-void handle_tun_downlink(struct server_ctx *ctx, uint8_t *ip_pkt, size_t len,
-                         int sockfd)
+/* gate + session snapshot + outer header + in-place XOR; returns false
+ * when the packet was dropped or consumed locally (nothing to send).
+ * Shared by handle_tun_downlink (prep + direct send) and the TUN reader
+ * pool's batching path (iwan_server.c stages the [hdr, payload] pair
+ * into a per-queue sendmmsg batch instead). The in-place XOR contract
+ * is unchanged: the buffer belongs to the caller until this returns. */
+bool tun_prep_downlink(struct server_ctx *ctx, uint8_t *ip_pkt, size_t len,
+                       struct server_sess_snap *snap_out, uint8_t *hdr_out)
 {
     struct server_sess_snap snap;
-    uint8_t hdr[IWAN_HDR_LEN];
     uint32_t saddr, daddr;
 
     if (len < 20 || len > 65536)
-        return;
+        return false;
     /* H1: gate the inner header before any session lookup. dst must be a
      * client address or the server's own address; the latter is the
      * SOCKS-mode local-delivery case and must never be rejected here (a
@@ -1446,14 +1459,14 @@ void handle_tun_downlink(struct server_ctx *ctx, uint8_t *ip_pkt, size_t len,
                           "plen=%u",
                           len, ip_pkt[0] >> 4,
                           ((unsigned)ip_pkt[4] << 8) | ip_pkt[5]);
-            return;
+            return false;
         }
         /* server-bound (its own derived ULA): consumed locally */
         {
             uint8_t srv6[16];
             ip6_derive_ula(ip4_u32(ctx->server_ip), srv6);
             if (memcmp(d6, srv6, 16) == 0)
-                return;
+                return false;
         }
         /* session lookup: the client's ULA embeds its inner IPv4 in the
          * low 32 bits (protocol.h), so the IPv4 session table applies */
@@ -1462,7 +1475,7 @@ void handle_tun_downlink(struct server_ctx *ctx, uint8_t *ip_pkt, size_t len,
             struct server_session *s = find_session_by_ip_unlocked(ctx, d6 + 12);
             if (!s) {
                 pthread_rwlock_unlock(&ctx->sess_lock);
-                return;
+                return false;
             }
             snap.peer = s->peer;
             snap.sid = s->sid;
@@ -1487,12 +1500,12 @@ void handle_tun_downlink(struct server_ctx *ctx, uint8_t *ip_pkt, size_t len,
                           ip_pkt[0] >> 4, ip_pkt[0] & 0x0F,
                           ((unsigned)ip_pkt[2] << 8) | ip_pkt[3]);
             }
-            return;
+            return false;
         }
         if (daddr == ip4_u32(ctx->server_ip)) {
             /* server-bound packet: the gate allows it, but no client owns
              * this address — the server machine consumes it locally */
-            return;
+            return false;
         }
         /* snapshot under the read lock; the send happens lock-free */
         pthread_rwlock_rdlock(&ctx->sess_lock);
@@ -1500,7 +1513,7 @@ void handle_tun_downlink(struct server_ctx *ctx, uint8_t *ip_pkt, size_t len,
             struct server_session *s = find_session_by_ip_unlocked(ctx, ip_pkt + 16);
             if (!s) {
                 pthread_rwlock_unlock(&ctx->sess_lock);
-                return;
+                return false;
             }
             snap.peer = s->peer;
             snap.sid = s->sid;
@@ -1512,9 +1525,21 @@ void handle_tun_downlink(struct server_ctx *ctx, uint8_t *ip_pkt, size_t len,
     }
 
     pkt_hdr(snap.enc ? PT_DATA_ENC : PT_DATA, snap.enc, snap.sid,
-            snap.token, hdr);
+            snap.token, hdr_out);
     if (snap.enc)
         xor_crypt(ip_pkt, len, snap.xor_key, sizeof snap.xor_key);
+    *snap_out = snap;
+    return true;
+}
+
+void handle_tun_downlink(struct server_ctx *ctx, uint8_t *ip_pkt, size_t len,
+                         int sockfd)
+{
+    struct server_sess_snap snap;
+    uint8_t hdr[IWAN_HDR_LEN];
+
+    if (!tun_prep_downlink(ctx, ip_pkt, len, &snap, hdr))
+        return;
     /* Zero-copy send: the payload is XORed IN PLACE (the buffer belongs
      * to the caller until this returns — the tun reader's scratch or a
      * mirror stack buffer — and UDP datagrams are never retransmitted,

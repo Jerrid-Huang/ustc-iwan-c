@@ -446,17 +446,98 @@ static void server_cleanup_nat(void)
 }
 
 /* shared tun_pool glue: downlink reader callback (one per queue) */
+/* A1: downlink sendmmsg batch — each queue gets its own batch state;
+ * packets are staged (hdr + payload COPY, the reader's TLS buffer is
+ * reused for the next read) and flushed with ONE sendmmsg on the
+ * reader's flush signal or when the batch fills. Sparse traffic adds no
+ * latency: the reader fires the flush signal right after draining its
+ * burst. Same drop contract as the per-packet path: UDP datagrams are
+ * never retransmitted, so unsent data segments recover by TCP RTO and
+ * pure ACKs regenerate. */
+#define SRV_DL_BATCH 64
+#define SRV_DL_SLOT  1500   /* inner MTU; larger packets bypass the batch */
+struct srv_dl_batch {
+    uint8_t hdrs[SRV_DL_BATCH][IWAN_HDR_LEN];
+    uint8_t pl[SRV_DL_BATCH][SRV_DL_SLOT];
+    struct sockaddr_in peers[SRV_DL_BATCH];
+    struct iovec iovs[SRV_DL_BATCH * 2];
+    struct mmsghdr msgs[SRV_DL_BATCH];
+    int n;
+};
+
 struct srv_pool_ud {
     struct server_ctx *ctx;
-    int udp_fd;
+    const int *udp_fds;    /* A2: per-reader send socket (qid % nfds) */
+    int nfds;
+    struct srv_dl_batch b[TUN_POOL_MAX];  /* one batch state per queue */
 };
+
+/* flush the batch with one sendmmsg; partial sends drop the rest (the
+ * socket is non-blocking, so EAGAIN means the send buffer is full) */
+static void srv_dl_flush(struct srv_dl_batch *b, int fd)
+{
+    int n = b->n, sent = 0;
+
+    b->n = 0;
+    while (sent < n) {
+        int r = port_sendmmsg(fd, &b->msgs[sent], (unsigned)(n - sent), 0);
+        if (r <= 0) {
+            if (r < 0 && errno == EINTR)
+                continue;
+            break;   /* EAGAIN / fatal: drop the rest (same contract) */
+        }
+        for (int i = 0; i < r; i++)
+            PROF_ADD(g_prof_srv_dlsend,
+                     b->iovs[(size_t)(sent + i) * 2 + 1].iov_len);
+        sent += r;
+    }
+    if (sent < n)
+        server_add_send_drops((unsigned long long)(n - sent));
+}
 
 static void srv_tun_pkt(void *ud, uint8_t *pkt, size_t len, bool last)
 {
     struct srv_pool_ud *pu = ud;
-    (void)last;
+    int qid = tun_reader_qid();
+    struct srv_dl_batch *b;
+    struct server_sess_snap snap;
+    uint8_t hdr[IWAN_HDR_LEN];
+    int fd;
+
+    if (qid < 0 || qid >= TUN_POOL_MAX)
+        qid = 0;
+    b = &pu->b[qid];
+    fd = pu->udp_fds[qid % pu->nfds];
     PROF_ADD(g_prof_srv_tunr, len);
-    handle_tun_downlink(pu->ctx, pkt, len, pu->udp_fd);
+
+    if (len < 20) {
+        /* too small for an inner header: drop (previous staged packets
+         * still flush on the reader's signal below) */
+    } else if (len > SRV_DL_SLOT) {
+        /* oversized (never on an MTU-1500 TUN): flush first so per-queue
+         * ordering is preserved, then prep + direct-send */
+        srv_dl_flush(b, fd);
+        handle_tun_downlink(pu->ctx, pkt, len, fd);
+    } else if (tun_prep_downlink(pu->ctx, pkt, len, &snap, hdr)) {
+        int i = b->n;
+        memcpy(b->hdrs[i], hdr, IWAN_HDR_LEN);
+        memcpy(b->pl[i], pkt, len);
+        b->peers[i] = snap.peer;
+        b->iovs[i * 2].iov_base = b->hdrs[i];
+        b->iovs[i * 2].iov_len = IWAN_HDR_LEN;
+        b->iovs[i * 2 + 1].iov_base = b->pl[i];
+        b->iovs[i * 2 + 1].iov_len = len;
+        memset(&b->msgs[i], 0, sizeof b->msgs[i]);
+        b->msgs[i].msg_hdr.msg_name = &b->peers[i];
+        b->msgs[i].msg_hdr.msg_namelen = sizeof b->peers[i];
+        b->msgs[i].msg_hdr.msg_iov = &b->iovs[i * 2];
+        b->msgs[i].msg_hdr.msg_iovlen = 2;
+        b->n++;
+        if (b->n == SRV_DL_BATCH)
+            srv_dl_flush(b, fd);
+    }
+    if (last)
+        srv_dl_flush(b, fd);
 }
 
 /* open and configure the tun. Exits on failure. */
@@ -1013,7 +1094,8 @@ int main(int argc, char **argv)
         if (ncpu > 0 && ncpu < maxq)
             maxq = (int)ncpu;
         pu.ctx = &ctx;
-        pu.udp_fd = udp_fds[0];
+        pu.udp_fds = udp_fds;
+        pu.nfds = nfds;
         /* eager full pool: uplink writers spread across the queue fds
          * (tun_pool_write_fd, tid % nq); starting at the recv-thread
          * count means the write-side fan-out is effective immediately

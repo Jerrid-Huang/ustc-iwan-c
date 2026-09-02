@@ -303,6 +303,17 @@ int tun_write_retry(int fd, const uint8_t *pkt, size_t len, int max_ms,
 #define TUN_BUSY_GROW 0.85
 #define TUN_BUSY_SHRINK 0.60
 
+/* queue index of the calling reader thread (0..pool size-1), set once at
+ * thread start; consumers (the server's per-reader downlink fd + batch
+ * state) read it inside the packet callback. Always 0 on Windows (the
+ * wintun pool is single-queue and never sets it). */
+static _Thread_local int t_reader_qid;
+
+int tun_reader_qid(void)
+{
+    return t_reader_qid;
+}
+
 struct tun_queue {
     struct tun_pool *pool;
     int fd;
@@ -337,6 +348,7 @@ static void *tun_reader_main(void *ud)
     struct pollfd pfd = { .fd = q->fd, .events = POLLIN };
     static _Thread_local uint8_t buf[65536];
 
+    t_reader_qid = (int)(q - pool->qs);
     while (!q->stop && (pool->abort == NULL || !*pool->abort)) {
         int pr = poll(&pfd, 1, TUN_POLL_MS);
         if (pr < 0 && errno != EINTR)
