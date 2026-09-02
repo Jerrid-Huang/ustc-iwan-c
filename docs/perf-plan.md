@@ -20,6 +20,13 @@
 | **下行 sendmmsg 批处理 + per-reader 发送 fd** | `abb2b2e` | 每队列 64 槽批状态，flush 信号/批满时一次 sendmmsg；fd 按 qid % nfds 分摊 |
 | https TCP_NODELAY | `abb2b2e` | Nagle 拖慢 TLS 握手 40–200ms/跳 |
 | bridge_recv 预分配 | `abb2b2e` | 整链 buf_ensure 后 memcpy |
+| C4 prof 计数器门控 | `af7308a` | g_pump_prof_on 一次性解析，add/fetch_add 全部门控 |
+| C1 GSO 迟滞闩锁 | `af7308a` | 连续 IWAN_GSO_HYST=8 才重 arm；send_ctrl 清后恢复原 mss |
+| C2(有界) TUN 写预算 | `af7308a` | max_ms=0 → PUMP_SEND_RETRY_MS=5ms；writev 批量不可行（TUN 一次一帧） |
+| B2 readv 聚合 64KB | `af7308a` | 45×1460，每 256KB 上传轮次 ~45→~4 |
+| E2 Happy Eyeballs | `af7308a` | v4/v6 双 lane 并行竞速（简化版） |
+| E4 SSL_CTX 缓存 | `af7308a` | 按 CA 模式缓存两枚，登录路径复用 |
+| F LTO 选项 | `af7308a` | IWAN_LTO 默认 OFF，-flto=auto 已验证 |
 
 ## 已拒绝（勿回退，证据见下）
 
@@ -36,14 +43,11 @@
 | 项 | 内容 | 暂缓理由 | 重启条件 |
 |---|---|---|---|
 | B1/C3/#6 | 下行缓冲环形化（`buf_consume`/`rp_flush` 部分 drain 的 O(n) memmove + 倍增 realloc） | 慢读端本身低频且非 CPU 瓶颈；ring 化 buf_t 触及 6+ 调用点（buf_put/ensure/直接读 data+len），漏一处即静默数据错位 | `IWAN_PUMP_PROF` 显示慢客户端 drain 占到可测 CPU |
-| B2 | 上行 readv 聚合 4×1460 → 64KB scratch | snd_buf 背压上界已保证不丢；tcp_write len 为 u16_t，扩大 scratch 只省 readv 次数 | 上行 syscall 计数成为 prof 头项 |
-| C1 | GSO 迟滞闩锁（MSS 稳定 N 批才切；send_ctrl 后恢复原 MSS 不清零） | 真实但牵动 send_lock 语义与 gso_mss 全局状态机；send_ctrl 清零是"防 lingering segment"的安全设计 | 混合 MTU 流量实测 setsockopt 抖动成为 prof 头项 |
-| C2 | TUN 写侧 writev 批量（iovec 直指 recvmmsg arena 零拷贝）+ 重试 5ms 预算 | 零拷贝重构触及 TUN 写重试生命周期；下行逐包 write 是 syscall 大项但重构面大 | 下行 syscall 计数成为 prof 头项（同 C1 一起评估） |
-| C4 | prof 计数器门控（env 未设置跳过采集） | 仅 TUN 模式客户端路径（proxy.c），SOCKS 推荐模式不经过；收益可忽略 | 顺手项，与任一 proxy.c 改动搭车 |
+| C2 批量部分 | writev 批量 TUN 写 | **不可行**：TUN 一次调用一帧，多 iovec 会被内核拼成一帧被 gate 丢弃（已核实 tun_get_user 语义）；有界预算部分已落地（af7308a） | 无（已关闭） |
+| E1 | 登录路径 async DNS | getaddrinfo 在同步函数里，真 async 需改调用方框架；收益（一次 DNS ~50ms）与风险不配 | 登录延迟实测 > 2s 且用户可感知 |
+| E4 会话复用 | SSL_SESSION 复用 | 牵动会话生命周期与 wincrypt store 枚举；SSL_CTX 缓存已落地（af7308a），session 复用收益递减 | 同上 |
 | D1/D2 | Windows：pump_win_single 批量 WSASend + SIO_UDP_NETSEGMENT；wintun ReceivePacket 攒批 | Windows 吞吐未实测为瓶颈；IOCP/批处理改动面大 | Windows 实测吞吐成为瓶颈 |
-| E1/E2/E4 | 登录路径：async DNS、Happy Eyeballs、SSL_CTX/SESSION 复用 | 非隧道吞吐热点（一次认证多次重建才 10×）；SSL 生命周期与 wincrypt store 枚举牵动安全面 | 登录延迟实测 > 2s 且用户可感知 |
 | E5 | gcm.c 每次解密新建 EVP_CIPHER_CTX | 仅登录一次性调用，非性能项 | 顺手项 |
-| F | LTO（CMake IPO） | 名义零风险但 mingw/musl 交叉工具链对 LTO 支持参差；需 A/B 与 CI 验证 | Linux A/B 有 ≥3% 收益且 CI 全绿 |
 | #5 进阶 | root 时 SO_RCVBUFFORCE 真正生效 | SOCKS 模式定位免 root，force 无效 | 无（保留最低成本版即可） |
 | #3/#7 | DNS 线程池/缓存/合并；reservev 尾部小槽 + commitv | 线程创建 ~50µs vs DNS RTT 几十 ms；窗口边缘才见效 | 页面加载场景实测连接建立延迟分布 |
 
