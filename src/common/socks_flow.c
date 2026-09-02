@@ -37,7 +37,10 @@
 #include "util.h"
 
 #define LOCAL_WRITE_LIMIT   262144
-#define LOCAL_IOV_MAX       4      /* zero-copy readv feed: reserve slots */
+#define LOCAL_IOV_MAX       45     /* zero-copy readv feed: reserve slots
+                                    * (== NS_SCRATCH_SLOTS, lwip_bridge.c;
+                                    * the iov array must hold every slot
+                                    * ns_send_reservev can return) */
 #define HANDSHAKE_TIMEOUT_MS 30000u /* ms: greeting/request/resolve/connect */
 #define HANDSHAKE_INPUT_MAX (64 * 1024) /* handshake-phase input cap */
 #define TCP_RX_CHUNK        16384

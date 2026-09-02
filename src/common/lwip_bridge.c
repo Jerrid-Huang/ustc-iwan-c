@@ -44,6 +44,12 @@
 #define NS_CONNECT_TIMEOUT 30000u
 #define NS_FIN_WAIT_TIMEOUT 30000u      /* half-closed, no peer FIN: abort */
 #define NS_MSS             1460u
+/* B2: zero-copy readv slots per upload round (scratch size); LOCAL_IOV_MAX
+ * in socks_flow.c must stay in sync with this (its iov array must hold
+ * every slot reservev can return). 45 slots ~64KB: one readv() covers a
+ * full 64KB kernel read instead of ~5.8KB, cutting the readv+tcp_write
+ * round count per 256KB upload from ~45 to ~4. */
+#define NS_SCRATCH_SLOTS   45
 #define NS_TICK_MAX_MS     10000
 #define NS_POLL_DEAD_MS    1000u           /* poll stopped => pcb in TIME_WAIT
                                              * or freed; safe to reclaim */
@@ -683,8 +689,8 @@ int ns_send_reservev(Netstack *ns, int idx, struct iovec *iov, int maxn)
     if (avail < NS_MSS)
         return 0;
 
-    if (maxn > 4)
-        maxn = 4;
+    if (maxn > NS_SCRATCH_SLOTS)
+        maxn = NS_SCRATCH_SLOTS;
     c->scratch_commit = 0;
     int n = 0;
     for (int k = 0; k < maxn && avail >= NS_MSS; k++) {

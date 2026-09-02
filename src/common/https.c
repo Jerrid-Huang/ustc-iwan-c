@@ -516,11 +516,27 @@ static int https_ctx_add_embedded_cas(SSL_CTX *ctx)
     return n;
 }
 
-/* One client TLS context with peer verification and CA loading. The
-   context is created per exchange (https_transport) rather than cached:
-   HTTPS round trips are rare (auth/OIDC), and per-exchange ownership
-   keeps the Windows store enumeration and the OpenSSL state clear of
-   static data and locking in a process that spawns threads elsewhere. */
+/* One client TLS context with peer verification and CA loading, cached
+   per CA mode (0 = system store, 1 = bundled fallback roots): a single
+   auth/OIDC round trip builds the context up to twice (attempt 1 system
+   store, attempt 2 + bundled roots), and later exchanges reuse it. The
+   cache is process-lifetime and lazily initialized by the serial login
+   path (https_transport runs on one thread at a time); SSL objects are
+   always created fresh from the shared context, which OpenSSL allows. */
+static SSL_CTX *g_https_ctx[2];   /* [0] system store, [1] + fallback CAs */
+
+static SSL_CTX *https_ctx_new(bool with_fallback);
+
+static SSL_CTX *https_ctx_get(bool with_fallback)
+{
+    SSL_CTX **slot = &g_https_ctx[with_fallback ? 1 : 0];
+
+    if (*slot)
+        return *slot;
+    *slot = https_ctx_new(with_fallback);
+    return *slot;
+}
+
 static SSL_CTX *https_ctx_new(bool with_fallback)
 {
     SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
@@ -543,6 +559,7 @@ static SSL_CTX *https_ctx_new(bool with_fallback)
             SSL_CTX_free(ctx);
             return NULL;
         }
+        /* (cache callers never see this NULL: with_fallback continues) */
         /* system store unusable: fall back to the bundled roots alone */
         log_err("HTTPS: system CA store unusable; using bundled fallback "
                 "roots only");
@@ -559,16 +576,131 @@ static SSL_CTX *https_ctx_new(bool with_fallback)
     return ctx;
 }
 
-/* Open a TCP connection to host:port. The connect is driven on a
-   nonblocking socket with a POLLOUT wait (bounded by the remaining
-   deadline), then the socket is switched back to blocking: from there
-   on SO_RCVTIMEO / SO_SNDTIMEO bound every SSL read/write. Returns the
-   fd, or -1 with a reason in diag. */
+/* E2: simplified Happy Eyeballs. The resolved addresses are split into
+   an IPv6 and an IPv4 lane (the resolver's AF_UNSPEC order decides which
+   lane an address belongs to), both lanes run concurrently and the first
+   lane whose socket becomes writable with SO_ERROR==0 wins; the other
+   lane's in-flight socket is closed. A lane whose attempt fails moves to
+   its next address. Not full RFC 8305 (no delayed v4 start): both lanes
+   start together, which is enough to avoid the sequential whiteout where
+   a dead IPv6 path stalls the login for the whole 25s deadline before
+   IPv4 is even tried. The TLS exchange that follows is unchanged. */
+
+/* one lane: the address slice it still has to try, its in-flight socket
+   and connect state */
+typedef struct {
+    struct addrinfo *next;      /* next address to try (NULL = exhausted) */
+    struct addrinfo *cur;       /* address currently being tried */
+    int fd;                     /* in-flight socket, -1 = none */
+    bool waiting;               /* connect in progress on fd */
+    bool failed;                /* all addresses tried */
+} he_lane;
+
+/* start (or restart) a lane's connect attempt on its next address.
+ * Returns with either an in-flight connect or the lane failed/exhausted. */
+static void he_lane_start(he_lane *ln, char *diag, size_t diagsz)
+{
+#ifndef _WIN32
+    (void)diag;
+    (void)diagsz;
+#endif
+    for (;;) {
+        struct addrinfo *ai = ln->next;
+        int fd;
+
+        ln->next = ai ? ai->ai_next : NULL;
+        if (!ai) {
+            ln->failed = true;
+            if (ln->fd >= 0) {
+                port_close(ln->fd);
+                ln->fd = -1;
+            }
+            ln->waiting = false;
+            return;
+        }
+        ln->cur = ai;
+        fd = port_socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) {
+#ifdef _WIN32
+            snprintf(diag, diagsz, "socket(family %d): wsa %d (errno %d)",
+                     ai->ai_family, WSAGetLastError(), errno);
+#endif
+            continue;   /* try the lane's next address */
+        }
+        if (port_set_nonblock(fd, true) != 0) {
+#ifdef _WIN32
+            snprintf(diag, diagsz, "ioctlsocket(FIONBIO): wsa %d (errno %d)",
+                     ai->ai_family, WSAGetLastError(), errno);
+#endif
+            port_close(fd);
+            continue;
+        }
+        {
+            /* E3: Nagle delays the small TLS handshake records behind
+             * each other (40-200ms per hop with delayed ACK); the tunnel
+             * sockets all disable it */
+            int nd = 1;
+            (void)port_setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nd,
+                                  sizeof nd);
+        }
+        if (port_connect(fd, ai->ai_addr, ai->ai_addrlen) != 0 &&
+            errno != EINPROGRESS && errno != EAGAIN &&
+            errno != EWOULDBLOCK) {
+            /* nonblocking connect: WSAEWOULDBLOCK -> EAGAIN on Windows,
+             * EINPROGRESS on Linux; both mean "wait for POLLOUT".
+             * Anything else is an immediate failure: next address. */
+#ifdef _WIN32
+            snprintf(diag, diagsz, "connect: wsa %d (errno %d)",
+                     WSAGetLastError(), errno);
+#endif
+            port_close(fd);
+            continue;
+        }
+        ln->fd = fd;
+        ln->waiting = true;
+        return;
+    }
+}
+
+/* reap a lane after poll reported it: writable+SO_ERROR==0 wins (the fd
+ * stays open), anything else moves the lane to its next address. */
+static bool he_lane_check(he_lane *ln, char *diag, size_t diagsz)
+{
+#ifndef _WIN32
+    (void)diag;
+    (void)diagsz;
+#endif
+    int soerr = 0;
+    socklen_t slen = sizeof soerr;
+
+    if (!ln->waiting || ln->fd < 0)
+        return false;
+    ln->waiting = false;
+    if (port_getsockopt(ln->fd, SOL_SOCKET, SO_ERROR, &soerr, &slen) == 0 &&
+        soerr == 0)
+        return true;   /* the winner */
+    if (soerr != 0)
+        errno = soerr;
+#ifdef _WIN32
+    snprintf(diag, diagsz, "connect SO_ERROR: soerr=%d wsa %d (errno %d)",
+             soerr, WSAGetLastError(), errno);
+#endif
+    port_close(ln->fd);
+    ln->fd = -1;
+    he_lane_start(ln, diag, diagsz);
+    return false;
+}
+
 static int https_connect_tcp(const char *host, uint16_t port,
                              uint64_t deadline_ms,
                              char *diag, size_t diagsz)
 {
-    struct addrinfo hints, *res = NULL, *ai;
+    struct addrinfo hints, *res = NULL;
+    struct addrinfo *v6_head = NULL, *v6_tail = NULL;
+    struct addrinfo *v4_head = NULL, *v4_tail = NULL;
+    he_lane l6 = { NULL, NULL, -1, false, false };
+    he_lane l4 = { NULL, NULL, -1, false, false };
+    struct addrinfo *ai;
     char service[8];
     int gai, fd = -1;
 
@@ -585,104 +717,112 @@ static int https_connect_tcp(const char *host, uint16_t port,
         return -1;
     }
 
+    /* split the resolver's order into the two lanes (per-lane order is
+     * the system's preference order) */
     for (ai = res; ai; ai = ai->ai_next) {
-        struct pollfd pfd;
-        int pr = 0;
+        if (ai->ai_family == AF_INET6) {
+            if (v6_tail)
+                v6_tail->ai_next = ai;
+            else
+                v6_head = ai;
+            v6_tail = ai;
+        } else {
+            if (v4_tail)
+                v4_tail->ai_next = ai;
+            else
+                v4_head = ai;
+            v4_tail = ai;
+        }
+    }
+    if (v6_tail)
+        v6_tail->ai_next = NULL;
+    if (v4_tail)
+        v4_tail->ai_next = NULL;
+    l6.next = v6_head;
+    l4.next = v4_head;
+    he_lane_start(&l6, diag, diagsz);
+    he_lane_start(&l4, diag, diagsz);
+
+    while (!l6.failed || !l4.failed) {
+        struct pollfd pfd[2];
+        nfds_t npfd = 0;
+        int l6_idx = -1, l4_idx = -1;
+        int pr;
 
         if (now_ms() >= deadline_ms) {
             snprintf(diag, diagsz, "timed out connecting to %s", host);
             break;
         }
-        fd = port_socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (fd < 0) {
-#ifdef _WIN32
-            snprintf(diag, diagsz, "socket(family %d): wsa %d (errno %d)",
-                     ai->ai_family, WSAGetLastError(), errno);
-#endif
-            continue;
+        /* v6 first in the poll set: it wins ties (preferred family) */
+        if (l6.waiting && l6.fd >= 0) {
+            l6_idx = (int)npfd;
+            pfd[npfd].fd = l6.fd;
+            pfd[npfd].events = POLLOUT;
+            npfd++;
         }
-        if (port_set_nonblock(fd, true) != 0) {
-#ifdef _WIN32
-            snprintf(diag, diagsz, "ioctlsocket(FIONBIO): wsa %d (errno %d)",
-                     WSAGetLastError(), errno);
-#endif
-            port_close(fd);
-            fd = -1;
-            continue;
+        if (l4.waiting && l4.fd >= 0) {
+            l4_idx = (int)npfd;
+            pfd[npfd].fd = l4.fd;
+            pfd[npfd].events = POLLOUT;
+            npfd++;
         }
+        if (npfd == 0)
+            break;   /* both lanes between attempts or exhausted */
         {
-            /* E3: Nagle delays the small TLS handshake records behind
-             * each other (40-200ms per hop with delayed ACK); the tunnel
-             * sockets all disable it */
-            int nd = 1;
-            (void)port_setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nd,
-                                  sizeof nd);
-        }
-        if (port_connect(fd, ai->ai_addr, ai->ai_addrlen) != 0) {
-            /* nonblocking connect: WSAEWOULDBLOCK -> EAGAIN on Windows,
-             * EINPROGRESS on Linux; both mean "wait for POLLOUT" */
-            if (errno != EINPROGRESS && errno != EAGAIN &&
-                errno != EWOULDBLOCK) {
-#ifdef _WIN32
-                snprintf(diag, diagsz, "connect: wsa %d (errno %d)",
-                         WSAGetLastError(), errno);
-#endif
-                port_close(fd);
-                fd = -1;
-                continue;
-            }
-            pfd.fd = fd;
-            pfd.events = POLLOUT;
-            for (;;) {
-                uint64_t remain = deadline_ms - now_ms();
-                int to = remain > HTTPS_POLL_MS ? (int)HTTPS_POLL_MS
-                                                : (int)remain;
+            uint64_t remain = deadline_ms - now_ms();
+            int to = remain > HTTPS_POLL_MS ? (int)HTTPS_POLL_MS
+                                            : (int)remain;
 
-                pr = port_poll(&pfd, 1, to);
+            for (;;) {
+                pr = port_poll(pfd, npfd, to);
                 if (pr >= 0 || errno != EINTR)
                     break;
             }
-            if (pr == 0)
-                errno = ETIMEDOUT;
-            if (pr <= 0 || !(pfd.revents & POLLOUT)) {
-#ifdef _WIN32
-                snprintf(diag, diagsz,
-                         "poll connect: pr=%d revents=0x%x wsa %d "
-                         "(errno %d)",
-                         pr, pfd.revents, WSAGetLastError(), errno);
-#endif
-                port_close(fd);
-                fd = -1;
-                continue;
+        }
+        if (pr == 0)
+            errno = ETIMEDOUT;
+        if (pr > 0) {
+            /* reap the loser first (both revents may be set when both
+             * connect in the same window): v6 wins ties */
+            if (l4_idx >= 0 &&
+                (pfd[l4_idx].revents & (POLLOUT | POLLERR | POLLHUP)) &&
+                he_lane_check(&l4, diag, diagsz)) {
+                fd = l4.fd;
+                break;
             }
-            {
-                int soerr = 0;
-                socklen_t slen = sizeof soerr;
-
-                if (port_getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr,
-                                    &slen) != 0 ||
-                    soerr != 0) {
-                    if (soerr != 0)
-                        errno = soerr;
-#ifdef _WIN32
-                    snprintf(diag, diagsz,
-                             "connect SO_ERROR: soerr=%d wsa %d "
-                             "(errno %d)",
-                             soerr, WSAGetLastError(), errno);
-#endif
-                    port_close(fd);
-                    fd = -1;
-                    continue;
-                }
+            if (l6_idx >= 0 &&
+                (pfd[l6_idx].revents & (POLLOUT | POLLERR | POLLHUP)) &&
+                he_lane_check(&l6, diag, diagsz)) {
+                fd = l6.fd;
+                break;
+            }
+        } else {
+            /* timeout/error: retire both in-flight sockets, lanes move
+             * to their next addresses */
+            if (l6.waiting && l6.fd >= 0) {
+                port_close(l6.fd);
+                l6.fd = -1;
+                l6.waiting = false;
+                he_lane_start(&l6, diag, diagsz);
+            }
+            if (l4.waiting && l4.fd >= 0) {
+                port_close(l4.fd);
+                l4.fd = -1;
+                l4.waiting = false;
+                he_lane_start(&l4, diag, diagsz);
             }
         }
-        /* connected; back to blocking for the TLS exchange */
-        if (port_set_nonblock(fd, false) != 0) {
-            port_close(fd);
-            fd = -1;
-            continue;
-        }
-        break;
+    }
+    /* loser cleanup: close the non-winner's in-flight socket */
+    if (fd >= 0) {
+        he_lane *loser = (fd == l6.fd) ? &l4 : &l6;
+        if (loser->fd >= 0)
+            port_close(loser->fd);
+    } else {
+        if (l6.fd >= 0)
+            port_close(l6.fd);
+        if (l4.fd >= 0)
+            port_close(l4.fd);
     }
     freeaddrinfo(res);
 
@@ -1159,7 +1299,7 @@ static bool https_transport(const char *host, struct sbuf *req,
             log_debug("https_transport: %s attempt %d%s", host,
                       attempt + 1, fallback ? " (bundled fallback CAs)" : "");
 
-        ctx = https_ctx_new(fallback);
+        ctx = https_ctx_get(fallback);
         if (!ctx) {
             /* CA problem: https_ctx_new already logged the specific
              * reason (missing bundle on Linux, empty ROOT store on
@@ -1202,8 +1342,9 @@ static bool https_transport(const char *host, struct sbuf *req,
                              "anchor (%ld); retrying with bundled "
                              "fallback CAs", verr);
                     SSL_free(ssl);
-                    SSL_CTX_free(ctx);
                     port_close(fd);
+                    /* ctx stays cached (attempt 2 fetches the fallback
+                     * one); only the SSL object and fd are per-attempt */
                     ssl = NULL;
                     ctx = NULL;
                     fd = -1;
@@ -1225,8 +1366,7 @@ out:
     free(req->d);
     if (ssl)
         SSL_free(ssl);
-    if (ctx)
-        SSL_CTX_free(ctx);
+    /* ctx is process-cached (https_ctx_get): never freed here */
     if (fd >= 0)
         port_close(fd);
     if (debug_enabled())

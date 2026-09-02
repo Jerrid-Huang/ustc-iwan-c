@@ -51,6 +51,23 @@ enum {
 };
 typedef struct { uint64_t us; uint64_t n; } pump_prof_t;
 
+/* C4: profiler collection is gated on IWAN_PUMP_PROF (parsed once, like
+ * profile.h's g_prof_on) — the per-packet timer/atomic work is pure
+ * waste when nobody reads the printout. The single-thread pump variant
+ * shares this flag through these externs. */
+extern atomic_int g_pump_prof_on;      /* collection gate (relaxed) */
+int pump_prof_gate_init(void);         /* parse env once, set the gate */
+static inline bool pump_prof_on(void)
+{
+    return atomic_load_explicit(&g_pump_prof_on, memory_order_relaxed);
+}
+static inline void pump_prof_add(pump_prof_t *p, uint64_t us)
+{
+    if (!pump_prof_on())
+        return;
+    p->us += us;
+    p->n++;
+}
 /* definitions live in proxy.c; the single-thread variant reads/writes
  * the same counters through these externs */
 extern atomic_uint_fast64_t g_prof_send_dgrams;
@@ -70,11 +87,7 @@ extern atomic_uint_fast64_t g_tun_wait_us, g_tun_timeouts, g_tun_wakeups,
                             g_tun_pkts, g_tun_drain_us, g_tun_allocfail;
 #endif
 
-static inline void pump_prof_add(pump_prof_t *p, uint64_t us)
-{
-    p->us += us;
-    p->n++;
-}
+static inline void pump_prof_add(pump_prof_t *p, uint64_t us);
 
 /* ---------------- TX batch ---------------- */
 typedef struct {
@@ -97,6 +110,13 @@ typedef struct {
     uint8_t  enc;
     size_t   gso_mss;   /* last UDP_SEGMENT value set, 0 = none */
     int      gso_ok;    /* 1 = UDP_SEGMENT usable, 0 = failed, -1 = untried */
+    size_t   gso_pending_mss; /* C1 hysteresis: mss seen in recent batches */
+    unsigned gso_streak;     /* C1 hysteresis: consecutive batches whose
+                              * uniform mss == gso_pending_mss while the
+                              * armed mss differs; re-arm after
+                              * IWAN_GSO_HYST batches so a mixed-MTU
+                              * (A/B alternating) stream stops flipping
+                              * the socket option on every batch */
     pthread_mutex_t send_lock; /* serializes GSO/sendmmsg on the shared socket */
     struct tun_pool *pool;
     pace_bucket pace;   /* aggregate send pacing (util.h); serialized by

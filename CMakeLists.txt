@@ -30,6 +30,14 @@ cmake_minimum_required(VERSION 3.16)
 
 project(iwan VERSION 0.7.3 LANGUAGES C)
 
+# F: interprocedural optimization (LTO). OFF by default: the mingw/musl
+# cross toolchains have uneven LTO support, so opt in after an A/B on
+# the Linux-native echo benchmark (IWAN_LTO=ON vs OFF).
+option(IWAN_LTO "Enable interprocedural optimization (LTO)" OFF)
+if(IWAN_LTO)
+  set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+endif()
+
 # Release-by-default (CMAKE_C_FLAGS_RELEASE = -O3; no -DNDEBUG: the
 # code has no runtime assert()s, only _Static_assert, which is
 # NDEBUG-independent).

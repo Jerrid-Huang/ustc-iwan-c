@@ -47,13 +47,32 @@ atomic_uint_fast64_t g_prof_tun_rbig;       /* wintun packets > 1508B */
 atomic_uint_fast64_t g_prof_tun_rdrop;      /* wintun packets > PUMP_SLOT */
 uint32_t g_prof_tun_rmax;                   /* max wintun packet len (B) */
 
-static bool pump_prof_wanted(void)
+/* C4: profiler collection gate — parsed once (first call), read on the
+ * per-packet hot path via pump_prof_on(). IWAN_DEBUG_STRIP builds never
+ * collect (the env var is never parsed). */
+atomic_int g_pump_prof_on;
+
+int pump_prof_gate_init(void)
 {
 #ifdef IWAN_DEBUG_STRIP
-    return false;   /* stripped build: the env var is never parsed */
+    atomic_store_explicit(&g_pump_prof_on, 0, memory_order_relaxed);
+    return 0;
 #else
-    return getenv("IWAN_PUMP_PROF") != NULL;
+    static int parsed;
+    if (!parsed) {
+        parsed = 1;
+        atomic_store_explicit(&g_pump_prof_on,
+                              getenv("IWAN_PUMP_PROF") != NULL,
+                              memory_order_relaxed);
+    }
+    return 0;
 #endif
+}
+
+static bool pump_prof_wanted(void)
+{
+    pump_prof_gate_init();
+    return pump_prof_on();
 }
 
 static void pump_prof_print(const pump_ctx_t *ctx)
@@ -124,17 +143,33 @@ static int send_ctrl(pump_ctx_t *ctx, uint8_t typ, uint8_t enc, uint16_t sid,
     ctrl_hdr(&pkt, typ, enc, sid, tok);
     size_t want = pkt.len;
     pthread_mutex_lock(&ctx->send_lock);
-    if (ctx->gso_mss != 0) {
-        int z = 0;
-        port_setsockopt(ctx->sockfd, SOL_UDP, UDP_SEGMENT, &z, sizeof z);
-        ctx->gso_mss = 0;
+    {
+        /* clear is required (a 24B frame is not an mss multiple), but
+         * C1: re-arm the PREVIOUS mss afterwards instead of leaving the
+         * socket bare — the next batch then does not re-probe/re-arm on
+         * the hot path */
+        size_t armed = ctx->gso_mss;
+        if (armed != 0) {
+            int z = 0;
+            port_setsockopt(ctx->sockfd, SOL_UDP, UDP_SEGMENT, &z, sizeof z);
+            ctx->gso_mss = 0;
+        }
+        ssize_t r = port_send(ctx->sockfd, pkt.data, want, 0);
+        if (armed != 0) {
+            int m = (int)armed;
+            if (port_setsockopt(ctx->sockfd, SOL_UDP, UDP_SEGMENT, &m,
+                                sizeof m) == 0)
+                ctx->gso_mss = armed;   /* restored, hysteresis tracker
+                                         * stays aligned */
+            /* re-arm failed: leave gso_mss 0; the next batch re-probes
+             * via udp_gso_prepare as before */
+        }
+        pthread_mutex_unlock(&ctx->send_lock);
+        buf_free(&pkt);
+        if (r < 0 || (size_t)r != want)
+            return -1;
+        return 0;
     }
-    ssize_t r = port_send(ctx->sockfd, pkt.data, want, 0);
-    pthread_mutex_unlock(&ctx->send_lock);
-    buf_free(&pkt);
-    if (r < 0 || (size_t)r != want)
-        return -1;
-    return 0;
 }
 
 #define PUMP_BATCH 32
@@ -285,13 +320,15 @@ static int send_gso(pump_ctx_t *ctx, struct iovec *iov, unsigned n,
          * EOPNOTSUPP on older systems, so the sendmmsg fallback below
          * works unchanged */
         if (!udp_gso_prepare(ctx->sockfd, mss, &ctx->gso_ok,
-                             &ctx->gso_mss)) {
+                             &ctx->gso_mss, &ctx->gso_pending_mss,
+                             &ctx->gso_streak)) {
             err_printf("[TUN->UDP] UDP_SEGMENT unsupported, using "
                        "sendmmsg\n");
             return TX_FALLBACK;
         }
     } else if (!udp_gso_prepare(ctx->sockfd, mss, &ctx->gso_ok,
-                                &ctx->gso_mss)) {
+                                &ctx->gso_mss, &ctx->gso_pending_mss,
+                                &ctx->gso_streak)) {
         /* re-arm a WORKING GSO socket failed (or GSO was already known
          * unavailable) — fall back to sendmmsg */
         return TX_FALLBACK;
@@ -371,7 +408,8 @@ static void pump_tx_send(pump_ctx_t *ctx, pump_tx_t *q)
     unsigned n = q->n;
     if (n == 0)
         return;
-    atomic_fetch_add(&g_prof_send_dgrams, n);
+    if (pump_prof_on())
+        atomic_fetch_add(&g_prof_send_dgrams, n);
     for (unsigned i = 0; i < n; i++) {
         q->msgs[i].msg_hdr.msg_iov = &q->iov[i];
         q->msgs[i].msg_hdr.msg_iovlen = 1;
@@ -620,7 +658,7 @@ static void *udp2tun_thread(void *ud) {
         int v = port_recvmmsg(ctx->sockfd, msgs, (unsigned)rxbatch,
                               MSG_DONTWAIT, NULL);
         pump_prof_add(&ctx->prof[PP_RECV], now_us() - t_recv);
-        if (v > 0)
+        if (v > 0 && pump_prof_on())
             atomic_fetch_add(&g_prof_recv_dgrams, (uint64_t)v);
         if (v < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -734,11 +772,16 @@ static void *udp2tun_thread(void *ud) {
                           saddr, daddr);
                 continue;
             }
-            /* write with unbounded EAGAIN retry: silent loss here costs
-             * inner TCP retransmits */
+            /* C2 (bounded part): TUN writes are one frame per call (a
+             * multi-iovec writev would be coalesced into ONE frame the
+             * gate drops), so batching is impossible — but the wait must
+             * not be unbounded either: a saturated TUN write side would
+             * head-of-line block the whole downlink thread. 5ms budget
+             * (PUMP_SEND_RETRY_MS); packets still unwritable after it
+             * are dropped, and inner TCP retransmits recover them. */
             uint64_t tw0 = now_us();
-            int wr = tun_write_retry(ctx->tun_fd, m + 8, (size_t)(n - 8), 0,
-                                     &g_stop);
+            int wr = tun_write_retry(ctx->tun_fd, m + 8, (size_t)(n - 8),
+                                     PUMP_SEND_RETRY_MS, &g_stop);
             pump_prof_add(&ctx->prof[PP_TUNWRITE], now_us() - tw0);
             if (wr != 0) {
                 if (!g_stop)
@@ -1032,6 +1075,7 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
 
     pump_ctx_t ctx;
     memset(ctx.prof, 0, sizeof ctx.prof);
+    pump_prof_gate_init();   /* C4: parse IWAN_PUMP_PROF once, up front */
     ctx.tun_fd = tun_fd;
     ctx.sockfd = sockfd;
     ctx.sid = sid;

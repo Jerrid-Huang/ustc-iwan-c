@@ -20,7 +20,19 @@ void udp_gso_clear(int fd, int *ok, size_t *gso_mss);
  * Returns 1 when armed/usable, 0 when GSO is unavailable (the caller
  * falls back to per-datagram sendmmsg). Probing is cached in *ok; a
  * hard failure disables GSO permanently so re-probing stops. */
-int udp_gso_prepare(int fd, size_t mss, int *ok, size_t *gso_mss);
+/* C1: re-arm hysteresis — a new uniform mss is armed only after this many
+ * consecutive batches with the same mss; mixed-MTU (A/B alternating)
+ * streams stop flipping the socket option on every batch (each flip is a
+ * setsockopt syscall on the hot send path). */
+#define IWAN_GSO_HYST 8
+
+/* C1 hysteresis: pending_mss/streak track how long a new uniform mss has
+ * been seen; it is armed (one setsockopt) only after IWAN_GSO_HYST
+ * consecutive batches, so mixed-MTU traffic stops re-arming on every
+ * batch. Pass a pump_ctx's fields; the clear/re-arm path in send_ctrl
+ * bypasses the tracker. */
+int udp_gso_prepare(int fd, size_t mss, int *ok, size_t *gso_mss,
+                    size_t *pending_mss, unsigned *streak);
 
 /* One bounded EAGAIN/ENOBUFS/EPERM wait: poll POLLOUT for the remaining
  * retry budget (retry_t0 = drain start, budget_ms = total budget).

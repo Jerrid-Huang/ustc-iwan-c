@@ -88,8 +88,11 @@ struct TcpConn {
                               * reconcile step calls tcp_recved for
                               * (rxq_unrecved - rxq.len): the part the socks
                               * layer already drained from rxq. */
-    uint8_t  scratch[4 * 1460]; /* zero-copy readv target (LOCAL_IOV_MAX x
-                                 * MSS) for ns_send_reservev */
+    uint8_t  scratch[45 * 1460]; /* zero-copy readv target (NS_SCRATCH_SLOTS
+                                 * x NS_MSS ~64KB, lwip_bridge.c);
+                                 * LOCAL_IOV_MAX (socks_flow.c) stays in
+                                 * sync: 64 conns x ~66KB ~4.2MB (was
+                                 * ~373KB) - deliberate readv batch size */
     size_t   scratch_commit;    /* cursor: bytes committed from scratch */
     uint64_t last_poll_ms;      /* last tcp_poll callback (close liveness) */
     uint8_t  reap_pending;      /* abrupt close: defer slot reuse until

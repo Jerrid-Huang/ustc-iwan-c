@@ -20,7 +20,8 @@ void udp_gso_clear(int fd, int *ok, size_t *gso_mss)
     }
 }
 
-int udp_gso_prepare(int fd, size_t mss, int *ok, size_t *gso_mss)
+int udp_gso_prepare(int fd, size_t mss, int *ok, size_t *gso_mss,
+                    size_t *pending_mss, unsigned *streak)
 {
     if (*ok == -1) {
         /* first use: probe; port_setsockopt translates UDP_SEGMENT to
@@ -34,20 +35,39 @@ int udp_gso_prepare(int fd, size_t mss, int *ok, size_t *gso_mss)
             return 0;
         }
         *gso_mss = mss;
+        *pending_mss = mss;
+        *streak = 0;
         return 1;
     }
     if (*ok && *gso_mss != mss) {
-        /* re-arm a WORKING GSO socket for a new mss; once GSO is known
-         * unavailable (e.g. SIO_UDP_NETSEGMENT rejected on Windows)
-         * re-probing on every distinct batch size would just spam
-         * WSAEOPNOTSUPP — stay on the sendmmsg fallback */
-        int m = (int)mss;
-        if (port_setsockopt(fd, SOL_UDP, UDP_SEGMENT, &m, sizeof m) != 0) {
-            *ok = 0;
-            *gso_mss = 0;
-            return 0;
+        /* C1 hysteresis: a different uniform mss does NOT re-arm the
+         * socket option immediately — mixed-MTU (A/B alternating) traffic
+         * would flip setsockopt on every batch. This batch falls back to
+         * sendmmsg; the new mss is armed only after it is seen
+         * IWAN_GSO_HYST consecutive batches. send_ctrl's clear/re-arm
+         * path bypasses this (it restores the armed mss itself). */
+        if (*pending_mss == mss)
+            (*streak)++;
+        else {
+            *pending_mss = mss;
+            *streak = 1;
         }
-        *gso_mss = mss;
+        if (*gso_mss != 0 && *streak >= IWAN_GSO_HYST) {
+            int m = (int)mss;
+            if (port_setsockopt(fd, SOL_UDP, UDP_SEGMENT, &m, sizeof m) != 0) {
+                *ok = 0;
+                *gso_mss = 0;
+                return 0;
+            }
+            *gso_mss = mss;
+            *streak = 0;
+        }
+        return 0;   /* this batch goes out via sendmmsg */
+    }
+    if (*ok) {
+        /* armed mss matches: reset the hysteresis tracker */
+        *pending_mss = mss;
+        *streak = 0;
     }
     return *ok ? 1 : 0;
 }
