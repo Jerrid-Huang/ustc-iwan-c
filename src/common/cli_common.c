@@ -102,7 +102,12 @@ void socks_cfg_from_auth(SocksConfig *cfg, const AuthResult *res,
 {
     cfg->inner_ip = inner_ip;
     cfg->gateway = gateway;
-    cfg->mtu = mtu;
+    /* L8 (bughunt): --mtu 0 / --socks-mtu 0 reach here as 0 (min(0, o.mtu)
+     * with no lower bound), which made socks.c's `plen > cfg->mtu`
+     * filter drop EVERY downlink datagram silently. Clamp to the
+     * protocol's valid range instead of accepting 0. */
+    cfg->mtu = mtu < IWAN_MTU_MIN ? IWAN_MTU_MIN
+             : mtu > IWAN_MTU_MAX ? IWAN_MTU_MAX : mtu;
     memcpy(cfg->xor_key, sk, sizeof cfg->xor_key);
     cfg->sid = res->sid;
     cfg->token = res->tok;

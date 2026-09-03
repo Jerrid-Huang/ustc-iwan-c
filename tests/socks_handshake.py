@@ -211,6 +211,17 @@ def run_no_token(port, connect_timeout_ms):
         greeting_then(b"\x05\x01\x00\x03\x00" b"\x00\x50", b"\x05\x08",
                       port)
 
+    def atyp3_frame_too_short():
+        # H1 (bughunt): exactly 4 bytes (05 01 00 03) must NOT OOB-read
+        # d[4]; the parser waits for the rest and stays silent instead
+        # of crashing or echoing a garbage-driven reply.
+        def body(s):
+            s.sendall(b"\x05\x01\x00")
+            expect_prefix(s, b"\x05\x00", DEFAULT_READ_TIMEOUT)
+            s.sendall(b"\x05\x01\x00\x03")
+            expect_silence(s, STALL_TIMEOUT, "atyp3_frame_too_short")
+        with_conn(port, body)
+
     def atyp_ipv6():
         # ATYP=4 is accepted (IPv6 targets supported): the SYN goes to
         # the unreachable off-link target (2001:db8::1) and the connect
@@ -252,6 +263,7 @@ def run_no_token(port, connect_timeout_ms):
         ("cmd_bind", cmd_bind),
         ("rsv_nonzero", rsv_nonzero),
         ("domain_len0", domain_len0),
+        ("atyp3_frame_too_short", atyp3_frame_too_short),
         ("atyp_ipv6", atyp_ipv6),
         ("stall_big_nmethods", stall_big_nmethods),
         ("greeting_only_auth", greeting_only_auth),

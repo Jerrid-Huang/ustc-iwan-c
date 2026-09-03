@@ -1777,17 +1777,20 @@ void service_local_inputs(Flow *fs) {
             } else if (n > 0) {
                 buf_put(&f->input, rbuf, (size_t)n);
                 /* Handshake-phase unbounded-input guard: bound only the
-                 * frame parsing states (greeting/request/DNS). Once the
-                 * connect is in flight (ST_CONNECTING) the buffered
-                 * bytes are tunnel payload — the ST_CONNECTING spill in
-                 * service_local_inputs feeds them into the netstack
-                 * (and pauses reads when the ring is full), so a large
-                 * HTTP upload during a slow connect must NOT be killed
-                 * by this cap. */
+                 * frame parsing states (greeting/request). Once the
+                 * connect is in flight (ST_CONNECTING) or DNS is running
+                 * (ST_RESOLVING, M4/bughunt), buffered bytes are tunnel
+                 * payload the client pipelined before the SOCKS reply —
+                 * the ST_CONNECTING spill in service_local_inputs feeds
+                 * them into the netstack, and ST_RESOLVING lands there
+                 * right after DNS completes, so a large HTTP upload
+                 * during a slow connect/DNS must NOT be killed by this
+                 * cap (previously ST_RESOLVING was still listed here and
+                 * a >HANDSHAKE_INPUT_MAX body killed the flow while its
+                 * ns_idx was still -1). */
                 if (f->input.len > HANDSHAKE_INPUT_MAX &&
                     (f->state == ST_GREETING ||
-                     f->state == ST_REQUEST ||
-                     f->state == ST_RESOLVING)) {
+                     f->state == ST_REQUEST)) {
                     f->local_eof = true;
                     set_flow_state(f, ST_CLOSING);
                 }

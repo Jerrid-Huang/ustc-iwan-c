@@ -109,9 +109,15 @@ int pp_http_target(const char *s, size_t n, bool is_connect,
         size_t close = 0;
         while (close < n && s[close] != ']')
             close++;
-        if (close == n || close < 3 || close > 45)
-            return -1;          /* ] must exist, addr 3..45 chars */
+        if (close == n || close < 3)
+            return -1;          /* ] must exist, addr >= 3 bytes */
         size_t hn6 = close - 1;
+        /* L5 (bughunt): RFC 4291's longest IPv6 literal is 45 chars;
+         * the `]` index is hn6+1, so the cap belongs on hn6 (the literal
+         * length), not on close. The old `close > 45` rejected a legal
+         * 45-char literal */
+        if (hn6 > 45)
+            return -1;
         char buf[48];
         if (hn6 >= sizeof buf)
             return -1;
@@ -293,6 +299,13 @@ int pp_socks_request(const uint8_t *d, size_t n, uint8_t *cmd,
         out->port = (uint16_t)((d[20] << 8) | d[21]);
         out->af = 6;
     } else if (atyp == 3) {
+        /* H1 (bughunt): n>=4 is guaranteed above, but reading d[4]
+         * needs n>=5 — a 4-byte frame (05 01 00 03) would OOB/uninit
+         * read past the frame. Check the domain-length byte's own
+         * address before touching it; the full frame bound below
+         * (n < 5 + l + 2) then guards the copy. */
+        if (n < 5)
+            return -1;
         uint8_t l = d[4];
         /* l is a u8 (<=255) and host[] holds 255 + NUL: l==0 is the
          * only invalid length */

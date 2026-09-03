@@ -14,6 +14,8 @@
 #include <io.h>
 #endif
 
+#include <openssl/crypto.h>   /* OPENSSL_cleanse (L2) */
+
 #include "common.h"
 #include "crypto.h"
 #include "json.h"
@@ -26,7 +28,14 @@ static long server_port(Json *s)
     Json *p = json_get(s, "serverPort");
     long v = 0;
     if (p && json_type(p) == JSON_NUM) {
-        v = (long)json_num(p);
+        /* L9 (bughunt, #6): a remote /m/config can carry serverPort:1e19
+         * — a legal double (< DBL_MAX), but out of long range, so the
+         * (long) cast below would be UB. Check the numeric domain FIRST
+         * (exact port, 1..65535), then cast. */
+        double dv = json_num(p);
+        if (dv < 1.0 || dv > 65535.0 || dv != (double)(long)dv)
+            return 0;
+        v = (long)dv;
     } else if (p && json_type(p) == JSON_STR) {
         /* strtol + full-consumption: reject "80http", whitespace and
          * overflow instead of atol's silent clamp / partial parse */
@@ -112,9 +121,15 @@ void oidc_fetch_config(Config *cf)
     char *resp = NULL;
     int st = oidc_ctrl_post("/m/auth", dev_body, kp, &resp);
     if (st != 200) {
+        /* M1 (bughunt): oidc_die formats %s from `detail` AFTER free —
+         * detail is only an alias pointer into resp, so vfprintf reads
+         * freed heap. Copy the body into a stack buffer first. */
         const char *detail = resp ? resp : "";
+        char dbuf[256];
+        snprintf(dbuf, sizeof dbuf, "%s", detail);
         free(resp);
-        oidc_die("fail HTTP %d: %s", st, detail);
+        resp = NULL;
+        oidc_die("fail HTTP %d: %s", st, dbuf);
     }
     free(resp);
     oidc_eprintf("OK\n");
@@ -190,7 +205,11 @@ void oidc_fetch_config(Config *cf)
     cf->servers = json_get(root, "servers");
     cf->pretty = oidc_buf_to_cstr(&b);
 
-    free(kp);
+    /* L2 (bughunt): kp holds the access_token — scrub before release */
+    if (kp) {
+        OPENSSL_cleanse(kp, strlen(kp));
+        free(kp);
+    }
     free(username);
 }
 

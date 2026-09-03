@@ -285,7 +285,11 @@ static void check_csrf_state(const char *cb_state, const char *saved,
     if (!cb_state)
         oidc_die("authorization response missing state parameter "
                  "(OIDC Core 3.1.2.1 CSRF check failed)");
-    if (!have_state || strcmp(cb_state, saved) != 0)
+    /* L1 (bughunt): constant-time compare like the other sensitive
+     * comparisons in this tree (crypto.c ct_eq); state is a fixed-length
+     * CSPRNG string, so a length check first is fine. */
+    if (!have_state || strlen(cb_state) != strlen(saved) ||
+        ct_eq(cb_state, saved, strlen(cb_state)) != 0)
         oidc_die("authorization response state does not match the saved "
                  "state (OIDC Core 3.1.2.1 CSRF check failed)");
 }
@@ -355,6 +359,15 @@ void oidc_login(char **kp_out, char **user_out)
 
     char *kp = take_access_token(tok);
     const char *id_token = verify_id_token(tok);
+    /* L2 (bughunt): scrub the refresh_token/access_token heap strings
+     * before json_free drops them — they outlive their use by a long
+     * shot (offline_access scope), so swap-forget is out. */
+    {
+        const char *rt = json_get_str(tok, "refresh_token");
+        if (rt) {
+            OPENSSL_cleanse((void *)rt, strlen(rt));
+        }
+    }
 
     char *username = oidc_id_token_username(id_token);
     json_free(tok);

@@ -1495,8 +1495,12 @@ static bool https_roundtrip(const char *host, const char *path,
                     failed = 1;
                     break;
                 }
-                /* cross-host hop: drop the Authorization header */
-                if (strcmp(new_host, cur_host) != 0 && cur_headers) {
+                /* cross-host hop: drop the Authorization header. L1:
+                 * hostnames are case-insensitive (RFC 3986), compare
+                 * case-insensitively — case-sensitive compare over-drops
+                 * (fail-safe) but is inconsistent with the resolver. */
+                if (port_strncasecmp(new_host, cur_host,
+                                     strlen(new_host)) != 0 && cur_headers) {
                     cur_headers = https_drop_auth(
                         cur_headers, no_auth,
                         sizeof no_auth / sizeof no_auth[0]);

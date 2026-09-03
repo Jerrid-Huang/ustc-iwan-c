@@ -704,6 +704,11 @@ struct rp_ent {
 struct rp_conn {
     int c, u;
     atomic_int dirs;            /* 2 -> 0: both threads retired */
+    atomic_int in_use;          /* H2: references held by rp_dir_main
+                                 * loops while they dereference cn
+                                 * outside g_rp_mu; free waits for 0 */
+    bool retired;               /* H2: dirs hit 0; free deferred until
+                                 * in_use==0 (see rp_reap_maybe) */
     struct rp_ent up, dn;      /* up thread owns .up, down owns .dn */
 };
 
@@ -782,14 +787,29 @@ static void rp_add(int c, int u)
  * the conn freed when BOTH threads have retired. Must run under
  * g_rp_mu (the last release frees the conn, and the first release
  * must not read the atomic after that free). */
-static void rp_release(struct rp_conn *cn)
+/* H2 (bughunt): free a retired conn only when no direction thread
+ * still dereferences it. kept in_use must be 0 AND the conn retired
+ * (dirs hit 0); g_rp_mu must be held. */
+static void rp_reap_maybe(struct rp_conn *cn)
 {
-    if (atomic_fetch_sub(&cn->dirs, 1) == 1) {
+    if (cn->retired && atomic_load(&cn->in_use) == 0) {
         port_close(cn->c);
         port_close(cn->u);
         free(cn->up.pend);
         free(cn->dn.pend);
         free(cn);
+    }
+}
+
+/* one direction thread retires its entry: when both have retired, the
+ * conn is marked and freed once the last in_use reference drops (not
+ * here — another direction thread may still be dereferencing cn in its
+ * lock-free processing loop). Must run under g_rp_mu. */
+static void rp_release(struct rp_conn *cn)
+{
+    if (atomic_fetch_sub(&cn->dirs, 1) == 1) {
+        cn->retired = true;
+        rp_reap_maybe(cn);
     }
 }
 
@@ -1107,6 +1127,11 @@ static void *rp_dir_main(void *ud)
                 rp_release(cn);
             }
         }
+        /* H2: drop the per-loop snapshot references; the last one to
+         * leave a retired conn frees it (rp_reap_maybe, lock held). */
+        for (size_t i = 0; i < n; i++)
+            if (atomic_fetch_sub(&snap[i]->in_use, 1) == 1)
+                rp_reap_maybe(snap[i]);
         pthread_mutex_unlock(&g_rp_mu);
     }
     free(pf);
@@ -1335,14 +1360,27 @@ int relay_proxy_start(const char *listen_str, const char *auth_token,
     /* start the two global direction threads up front */
     atomic_store(&g_rp_stop, 0);
     pthread_t tu, td;
-    if (pthread_create(&tu, NULL, rp_dir_main, (void *)(intptr_t)1) != 0 ||
-        pthread_create(&td, NULL, rp_dir_main, (void *)(intptr_t)0) != 0) {
-        atomic_store(&g_rp_stop, 1);
-        log_err("relay proxy: relay threads: %s", strerror(errno));
-        goto fail;
+    {
+        /* L11/C-6 (bughunt): create both threads before publishing
+         * g_rp_current; if the second create fails the first is already
+         * running and could dereference a dropped rp via rp_conn_main.
+         * Create both, then publish; on failure stop, detach the
+         * survivor and clear the pointer. */
+        int rc = pthread_create(&tu, NULL, rp_dir_main, (void *)(intptr_t)1);
+        if (rc == 0)
+            rc = pthread_create(&td, NULL, rp_dir_main, (void *)(intptr_t)0);
+        if (rc != 0) {
+            atomic_store(&g_rp_stop, 1);
+            log_err("relay proxy: relay threads: %s", strerror(errno));
+            if (rc == 0)
+                pthread_detach(tu);
+            g_rp_current = NULL;
+            goto fail;
+        }
     }
     pthread_detach(tu);
     pthread_detach(td);
+    g_rp_current = rp;
 
     if (pthread_create(&accept_th, NULL, rp_accept_main, rp) != 0) {
         port_close(fd);

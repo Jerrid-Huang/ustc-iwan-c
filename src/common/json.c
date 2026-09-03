@@ -686,9 +686,19 @@ Json *json_get(const Json *root, const char *path)
                 break;
             }
         if (cur->type == JSON_ARR && allnum) {
+            /* L10 (bughunt): cap the digit segment like the 64-byte key
+             * cap below and guard each step — a path like
+             * a.18446744073709551616 would wrap idx around and select a
+             * wrong element. 20 digits is > SIZE_MAX on 64-bit (and
+             * > UINT32_MAX, an array index is never larger). */
+            if (seglen >= 20)
+                return NULL;
             size_t idx = 0;
-            for (size_t i = 0; i < seglen; i++)
+            for (size_t i = 0; i < seglen; i++) {
+                if (idx > (SIZE_MAX - 9) / 10)
+                    return NULL;
                 idx = idx * 10 + (size_t)(a[i] - '0');
+            }
             next = json_arr_at(cur, idx);
         } else {
             char key[64];

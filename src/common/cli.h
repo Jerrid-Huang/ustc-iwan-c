@@ -52,6 +52,12 @@ typedef struct {
     char        usage_names[CLI_MAX_USAGE][24];
     char        usage_args[CLI_MAX_USAGE][48];
     int         nusage;
+    /* L7 (bughunt): duplicate detection must not depend on the 16-slot
+     * usage render table (a 17th distinct option would escape it);
+     * seen_names[] is the unbounded dedup list, usage_names[] stays the
+     * render table only. */
+    char      **seen_names;
+    int         nseen;
     bool        usage_dup;
     const char *dup_name;
     const char *dup_valname;

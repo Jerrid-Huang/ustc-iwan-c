@@ -12,8 +12,11 @@
 #ifdef _WIN32
 #include <dpapi.h>
 
-/* "WDP1:" + DPAPI-bytes-as-hex. Entropy = the app secret so only this
- * build can unseal under the same user. */
+/* "WDP1:" + DPAPI-bytes-as-hex. L12 (bughunt): the comment once claimed
+ * "Entropy = the app secret" but CryptProtectData below passes NULL — no
+ * entropy is used, so the blob is sealed to this machine+user only (not
+ * to this build). That is exactly the DPAPI guarantee; do not add the app
+ * secret as entropy, it is a public constant and would add nothing. */
 char *oidc_wrap_password(const char *blob, const char *domain,
                          const char *user)
 {

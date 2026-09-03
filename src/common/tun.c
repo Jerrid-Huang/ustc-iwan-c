@@ -460,9 +460,12 @@ static int tun_pool_add(struct tun_pool *pool)
 }
 
 /* drop the newest queue; queue 0 (the device owner) is never dropped.
- * nq is decremented BEFORE the fd is detached/closed so a concurrent
- * uplink writer that loaded the old nq can no longer select this fd
- * (the device owner's fd stays valid throughout). */
+ * The nq store happens BEFORE pthread_join: once nq no longer includes
+ * this queue, a concurrent uplink writer (tun_pool_write_fd, tid % nq)
+ * can no longer select its fd, so nothing writes to the fd after this.
+ * join waits for the reader thread to leave the fd, then detach/close
+ * are safe (M3, bughunt: the old order joined first and left the fd
+ * selectable-and-going-away during the wait). */
 static void tun_pool_del(struct tun_pool *pool)
 {
     int i;
@@ -471,8 +474,8 @@ static void tun_pool_del(struct tun_pool *pool)
         return;
     i = atomic_load(&pool->nq) - 1;
     pool->qs[i].stop = 1;
-    pthread_join(pool->qs[i].th, NULL);
     atomic_store(&pool->nq, i);
+    pthread_join(pool->qs[i].th, NULL);
     tun_detach(pool->qs[i].fd);
     tun_close(pool->qs[i].fd);
 }

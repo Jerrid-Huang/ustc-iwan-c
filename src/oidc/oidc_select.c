@@ -56,13 +56,28 @@ void oidc_print_servers(Json *servers)
         const char *name = json_get_str(s, "name");
         const char *host = json_get_str(s, "host");
         Json *portj = json_get(s, "port");
-        unsigned long port = portj ? (unsigned long)json_num(portj)
-                                   : (unsigned long)OIDC_DEFAULT_PORT;
+        /* L9 (bughunt, #7): never cast a raw double -> unsigned long —
+         * a local servers.json "port":1e19 would be UB. Validate in the
+         * numeric domain; a broken/missing value prints the default. */
+        long port = OIDC_DEFAULT_PORT;
+        if (portj && json_type(portj) == JSON_NUM) {
+            double dv = json_num(portj);
+            if (dv >= 1.0 && dv <= 65535.0 &&
+                dv == (double)(long)dv)
+                port = (long)dv;
+        } else if (portj && json_type(portj) == JSON_STR) {
+            char *end = NULL;
+            errno = 0;
+            long pv = strtol(json_str(portj), &end, 10);
+            if (errno == 0 && end != json_str(portj) && *end == '\0' &&
+                pv >= 1 && pv <= 65535)
+                port = pv;
+        }
         const char *nm = name ? name : "";
         int w = utf8_width(nm);
         int pad = w < 30 ? 30 - w : 0;
         printf("%2llu. %s%*s %s:%lu\n", (unsigned long long)(i + 1),
-               nm, pad, "", host ? host : "", port);
+               nm, pad, "", host ? host : "", (unsigned long)port);
     }
 }
 

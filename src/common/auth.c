@@ -180,9 +180,14 @@ static bool parse_ack(const uint8_t *buf, size_t len, uint32_t expect_nonce,
             remain -= ll;
         }
         reason[rlen] = '\0';
-        for (size_t i = 0; i < rlen; i++)
-            if ((uint8_t)reason[i] < 0x20 || (uint8_t)reason[i] == 0x7f)
+        /* L3 (bughunt): also blank the C1 control range (0x80-0x9F) the
+         * old filter missed; it is terminal garbage at worst, but blank
+         * it for defense-in-depth like the classic C0 range + DEL. */
+        for (size_t i = 0; i < rlen; i++) {
+            uint8_t c = (uint8_t)reason[i];
+            if (c < 0x20 || (c >= 0x7f && c <= 0x9f))
                 reason[i] = '?';
+        }
         if (rlen > 0)
             set_err(errmsg, errmsg_sz, "OPEN_REJECT: %s", reason);
         else
@@ -213,12 +218,13 @@ static bool parse_ack(const uint8_t *buf, size_t len, uint32_t expect_nonce,
     r->sid = (uint16_t)((buf[2] << 8) | buf[3]);
     r->tok = ((uint32_t)buf[4] << 24) | ((uint32_t)buf[5] << 16) |
              ((uint32_t)buf[6] << 8) | (uint32_t)buf[7];
-    /* degenerate-credential guard: an ACK with a zero session token
-     * would reduce blind 2^32 guessing to a trivial zero-accept. Real
-     * servers issue random nonzero tokens; refuse the degenerate case
-     * before parse_ack can report success. */
-    if (r->tok == 0 && r->sid == 0) {
-        set_err(errmsg, errmsg_sz, "degenerate zero sid/token");
+    /* M2 (bughunt): degenerate-credential guard — an ACK with a zero
+     * session token would reduce blind 2^32 guessing to a 2^16 sid
+     * search (tok is the whole data-plane credential); tok==0 alone is
+     * degenerate even when sid!=0. Real servers issue random nonzero
+     * tokens; refuse it before parse_ack can report success. */
+    if (r->tok == 0) {
+        set_err(errmsg, errmsg_sz, "degenerate zero token");
         return false;
     }
 

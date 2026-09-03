@@ -94,7 +94,9 @@ static const char *map_short(const cli_ctl *ctl, const char *a)
      * accept "--c", and accepting it would mask typos */
     if (!ctl->short_aliases || a[0] != '-' || a[1] == '-')
         return NULL;
-    if (a[2] != '\0')
+    /* L6 (bughunt): a bare "-" ends at a[1]==0, so a[2] reads one byte
+     * past the string object. Check the length explicitly instead. */
+    if (a[1] == '\0' || a[2] != '\0')
         return NULL;
     ch = a[1];
     for (const char *const(*p)[2] = ctl->short_aliases; (*p)[0]; p++)
@@ -128,8 +130,12 @@ static void validate_aliases(const cli_opt *opts, size_t nopts,
 static void track_flag(Cli *c, const cli_opt *o, const cli_ctl *ctl)
 {
     (void)ctl;
-    for (int j = 0; j < c->nusage; j++)
-        if (strcmp(c->usage_names[j], o->name) == 0) {
+    /* L7 (bughunt): dedup against seen_names[] (unbounded) instead of
+     * the 16-slot usage render table — the render table is filled only
+     * for the first CLI_MAX_USAGE distinct options, so a 17th+ option
+     * would escape duplication detection. */
+    for (int j = 0; j < c->nseen; j++)
+        if (strcmp(c->seen_names[j], o->name) == 0) {
             if (o->kind == CLI_OPT_BOOL) {
                 /* clap: bool dups error at the second occurrence */
                 c->usage_dup = true;
@@ -148,6 +154,16 @@ static void track_flag(Cli *c, const cli_opt *o, const cli_ctl *ctl)
             }
             return;   /* CSV: repeated freely; usage renders the flag once */
         }
+    /* record the option for duplicate detection */
+    {
+        char **ns = realloc(c->seen_names,
+                            ((size_t)c->nseen + 1) * sizeof *ns);
+        if (ns) {
+            c->seen_names = ns;
+            c->seen_names[c->nseen] = (char *)o->name;
+            c->nseen++;
+        }
+    }
     if (c->nusage < CLI_MAX_USAGE) {
         snprintf(c->usage_names[c->nusage],
                  sizeof c->usage_names[c->nusage], "%s", o->name);
