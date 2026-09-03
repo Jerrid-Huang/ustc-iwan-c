@@ -18,6 +18,7 @@
 
 #include "common.h"
 #include "crypto.h"
+#include "gcm.h"     /* decrypt_password: the server-sent blob */
 #include "json.h"
 #include "oidc.h"
 #include "oidc_pwsecret.h"
@@ -176,15 +177,32 @@ void oidc_fetch_config(Config *cf)
         oidc_esc_put(&b, json_get_str(s, "userName"));
         buf_put_str(&b, "\",\n      \"passWord\": \"");
         {
-            /* platform at-rest wrapping (audit M8): DPAPI / Keychain.
-             * json_get_str returns NULL for a missing field, and the
-             * wrap routine feeds it to strlen(); a malicious /m/config
-             * entry without passWord/userName must not crash the whole
-             * (possibly root) process — treat missing as empty. */
+            /* The server sends the password GCM-encrypted (its wire
+             * format; the key derives from the public app secret, so
+             * the ciphertext is obfuscation only). Decrypt ONCE here
+             * and store the PLAINTEXT: Windows seals it with DPAPI and
+             * macOS moves it into the login Keychain directly, and on
+             * Linux the file is 0600 plaintext by decision — the
+             * app-secret ciphertext layer added nothing (the binary is
+             * public). json_get_str returns NULL for a missing field,
+             * and the wrap routine feeds it to strlen(); a malicious
+             * /m/config entry without passWord/userName must not crash
+             * the whole (possibly root) process — treat missing as
+             * empty. An undecryptable blob is stored verbatim (the
+             * connect path's legacy-GCM fallback handles it). */
             const char *pw_raw = json_get_str(s, "passWord");
             const char *un_raw = json_get_str(s, "userName");
-            char *pw = oidc_wrap_password(pw_raw ? pw_raw : "",
-                                          OIDC_DOMAIN, un_raw ? un_raw : "");
+            char *plain = decrypt_password(pw_raw ? pw_raw : "",
+                                           OIDC_APP_SECRET, OIDC_DOMAIN,
+                                           un_raw ? un_raw : "");
+            char *pw = oidc_wrap_password(plain ? plain
+                                               : (pw_raw ? pw_raw : ""),
+                                          OIDC_DOMAIN,
+                                          un_raw ? un_raw : "");
+            if (plain) {
+                OPENSSL_cleanse(plain, strlen(plain));
+                free(plain);
+            }
             oidc_esc_put(&b, pw ? pw : (pw_raw ? pw_raw : ""));
             free(pw);
         }
@@ -360,9 +378,10 @@ void oidc_load_config(const char *path, Config *cf)
                  path);
         oidc_die_with_cause(msg, strerror(errno));
     }
-    /* the file holds per-line encrypted passwords (obfuscation-level):
-     * warn when it is group/world readable instead of silently loading
-     * (POSIX only: Windows has no group/world permission bits) */
+    /* the file holds per-line PLAINTEXT server passwords (by decision:
+     * the app-secret ciphertext layer was obfuscation only) — warn when
+     * it is group/world readable instead of silently loading (POSIX
+     * only: Windows has no group/world permission bits) */
 #ifndef _WIN32
     {
         struct stat st;

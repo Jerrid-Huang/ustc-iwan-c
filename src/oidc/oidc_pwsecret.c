@@ -12,11 +12,13 @@
 #ifdef _WIN32
 #include <dpapi.h>
 
-/* "WDP1:" + DPAPI-bytes-as-hex. L12 (bughunt): the comment once claimed
- * "Entropy = the app secret" but CryptProtectData below passes NULL — no
- * entropy is used, so the blob is sealed to this machine+user only (not
- * to this build). That is exactly the DPAPI guarantee; do not add the app
- * secret as entropy, it is a public constant and would add nothing. */
+/* "WDP1:" + DPAPI-bytes-as-hex. The sealed value is the plaintext
+ * password (the former GCM layer was obfuscation only). L12 (bughunt):
+ * the comment once claimed "Entropy = the app secret" but
+ * CryptProtectData below passes NULL — no entropy is used, so the blob
+ * is sealed to this machine+user only (not to this build). That is
+ * exactly the DPAPI guarantee; do not add the app secret as entropy,
+ * it is a public constant and would add nothing. */
 char *oidc_wrap_password(const char *blob, const char *domain,
                          const char *user)
 {
@@ -110,8 +112,8 @@ char *oidc_unwrap_password(const char *stored, const char *domain,
 #elif defined(__APPLE__)
 #include <Security/Security.h>
 
-/* "WKC1" marker: the real blob lives in the login Keychain under
- * service "ustc-iwan-c" / account "domain|user". */
+/* "WKC1" marker: the real value (the plaintext password) lives in the
+ * login Keychain under service "ustc-iwan-c" / account "domain|user". */
 static CFStringRef pw_acc(const char *domain, const char *user)
 {
     char acc[512];
@@ -179,8 +181,10 @@ char *oidc_unwrap_password(const char *stored, const char *domain,
     return res;
 }
 #else
-/* No per-user OS protection available: keep the legacy app-secret blob
- * (obfuscation-level only; see oidc_pwsecret.h). */
+/* No per-user OS protection available: store the plaintext password
+ * directly (by decision — the former app-secret GCM layer was
+ * obfuscation only); load_config warns on group/world-readable files
+ * and servers.json is created 0600. */
 char *oidc_wrap_password(const char *blob, const char *domain,
                          const char *user)
 {

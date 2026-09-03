@@ -73,7 +73,9 @@ static void print_help_long(void)
     printf(
         "Fetch, list, or connect using iWAN server config.\n"
         "\n"
-        "Config is stored at ~/.config/iwan/servers.json with encrypted passwords intact.\n"
+        "Config is stored at ~/.config/iwan/servers.json. Passwords are\n"
+        "stored as plaintext (0600; DPAPI-sealed on Windows, in the login\n"
+        "Keychain on macOS).\n"
         "\n"
         "Usage: iwan-client-oidc [OPTIONS]\n"
         "\n"

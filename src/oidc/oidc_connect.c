@@ -42,22 +42,37 @@ struct oidc_reauth_ctx {
     const Config *cf;
 };
 
+/* Recover the plaintext server password from the stored value:
+ * unwrap the platform protection (DPAPI / Keychain), then GCM-decrypt
+ * the LEGACY ciphertext format (pre-plaintext servers.json files).
+ * The current --fetch format stores the plaintext password itself, so
+ * the GCM check fails and the unwrapped blob IS the password — that
+ * fallback is also what makes this tolerant of a server that someday
+ * stops encrypting. Returns a malloc'd password or NULL (unwrap
+ * failed, e.g. locked Keychain). */
+static char *stored_password(const char *stored, const char *domain,
+                             const char *user)
+{
+    char *blob = oidc_unwrap_password(stored ? stored : "", domain,
+                                      user ? user : "");
+    if (!blob)
+        return NULL;
+    char *pw = decrypt_password(blob, OIDC_APP_SECRET, domain, user);
+    if (pw) {
+        OPENSSL_cleanse(blob, strlen(blob));
+        free(blob);
+        return pw;
+    }
+    return blob;   /* plaintext format: the blob is the password */
+}
+
 static int oidc_socks_reauth_cb(void *ud, SocksConfig *cfg, int *out_fd)
 {
     const struct oidc_reauth_ctx *rc = ud;
-    const char *stored = rc->encrypted_pw ? rc->encrypted_pw : "";
-    char *blob = oidc_unwrap_password(stored, rc->cf->domain,
-                                      rc->srv_user ? rc->srv_user : "");
-    if (!blob) {
-        log_err("SOCKS re-auth: cannot recover password (Keychain)");
-        return -1;
-    }
-    char *password = decrypt_password(blob, OIDC_APP_SECRET,
-                                      rc->cf->domain,
-                                      rc->srv_user ? rc->srv_user : "");
-    free(blob);
+    char *password = stored_password(rc->encrypted_pw, rc->cf->domain,
+                                     rc->srv_user);
     if (!password) {
-        log_err("SOCKS re-auth: cannot decrypt password");
+        log_err("SOCKS re-auth: cannot recover password (Keychain)");
         return -1;
     }
     AuthResult res;
@@ -297,9 +312,8 @@ void oidc_connect_server(const Opts *o, const Config *cf)
     };
     bool reconnecting = false;
     for (;;) {
-        char *password = decrypt_password(encrypted_pw ? encrypted_pw : "",
-                                          OIDC_APP_SECRET, cf->domain,
-                                          srv_user ? srv_user : "");
+        char *password = stored_password(encrypted_pw, cf->domain,
+                                         srv_user);
         if (!password) {
 #if defined(__APPLE__)
             oidc_die("cannot read password from the login Keychain "
