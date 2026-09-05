@@ -12,6 +12,8 @@
 #else
 #include <direct.h>
 #include <io.h>
+#include <winsock2.h>  /* before windows.h (its own requirement) */
+#include <windows.h>   /* MoveFileExA (M5: CRT rename cannot replace) */
 #endif
 
 #include <openssl/crypto.h>   /* OPENSSL_cleanse (L2) */
@@ -340,14 +342,20 @@ void oidc_save_config(const char *path, const Config *cf)
 #endif
         oidc_die("cannot write config to %s: %s", path, strerror(errno));
     }
-    if (rename(tmp, path) != 0) {
 #ifdef _WIN32
+    /* M5 (SUMMARY-2): the CRT rename cannot replace an existing target
+     * (the second --fetch would die forever); MoveFileExA with
+     * REPLACE_EXISTING keeps the atomic-replace semantics */
+    if (!MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING)) {
         _unlink(tmp);
-#else
-        unlink(tmp);
-#endif
         oidc_die("cannot write config to %s: %s", path, strerror(errno));
     }
+#else
+    if (rename(tmp, path) != 0) {
+        unlink(tmp);
+        oidc_die("cannot write config to %s: %s", path, strerror(errno));
+    }
+#endif
 #ifndef _WIN32
     /* fsync the parent directory so the rename itself is durable: an
      * atomic-replace promise is only half kept if a crash can roll the

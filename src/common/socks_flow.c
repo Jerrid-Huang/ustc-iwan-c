@@ -43,6 +43,10 @@
                                     * ns_send_reservev can return) */
 #define HANDSHAKE_TIMEOUT_MS 30000u /* ms: greeting/request/resolve/connect */
 #define HANDSHAKE_INPUT_MAX (64 * 1024) /* handshake-phase input cap */
+#define IWAN_RESOLV_INPUT_CAP (1024 * 1024) /* ST_RESOLVING input cap (M1):
+                             * pipelined bytes with nowhere to go while DNS
+                             * runs; over the cap the flow stops reading and
+                             * the kernel buffers (backpressure) */
 #define TCP_RX_CHUNK        16384
 
 static const char *flow_state_name(FlowState st)
@@ -145,9 +149,18 @@ static pthread_mutex_t g_dns_mu = PTHREAD_MUTEX_INITIALIZER;
 static DnsResult g_dns_q[DNS_RESULT_Q_LEN];
 static int g_dns_hd, g_dns_tl; /* ring */
 
-void dns_push(int flow_id, bool ok, uint8_t af, uint32_t ip,
-              const uint8_t ip6[16], uint16_t port) {
+/* session generation: bumped by dns_reset()/dns_stop() (run_socks).
+ * Workers capture it at spawn and stop registering/sending once it
+ * changes, so a worker can never touch the session socket after it was
+ * closed (and possibly reused by another open()); dns_drain also drops
+ * results whose generation is stale (H3). Declared before the result
+ * queue: dns_drain reads it. */
+static atomic_uint g_dns_gen = 1;
+
+void dns_push_g(unsigned gen, int flow_id, bool ok, uint8_t af,
+                uint32_t ip, const uint8_t ip6[16], uint16_t port) {
     pthread_mutex_lock(&g_dns_mu);
+    g_dns_q[g_dns_tl].gen = gen;
     g_dns_q[g_dns_tl].flow_id = flow_id;
     g_dns_q[g_dns_tl].ok = ok;
     g_dns_q[g_dns_tl].af = af;
@@ -163,9 +176,19 @@ void dns_push(int flow_id, bool ok, uint8_t af, uint32_t ip,
 
 int dns_drain(DnsResult *out, int max) {
     int n = 0;
+    /* session generation NOW: entries pushed by a torn-down session's
+     * workers are dropped here, not delivered — their flow ids are
+     * indistinguishable from a fresh session's (g_next_id resets to 1
+     * every session), so a stale result would inject the wrong IP
+     * into a new flow (SUMMARY-2 H3). Relaxed load: a torn-down
+     * entry is merely discarded, and dns_reset() clears the ring
+     * under this same mutex anyway. */
+    unsigned cur = atomic_load_explicit(&g_dns_gen, memory_order_relaxed);
     pthread_mutex_lock(&g_dns_mu);
     while (g_dns_hd != g_dns_tl && n < max) {
-        out[n++] = g_dns_q[g_dns_hd];
+        if (g_dns_q[g_dns_hd].gen == cur)
+            out[n++] = g_dns_q[g_dns_hd];
+        /* stale-generation entries are dropped, not delivered */
         g_dns_hd = (g_dns_hd + 1) % DNS_RESULT_Q_LEN;
     }
     pthread_mutex_unlock(&g_dns_mu);
@@ -261,15 +284,9 @@ static pthread_mutex_t g_dns_wait_mu = PTHREAD_MUTEX_INITIALIZER;
  * decremented after in_use=false, both under g_dns_wait_mu. */
 static atomic_int g_dns_wait_n;
 
-/* session generation: bumped by dns_reset()/dns_stop() (run_socks).
- * Workers capture it at spawn and stop registering/sending once it
- * changes, so a worker can never touch the session socket after it was
- * closed (and possibly reused by another open()). */
-static atomic_uint g_dns_gen = 1;
-
 /* true when the session generation changed since this job was spawned,
- * i.e. the tunnel session was torn down and workers must stop (see the
- * g_dns_gen comment above) */
+ * i.e. the tunnel session was torn down and workers must stop (see
+ * g_dns_gen above) */
 static bool dns_stale(const DnsJob *j)
 {
     return atomic_load(&g_dns_gen) != j->gen;
@@ -508,7 +525,10 @@ static bool dns_consume_answer(int slot, uint16_t dport, uint16_t want_id,
             w->in_use = false;
             atomic_fetch_sub_explicit(&g_dns_wait_n, 1, memory_order_release);
             pthread_mutex_unlock(&g_dns_wait_mu);
-            dns_push(flow_id, true, af, ip, ip6, fport);
+            /* event-loop side: tag with the current generation so the
+             * drain filter accepts it (H3) */
+            dns_push_g(atomic_load(&g_dns_gen), flow_id, true, af, ip,
+                       ip6, fport);
         } else {
             pthread_mutex_unlock(&g_dns_wait_mu);
         }
@@ -757,13 +777,21 @@ static void *dns_worker(void *arg) {
     if (g_dns_server_ip4 == 0 || j->qtype == 0) {
         /* no tunnel DNS (dns=0.0.0.0) or a local-fallback worker:
          * resolve via the system resolver — no session socket involved,
-         * so the generation gate above is sufficient */
+         * so the socket-safety generation gate above suffices there.
+         * dns_query_local BLOCKS in getaddrinfo for up to ~30s, and the
+         * session can be torn down and rebuilt meanwhile: the gate must
+         * be re-checked after the call, or the stale worker injects an
+         * old IP into a new session's same-numbered flow (SUMMARY-2 H3;
+         * dns_drain's generation filter is the second layer). */
         uint32_t lip = 0;
         uint8_t lip6[16] = {0}, af = 4;
-        if (dns_query_local(j->domain, &af, &lip, lip6))
-            dns_push(j->flow_id, true, af, lip, lip6, j->port);
+        bool resolved = dns_query_local(j->domain, &af, &lip, lip6);
+        if (dns_stale(j))
+            goto done;   /* session torn down while we resolved */
+        if (resolved)
+            dns_push_g(j->gen, j->flow_id, true, af, lip, lip6, j->port);
         else
-            dns_push(j->flow_id, false, 4, 0, NULL, j->port);
+            dns_push_g(j->gen, j->flow_id, false, 4, 0, NULL, j->port);
         goto done;
     }
     if (g_sockfd < 0)
@@ -866,7 +894,7 @@ static void *dns_worker(void *arg) {
         if (act == 3)
             break;
         if (act == 2) {
-            dns_push(j->flow_id, false, 4, 0, NULL, j->port);
+            dns_push_g(j->gen, j->flow_id, false, 4, 0, NULL, j->port);
             break;
         }
     }
@@ -878,7 +906,7 @@ fail:
         dns_retire_slot_locked(slot, sport, id);
         pthread_mutex_unlock(&g_dns_wait_mu);
     }
-    dns_push(j->flow_id, false, 4, 0, NULL, j->port);
+    dns_push_g(j->gen, j->flow_id, false, 4, 0, NULL, j->port);
 done:
     /* wake the event loop, unless the session is gone: its eventfd may
      * already be closed (and reused), and the loop is not waiting.
@@ -924,7 +952,8 @@ void spawn_dns(int flow_id, const char *domain, uint16_t port) {
         pthread_t th;
         DnsJob *j = malloc(sizeof *j);
         if (!j) {
-            dns_push(flow_id, false, 4, 0, NULL, port);
+            dns_push_g(atomic_load(&g_dns_gen), flow_id, false, 4, 0,
+                       NULL, port);
             continue;
         }
         j->flow_id = flow_id;
@@ -935,7 +964,8 @@ void spawn_dns(int flow_id, const char *domain, uint16_t port) {
         if (pthread_create(&th, NULL, dns_worker, j) != 0) {
             free(j->domain);
             free(j);
-            dns_push(flow_id, false, 4, 0, NULL, port);
+            dns_push_g(atomic_load(&g_dns_gen), flow_id, false, 4, 0,
+                       NULL, port);
             continue;
         }
         pthread_detach(th);
@@ -1766,6 +1796,20 @@ void service_local_inputs(Flow *fs) {
              * (dead tunnel, in-place re-auth pending) is NOT read: the
              * kernel socket buffers the client's bytes (backpressure)
              * until the re-established connection drains them. */
+            /* M1 (SUMMARY-2): a RESOLVING flow's pipelined bytes have
+             * nowhere to go (the ST_CONNECTING spill needs ns_idx >= 0,
+             * and ns_idx stays -1 until DNS completes), so bound them:
+             * stop reading once input reaches IWAN_RESOLV_INPUT_CAP —
+             * the kernel socket buffers the rest (backpressure), and
+             * this branch re-enters every event-loop round, so reading
+             * resumes as soon as the resolution lands and the spill
+             * drains input below the cap. A CONNECT header plus a
+             * normal pipelined request is far below 1MB; previously the
+             * input grew unboundedly for up to the 30s DNS window and
+             * buf_ensure failure aborted the whole process. */
+            if (f->state == ST_RESOLVING &&
+                f->input.len >= IWAN_RESOLV_INPUT_CAP)
+                continue;   /* over the cap: skip this flow this round */
             uint8_t rbuf[TCP_RX_CHUNK];
             ssize_t n = port_recv(f->fd, rbuf, sizeof rbuf, 0);
             if (n == 0) {

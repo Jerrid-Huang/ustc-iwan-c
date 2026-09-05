@@ -726,6 +726,11 @@ static void *recv_thread_main(void *v)
                 continue;
             perror("poll");
             a->poll_err = 1;   /* fatal: exit non-zero for service mgrs */
+            /* M8 (SUMMARY-2): a thread exiting without the stop flag
+             * would leave main deadlocked in pthread_join (whose comment
+             * promises "exit within one poll timeout") — set it so the
+             * shutdown path completes */
+            atomic_store_explicit(&g_stop, true, memory_order_relaxed);
             break;
         }
         if (pfd.revents & POLLERR) {

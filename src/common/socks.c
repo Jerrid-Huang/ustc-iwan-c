@@ -259,15 +259,33 @@ static int socks_send_batch2(int sockfd, SocksConfig *cfg,
             else
                 cfg->gso_mss = mss;
         } else if (cfg->gso_ok > 0 && cfg->gso_mss != mss) {
-            /* gso_ok == -1 caches the disabled state: once setsockopt
-             * failed it will not succeed later, so stop re-probing it
-             * on every drain round */
+            /* C1-style: a different mss re-arms the socket option (a
+             * mixed-MTU stream is rare on the uplink; the probe cost
+             * only bites per drain round with a changed mss) */
             int m = (int)mss;
             if (port_setsockopt(sockfd, SOL_UDP, UDP_SEGMENT, &m,
                                 sizeof m) != 0)
                 cfg->gso_ok = -1;
             else
                 cfg->gso_mss = mss;
+        } else if (cfg->gso_ok < 0) {
+            /* M11 (SUMMARY-2): a cached failure is re-probed at most
+             * once per second — the cause can be transient (temporary
+             * resource exhaustion, a restored offload setting), and a
+             * permanent disable would silently cap uplink throughput
+             * for the process lifetime. Previously the disabled state
+             * was never revisited. */
+            static uint64_t last_gso_probe;
+            uint64_t now = now_ms();
+            if (now - last_gso_probe >= 1000) {
+                last_gso_probe = now;
+                int m = (int)mss;
+                if (port_setsockopt(sockfd, SOL_UDP, UDP_SEGMENT, &m,
+                                    sizeof m) == 0) {
+                    cfg->gso_ok = 1;
+                    cfg->gso_mss = mss;
+                }
+            }
         }
         if (cfg->gso_ok > 0) {
             struct msghdr mh;
@@ -649,6 +667,12 @@ int receive_vpn(int sockfd, SocksConfig *cfg) {
             }
             int r = vpn_handle_datagram(sockfd, cfg, rx_bufs[i], (size_t)n);
             if (r < 0) {
+                /* the handler did not take pool ownership: release the
+                 * current slot too, or a PT_CLOSE (and any other fatal
+                 * return) leaks it — 256 slots, init-once, and an
+                 * in-place re-auth per CLOSE would exhaust the pool
+                 * (SUMMARY-2 M9) */
+                ns_rx_buf_release(rx_bufs[i]);
                 for (int j = i + 1; j < got; j++)
                     ns_rx_buf_release(rx_bufs[j]);
                 return -1;

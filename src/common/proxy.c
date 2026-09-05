@@ -602,6 +602,7 @@ static void *udp2tun_thread(void *ud) {
                            : 0;
     uint64_t last_rx = now_ms();   /* any downlink resets the stale clock */
     int ka_fail = 0;
+    int ka_res_fail = 0;   /* M13: consecutive ECHO_RES reply failures */
     int i;
 
     if (!batch) {
@@ -730,11 +731,25 @@ static void *udp2tun_thread(void *ud) {
                     continue;
                 if (send_ctrl(ctx, PT_ECHO_RES, ctx->enc, ctx->sid,
                               ctx->tok) != 0) {
-                    log_err("[UDP->TUN] keepalive response err: %s",
-                            strerror(errno));
-                    ctx->session_lost = true;
-                    g_stop = 1;
-                    break;
+                    /* M13: same transient-error discipline as the
+                     * ECHO_REQ send direction above — one failed reply
+                     * (roaming, carrier hiccup, transient ENOBUFS) does
+                     * not kill the session; only PUMP_KA_FAIL_MAX
+                     * consecutive failures do */
+                    int e = errno;
+                    if (++ka_res_fail >= PUMP_KA_FAIL_MAX) {
+                        log_err("[UDP->TUN] keepalive response err: %s "
+                                "(%d consecutive); session lost",
+                                strerror(e), ka_res_fail);
+                        ctx->session_lost = true;
+                        g_stop = 1;
+                        break;
+                    }
+                    err_printf("[UDP->TUN] keepalive response err: %s "
+                            "(retry %d/%d)\n", strerror(e), ka_res_fail,
+                            PUMP_KA_FAIL_MAX);
+                } else {
+                    ka_res_fail = 0;
                 }
                 continue;
             }
@@ -1092,6 +1107,13 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
     ctx.enc = enc;
     ctx.gso_mss = 0;
     ctx.gso_ok = -1;
+    /* M14 (SUMMARY-2): the rest of the sentinel/state fields must be
+     * initialized explicitly — session_lost is read by the tick loop
+     * and the GSO hysteresis state by the first send batch, all before
+     * any write (stack garbage previously drove that control flow) */
+    ctx.session_lost = false;
+    ctx.gso_pending_mss = 0;
+    ctx.gso_streak = 0;
     memcpy(ctx.xor_key, xor_key, 8);
     pthread_mutex_init(&ctx.send_lock, NULL);
     pace_bucket_init(&ctx.pace);

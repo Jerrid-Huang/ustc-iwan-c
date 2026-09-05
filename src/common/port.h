@@ -302,14 +302,24 @@ static inline int port_recvmmsg(int fd, struct mmsghdr *msgvec,
 {
 #  ifdef __APPLE__
     /* recvmmsg emulation: same drained-shape as the winsock path
-     * (0 messages with EAGAIN/EINTR/ECONNRESET is not an error). */
+     * (EINTR/ECONNRESET with no messages is not an error). M12
+     * (SUMMARY-2): an EMPTY queue must read as -1/EAGAIN like Linux
+     * recvmmsg(MSG_DONTWAIT) — callers only park on v < 0, so
+     * returning 0 here made the pump loop busy-spin a full core (the
+     * exact bug the winsock path already fixed). A partial batch
+     * (got > 0) is still returned as messages received. */
     (void)timeout;
     unsigned got = 0;
     for (; got < vlen; got++) {
         ssize_t n = recvmsg(fd, &msgvec[got].msg_hdr, flags);
         if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK ||
-                errno == EINTR || errno == ECONNRESET)
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (got > 0)
+                    return (int)got;
+                errno = EAGAIN;
+                return -1;
+            }
+            if (errno == EINTR || errno == ECONNRESET)
                 return (int)got;
             if (got > 0)
                 return (int)got;

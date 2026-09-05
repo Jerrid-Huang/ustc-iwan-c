@@ -18,7 +18,12 @@
 #define MAX_FLOWS       256
 
 /* ---- tunnel DNS (socks_flow.c) ---- */
-#define DNS_RESULT_Q_LEN 64     /* DNS result ring size (dns_push/dns_drain) */
+#define DNS_RESULT_Q_LEN 256    /* DNS result ring size (dns_push/dns_drain).
+                                 * 256 not 64: the event loop drains 16 per
+                                 * round, so 64 could drop-oldest under a
+                                 * burst of slow lookups and strand a flow
+                                 * for its full 30s timeout (SUMMARY-2 M10);
+                                 * ~48B per entry, 12KB total */
 #define DNS_DRAIN_MAX    16     /* results handled per event-loop round */
 #define DNS_WAIT_MAX     16     /* concurrent pending queries */
 #define DNS_POLL_MS      250u   /* worker retry/poll interval */
@@ -88,6 +93,11 @@ typedef struct {
     uint32_t ip;               /* host-order MSB-first (af == 4) */
     uint8_t  ip6[16];          /* raw bytes (af == 6) */
     uint16_t port;
+    unsigned gen;              /* session generation at push time: the
+                                * drain side drops entries from a torn-
+                                * down session so a stale worker's
+                                * result can never reach a new session's
+                                * same-numbered flow (SUMMARY-2 H3) */
 } DnsResult;
 
 /* ---- shared state between socks.c (server) and socks_flow.c (flows) ---- */
@@ -109,8 +119,14 @@ void send_vpn_keepalive(int sockfd, const SocksConfig *cfg,
 int  receive_vpn(int sockfd, SocksConfig *cfg);
 
 /* ---- flow lifecycle / SOCKS5 handshake / DNS / port alloc / I/O (socks_flow.c) ---- */
-void dns_push(int flow_id, bool ok, uint8_t af, uint32_t ip,
-              const uint8_t ip6[16], uint16_t port);
+/* gen: the caller's session generation at spawn time. The drain side
+ * drops results from a torn-down session (SUMMARY-2 H3): a stale
+ * worker that resolves after its session died would otherwise inject
+ * an old IP into a new session's same-numbered flow (socks.c resets
+ * g_next_id to 1 every session). Callers that push outside a worker
+ * (spawn failure paths) pass the current generation. */
+void dns_push_g(unsigned gen, int flow_id, bool ok, uint8_t af,
+                uint32_t ip, const uint8_t ip6[16], uint16_t port);
 int  dns_drain(DnsResult *out, int max);
 void spawn_dns(int flow_id, const char *domain, uint16_t port);
 void dns_set_server(const char *ip);   /* tunnel DNS resolver (run_socks) */

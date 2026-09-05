@@ -15,8 +15,9 @@
  * Thread model: one accept thread; two GLOBAL direction threads
  * (poll-based event loop) shared by all connections — up thread
  * (client -> upstream) and down thread (upstream -> client).
- * relay_proxy_stop closes the listener; live connections are reaped
- * when their sockets close at process exit.
+ * relay_proxy_stop closes the listener; every connection is closed
+ * and freed when both direction threads retire it (in_use reference
+ * drops to zero), not just at process exit.
  */
 
 #include <errno.h>
@@ -704,11 +705,15 @@ struct rp_ent {
 struct rp_conn {
     int c, u;
     atomic_int dirs;            /* 2 -> 0: both threads retired */
-    atomic_int in_use;          /* H2: references held by rp_dir_main
-                                 * loops while they dereference cn
-                                 * outside g_rp_mu; free waits for 0 */
-    bool retired;               /* H2: dirs hit 0; free deferred until
-                                 * in_use==0 (see rp_reap_maybe) */
+    atomic_int in_use;          /* references held by rp_dir_main loop
+                                 * iterations while they dereference cn:
+                                 * +1 per snapshot entry under g_rp_mu,
+                                 * -1 at the loop bottom; free waits for
+                                 * the last reference (>=1 while any
+                                 * iteration may still touch cn) */
+    bool retired;               /* dirs hit 0; freed when the last
+                                 * in_use reference drops (see
+                                 * rp_reap_maybe) */
     struct rp_ent up, dn;      /* up thread owns .up, down owns .dn */
 };
 
@@ -716,6 +721,12 @@ static struct rp_conn **g_rp_up, **g_rp_dn;
 static size_t g_rp_up_n, g_rp_up_cap, g_rp_dn_n, g_rp_dn_cap;
 static pthread_mutex_t g_rp_mu = PTHREAD_MUTEX_INITIALIZER;
 static atomic_int g_rp_stop;
+/* bumped under g_rp_mu whenever a connection array changes (add,
+ * retire swap, rollback swap); direction threads rebuild their cached
+ * pollset when the generation they built it from is stale (M7: a
+ * same-round swap keeps the count unchanged, so a count-only check
+ * misses it) */
+static atomic_uint_fast64_t g_rp_arr_gen;
 
 /* [prof] relay byte counters (up = client->upstream, dn = reverse) */
 atomic_uint_fast64_t g_prof_rp_up_recv, g_prof_rp_up_send;
@@ -762,6 +773,8 @@ static void rp_add(int c, int u)
     bool ok = rp_arr_add(&g_rp_up, &g_rp_up_n, &g_rp_up_cap, cn);
     if (ok)
         ok = rp_arr_add(&g_rp_dn, &g_rp_dn_n, &g_rp_dn_cap, cn);
+    if (ok)
+        atomic_fetch_add(&g_rp_arr_gen, 1);
     if (!ok) {
         for (size_t i = 0; i < g_rp_up_n; i++)
             if (g_rp_up[i] == cn) {
@@ -773,6 +786,7 @@ static void rp_add(int c, int u)
                 g_rp_dn[i] = g_rp_dn[--g_rp_dn_n];
                 break;
             }
+        atomic_fetch_add(&g_rp_arr_gen, 1);
     }
     pthread_mutex_unlock(&g_rp_mu);
     if (!ok) {
@@ -783,13 +797,12 @@ static void rp_add(int c, int u)
     }
 }
 
-/* one direction thread retires its entry: the sockets are closed and
- * the conn freed when BOTH threads have retired. Must run under
- * g_rp_mu (the last release frees the conn, and the first release
- * must not read the atomic after that free). */
-/* H2 (bughunt): free a retired conn only when no direction thread
- * still dereferences it. kept in_use must be 0 AND the conn retired
- * (dirs hit 0); g_rp_mu must be held. */
+/* free a retired conn once no loop iteration may still dereference
+ * it: every iteration holds in_use >= 1 on its snapshot entries (added
+ * under g_rp_mu, dropped at the loop bottom), so a retired conn with
+ * in_use == 0 is unreferenced and safe to close and free. Must run
+ * under g_rp_mu (the freeing thread may be the last holder; the
+ * atomics are read before the free). */
 static void rp_reap_maybe(struct rp_conn *cn)
 {
     if (cn->retired && atomic_load(&cn->in_use) == 0) {
@@ -802,15 +815,25 @@ static void rp_reap_maybe(struct rp_conn *cn)
 }
 
 /* one direction thread retires its entry: when both have retired, the
- * conn is marked and freed once the last in_use reference drops (not
- * here — another direction thread may still be dereferencing cn in its
- * lock-free processing loop). Must run under g_rp_mu. */
+ * conn is marked; the actual close+free happens when the last in_use
+ * reference drops (not necessarily here — the caller still holds its
+ * own reference until its loop bottom). Must run under g_rp_mu. */
 static void rp_release(struct rp_conn *cn)
 {
     if (atomic_fetch_sub(&cn->dirs, 1) == 1) {
         cn->retired = true;
         rp_reap_maybe(cn);
     }
+}
+
+/* drop every snapshot reference this loop iteration holds (early exit
+ * / loop bottom); must run under g_rp_mu — the last reference out of
+ * a retired conn closes and frees it */
+static void rp_snap_unref_all(struct rp_conn **snap, size_t n)
+{
+    for (size_t i = 0; i < n; i++)
+        if (atomic_fetch_sub(&snap[i]->in_use, 1) == 1)
+            rp_reap_maybe(snap[i]);
 }
 
 static bool rp_pend(struct rp_ent *e, const uint8_t *p, size_t n)
@@ -878,6 +901,7 @@ static void *rp_dir_main(void *ud)
     int *slot_from = NULL, *slot_to = NULL;
     size_t slotcap = 0;
     bool pf_dirty = true;
+    unsigned long long built_gen = 0;
     struct rp_conn **snap = NULL;
     size_t snapcap = 0;
     uint8_t buf[RP_BUF];
@@ -897,23 +921,42 @@ static void *rp_dir_main(void *ud)
             snapcap = n;
         }
         memcpy(snap, *arrp, n * sizeof *snap);
+        /* hold one reference per snapshot entry while this iteration
+         * dereferences them outside g_rp_mu; dropped at the loop
+         * bottom (or on the early exits below). Under the same
+         * critical section as the memcpy, so every snapshotted conn
+         * is ref-protected before the lock is released. */
+        for (size_t i = 0; i < n; i++)
+            atomic_fetch_add(&snap[i]->in_use, 1);
         pthread_mutex_unlock(&g_rp_mu);
 
         if (n * 2 > pfcap) {
             struct pollfd *n2 = realloc(pf, (n * 2) * sizeof *n2);
-            if (!n2)
+            if (!n2) {
+                pthread_mutex_lock(&g_rp_mu);
+                rp_snap_unref_all(snap, n);
+                pthread_mutex_unlock(&g_rp_mu);
                 return NULL;
+            }
             pf = n2;
             pfcap = n * 2;
         }
         if (n > slotcap) {
             int *ns = realloc(slot_from, n * sizeof *ns);
-            if (!ns)
+            if (!ns) {
+                pthread_mutex_lock(&g_rp_mu);
+                rp_snap_unref_all(snap, n);
+                pthread_mutex_unlock(&g_rp_mu);
                 return NULL;
+            }
             slot_from = ns;
             ns = realloc(slot_to, n * sizeof *ns);
-            if (!ns)
+            if (!ns) {
+                pthread_mutex_lock(&g_rp_mu);
+                rp_snap_unref_all(snap, n);
+                pthread_mutex_unlock(&g_rp_mu);
                 return NULL;
+            }
             slot_to = ns;
             slotcap = n;
             pf_dirty = true;
@@ -923,7 +966,13 @@ static void *rp_dir_main(void *ud)
          * slot_from[i]/slot_to[i] map entry i to its pollfd index, so
          * the per-entry event lookup is O(1) instead of an O(n*k)
          * fd scan on every loop iteration. */
-        if (pf_dirty) {
+        unsigned long long cur_gen =
+            atomic_load_explicit(&g_rp_arr_gen, memory_order_relaxed);
+        /* M7: rebuild also when a connection array changed since this
+         * pollset was built (a same-round add+retire keeps the count
+         * unchanged, so a count-only check misses it); this also
+         * removes the one-round delay after a retire */
+        if (pf_dirty || cur_gen != built_gen) {
             size_t k = 0;
             for (size_t i = 0; i < n; i++) {
                 struct rp_ent *e = up_dir ? &snap[i]->up : &snap[i]->dn;
@@ -946,6 +995,7 @@ static void *rp_dir_main(void *ud)
             }
             pf_n = k;
             pf_dirty = false;
+            built_gen = cur_gen;
         }
         int pr = port_poll(pf, pf_n, RP_POLL_MS);
 #ifndef IWAN_DEBUG_STRIP
@@ -956,8 +1006,18 @@ static void *rp_dir_main(void *ud)
         }
 #endif
         if (pr < 0) {
-            if (errno == EINTR)
+            if (errno == EINTR) {
+                /* drop this iteration's references before restarting:
+                 * the next pass overwrites the snapshot buffer, so a
+                 * reference left behind here would dangle forever */
+                pthread_mutex_lock(&g_rp_mu);
+                rp_snap_unref_all(snap, n);
+                pthread_mutex_unlock(&g_rp_mu);
                 continue;
+            }
+            pthread_mutex_lock(&g_rp_mu);
+            rp_snap_unref_all(snap, n);
+            pthread_mutex_unlock(&g_rp_mu);
             break;              /* poll failed: stop relaying */
         }
         if (prof_print(tag, &pst,
@@ -1122,16 +1182,16 @@ static void *rp_dir_main(void *ud)
                 for (size_t j = 0; j < *np; j++)
                     if ((*arrp)[j] == cn) {
                         (*arrp)[j] = (*arrp)[--*np];
+                        atomic_fetch_add(&g_rp_arr_gen, 1);
                         break;
                     }
                 rp_release(cn);
             }
         }
-        /* H2: drop the per-loop snapshot references; the last one to
-         * leave a retired conn frees it (rp_reap_maybe, lock held). */
-        for (size_t i = 0; i < n; i++)
-            if (atomic_fetch_sub(&snap[i]->in_use, 1) == 1)
-                rp_reap_maybe(snap[i]);
+        /* drop this iteration's snapshot references; the last one to
+         * leave a retired conn closes and frees it (rp_reap_maybe,
+         * lock held) */
+        rp_snap_unref_all(snap, n);
         pthread_mutex_unlock(&g_rp_mu);
     }
     free(pf);

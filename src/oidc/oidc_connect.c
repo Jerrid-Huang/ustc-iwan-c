@@ -57,7 +57,11 @@ static char *stored_password(const char *stored, const char *domain,
                                       user ? user : "");
     if (!blob)
         return NULL;
-    char *pw = decrypt_password(blob, OIDC_APP_SECRET, domain, user);
+    /* same NULL guard as the unwrap call above: a servers.json entry
+     * without "username" leaves user NULL, and decrypt_password
+     * strlen()s it (SUMMARY-2 M2) */
+    char *pw = decrypt_password(blob, OIDC_APP_SECRET, domain,
+                                user ? user : "");
     if (pw) {
         OPENSSL_cleanse(blob, strlen(blob));
         free(blob);

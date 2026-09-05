@@ -771,12 +771,15 @@ bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
     }
     /* the server-pinned /32 only exists in the IPv4 table; an IPv6
      * server address cannot be routed via the (IPv4) default gateway
-     * and would fail every `ip route add` attempt, so skip it */
+     * and would fail every `ip route add` attempt, so skip it.
+     * M4 (SUMMARY-2): `replace` not `add` — a pin left behind by a
+     * crashed client would make every later connection fail with
+     * EEXIST (and the stale pin blackholes server traffic) */
     if (srv_v4 && !srv_lo) {
-        char *a5[] = { "route", "add", srv32, "via", (char *)ogw, "dev",
+        char *a5[] = { "route", "replace", srv32, "via", (char *)ogw, "dev",
                        (char *)odev, NULL };
         if (!ip_run(a5)) {
-            log_err("route_setup: route add %s via %s dev %s failed",
+            log_err("route_setup: route replace %s via %s dev %s failed",
                     srv32, ogw, odev);
             route_iface_down(tun);
             return false;

@@ -824,7 +824,14 @@ static int https_connect_tcp(const char *host, uint16_t port,
         if (l4.fd >= 0)
             port_close(l4.fd);
     }
-    freeaddrinfo(res);
+    /* the split reuses the original chain nodes, so `res` is now the
+     * head of only one of the two subchains: free both (each exactly
+     * once) — freeing only `res` leaks the other subchain
+     * (SUMMARY-2 M3) */
+    if (v6_head)
+        freeaddrinfo(v6_head);
+    if (v4_head)
+        freeaddrinfo(v4_head);
 
     if (fd < 0 && diag[0] == '\0') {
 #ifdef _WIN32
@@ -1277,7 +1284,12 @@ static int https_resp_parse(struct sbuf *resp, int *status, char **body_out)
 static bool https_transport(const char *host, struct sbuf *req,
                             struct sbuf *resp, uint64_t deadline_ms)
 {
-    char diag[512];
+    /* zeroed: when both Happy-Eyeballs lanes exhaust their addresses
+     * nothing writes diag, and https_connect_tcp checks diag[0]=='\0'
+     * to decide whether to fill in the errno text — a garbage
+     * non-empty buffer would skip that and reach the log (SUMMARY-2
+     * M6) */
+    char diag[512] = { 0 };
     SSL_CTX *ctx = NULL;
     SSL *ssl = NULL;
     int fd = -1;

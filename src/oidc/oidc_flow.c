@@ -287,9 +287,11 @@ static void check_csrf_state(const char *cb_state, const char *saved,
                  "(OIDC Core 3.1.2.1 CSRF check failed)");
     /* L1 (bughunt): constant-time compare like the other sensitive
      * comparisons in this tree (crypto.c ct_eq); state is a fixed-length
-     * CSPRNG string, so a length check first is fine. */
+     * CSPRNG string, so a length check first is fine. ct_eq returns
+     * non-zero on a MATCH, so a mismatch dies on == 0 (the polarity
+     * here was once inverted — see bughunt SUMMARY-2 H2). */
     if (!have_state || strlen(cb_state) != strlen(saved) ||
-        ct_eq(cb_state, saved, strlen(cb_state)) != 0)
+        ct_eq(cb_state, saved, strlen(cb_state)) == 0)
         oidc_die("authorization response state does not match the saved "
                  "state (OIDC Core 3.1.2.1 CSRF check failed)");
 }

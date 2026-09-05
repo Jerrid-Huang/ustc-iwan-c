@@ -39,6 +39,35 @@ int udp_gso_prepare(int fd, size_t mss, int *ok, size_t *gso_mss,
         *streak = 0;
         return 1;
     }
+    if (*ok == 0) {
+        /* M11: a hard failure (probe or re-arm setsockopt) is cached,
+         * but its cause can be transient (temporary resource
+         * exhaustion, a restored offload setting). Re-probe at most
+         * once per second — shared across all callers so the hot send
+         * path never hammers setsockopt: success re-enables GSO for
+         * the whole process, failure keeps the sendmmsg fallback.
+         * Previously one failure disabled GSO for the process
+         * lifetime (SUMMARY-2 M11). */
+        static atomic_uint_fast64_t last_probe_ms;
+        uint64_t now = now_ms();
+        uint64_t last = atomic_load_explicit(&last_probe_ms,
+                                             memory_order_relaxed);
+        if (now - last < 1000)
+            return 0;
+        if (!atomic_compare_exchange_strong_explicit(&last_probe_ms,
+                                                     &last, now,
+                                                     memory_order_relaxed,
+                                                     memory_order_relaxed))
+            return 0;   /* another caller is probing this second */
+        int m = (int)mss;
+        if (port_setsockopt(fd, SOL_UDP, UDP_SEGMENT, &m, sizeof m) != 0)
+            return 0;
+        *ok = 1;
+        *gso_mss = mss;
+        *pending_mss = mss;
+        *streak = 0;
+        return 1;
+    }
     if (*ok && *gso_mss != mss) {
         /* C1 hysteresis: a different uniform mss does NOT re-arm the
          * socket option immediately — mixed-MTU (A/B alternating) traffic

@@ -435,9 +435,39 @@ static err_t bridge_poll(void *arg, struct tcp_pcb *pcb)
 /* public ns_* API                                                     */
 /* ------------------------------------------------------------------ */
 
+/* H4: every pcb must be gone from lwIP's global lists before a second
+ * lwip_init() runs: tcp_init() only re-seeds the local port (the lists
+ * survive) while memp_init() re-pools the very memory the pcbs occupy
+ * — the next allocations alias the stale entries (list self-loop /
+ * state corruption). tcp_abort/tcp_close unlink each pcb and hand its
+ * memory back to the pool; tcp_abort fires the err callback
+ * (bridge_err clears the owning TcpConn slot while ns is still
+ * intact). TIME-WAIT and LISTEN pcbs fire no callback — their slots
+ * are reset by the caller's memset. */
+static void ns_teardown_pcbs(void)
+{
+    for (int li = 0; li < NUM_TCP_PCB_LISTS; li++) {
+        struct tcp_pcb *p = *tcp_pcb_lists[li];
+        while (p != NULL) {
+            struct tcp_pcb *next = p->next;
+            if (p->state == LISTEN)
+                tcp_close(p);
+            else
+                tcp_abort(p);
+            p = next;
+        }
+    }
+}
+
 void ns_init(Netstack *ns, uint32_t inner_ip, uint32_t gw, uint16_t mtu)
 {
     struct netif *old_netif = ns->netif;   /* save before the memset */
+
+    /* H4: a live stack (re-auth, any session) may still have pcbs on
+     * lwIP's lists — tear them down before the memset + re-init. A
+     * first init finds an empty netif pointer and skips this. */
+    if (old_netif != NULL)
+        ns_teardown_pcbs();
 
     memset(ns, 0, sizeof *ns);
     /* every tx slot starts free; the lport_map hint starts empty */
