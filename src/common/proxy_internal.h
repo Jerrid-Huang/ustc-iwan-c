@@ -49,7 +49,10 @@ enum {
     PP_POLLWAIT,      /* recv sub: parked in port_poll (no downlink) */
     PP_DLPKT,         /* downlink: whole per-packet loop (incl tun_write) */
 };
-typedef struct { uint64_t us; uint64_t n; } pump_prof_t;
+/* M3-10: per-slot profiler counters — RMW'd by up to TUN_POOL_MAX reader
+ * threads and read live by run_pump's tick, so they must be atomic
+ * (plain uint64_t was a data race whenever IWAN_PUMP_PROF=1). */
+typedef struct { atomic_uint_fast64_t us; atomic_uint_fast64_t n; } pump_prof_t;
 
 /* C4: profiler collection is gated on IWAN_PUMP_PROF (parsed once, like
  * profile.h's g_prof_on) — the per-packet timer/atomic work is pure
@@ -78,7 +81,7 @@ extern atomic_uint_fast64_t g_prof_recv_empty;
 extern atomic_uint_fast64_t g_prof_recv_badtok;
 extern atomic_uint_fast64_t g_prof_tun_rbig;
 extern atomic_uint_fast64_t g_prof_tun_rdrop;
-extern uint32_t g_prof_tun_rmax;
+extern _Atomic uint32_t g_prof_tun_rmax;
 extern atomic_uint_fast64_t g_prof_pump_tx;
 extern atomic_uint_fast64_t g_prof_pump_rx;
 
@@ -86,8 +89,6 @@ extern atomic_uint_fast64_t g_prof_pump_rx;
 extern atomic_uint_fast64_t g_tun_wait_us, g_tun_timeouts, g_tun_wakeups,
                             g_tun_pkts, g_tun_drain_us, g_tun_allocfail;
 #endif
-
-static inline void pump_prof_add(pump_prof_t *p, uint64_t us);
 
 /* ---------------- TX batch ---------------- */
 typedef struct {
@@ -121,10 +122,13 @@ typedef struct {
     struct tun_pool *pool;
     pace_bucket pace;   /* aggregate send pacing (util.h); serialized by
                          * send_lock — the bucket is not thread-safe */
-    bool session_lost;  /* set by udp2tun_thread when the tunnel is
-                         * considered dead (keepalive failures / no
-                         * downlink); distinguishes failure from the
-                         * user's Ctrl-C so run_pump can report it */
+    /* M3-1: written by udp2tun_thread and read by run_pump's tick loop
+     * while the thread is alive — must be atomic (plain bool was a
+     * C11 data race; M14 only initialized it) */
+    _Atomic bool session_lost; /* set by udp2tun_thread when the tunnel
+                          * is considered dead (keepalive failures / no
+                          * downlink); distinguishes failure from the
+                          * user's Ctrl-C so run_pump can report it */
     pump_prof_t prof[PUMP_PROF_N];   /* [prof] stage timers (whole-run) */
 } pump_ctx_t;
 

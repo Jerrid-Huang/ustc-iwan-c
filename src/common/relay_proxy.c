@@ -189,22 +189,24 @@ static bool rp_fail_key_of(const struct sockaddr_storage *ss,
 
 static void rp_fail_note(const rp_fail_key *key, bool success)
 {
-    uint8_t b[LOCKOUT_KEY_MAX];
-    size_t n = rp_fail_key_bytes(key, b);
-
+    /* M3-2: NULL guard first — rp_fail_key_bytes dereferences key (the
+     * old code called it before this check, making the guard dead code
+     * and the getpeername-failed path a latent crash) */
     if (!key)
         return;             /* getpeername failed: nothing to track */
+    uint8_t b[LOCKOUT_KEY_MAX];
+    size_t n = rp_fail_key_bytes(key, b);
     lockout_note(g_rp_fail, RP_FAIL_TRACK_MAX, b, n, success,
                  RP_FAIL_MAX, RP_FAIL_WINDOW_MS, &g_rp_fail_mu);
 }
 
 static bool rp_fail_blocked(const rp_fail_key *key)
 {
-    uint8_t b[LOCKOUT_KEY_MAX];
-    size_t n = rp_fail_key_bytes(key, b);
-
+    /* M3-2: same guard-first fix as rp_fail_note */
     if (!key)
         return false;
+    uint8_t b[LOCKOUT_KEY_MAX];
+    size_t n = rp_fail_key_bytes(key, b);
     return lockout_blocked(g_rp_fail, RP_FAIL_TRACK_MAX, b, n,
                            &g_rp_fail_mu);
 }
@@ -920,7 +922,11 @@ static void *rp_dir_main(void *ud)
             snap = ns;
             snapcap = n;
         }
-        memcpy(snap, *arrp, n * sizeof *snap);
+        /* M3-4: with no connections both snap and *arrp are NULL, and
+         * memcpy(NULL, NULL, 0) is UB — it fires on every empty
+         * snapshot under halting UBSan (relay aborting at startup) */
+        if (n)
+            memcpy(snap, *arrp, n * sizeof *snap);
         /* hold one reference per snapshot entry while this iteration
          * dereferences them outside g_rp_mu; dropped at the loop
          * bottom (or on the early exits below). Under the same

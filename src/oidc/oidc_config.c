@@ -347,8 +347,12 @@ void oidc_save_config(const char *path, const Config *cf)
      * (the second --fetch would die forever); MoveFileExA with
      * REPLACE_EXISTING keeps the atomic-replace semantics */
     if (!MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING)) {
+        /* M3-7: MoveFileExA reports failure via GetLastError (ERROR_*),
+         * not errno — strerror(errno) was stale/misleading */
+        DWORD gle = GetLastError();
         _unlink(tmp);
-        oidc_die("cannot write config to %s: %s", path, strerror(errno));
+        oidc_die("cannot write config to %s: Windows error %lu (0x%lx)",
+                 path, (unsigned long)gle, (unsigned long)gle);
     }
 #else
     if (rename(tmp, path) != 0) {

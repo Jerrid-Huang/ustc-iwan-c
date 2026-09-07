@@ -1227,6 +1227,13 @@ static int https_resp_parse(struct sbuf *resp, int *status, char **body_out)
     int chunked = 0;
     char *out, *te;
 
+    /* M3-3: the caller seeds *body_out with empty_str() before the
+     * redirect loop; every return path below overwrites it, so free the
+     * seed once here — otherwise 1 heap byte leaked per HTTPS request.
+     * parse runs at most once per round-trip (on the final response). */
+    free(*body_out);
+    *body_out = NULL;
+
     *status = https_resp_status(resp->d, resp->len);
     if (*status < 0) {
         free(resp->d);

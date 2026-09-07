@@ -699,7 +699,8 @@ struct recv_thr_arg {
     int nusers;
     int fd;
     unsigned tid;
-    int poll_err;   /* primary: fatal poll failure */
+    _Atomic int *poll_err;   /* M3-6: shared fatal-poll flag (all
+                              * threads OR into it; main aggregates) */
 };
 
 static void *recv_thread_main(void *v)
@@ -725,7 +726,7 @@ static void *recv_thread_main(void *v)
             if (errno == EINTR)
                 continue;
             perror("poll");
-            a->poll_err = 1;   /* fatal: exit non-zero for service mgrs */
+            atomic_store_explicit(a->poll_err, 1, memory_order_relaxed);
             /* M8 (SUMMARY-2): a thread exiting without the stop flag
              * would leave main deadlocked in pthread_join (whose comment
              * promises "exit within one poll timeout") — set it so the
@@ -873,7 +874,8 @@ int main(int argc, char **argv)
     char subnet_net[64];
     int udp_fds[IWAN_SRV_THREADS_MAX];
     int nusers, tun_fd = -1, nfds;
-    int poll_err = 0;   /* fatal poll failure: report exit != 0 */
+    _Atomic int poll_err = 0;   /* M3-6: fatal poll flag aggregated from
+                                 * all recv threads (exit != 0 for mgrs) */
     bool drop_child = false; /* A1: this process is the forked, de-privileged server */
 
     util_ignore_sigpipe();     /* EPIPE on a dead socket, not a SIGPIPE kill */
@@ -1142,7 +1144,8 @@ int main(int argc, char **argv)
          * udp_fds[1] had no consumer at all (~25% of packets lost). */
         args[i + 1] = (struct recv_thr_arg){ &ctx, users, nusers,
                                              udp_fds[i + 1],
-                                             (unsigned)(i + 1), 0 };
+                                             (unsigned)(i + 1),
+                                             &poll_err };
         if (pthread_create(&workers[i], NULL, recv_thread_main,
                            &args[i + 1]) != 0) {
             log_err("cannot start uplink recv thread %d: %s", i + 1,
@@ -1152,9 +1155,9 @@ int main(int argc, char **argv)
         }
         ncreated++;
     }
-    args[0] = (struct recv_thr_arg){ &ctx, users, nusers, udp_fds[0], 0, 0 };
+    args[0] = (struct recv_thr_arg){ &ctx, users, nusers, udp_fds[0], 0,
+                                     &poll_err };
     recv_thread_main(&args[0]);   /* primary loop, inline */
-    poll_err = args[0].poll_err;
 
     /* join ONLY the threads that were created: pthread_create failure
      * leaves the remaining workers[] entries uninitialized, and joining
@@ -1162,6 +1165,10 @@ int main(int argc, char **argv)
     for (int i = 0; i < ncreated; i++)
         pthread_join(workers[i], NULL);   /* exit within one poll timeout */
 
+    /* M3-6: aggregate AFTER the join so a worker's fatal poll failure
+     * in its final window is not lost (previously only the primary's
+     * flag was surfaced and a secondary fatal still exited 0) */
+    int shutdown_poll_err = atomic_load(&poll_err);
     return server_shutdown(&ctx, tun_fd, udp_fds, nfds, drop_child,
-                           poll_err);
+                           shutdown_poll_err);
 }

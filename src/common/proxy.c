@@ -45,7 +45,7 @@ atomic_uint_fast64_t g_prof_recv_empty;     /* EAGAIN (no data) iterations */
 atomic_uint_fast64_t g_prof_recv_badtok;    /* datagrams with bad sid/token */
 atomic_uint_fast64_t g_prof_tun_rbig;       /* wintun packets > 1508B */
 atomic_uint_fast64_t g_prof_tun_rdrop;      /* wintun packets > PUMP_SLOT */
-uint32_t g_prof_tun_rmax;                   /* max wintun packet len (B) */
+_Atomic uint32_t g_prof_tun_rmax;       /* max wintun packet len (B) */
 
 /* C4: profiler collection gate — parsed once (first call), read on the
  * per-packet hot path via pump_prof_on(). IWAN_DEBUG_STRIP builds never
@@ -85,12 +85,15 @@ static void pump_prof_print(const pump_ctx_t *ctx)
     if (!getenv("IWAN_PUMP_PROF"))
         return;
     for (int i = 0; i < PUMP_PROF_N; i++) {
-        if (ctx->prof[i].n == 0)
+        uint64_t n = atomic_load_explicit(&ctx->prof[i].n,
+                                          memory_order_relaxed);
+        uint64_t us = atomic_load_explicit(&ctx->prof[i].us,
+                                           memory_order_relaxed);
+        if (n == 0)
             continue;
         fprintf(stderr, "[pump-prof] %-10s n=%-10llu avg_us=%.3f total_ms=%.1f\n",
-                names[i], (unsigned long long)ctx->prof[i].n,
-                (double)ctx->prof[i].us / (double)ctx->prof[i].n,
-                (double)ctx->prof[i].us / 1000.0);
+                names[i], (unsigned long long)n,
+                (double)us / (double)n, (double)us / 1000.0);
     }
     fprintf(stderr,
             "[pump-prof] send-ctr  dgrams=%-8llu syscalls=%-8llu "
@@ -106,7 +109,7 @@ static void pump_prof_print(const pump_ctx_t *ctx)
             (unsigned long long)atomic_load(&g_prof_recv_badtok));
     fprintf(stderr,
             "[pump-prof] tun-rx    rmax=%-5u rbig=%-8llu rdrop=%-8llu\n",
-            g_prof_tun_rmax,
+            (unsigned)atomic_load(&g_prof_tun_rmax),
             (unsigned long long)atomic_load(&g_prof_tun_rbig),
             (unsigned long long)atomic_load(&g_prof_tun_rdrop));
 #ifdef _WIN32
@@ -661,26 +664,34 @@ static void *udp2tun_thread(void *ud) {
         pump_prof_add(&ctx->prof[PP_RECV], now_us() - t_recv);
         if (v > 0 && pump_prof_on())
             atomic_fetch_add(&g_prof_recv_dgrams, (uint64_t)v);
-        if (v < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                atomic_fetch_add(&g_prof_recv_empty, 1);
-                uint64_t ka_ms = last_ka + PUMP_KEEPALIVE_MS;
-                uint64_t now_msv = now_ms();
-                int to = ka_ms > now_msv ? (int)(ka_ms - now_msv) : 1;
-                if (to > PUMP_POLL_CEIL_MS)
-                    to = PUMP_POLL_CEIL_MS;
-                struct pollfd pfd = { .fd = ctx->sockfd, .events = POLLIN };
-                uint64_t pw0 = now_us();
-                int pr = port_poll(&pfd, 1, to);
-                pump_prof_add(&ctx->prof[PP_POLLWAIT], now_us() - pw0);
-                if (pr < 0 && errno != EINTR) {
-                    err_printf("[UDP->TUN] poll err\n");
-                    ctx->session_lost = true;   /* abnormal: reconnect */
-                    g_stop = 1;   /* any pump-fatal error stops the tunnel */
-                    break;
-                }
-                continue;
+        if (v == 0 || (v < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))) {
+            /* M3-8: a zero-datagram batch — the macOS/Windows recvmmsg
+             * emulations return 0 for an empty queue (and for a spurious
+             * EINTR/ECONNRESET on an empty queue) — is parked exactly
+             * like EAGAIN. Previously v==0 fell through to
+             * `last_rx = now_ms()`, which (a) reset the 60s stale-
+             * downlink watchdog on every spurious wake and (b) with a
+             * repeating ICMP ECONNRESET did not park, busy-looping the
+             * core (the same shape M12 fixed for EAGAIN). */
+            atomic_fetch_add(&g_prof_recv_empty, 1);
+            uint64_t ka_ms = last_ka + PUMP_KEEPALIVE_MS;
+            uint64_t now_msv = now_ms();
+            int to = ka_ms > now_msv ? (int)(ka_ms - now_msv) : 1;
+            if (to > PUMP_POLL_CEIL_MS)
+                to = PUMP_POLL_CEIL_MS;
+            struct pollfd pfd = { .fd = ctx->sockfd, .events = POLLIN };
+            uint64_t pw0 = now_us();
+            int pr = port_poll(&pfd, 1, to);
+            pump_prof_add(&ctx->prof[PP_POLLWAIT], now_us() - pw0);
+            if (pr < 0 && errno != EINTR) {
+                err_printf("[UDP->TUN] poll err\n");
+                ctx->session_lost = true;   /* abnormal: reconnect */
+                g_stop = 1;   /* any pump-fatal error stops the tunnel */
+                break;
             }
+            continue;
+        }
+        if (v < 0) {
             if (errno == EINTR || errno == ECONNREFUSED)
                 continue;   /* EINTR: signal; ECONNREFUSED: one-shot
                              * connected-UDP ICMP artifact (Linux side;
@@ -1085,6 +1096,21 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
                       tun_ifname(tun_name));
     }
 
+    /* M3-9: the stop handler is installed process-wide for life, so on
+     * a reconnecting session a Ctrl-C pressed during the blocking setup
+     * above has already set g_user_stop. Do NOT clear it with
+     * `g_stop = 0` below, and do not start the pump: tear the route
+     * side down and return so the user's explicit stop is honored on
+     * the healthy link instead of being swallowed. (The loop condition
+     * also watches g_user_stop, so even a stop that lands in the tiny
+     * window between this check and the loop start is honored.) */
+    if (g_user_stop) {
+        log_info("TUN proxy: stop requested during setup; aborting");
+        route_iface_down(tun_name);
+        slist_free(&routes);
+        slist_free(&routes6);
+        return -1;
+    }
     g_stop = 0;
     install_signals();
 
@@ -1174,7 +1200,7 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
     /* [prof] printouts exist only under IWAN_PUMP_PROF=1; a default run
      * is fully silent (counters still accumulate -- a few atomics). */
     uint64_t prof_last = now_ms();
-    while (!g_stop) {
+    while (!g_stop && !g_user_stop) {
         port_sleep_us(100 * 1000);
         uint64_t nm = now_ms();
         if (pump_prof_wanted() && nm - prof_last >= 1000) {

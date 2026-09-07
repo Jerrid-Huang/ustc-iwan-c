@@ -81,7 +81,15 @@ int udp_gso_prepare(int fd, size_t mss, int *ok, size_t *gso_mss,
             *pending_mss = mss;
             *streak = 1;
         }
-        if (*gso_mss != 0 && *streak >= IWAN_GSO_HYST) {
+        /* M3-5: a gso_mss == 0 armed state (ok still 1) is a dead state —
+         * udp_gso_clear (called on any fallback batch) and send_ctrl's
+         * failed re-arm both zero gso_mss without touching ok, and the
+         * `*gso_mss != 0` guard below would then never re-arm, so GSO
+         * stayed disabled for the whole session and the M11 *ok==0
+         * re-probe was unreachable. When gso_mss is 0 there is no armed
+         * value to be conservative about: re-arm immediately. A genuine
+         * setsockopt failure lands in the *ok==0 M11 path. */
+        if ((*gso_mss == 0 || *streak >= IWAN_GSO_HYST)) {
             int m = (int)mss;
             if (port_setsockopt(fd, SOL_UDP, UDP_SEGMENT, &m, sizeof m) != 0) {
                 *ok = 0;
