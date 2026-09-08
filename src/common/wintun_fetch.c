@@ -85,6 +85,10 @@ static char *ps_capture(const char *ps_expr){
         _pclose(p);
         return NULL;
     }
+    buf[0] = '\0';   /* FIND-W-2: a child with no stdout leaves the malloc'd
+                      * buffer untouched — ensure NUL so consumers (strstr
+                      * over it) read an empty string, not uninitialized
+                      * (possibly over-read) heap */
     char line[512];
     while (fgets(line, sizeof line, p)) {
         size_t ll = strlen(line);
@@ -216,9 +220,12 @@ int wintun_ensure(void)
     char zipq[PS_CMD_MAX], tmpq[PS_CMD_MAX];
     ps_squote(zipq, sizeof zipq, zip);
     ps_squote(tmpq, sizeof tmpq, tmpdir);
+    /* FIND-W-1: the two %s slots were reversed — the URL wants the
+     * VERSION (wintun-%s.zip), -OutFile wants the local zip path. As
+     * written, every download produced a 404 URL + a file named "0.14.1" */
     snprintf(cmd, sizeof cmd,
              "(Invoke-WebRequest -UseBasicParsing '" WINTUN_ZIP_FMT "')"
-             " -OutFile '%s'", zipq, ver);
+             " -OutFile '%s'", ver, zipq);
     log_info("downloading wintun-%s.zip ...", ver);
     ps_capture(cmd);
 
