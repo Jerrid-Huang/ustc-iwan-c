@@ -90,12 +90,14 @@ static void rp_hs_init(struct rp_hs *hs)
     hs->in = 0;
 }
 
-/* Wait for readability within the handshake: the poll timeout is the
- * remaining absolute budget capped at RP_HANDSHAKE_TIMEOUT_MS (the
- * per-poll ceiling still applies — the total budget is independent).
- * Returns 1 when the fd is readable, 0 on timeout or exhausted
- * budget (the caller must close). */
-static int rp_hs_poll(const struct rp_hs *hs, int fd)
+/* Poll within the handshake budget for the requested events: the poll
+ * timeout is the remaining absolute budget capped at
+ * RP_HANDSHAKE_TIMEOUT_MS (the per-poll ceiling still applies — the
+ * total budget is independent). EINTR is not a timeout: a signal-
+ * interrupted poll is retried while budget remains (M1). Returns 1
+ * when the desired event fired, 0 on timeout, budget exhaustion or a
+ * hard poll error (the caller must close). */
+static int rp_hs_poll_ev(const struct rp_hs *hs, int fd, short events)
 {
     uint64_t now = now_ms();
     uint64_t left = hs->deadline > now ? hs->deadline - now : 0;
@@ -106,9 +108,75 @@ static int rp_hs_poll(const struct rp_hs *hs, int fd)
     if (left > RP_HANDSHAKE_TIMEOUT_MS)
         left = RP_HANDSHAKE_TIMEOUT_MS;
     pfd.fd = fd;
-    pfd.events = POLLIN;
+    pfd.events = events;
     pfd.revents = 0;
-    return port_poll(&pfd, 1, (int)left) > 0 ? 1 : 0;
+    for (;;) {
+        int r = port_poll(&pfd, 1, (int)left);
+        if (r >= 0 || errno != EINTR)
+            return r > 0 ? 1 : 0;
+        /* signal-interrupted poll: retry within the remaining budget */
+        now = now_ms();
+        left = hs->deadline > now ? hs->deadline - now : 0;
+        if (left == 0)
+            return 0;
+        if (left > RP_HANDSHAKE_TIMEOUT_MS)
+            left = RP_HANDSHAKE_TIMEOUT_MS;
+    }
+}
+
+/* Wait for readability within the handshake (POLLIN, see
+ * rp_hs_poll_ev). */
+static int rp_hs_poll(const struct rp_hs *hs, int fd)
+{
+    return rp_hs_poll_ev(hs, fd, POLLIN);
+}
+
+/* Poll one fd for readiness within `timeout_ms`, retrying through
+ * EINTR while budget remains (M1: connect waits must not treat a
+ * signal-interrupted poll as a failed/skipped candidate). Returns the
+ * poll result >= 0, or -1 on a hard error (caller checks > 0 for
+ * ready). */
+static int rp_poll_retry(struct pollfd *pfd, int timeout_ms)
+{
+    uint64_t deadline = now_ms() + (uint64_t)timeout_ms;
+    for (;;) {
+        uint64_t now = now_ms();
+        int left = deadline > now ? (int)(deadline - now) : 0;
+        if (left <= 0)
+            return 0;
+        int r = port_poll(pfd, 1, left);
+        if (r >= 0 || errno != EINTR)
+            return r;
+    }
+}
+
+/* Write exactly `len` bytes on a possibly-nonblocking fd, drawing from
+ * the handshake budget like rp_hs_poll: a short write (EAGAIN on a
+ * Windows accept()-inherited nonblocking socket, or an OS-level short
+ * write) is completed by polling POLLOUT and writing again; EINTR is
+ * retried. Returns 0 when all bytes were written, -1 on timeout,
+ * budget exhaustion or a hard error. Linux blocking sockets satisfy
+ * this in a single write, so the loop is a no-op there. */
+static int rp_send_full(const struct rp_hs *hs, int fd, const void *buf,
+                        size_t len)
+{
+    const uint8_t *p = (const uint8_t *)buf;
+    size_t done = 0;
+    while (done < len) {
+        ssize_t w = port_send(fd, p + done, len - done, 0);
+        if (w > 0) {
+            done += (size_t)w;
+            continue;
+        }
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK ||
+                      errno == EINTR)) {
+            if (rp_hs_poll_ev(hs, fd, POLLOUT) <= 0)
+                return -1;
+            continue;
+        }
+        return -1;              /* hard error */
+    }
+    return 0;
 }
 
 /* recv with the handshake input cap: behaves like port_recv, but a
@@ -252,8 +320,10 @@ static int rp_connect_literal(int af, const void *addr, uint16_t port,
     if (port_connect(fd, (struct sockaddr *)&ss, salen) == 0) {
         /* immediate success */
     } else if (errno == EINPROGRESS) {
+        /* rp_poll_retry: EINTR keeps waiting within the timeout instead
+         * of aborting the connect (M1) */
         struct pollfd pfd = { .fd = fd, .events = POLLOUT };
-        if (port_poll(&pfd, 1, RP_CONNECT_TIMEOUT_MS) <= 0) {
+        if (rp_poll_retry(&pfd, RP_CONNECT_TIMEOUT_MS) <= 0) {
             port_close(fd);
             return -1;
         }
@@ -268,7 +338,13 @@ static int rp_connect_literal(int af, const void *addr, uint16_t port,
         port_close(fd);
         return -1;
     }
-    port_set_nonblock(fd, false);   /* relay threads want blocking */
+    /* restore blocking for the relay threads; if the mode cannot be
+     * restored, treat it as a connect failure — a stray nonblocking fd
+     * would alias EAGAIN as a hard relay error (C-F4) */
+    if (port_set_nonblock(fd, false) != 0) {
+        port_close(fd);
+        return -1;
+    }
     *fd_out = fd;
     return 0;
 }
@@ -280,16 +356,22 @@ static int rp_connect_literal(int af, const void *addr, uint16_t port,
 static bool g_rp_ssrf_off;
 
 /* M7 (SSRF gate): true when the target address (literal or resolved)
- * points at the proxy host's own loopback or a link-local range. An
- * authenticated NON-loopback peer must not use the relay as a
- * springboard into services bound to the local host; a loopback peer
- * (local user) is exempt, keeping today's local usage unchanged. */
+ * points at the proxy host's own loopback, 0.0.0.0, or a link-local
+ * range. An authenticated NON-loopback peer must not use the relay as
+ * a springboard into services bound to the local host; a loopback peer
+ * (local user) is exempt, keeping today's local usage unchanged.
+ *
+ * 0.0.0.0 is blocked too (H1): on Linux connect(0.0.0.0) resolves to
+ * loopback, so it is an alternate spelling of 127.0.0.1 that would
+ * otherwise slip around the gate; a proxy must not be asked to reach
+ * an unspecified address anyway. */
 static bool rp_target_blocked(bool guard, int af, const uint8_t *p)
 {
     if (!guard)
         return false;
     if (af == 4)
-        return p[0] == 127 ||              /* 127.0.0.0/8 */
+        return p[0] == 0 ||                /* 0.0.0.0/8 (connect->loopback) */
+               p[0] == 127 ||              /* 127.0.0.0/8 */
                (p[0] == 169 && p[1] == 254);   /* 169.254.0.0/16 */
     if (af == 6) {
         static const uint8_t lo[16] = { 0, 0, 0, 0, 0, 0, 0, 0,
@@ -301,9 +383,11 @@ static bool rp_target_blocked(bool guard, int af, const uint8_t *p)
         if (p[0] == 0xfe && (p[1] & 0xc0) == 0x80)
             return true;                    /* fe80::/10 */
         /* ::ffff:a.b.c.d: the mapped v4 address obeys the v4 rules,
-         * else a crafted AAAA ::ffff:127.0.0.1 would bypass the gate */
+         * else a crafted AAAA ::ffff:127.0.0.1 / ::ffff:0.0.0.0 would
+         * bypass the gate */
         if (memcmp(p, v4map, 12) == 0)
-            return p[12] == 127 ||
+            return p[12] == 0 ||
+                   p[12] == 127 ||
                    (p[12] == 169 && p[13] == 254);
     }
     return false;
@@ -363,12 +447,17 @@ static int rp_connect_target(int *fd_out, const char *host, uint16_t port,
         fd = port_socket(ai->ai_family, SOCK_STREAM, 0);
         if (fd < 0)
             continue;
-        port_set_nonblock(fd, true);
+        if (port_set_nonblock(fd, true) != 0) {
+            port_close(fd);
+            continue;
+        }
         if (port_connect(fd, ai->ai_addr, ai->ai_addrlen) == 0)
             last = fd;
         else if (errno == EINPROGRESS) {
+            /* rp_poll_retry: EINTR keeps this candidate waiting within
+             * the timeout instead of skipping it (M1) */
             struct pollfd pfd = { .fd = fd, .events = POLLOUT };
-            if (port_poll(&pfd, 1, RP_CONNECT_TIMEOUT_MS) > 0) {
+            if (rp_poll_retry(&pfd, RP_CONNECT_TIMEOUT_MS) > 0) {
                 int soerr = 0;
                 socklen_t sl = sizeof soerr;
                 if (port_getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr,
@@ -376,23 +465,33 @@ static int rp_connect_target(int *fd_out, const char *host, uint16_t port,
                     last = fd;
             }
         }
-        if (last >= 0)
+        if (last >= 0) {
+            /* restore blocking for the relay threads; a failed restore
+             * rejects this candidate (a nonblocking fd would alias
+             * EAGAIN as a hard relay error) rather than handing it on
+             * (C-F4) */
+            if (port_set_nonblock(fd, false) != 0) {
+                port_close(fd);
+                last = -1;
+                continue;       /* try the next candidate */
+            }
             break;
+        }
         port_close(fd);
     }
     freeaddrinfo(res);
     if (last < 0)
         return blocked ? -2 : -1;
-    port_set_nonblock(last, false);   /* relay threads want blocking */
     *fd_out = last;
     return 0;
 }
 
 /* ---- SOCKS5 ---- */
 
-/* read exactly `want` bytes, waiting through EAGAIN. Windows accept()
- * inherits the listener's nonblocking mode (unlike Linux), so the
- * handshake reads must poll instead of treating EAGAIN as fatal.
+/* read exactly `want` bytes, waiting through EAGAIN/EINTR. Windows
+ * accept() inherits the listener's nonblocking mode (unlike Linux), so
+ * the handshake reads must poll instead of treating EAGAIN as fatal;
+ * EINTR is retried too (M1), exactly like the handshake poll loops.
  * Polls draw from the handshake budget (M6b) and reads count toward
  * the handshake input cap. */
 static bool rp_read_full(int fd, uint8_t *buf, size_t want,
@@ -405,7 +504,8 @@ static bool rp_read_full(int fd, uint8_t *buf, size_t want,
             got += (size_t)r;
             continue;
         }
-        if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK ||
+                      errno == EINTR)) {
             if (rp_hs_poll(hs, fd) <= 0)
                 return false;
             continue;
@@ -415,10 +515,12 @@ static bool rp_read_full(int fd, uint8_t *buf, size_t want,
     return true;
 }
 
-static void rp_socks_reply(int fd, uint8_t rep)
+static void rp_socks_reply(int fd, uint8_t rep, const struct rp_hs *hs)
 {
     uint8_t r[10] = {5, rep, 0, 1, 0, 0, 0, 0, 0, 0};
-    if (port_send(fd, r, sizeof r, 0) != (ssize_t)sizeof r)
+    /* M3: rp_send_full completes short writes (Windows nonblocking
+     * handshake replies) and verifies the full 10 bytes went out */
+    if (rp_send_full(hs, fd, r, sizeof r) != 0)
         err_printf("rp_socks_reply send failed rep=%u errno=%d\n", rep,
                    errno);
 }
@@ -445,8 +547,8 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
     pp_target t;
     uint8_t method = 0, cmd = 0, rep = 0;
 
-    if (n < 2)
-        return -1;
+    if (n == 0)
+        return -1;              /* nothing at all is still fatal */
     /* pre-auth bound: `first` holds up to a full 4096B read but every
      * parser below works out of b[2048] (later reads all guard
      * n >= sizeof b). An oversized first packet is not a valid SOCKS5
@@ -454,6 +556,15 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
     if (n > sizeof b)
         return -1;
     memcpy(b, first, n);
+    /* M2: a TCP-fragmented greeting whose first read returned only the
+     * single 0x05 byte (n == 1) must not be hard-closed. b[1] is not
+     * initialized yet, so first top up to the fixed 2-byte greeting
+     * head ([ver, nmethods]) before computing the method-list length. */
+    if (n == 1) {
+        if (!rp_read_full(fd, b + n, 1, hs))
+            return -1;
+        n = 2;
+    }
     if (pp_socks_greeting(b, n, token != NULL, &method) != 0) {
         /* greeting may span reads: [5, nmethods, methods...] */
         size_t want = 2 + (size_t)b[1];
@@ -466,7 +577,7 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
     method = pp_socks_pick_method(token != NULL, method);
     if (method == 0xff) {
         uint8_t no[2] = {5, 0xff};
-        (void)port_send(fd, no, 2, 0);
+        (void)rp_send_full(hs, fd, no, sizeof no);
         return -1;
     }
     /* consume the greeting so a pipelined CONNECT frame is aligned */
@@ -477,7 +588,7 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
     }
     if (token || method == 2) {
         uint8_t ok[2] = {5, 2};
-        (void)port_send(fd, ok, 2, 0);
+        (void)rp_send_full(hs, fd, ok, sizeof ok);
         /* RFC1929: [1, ulen, user..., plen, pass...]. Token-less mode
          * accepts any well-formed frame (courtesy — a client that
          * offered only 0x02, e.g. curl -U, must not be rejected). */
@@ -494,7 +605,7 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
                 uint8_t rr[2] = {1, ok ? 0 : 1};
                 if (!ok)
                     rp_fail_note(fk, false);
-                (void)port_send(fd, rr, 2, 0);
+                (void)rp_send_full(hs, fd, rr, sizeof rr);
                 if (!ok)
                     return -1;
                 if (token)
@@ -517,7 +628,8 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
                     n += (size_t)r;
                     continue;
                 }
-                if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK ||
+                              errno == EINTR)) {
                     if (rp_hs_poll(hs, fd) <= 0)
                         return -1;
                     continue;
@@ -527,7 +639,7 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
         }
     } else {
         uint8_t ok[2] = {5, 0};
-        (void)port_send(fd, ok, 2, 0);
+        (void)rp_send_full(hs, fd, ok, sizeof ok);
     }
 
     /* CONNECT request [5, CMD, RSV, ATYP, addr..., port] */
@@ -547,7 +659,8 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
                 n += (size_t)r;
                 continue;
             }
-            if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK ||
+                          errno == EINTR)) {
                 if (rp_hs_poll(hs, fd) <= 0)
                     return -1;
                 continue;
@@ -556,7 +669,7 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
         }
     }
     if (rep != 0) {
-        rp_socks_reply(fd, rep);
+        rp_socks_reply(fd, rep, hs);
         return -1;
     }
     /* R4-08-F1: bytes that arrived past the CONNECT frame were already
@@ -579,7 +692,7 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
                                    (const uint8_t *)&t.ip4, t.af == 6,
                                    t.ip6, guard);
         if (rc == 0) {
-            rp_socks_reply(fd, 0);
+            rp_socks_reply(fd, 0, hs);
             if (n > frame_end &&
                 port_send(up, b + frame_end, n - frame_end, 0) !=
                     (ssize_t)(n - frame_end)) {
@@ -593,7 +706,7 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
         }
         /* M7: a gate refusal is "not allowed" (rep 2), everything
          * else stays a general failure */
-        rp_socks_reply(fd, rc == -2 ? 2 : 5);
+        rp_socks_reply(fd, rc == -2 ? 2 : 5, hs);
         return -1;
     }
 }
@@ -614,9 +727,14 @@ static int rp_handle_http(int fd, const uint8_t *first, size_t first_n,
      * reads a full frame. (The scan guard `i = 4` below simply does
      * nothing until n >= 4.) */
     memcpy(buf, first, first_n);
-    /* read until \r\n\r\n */
+    /* read until \r\n\r\n. L1: the scan must also run on the final
+     * chunk — `n < sizeof buf - 1` skipped the batch that brought n to
+     * 8191, so a legal ~8191-byte header whose terminator arrived in
+     * that batch was misjudged as incomplete. With `n < sizeof buf`
+     * the last (8191-byte) batch is scanned too; a terminator found
+     * there breaks out before any further read. */
     hdr_end = (size_t)-1;
-    while (n < sizeof buf - 1) {
+    while (n < sizeof buf) {
         for (size_t i = 4; i <= n; i++) {
             if (buf[i - 4] == '\r' && buf[i - 3] == '\n' &&
                 buf[i - 2] == '\r' && buf[i - 1] == '\n') {
@@ -631,7 +749,8 @@ static int rp_handle_http(int fd, const uint8_t *first, size_t first_n,
             n += (size_t)r;
             continue;
         }
-        if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK ||
+                      errno == EINTR)) {
             if (rp_hs_poll(hs, fd) <= 0)
                 return -1;
             continue;
@@ -679,13 +798,17 @@ static int rp_handle_http(int fd, const uint8_t *first, size_t first_n,
                           (const uint8_t *)&t.ip4, t.af == 6,
                           t.ip6, guard) != 0) {
         static const char bad[] = "HTTP/1.1 502 Bad Gateway\r\n\r\n";
-        (void)port_send(fd, bad, sizeof bad - 1, 0);
+        (void)rp_send_full(hs, fd, bad, sizeof bad - 1);
         return -1;
     }
     if (is_connect) {
         static const char ok[] =
             "HTTP/1.1 200 Connection Established\r\n\r\n";
-        if (port_send(fd, ok, sizeof ok - 1, 0) < 0) {
+        /* M3: rp_send_full verifies the ENTIRE reply went out — the old
+         * `< 0` check only caught hard errors, so a partial (EAGAIN
+         * short-write on Windows nonblocking) 200 left the client
+         * waiting for a CONNECT response */
+        if (rp_send_full(hs, fd, ok, sizeof ok - 1) != 0) {
             port_close(up);
             return -1;
         }
@@ -968,7 +1091,7 @@ static void *rp_dir_main(void *ud)
             struct rp_conn **ns = realloc(snap, n * sizeof *ns);
             if (!ns) {
                 pthread_mutex_unlock(&g_rp_mu);
-                return NULL;
+                goto cleanup;   /* L3: free pf/slot buffers too */
             }
             snap = ns;
             snapcap = n;
@@ -985,6 +1108,15 @@ static void *rp_dir_main(void *ud)
          * is ref-protected before the lock is released. */
         for (size_t i = 0; i < n; i++)
             atomic_fetch_add(&snap[i]->in_use, 1);
+        /* M6: record the array generation inside the same critical
+         * section as the snapshot. Read after the unlock it could pair
+         * a fresh generation with a stale snapshot, making the gen check
+         * below believe the pollset is current and skip a rebuild round
+         * (a new index would then read realloc residue / uninitialized
+         * values). Same lock, same instant, so built_gen always matches
+         * the snapshot it was taken from. */
+        unsigned long long cur_gen =
+            atomic_load_explicit(&g_rp_arr_gen, memory_order_relaxed);
         pthread_mutex_unlock(&g_rp_mu);
 
         if (n * 2 > pfcap) {
@@ -993,7 +1125,7 @@ static void *rp_dir_main(void *ud)
                 pthread_mutex_lock(&g_rp_mu);
                 rp_snap_unref_all(snap, n);
                 pthread_mutex_unlock(&g_rp_mu);
-                return NULL;
+                goto cleanup;   /* L3: free pf/slot buffers too */
             }
             pf = n2;
             pfcap = n * 2;
@@ -1004,7 +1136,7 @@ static void *rp_dir_main(void *ud)
                 pthread_mutex_lock(&g_rp_mu);
                 rp_snap_unref_all(snap, n);
                 pthread_mutex_unlock(&g_rp_mu);
-                return NULL;
+                goto cleanup;   /* L3: free pf/slot buffers too */
             }
             slot_from = ns;
             ns = realloc(slot_to, n * sizeof *ns);
@@ -1012,7 +1144,7 @@ static void *rp_dir_main(void *ud)
                 pthread_mutex_lock(&g_rp_mu);
                 rp_snap_unref_all(snap, n);
                 pthread_mutex_unlock(&g_rp_mu);
-                return NULL;
+                goto cleanup;   /* L3: free pf/slot buffers too */
             }
             slot_to = ns;
             slotcap = n;
@@ -1022,9 +1154,8 @@ static void *rp_dir_main(void *ud)
          * state changed (from_eof, pend crossing the cap, add/retire).
          * slot_from[i]/slot_to[i] map entry i to its pollfd index, so
          * the per-entry event lookup is O(1) instead of an O(n*k)
-         * fd scan on every loop iteration. */
-        unsigned long long cur_gen =
-            atomic_load_explicit(&g_rp_arr_gen, memory_order_relaxed);
+         * fd scan on every loop iteration. (cur_gen itself was read in
+         * the snapshot's critical section above — see M6.) */
         /* M7: rebuild also when a connection array changed since this
          * pollset was built (a same-round add+retire keeps the count
          * unchanged, so a count-only check misses it); this also
@@ -1225,8 +1356,13 @@ static void *rp_dir_main(void *ud)
                 }
             }
         }
-        if (n != pf_n)
-            pf_dirty = true;   /* array changed: pollset is stale */
+        /* M4: no count comparison here — n is the snapshot entry count
+         * and pf_n is the built pollfd count (up to 2 slots per entry),
+         * so any entry with pend (dual registration) makes n != pf_n
+         * permanently true and would force a full rebuild every loop
+         * under congestion, defeating the cache. Correctness is already
+         * covered by the per-entry compare above and the generation
+         * check (cur_gen vs built_gen) for array add/retire changes. */
         pthread_mutex_lock(&g_rp_mu);
         for (size_t i = 0; i < n; i++) {
             struct rp_conn *cn = snap[i];
@@ -1251,6 +1387,9 @@ static void *rp_dir_main(void *ud)
         rp_snap_unref_all(snap, n);
         pthread_mutex_unlock(&g_rp_mu);
     }
+cleanup:
+    /* L3: every exit path lands here so the local buffers are always
+     * released (realloc-failure early exits used to leak them) */
     free(pf);
     free(snap);
     free(slot_from);
@@ -1477,6 +1616,7 @@ int relay_proxy_start(const char *listen_str, const char *auth_token,
     /* start the two global direction threads up front */
     atomic_store(&g_rp_stop, 0);
     pthread_t tu, td;
+    bool tu_created = false;
     {
         /* L11/C-6 (bughunt): create both threads before publishing
          * g_rp_current; if the second create fails the first is already
@@ -1484,14 +1624,21 @@ int relay_proxy_start(const char *listen_str, const char *auth_token,
          * Create both, then publish; on failure stop, detach the
          * survivor and clear the pointer. */
         int rc = pthread_create(&tu, NULL, rp_dir_main, (void *)(intptr_t)1);
-        if (rc == 0)
+        if (rc == 0) {
+            tu_created = true;
             rc = pthread_create(&td, NULL, rp_dir_main, (void *)(intptr_t)0);
+        }
         if (rc != 0) {
+            /* L2: detach the surviving up thread (else it stays a
+             * zombie), close the listening fd, clear the pointer; stop
+             * has already been raised for it to exit */
             atomic_store(&g_rp_stop, 1);
             log_err("relay proxy: relay threads: %s", strerror(errno));
-            if (rc == 0)
+            if (tu_created)
                 pthread_detach(tu);
             g_rp_current = NULL;
+            port_close(fd);
+            rp->listener = -1;
             goto fail;
         }
     }
@@ -1500,6 +1647,16 @@ int relay_proxy_start(const char *listen_str, const char *auth_token,
     g_rp_current = rp;
 
     if (pthread_create(&accept_th, NULL, rp_accept_main, rp) != 0) {
+        /* M5/L2: accept failed — the two direction threads are already
+         * detached and running with g_rp_stop=0 and g_rp_current=rp.
+         * Without this cleanup g_rp_current would dangle past this rp's
+         * free and the threads would spin forever on the 100ms poll,
+         * so a caller retry would spawn a second pair relaying the same
+         * array concurrently (data corruption). Stop them and clear the
+         * dangling pointer, aligned with the relay-thread failure path
+         * above, before closing the listener. */
+        atomic_store(&g_rp_stop, 1);
+        g_rp_current = NULL;
         port_close(fd);
         rp->listener = -1;
         goto fail;

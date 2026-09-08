@@ -1221,7 +1221,10 @@ static bool socks_target_blocked(const Flow *f, int af, const uint8_t *p)
     if (socks_ssrf_off() || socks_peer_is_loopback(f))
         return false;
     if (af == 4)
-        return p[0] == 127 ||                        /* 127.0.0.0/8 */
+        return p[0] == 0 ||                          /* 0.0.0.0/8: Linux
+                                                        connect() routes it
+                                                        to loopback -> SSRF */
+               p[0] == 127 ||                        /* 127.0.0.0/8 */
                (p[0] == 169 && p[1] == 254);         /* 169.254.0.0/16 */
     if (af == 6) {
         static const uint8_t lo[16] = {
@@ -1232,8 +1235,12 @@ static bool socks_target_blocked(const Flow *f, int af, const uint8_t *p)
             return true;                              /* ::1 */
         if (p[0] == 0xfe && (p[1] & 0xc0) == 0x80)
             return true;                              /* fe80::/10 */
+        /* ::ffff:a.b.c.d: the mapped v4 address obeys the v4 rules,
+         * else a crafted AAAA would bypass the gate; 0.0.0.0 is never a
+         * legitimate proxy target (Linux routes it to loopback). */
         if (memcmp(p, v4map, 12) == 0)
-            return p[12] == 127 ||                    /* ::ffff:127/8 */
+            return p[12] == 0 ||                      /* ::ffff:0.0.0.0 */
+                   p[12] == 127 ||                    /* ::ffff:127/8 */
                    (p[12] == 169 && p[13] == 254);    /* ::ffff:169.254 */
     }
     return false;
