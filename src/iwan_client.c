@@ -411,8 +411,8 @@ static void parse_cmd(int argc, char **argv, int start, const char *sub,
 static char g_pass_buf[512];
 static char g_ct_buf[512];
 
-/* fill the 9 credential/connection options shared by auth/proxy/socks
- * into opts[0..8]; each command appends its private options after */
+/* fill the 8 credential/connection options shared by auth/proxy/socks
+ * into opts[0..7]; each command appends its private options after */
 static void add_auth_opts(cli_opt *opts, CmdOpts *o)
 {
     opts[0] = (cli_opt){ "server",       CLI_OPT_STR, &o->server,
@@ -594,7 +594,10 @@ static int cmd_auth(int argc, char **argv, int start)
     o.port = 6001;
     o.user = "_rev_m_1";
     o.mtu = IWAN_DEFAULT_MTU;
-    cli_opt opts[9];
+    /* must match the 8 options add_auth_opts fills (opts[0..7]):
+     * any extra slot would be left uninitialized and parse_cmd would
+     * call strlen() on it when an unknown --long option is scanned */
+    cli_opt opts[8];
 
     add_auth_opts(opts, &o);
     parse_cmd(argc, argv, start, "auth", opts, sizeof opts / sizeof opts[0]);

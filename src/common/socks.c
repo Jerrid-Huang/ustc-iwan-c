@@ -812,6 +812,18 @@ static void socks_reauth_swap(int *sockfd, int nfd, SocksConfig *cfg)
 int run_socks(int sockfd, SocksConfig *cfg) {
     int listener;
 
+    /* M1 stop guard: the ctrl handler is installed process-wide for
+     * life (Windows has no per-session save/restore), so on a
+     * reconnecting session a Ctrl-C pressed during the blocking
+     * authenticate()/setup above has already set g_user_stop. Honor it
+     * here and return 0 (the caller's "user stopped it" code) WITHOUT
+     * clearing g_stop below, instead of swallowing the stop and
+     * starting a fresh session. The main-loop condition also watches
+     * g_user_stop, so a stop landing between this check and the loop
+     * start is honored too. */
+    if (g_user_stop)
+        return 0;
+
     /* runtime session-health state: memset-to-zero callers leave
      * last_rx = 0, which would read as "no downlink for 16 hours" */
     cfg->last_rx = now_ms();
@@ -952,7 +964,7 @@ int run_socks(int sockfd, SocksConfig *cfg) {
     uint64_t last_ka = now_ms() - SOCKS_KEEPALIVE_MS;
     unsigned stale_ms = socks_rx_stale_ms();   /* parsed once, cached */
 
-    while (!g_stop) {
+    while (!g_stop && !g_user_stop) {
         /* downlink-silence watchdog: re-auth the tunnel in place (the
          * listener, flows and inner TCP survive); the old behavior —
          * declaring the session lost and exiting — only applies when no
