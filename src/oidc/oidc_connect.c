@@ -361,9 +361,19 @@ void oidc_connect_server(const Opts *o, const Config *cf)
 
         int rc;
         if (o->socks) {
+            /* H-1: OIDC mode always sets cfg.reauth (oidc_socks_reauth_cb),
+             * so run_socks may swap in a fresh session fd mid-run via
+             * socks_reauth_swap. run_socks/run_socks_mode now OWN and close
+             * the current sockfd in their teardown (including any
+             * swapped-in replacement); the caller MUST NOT port_close(fd)
+             * afterwards — closing the stale pre-swap fd would be a double
+             * close (and could clobber an unrelated descriptor reusing
+             * that number) and would leak every replaced session socket.
+             * run_socks_mode itself only forwards fd to run_socks and does
+             * not close it, so ownership passes straight through. */
             rc = run_socks_mode(o, fd, sk, &res, &reauth_ctx);
-            port_close(fd);
         } else {
+            /* run_pump does NOT own fd: the caller closes it here */
             rc = run_pump(tun_fd, o->tun, fd, sk, res.sid, res.tok,
                           1, host, &routes, &routes6,
                           res.tun, res.mtu);

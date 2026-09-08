@@ -63,7 +63,11 @@ typedef struct SocksConfig {
     bool     session_lost; /* tunnel died (keepalive / no downlink) */
 } SocksConfig;
 
-/* Run SOCKS5 server (blocks). sockfd = authenticated UDP socket. */
+/* Run SOCKS5 server (blocks). sockfd = authenticated UDP socket.
+ * Ownership (A-1): run_socks takes ownership of sockfd and is
+ * responsible for closing it on every return path — including the
+ * CURRENT value (a new fd may have been swapped in by an in-place
+ * re-auth), so the caller must NOT close it afterwards. */
 int run_socks(int sockfd, SocksConfig *cfg);   /* 0 stopped, 1 session lost */
 
 #endif

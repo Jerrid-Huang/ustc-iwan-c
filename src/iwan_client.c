@@ -946,15 +946,19 @@ static int cmd_socks(int argc, char **argv, int start)
         cfg.open_proxy = o.socks_no_token;
         cfg.allow_remote = o.allow_remote;
         cfg.ipv6 = o.socks_ipv6;
-        /* No in-place re-auth callback: run_socks never swaps/closes the
-         * session fd (socks_reauth_tunnel bails on !cfg->reauth), so the
-         * port_close(sockfd) below closes exactly the fd we opened — no
-         * double close, no leaked replacement socket. Session recovery is
+        /* H-1 contract: run_socks now OWNS sockfd from entry and closes
+         * it in its teardown on every return path, so the caller must NOT
+         * port_close(sockfd) after run_socks returns — closing again
+         * would be a double close (and, if the number was meanwhile
+         * reused, would clobber an unrelated descriptor). This path has
+         * no in-place re-auth callback (socks_reauth_tunnel bails on
+         * !cfg->reauth), so run_socks never even swaps the fd, but the
+         * ownership rule still applies uniformly. Session recovery is
          * owned by this outer reconnect loop (the same way cmd_proxy does
-         * it): on session loss run_socks returns 1 and we re-run
-         * authenticate() + run_socks() above. */
+         * it): on session loss run_socks closes the socket, returns 1,
+         * and we re-run authenticate() (which allocates a fresh sockfd)
+         * + run_socks() above. */
         int rc = run_socks(sockfd, &cfg);
-        port_close(sockfd);
         if (rc == 0)
             break;   /* user stopped it (run_socks returns 0 unless the
                       * session was detected lost; the reconnect re-runs

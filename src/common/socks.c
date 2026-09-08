@@ -102,6 +102,14 @@ void wait_events(int listener, int sockfd, int dns_evfd, int timeout_ms)
         Flow *f = &g_flows[i];
         if (!f->active)
             continue;
+        /* L-6 defensive guard: the invariant is flow_alloc assigns fd
+         * and flow_free closes it before clearing active, so an active
+         * flow always has fd >= 0 — still, never let a negative fd into
+         * the poll set (port_poll would treat it as an error slot);
+         * skip it instead of registering it. Placed before the events
+         * computation. */
+        if (f->fd < 0)
+            continue;
         fds[n].fd = f->fd;
         /* rx_paused (netstack ring full): do NOT register POLLIN — the
          * socket stays readable, so polling it would return instantly
@@ -140,6 +148,12 @@ void wait_events(int listener, int sockfd, int dns_evfd, int timeout_ms)
 
 void accept_connections(int listener) {
     for (;;) {
+        /* L-5: with a large pended backlog the drain loop would accept
+         * every pending client even after a stop signal; check the shared
+         * stop flags each round and bail out (teardown still closes any
+         * accepted flow via flow_free, so nothing leaks). */
+        if (g_stop || g_user_stop)
+            return;
         struct sockaddr_in peer;
         socklen_t peerlen = sizeof peer;
         int cfd = port_accept(listener, (struct sockaddr *)&peer, &peerlen);
@@ -587,6 +601,13 @@ static int vpn_handle_datagram(int sockfd, SocksConfig *cfg, uint8_t *b,
                   cfg->token & 0xFFFFu);
     if (psid != cfg->sid || ptok != cfg->token)
         return 0;
+    /* A-4: a frame that passes the sid/token gate is a genuine downlink
+     * for THIS session (ECHO_REQ / CLOSE / DATA/DATA_ENC) — the true
+     * "session is alive" signal. The stale-session clock is reset HERE
+     * (moved from receive_vpn's raw "v > 0" refresh, which spoofable
+     * old/junk frames could keep asleep). The cfg parameter is available
+     * here and last_rx is refreshed before type dispatch. */
+    cfg->last_rx = now_ms();
     if (t == PT_CLOSE) {
         /* control packets carry the 16-byte header sig; never
          * let a spoofed sid/tok-only datagram kill the session */
@@ -664,8 +685,14 @@ int receive_vpn(int sockfd, SocksConfig *cfg) {
         }
         int v = port_recvmmsg(sockfd, rx_msgs, (unsigned)got,
                               MSG_DONTWAIT, NULL);
-        if (v > 0)
-            cfg->last_rx = now_ms();   /* downlink resets the stale clock */
+        /* A-4: last_rx is NOT refreshed here merely because a datagram
+         * was received — the old "v > 0 => refresh" rule let a peer
+         * keep the stale-session watchdog asleep by flooding frames
+         * whose sid/token gate then rejects them. It is refreshed
+         * inside vpn_handle_datagram only AFTER the sid/token gate
+         * passes (a genuinely valid session frame = the true "session is
+         * alive" downlink signal). The RX-pool-exhausted path (got == 0)
+         * never reaches here and does not refresh, as intended. */
         /* EINTR is tolerated (falls into the v <= 0 drained branch
          * below): Linux native recvmmsg returns -1/EINTR when a
          * stopping-class signal interrupts the syscall at entry with 0
@@ -823,7 +850,10 @@ static int socks_reauth_tunnel(SocksConfig *cfg)
     return newfd;
 }
 
-/* re-auth succeeded: swap the tunnel socket in place */
+/* re-auth succeeded: swap the tunnel socket in place.
+ * Ownership note (A-1): this closes the OLD fd and installs the new one
+ * into *sockfd; run_socks's teardown then owns and closes the CURRENT
+ * fd on exit, so the caller must never close either rendition. */
 static void socks_reauth_swap(int *sockfd, int nfd, SocksConfig *cfg)
 {
     if (nfd < 0)
@@ -854,8 +884,13 @@ int run_socks(int sockfd, SocksConfig *cfg) {
      * starting a fresh session. The main-loop condition also watches
      * g_user_stop, so a stop landing between this check and the loop
      * start is honored too. */
-    if (g_user_stop)
+    if (g_user_stop) {
+        /* A-1: run_socks owns sockfd from entry and every return path
+         * must close it (callers no longer close after run_socks
+         * returns), including this pre-setup stop. */
+        port_close(sockfd);
         return 0;
+    }
 
     /* runtime session-health state: memset-to-zero callers leave
      * last_rx = 0, which would read as "no downlink for 16 hours" */
@@ -870,6 +905,7 @@ int run_socks(int sockfd, SocksConfig *cfg) {
     listener = port_socket(AF_INET, SOCK_STREAM, 0);
     if (listener < 0) {
         log_err("socket SOCKS5 listener: %s", strerror(errno));
+        port_close(sockfd);   /* A-1: own + close sockfd on every return */
         return 0;
     }
     int one = 1;
@@ -877,6 +913,7 @@ int run_socks(int sockfd, SocksConfig *cfg) {
     if (port_bind(listener, (struct sockaddr *)&laddr, sizeof laddr) < 0) {
         log_err("bind SOCKS5 listener: %s", strerror(errno));
         port_close(listener);
+        port_close(sockfd);   /* A-1: own + close sockfd on every return */
         return 0;
     }
     if (laddr.sin_addr.s_addr != htonl(INADDR_LOOPBACK)) {
@@ -899,16 +936,35 @@ int run_socks(int sockfd, SocksConfig *cfg) {
                     "pass --allow-remote to override",
                     cfg->listen_str ? cfg->listen_str : "?");
             port_close(listener);
+            port_close(sockfd);   /* A-1: own + close sockfd on every return */
             return 0;
         }
     }
     if (port_listen(listener, LISTEN_BACKLOG) < 0) {
         log_err("listen SOCKS5: %s", strerror(errno));
         port_close(listener);
+        port_close(sockfd);   /* A-1: own + close sockfd on every return */
         return 0;
     }
-    port_set_nonblock(listener, true);
-    port_set_nonblock(sockfd, true);
+    /* A-6: non-blocking mode is not optional here — a blocking listener
+     * would freeze the single-threaded event loop on the first accept,
+     * and a blocking session socket would stall sends. Refuse to start
+     * (same style as the error paths above) rather than half-set-up.
+     * sockfd is closed on these failure returns too: run_socks owns it
+     * from entry and the callers no longer close it (A-1). */
+    if (port_set_nonblock(listener, true) < 0) {
+        log_err("SOCKS5: set nonblock on listener: %s", strerror(errno));
+        port_close(listener);
+        port_close(sockfd);
+        return 0;
+    }
+    if (port_set_nonblock(sockfd, true) < 0) {
+        log_err("SOCKS5: set nonblock on session socket: %s",
+                strerror(errno));
+        port_close(listener);
+        port_close(sockfd);
+        return 0;
+    }
     {
         /* high-BDP tunnel: default UDP buffers (~212KB) overflow once
          * the TCP window keeps >~150 segments in flight, silently
@@ -952,6 +1008,7 @@ int run_socks(int sockfd, SocksConfig *cfg) {
     g_flows = calloc(MAX_FLOWS, sizeof *g_flows);
     if (!g_flows) {
         port_close(listener);
+        port_close(sockfd);   /* A-1: own + close sockfd on every return */
         return 0;
     }
     g_next_id = 1;
@@ -1002,7 +1059,15 @@ int run_socks(int sockfd, SocksConfig *cfg) {
          * listener, flows and inner TCP survive); the old behavior —
          * declaring the session lost and exiting — only applies when no
          * re-auth callback was provided. stale_ms == 0 disables it. */
-        if (stale_ms != 0 && now_ms() - cfg->last_rx > stale_ms) {
+        /* A-2: fold the watchdog into the reauth_at backoff — a stale
+         * trigger while a previous re-auth is still backing off (a
+         * failed auth sets reauth_at = now+10s) must NOT immediately
+         * fire a second full re-auth. legacy (!cfg->reauth) keeps
+         * reauth_at == 0 (socks_reauth_tunnel bails at its top and never
+         * sets it), so that path is unchanged: still an immediate
+         * session_lost/exit. */
+        if (stale_ms != 0 && now_ms() - cfg->last_rx > stale_ms &&
+            (cfg->reauth_at == 0 || now_ms() >= cfg->reauth_at)) {
             log_err("SOCKS: no downlink for %llu ms; re-authing tunnel",
                     (unsigned long long)(now_ms() - cfg->last_rx));
             int nfd = socks_reauth_tunnel(cfg);
@@ -1039,7 +1104,13 @@ int run_socks(int sockfd, SocksConfig *cfg) {
         /* the queue drained: let lwIP retry output it held on ERR_MEM */
         ns_tx_kick(&g_ns);
         send_vpn_keepalive(sockfd, cfg, &last_ka);
-        if (cfg->ka_fail >= SOCKS_KA_FAIL_MAX) {
+        /* A-3: same reauth_at backoff as the stale watchdog — a failed
+         * re-auth sets reauth_at (= now+10s) and does NOT reset ka_fail
+         * (only success does), so without this gate every loop round
+         * would re-auth again and blast the server. legacy keeps
+         * reauth_at == 0 -> unchanged behavior. */
+        if (cfg->ka_fail >= SOCKS_KA_FAIL_MAX &&
+            (cfg->reauth_at == 0 || now_ms() >= cfg->reauth_at)) {
             log_err("SOCKS: %d consecutive keepalive send failures; "
                     "re-authing tunnel", cfg->ka_fail);
             int nfd = socks_reauth_tunnel(cfg);
@@ -1063,6 +1134,14 @@ int run_socks(int sockfd, SocksConfig *cfg) {
                 g_stop = 1;
                 break;
             }
+            /* A-5: hard recv error (receive_vpn set session_lost on its
+             * abnormal path) and the re-auth FAILED (callback exists):
+             * without clearing it the next round's session_lost branch
+             * would immediately re-auth once more before the reauth_at
+             * backoff takes effect. Clear it so the retry runs on the
+             * reauth_at schedule (mirrors the session_lost branch
+             * above, :1062-1063). */
+            cfg->session_lost = false;
         }
         service_local_inputs(g_flows);
         handle_dns_results();
@@ -1110,6 +1189,10 @@ int run_socks(int sockfd, SocksConfig *cfg) {
      * eventfd further down) can never race a worker's send or wakeup. */
     dns_stop();
     g_sockfd = -1;
+    /* L-4: the global config pointer still refers to the caller's stack
+     * cfg after we return — NULL it so nothing can dereference a dangling
+     * pointer on a later re-entry or from another thread. */
+    g_socks_cfg = NULL;
 
     for (int i = 0; i < MAX_FLOWS; i++) {
         if (g_flows[i].active)
@@ -1125,6 +1208,16 @@ int run_socks(int sockfd, SocksConfig *cfg) {
         buf_free(&p);
     }
 
+    /* A-1 ownership contract: run_socks owns sockfd and MUST close the
+     * CURRENT value on exit (the original fd, or the new fd swapped in
+     * by a re-auth — the old one was already closed inside
+     * socks_reauth_swap, so this is a single close either way; without
+     * reauth it is the original fd). Callers must NOT close it
+     * themselves: with a re-auth the caller-held old fd number may have
+     * been reused, so a caller-side close would be a double-close of an
+     * unrelated descriptor. The PT_CLOSE goodbye was sent above on this
+     * same socket. */
+    port_close(sockfd);
     port_close(listener);
     if (g_dns_evfd >= 0) {
         port_evfd_close(g_dns_evfd);
