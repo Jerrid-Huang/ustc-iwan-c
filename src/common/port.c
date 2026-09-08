@@ -224,7 +224,13 @@ void port_sleep_us(unsigned us)
      * sleep to pace never spin harder than intended */
     Sleep((us + 999) / 1000);
 #else
-    usleep(us);
+    /* EINTR-safe, mirroring port_sleep_ms (L-F5): a signal must not
+     * truncate the requested pause or a pacing caller would spin harder
+     * than intended. */
+    struct timespec ts = { .tv_sec = us / 1000000u,
+                           .tv_nsec = (long)(us % 1000000u) * 1000L };
+    while (nanosleep(&ts, &ts) < 0 && errno == EINTR)
+        ;
 #endif
 }
 
@@ -410,6 +416,34 @@ static size_t win_join_argv(char *const argv[], int start, wchar_t *out,
     if (n < outsz)
         out[n] = L'\0';
     return n;
+}
+
+/* Resolve a bare helper name (netsh/route) against System32 so it can
+ * be used as lpApplicationName. CreateProcessW(NULL, cmdline) with a
+ * bare name searches the exe dir and the CWD BEFORE System32, so a
+ * local binary dropped into either could hijack an elevated routing
+ * operation. Shared by port_run_cmd and port_cmd_capture (W-M2).
+ * Returns a pointer into appbuf, or NULL when argv[start] already
+ * contains a path separator (callers then keep the historical
+ * CreateProcessW(NULL, ...) bare-name fallback). */
+static const wchar_t *win_system32_appname(char *const argv[], int start,
+                                           wchar_t *appbuf, size_t appbufsz)
+{
+    const char *name = argv[start];
+    if (name == NULL || strchr(name, '\\') != NULL ||
+        strchr(name, '/') != NULL)
+        return NULL;
+    wchar_t sysdir[MAX_PATH];
+    UINT sn = GetSystemDirectoryW(sysdir, MAX_PATH);
+    wchar_t wname[64];
+    if (sn == 0 || sn >= MAX_PATH - 16 ||
+        MultiByteToWideChar(CP_UTF8, 0, name, -1, wname, 64) <= 0)
+        return NULL;
+    if (appbufsz < 8)
+        return NULL;
+    _snwprintf(appbuf, (int)appbufsz, L"%s\\%s.exe", sysdir, wname);
+    appbuf[appbufsz - 1] = L'\0';
+    return appbuf;
 }
 #endif /* _WIN32 */
 
@@ -632,20 +666,10 @@ int port_run_cmd(char *const argv[])
      * bare name searches the exe dir and the CWD BEFORE System32, so a
      * local binary dropped into either could hijack an elevated
      * routing operation. Both helpers used on this path (netsh, route)
-     * live in System32. */
+     * live in System32. Shared helper (W-M2). */
     wchar_t appbuf[MAX_PATH];
-    const wchar_t *appname = NULL;
-    if (strchr(argv[0], '\\') == NULL && strchr(argv[0], '/') == NULL) {
-        wchar_t sysdir[MAX_PATH];
-        UINT sn = GetSystemDirectoryW(sysdir, MAX_PATH);
-        wchar_t wname[64];
-        if (sn > 0 && sn < MAX_PATH - 16 &&
-            MultiByteToWideChar(CP_UTF8, 0, argv[0], -1, wname, 64) > 0) {
-            _snwprintf(appbuf, MAX_PATH, L"%s\\%s.exe", sysdir, wname);
-            appbuf[MAX_PATH - 1] = L'\0';
-            appname = appbuf;
-        }
-    }
+    const wchar_t *appname = win_system32_appname(argv, 0, appbuf,
+                                                  MAX_PATH);
 
     if (!CreateProcessW(appname, cmdline, NULL, NULL, FALSE,
                         CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
@@ -671,9 +695,35 @@ int port_run_cmd(char *const argv[])
         execvp(argv[0], argv);
         _exit(127);
     }
+    /* bounded wait, aligned with the Windows 60000ms side above (L-F1):
+     * a hung helper (ifconfig/route/netstat) must not wedge the caller
+     * forever. Poll with WNOHANG so signals cannot wedge us; EINTR only
+     * retries the poll. On timeout SIGKILL the child and keep reaping
+     * (the SIGKILLed child still needs a waitpid to reclaim it), then
+     * return -1 like the Windows timed-out path. */
     int st = 0;
-    while (waitpid(pid, &st, 0) < 0 && errno == EINTR)
-        ;
+    uint64_t deadline = port_now_ms() + 60000;
+    bool timed_out = false;
+    for (;;) {
+        pid_t r = waitpid(pid, &st, WNOHANG);
+        if (r == pid)
+            break;
+        if (r < 0) {
+            if (errno == EINTR)
+                continue;   /* retry the poll */
+            return -1;
+        }
+        if (port_now_ms() >= deadline) {
+            timed_out = true;
+            kill(pid, SIGKILL);
+            continue;   /* keep reaping until waitpid returns the pid */
+        }
+        port_sleep_ms(10);
+    }
+    if (timed_out) {
+        log_err("port_run_cmd: %s timed out after 60s", argv[0]);
+        return -1;
+    }
     if (WIFEXITED(st))
         return WEXITSTATUS(st);
     return -1;
@@ -693,6 +743,8 @@ char *port_cmd_capture(char *const argv[], size_t max)
      * size); every write below is bounded against this length */
     const size_t cmd_cap = sizeof cmdline / sizeof cmdline[0];
     size_t n = 0;
+    bool dropped = false;   /* set when an argument was truncated by the
+                             * capacity ceiling (W-M1) */
 
     sa.nLength = sizeof sa;
     sa.bInheritHandle = TRUE;
@@ -729,6 +781,10 @@ char *port_cmd_capture(char *const argv[], size_t max)
             cmdline[n++] = (wchar_t)(unsigned char)*a;
             a++;
         }
+        if (*a)
+            dropped = true;   /* capacity exhausted mid-argument: fail
+                               * loudly below instead of silently running
+                               * a rewritten command */
         if (quote) {
             if (n >= cmd_cap - 1) {
                 CloseHandle(rd);
@@ -738,16 +794,24 @@ char *port_cmd_capture(char *const argv[], size_t max)
             cmdline[n++] = L'"';
         }
     }
-    if (n >= cmd_cap) {
-        /* no room left even for the terminator */
+    if (dropped || n >= cmd_cap) {
+        /* a truncated argument would silently rewrite the command
+         * (win_join_argv fails loudly too); also no room even for the
+         * terminator */
         CloseHandle(rd);
         CloseHandle(wr);
         return NULL;
     }
     cmdline[n] = L'\0';
 
-    if (!CreateProcessW(NULL, cmdline, NULL, NULL, TRUE, CREATE_NO_WINDOW,
-                        NULL, NULL, &si, &pi)) {
+    /* Same System32 resolution as port_run_cmd (bare helper names only):
+     * CreateProcessW(NULL, cmdline) would search exe-dir and CWD before
+     * System32 — a local hijack for an elevated helper run (W-M2). */
+    wchar_t appbuf[MAX_PATH];
+    const wchar_t *appname = win_system32_appname(argv, 0, appbuf,
+                                                  MAX_PATH);
+    if (!CreateProcessW(appname, cmdline, NULL, NULL, TRUE,
+                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         CloseHandle(rd);
         CloseHandle(wr);
         return NULL;
@@ -802,16 +866,52 @@ char *port_cmd_capture(char *const argv[], size_t max)
     size_t got = 0;
     while (got < max) {
         ssize_t r = read(fds[0], out + got, max - got);
-        if (r <= 0)
-            break;
+        if (r < 0) {
+            if (errno == EINTR)
+                continue;   /* L-F4: a signal must not silently truncate
+                             * the captured output — retry the read */
+            break;          /* hard read error: keep what we already have */
+        }
+        if (r == 0)
+            break;          /* EOF */
         got += (size_t)r;
     }
+    /* close the read end BEFORE reaping: the child's write end is now
+     * the only remaining reference, so a child that overruns `max` gets
+     * EPIPE/SIGPIPE on its next write instead of blocking on a full
+     * pipe forever. The old "parent/child deadlock" chain does not
+     * hold — the child never holds the read end (it closed fds[0] in
+     * the exec branch) and the parent closes it here before waitpid;
+     * the real unbounded risk is an un-timed waitpid below. */
     close(fds[0]);
     out[got] = '\0';
+    /* bounded reap, same policy as port_run_cmd (60s + SIGKILL + keep
+     * reaping): a wedged helper must not hang the caller indefinitely.
+     * Whatever we captured is returned — partial output beats an
+     * indefinite wedge (same spirit as the Windows branch above). */
     int st = 0;
-    while (waitpid(pid, &st, 0) < 0 && errno == EINTR)
-        ;
-    return out;
+    uint64_t deadline = port_now_ms() + 60000;
+    bool timed_out = false;
+    for (;;) {
+        pid_t r = waitpid(pid, &st, WNOHANG);
+        if (r == pid)
+            break;
+        if (r < 0) {
+            if (errno == EINTR)
+                continue;   /* retry the poll */
+            break;          /* ECHILD etc.: nothing more to reap */
+        }
+        if (port_now_ms() >= deadline) {
+            timed_out = true;
+            kill(pid, SIGKILL);
+            continue;   /* keep reaping until waitpid returns the pid */
+        }
+        port_sleep_ms(10);
+    }
+    if (timed_out)
+        log_err("port_cmd_capture: %s timed out after 60s; returning "
+                "partial output", argv[0]);
+    return out;   /* partial output beats an indefinite wedge */
 #endif
 }
 
@@ -1104,8 +1204,12 @@ int port_sendmmsg(int fd, struct mmsghdr *msgvec, unsigned vlen, int flags)
             bool heap = false;
             if (vlen > IOV_TO_WSABUF_STACK) {
                 w = calloc(vlen, sizeof *w);
-                if (!w)
+                if (!w) {
+                    errno = ENOMEM;   /* align the non-fast path below,
+                                       * which sets errno via
+                                       * iov_to_wsabuf */
                     return -1;
+                }
                 heap = true;
             }
             for (unsigned i = 0; i < vlen; i++) {
@@ -1198,8 +1302,12 @@ int port_recvmmsg(int fd, struct mmsghdr *msgvec, unsigned vlen, int flags,
             bool heap = false;
             if (vlen > IOV_TO_WSABUF_STACK) {
                 w = calloc(vlen, sizeof *w);
-                if (!w)
+                if (!w) {
+                    errno = ENOMEM;   /* align the non-fast path below,
+                                       * which sets errno via
+                                       * iov_to_wsabuf */
                     return -1;
+                }
                 heap = true;
             }
             for (unsigned i = 0; i < vlen; i++) {
@@ -1518,6 +1626,27 @@ int port_setsockopt(int fd, int level, int optname, const void *optval,
         DWORD ret = 0;
         if (WSAIoctl((SOCKET)fd, SIO_UDP_NETSEGMENT, &mss, sizeof mss,
                      NULL, 0, &ret, NULL, NULL) == SOCKET_ERROR) {
+            set_sock_errno(fd);
+            return -1;
+        }
+        return 0;
+    }
+    /* SO_REUSEADDR on Windows lets ANOTHER process bind the same
+     * addr:port — it does not grant Linux-style TIME_WAIT reuse. Our
+     * every SO_REUSEADDR call site (socks.c:860, relay_proxy.c:1462 — a
+     * sock.c line may drift under the parallel socks.c fixer) is a TCP
+     * listener, so translate it to SO_EXCLUSIVEADDRUSE (int 1):
+     * no other process can bind our listening address (closes the local
+     * port-steal / hijack hole). Cost: a restart while the old socket
+     * is still in TIME_WAIT is rejected (no reuse), which is the
+     * opposite of what Linux callers may expect — acceptable for a
+     * client whose restart already waits for the port to free. Error
+     * semantics stay on set_sock_errno like every other path. */
+    if (level == SOL_SOCKET && optname == SO_REUSEADDR) {
+        int exclusive = 1;
+        if (setsockopt((SOCKET)fd, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                       (const char *)&exclusive, sizeof exclusive) ==
+            SOCKET_ERROR) {
             set_sock_errno(fd);
             return -1;
         }

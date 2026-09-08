@@ -165,7 +165,15 @@ void accept_connections(int listener) {
         int nodelay = 1;
         port_setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &nodelay,
                         sizeof nodelay);
-        port_set_nonblock(cfd, true);
+        if (port_set_nonblock(cfd, true) < 0) {
+            /* FIONBIO/fcntl failure: without non-blocking mode this
+             * connection would block the single-threaded event loop
+             * (e.g. after a Windows FIONBIO error), so refuse it. */
+            log_err("SOCKS5: set nonblock on accepted fd: %s",
+                    strerror(errno));
+            port_close(cfd);
+            continue;
+        }
         Flow *f = flow_alloc(&peer);
         if (!f) {
             port_close(cfd);
@@ -642,11 +650,20 @@ int receive_vpn(int sockfd, SocksConfig *cfg) {
                               MSG_DONTWAIT, NULL);
         if (v > 0)
             cfg->last_rx = now_ms();   /* downlink resets the stale clock */
+        /* EINTR is tolerated (falls into the v <= 0 drained branch
+         * below): Linux native recvmmsg returns -1/EINTR when a
+         * stopping-class signal interrupts the syscall at entry with 0
+         * received, whereas macOS/Windows normalize that to 0 — treating
+         * it as a drop would reconnect the tunnel on Linux only. */
         if (v < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
-            errno != ECONNREFUSED) {
+            errno != ECONNREFUSED && errno != EINTR) {
             for (int i = 0; i < got; i++)
                 ns_rx_buf_release(rx_bufs[i]);
             log_err("receive_vpn: recvmmsg: %s", strerror(errno));
+            /* ECONNRESET is deliberately NOT tolerated here: socks is a
+             * connected-type VPN tunnel, so a reset means real loss and
+             * reconnect is correct — unlike the proxy's UDP->TUN pump,
+             * which normalizes it to 0. */
             cfg->session_lost = true;   /* abnormal: reconnect, not a
                                          * clean user stop (run_socks
                                          * returns 1) */

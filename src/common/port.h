@@ -337,10 +337,30 @@ static inline ssize_t port_readv(int fd, const struct iovec *iov, int iovcnt)
 static inline ssize_t port_writev(int fd, const struct iovec *iov, int iovcnt)
 { return writev(fd, iov, iovcnt); }
 static inline int port_socket(int domain, int type, int protocol)
-{ return socket(domain, type, protocol); }
+{
+#  ifdef __linux__
+    /* SOCK_CLOEXEC is an independent bit (0x80000 on Linux): OR-ing it
+     * into the socket() type does not change SOCK_STREAM/SOCK_DGRAM
+     * semantics, only marks the fd close-on-exec (L-F3). No caller
+     * inspects the exact type bits afterwards. */
+    return socket(domain, type | SOCK_CLOEXEC, protocol);
+#  else
+    /* macOS keeps plain socket(): CLOEXEC is Linux-specific, and the
+     * __APPLE__ / other POSIX branches must stay byte-identical. */
+    return socket(domain, type, protocol);
+#  endif
+}
 static inline int port_accept(int fd, struct sockaddr *addr,
                               socklen_t *addrlen)
-{ return accept(fd, addr, addrlen); }
+{
+#  ifdef __linux__
+    /* accept4(..., SOCK_CLOEXEC): accepted client sockets must not leak
+     * into helper subprocesses either (L-F3). */
+    return accept4(fd, addr, addrlen, SOCK_CLOEXEC);
+#  else
+    return accept(fd, addr, addrlen);
+#  endif
+}
 static inline int port_connect(int fd, const struct sockaddr *addr,
                                socklen_t len)
 { return connect(fd, addr, len); }
@@ -367,7 +387,9 @@ int  port_evfd_wake(int fd);    /* make the fd readable */
 int  port_evfd_drain(int fd);   /* consume pending wakeups, nonblocking */
 void port_evfd_close(int fd);
 #  else
-static inline int port_evfd_create(void) { return eventfd(0, EFD_NONBLOCK); }
+static inline int port_evfd_create(void)
+{ return eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC); }   /* L-F3: no fd leak
+                                                      * into helpers */
 static inline int port_evfd_wake(int fd)
 {
     uint64_t one = 1;

@@ -665,10 +665,15 @@ static void *udp2tun_thread(void *ud) {
         if (v > 0 && pump_prof_on())
             atomic_fetch_add(&g_prof_recv_dgrams, (uint64_t)v);
         if (v == 0 || (v < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))) {
-            /* M3-8: a zero-datagram batch — the macOS/Windows recvmmsg
-             * emulations return 0 for an empty queue (and for a spurious
-             * EINTR/ECONNRESET on an empty queue) — is parked exactly
-             * like EAGAIN. Previously v==0 fell through to
+            /* R04: empty queue is now -1/EAGAIN on all three platforms
+             * (M12/M3-8 fixed macOS/Windows to match Linux), so it is
+             * handled by the v<0 branch below; the v<0 && (EINTR ||
+             * ECONNREFUSED) -> continue there covers those errnos too.
+             * The v==0 half is therefore purely defensive dead-code in
+             * current builds (kept harmlessly in case a future macOS/
+             * Windows emulation regresses to returning 0 for an empty
+             * queue, incl. a spurious EINTR/ECONNRESET on an empty one):
+             * it parks exactly like EAGAIN instead of falling through to
              * `last_rx = now_ms()`, which (a) reset the 60s stale-
              * downlink watchdog on every spurious wake and (b) with a
              * repeating ICMP ECONNRESET did not park, busy-looping the
