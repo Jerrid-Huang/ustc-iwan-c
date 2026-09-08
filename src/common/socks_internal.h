@@ -53,6 +53,9 @@ typedef struct {
     uint16_t lport;
     bool     local_eof;
     uint64_t state_ms;         /* when state last changed */
+    uint64_t last_progress_ms; /* last time rxq/output was actually drained
+                                * to the client (R07 M-1/M-3 no-progress
+                                * watchdog) */
     bool     auth_pending;     /* RFC1929 auth sub-negotiation in progress */
     bool     http_mode;        /* client speaks HTTP proxy, not SOCKS5 */
     bool     http_connect;     /* HTTP mode: CONNECT tunnel (else absolute-URI

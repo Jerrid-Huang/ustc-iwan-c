@@ -1072,6 +1072,8 @@ Flow *flow_alloc(struct sockaddr_in *peer) {
     f->ns_idx = -1;
     f->state = ST_GREETING;
     f->state_ms = now_ms();
+    f->last_progress_ms = now_ms();   /* R07 M-1/M-3 no-progress watchdog:
+                                       * explicit after memset */
     f->peer_ip = peer->sin_addr.s_addr;   /* network byte order */
     f->peer_port = ntohs(peer->sin_port); /* host order */
     if (debug_enabled()) {
@@ -2022,6 +2024,9 @@ void service_local_outputs(void) {
                     buf_clear(&f->output);   /* full drain: no memmove */
                 else
                     buf_consume(&f->output, (size_t)n);
+                /* R07 M-1/M-3: any actual byte written to the client is
+                 * progress — resets the no-progress watchdog */
+                f->last_progress_ms = now_ms();
             } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                 break;
             } else {
@@ -2059,6 +2064,10 @@ void service_local_outputs(void) {
                         buf_consume(&c->rxq, (size_t)n);  /* partial */
                         f->rxq_waiting = true;
                     }
+                    /* R07 M-1/M-3: rxq -> client drain is the key
+                     * progress signal — even a partial write resets the
+                     * no-progress watchdog */
+                    f->last_progress_ms = now_ms();
                 } else if (n < 0 && errno != EAGAIN &&
                            errno != EWOULDBLOCK) {
                     f->local_eof = true;
@@ -2114,30 +2123,70 @@ void reap_flows(void) {
                  * must not be freed while it still holds undelivered data
                  * — the close(fd) would reset the client socket (RST on
                  * unread data) and the rxq payload would be lost.
-                 * H-1 (R06): that "keep until drained" grace must not be
-                 * unbounded while the pcb is still alive: if the client
-                 * quit reading/writing for a full close timeout with the
-                 * flow stuck in a graceful close, force-terminate below
-                 * (30s hard floor alongside the ns_idx<0 force-reap). */
-                if (f->state == ST_CLOSING &&
-                    now_ms() - f->state_ms >= ST_CLOSING_TIMEOUT_MS) {
-                    /* H-1: stuck graceful close — client stopped
-                     * reading/writing for a full close timeout while the
-                     * pcb is still alive (TIME_WAIT/LAST_ACK). lwIP frees
-                     * a TIME_WAIT pcb silently after 2*MSL with no
-                     * callback, leaving c->pcb dangling -> UAF in ns_tick.
-                     * Force-terminate now (ns_abort is TW-safe:
-                     * tcp_abort + unconditional c->pcb clear, R2-1) and
-                     * release the slot ref so the ns_idx<0 path
-                     * force-reaps this flow the same round. A gratuitous
-                     * RST here is the same cost the existing ns_idx<0
-                     * force-reap already accepts for a wedged client. */
+                 * R07 M-1/M-3: that "keep until drained" grace is now a
+                 * NO-PROGRESS watchdog keyed on last_progress_ms, not a
+                 * pure wall-clock from ST_CLOSING entry (state_ms). Every
+                 * actual drain of rxq/output to the client refreshes
+                 * last_progress_ms (service_local_outputs), so a client
+                 * that IS slowly reading (peer already FIN'd, trailing
+                 * rxq still being drained) is never killed while it makes
+                 * progress — that wall-clock regression (R6 H-1's 30s
+                 * pure-timeout killing a legitimately slow-draining
+                 * TIME_WAIT tail) is M-3. But a client that makes NO
+                 * progress for a full close timeout while the pcb is
+                 * still alive is force-terminated, which closes both:
+                 *   - H-1: stuck graceful close (TIME_WAIT/LAST_ACK, pcb
+                 *     alive). lwIP frees a TIME_WAIT pcb silently after
+                 *     2*MSL with no callback, leaving c->pcb dangling ->
+                 *     UAF in ns_tick. Force-terminate (ns_abort is
+                 *     TW-safe: tcp_abort + unconditional c->pcb clear,
+                 *     R2-1) and release the slot ref so the ns_idx<0
+                 *     path force-reaps this flow (same round when the
+                 *     old state_ms is likewise overdue).
+                 *   - M-1: passive CLOSE_WAIT deadlock. Peer FIN'd
+                 *     (c->state == NS_CLOSE_WAIT) but the local client
+                 *     never reads, so rxq stays non-empty and the
+                 *     graceful ns_close path never fires; the flow sits
+                 *     in ST_ESTABLISHED forever (ns_tick's SYN_SENT /
+                 *     FIN_WAIT / LAST_ACK timeouts all miss) and the
+                 *     64-slot table / fd / flow entry is pinned
+                 *     permanently. No progress for 30s -> force-kill it
+                 *     here too.
+                 * Semantics: state_ms = when the flow *state* last
+                 * changed (wall clock); last_progress_ms = when we last
+                 * actually *drained* bytes to the client (progress
+                 * clock). The watchdog keys off progress, so a healthy
+                 * long-lived flow is never at risk while a wedged one is
+                 * hard-bounded at ST_CLOSING_TIMEOUT_MS. */
+                if (now_ms() - f->last_progress_ms >=
+                        ST_CLOSING_TIMEOUT_MS &&
+                    (f->state == ST_CLOSING ||
+                     (f->state == ST_ESTABLISHED &&
+                      c->state == NS_CLOSE_WAIT))) {
                     ns_abort(&g_ns, f->ns_idx);
                     ns_flow_unref(f->ns_idx);
                     f->ns_idx = -1;
-                    /* keep ST_CLOSING + old state_ms: the ns_idx < 0
-                     * block below (state==ST_CLOSING && timed out)
-                     * force-reaps immediately */
+                    if (f->state != ST_CLOSING) {
+                        /* M-1: ST_ESTABLISHED + CLOSE_WAIT wedge. Jump
+                         * straight to ST_CLOSING WITHOUT set_flow_state —
+                         * keep the old state_ms/last_progress_ms so the
+                         * ns_idx < 0 block below (state==ST_CLOSING &&
+                         * timed out) force-reaps this flow the same
+                         * round (buf_clear + removable = 1), dropping
+                         * the undelivered rxq/data. This deliberate
+                         * force-reap is exactly the "kill the stuck flow,
+                         * discard undelivered data" semantic — it is NOT
+                         * the M-2 case where an error reply must not be
+                         * cleared before delivery (there we use
+                         * set_flow_state to refresh the clock instead). */
+                        f->state = ST_CLOSING;
+                    }
+                    /* H-1 already ST_CLOSING: keep ST_CLOSING + old
+                     * state_ms/last_progress_ms (do not refresh the
+                     * clock) — the ns_idx < 0 block below
+                     * (state==ST_CLOSING && timed out) force-reaps it,
+                     * immediately when the old state_ms is overdue too,
+                     * else once that ages out. */
                 } else {
                     removable = c->state == NS_CLOSED && c->rxq.len == 0 &&
                                 f->output.len == 0;

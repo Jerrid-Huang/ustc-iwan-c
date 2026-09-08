@@ -196,6 +196,16 @@ static void conn_reconcile_rxq(TcpConn *c)
 {
     if (c->pcb == NULL)
         return;
+    /* R07-FIX B-2 (LOW, defensive): rxq.len >= rxq_unrecved means the socks
+     * layer has drained every delivered-but-unacknowledged byte, so there is
+     * nothing left to tcp_recved() — the subtraction below would underflow.
+     * Unreachable today: recv_cb only appends both counters in lockstep and
+     * every drain/last reconcile drops rxq_unrecved by the same amount, so
+     * rxq_unrecved - rxq.len stays a non-negative "unacked" count. Guard is
+     * kept so a future invariant break degrades to a no-op, not to a huge
+     * size_t (>= 0xFFFF) blindly fed to tcp_recved(). */
+    if (c->rxq.len >= c->rxq_unrecved)
+        return;
     size_t to_recved = c->rxq_unrecved - c->rxq.len;
     if (to_recved == 0)
         return;
@@ -394,8 +404,18 @@ static err_t bridge_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p,
                          err_t err)
 {
     TcpConn *c = (TcpConn *)arg;
-    if (c->pcb != pcb)
+    /* R07-FIX B-3 (LOW, defensive): stale callback — the slot was reused but
+     * the OLD pcb's recv still reached us. Free the pbuf we own before
+     * returning, or it leaks. p may be NULL (that is lwIP's EOF marker, not a
+     * buffer) in which case there is nothing to free. Unreachable today:
+     * slot reuse requires c->pcb == NULL while this pcb's callback_arg was
+     * cleared when lwIP freed it, so a live pcb can never mismatch c->pcb;
+     * kept as cheap hardening. */
+    if (c->pcb != pcb) {
+        if (p)
+            pbuf_free(p);
         return ERR_OK;   /* stale: slot was reused */
+    }
 
     if (p == NULL) {
         /* remote FIN (EOF). Active close: we already sent our FIN, so after
@@ -438,6 +458,13 @@ static void bridge_err(void *arg, err_t err)
     c->pcb = NULL;        /* lwIP freed the pcb just before firing err_cb */
     c->reap_pending = 1;  /* defer reuse until update_tcp_states has read it */
     buf_free(&c->rxq);    /* discard undrained data, like native conn_clear */
+    /* R07-FIX B-4 (LOW, invariant): keep rxq_unrecved in sync with the
+     * conn_reconcile_rxq invariant (append adds, drain drops the same
+     * amount, reset to 0) — the rxq is being discarded wholesale here, so
+     * the outstanding unacknowledged count must go back to 0 too, or a
+     * later reconcile on this slot's reused life could compute a bogus
+     * tcp_recved() window. */
+    c->rxq_unrecved = 0;
 }
 
 static err_t bridge_poll(void *arg, struct tcp_pcb *pcb)
@@ -880,11 +907,19 @@ void ns_abort(Netstack *ns, int idx)
      * tcp_recved() a freed pcb via conn_reconcile_rxq (real UAF). Clear
      * the slot unconditionally: on a normal abort bridge_err already ran
      * synchronously (pcb==NULL, reap_pending=1) and this is a no-op; on
-     * the TW path it is the missing cleanup. */
+     * the TW path it is the missing cleanup.
+     * R07-FIX B-4 (LOW, invariant): this TW branch discards undelivered
+     * downlink data, so it must also drop rxq and zero rxq_unrecved to match
+     * bridge_err's semantics and the conn_reconcile_rxq invariant (append
+     * adds, drain drops the same amount, reset goes back to 0) — otherwise
+     * the slot's next life could reconcile a stale unacked count. */
     if (c->pcb != NULL) {
         c->pcb = NULL;
         c->state = NS_CLOSED;
         c->reap_pending = 1;
+        c->rxq_unrecved = 0;   /* R07-FIX B-4: drop undelivered rxq like
+                                * bridge_err (buf is freed below) */
+        buf_free(&c->rxq);
     }
 }
 
@@ -943,20 +978,33 @@ bool ns_port_tw_held(uint16_t p)
 static void conn_reap_if_dead(Netstack *ns, int idx, uint64_t now)
 {
     TcpConn *c = &ns->conns[idx];
-    /* FIND-R2-3 / FIND-F09-R1: reclaim a gracefully-closed slot only when
-     * ALL of the following hold:
-     *   - c->pcb != NULL and the pcb has left the active poll loop (it is
-     *     in TIME_WAIT, or LAST_ACK about to be freed) => lwIP can no
-     *     longer fire err_cb at the slot;
+    /* FIND-R2-3 / FIND-F09-R1 / R07-FIX B-1 (LOW): reclaim a gracefully-closed
+     * slot only when ALL of the following hold:
+     *   - c->pcb != NULL and its lwIP state is exactly TIME_WAIT (see the
+     *     TW-only rationale below);
      *   - c->rxq.len == 0 => the undrained trailing data has been fully
      *     pushed to the local client (service_local_outputs); the old
      *     "poll stopped 1s" test alone dropped tail bytes on slow clients;
      *   - no flow references the slot (FIND-R2-5 invariant). The slot
      *     staying referenced is what lets service_local_outputs keep
      *     draining rxq; this function runs after the flow is freed.
+     * TW-only rationale: only a TIME_WAIT pcb is freed by lwIP SILENTLY
+     * (tcp_slowtmr and tcp_abandon's TW branch call tcp_free() with no err
+     * callback), so the bridge itself must null c->pcb or it would dangle
+     * into a later ns_tick tcp_recved(). A LAST_ACK pcb is still on
+     * tcp_active_pcbs and lwIP fires err_cb when it is freed (ERR_CLSD from
+     * tcp_input_delayed_close on the completing ACK, or ERR_ABRT from
+     * tcp_slowtmr's LAST_ACK expiry); nulling c->pcb here would let that
+     * later err_cb hit a reused slot and kill an unrelated connection.
+     * LAST_ACK is therefore left to ns_tick's LAST_ACK timeout branch
+     * (ns_abort, synchronous cleanup) or to lwIP's own err_cb (bridge_err).
+     * Reading c->pcb->state is valid: c->pcb != NULL is checked above, and
+     * this function runs inside ns_tick BEFORE sys_check_timeouts() of the
+     * same round, so lwIP's slowtmr has not yet free'd any pcb this round.
      * The lport is NOT returned here: lwIP's TIME_WAIT keeps owning it for
      * 2*MSL, and alloc_port avoids it via ns_port_tw_held (FIND-F03-3). */
     if (c->state == NS_CLOSED && c->pcb != NULL &&
+        c->pcb->state == TIME_WAIT &&
         c->rxq.len == 0 &&
         ns_flow_held(idx) == 0 &&
         now - c->last_poll_ms > NS_POLL_DEAD_MS) {
