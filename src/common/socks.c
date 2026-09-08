@@ -763,6 +763,18 @@ static int socks_reauth_tunnel(SocksConfig *cfg)
          * sid/token); lwIP's RTO retransmits the same segments with the
          * new header. Old-session downlink frames are rejected by the
          * sid/token gate in receive_vpn. */
+        /* R4-09-F3: dns_reset() above retired all in-flight DNS workers and
+         * cleared the wait table, so a flow still in ST_RESOLVING can never
+         * get a result — fail it now (matching the IP-change path) rather
+         * than leave it hanging to the 30s handshake timeout with no reply. */
+        for (int i = 0; i < MAX_FLOWS; i++) {
+            Flow *f = &g_flows[i];
+            if (f->active && f->state == ST_RESOLVING) {
+                f->ns_idx = -1;
+                queue_socks_error(f, 4);
+                set_flow_state(f, ST_CLOSING);
+            }
+        }
         ns_set_outer(&g_ns, oh, cfg->xor_key);
         while (ns_tx_peek(&g_ns))
             ns_tx_pop(&g_ns);
@@ -779,10 +791,19 @@ static int socks_reauth_tunnel(SocksConfig *cfg)
 }
 
 /* re-auth succeeded: swap the tunnel socket in place */
-static void socks_reauth_swap(int *sockfd, int nfd)
+static void socks_reauth_swap(int *sockfd, int nfd, SocksConfig *cfg)
 {
     if (nfd < 0)
         return;
+    /* FIND-F02-1: the GSO cache lives on the SocksConfig but UDP_SEGMENT is
+     * a per-SOCKET option — after swapping in a fresh session fd the old
+     * gso_ok/gso_mss describe a socket that no longer exists (the new one
+     * was never configured), so reset to untried and let the next send
+     * batch re-probe. Otherwise the inline state machine would send long
+     * datagrams as if GSO were armed: silent kernel IP fragmentation /
+     * EMSGSIZE + throughput loss (and the M11 re-probe never sees it). */
+    cfg->gso_ok = 0;   /* socks.h semantics: 0 = untried */
+    cfg->gso_mss = 0;
     port_close(*sockfd);
     *sockfd = nfd;
     g_sockfd = nfd;
@@ -940,7 +961,7 @@ int run_socks(int sockfd, SocksConfig *cfg) {
             log_err("SOCKS: no downlink for %llu ms; re-authing tunnel",
                     (unsigned long long)(now_ms() - cfg->last_rx));
             int nfd = socks_reauth_tunnel(cfg);
-            socks_reauth_swap(&sockfd, nfd);
+            socks_reauth_swap(&sockfd, nfd, cfg);
             if (nfd < 0 && !cfg->reauth) {
                 cfg->session_lost = true;
                 g_stop = 1;
@@ -950,7 +971,7 @@ int run_socks(int sockfd, SocksConfig *cfg) {
         /* a failed re-auth retries on this schedule */
         if (cfg->reauth_at != 0 && now_ms() >= cfg->reauth_at) {
             int nfd = socks_reauth_tunnel(cfg);
-            socks_reauth_swap(&sockfd, nfd);
+            socks_reauth_swap(&sockfd, nfd, cfg);
         }
         /* flush leftover tx items first: their segment pointers stay
          * valid only until receive_vpn's handle_rx drop/compact moves
@@ -963,7 +984,7 @@ int run_socks(int sockfd, SocksConfig *cfg) {
              * success; on failure it stays cleared so the retry runs
              * on the reauth_at schedule instead of every loop round. */
             int nfd = socks_reauth_tunnel(cfg);
-            socks_reauth_swap(&sockfd, nfd);
+            socks_reauth_swap(&sockfd, nfd, cfg);
             if (nfd < 0 && !cfg->reauth) {
                 break;
             } else if (nfd < 0) {
@@ -977,7 +998,7 @@ int run_socks(int sockfd, SocksConfig *cfg) {
             log_err("SOCKS: %d consecutive keepalive send failures; "
                     "re-authing tunnel", cfg->ka_fail);
             int nfd = socks_reauth_tunnel(cfg);
-            socks_reauth_swap(&sockfd, nfd);
+            socks_reauth_swap(&sockfd, nfd, cfg);
             if (nfd < 0 && !cfg->reauth) {
                 cfg->session_lost = true;
                 g_stop = 1;
@@ -989,7 +1010,7 @@ int run_socks(int sockfd, SocksConfig *cfg) {
             /* server CLOSE / hard recv error: re-auth in place when a
              * callback exists, else legacy exit for the caller loop */
             int nfd = socks_reauth_tunnel(cfg);
-            socks_reauth_swap(&sockfd, nfd);
+            socks_reauth_swap(&sockfd, nfd, cfg);
             if (nfd >= 0)
                 continue;
             if (!cfg->reauth) {

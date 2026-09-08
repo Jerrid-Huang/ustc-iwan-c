@@ -48,6 +48,10 @@
                              * runs; over the cap the flow stops reading and
                              * the kernel buffers (backpressure) */
 #define TCP_RX_CHUNK        16384
+#define ST_CLOSING_TIMEOUT_MS 30000u /* R4-09-F1: bound a stuck closing flow
+                             * (client never drains the queued reply) so a
+                             * dead-connection flow is force-reaped instead
+                             * of pinning its fd/slot forever */
 
 static const char *flow_state_name(FlowState st)
 {
@@ -1636,6 +1640,12 @@ void update_tcp_states(void) {
              * reset the reason before this read; worst case the flow
              * reports rep=5. A re-established flow already got its
              * success reply: close without a second reply. */
+            /* R4-09-F1: detach the dead slot index BEFORE the flow leaves
+             * ST_CONNECTING — term_reason was read above, and from the
+             * next round on the slot may be reused for a new flow, in
+             * which case a stale ns_idx would make this flow read or
+             * write another flow's connection. */
+            f->ns_idx = -1;
             if (f->reply_sent) {
                 set_flow_state(f, ST_CLOSING);
             } else {
@@ -1655,7 +1665,41 @@ void update_tcp_states(void) {
     }
 }
 
+/* R4-09-F1: has the netstack connection this flow references died?
+ * bridge_err() marks the slot NS_CLOSED with pcb==NULL; ns_tick clears
+ * reap_pending on the very next tick, after which conn_slot_alloc may
+ * hand the slot to a NEW flow. While the flow still holds the index it
+ * must not touch the slot — otherwise its input/output servicing reads
+ * or writes another flow's connection. */
+static bool flow_conn_dead(const Flow *f)
+{
+    TcpConn *c;
+    if (f->ns_idx < 0)
+        return false;
+    c = ns_conn(&g_ns, f->ns_idx);
+    /* FIND-F03-1: "dead" = the pcb is GONE (slot reusable, a stale
+     * ns_idx would read/write another flow's conn). A graceful shutdown
+     * (state==NS_CLOSED but pcb still alive in TIME_WAIT/LAST_ACK) is
+     * NOT dead: the slot cannot be reused while pcb != NULL, and the
+     * rxq may still hold undrained trailing response bytes that
+     * service_local_outputs must deliver before the fd closes. */
+    return c == NULL || c->pcb == NULL;
+}
+
 void service_local_inputs(Flow *fs) {
+    /* R4-09-F1: detach every flow from a dead netstack connection before
+     * any handshake this round can allocate the freed slot (conn_slot_alloc
+     * reuses pcb==NULL slots; a stale ns_idx would make this flow read or
+     * write another flow's connection). ST_CONNECTING is handled by
+     * update_tcp_states later this round (it needs term_reason for the
+     * reply), and its dead slot is still reap_pending-protected today. */
+    for (int i = 0; i < MAX_FLOWS; i++) {
+        Flow *f = &fs[i];
+        if (f->active && f->state != ST_CONNECTING && flow_conn_dead(f)) {
+            f->ns_idx = -1;
+            set_flow_state(f, ST_CLOSING);
+        }
+    }
     for (int i = 0; i < MAX_FLOWS; i++) {
         Flow *f = &fs[i];
         if (!f->active || f->local_eof)
@@ -1690,8 +1734,17 @@ void service_local_inputs(Flow *fs) {
                                       ? f->input.len - used
                                       : iov[k].iov_len;
                     memcpy(iov[k].iov_base, f->input.data + used, take);
-                    ns_send_commit(&g_ns, f->ns_idx, take);
-                    used += take;
+                    /* R4-09-F2: ns_send_commit returns what tcp_write
+                     * actually accepted; it can be 0/short on ERR_MEM
+                     * (pbuf / MEMP_TCP_SEG pool exhaustion, independent
+                     * of snd_buf). Only count what lwIP took — anything
+                     * else must stay in f->input for a later retry. */
+                    int w = ns_send_commit(&g_ns, f->ns_idx, take);
+                    if (w <= 0)
+                        break;   /* nothing accepted: keep take in input */
+                    used += (size_t)w;
+                    if ((size_t)w < take)
+                        break;   /* partial commit: keep the remainder */
                     if (take < iov[k].iov_len)
                         break;   /* input exhausted mid-slot */
                 }
@@ -1743,8 +1796,33 @@ void service_local_inputs(Flow *fs) {
                     for (int k = 0; k < nv && left > 0; k++) {
                         size_t take = left < iov[k].iov_len ? left
                                                              : iov[k].iov_len;
-                        ns_send_commit(&g_ns, f->ns_idx, take);
-                        left -= take;
+                        /* R4-09-F2: only count bytes lwIP actually
+                         * accepted (ns_send_commit can return 0/short on
+                         * ERR_MEM, independent of snd_buf). */
+                        int w = ns_send_commit(&g_ns, f->ns_idx, take);
+                        if (w > 0)
+                            left -= (size_t)w;
+                        if (w < (int)take)
+                            break;
+                    }
+                    if (left > 0) {
+                        /* R4-09-F2: readv already pulled these bytes out
+                         * of the client socket's kernel buffer, but lwIP
+                         * did not accept them — copy the uncommitted tail
+                         * (contiguous in the netstack scratch) back into
+                         * f->input so the spill path retries next tick
+                         * instead of silently dropping the upload. */
+                        TcpConn *dc = ns_conn(&g_ns, f->ns_idx);
+                        if (dc) {
+                            size_t tail = (size_t)r2 - left;
+                            buf_put(&f->input, dc->scratch + tail, left);
+                        }
+                        f->rx_paused = true;
+                        /* stop this round's readv loop: further batches
+                         * would place newer bytes after the preserved tail
+                         * in f->input and break stream ordering; the spill
+                         * path retries the tail on a later round */
+                        break;
                     }
                 } else if (r2 == 0) {
 #ifndef _WIN32
@@ -1941,19 +2019,40 @@ void service_local_outputs(void) {
 void reap_flows(void) {
     for (int i = 0; i < MAX_FLOWS; i++) {
         Flow *f = &g_flows[i];
+        int removable = 0;
         if (!f->active)
             continue;
-        int removable;
         if (f->ns_idx >= 0) {
             TcpConn *c = ns_conn(&g_ns, f->ns_idx);
-            /* the netstack rxq is the flow's receive buffer: a flow must
-             * not be freed while it still holds undelivered data — the
-             * close(fd) would reset the client socket (RST on unread
-             * data) and the rxq payload would be lost */
-            removable = c && c->state == NS_CLOSED && c->rxq.len == 0 &&
-                        f->output.len == 0;
-        } else {
-            removable = f->state == ST_CLOSING && f->output.len == 0;
+            if (c == NULL || c->pcb == NULL) {
+                /* R4-09-F1 / FIND-F03-1: connection DIED (pcb gone, slot
+                 * reusable) — detach the slot index so it can be reused
+                 * safely; the flow is drained and reaped as a closing
+                 * flow below. Note: a graceful shutdown (state==NS_CLOSED
+                 * but pcb alive in TIME_WAIT/LAST_ACK) falls through to
+                 * the removable branch — it may still hold trailing rxq
+                 * bytes, and "don't free while undelivered data remains"
+                 * must keep the slot until they are drained. */
+                f->ns_idx = -1;
+                set_flow_state(f, ST_CLOSING);
+            } else {
+                /* the netstack rxq is the flow's receive buffer: a flow
+                 * must not be freed while it still holds undelivered data
+                 * — the close(fd) would reset the client socket (RST on
+                 * unread data) and the rxq payload would be lost */
+                removable = c->state == NS_CLOSED && c->rxq.len == 0 &&
+                            f->output.len == 0;
+            }
+        }
+        if (f->ns_idx < 0) {
+            if (f->state == ST_CLOSING &&
+                now_ms() - f->state_ms >= ST_CLOSING_TIMEOUT_MS) {
+                /* client never drained the reply: force-reap the flow */
+                buf_clear(&f->output);
+                removable = 1;
+            } else {
+                removable = f->state == ST_CLOSING && f->output.len == 0;
+            }
         }
         if (removable) {
             flow_free(f);

@@ -62,6 +62,8 @@ static char *state_file_path(void)
 #endif
     size_t n = strlen(dir) + 64;
     char *p = malloc(n);
+    if (!p)
+        oidc_die("out of memory");   /* fail closed: cannot persist the state */
 #ifdef _WIN32
     /* no uid on Windows: the USERNAME env var stands in for the per-user
      * directory component. This is not a security boundary — the file is
@@ -149,10 +151,14 @@ static void make_pkce(char **verifier_out, char **challenge_out)
     uint8_t vb[64];
     oidc_rand_bytes(vb, sizeof vb);
     char *code_verifier = b64url_no_pad(vb, sizeof vb);
+    if (!code_verifier)
+        oidc_die("out of memory");   /* fail closed: no verifier, no login */
     uint8_t ch[32];
     sha256(code_verifier, strlen(code_verifier), ch);
     *verifier_out = code_verifier;
     *challenge_out = b64url_no_pad(ch, sizeof ch);
+    if (!*challenge_out)
+        oidc_die("out of memory");   /* fail closed: no S256 challenge */
 }
 
 /* 32 random alphanumeric characters, malloc'd */
@@ -161,6 +167,8 @@ static char *make_state(void)
     static const char ALPH[] =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     char *state = malloc(33);
+    if (!state)
+        oidc_die("out of memory");   /* fail closed: no CSRF state to issue */
     for (int i = 0; i < 32; i++)
         state[i] = ALPH[rand_u32() % 62];
     state[32] = '\0';
@@ -198,14 +206,25 @@ static char *read_redirect_url(void)
     char rline[4096];
     if (!fgets(rline, sizeof rline, stdin))
         oidc_die("no redirect URL");
-    char *nl = strchr(rline, '\n');
-    if (nl)
-        *nl = '\0';
-    else if (!feof(stdin))
-        /* no newline but not EOF: the paste exceeded the buffer and was
-         * silently truncated — the resulting URL would fail with a
-         * baffling state/code mismatch later, so fail loudly instead */
-        oidc_die("redirect URL too long (max 4095 bytes)");
+    size_t len = strlen(rline);
+    if (len > 0 && rline[len - 1] == '\n') {
+        rline[--len] = '\0';
+        if (len > 0 && rline[len - 1] == '\r')
+            rline[--len] = '\0';          /* CRLF paste */
+    } else if (!feof(stdin) && len >= sizeof rline - 1) {
+        /* buffer full, no newline, not EOF: either genuinely too long or
+         * a 4095-byte paste whose newline is still pending; peek one
+         * char to tell them apart (fail only when the URL really
+         * exceeds 4095) */
+        int c = fgetc(stdin);
+        if (c != '\n' && c != EOF && c != '\r')
+            oidc_die("redirect URL too long (max 4095 bytes)");
+        /* whitespace after the URL (newline/CR) is fine */
+        if (c != EOF) {
+            int c2 = (c == '\r') ? fgetc(stdin) : c;   /* consume optional \r\n */
+            (void)c2;
+        }
+    }
 
     /* refuse URLs that do not carry our private-use scheme: pasting an
      * arbitrary http(s) URL here would otherwise make the client parse
@@ -246,13 +265,25 @@ static Json *exchange_code(const char *code, const char *code_verifier)
     char *resp = NULL;
     if (!https_post(OIDC_AUTH_HOST, OIDC_TOKEN_PATH, (char *)body.data,
                     headers, &st, &resp)) {
-        buf_free(&body);
-        oidc_die("token exchange failed (HTTP %d): %s", st,
+        /* R4-03-4: free resp on the die path, but format the message
+         * FIRST — oidc_die consumes its args immediately and resp must
+         * still be alive while it is read */
+        char msg[512];
+        snprintf(msg, sizeof msg, "token exchange failed (HTTP %d): %s", st,
                  resp && *resp ? resp : "no response (transport error)");
+        buf_free(&body);
+        free(resp);
+        oidc_die("%s", msg);
     }
     buf_free(&body);
-    if (st != 200)
-        oidc_die("token exchange failed HTTP %d: %s", st, resp ? resp : "");
+    if (st != 200) {
+        /* R4-03-4: same ordering — format before freeing resp */
+        char msg[512];
+        snprintf(msg, sizeof msg, "token exchange failed HTTP %d: %s", st,
+                 resp ? resp : "");
+        free(resp);
+        oidc_die("%s", msg);
+    }
 
     Json *tok = json_parse(resp);
     free(resp);

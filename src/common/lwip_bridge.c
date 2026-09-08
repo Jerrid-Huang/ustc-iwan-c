@@ -466,8 +466,18 @@ void ns_init(Netstack *ns, uint32_t inner_ip, uint32_t gw, uint16_t mtu)
     /* H4: a live stack (re-auth, any session) may still have pcbs on
      * lwIP's lists — tear them down before the memset + re-init. A
      * first init finds an empty netif pointer and skips this. */
-    if (old_netif != NULL)
+    if (old_netif != NULL) {
         ns_teardown_pcbs();
+        /* FIND-F03-4: the teardown frees every pcb, but a TIME_WAIT
+         * pcb's abort fires no err callback (lwIP frees TW without
+         * TCP_EVENT_ERR), so that slot's rxq — undrained trailing bytes
+         * from a graceful half-close — is never released by bridge_err.
+         * Free every slot's rxq now; buf_free is idempotent, so slots
+         * already released by bridge_err are safe. Without this the
+         * memset below drops the pointers and each re-auth leaks them. */
+        for (int i = 0; i < NS_MAX_CONN; i++)
+            buf_free(&ns->conns[i].rxq);
+    }
 
     memset(ns, 0, sizeof *ns);
     /* every tx slot starts free; the lport_map hint starts empty */
@@ -639,9 +649,11 @@ fail:
     /* abort FIRST, while the arg is still the conn: tcp_abort fires the
      * err callback synchronously, and bridge_err early-returns on a NULL
      * pcb (c->pcb is not assigned until success). Nulling the arg first
-     * would make bridge_err dereference a NULL conn (crash). */
-    tcp_abort(pcb);
-    tcp_arg(pcb, NULL);
+     * would make bridge_err dereference a NULL conn (crash). Note the
+     * pcb is FREED by tcp_abort (tcp_abandon -> tcp_free), so no
+     * tcp_arg(pcb, ...) is allowed after it — that would be a
+     * use-after-free write into the returned memp (FIND-F03-2). */
+    tcp_abort(pcb);   /* async bridge_err already ran; pcb now free */
     c->pcb = NULL;
     return -1;
 }

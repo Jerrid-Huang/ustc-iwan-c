@@ -989,7 +989,11 @@ void route_teardown(const char *tun, const char *srv, const char *ogw,
                             "default via %s dev %s", ogw, odev);
             }
         } else {
-            char *d3[] = { "route", "del", (char *)c, NULL };
+            /* only remove the entry we installed on the tunnel dev; an
+             * unqualified del could clobber a same-prefix route on
+             * another device */
+            char *d3[] = { "route", "del", (char *)c, "dev",
+                           (char *)tun, NULL };
             if (!ip_run(d3))
                 log_debug("route_teardown: route del %s: not present", c);
         }

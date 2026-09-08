@@ -43,8 +43,14 @@ void lockout_note(lockout_rec *tbl, int n, const void *key, size_t klen,
     }
     if (!e)
         e = oldest;
-    /* fresh entry, or the previous burst aged out of the window */
-    if (e->first_fail_ms == 0 || now - e->first_fail_ms > window_ms) {
+    /* fresh entry: an empty slot, a slot whose key changed (full-table
+     * eviction taking over a different source's record — the victim's
+     * fail count / blocked_until_ms must NOT be inherited by the new
+     * key), or the previous burst aged out of the window (R4-06-3: the
+     * window ends at exactly window_ms, hence >=) */
+    if (e->first_fail_ms == 0 ||
+        memcmp(e->key, key, klen) != 0 ||
+        now - e->first_fail_ms >= window_ms) {
         memset(e, 0, sizeof *e);
         memcpy(e->key, key, klen);
         e->fail = 1;

@@ -148,6 +148,17 @@ char *oidc_url_param(const char *s, const char *name)
     const char *p = q + 1;
     while (*p) {
         const char *amp = strchr(p, '&');
+        const char *hash = strchr(p, '#');
+        if (hash && (!amp || hash < amp)) {
+            /* a '#' begins the fragment, which terminates the query
+             * (RFC 3986): this segment ends at the hash (possibly
+             * empty) and the scan stops after it */
+            size_t seg = (size_t)(hash - p);
+            const char *kv = memchr(p, '=', seg);
+            if (kv && (size_t)(kv - p) == nlen && strncmp(p, name, nlen) == 0)
+                return oidc_urldec(kv + 1, seg - nlen - 1);
+            break;
+        }
         size_t seg = amp ? (size_t)(amp - p) : strlen(p);
         const char *kv = memchr(p, '=', seg);
         if (kv && (size_t)(kv - p) == nlen && strncmp(p, name, nlen) == 0)

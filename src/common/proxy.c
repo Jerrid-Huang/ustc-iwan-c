@@ -1106,7 +1106,11 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
      * window between this check and the loop start is honored.) */
     if (g_user_stop) {
         log_info("TUN proxy: stop requested during setup; aborting");
-        route_iface_down(tun_name);
+        /* route_setup may already have replaced the default route and
+         * installed the server pin / proxy routes / preserve route, so
+         * roll all of them back exactly like the normal/fail paths */
+        teardown_routes(tun_name, auth_tun_ip, server, ogw, odev,
+                        ogw_metric, &routes, had_routes, &routes6);
         slist_free(&routes);
         slist_free(&routes6);
         return -1;
@@ -1125,7 +1129,12 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
         uint8_t b4[4];
         if (!s2ip4(auth_tun_ip, b4)) {
             log_err("invalid auth tunnel IP '%s'", auth_tun_ip);
+            /* this runs after routes may already be installed, so it
+             * must roll them back too before bailing out */
+            teardown_routes(tun_name, auth_tun_ip, server, ogw, odev,
+                            ogw_metric, &routes, had_routes, &routes6);
             slist_free(&routes);
+            slist_free(&routes6);
             return -1;
         }
         ctx.inner_ip = ip4_u32(b4);

@@ -462,10 +462,12 @@ static int authenticate(const CmdOpts *o, int style, AuthResult *res)
                             o->server, o->port, style, res);
     if (r == -1) {
         log_err("Error: invalid --ct-pass hex (want exactly 32 hex digits)");
-        cleanse_str(o->ct_pass);   /* last use of the ct pass */
+        cleanse_str(o->ct_pass);   /* error path: ct pass can never be
+                                    * reused, wipe it now */
         return -1;
     }
-    cleanse_str(o->ct_pass);   /* last use of the ct pass */
+    /* success: keep ct_pass so reconnect/re-auth can reuse the credential;
+     * the terminal caller (cmd_proxy / cmd_socks) wipes it at session end */
     if (r == -2) {
         fprintf(stderr, "Error: username too long (max %d bytes)\n",
                 IWAN_TLV_VLEN_MAX);
@@ -694,6 +696,7 @@ static int cmd_proxy(int argc, char **argv, int start)
 
     if (!tun_name_valid(o.tun)) {
         log_err("Error: invalid TUN device name '%s'", o.tun);
+        slist_free(&routes);
         free_route_opts(&o);
         return 1;
     }
@@ -822,6 +825,7 @@ static int cmd_proxy(int argc, char **argv, int start)
             break;   /* Ctrl-C during the reconnect wait */
     }
     cleanse_str(o.pass);
+    cleanse_str(o.ct_pass);
     relay_proxy_stop(rp);
     tun_close(tun_fd);
     log_info("done.");
@@ -831,37 +835,9 @@ static int cmd_proxy(int argc, char **argv, int start)
     return rc == 0 ? 0 : 1;
 }
 
-/* in-place tunnel re-auth (socks.h): re-authenticate and refresh the
- * session fields of cfg. The SOCKS listener, flows and lwIP inner TCP
- * state are kept by run_socks; only the carrier switches. */
-static int socks_reauth_cb(void *ud, SocksConfig *cfg, int *out_fd)
-{
-    CmdOpts *o = ud;
-    AuthResult res;
-    int fd = authenticate(o, DO_AUTH_PUMP, &res);
-    if (fd < 0) {
-        log_err("SOCKS re-auth: authenticate failed");
-        return -1;
-    }
-    uint8_t sk[16];
-    session_key(o->user, o->pass, sk);
-    uint32_t inner_ip, gateway;
-    int ar = auth_result_addrs(&res, &inner_ip, &gateway);
-    if (ar == 0)
-        log_err("SOCKS re-auth: server returned invalid tun");
-    else if (ar < 0)
-        log_err("SOCKS re-auth: server returned invalid gw");
-    if (ar != 1) {
-        wipe(sk, sizeof sk);
-        port_close(fd);
-        return -1;
-    }
-    socks_cfg_from_auth(cfg, &res, inner_ip, gateway, sk,
-                        (int)(res.mtu < o->mtu ? res.mtu : o->mtu));
-    wipe(sk, sizeof sk);
-    *out_fd = fd;
-    return 0;
-}
+/* (R4-01-2: in-place tunnel re-auth was removed from cmd_socks — the
+ * reconnect loop owns session recovery now, so the old re-auth callback
+ * was deleted; see git history. Nothing else used it.) */
 
 static int cmd_socks(int argc, char **argv, int start)
 {
@@ -910,6 +886,7 @@ static int cmd_socks(int argc, char **argv, int start)
             if (!reconnecting) {
                 log_err("Error: auth failed");
                 cleanse_str(o.pass);
+                cleanse_str(o.ct_pass);
                 return 1;
             }
             /* a reconnect hit the same loss window that killed the
@@ -919,6 +896,7 @@ static int cmd_socks(int argc, char **argv, int start)
             port_sleep_ms(3000);
             if (g_user_stop) {
                 cleanse_str(o.pass);
+                cleanse_str(o.ct_pass);
                 return 1;
             }
             continue;
@@ -944,6 +922,7 @@ static int cmd_socks(int argc, char **argv, int start)
             wipe(sk, sizeof sk);
             port_close(sockfd);
             cleanse_str(o.pass);
+            cleanse_str(o.ct_pass);
             return 1;
         }
         check_gw_server(o.server, res.gw);   /* F8 */
@@ -964,9 +943,13 @@ static int cmd_socks(int argc, char **argv, int start)
         cfg.open_proxy = o.socks_no_token;
         cfg.allow_remote = o.allow_remote;
         cfg.ipv6 = o.socks_ipv6;
-        cfg.reauth = socks_reauth_cb;   /* in-place tunnel re-auth */
-        cfg.reauth_ud = &o;
-
+        /* No in-place re-auth callback: run_socks never swaps/closes the
+         * session fd (socks_reauth_tunnel bails on !cfg->reauth), so the
+         * port_close(sockfd) below closes exactly the fd we opened — no
+         * double close, no leaked replacement socket. Session recovery is
+         * owned by this outer reconnect loop (the same way cmd_proxy does
+         * it): on session loss run_socks returns 1 and we re-run
+         * authenticate() + run_socks() above. */
         int rc = run_socks(sockfd, &cfg);
         port_close(sockfd);
         if (rc == 0)
@@ -980,6 +963,7 @@ static int cmd_socks(int argc, char **argv, int start)
             break;   /* Ctrl-C during the reconnect wait */
     }
     cleanse_str(o.pass);
+    cleanse_str(o.ct_pass);
     return 0;
 }
 

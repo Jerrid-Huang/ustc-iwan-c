@@ -419,8 +419,18 @@ int open_tun(const char *name)
          * state; a freshly created adapter has no stale state to clear,
          * so only the reused path retries. wintun >= 0.14 has no
          * WintunDeleteAdapter export, so the stale adapter is removed
-         * through SetupDi by name. */
-        if (session == NULL && !created) {
+         * through SetupDi by name.
+         *
+         * wintun allows only one session per adapter, so a
+         * start_session failure on a reused adapter can equally mean
+         * another process currently owns the live session on it. Only
+         * the documented "wedged adapter" error (ERROR_DEVICE_NOT_CONNECTED,
+         * 1247) authorizes removing the device; any other failure must
+         * NOT delete the adapter, or a live session owned by another
+         * process would be torn out from under it. */
+        if (session == NULL && !created &&
+            serr == ERROR_DEVICE_NOT_CONNECTED) {
+            BOOL made = TRUE;   /* was the reopened adapter created here? */
             log_err("tun: WintunStartSession failed on reused adapter "
                     "(error %lu); deleting stale adapter and retrying",
                     (unsigned long)serr);
@@ -431,11 +441,19 @@ int open_tun(const char *name)
                 adapter = iwan_wintun.create_adapter(name16,
                                                      IWAN_WINTUN_POOL,
                                                      &IWAN_WINTUN_GUID);
+                if (adapter == NULL &&
+                    GetLastError() == ERROR_ALREADY_EXISTS) {
+                    /* lost a create race with another process: open the
+                     * winner (mirrors the create-race fallback above) */
+                    adapter = iwan_wintun.open_adapter(name16,
+                                                       IWAN_WINTUN_POOL);
+                    made = FALSE;
+                }
                 if (adapter == NULL)
                     Sleep(500);
             }
             if (adapter != NULL) {
-                created = TRUE;
+                created = made;
                 for (attempt = 0; attempt < 4 && session == NULL;
                      attempt++) {
                     session = iwan_wintun.start_session(
@@ -511,13 +529,21 @@ void set_nonblock(int fd)
     (void)fd;   /* wintun receive is always non-blocking, send blocking */
 }
 
-ptrdiff_t tun_write(int fd, const void *buf, size_t len)
+/* Core wintun write with a retry budget. max_ms <= 0 disables the
+ * budget check (tun_write's unlimited legacy 20-iteration behaviour);
+ * stop (may be NULL) is re-checked at the top of every retry iteration.
+ * NOTE: the DLL's own blocking (WintunAllocateSendPacket / the old
+ * blocking send) cannot be interrupted from this layer, so the budget
+ * only bounds the gaps between failed attempts, not the DLL call itself. */
+static ptrdiff_t tun_write_bounded(int fd, const void *buf, size_t len,
+                                   int max_ms, atomic_bool *stop)
 {
     struct tun_slot *s = tun_slot_get(fd);
     if (s == NULL) {
         errno = EBADF;
         return -1;
     }
+    uint64_t t0 = now_ms();
     if (iwan_wintun.allocate_send_packet) {
         /* wintun 0.14+: reserve ring space (blocks until room — that is
          * the backpressure), copy, then send the reserved buffer; the
@@ -527,10 +553,19 @@ ptrdiff_t tun_write(int fd, const void *buf, size_t len)
          * under load; retry briefly before declaring the session dead. */
         BYTE *dst = NULL;
         for (int i = 0; i < 20 && dst == NULL; i++) {
+            if (stop != NULL && *stop) {
+                errno = EINTR;
+                return -1;
+            }
             dst = iwan_wintun.allocate_send_packet(s->session,
                                                    (DWORD)len);
             if (dst == NULL) {
                 atomic_fetch_add(&g_tun_allocfail, 1);
+                if (max_ms > 0 &&
+                    now_ms() - t0 >= (uint64_t)max_ms) {
+                    errno = EAGAIN;
+                    return -1;
+                }
                 Sleep(10);
             }
         }
@@ -544,10 +579,20 @@ ptrdiff_t tun_write(int fd, const void *buf, size_t len)
         /* wintun <= 0.13: BOOL send(Session, Packet, PacketSize) */
         BOOL ok = FALSE;
         for (int i = 0; i < 20 && !ok; i++) {
+            if (stop != NULL && *stop) {
+                errno = EINTR;
+                return -1;
+            }
             ok = iwan_wintun.send_packet_old(s->session, buf,
                                              (DWORD)len);
-            if (!ok)
+            if (!ok) {
+                if (max_ms > 0 &&
+                    now_ms() - t0 >= (uint64_t)max_ms) {
+                    errno = EAGAIN;
+                    return -1;
+                }
                 Sleep(10);
+            }
         }
         if (!ok) {
             errno = EIO;
@@ -557,16 +602,23 @@ ptrdiff_t tun_write(int fd, const void *buf, size_t len)
     return (ptrdiff_t)len;
 }
 
+ptrdiff_t tun_write(int fd, const void *buf, size_t len)
+{
+    return tun_write_bounded(fd, buf, len, -1, NULL);
+}
+
 int tun_write_retry(int fd, const uint8_t *pkt, size_t len, int max_ms,
                     atomic_bool *stop)
 {
-    /* WintunSendPacket blocks until the ring has room, so a single call
-     * is the whole write and no EAGAIN exists: the max_ms bound is
-     * inherent to the kernel ring. The stop flag is honored at entry. */
-    (void)max_ms;
+    /* The DLL blocks internally while the ring is full, so this layer
+     * cannot guarantee a hard max_ms: the budget bounds the retry loop
+     * (failed attempts mean the ring is full or the session is gone,
+     * with a Sleep between tries) and max_ms<=0 maps to the legacy
+     * 200ms window. Stop is re-checked at the top of every iteration. */
     if (stop != NULL && *stop)
         return -1;
-    return tun_write(fd, pkt, len) == (ptrdiff_t)len ? 0 : -1;
+    return tun_write_bounded(fd, pkt, len, max_ms > 0 ? max_ms : 200,
+                             stop) == (ptrdiff_t)len ? 0 : -1;
 }
 
 int tun_steering_attach(int tun_fd)

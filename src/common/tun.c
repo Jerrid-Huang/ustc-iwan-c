@@ -93,7 +93,11 @@ const char *tun_ifname(const char *name)
 static int bpf_prog_load_steer(const struct bpf_insn *insns,
                                    unsigned int cnt, const char *license)
 {
-    char log[4096];
+    /* Zero the log before use: the first load runs with log_level=0
+     * (the kernel need not write anything); if the retry with the
+     * verifier log enabled also fails before filling it, the log_err
+     * below would otherwise print uninitialized stack garbage. */
+    char log[4096] = {0};
     union bpf_attr attr;
     int fd;
 
@@ -139,20 +143,23 @@ int tun_steering_attach(int tun_fd)
     if (memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0 ||
         eh->e_ident[EI_CLASS] != ELFCLASS64)
         return -1;
-    if (eh->e_shoff + (size_t)eh->e_shnum * sizeof(Elf64_Shdr) > olen)
+    /* Bounds checks in subtraction form so a malicious blob can never
+     * make the 64-bit offsets/shifts integer-overflow past olen. */
+    if (eh->e_shoff > olen ||
+        (size_t)eh->e_shnum > (olen - eh->e_shoff) / sizeof(Elf64_Shdr))
         return -1;
     sh = (const Elf64_Shdr *)(o + eh->e_shoff);
     if (eh->e_shstrndx >= eh->e_shnum)
         return -1;
     shstr = &sh[eh->e_shstrndx];
-    if (shstr->sh_offset + shstr->sh_size > olen)
+    if (shstr->sh_offset > olen || shstr->sh_size > olen - shstr->sh_offset)
         return -1;
     shstrtab = (const char *)(o + shstr->sh_offset);
 
     for (int i = 0; i < eh->e_shnum; i++) {
         const char *name;
 
-        if (sh[i].sh_offset + sh[i].sh_size > olen)
+        if (sh[i].sh_offset > olen || sh[i].sh_size > olen - sh[i].sh_offset)
             continue;
         /* R21b: sh_name is an offset into the string table — bound it to
          * the table and require a NUL within it before strcmp can read
@@ -236,7 +243,11 @@ ptrdiff_t tun_write(int fd, const void *buf, size_t len) {
      * payload length consumed to keep tun_write_retry's partial-write
      * arithmetic intact. */
     static _Thread_local uint8_t wbuf[4 + 65536];
-    if (len == 0 || len > 65536) {
+    /* XNU's max datagram for the utun control socket is 65536 bytes
+     * INCLUDING the 4-byte address-family header, so the true maximum
+     * payload is 65532; a 65533..65536 payload would be rejected as
+     * EMSGSIZE by the kernel and take the session down. */
+    if (len == 0 || len > 65536 - 4) {
         errno = len ? EMSGSIZE : EINVAL;
         return -1;
     }
@@ -246,7 +257,15 @@ ptrdiff_t tun_write(int fd, const void *buf, size_t len) {
     memcpy(wbuf, &fam, sizeof fam);
     memcpy(wbuf + sizeof fam, buf, len);
     ssize_t w = write(fd, wbuf, len + sizeof fam);
-    return w < 0 ? (ptrdiff_t)-1 : (ptrdiff_t)len;
+    /* SOCK_DGRAM writes are normally all-or-nothing, but we must not
+     * report a short positive write as a full send (fail closed). */
+    if (w < 0)
+        return -1;
+    if ((size_t)w != len + sizeof fam) {
+        errno = EIO;
+        return -1;
+    }
+    return (ptrdiff_t)len;
 #else
     return (ptrdiff_t)write(fd, buf, len);
 #endif

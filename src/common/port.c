@@ -9,6 +9,7 @@
 #ifdef __linux__
 #include <sys/random.h>
 #endif
+#include <pwd.h>       /* getpwuid (port_home_dir passwd fallback) */
 #include <sys/wait.h>
 #else
 #include <signal.h>
@@ -589,9 +590,13 @@ char *port_home_dir(void)
     }
     return NULL;
 #else
+    /* documented contract (port.h): HOME first, then the passwd entry */
     const char *home = getenv("HOME");
     if (home && home[0])
         return strdup(home);
+    struct passwd *pw = getpwuid(getuid());
+    if (pw && pw->pw_dir && pw->pw_dir[0])
+        return strdup(pw->pw_dir);
     return NULL;
 #endif
 }
@@ -683,6 +688,10 @@ char *port_cmd_capture(char *const argv[], size_t max)
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
     wchar_t cmdline[2048];
+    /* capacity in ELEMENTS (the old guards compared size_t n, an element
+     * index, against sizeof cmdline which is BYTES — off by the wchar_t
+     * size); every write below is bounded against this length */
+    const size_t cmd_cap = sizeof cmdline / sizeof cmdline[0];
     size_t n = 0;
 
     sa.nLength = sizeof sa;
@@ -703,18 +712,37 @@ char *port_cmd_capture(char *const argv[], size_t max)
     for (int i = 0; argv[i]; i++) {
         const char *a = argv[i];
         int quote = strchr(a, ' ') != NULL || strchr(a, '\t') != NULL;
-        if (i > 0 && n < sizeof cmdline - 1)
+        if (i > 0 && n < cmd_cap - 1)
             cmdline[n++] = L' ';
-        if (quote)
+        if (quote) {
+            /* bail safely instead of writing past the array */
+            if (n >= cmd_cap - 1) {
+                CloseHandle(rd);
+                CloseHandle(wr);
+                return NULL;
+            }
             cmdline[n++] = L'"';
-        while (*a && n < sizeof cmdline - 2) {
+        }
+        while (*a && n < cmd_cap - 2) {
             if (*a == '"')
                 cmdline[n++] = L'\\';
             cmdline[n++] = (wchar_t)(unsigned char)*a;
             a++;
         }
-        if (quote)
+        if (quote) {
+            if (n >= cmd_cap - 1) {
+                CloseHandle(rd);
+                CloseHandle(wr);
+                return NULL;
+            }
             cmdline[n++] = L'"';
+        }
+    }
+    if (n >= cmd_cap) {
+        /* no room left even for the terminator */
+        CloseHandle(rd);
+        CloseHandle(wr);
+        return NULL;
     }
     cmdline[n] = L'\0';
 
@@ -1566,7 +1594,6 @@ int port_evfd_create(void)
     struct sockaddr_in a;
     socklen_t alen = sizeof a;
     evfd_peer_t s, peer;
-    int one = 1;
 
     /* process-level singleton: only one evfd exists per process (the
      * SOCKS DNS wakeup). A second create would otherwise silently
@@ -1600,15 +1627,17 @@ int port_evfd_create(void)
         return -1;
     }
     /* the read side must never block the drain; the peer side is only
-     * ever written to */
-    if (port_set_nonblock((int)s, true) != 0) {
+     * ever written to. Make BOTH nonblocking (the old code also shrank
+     * SO_RCVBUF to 1 byte, which made the tiny loopback buffer fill
+     * after a single wake and then block on the next one — removed: the
+     * loopback default is plenty for a one-byte wake, and a full peer
+     * buffer must never stall a DNS worker holding g_dns_wait_mu). */
+    if (port_set_nonblock((int)s, true) != 0 ||
+        port_set_nonblock((int)peer, true) != 0) {
         evfd_close_fd((int)s);
         evfd_close_fd((int)peer);
         return -1;
     }
-    (void)setsockopt((int)s, SOL_SOCKET, SO_RCVBUF, (const char *)&one,
-                     sizeof one);
-    /* loopback rcvbuf: a wake byte is tiny; keep defaults otherwise */
     g_evfd_peer = peer;
     return (int)s;
 }
@@ -1619,8 +1648,18 @@ int port_evfd_wake(int fd)
     (void)fd;   /* the wake side is the static peer socket */
     if (g_evfd_peer == EVFD_INVALID)
         return -1;
-    if (send((int)g_evfd_peer, &c, 1, 0) != 1)
+    if (send((int)g_evfd_peer, &c, 1, 0) != 1) {
+#ifdef _WIN32
+        /* winsock reports the error in WSAGetLastError, not errno */
+        set_sock_errno(fd);
+#endif
+        /* a full peer/loop buffer means a wake is already pending, so
+         * the reader is (or is about to be) awake — treat that as
+         * success rather than failing a DNS worker. */
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            return 0;
         return -1;
+    }
     return 0;
 }
 

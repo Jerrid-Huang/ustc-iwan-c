@@ -213,12 +213,15 @@ static bool rp_fail_blocked(const rp_fail_key *key)
 
 /* ---- target resolution/connect (kernel stack) ---- */
 
-/* literal IPv4/IPv6: connect directly, no resolution. The connect is
- * synchronous: immediate success is taken, EINPROGRESS is polled for
- * writability within RP_CONNECT_TIMEOUT_MS and then SO_ERROR is
- * checked. NOTE: no port_set_nonblock here — the literal paths are
- * blocking-style (the domain path below sets nonblock because it must
- * try many addresses). */
+/* literal IPv4/IPv6: connect directly, no resolution. The connect runs
+ * nonblocking (R4-08-F3): on a blocking socket POSIX never returns
+ * EINPROGRESS, so the old code's EINPROGRESS branch — the only place the
+ * RP_CONNECT_TIMEOUT_MS bound was applied — was dead and a black-holed
+ * literal target could pin a connection thread for the OS's ~130s
+ * default timeout. Now it matches the domain path: nonblock connect,
+ * poll for writability within RP_CONNECT_TIMEOUT_MS, check SO_ERROR,
+ * then restore blocking before the fd is handed to the relay (which
+ * expects blocking sockets). */
 static int rp_connect_literal(int af, const void *addr, uint16_t port,
                               int *fd_out)
 {
@@ -242,27 +245,32 @@ static int rp_connect_literal(int af, const void *addr, uint16_t port,
         sa->sin6_port = htons(port);
         salen = sizeof *sa;
     }
-    if (port_connect(fd, (struct sockaddr *)&ss, salen) == 0 ||
-        errno == EINPROGRESS) {
-        struct pollfd pfd = { .fd = fd, .events = POLLOUT };
-        if (errno == EINPROGRESS) {
-            if (port_poll(&pfd, 1, RP_CONNECT_TIMEOUT_MS) <= 0) {
-                port_close(fd);
-                return -1;
-            }
-            int soerr = 0;
-            socklen_t sl = sizeof soerr;
-            if (port_getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr,
-                                &sl) != 0 || soerr != 0) {
-                port_close(fd);
-                return -1;
-            }
-        }
-        *fd_out = fd;
-        return 0;
+    if (port_set_nonblock(fd, true) != 0) {
+        port_close(fd);
+        return -1;
     }
-    port_close(fd);
-    return -1;
+    if (port_connect(fd, (struct sockaddr *)&ss, salen) == 0) {
+        /* immediate success */
+    } else if (errno == EINPROGRESS) {
+        struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+        if (port_poll(&pfd, 1, RP_CONNECT_TIMEOUT_MS) <= 0) {
+            port_close(fd);
+            return -1;
+        }
+        int soerr = 0;
+        socklen_t sl = sizeof soerr;
+        if (port_getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr,
+                            &sl) != 0 || soerr != 0) {
+            port_close(fd);
+            return -1;
+        }
+    } else {
+        port_close(fd);
+        return -1;
+    }
+    port_set_nonblock(fd, false);   /* relay threads want blocking */
+    *fd_out = fd;
+    return 0;
 }
 
 /* M7: the SSRF gate is on by default; IWAN_RELAY_ALLOW_LOOPBACK=1 is
@@ -551,13 +559,36 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
         rp_socks_reply(fd, rep);
         return -1;
     }
+    /* R4-08-F1: bytes that arrived past the CONNECT frame were already
+     * read out of the client socket during the handshake (rp_hs_recv
+     * reads in multi-KB chunks), so they must be forwarded to the
+     * upstream once it is connected — the relay's direction loop starts
+     * from empty buffers and would otherwise silently drop this
+     * pipelined tunnel data. Compute the consumed frame length the same
+     * way the parser does (b[3] = ATYP). */
     {
+        size_t frame_end;
+        if (b[3] == 1)
+            frame_end = 10;
+        else if (b[3] == 4)
+            frame_end = 22;
+        else
+            frame_end = 5 + (size_t)b[4] + 2;
         int up = -1;
         int rc = rp_connect_target(&up, t.host, t.port, t.af == 4,
                                    (const uint8_t *)&t.ip4, t.af == 6,
                                    t.ip6, guard);
         if (rc == 0) {
             rp_socks_reply(fd, 0);
+            if (n > frame_end &&
+                port_send(up, b + frame_end, n - frame_end, 0) !=
+                    (ssize_t)(n - frame_end)) {
+                /* the upstream socket is blocking at this point, so a
+                 * short send is a hard failure, not EAGAIN: fail closed
+                 * rather than silently truncate the tunnel start */
+                port_close(up);
+                return -1;
+            }
             return up;           /* caller relays on fd <-> up */
         }
         /* M7: a gate refusal is "not allowed" (rep 2), everything
@@ -577,9 +608,11 @@ static int rp_handle_http(int fd, const uint8_t *first, size_t first_n,
     size_t n = first_n, hdr_end;
     ssize_t r;
 
-    /* first packet must contain the request line and method token */
-    if (first_n < 8)
-        return -1;
+    /* R4-08-F2: no minimum first-packet size here — a legitimately
+     * fragmented HTTP request whose first recv() returned < 8 bytes is
+     * read to the header terminator below, exactly like the SOCKS path
+     * reads a full frame. (The scan guard `i = 4` below simply does
+     * nothing until n >= 4.) */
     memcpy(buf, first, first_n);
     /* read until \r\n\r\n */
     hdr_end = (size_t)-1;
@@ -656,11 +689,29 @@ static int rp_handle_http(int fd, const uint8_t *first, size_t first_n,
             port_close(up);
             return -1;
         }
+        /* R4-08-F1: forward bytes already-read past the CONNECT header
+         * (e.g. the first TLS bytes coalesced with the request) — they
+         * are no longer in the client socket's kernel buffer and the
+         * relay loop would start from empty. */
+        if (n > hdr_end &&
+            port_send(up, buf + hdr_end, n - hdr_end, 0) !=
+                (ssize_t)(n - hdr_end)) {
+            port_close(up);
+            return -1;
+        }
         return up;
     }
     /* absolute-URI forward: send the original request head verbatim
      * (RFC 7230 servers accept absolute-form on a proxy connection) */
     if (port_send(up, buf, hdr_end, 0) != (ssize_t)hdr_end) {
+        port_close(up);
+        return -1;
+    }
+    /* R4-08-F1: also forward the request body bytes that were coalesced
+     * with the head into buf — same silent-drop hazard. */
+    if (n > hdr_end &&
+        port_send(up, buf + hdr_end, n - hdr_end, 0) !=
+            (ssize_t)(n - hdr_end)) {
         port_close(up);
         return -1;
     }
