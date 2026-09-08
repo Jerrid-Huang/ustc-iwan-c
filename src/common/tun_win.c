@@ -610,14 +610,18 @@ ptrdiff_t tun_write(int fd, const void *buf, size_t len)
 int tun_write_retry(int fd, const uint8_t *pkt, size_t len, int max_ms,
                     atomic_bool *stop)
 {
-    /* The DLL blocks internally while the ring is full, so this layer
-     * cannot guarantee a hard max_ms: the budget bounds the retry loop
-     * (failed attempts mean the ring is full or the session is gone,
-     * with a Sleep between tries) and max_ms<=0 maps to the legacy
-     * 200ms window. Stop is re-checked at the top of every iteration. */
+    /* FIND-W-3: align with tun.h's contract ("max_ms == 0 waits
+     * indefinitely") and with the POSIX backend: max_ms <= 0 means NO
+     * budget — keep retrying (subject to stop) instead of the old
+     * implicit 200ms window here, which silently contradicted the
+     * cross-platform contract and dropped packets on Windows under
+     * load. tun_write_bounded itself already treats max_ms <= 0 as "no
+     * deadline" and its loop re-checks stop at the top of every
+     * iteration; the DLL's internal blocking cannot be interrupted from
+     * this layer (documented at tun_write_bounded). */
     if (stop != NULL && *stop)
         return -1;
-    return tun_write_bounded(fd, pkt, len, max_ms > 0 ? max_ms : 200,
+    return tun_write_bounded(fd, pkt, len, max_ms,
                              stop) == (ptrdiff_t)len ? 0 : -1;
 }
 

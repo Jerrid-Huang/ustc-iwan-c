@@ -36,6 +36,17 @@
 #include "socks_internal.h"
 #include "util.h"
 
+/* FIND-R2-4 / FIND-R2-5: bridge extensions that live in lwip_bridge.c but
+ * are not declared in lwip_bridge.h (that header is outside this round's
+ * editable set). ns_flow_ref/ns_flow_unref maintain the per-slot
+ * flow-reference counter this layer must bump at every f->ns_idx
+ * assignment/detach; ns_port_tw_held reports whether lwIP's TIME_WAIT list
+ * still holds an ephemeral port. Both run on the single event-loop thread
+ * that also drives lwIP, so they need no locking. */
+int  ns_flow_ref(int idx);
+void ns_flow_unref(int idx);
+bool ns_port_tw_held(uint16_t p);
+
 #define LOCAL_WRITE_LIMIT   262144
 #define LOCAL_IOV_MAX       45     /* zero-copy readv feed: reserve slots
                                     * (== NS_SCRATCH_SLOTS, lwip_bridge.c;
@@ -228,7 +239,13 @@ static uint16_t alloc_ephemeral(int (*in_use)(uint16_t p))
     return 0;
 }
 
-/* TCP-flow variant: collision scan over the active flows' local ports */
+/* TCP-flow variant: collision scan over the active flows' local ports.
+ * FIND-F03-3 / FIND-R2-4: also avoid ports lwIP still holds in TIME_WAIT
+ * (2*MSL, no free callback). A slot may have been reclaimed (c->pcb=NULL)
+ * while lwIP's tcp_tw_pcbs list still owns the lport; handing that port to
+ * a new flow would make tcp_bind fail with ERR_USE and the connect fail
+ * spuriously. ns_port_tw_held walks the bridge-side list on the same
+ * single event-loop thread. */
 static int tcp_port_in_use(uint16_t p)
 {
     for (int i = 0; i < MAX_FLOWS; i++) {
@@ -236,6 +253,8 @@ static int tcp_port_in_use(uint16_t p)
             g_flows[i].lport == p)
             return 1;
     }
+    if (ns_port_tw_held(p))
+        return 1;
     return 0;
 }
 
@@ -1069,8 +1088,31 @@ void flow_free(Flow *f) {
         port_close(f->fd);   /* local client stream: a socket */
         f->fd = -1;
     }
-    if (f->ns_idx >= 0)
-        ns_abort(&g_ns, f->ns_idx);
+    if (f->ns_idx >= 0) {
+        TcpConn *c = ns_conn(&g_ns, f->ns_idx);
+        if (c != NULL && c->pcb != NULL &&
+            (c->state == NS_CLOSED || c->state == NS_FIN_WAIT)) {
+            /* FIND-F5-1 / FIND-F03-5: graceful shutdown with a live pcb
+             * (LAST_ACK / TIME_WAIT, or CLOSE_WAIT already answered with
+             * our FIN). Do NOT abort here: aborting a TIME_WAIT pcb both
+             * leaves a dangling c->pcb and, on LAST_ACK, fires a
+             * gratuitous RST at the peer. The trailing rxq has already
+             * been drained (reap only frees with rxq empty), so this
+             * flow just drops its slot reference and closes the local fd;
+             * lwIP's close state machine (LAST_ACK RTO / TIME_WAIT 2*MSL,
+             * both bounded by ns_tick) and conn_reap_if_dead reclaim the
+             * slot afterwards (FIND-R2-3). */
+            /* no abort */
+        } else {
+            /* connection truly gone (pcb==NULL / slot invalid) or an
+             * active-but-unfinished close (SYN_SENT / ESTABLISHED /
+             * CLOSE_WAIT with a live pcb): abandon it with a RST so the
+             * peer side and the slot are both freed. ns_abort is a no-op
+             * when the pcb is already gone. */
+            ns_abort(&g_ns, f->ns_idx);
+        }
+        ns_flow_unref(f->ns_idx);
+    }
     buf_free(&f->input);
     buf_free(&f->output);
     f->active = 0;
@@ -1107,6 +1149,10 @@ static void open_tcp_conn_af(Flow *f, uint8_t af, uint32_t rip,
         return;
     }
     f->ns_idx = idx;
+    /* FIND-R2-5: this is the ONE place a flow takes a slot reference;
+     * mark it so conn_slot_alloc refuses the slot while the flow lives.
+     * All f->ns_idx = -1 detach points pair with ns_flow_unref below. */
+    ns_flow_ref(idx);
     f->lport = lport;
     f->tgt_af = af;
     if (af == 6)
@@ -1645,6 +1691,7 @@ void update_tcp_states(void) {
              * next round on the slot may be reused for a new flow, in
              * which case a stale ns_idx would make this flow read or
              * write another flow's connection. */
+            ns_flow_unref(f->ns_idx);   /* FIND-R2-5: release the slot ref */
             f->ns_idx = -1;
             if (f->reply_sent) {
                 set_flow_state(f, ST_CLOSING);
@@ -1696,6 +1743,7 @@ void service_local_inputs(Flow *fs) {
     for (int i = 0; i < MAX_FLOWS; i++) {
         Flow *f = &fs[i];
         if (f->active && f->state != ST_CONNECTING && flow_conn_dead(f)) {
+            ns_flow_unref(f->ns_idx);   /* FIND-R2-5: release the slot ref */
             f->ns_idx = -1;
             set_flow_state(f, ST_CLOSING);
         }
@@ -2033,6 +2081,7 @@ void reap_flows(void) {
                  * the removable branch — it may still hold trailing rxq
                  * bytes, and "don't free while undelivered data remains"
                  * must keep the slot until they are drained. */
+                ns_flow_unref(f->ns_idx);   /* FIND-R2-5: release the slot ref */
                 f->ns_idx = -1;
                 set_flow_state(f, ST_CLOSING);
             } else {

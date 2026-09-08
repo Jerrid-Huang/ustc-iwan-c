@@ -43,6 +43,12 @@
 
 #define NS_CONNECT_TIMEOUT 30000u
 #define NS_FIN_WAIT_TIMEOUT 30000u      /* half-closed, no peer FIN: abort */
+/* FIND-R2-3: a graceful close whose peer never sends the final ACK leaves
+ * the pcb parked in LAST_ACK. lwIP's RTO backoff would hold it for minutes
+ * before firing err_cb; bound it with a 30s timeout (same magnitude as the
+ * socks layer's ST_CLOSING_TIMEOUT_MS) so R2-2 ("graceful close does not
+ * abort") cannot leave the slot hostage to a dead peer. */
+#define NS_LAST_ACK_TIMEOUT 30000u
 #define NS_MSS             1460u
 /* B2: zero-copy readv slots per upload round (scratch size); LOCAL_IOV_MAX
  * in socks_flow.c must stay in sync with this (its iov array must hold
@@ -74,6 +80,18 @@ struct ns_rx_slot {
 static struct ns_rx_slot g_rx_slots[NS_RX_POOL];
 static struct ns_rx_slot *g_rx_free;
 static int g_rx_pool_init;
+
+/* FIND-R2-5: flow-reference counter, 1 while a socks_flow holds
+ * f->ns_idx == this slot index. Makes "a slot must never be handed to a
+ * new flow while an old flow still references it" a hard invariant
+ * (FIND-F03-1): conn_slot_alloc refuses any referenced slot, and the
+ * socks layer pairs every f->ns_idx assignment with ns_flow_ref /
+ * ns_flow_unref. A parallel uint8_t array, not a TcpConn field, because
+ * lwip_bridge.h is outside this round's editable files; there is exactly
+ * one Netstack (g_ns). All access is on the single event-loop thread, so
+ * no locking. ns_init wipes it when a stack rebuild invalidates every
+ * slot. */
+static uint8_t g_flow_ref[NS_MAX_CONN];
 
 static void ns_rx_slot_free(struct pbuf *p)
 {
@@ -480,6 +498,11 @@ void ns_init(Netstack *ns, uint32_t inner_ip, uint32_t gw, uint16_t mtu)
     }
 
     memset(ns, 0, sizeof *ns);
+    /* FIND-R2-5: a rebuilt stack invalidates every slot, so no flow can
+     * still legitimately reference one; drop all flow references. The
+     * surviving SOCKS flows re-establish through socks_reauth_flows and
+     * re-mark their NEW slots with ns_flow_ref. */
+    memset(g_flow_ref, 0, sizeof g_flow_ref);
     /* every tx slot starts free; the lport_map hint starts empty */
     for (int w = 0; w < (int)((NS_TX_MAX + 63) / 64); w++)
         ns->tx_free_mask[w] = ~0ULL;
@@ -558,12 +581,41 @@ void ns_set_outer(Netstack *ns, const uint8_t hdr[8], const uint8_t key[8])
     memcpy(ns->xor_key, key, 8);
 }
 
+/* ------------------------------------------------------------------ */
+/* flow-reference counter API (FIND-R2-5)                            */
+/* ------------------------------------------------------------------ */
+/* g_flow_ref lives near the top of the file (ns_init wipes it). The
+ * socks layer calls these at every f->ns_idx = idx / f->ns_idx = -1
+ * site. */
+int ns_flow_ref(int idx)
+{
+    if (idx < 0 || idx >= NS_MAX_CONN)
+        return -1;
+    g_flow_ref[idx] = 1;
+    return idx;
+}
+
+void ns_flow_unref(int idx)
+{
+    if (idx < 0 || idx >= NS_MAX_CONN)
+        return;
+    g_flow_ref[idx] = 0;
+}
+
+static int ns_flow_held(int idx)
+{
+    if (idx < 0 || idx >= NS_MAX_CONN)
+        return 0;
+    return g_flow_ref[idx] != 0;
+}
+
 /* slot allocation + pcb setup shared by ns_connect / ns_connect6 */
 static int conn_slot_alloc(Netstack *ns, TcpConn **out)
 {
     int idx = -1;
     for (int i = 0; i < NS_MAX_CONN; i++) {
-        if (ns->conns[i].pcb == NULL && !ns->conns[i].reap_pending) {
+        if (ns->conns[i].pcb == NULL && !ns->conns[i].reap_pending &&
+            g_flow_ref[i] == 0) {
             idx = i;
             break;
         }
@@ -809,6 +861,7 @@ void ns_close(Netstack *ns, int idx)
     } else if (c->state == NS_CLOSE_WAIT) {
         /* peer already FIN'd: our FIN completes the close -> LAST_ACK */
         c->state = NS_CLOSED;
+        c->state_ms = now_ms();   /* NS_LAST_ACK_TIMEOUT measures from here */
         tcp_shutdown(c->pcb, 0, 1);
     }
 }
@@ -820,7 +873,19 @@ void ns_abort(Netstack *ns, int idx)
     TcpConn *c = &ns->conns[idx];
     if (c->pcb == NULL)
         return;
-    tcp_abort(c->pcb);   /* fires bridge_err -> NS_CLOSED + reap_pending */
+    tcp_abort(c->pcb);
+    /* FIND-F03-5: tcp_abort on a TIME_WAIT pcb (tcp_abandon's TW branch,
+     * tcp.c) frees the pcb WITHOUT firing the err callback, so bridge_err
+     * never runs and c->pcb would dangle — the next ns_tick could then
+     * tcp_recved() a freed pcb via conn_reconcile_rxq (real UAF). Clear
+     * the slot unconditionally: on a normal abort bridge_err already ran
+     * synchronously (pcb==NULL, reap_pending=1) and this is a no-op; on
+     * the TW path it is the missing cleanup. */
+    if (c->pcb != NULL) {
+        c->pcb = NULL;
+        c->state = NS_CLOSED;
+        c->reap_pending = 1;
+    }
 }
 
 void ns_rx_packet(Netstack *ns, const uint8_t *pkt, size_t n)
@@ -840,6 +905,25 @@ void ns_rx_packet(Netstack *ns, const uint8_t *pkt, size_t n)
         ip4_input(p, ns->netif);
 }
 
+/* FIND-R2-4 / FIND-F03-3: does lwIP still hold local port p for a
+ * TIME_WAIT pcb? A closed connection's local port lives on lwIP's
+ * tcp_tw_pcbs list for 2*MSL with NO callback when it finally frees the
+ * pcb, so the socks layer has no event to learn the port is free again.
+ * alloc_port must avoid these ports or a new flow's tcp_bind collides
+ * with the lingering TIME_WAIT pcb (ERR_USE). We walk lwIP's own
+ * tcp_tw_pcbs list directly (tcp_priv.h is included above); the read
+ * takes no lock because this runs on the single event-loop thread that
+ * also mutates lwIP, exactly like the rest of the bridge. */
+bool ns_port_tw_held(uint16_t p)
+{
+    const struct tcp_pcb *pcb;
+    for (pcb = tcp_tw_pcbs; pcb != NULL; pcb = pcb->next) {
+        if (pcb->local_port == p)
+            return true;
+    }
+    return false;
+}
+
 /* ------------------------------------------------------------------ */
 /* ns_tick: drive lwIP timers + reconcile timeouts / close reaps       */
 /* ------------------------------------------------------------------ */
@@ -847,13 +931,25 @@ void ns_rx_packet(Netstack *ns, const uint8_t *pkt, size_t n)
 static void conn_reap_if_dead(Netstack *ns, int idx, uint64_t now)
 {
     TcpConn *c = &ns->conns[idx];
-    /* graceful close: the pcb is still alive in TIME_WAIT / LAST_ACK. Once
-     * tcp_poll stops firing, lwIP no longer owns the pcb (it is in TIME_WAIT
-     * or freed) and no more err_cb can fire, so the slot is safe to reuse. */
+    /* FIND-R2-3 / FIND-F09-R1: reclaim a gracefully-closed slot only when
+     * ALL of the following hold:
+     *   - c->pcb != NULL and the pcb has left the active poll loop (it is
+     *     in TIME_WAIT, or LAST_ACK about to be freed) => lwIP can no
+     *     longer fire err_cb at the slot;
+     *   - c->rxq.len == 0 => the undrained trailing data has been fully
+     *     pushed to the local client (service_local_outputs); the old
+     *     "poll stopped 1s" test alone dropped tail bytes on slow clients;
+     *   - no flow references the slot (FIND-R2-5 invariant). The slot
+     *     staying referenced is what lets service_local_outputs keep
+     *     draining rxq; this function runs after the flow is freed.
+     * The lport is NOT returned here: lwIP's TIME_WAIT keeps owning it for
+     * 2*MSL, and alloc_port avoids it via ns_port_tw_held (FIND-F03-3). */
     if (c->state == NS_CLOSED && c->pcb != NULL &&
+        c->rxq.len == 0 &&
+        ns_flow_held(idx) == 0 &&
         now - c->last_poll_ms > NS_POLL_DEAD_MS) {
         c->pcb = NULL;
-        buf_free(&c->rxq);
+        buf_free(&c->rxq);   /* rxq is empty (checked above): no-op reset */
     }
 }
 
@@ -886,6 +982,21 @@ int ns_tick(Netstack *ns, uint64_t now)
             now - c->state_ms > NS_FIN_WAIT_TIMEOUT) {
             c->term_reason = NS_TERM_TIMEOUT;
             tcp_abort(c->pcb);   /* bridge_err -> NS_CLOSED + reap_pending */
+            continue;
+        }
+        /* FIND-R2-3: graceful close, peer never ACKs our FIN — the pcb
+         * parks in LAST_ACK where lwIP's RTO backoff could hold it for
+         * minutes before freeing it. R2-2 deliberately does NOT abort a
+         * graceful close (to avoid a gratuitous RST), so this timeout is
+         * the bound that converts a dead peer into a reclaimable slot.
+         * An abort is the right terminal action here: a peer that never
+         * ACKs our FIN is not going to read more data. state_ms is set at
+         * LAST_ACK entry (ns_close CLOSE_WAIT branch). */
+        if (c->state == NS_CLOSED && c->pcb != NULL &&
+            c->pcb->state == LAST_ACK &&
+            now - c->state_ms > NS_LAST_ACK_TIMEOUT) {
+            c->term_reason = NS_TERM_TIMEOUT;
+            tcp_abort(c->pcb);   /* bridge_err + ns_abort cleanup => safe */
             continue;
         }
         conn_reap_if_dead(ns, i, now);
