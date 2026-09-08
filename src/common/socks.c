@@ -112,8 +112,24 @@ void wait_events(int listener, int sockfd, int dns_evfd, int timeout_ms)
          * read it again (the client half-closed; upstream data keeps
          * flowing via service_local_outputs, which is unconditional).
          * Same busy-spin trap — leave events empty; the flow is reaped
-         * by the peer FIN or the NS_FIN_WAIT timeout, whichever first. */
-        fds[n].events = (f->rx_paused || f->local_eof) ? 0 : POLLIN;
+         * by the peer FIN or the NS_FIN_WAIT timeout, whichever first.
+         * ST_CLOSING (R06-FIND M-1, coordinated with service_local_inputs
+         * in socks_flow.c, which has already stopped feeding input for
+         * ST_CLOSING): after a connect failure/rejection the client keeps
+         * writing replies it never reads, so the fd stays readable forever.
+         * Without this check each poll round would read those bytes into
+         * f->input with no cap (ST_CLOSING is outside the GREETING/REQUEST
+         * HANDSHAKE_INPUT_MAX and the RESOLVING 1MB cap), letting a client
+         * feed hundreds of MB in ~30s -> buf_ensure -> oom_abort. Closing
+         * POLLIN here + A's feed stop together prevent the busy-spin and
+         * the unbounded buffering; the ST_CLOSING flow is then force-reaped
+         * by reap_flows after ST_CLOSING_TIMEOUT_MS (30s). POLLOUT below
+         * stays enabled (f->output.len > 0), so any queued reply/data is
+         * still delivered by service_local_outputs before the flow dies. */
+        fds[n].events =
+            (f->rx_paused || f->local_eof || f->state == ST_CLOSING)
+                ? 0
+                : POLLIN;
         if (f->output.len > 0 || f->rxq_waiting)
             fds[n].events |= POLLOUT;
         n++;

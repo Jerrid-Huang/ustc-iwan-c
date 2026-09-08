@@ -1038,7 +1038,12 @@ void queue_socks_error(Flow *f, uint8_t rep) {
     } else {
         socks_reply(f, rep, 0, 0);
     }
-    f->state = ST_CLOSING;
+    /* M-2 (R06): refresh state_ms via set_flow_state instead of writing
+     * the state directly — a direct write leaves an old state_ms, so a
+     * flow whose stored timestamp is already > ST_CLOSING_TIMEOUT_MS
+     * gets force-reaped by reap_flows the same/next round, buf_clear()-ing
+     * the error reply we just queued before it reaches the client. */
+    set_flow_state(f, ST_CLOSING);
 }
 
 void set_flow_state(Flow *f, FlowState st) {
@@ -1924,6 +1929,19 @@ void service_local_inputs(Flow *fs) {
                 }
             }
         } else if (f->state != ST_ESTABLISHED) {
+            /* M-1 (R06): a CLOSING flow must stop reading entirely. It
+             * has no parser to consume the bytes, and input has no cap
+             * here (the HANDSHAKE_INPUT_MAX guard above only covers
+             * ST_GREETING/ST_REQUEST), so a client that keeps writing
+             * during the 30s close window would inflate f->input until
+             * buf_ensure hits oom_abort and kills the whole process. The
+             * peer no longer needs the reads anyway (we already sent our
+             * close). socks.c wait_events drops the POLLIN registration
+             * for ST_CLOSING in lockstep (parallel agent C), so this
+             * branch is not re-entered with buffered-but-unread data —
+             * no busy-spin. */
+            if (f->state == ST_CLOSING)
+                continue;
             /* greeting/request (or CONNECTING): read into rbuf for the
              * handshake parser. An ESTABLISHED flow whose conn vanished
              * (dead tunnel, in-place re-auth pending) is NOT read: the
@@ -2095,9 +2113,35 @@ void reap_flows(void) {
                 /* the netstack rxq is the flow's receive buffer: a flow
                  * must not be freed while it still holds undelivered data
                  * — the close(fd) would reset the client socket (RST on
-                 * unread data) and the rxq payload would be lost */
-                removable = c->state == NS_CLOSED && c->rxq.len == 0 &&
-                            f->output.len == 0;
+                 * unread data) and the rxq payload would be lost.
+                 * H-1 (R06): that "keep until drained" grace must not be
+                 * unbounded while the pcb is still alive: if the client
+                 * quit reading/writing for a full close timeout with the
+                 * flow stuck in a graceful close, force-terminate below
+                 * (30s hard floor alongside the ns_idx<0 force-reap). */
+                if (f->state == ST_CLOSING &&
+                    now_ms() - f->state_ms >= ST_CLOSING_TIMEOUT_MS) {
+                    /* H-1: stuck graceful close — client stopped
+                     * reading/writing for a full close timeout while the
+                     * pcb is still alive (TIME_WAIT/LAST_ACK). lwIP frees
+                     * a TIME_WAIT pcb silently after 2*MSL with no
+                     * callback, leaving c->pcb dangling -> UAF in ns_tick.
+                     * Force-terminate now (ns_abort is TW-safe:
+                     * tcp_abort + unconditional c->pcb clear, R2-1) and
+                     * release the slot ref so the ns_idx<0 path
+                     * force-reaps this flow the same round. A gratuitous
+                     * RST here is the same cost the existing ns_idx<0
+                     * force-reap already accepts for a wedged client. */
+                    ns_abort(&g_ns, f->ns_idx);
+                    ns_flow_unref(f->ns_idx);
+                    f->ns_idx = -1;
+                    /* keep ST_CLOSING + old state_ms: the ns_idx < 0
+                     * block below (state==ST_CLOSING && timed out)
+                     * force-reaps immediately */
+                } else {
+                    removable = c->state == NS_CLOSED && c->rxq.len == 0 &&
+                                f->output.len == 0;
+                }
             }
         }
         if (f->ns_idx < 0) {

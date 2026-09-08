@@ -905,20 +905,32 @@ void ns_rx_packet(Netstack *ns, const uint8_t *pkt, size_t n)
         ip4_input(p, ns->netif);
 }
 
-/* FIND-R2-4 / FIND-F03-3: does lwIP still hold local port p for a
- * TIME_WAIT pcb? A closed connection's local port lives on lwIP's
- * tcp_tw_pcbs list for 2*MSL with NO callback when it finally frees the
- * pcb, so the socks layer has no event to learn the port is free again.
- * alloc_port must avoid these ports or a new flow's tcp_bind collides
- * with the lingering TIME_WAIT pcb (ERR_USE). We walk lwIP's own
- * tcp_tw_pcbs list directly (tcp_priv.h is included above); the read
- * takes no lock because this runs on the single event-loop thread that
- * also mutates lwIP, exactly like the rest of the bridge. */
+/* FIND-R2-4 / FIND-F03-3 / R06-FIND M-4 (R22-A): does lwIP still hold
+ * local port p? Two cases collide with a new flow's tcp_bind (ERR_USE):
+ *   - TIME_WAIT pcb: lives on lwIP's tcp_tw_pcbs list for 2*MSL with NO
+ *     callback when it finally frees the pcb, so the socks layer has no
+ *     event to learn the port is free again.
+ *   - LAST_ACK pcb: after a graceful close is flow_free'd, the pcb stays
+ *     on lwIP's tcp_active_pcbs list (the active list, NOT tw) in LAST_ACK
+ *     for up to 30s until ns_tick's LAST_ACK timeout tcp_aborts it. During
+ *     that window tcp_port_in_use (which only checks live-flow lports and
+ *     this function) would miss it and alloc_port could randomly pick the
+ *     port, making tcp_bind fail with ERR_USE and the connection spuriously
+ *     report rep=1 (~0.39%/call worst case). We therefore also scan
+ *     tcp_active_pcbs for pcbs stuck in LAST_ACK.
+ * We walk lwIP's own lists directly (tcp_priv.h is included above); the
+ * read takes no lock because this runs on the single event-loop thread
+ * that also mutates lwIP, exactly like the rest of the bridge. The TW
+ * filtering behaviour is unchanged. */
 bool ns_port_tw_held(uint16_t p)
 {
     const struct tcp_pcb *pcb;
     for (pcb = tcp_tw_pcbs; pcb != NULL; pcb = pcb->next) {
         if (pcb->local_port == p)
+            return true;
+    }
+    for (pcb = tcp_active_pcbs; pcb != NULL; pcb = pcb->next) {
+        if (pcb->state == LAST_ACK && pcb->local_port == p)
             return true;
     }
     return false;
@@ -968,20 +980,24 @@ int ns_tick(Netstack *ns, uint64_t now)
         any_active = 1;
         conn_reconcile_rxq(c);
 
-        /* connect timeout (mirrors native conn_tick's SYN_SENT abort) */
+        /* connect timeout (mirrors native conn_tick's SYN_SENT abort).
+         * ns_abort is the R2-1 unified cleanup: tcp_abort (bridge_err runs
+         * synchronously -> NS_CLOSED + reap_pending) plus an unconditional
+         * slot clear, so the slot can never be left with a dangling pcb. */
         if (c->state == NS_SYN_SENT &&
             now - c->state_ms > ns->connect_timeout_ms) {
             c->term_reason = NS_TERM_TIMEOUT;
-            tcp_abort(c->pcb);   /* bridge_err -> NS_CLOSED + reap_pending */
+            ns_abort(ns, i);
             continue;
         }
         /* half-closed (our FIN sent, local client gone): if the peer never
          * FINs back (keep-alive server, hung upstream), the pcb/slot/flow
-         * triple would hang forever — bound it like the connect timeout */
+         * triple would hang forever — bound it like the connect timeout.
+         * ns_abort unifies cleanup (see R2-1 ns_abort comment). */
         if (c->state == NS_FIN_WAIT &&
             now - c->state_ms > NS_FIN_WAIT_TIMEOUT) {
             c->term_reason = NS_TERM_TIMEOUT;
-            tcp_abort(c->pcb);   /* bridge_err -> NS_CLOSED + reap_pending */
+            ns_abort(ns, i);
             continue;
         }
         /* FIND-R2-3: graceful close, peer never ACKs our FIN — the pcb
@@ -991,12 +1007,14 @@ int ns_tick(Netstack *ns, uint64_t now)
          * the bound that converts a dead peer into a reclaimable slot.
          * An abort is the right terminal action here: a peer that never
          * ACKs our FIN is not going to read more data. state_ms is set at
-         * LAST_ACK entry (ns_close CLOSE_WAIT branch). */
+         * LAST_ACK entry (ns_close CLOSE_WAIT branch). ns_abort runs the
+         * R2-1 unified cleanup (tcp_abort + unconditional slot clear) so
+         * the slot is always reclaimed after this bound. */
         if (c->state == NS_CLOSED && c->pcb != NULL &&
             c->pcb->state == LAST_ACK &&
             now - c->state_ms > NS_LAST_ACK_TIMEOUT) {
             c->term_reason = NS_TERM_TIMEOUT;
-            tcp_abort(c->pcb);   /* bridge_err + ns_abort cleanup => safe */
+            ns_abort(ns, i);
             continue;
         }
         conn_reap_if_dead(ns, i, now);
