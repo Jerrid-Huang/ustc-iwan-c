@@ -145,12 +145,24 @@ static void parse_opts(int argc, char **argv, struct opts *o)
             snprintf(o->tun, sizeof o->tun, "%s", optarg);
             break;
         case 's':
+            /* M4: same guard as -t — a legal IPv4 dotted quad is at most
+             * 15 chars (exactly fills the 16-byte buffer incl. NUL), so
+             * anything >= sizeof is an invalid address that snprintf would
+             * silently truncate and s2ip4 afterwards would happily accept
+             * (e.g. "192.168.100.1000" -> ".100") */
+            if (strlen(optarg) >= sizeof o->server_ip)
+                usage_error(argv[0],
+                            "error: server IP too long: '%s' (max 15)", optarg);
             snprintf(o->server_ip, sizeof o->server_ip, "%s", optarg);
             break;
         case 'S':
             snprintf(o->subnet, sizeof o->subnet, "%s", optarg);
             break;
         case 'd':
+            /* M4: same over-length interception as -s (see above) */
+            if (strlen(optarg) >= sizeof o->dns)
+                usage_error(argv[0],
+                            "error: DNS IP too long: '%s' (max 15)", optarg);
             snprintf(o->dns, sizeof o->dns, "%s", optarg);
             break;
         case 'u':
@@ -308,6 +320,11 @@ static char nat_subnet_saved[64];
 static char nat_if_saved[64];
 static bool nat_rule_added;
 static bool fwd_rule_added;   /* our FORWARD ACCEPT for the tunnel subnet */
+static char fwd_subnet_saved[64]; /* subnet of the FORWARD ACCEPT we added:
+                                   * kept separate from nat_subnet_saved so
+                                   * cleanup removes exactly this rule even
+                                   * when the MASQUERADE rule pre-existed
+                                   * (M2 — see setup_nat) */
 
 static void enable_ip_forward(void)
 {
@@ -398,6 +415,13 @@ static void setup_nat(const char *subnet, const char *nat_if)
         rc = iptables_ensure(fchk, fadd);
         if (rc == 1) {
             fwd_rule_added = true;
+            /* M2: remember THIS FORWARD rule's own subnet.  nat_subnet_saved
+             * is only written when we also added the MASQUERADE rule; when
+             * that rule pre-existed (nat_subnet_saved == "") we still added
+             * the FORWARD ACCEPT and cleanup must remove exactly it — using
+             * nat_subnet_saved there would `iptables -D FORWARD -s ""` (fails)
+             * and leak the rule forever. */
+            snprintf(fwd_subnet_saved, sizeof fwd_subnet_saved, "%s", subnet);
             printf("iptables: FORWARD %s ACCEPT\n", subnet);
         } else if (rc < 0) {
             fprintf(stderr, "warning: iptables FORWARD ACCEPT failed "
@@ -438,8 +462,10 @@ static void server_cleanup_nat(void)
     }
 
     if (fwd_rule_added) {
+        /* M2: delete with fwd_subnet_saved (the subnet we actually added),
+         * never nat_subnet_saved — see setup_nat. */
         char *fdel[] = { "iptables", "-D", "FORWARD", "-s",
-                         nat_subnet_saved, "-j", "ACCEPT", NULL };
+                         fwd_subnet_saved, "-j", "ACCEPT", NULL };
         if (run_cmd(fdel) != 0)
             fprintf(stderr, "warning: iptables -D FORWARD ACCEPT failed\n");
     }
@@ -715,6 +741,15 @@ static void *recv_thread_main(void *v)
 
     buf = malloc((size_t)UDP_RXBATCH * 65536);
     if (!buf) {
+        /* M3: without the fatal flag this was a silent black hole — a
+         * worker returned with its SO_REUSEPORT socket never consumed
+         * (every datagram the kernel hashed to it lost forever), and the
+         * primary's OOM (tid==0, runs inline in main) still let main
+         * print "server ready" and exit 0.  Same contract as the
+         * poll-fatal path below: flag it AND stop the loop, so main's
+         * aggregation (shutdown_poll_err) makes the process exit non-zero. */
+        atomic_store_explicit(a->poll_err, 1, memory_order_relaxed);
+        atomic_store_explicit(&g_stop, true, memory_order_relaxed);
         log_err("uplink recv thread: out of memory");
         return NULL;
     }
@@ -986,6 +1021,28 @@ int main(int argc, char **argv)
         }
     }
 
+    /* M5: server_ip and --dns must lie INSIDE the advertised --subnet.
+     * The old code only checked they were outside the client pool, so a
+     * misconfiguration could silently start with an unreachable peer or a
+     * public address polluting the host's routing.  subnet_base/mask are
+     * already parsed (above); a plain per-bit AND is the membership test. */
+    {
+        uint32_t mask32 = 0xFFFFFFFFu << (32 - o.mask);
+        uint32_t sipu = ip4_u32(sip), dipu = ip4_u32(dip);
+        if ((sipu & mask32) != subnet_base) {
+            fprintf(stderr, "error: --server-ip %s is outside --subnet %s "
+                            "(must be within %s)\n",
+                    o.server_ip, o.subnet, subnet_net);
+            return 1;
+        }
+        if ((dipu & mask32) != subnet_base) {
+            fprintf(stderr, "error: --dns %s is outside --subnet %s "
+                            "(must be within %s)\n",
+                    o.dns, o.subnet, subnet_net);
+            return 1;
+        }
+    }
+
     if (o.no_tun) {
         printf("no-tun mode: TCP echo mirror (bench harness)\n");
     } else {
@@ -994,6 +1051,18 @@ int main(int argc, char **argv)
         tun_fd = setup_tun(o.tun, o.server_ip, o.mask);
         ctx.tun_fd = tun_fd;
         printf("tun %s fd=%d\n", o.tun, tun_fd);
+        /* M1: attach the eBPF flow-hash steering HERE, while still root.
+         * It is a root-only BPF_PROG_LOAD syscall + TUNSETSTEERINGEBPF
+         * ioctl — no thread interaction, safe to do before the fork.  After
+         * the fork/drop below an unprivileged process would hit EPERM and
+         * silently fall back to the kernel's degenerate automq flow hash
+         * (the exact problem this feature exists to fix).  Failure is
+         * non-fatal: the kernel keeps automq (tun.c logs the reason). */
+        if (tun_steering_attach(tun_fd) == 0)
+            printf("tun steering: eBPF flow hash attached\n");
+        else
+            printf("tun steering: eBPF flow hash NOT attached "
+                   "(kernel automq fallback; see tun.c log)\n");
     }
 
     nfds = setup_udp(o.port, udp_fds, recv_threads);
@@ -1117,10 +1186,21 @@ int main(int argc, char **argv)
                 server_cleanup_nat(); /* parent (root) undoes NAT */
             return 1;
         }
+        /* M1: report the REAL queue count (tun_pool_queues) instead of the
+         * requested initq — eager multi-queue fill (tun_pool_add ->
+         * open /dev/net/tun per queue) silently degrades to a single queue
+         * when /dev/net/tun is not group-readable, and claiming initq
+         * queues then lied about the actual fan-out.  Deeper "pre-open the
+         * extra queue fds while still root" is a pool-architecture change
+         * (follow-up, out of scope this round). */
+        int nq = tun_pool_queues(ctx.qpool);
         printf("tun reader pool: %d queue%s (dynamic up to %d)\n",
-               initq, initq > 1 ? "s" : "", maxq);
-        if (tun_steering_attach(tun_fd) == 0)
-            printf("tun steering: eBPF flow hash attached\n");
+               nq, nq > 1 ? "s" : "", maxq);
+        if (nq < initq)
+            fprintf(stderr,
+                    "warning: tun reader pool: only %d queue(s) (wanted %d); "
+                    "/dev/net/tun access or queue setup limited -- steering "
+                    "may be single-queue\n", nq, initq);
     }
     printf("listening UDP 0.0.0.0:%u (%d recv thread%s)\n",
            (unsigned)o.port, recv_threads, recv_threads > 1 ? "s" : "");
