@@ -67,7 +67,12 @@ typedef struct SocksConfig {
  * Ownership (A-1): run_socks takes ownership of sockfd and is
  * responsible for closing it on every return path — including the
  * CURRENT value (a new fd may have been swapped in by an in-place
- * re-auth), so the caller must NOT close it afterwards. */
-int run_socks(int sockfd, SocksConfig *cfg);   /* 0 stopped, 1 session lost */
+ * re-auth), so the caller must NOT close it afterwards.
+ * Return semantics: 0 = clean user stop, 1 = session lost (caller
+ * should re-authenticate and retry), -1 = startup/setup failure
+ * (socket/bind/listen refused, non-loopback rejected, nonblock
+ * failed, OOM): the caller must NOT treat -1 as a clean user stop
+ * (e.g. must not silently exit 0 or skip a retry). See run_socks. */
+int run_socks(int sockfd, SocksConfig *cfg);   /* 0 stopped, 1 session lost, -1 startup/setup failure (caller must not treat as a clean user stop) */
 
 #endif

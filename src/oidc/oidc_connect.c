@@ -67,6 +67,17 @@ static char *stored_password(const char *stored, const char *domain,
         free(blob);
         return pw;
     }
+    /* R13 B-3 (M-3 hardening, minimal): decrypt_password failed. The
+     * blob is the legacy PLAINTEXT password only if the server actually
+     * stored it that way — but the identical failure mode also covers a
+     * corrupt/tampered blob or a changed app secret, which would then be
+     * fed to the auth stack as if it were the real password. We keep the
+     * tolerant legacy fallback (no contract change), but it must no
+     * longer be silent. A fuller fix (blob format marker etc.) is a
+     * design change, deliberately out of scope here. */
+    log_err("stored password decrypt failed; falling back to treating "
+            "the stored blob as a legacy plaintext password — this may "
+            "indicate corruption/tampering or a secret change");
     return blob;   /* plaintext format: the blob is the password */
 }
 
@@ -145,10 +156,16 @@ static int run_socks_mode(const Opts *o, int fd, const uint8_t sk[16],
     cfg.reauth = oidc_socks_reauth_cb;   /* in-place tunnel re-auth */
     cfg.reauth_ud = (void *)rc;
 
-    /* propagate run_socks's return: 1 = session lost (reconnect),
-     * 0 = stopped. The hardcoded 0 here used to make every lost
-     * session look like a clean user stop — the process exited
-     * silently instead of reconnecting. */
+    /* propagate run_socks's return unchanged — three states
+     * (0 = clean user stop, 1 = session lost / reconnect, -1 = startup
+     * failure): the -1 from the invalid-address check above is already a
+     * pre-startup failure, and run_socks now reports a failed
+     * socket/bind/listen as -1 (R13-M-1) instead of masking it as a
+     * clean stop. The hardcoded 0 here used to make every lost session
+     * look like a clean user stop — the process exited silently instead
+     * of reconnecting. Every early return in this function is -1
+     * (failure) or aborts (oidc_die); nothing here can mis-report an
+     * error as "stopped". */
     return run_socks(fd, &cfg);
 }
 
@@ -380,18 +397,28 @@ void oidc_connect_server(const Opts *o, const Config *cf)
             port_close(fd);
         }
         OPENSSL_cleanse(sk, sizeof sk);   /* session key scrub */
-        if (rc == 0)
-            break;   /* user stopped it (pump returns 0 when the exit
-                      * was not a detected session loss); run_pump
-                      * resets g_stop on entry, so a lost session
-                      * (rc == 1, g_stop set by the pump's detection)
-                      * falls through to reconnect */
+        /* R13-M-1 three-state return from run_socks_mode / run_pump:
+         *   rc == 0 -> clean user stop (break out of the reconnect loop
+         *              and exit: the process exit code stays a normal 0)
+         *   rc == 1 -> session lost (run_pump resets g_stop on entry;
+         *              run_socks sets g_stop on its lost-session
+         *              detection) -> falls through to the reconnect path
+         *   rc <  0 -> startup/config failure (run_socks now reports a
+         *              failed socket/bind/listen as -1, NOT as a clean 0
+         *              stop; run_socks_mode's invalid-address path is
+         *              also -1) -> must exit non-zero here: retrying
+         *              cannot help, and treating it as a user stop would
+         *              silently mask a broken client with exit code 0 */
         if (rc < 0) {
+            log_err("connection startup failed (rc=%d): not a clean "
+                    "stop — exiting non-zero", rc);
 #ifdef _WIN32
             oidc_pause_if_relaunched();
 #endif
             exit(1);   /* config/startup failure: retrying cannot help */
         }
+        if (rc == 0)
+            break;   /* user stopped it */
         oidc_eprintf("  tunnel session lost; reconnecting...\n");
         reconnecting = true;
         port_sleep_ms(1000);

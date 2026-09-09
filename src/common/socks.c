@@ -906,7 +906,7 @@ int run_socks(int sockfd, SocksConfig *cfg) {
     if (listener < 0) {
         log_err("socket SOCKS5 listener: %s", strerror(errno));
         port_close(sockfd);   /* A-1: own + close sockfd on every return */
-        return 0;
+        return -1;   /* R13-M-1: startup failure, NOT a clean user stop */
     }
     int one = 1;
     port_setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
@@ -914,7 +914,7 @@ int run_socks(int sockfd, SocksConfig *cfg) {
         log_err("bind SOCKS5 listener: %s", strerror(errno));
         port_close(listener);
         port_close(sockfd);   /* A-1: own + close sockfd on every return */
-        return 0;
+        return -1;   /* R13-M-1: startup failure, NOT a clean user stop */
     }
     if (laddr.sin_addr.s_addr != htonl(INADDR_LOOPBACK)) {
         if (cfg->allow_remote) {
@@ -937,14 +937,14 @@ int run_socks(int sockfd, SocksConfig *cfg) {
                     cfg->listen_str ? cfg->listen_str : "?");
             port_close(listener);
             port_close(sockfd);   /* A-1: own + close sockfd on every return */
-            return 0;
+            return -1;   /* R13-M-1: config/deploy failure, NOT user stop */
         }
     }
     if (port_listen(listener, LISTEN_BACKLOG) < 0) {
         log_err("listen SOCKS5: %s", strerror(errno));
         port_close(listener);
         port_close(sockfd);   /* A-1: own + close sockfd on every return */
-        return 0;
+        return -1;   /* R13-M-1: startup failure, NOT a clean user stop */
     }
     /* A-6: non-blocking mode is not optional here — a blocking listener
      * would freeze the single-threaded event loop on the first accept,
@@ -956,14 +956,14 @@ int run_socks(int sockfd, SocksConfig *cfg) {
         log_err("SOCKS5: set nonblock on listener: %s", strerror(errno));
         port_close(listener);
         port_close(sockfd);
-        return 0;
+        return -1;   /* R13-M-1: startup failure, NOT a clean user stop */
     }
     if (port_set_nonblock(sockfd, true) < 0) {
         log_err("SOCKS5: set nonblock on session socket: %s",
                 strerror(errno));
         port_close(listener);
         port_close(sockfd);
-        return 0;
+        return -1;   /* R13-M-1: startup failure, NOT a clean user stop */
     }
     {
         /* high-BDP tunnel: default UDP buffers (~212KB) overflow once
@@ -1009,7 +1009,7 @@ int run_socks(int sockfd, SocksConfig *cfg) {
     if (!g_flows) {
         port_close(listener);
         port_close(sockfd);   /* A-1: own + close sockfd on every return */
-        return 0;
+        return -1;   /* R13-M-1: startup failure, NOT a clean user stop */
     }
     g_next_id = 1;
     /* clear any DNS state a previous session left behind (result ring,

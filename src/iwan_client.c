@@ -959,12 +959,25 @@ static int cmd_socks(int argc, char **argv, int start)
          * and we re-run authenticate() (which allocates a fresh sockfd)
          * + run_socks() above. */
         int rc = run_socks(sockfd, &cfg);
+        /* run_socks tri-state contract (R13-FIND M-1, adapted with the
+         * -1 semantics landed by parallel agent A):
+         *   0  user stopped it  -> clean break, no retry
+         *   1  session lost     -> reconnect (re-auth runs via the
+         *                          caller's loop) with the message below
+         *  -1  startup failed   -> e.g. SOCKS5 listener bind failed / port
+         *                          in use; NOT a lost tunnel, so it gets
+         *                          its own diagnostic below. It still goes
+         *                          through the same 1s retry loop (bounded
+         *                          by g_user_stop), matching the task's
+         *                          "keep current retry behaviour, only add
+         *                          the distinguishing log". */
         if (rc == 0)
-            break;   /* user stopped it (run_socks returns 0 unless the
-                      * session was detected lost; the reconnect re-runs
-                      * auth via the caller's loop) */
+            break;   /* user stopped it */
+        if (rc < 0)
+            log_err("SOCKS startup failed (rc=%d); will retry in 1s...", rc);
         reconnecting = true;
-        log_err("tunnel session lost; reconnecting in 1s...");
+        if (rc > 0)
+            log_err("tunnel session lost; reconnecting in 1s...");
         port_sleep_ms(1000);
         if (g_user_stop)
             break;   /* Ctrl-C during the reconnect wait */

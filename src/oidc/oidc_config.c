@@ -284,6 +284,18 @@ void oidc_save_config(const char *path, const Config *cf)
         dir[slash - path] = '\0';
         dir_created = mkdir_p(dir);
     }
+    /* R13-M-5 defensive guard: a path with a leading separator but no
+     * directory component at all (slash == path) resolves to the
+     * filesystem ROOT — exactly what happens when --config-dir is an
+     * empty string (main joins "" + "/servers.json" into
+     * "/servers.json"). Writing there as root (sudo re-exec) is a
+     * misconfiguration, never a legitimate save: refuse loudly instead
+     * of open(NULL)/root-write UB. (The authoritative rejection belongs
+     * at CLI parse time in oidc_cli.c / iwan_client_oidc.c, which are
+     * outside this file's ownership — see the R13 report.) */
+    if (slash && slash == path)
+        oidc_die("refusing to save config into the filesystem root "
+                 "(path \"%s\"): is --config-dir empty?", path);
     /* write a sibling temp file, then rename() over the target so the
      * config is replaced atomically: a concurrent reader never sees a
      * half-written file. Same directory keeps rename() on one filesystem.
@@ -363,13 +375,19 @@ void oidc_save_config(const char *path, const Config *cf)
 #ifndef _WIN32
     /* fsync the parent directory so the rename itself is durable: an
      * atomic-replace promise is only half kept if a crash can roll the
-     * directory entry back to the old file */
-    {
+     * directory entry back to the old file. Guard the empty case
+     * (dir == NULL or ""): open(NULL, O_RDONLY|O_DIRECTORY) is UB, and
+     * with no directory component there is simply no parent dir to
+     * fsync — skip it (log_debug). Non-empty normal paths are unchanged. */
+    if (dir && dir[0] != '\0') {
         int dfd = open(dir, O_RDONLY | O_DIRECTORY);
         if (dfd >= 0) {
             (void)fsync(dfd);
             close(dfd);
         }
+    } else {
+        log_debug("config save: no parent directory to fsync (dir is "
+                  "empty/absent) — skipping parent-dir fsync");
     }
 #endif
     free(tmp);

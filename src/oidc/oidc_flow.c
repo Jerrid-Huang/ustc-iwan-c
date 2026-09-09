@@ -477,10 +477,15 @@ int oidc_ctrl_post(const char *path, const char *body,
     int st = 0;
     char *resp = NULL;
     if (!https_post(OIDC_CONTROLLER_HOST, path, body, headers, &st, &resp)) {
+        /* R13-M-6: auth holds "Authorization: Bearer <token>" — scrub
+         * the heap copy before release (R12 L-7: OPENSSL_cleanse) */
+        OPENSSL_cleanse(auth, strlen(auth));
         free(auth);
         oidc_die("request to %s failed (HTTP %d): %s", path, st,
                  resp && *resp ? resp : "no response (transport error)");
     }
+    /* R13-M-6: scrub the Bearer heap copy on the success path too */
+    OPENSSL_cleanse(auth, strlen(auth));
     free(auth);
     *resp_out = resp;
     return st;
