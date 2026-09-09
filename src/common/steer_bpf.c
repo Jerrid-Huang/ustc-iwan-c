@@ -18,8 +18,19 @@ static long (*bpf_skb_load_bytes)(void *ctx, __u32 off, void *to,
 SEC("classifier")
 int steer(struct __sk_buff *skb)
 {
-    __u8 proto;
+    __u8 byte0, proto;
     __u32 saddr, daddr, sport, dport;
+
+    /* Version gate: only IPv4 flows are steered. Parsing the 4-tuple at
+     * IPv4 offsets (12/16/20/22) on IPv6 packets would hash them all to
+     * ~one queue — the exact degeneration this classifier replaces for
+     * our fd00::/96-derived ULA traffic. Non-IPv4 (IPv6 etc.) returns 0
+     * and lets the kernel distribute normally; we never drop data, only
+     * (mis)balance. */
+    if (bpf_skb_load_bytes(skb, 0, &byte0, 1))
+        return 0;
+    if ((byte0 >> 4) != 4)
+        return 0;
 
     if (bpf_skb_load_bytes(skb, 9, &proto, 1))
         return 0;
@@ -37,7 +48,12 @@ int steer(struct __sk_buff *skb)
         bpf_skb_load_bytes(skb, 20, &sport, 2) ||
         bpf_skb_load_bytes(skb, 22, &dport, 2))
         return 0;
-    return saddr ^ daddr ^ sport ^ dport;
+    /* Mask to 16 bits: the kernel treats a SOCKET_FILTER return as the
+     * number of bytes to keep and caps it at 0..0xffff on older kernels,
+     * so an unmasked 32-bit hash could be misread as "drop everything".
+     * Truncating costs no distribution quality (we only use it via
+     * ret % numqueues). */
+    return (saddr ^ daddr ^ sport ^ dport) & 0xffff;
 }
 
 char _license[] SEC("license") = "Dual MIT/GPL";

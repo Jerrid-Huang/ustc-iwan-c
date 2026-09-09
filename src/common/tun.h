@@ -16,9 +16,19 @@
 
 /* All tun devices are created with IFF_MULTI_QUEUE: a single queue fd is
  * indistinguishable from the old single-queue mode, and extra queue fds
- * (tun_attach) enable parallel user-space readers. */
+ * (tun_attach) enable parallel user-space readers.
+ * open_tun is the MAIN-device creation and uses IFF_TUN_EXCL (fails EBUSY
+ * if the name is already taken); tun_attach deliberately does NOT use
+ * EXCL because it re-opens the device we already own to add a queue. */
 int  open_tun(const char *name);     /* device owner fd or -1 */
 int  tun_attach(const char *name);   /* extra queue fd or -1 */
+
+/* Pre-open up to `maxn` extra queue fds (tun_attach each; stop at first
+ * failure). The server calls this while still root so the de-privileged
+ * child can pass the fds to tun_pool_create_pre and keep a real
+ * multi-queue fan-out. Returns the number actually opened (0 on non-Linux
+ * where tun_attach is unavailable). */
+int  tun_attach_many(const char *name, int *fds, int maxn);
 
 /* The interface name to hand to ifconfig/route etc. Linux/Windows:
  * the requested name IS the interface. macOS: utun devices are named
@@ -113,6 +123,18 @@ typedef void (*tun_exit_fn)(void);
 struct tun_pool *tun_pool_create(const char *name, int fd0, int maxq,
                                  int initq, tun_pkt_fn cb, void *ud,
                                  atomic_bool *abort);
+/* tun_pool_create_pre: same as tun_pool_create, but the eager fill first
+ * consumes up to `npre` queue fds from `prefds` (pre-opened by the caller
+ * while it still had the privilege), then falls back to tun_attach for any
+ * shortfall. Ownership of all `prefds` transfers to the pool — they become
+ * ordinary extra queues (closed by tun_pool_destroy), and any the pool
+ * does not need are closed during create. Pass prefds=NULL/npre=0 for the
+ * plain behavior. The server uses this to keep a real multi-queue fan-out
+ * after fork+setuid (see tun_attach_many). */
+struct tun_pool *tun_pool_create_pre(const char *name, int fd0, int maxq,
+                                     int initq, const int *prefds, int npre,
+                                     tun_pkt_fn cb, void *ud,
+                                     atomic_bool *abort);
 /* actual number of reader threads currently running: adapts (AIMD
  * grow/shrink) on Linux, always 1 on Windows (wintun is single-queue) */
 int tun_pool_queues(const struct tun_pool *p);

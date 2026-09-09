@@ -12,7 +12,7 @@ if(NOT DEFINED IN OR NOT DEFINED OUT)
   message(FATAL_ERROR "usage: cmake -DIN=<obj> -DOUT=<cfile> -P embed_bpf.cmake")
 endif()
 
-file(READ "${IN}" HEX _hex)                 # continuous lowercase hex
+file(READ "${IN}" _hex HEX)                 # continuous lowercase hex
 string(REGEX REPLACE "(..)" "0x\\1," _bytes "${_hex}")
 string(REGEX REPLACE "((0x[0-9a-f]{2},){16})" "\\1\n" _lines "${_bytes}")
 

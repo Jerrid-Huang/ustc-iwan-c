@@ -574,10 +574,14 @@ static int setup_tun(const char *name, const char *server_ip, int mask)
 
     /* No pre-delete: our TUN devices are non-persistent (open_tun never
      * sets TUNSETPERSIST), so the kernel removes them when we exit —
-     * including on a crash. If `name` is occupied by any interface type,
-     * TUNSETIFF fails with EBUSY/EEXIST below and startup aborts instead
-     * of touching a device we do not own. main() already validated the
-     * name shape (tun_name_valid). */
+     * including on a crash. This is the MAIN-device creation, so open_tun
+     * sets IFF_TUN_EXCL: if `name` is already in use (any interface type,
+     * including a tun owned by another process), TUNSETIFF fails EBUSY
+     * and startup aborts instead of silently attaching to — and then
+     * flushing the addresses of — a device we do not own. (The extra
+     * queue fds opened later via tun_attach_many deliberately skip EXCL;
+     * they attach to the device created here.) main() already validated
+     * the name shape (tun_name_valid). */
     fd = open_tun(name);
     if (fd < 0) {
         fprintf(stderr, "error: cannot open tun device %s: %s (run as root?)\n",
@@ -909,6 +913,14 @@ int main(int argc, char **argv)
     char subnet_net[64];
     int udp_fds[IWAN_SRV_THREADS_MAX];
     int nusers, tun_fd = -1, nfds;
+    /* H-3: queue fds pre-opened in the root section (before fork+setuid)
+     * and handed to tun_pool_create_pre; `pre` lives on main's stack and
+     * is inherited by the child across the fork. maxq/initq are computed
+     * once in the root section and reused for the pool after the fork. */
+    int pre[TUN_POOL_MAX];
+    int npre = 0;
+    int maxq = TUN_POOL_MAX;
+    int initq = 0;
     _Atomic int poll_err = 0;   /* M3-6: fatal poll flag aggregated from
                                  * all recv threads (exit != 0 for mgrs) */
     bool drop_child = false; /* A1: this process is the forked, de-privileged server */
@@ -1063,6 +1075,37 @@ int main(int argc, char **argv)
         else
             printf("tun steering: eBPF flow hash NOT attached "
                    "(kernel automq fallback; see tun.c log)\n");
+
+        /* H-3: pre-open the extra queue fds HERE, while still root, so a
+         * default root deployment actually gets a multi-queue fan-out.
+         * tun_pool_add -> tun_attach -> open("/dev/net/tun")+TUNSETIFF
+         * afterwards (in the forked setuid child, which has lost
+         * CAP_NET_ADMIN) fails EPERM, silently pinning the server to a
+         * single queue. tun_attach_many opens up to initq-1 extra queue
+         * fds on the device we just created; the fds cross the fork below
+         * (inherited by the child) and are handed to tun_pool_create_pre,
+         * which takes ownership of them (pool closes them on destroy; the
+         * root parent does NOT close them — it just waits/forwards).  Only
+         * the extra queues we create ourselves are touched; existing
+         * devices are never modified.  On a non-root deployment
+         * tun_attach_many returns 0 and the pool falls back to attaching
+         * at creation time (unchanged behavior).  The pool geometry
+         * (maxq/initq) is computed here once so it is available both for
+         * the pre-open and for the pool creation after the fork. */
+        {
+            long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+            maxq = TUN_POOL_MAX;
+            if (ncpu > 0 && ncpu < maxq)
+                maxq = (int)ncpu;
+            initq = recv_threads < maxq ? recv_threads : maxq;
+            npre = tun_attach_many(o.tun, pre, initq - 1);
+            if (npre > 0)
+                printf("tun: pre-opened %d extra queue fd%s while root\n",
+                       npre, npre > 1 ? "s" : "");
+            else
+                printf("tun: no pre-opened extra queue fds "
+                       "(non-root or queue setup limited)\n");
+        }
     }
 
     nfds = setup_udp(o.port, udp_fds, recv_threads);
@@ -1165,10 +1208,9 @@ int main(int argc, char **argv)
 
     if (!o.no_tun) {
         static struct srv_pool_ud pu; /* readers reference this for life */
-        long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
-        int maxq = TUN_POOL_MAX;
-        if (ncpu > 0 && ncpu < maxq)
-            maxq = (int)ncpu;
+        /* maxq/initq were computed once in the root section above (H-3)
+         * so the same geometry drives both the queue pre-open and this
+         * pool. */
         pu.ctx = &ctx;
         pu.udp_fds = udp_fds;
         pu.nfds = nfds;
@@ -1176,10 +1218,13 @@ int main(int argc, char **argv)
          * (tun_pool_write_fd, tid % nq); starting at the recv-thread
          * count means the write-side fan-out is effective immediately
          * instead of waiting for the downlink-driven AIMD to grow the
-         * pool (ACK-only downlink keeps it near 1 queue otherwise) */
-        int initq = recv_threads < maxq ? recv_threads : maxq;
-        ctx.qpool = tun_pool_create(o.tun, tun_fd, maxq, initq,
-                                    srv_tun_pkt, &pu, &g_stop);
+         * pool (ACK-only downlink keeps it near 1 queue otherwise).
+         * tun_pool_create_pre first consumes the queue fds pre-opened in
+         * the root section (via tun_attach_many), then falls back to
+         * tun_attach for any shortfall (non-root deployments). */
+        ctx.qpool = tun_pool_create_pre(o.tun, tun_fd, maxq, initq,
+                                        npre > 0 ? pre : NULL, npre,
+                                        srv_tun_pkt, &pu, &g_stop);
         if (!ctx.qpool) {
             fprintf(stderr, "error: cannot start TUN reader pool\n");
             if (!drop_child)
@@ -1188,11 +1233,9 @@ int main(int argc, char **argv)
         }
         /* M1: report the REAL queue count (tun_pool_queues) instead of the
          * requested initq — eager multi-queue fill (tun_pool_add ->
-         * open /dev/net/tun per queue) silently degrades to a single queue
-         * when /dev/net/tun is not group-readable, and claiming initq
-         * queues then lied about the actual fan-out.  Deeper "pre-open the
-         * extra queue fds while still root" is a pool-architecture change
-         * (follow-up, out of scope this round). */
+         * open /dev/net/tun per queue) still degrades when /dev/net/tun
+         * access is limited, and claiming initq queues would then lie
+         * about the actual fan-out. */
         int nq = tun_pool_queues(ctx.qpool);
         printf("tun reader pool: %d queue%s (dynamic up to %d)\n",
                nq, nq > 1 ? "s" : "", maxq);

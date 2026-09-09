@@ -747,6 +747,18 @@ rollback:
     return false;
 }
 #else
+/* Linux/POSIX session state: whether THIS process actually installed the
+ * tunnel default route and/or the server /32 pin during route_setup.
+ * route_teardown must never remove a route this process did not install;
+ * in particular, when route_setup fails BEFORE replacing the default, the
+ * rollback must leave the pre-existing physical default(s) completely
+ * untouched (an unqualified `route del default` would delete the real
+ * default and strand the machine). Each flag is set only after the
+ * matching install command succeeds and cleared by route_teardown, so a
+ * later session starts clean. */
+static bool srv_default_installed;
+static bool srv_pin_installed;
+
 bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
                  const char *srv, const char *ogw, const char *odev,
                  const char *metric, const slist_t *routes_with_default) {
@@ -760,6 +772,13 @@ bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
     bool srv_lo = srv_v4 && (ntohl(s4.s_addr) >> 24) == 127;
     snprintf(srv32, sizeof srv32, "%s/32", srv);
     char *fc[] = { "route", "flush", "cache", NULL };
+
+    /* B-1/B-2: start a fresh session — neither the tunnel default nor
+     * the server pin is installed yet, so if anything below fails before
+     * we install them, the rollback (route_teardown) must not touch the
+     * pre-existing routes (it only acts when the matching flag is set) */
+    srv_default_installed = false;
+    srv_pin_installed = false;
 
     /* every step mutates system state, so a failure must stop the
      * sequence and undo what was applied; a half-configured tunnel
@@ -784,6 +803,11 @@ bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
             route_iface_down(tun);
             return false;
         }
+        /* B-2: remember that WE now own this /32 — teardown may only
+         * remove it (and only via the same via/dev attributes) when this
+         * flag is set, so a pre-existing /32 that we never replaced is
+         * never deleted by us */
+        srv_pin_installed = true;
     }
 
     for (size_t i = 0; i < routes_with_default->n; i++) {
@@ -811,6 +835,12 @@ bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
                         tun);
                 goto rollback_routes;
             }
+            /* B-1: remember that we replaced the default with a tunnel
+             * route (dev <tun>, no via). route_teardown may only delete
+             * the default (and then restore the pre-VPN one) when this
+             * flag is set, so a setup that fails before this point never
+             * tears the pre-existing physical default away. */
+            srv_default_installed = true;
         } else {
             char *r3[] = { "route", "replace", (char *)c, "dev",
                            (char *)tun, NULL };
@@ -947,11 +977,35 @@ void route_teardown(const char *tun, const char *srv, const char *ogw,
     for (size_t i = 0; i < routes->n; i++) {
         const char *c = routes->v[i];
         if (is_default_v4(c)) {
-            char *d1[] = { "route", "del", "default", NULL };
+            /* B-1: only ever remove a default that THIS process really
+             * installed. route_setup sets srv_default_installed only
+             * after `route replace default dev <tun>` succeeded, so when
+             * setup failed before that step (rollback path) — or there
+             * is simply no tunnel default from this session — the
+             * pre-existing physical default(s) are left completely
+             * untouched; the old unqualified `route del default` would
+             * have deleted the real default and stranded the machine. */
+            if (!srv_default_installed)
+                continue;
+            /* we did replace the default: clear the flag up front —
+             * whether or not the delete below succeeds we no longer own
+             * a tunnel default afterwards, so a later teardown (or a
+             * fresh session) cannot act on stale state. */
+            srv_default_installed = false;
+            /* delete ONLY the tunnel default we installed, mirroring
+             * setup's `route replace default dev <tun>`: qualifying with
+             * `dev <tun>` means a multi-default host loses only our
+             * entry (the old unqualified del was ambiguous there and
+             * could remove an unrelated default on a single-default host
+             * during a failed-setup rollback). */
+            char *d1[] = { "route", "del", "default", "dev",
+                           (char *)tun, NULL };
             if (!ip_run(d1)) {
-                /* the default route was not ours to remove (never
-                 * replaced, or already gone): leave whatever is there
-                 * alone — deleting it here would strand the machine */
+                /* our tunnel default is already gone (crash cleanup, or
+                 * the replace never took effect): leave whatever default
+                 * is there alone */
+                log_debug("route_teardown: no tunnel default on %s to "
+                          "delete", tun);
                 continue;
             }
             /* we removed it: restore the original via-gateway route,
@@ -1001,11 +1055,19 @@ void route_teardown(const char *tun, const char *srv, const char *ogw,
     char srv32[64];
     struct in_addr s4;
     snprintf(srv32, sizeof srv32, "%s/32", srv);
+    /* B-2: only remove the server /32 pin this process actually
+     * installed — srv_pin_installed is set by route_setup right after
+     * `route replace <srv>/32 via <ogw> dev <odev>` succeeds. The delete
+     * mirrors setup's via/dev attributes, so a pre-existing /32 that is
+     * not ours (or one pinned via another gateway/device) is never
+     * touched by the teardown. */
     if (inet_pton(AF_INET, srv, &s4) == 1 &&
-        (ntohl(s4.s_addr) >> 24) != 127) {
-        char *d4[] = { "route", "del", srv32, NULL };
+        (ntohl(s4.s_addr) >> 24) != 127 && srv_pin_installed) {
+        char *d4[] = { "route", "del", srv32, "via", (char *)ogw, "dev",
+                       (char *)odev, NULL };
         if (!ip_run(d4))
             log_debug("route_teardown: route del %s: not present", srv32);
+        srv_pin_installed = false;
     }
     route_iface_down(tun);
     char *fc[] = { "route", "flush", "cache", NULL };

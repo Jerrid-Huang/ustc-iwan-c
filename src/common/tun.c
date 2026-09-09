@@ -27,7 +27,11 @@
  * same device-name rule set. */
 
 #ifdef __linux__
-int open_tun(const char *name) {
+/* Shared TUN open path. `extra_flags` is OR-ed into the TUNSETIFF
+ * flags. Main-device creation passes IFF_TUN_EXCL (open_tun); extra
+ * queue attach passes none (tun_attach), because the device name is
+ * already taken by the very device we are attaching to. */
+static int open_tun_flags(const char *name, int extra_flags) {
     if (!tun_name_valid(name))
         return -1;
     int fd = open("/dev/net/tun", O_RDWR);
@@ -35,7 +39,7 @@ int open_tun(const char *name) {
     if (fd < 0)
         return -1;
     memset(&ifr, 0, sizeof ifr);
-    ifr.ifr_flags = IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE;
+    ifr.ifr_flags = IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE | extra_flags;
     strncpy(ifr.ifr_name, name, IFNAMSIZ - 1);
     if (ioctl(fd, TUNSETIFF, &ifr) < 0) {
         int e = errno;
@@ -43,24 +47,41 @@ int open_tun(const char *name) {
         errno = e;
         return -1;
     }
-    /* the TUN receive queue carries the peer kernel's ACK stream: the
-     * default rcvbuf (~212KB) overflows in ~2ms under a high-rate
-     * upload burst and TCP ACKs are never retransmitted, so every
-     * overflowed ACK forces a full RTO recovery on the far side.
-     * Match the UDP session buffers (4MiB) so the reader pool can
-     * drain bursts instead of the kernel dropping them. */
-    int sz = 4 * 1024 * 1024;
-    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof sz);
     return fd;
 }
 
-/* attach another queue fd to an existing IFF_MULTI_QUEUE device */
+int open_tun(const char *name) {
+    /* IFF_TUN_EXCL: main-device creation must never silently attach to
+     * an interface created by someone else — TUNSETIFF fails EBUSY if
+     * `name` is already in use, instead of joining it (and then
+     * setup_tun flushing its addresses). */
+    return open_tun_flags(name, IFF_TUN_EXCL);
+}
+
+/* attach another queue fd to an existing IFF_MULTI_QUEUE device.
+ * Deliberately NO IFF_TUN_EXCL: the name is already taken by the device
+ * we own and EXCL would make TUNSETIFF fail EBUSY, so extra queues
+ * would be impossible. (A legacy SO_RCVBUF setsockopt was removed here:
+ * a tun device fd is a character device, so setsockopt always returns
+ * ENOTSOCK and never did anything — the receive-side buffering is the
+ * device packet queue, not a socket rcvbuf.) */
 int tun_attach(const char *name) {
-    return open_tun(name);
+    return open_tun_flags(name, 0);
 }
 
 void tun_detach(int fd) {
-    ioctl(fd, TUNSETQUEUE, (void *)(long)IFF_DETACH_QUEUE);
+    struct ifreq ifr;
+
+    memset(&ifr, 0, sizeof ifr);
+    ifr.ifr_flags = IFF_DETACH_QUEUE;
+    /* TUNSETQUEUE copies a full struct ifreq from userspace; passing the
+     * bare flag integer as the ioctl arg made the kernel fail with
+     * EFAULT, silently masked by the close() that followed (the close
+     * does detach the queue regardless). The real detach still happens
+     * on close, so failure here is non-fatal — log it for diagnosis. */
+    if (ioctl(fd, TUNSETQUEUE, &ifr) < 0)
+        log_debug("tun_detach: TUNSETQUEUE: %s (close will detach)",
+                  strerror(errno));
 }
 
 /* macOS/other non-Linux backends (tun_mac.c) implement open_tun,
@@ -223,6 +244,27 @@ int tun_steering_attach(int tun_fd)
 
 void tun_close(int fd) {
     close(fd);
+}
+
+/* Pre-open up to `maxn` extra queue fds for an existing IFF_MULTI_QUEUE
+ * device. The server calls this while still root (CAP_NET_ADMIN held,
+ * before fork+setuid) so the queue fan-out actually exists in the
+ * unprivileged child; after the privilege drop /dev/net/tun open+TUNSETIFF
+ * would fail EPERM and the pool would degrade to a single queue. Stops at
+ * the first failure; returns the number actually opened. On non-Linux
+ * backends tun_attach returns -1, so this yields 0 and callers fall back to
+ * attaching after the pool starts (unchanged behavior). */
+int tun_attach_many(const char *name, int *fds, int maxn)
+{
+    int n = 0;
+
+    while (n < maxn) {
+        int fd = tun_attach(name);
+        if (fd < 0)
+            break;
+        fds[n++] = fd;
+    }
+    return n;
 }
 
 void set_nonblock(int fd) {
@@ -452,15 +494,17 @@ static void *tun_reader_main(void *ud)
     return NULL;
 }
 
-static int tun_pool_add(struct tun_pool *pool)
+/* start a reader thread on an already-open queue fd and publish it as
+ * the newest pool queue. On success the pool owns `fd` (as an extra
+ * queue, later closed by tun_pool_destroy/del). On failure `fd` is NOT
+ * closed here — the caller keeps ownership and must close it (this keeps
+ * the pre-opened-fd path free of double-close when create_pre bins the
+ * leftovers). */
+static int tun_pool_add_fd(struct tun_pool *pool, int fd)
 {
-    int fd;
     int nq = atomic_load(&pool->nq);
 
     if (nq >= pool->maxq)
-        return -1;
-    fd = tun_attach(pool->tunname);
-    if (fd < 0)
         return -1;
     set_nonblock(fd);
     {
@@ -469,12 +513,28 @@ static int tun_pool_add(struct tun_pool *pool)
         q->fd = fd;
         q->stop = 0;
         atomic_store(&q->waits, 0);
-        if (pthread_create(&q->th, NULL, tun_reader_main, q) != 0) {
-            close(fd);
+        if (pthread_create(&q->th, NULL, tun_reader_main, q) != 0)
             return -1;
-        }
     }
     atomic_store(&pool->nq, nq + 1);
+    return 0;
+}
+
+/* attach one extra queue the ordinary way (needs CAP_NET_ADMIN /
+ * /dev/net/tun access at call time) and add it to the pool */
+static int tun_pool_add(struct tun_pool *pool)
+{
+    int fd;
+
+    if (atomic_load(&pool->nq) >= pool->maxq)
+        return -1;
+    fd = tun_attach(pool->tunname);
+    if (fd < 0)
+        return -1;
+    if (tun_pool_add_fd(pool, fd) != 0) {
+        close(fd);   /* ownership stayed with us on failure */
+        return -1;
+    }
     return 0;
 }
 
@@ -499,12 +559,14 @@ static void tun_pool_del(struct tun_pool *pool)
     tun_close(pool->qs[i].fd);
 }
 
-struct tun_pool *tun_pool_create(const char *name, int fd0, int maxq,
-                                 int initq, tun_pkt_fn cb, void *ud,
-                                 atomic_bool *abort)
+struct tun_pool *tun_pool_create_pre(const char *name, int fd0, int maxq,
+                                     int initq, const int *prefds, int npre,
+                                     tun_pkt_fn cb, void *ud,
+                                     atomic_bool *abort)
 {
     struct tun_pool *pool = calloc(1, sizeof *pool);
     struct tun_queue *q;
+    int pi = 0;   /* index of the next pre-opened fd to consume */
 
     if (!pool)
         return NULL;
@@ -526,16 +588,40 @@ struct tun_pool *tun_pool_create(const char *name, int fd0, int maxq,
     atomic_store(&pool->nq, 1);
     pool->slow_start = 1;
     pool->idle_cycles = 0;
-    /* eager start: attach initq-1 extra queues up front (used by the
+    /* eager start: reach initq-1 extra queues up front (used by the
      * client pump, whose bulk uplink would otherwise make the AIMD hunt
-     * between the single-queue and multi-queue capacities) */
+     * between the single-queue and multi-queue capacities). Prefer the
+     * caller's pre-opened queue fds (taken, not attached) — the server
+     * opened them while still root so the unprivileged child can keep a
+     * real multi-queue fan-out; any shortfall then falls back to
+     * tun_attach for deployments that still have the capability at pool
+     * time (non-root servers that own /dev/net/tun, clients). */
     if (initq > pool->maxq)
         initq = pool->maxq;
+    /* first consume the pre-opened fds; ownership of all `prefds`
+     * transfers to the pool (any left over are closed here) */
+    while (atomic_load(&pool->nq) < initq && prefds && pi < npre) {
+        if (tun_pool_add_fd(pool, prefds[pi]) != 0)
+            break;
+        pi++;
+    }
+    for (; pi < npre; pi++)
+        close(prefds[pi]);   /* hand back unused pre-opened fds */
+    /* then attach any still-needed extra queues the ordinary way */
     while (atomic_load(&pool->nq) < initq) {
         if (tun_pool_add(pool) != 0)
             break;
     }
     return pool;
+}
+
+struct tun_pool *tun_pool_create(const char *name, int fd0, int maxq,
+                                 int initq, tun_pkt_fn cb, void *ud,
+                                 atomic_bool *abort)
+{
+    /* no pre-opened fds: same eager fill via tun_pool_add as before */
+    return tun_pool_create_pre(name, fd0, maxq, initq, NULL, 0,
+                               cb, ud, abort);
 }
 
 int tun_pool_queues(const struct tun_pool *pool)
