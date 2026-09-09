@@ -13,6 +13,7 @@
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
+#include <openssl/crypto.h>   /* OPENSSL_cleanse (L-7): wipe Bearer/token */
 #ifdef _WIN32
 #  include <wincrypt.h>
 #endif
@@ -843,6 +844,22 @@ static int https_connect_tcp(const char *host, uint16_t port,
                  (unsigned)port, strerror(errno));
 #endif
     }
+    /* C-1 (E2 regression, af7308a): Happy Eyeballs connects on
+     * nonblocking fds (set above). The TLS stage that follows
+     * (https_tls_connect/write/read) is designed for a BLOCKING fd
+     * parked on SO_RCVTIMEO/SO_SNDTIMEO; on a nonblocking fd
+     * SSL_ERROR_WANT_READ/WANT_WRITE return immediately and the old
+     * "continue" loop would spin one core for the whole deadline.
+     * Restore blocking on the winner at this single return funnel so
+     * every path hands a blocking fd to https_connect_tls. */
+    if (fd >= 0 && port_set_nonblock(fd, false) != 0) {
+#ifdef _WIN32
+        snprintf(diag, diagsz, "ioctlsocket(FIONBIO): wsa %d (errno %d)",
+                 fd, WSAGetLastError(), errno);
+#endif
+        port_close(fd);
+        fd = -1;
+    }
     return fd;
 }
 
@@ -923,7 +940,12 @@ static int https_tls_connect(SSL *ssl, int fd, uint64_t deadline_ms,
             int e = SSL_get_error(ssl, r);
 
             if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE)
-                continue;   /* interrupted by the socket timeout */
+                /* socket-timeout semantics hold only on a BLOCKING fd;
+                 * https_connect_tcp restored it to blocking (C-1), so a
+                 * WANT_* here means the SO_RCVTIMEO/SNDTIMEO fired and we
+                 * re-check the deadline. On a nonblocking fd this would
+                 * return instantly and spin one core until the deadline. */
+                continue;
             if (e == SSL_ERROR_SYSCALL) {
                 if (errno == EINTR)
                     continue;
@@ -998,6 +1020,8 @@ static int https_tls_write(SSL *ssl, int fd, const char *req,
             int e = SSL_get_error(ssl, w);
 
             if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE)
+                /* fd is blocking (restored by C-1); WANT_* means the send
+                 * timeout fired — re-check the deadline next iteration */
                 continue;
             if (e == SSL_ERROR_SYSCALL) {
                 if (errno == EINTR)
@@ -1138,7 +1162,11 @@ static int https_tls_read(SSL *ssl, int fd, struct sbuf *resp,
                 return 0;
             }
             if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE)
-                continue;   /* interrupted by the socket timeout */
+                /* socket-timeout semantics hold only on a BLOCKING fd
+                 * (restored by C-1); here WANT_* means SO_RCVTIMEO fired
+                 * and we re-check the deadline — on a nonblocking fd this
+                 * returns instantly and spins until the deadline */
+                continue;
             if (e == SSL_ERROR_SYSCALL) {
                 if (r == 0) {
                     /* EOF without close_notify: the peer closed after
@@ -1382,6 +1410,12 @@ static bool https_transport(const char *host, struct sbuf *req,
     }
 
 out:
+    /* L-7: the request buffer may hold the caller's Authorization:
+     * Bearer <token> (and the token-endpoint POST body); scrub it from
+     * the heap before release instead of leaving the credential in a
+     * freed chunk. */
+    if (req->d && req->len)
+        OPENSSL_cleanse(req->d, req->len);
     free(req->d);
     if (ssl)
         SSL_free(ssl);
@@ -1516,10 +1550,15 @@ static bool https_roundtrip(const char *host, const char *path,
                 }
                 /* cross-host hop: drop the Authorization header. L1:
                  * hostnames are case-insensitive (RFC 3986), compare
-                 * case-insensitively — case-sensitive compare over-drops
-                 * (fail-safe) but is inconsistent with the resolver. */
-                if (port_strncasecmp(new_host, cur_host,
-                                     strlen(new_host)) != 0 && cur_headers) {
+                 * case-insensitively. Same host requires EQUAL
+                 * hostnames: a prefix match (new shorter than cur, or
+                 * vice versa) is a different host — e.g. new="a.com"
+                 * vs cur="a.com.attacker.io" — and MUST drop the
+                 * Authorization header (C-2). */
+                if (!(strlen(new_host) == strlen(cur_host) &&
+                      port_strncasecmp(new_host, cur_host,
+                                       strlen(new_host)) == 0) &&
+                    cur_headers) {
                     cur_headers = https_drop_auth(
                         cur_headers, no_auth,
                         sizeof no_auth / sizeof no_auth[0]);
