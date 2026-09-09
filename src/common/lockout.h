@@ -4,8 +4,12 @@
 /* Fixed-slot failure lockout table shared by the SOCKS and relay
  * listeners: max_fails consecutive failures from the same key within
  * window_ms trip a ban for another window_ms; a successful auth clears
- * the peer's history. Slots are reclaimed empty-first, else oldest
- * first_fail_ms (the entry that would age out soonest).
+ * the peer's history. Slots are reclaimed empty-first, else the oldest
+ * non-blocked first_fail_ms (the entry that would age out soonest); an
+ * entry under an active ban is only evicted as a last resort, when every
+ * candidate is still blocked. A same-key failure that arrives after the
+ * counting window while the ban is still running restarts only the count,
+ * never the ban itself (M-1).
  *
  * Keys are opaque byte blobs encoded by the caller (SOCKS: the IPv4
  * address; relay: family flag + address words, v6 merged to /64).

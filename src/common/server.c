@@ -39,6 +39,14 @@
  * client discards almost all echoes), and a naive advance-on-seen table
  * fails on the first lost echo (the retransmit advances the table a
  * second time and every later mirror is discarded as out-of-order).
+ * The first segment of a connection (its SYN — the only packet that
+ * creates an entry) must always be treated as NEW data: the retransmit
+ * heuristic reads client_max - s_orig, but with a fresh entry
+ * client_max stays 0, so an initial ISN in the upper half of the seq
+ * space ([2^31+1, 2^32-1]) wraps the subtraction into a small "back"
+ * and is misclassified as a retransmit, wedging the counters forever.
+ * The per-entry `seeded` flag marks the first-segment handoff so the
+ * retransmit test only runs from the second segment onward.
  * Locked: handle_udp runs on several SO_REUSEPORT recv threads. */
 #define ECHO_MAX_CONN 64
 struct echo_conn {
@@ -51,6 +59,7 @@ struct echo_conn {
     uint16_t t_port;
     uint32_t client_max;         /* highest client seq+len seen */
     uint32_t emit_seq;           /* next seq our mirrors will use */
+    bool     seeded;             /* first segment already handled */
     uint64_t last_ms;            /* idle reclamation */
 };
 static struct echo_conn g_echo[ECHO_MAX_CONN];
@@ -95,6 +104,8 @@ static struct echo_conn *echo_lookup(uint8_t af, const uint32_t *c4,
         }
         free_slot->client_max = 0;
         free_slot->emit_seq = 0;
+        free_slot->seeded = false;   /* fresh entry: first segment is
+                                      * unconditionally new data */
         free_slot->last_ms = now;
         pthread_mutex_unlock(&g_echo_mu);
         return free_slot;
@@ -121,14 +132,26 @@ static int echo_seq_advance(uint8_t af, const uint32_t *c4,
     uint32_t len = (uint32_t)paylen;
     if (flags & (TCP_SYN | TCP_FIN))
         len++;               /* SYN/FIN each consume one sequence number */
-    /* unsigned subtraction: back is small when s_orig lags client_max
-     * (retransmit), huge (wrapped) when s_orig is at or past it */
-    uint32_t back = (uint32_t)(ec->client_max - s_orig);
-    if (back != 0 && back < 0x80000000u) {
-        /* retransmit: re-echo at the position this content was first
-         * mirrored to; counters do not move */
-        *seq_out = ec->emit_seq - back;
-        return 0;
+    if (!ec->seeded) {
+        /* First segment for this 4-tuple (in practice its SYN, the only
+         * segment that creates an entry): never a retransmit — always a
+         * fresh new-data packet. The retransmit test below relies on a
+         * valid client_max and would otherwise misfire for an initial
+         * ISN in [2^31+1, 2^32-1] (a fresh client_max of 0 wraps
+         * client_max - s_orig into a small "back"), freezing the state
+         * machine. Seed the counters and skip the retransmit check. */
+        ec->seeded = true;
+    } else {
+        /* unsigned subtraction: back is small when s_orig lags
+         * client_max (retransmit), huge (wrapped) when s_orig is at or
+         * past it */
+        uint32_t back = (uint32_t)(ec->client_max - s_orig);
+        if (back != 0 && back < 0x80000000u) {
+            /* retransmit: re-echo at the position this content was
+             * first mirrored to; counters do not move */
+            *seq_out = ec->emit_seq - back;
+            return 0;
+        }
     }
     *seq_out = ec->emit_seq;
     ec->client_max = s_orig + len;
@@ -810,6 +833,16 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
         }
     }
     if (!pass) {
+        /* M-4: burn an equal-cost dummy derivation so an unknown-username
+         * rejection takes the same time as a known user's wrong password —
+         * prevents remote account enumeration by timing (the real compare
+         * is already CRYPTO_memcmp constant-time; this closes the
+         * path-existence side channel). The dummy never participates in
+         * an accept. */
+        uint8_t dummy[16];
+        static const char dummy_pass[] = "iw-no-such-account-dummy";
+        encrypt_password(dummy_pass, a.user, dummy);
+        (void)CRYPTO_memcmp(dummy, a.ct, sizeof a.ct);
         open_reject(sockfd, peer, a.user, "invalid credentials");
         return;
     }
@@ -1066,27 +1099,51 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                     if (ip6_pkt_ok(in, inlen, s6, d6) != 0 ||
                         memcmp(s6, want6, 16) != 0) {
                         g_up[tid].h1++;
-                        if (debug_enabled())
-                            log_debug("uplink drop: bad inner IPv6 "
-                                      "(sid 0x%04x) v=%u nexth=%u plen=%u",
-                                      sid, in[0] >> 4, in[6],
-                                      ((unsigned)in[4] << 8) | in[5]);
+                        if (debug_enabled()) {
+                            /* short frames can fail the sanity check
+                             * before in[4..6] exist — never read past the
+                             * datagram end (stale slot bytes), just log a
+                             * shorter diagnosis */
+                            if (inlen >= 8)
+                                log_debug("uplink drop: bad inner IPv6 "
+                                          "(sid 0x%04x) v=%u nexth=%u "
+                                          "plen=%u",
+                                          sid, in[0] >> 4, in[6],
+                                          ((unsigned)in[4] << 8) | in[5]);
+                            else
+                                log_debug("uplink drop: bad inner IPv6 "
+                                          "(sid 0x%04x) v=%u",
+                                          sid, in[0] >> 4);
+                        }
                         break;
                     }
                 } else {
                     if (ipv4_pkt_ok(in, inlen, &saddr, &daddr) != 0 ||
                         saddr != s_ip) {
                         g_up[tid].h1++;
-                        if (debug_enabled())
-                            log_debug("uplink drop: bad inner IPv4 "
-                                      "(sid 0x%04x) %u.%u.%u.%u->%u.%u.%u.%u "
-                                      "v=%u ihl=%u tot=%u",
-                                      sid, raw[8 + 12], raw[8 + 13],
-                                      raw[8 + 14], raw[8 + 15], raw[8 + 16],
-                                      raw[8 + 17], raw[8 + 18], raw[8 + 19],
-                                      raw[8] >> 4, raw[8] & 0x0F,
-                                      ((unsigned)raw[8 + 2] << 8) |
-                                          raw[8 + 3]);
+                        if (debug_enabled()) {
+                            /* short frames can fail the sanity check
+                             * before the inner header bytes exist — never
+                             * read past the datagram end (stale slot
+                             * bytes); skip the unavailable fields */
+                            if (inlen >= 20)
+                                log_debug("uplink drop: bad inner IPv4 "
+                                          "(sid 0x%04x) %u.%u.%u.%u->"
+                                          "%u.%u.%u.%u v=%u ihl=%u tot=%u",
+                                          sid, in[12], in[13], in[14],
+                                          in[15], in[16], in[17], in[18],
+                                          in[19], in[0] >> 4, in[0] & 0x0F,
+                                          ((unsigned)in[2] << 8) | in[3]);
+                            else if (inlen >= 4)
+                                log_debug("uplink drop: bad inner IPv4 "
+                                          "(sid 0x%04x) v=%u ihl=%u tot=%u",
+                                          sid, in[0] >> 4, in[0] & 0x0F,
+                                          ((unsigned)in[2] << 8) | in[3]);
+                            else
+                                log_debug("uplink drop: bad inner IPv4 "
+                                          "(sid 0x%04x) v=%u ihl=%u",
+                                          sid, in[0] >> 4, in[0] & 0x0F);
+                        }
                         break;
                     }
                 }
