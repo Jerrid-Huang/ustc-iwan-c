@@ -1169,6 +1169,11 @@ int main(int argc, char **argv)
                 fprintf(stderr, "error: cannot install forwarding "
                         "handlers: %s\n", strerror(errno));
                 sigprocmask(SIG_SETMASK, &oldmask, NULL);
+                /* R24-f3 F3: the server child is already forked; without
+                 * this it would keep running as an orphan while we just
+                 * stripped the NAT rules it depends on. Kill + reap it. */
+                kill(pid, SIGKILL);
+                (void)waitpid(pid, NULL, 0);
                 server_cleanup_nat();
                 return 1;
             }

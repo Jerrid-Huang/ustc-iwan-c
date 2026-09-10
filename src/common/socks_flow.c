@@ -1464,7 +1464,13 @@ static bool handshake_greeting(Flow *f)
             greet_reject(f);
             return false;
         }
-        buf_consume(&f->input, 2 + (size_t)f->input.data[1]);
+        /* R24-f1 F1: snap the frame length before consuming — reading
+         * f->input.data[1] inside the buf_consume argument is safe today
+         * (argument evaluation precedes the memmove) but fragile. */
+        {
+            size_t nm = 2 + (size_t)f->input.data[1];
+            buf_consume(&f->input, nm);
+        }
         if (method == 2) {
             /* token mode: real RFC1929. Token-less mode with a client
              * that offered only 0x02: accept the flow and validate
@@ -1509,7 +1515,12 @@ static bool handshake_greeting(Flow *f)
     /* token-less mode validates nothing (the greeting already accepted
      * the flow as a courtesy) */
     bool ok = pp_socks_auth_ok(pass, plen, tok);
-    buf_consume(&f->input, 2 + (size_t)f->input.data[1] + 1 + plen);
+    /* R24-f1 F2: same fragility — pass was borrowed from f->input.data;
+     * finish all reads of the buffer (incl. data[1]) before consuming. */
+    {
+        size_t nm = 2 + (size_t)f->input.data[1] + 1 + plen;
+        buf_consume(&f->input, nm);
+    }
     f->auth_pending = false;
     if (!ok) {
         /* well-formed frame, wrong password: counts toward the source's

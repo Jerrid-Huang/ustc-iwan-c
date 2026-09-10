@@ -136,8 +136,13 @@ static int run_socks_mode(const Opts *o, int fd, const uint8_t sk[16],
         log_err("server returned invalid tunnel IPv4 address");
     else if (sar < 0)
         log_err("server returned invalid gateway IPv4 address");
-    if (sar != 1)
+    if (sar != 1) {
+        /* R24-f2 F2: run_pump/run_socks do not own fd on this failure path
+         * (the caller expects to hand it to the runner); the sole caller
+         * exits on rc<0 today, but close here to match the A-1 contract. */
+        port_close(fd);
         return -1;
+    }
 
     struct sockaddr_in listen;
     if (parse_host_port(o->socks_listen, &listen) != 0)
@@ -311,8 +316,10 @@ void oidc_connect_server(const Opts *o, const Config *cf)
         if (o->socks_listen &&
             relay_proxy_start(o->socks_listen, o->socks_token,
                               o->socks_no_token, o->allow_remote,
-                              &rp) != 0)
+                              &rp) != 0) {
+            port_close(tun_fd);   /* R24-f3 F5: own fd before die (mirrors cmd_proxy) */
             oidc_die("cannot start the SOCKS5+HTTP proxy");
+        }
     }
 
     slist_t routes;

@@ -917,6 +917,10 @@ static int socks_reauth_tunnel(SocksConfig *cfg)
         dns_session_lock();   /* R20: publish under the DNS wait mutex */
         if (!ns_init(&g_ns, cfg->inner_ip, cfg->gateway, (uint16_t)cfg->mtu)) {
             dns_session_unlock();
+            /* R24-f2 F1: this fresh session fd is NOT owned by the caller
+             * (socks_reauth_swap bails on nfd<0 without installing it), so
+             * close it here or it leaks one socket per failed re-auth. */
+            port_close(newfd);
             log_err("SOCKS: stack rebuild failed");
             return -1;
         }
