@@ -630,7 +630,8 @@ static void he_lane_start(he_lane *ln, char *diag, size_t diagsz)
         }
         if (port_set_nonblock(fd, true) != 0) {
 #ifdef _WIN32
-            snprintf(diag, diagsz, "ioctlsocket(FIONBIO): wsa %d (errno %d)",
+            snprintf(diag, diagsz,
+                     "ioctlsocket(FIONBIO): family %d, wsa %d (errno %d)",
                      ai->ai_family, WSAGetLastError(), errno);
 #endif
             port_close(fd);
@@ -854,7 +855,8 @@ static int https_connect_tcp(const char *host, uint16_t port,
      * every path hands a blocking fd to https_connect_tls. */
     if (fd >= 0 && port_set_nonblock(fd, false) != 0) {
 #ifdef _WIN32
-        snprintf(diag, diagsz, "ioctlsocket(FIONBIO): wsa %d (errno %d)",
+        snprintf(diag, diagsz,
+                 "ioctlsocket(FIONBIO): fd %d, wsa %d (errno %d)",
                  fd, WSAGetLastError(), errno);
 #endif
         port_close(fd);

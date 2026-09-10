@@ -390,6 +390,16 @@ void oidc_connect_server(const Opts *o, const Config *cf)
              * not close it, so ownership passes straight through. */
             rc = run_socks_mode(o, fd, sk, &res, &reauth_ctx);
         } else {
+#ifdef _WIN32
+            /* M1: Windows sockets default to BLOCKING; the pump paths
+             * expect a nonblocking datagram socket. A blocking socket
+             * makes pump_win_single_pkt's WSASend block, bypassing the
+             * 5ms EAGAIN budget and ending in ETIMEDOUT after 3s, which
+             * fatally kills the session. On Linux the pump sets this
+             * itself (same alignment as iwan_client.c cmd_proxy). */
+            if (port_set_nonblock(fd, true) != 0)
+                log_err("Error: set nonblock: %s", strerror(errno));
+#endif
             /* run_pump does NOT own fd: the caller closes it here */
             rc = run_pump(tun_fd, o->tun, fd, sk, res.sid, res.tok,
                           1, host, &routes, &routes6,

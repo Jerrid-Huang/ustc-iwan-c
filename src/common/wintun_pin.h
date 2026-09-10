@@ -12,6 +12,7 @@
 #include <stddef.h> /* wchar_t */
 #include <stdbool.h>
 #include <stdint.h>
+#include <windows.h> /* HMODULE for wintun_load_secure */
 
 /* Official wintun.dll 0.14.1 SHA-256, per target architecture. */
 #if defined(__x86_64__) || defined(_M_X64)
@@ -33,6 +34,23 @@
  * behaviour. */
 bool wintun_pin_ok(const wchar_t *path);
 bool wintun_pin_ok_a(const char *path);
+
+/* M3: load the (already Authenticode+pin verified) wintun.dll with
+ * dependency-import resolution hardened against CWD/PATH DLL planting.
+ * The module is passed by absolute path, but without loader flags its own
+ * import dependencies would resolve through the standard search order
+ * (current directory → PATH), letting a hostile same-named DLL dropped
+ * in the CWD load into this process at the pinned module's privilege.
+ *
+ * tun_win.c must call this instead of plain LoadLibraryW AFTER both
+ * verification gates pass (verify-then-load is preserved: wintun_load_secure
+ * never verifies, it only loads what the caller already pinned).
+ *
+ * Win7-safe: on systems without LOAD_LIBRARY_SEARCH_* support (Win8+ /
+ * Win7 KB2533623) it falls back to SetDllDirectoryW(L"") around a plain
+ * LoadLibraryW, removing the CWD from the search for the duration of the
+ * load. Returns a module handle, or NULL (see GetLastError). */
+HMODULE wintun_load_secure(const wchar_t *path);
 
 #endif /* _WIN32 */
 

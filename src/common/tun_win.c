@@ -177,7 +177,13 @@ static bool wintun_load(void)
             if (slash) {
                 wcscpy(slash + 1, L"wintun.dll");
                 if (wintun_verify(dllpath) && wintun_pin_ok(dllpath)) {
-                    iwan_wintun.dll = LoadLibraryW(dllpath);
+                    /* M3: wintun_load_secure keeps this absolute-path
+                     * module's dependency imports out of CWD/PATH (a
+                     * hostile same-named dependency DLL dropped in the
+                     * CWD would otherwise load at this verified module's
+                     * privilege). The Authenticode+pin checks above still
+                     * gate which file is loaded. */
+                    iwan_wintun.dll = wintun_load_secure(dllpath);
                     /* NOTE: no early return here — the GetProcAddress
                      * resolution below MUST run for every successful
                      * load, or the API pointers stay NULL and open_tun
@@ -199,7 +205,9 @@ static bool wintun_load(void)
         if (sn > 0 && sn < MAX_PATH - 16) {
             wcscpy(sysdll + sn, L"\\wintun.dll");
             if (wintun_verify(sysdll) && wintun_pin_ok(sysdll)) {
-                iwan_wintun.dll = LoadLibraryW(sysdll);
+                /* M3: same secure load as the exe-dir branch above — no
+                 * CWD/PATH resolution for wintun.dll's own imports. */
+                iwan_wintun.dll = wintun_load_secure(sysdll);
             } else {
                 log_err("wintun.dll failed verification (System32); "
                         "refusing to load an unverified driver shim");
@@ -295,9 +303,12 @@ static bool utf8_to_wchar(const char *s, wchar_t *out, size_t cap)
     return MultiByteToWideChar(CP_UTF8, 0, s, -1, out, (int)cap) > 0;
 }
 
-/* wintun >= 0.14 removed WintunDeleteAdapter from the DLL, so a wedged
- * stale adapter is deleted through SetupDi (DIF_REMOVE) by matching the
- * adapter's friendly name. Returns 1 when a device was removed. */
+/* wintun >= 0.14 removed WintunDeleteAdapter from the DLL, so an orphaned
+ * adapter is deleted through SetupDi (DIF_REMOVE) by matching the adapter's
+ * friendly name. Used ONLY for adapters this process created itself and
+ * never got a session on (M5 orphan cleanup) — a pre-existing/reused
+ * adapter is never passed here (hard boundary). Returns 1 when a device
+ * was removed. */
 static int wintun_delete_adapter_by_name(const wchar_t *name)
 {
     HDEVINFO devs;
@@ -399,7 +410,6 @@ int open_tun(const char *name)
 
     session = iwan_wintun.start_session(adapter, IWAN_WINTUN_RING_CAPACITY);
     if (session == NULL) {
-        DWORD serr = GetLastError();
         int attempt;
 
         /* A freshly created/reused adapter can need a moment before
@@ -411,63 +421,32 @@ int open_tun(const char *name)
                                                 IWAN_WINTUN_RING_CAPACITY);
         }
 
-        /* A reused adapter can be left wedged by a crashed or killed
-         * previous run (e.g. its process was terminated while holding
-         * the session, leaving the adapter in a state where
-         * WintunStartSession fails with ERROR_DEVICE_NOT_CONNECTED,
-         * 1247). Deleting and recreating the adapter once clears that
-         * state; a freshly created adapter has no stale state to clear,
-         * so only the reused path retries. wintun >= 0.14 has no
-         * WintunDeleteAdapter export, so the stale adapter is removed
-         * through SetupDi by name.
-         *
-         * wintun allows only one session per adapter, so a
-         * start_session failure on a reused adapter can equally mean
-         * another process currently owns the live session on it. Only
-         * the documented "wedged adapter" error (ERROR_DEVICE_NOT_CONNECTED,
-         * 1247) authorizes removing the device; any other failure must
-         * NOT delete the adapter, or a live session owned by another
-         * process would be torn out from under it. */
-        if (session == NULL && !created &&
-            serr == ERROR_DEVICE_NOT_CONNECTED) {
-            BOOL made = TRUE;   /* was the reopened adapter created here? */
-            log_err("tun: WintunStartSession failed on reused adapter "
-                    "(error %lu); deleting stale adapter and retrying",
-                    (unsigned long)serr);
-            iwan_wintun.close_adapter(adapter);
-            adapter = NULL;
-            wintun_delete_adapter_by_name(name16);
-            for (attempt = 0; attempt < 8 && adapter == NULL; attempt++) {
-                adapter = iwan_wintun.create_adapter(name16,
-                                                     IWAN_WINTUN_POOL,
-                                                     &IWAN_WINTUN_GUID);
-                if (adapter == NULL &&
-                    GetLastError() == ERROR_ALREADY_EXISTS) {
-                    /* lost a create race with another process: open the
-                     * winner (mirrors the create-race fallback above) */
-                    adapter = iwan_wintun.open_adapter(name16,
-                                                       IWAN_WINTUN_POOL);
-                    made = FALSE;
-                }
-                if (adapter == NULL)
-                    Sleep(500);
-            }
-            if (adapter != NULL) {
-                created = made;
-                for (attempt = 0; attempt < 4 && session == NULL;
-                     attempt++) {
-                    session = iwan_wintun.start_session(
-                        adapter, IWAN_WINTUN_RING_CAPACITY);
-                    if (session == NULL)
-                        Sleep(500);
-                }
-            }
-        }
+        /* Fail-closed: NO destructive recovery of a PRE-EXISTING adapter.
+         * A reused adapter (created == false) can fail start_session with
+         * ERROR_DEVICE_NOT_CONNECTED (1247) both when it is wedged by a
+         * crashed previous run AND when ANOTHER process currently owns a
+         * live session on it; the error code cannot distinguish the two
+         * (hard boundary: never remove an adapter this process did not
+         * create). A wedged stale adapter therefore is never deleted
+         * automatically here — the user clears it by hand (wintun /
+         * ncpa.cpl) or it disappears on reboot. */
         if (session == NULL) {
             log_err("tun: WintunStartSession failed (error %lu)",
                     (unsigned long)GetLastError());
             if (adapter != NULL)
                 iwan_wintun.close_adapter(adapter);
+            /* M5 orphan cleanup: an adapter WE created this run and never
+             * got a session started on is ours alone (created == true,
+             * this process, never returned a session), so removing it is
+             * inside the hard boundary — wintun adapters are persistent
+             * by default and would otherwise linger forever as a dead
+             * "iwan" NIC. Reused adapters (created == false) are never
+             * touched here. */
+            if (created && adapter != NULL) {
+                wintun_delete_adapter_by_name(name16);
+                log_err("tun: removed orphan adapter '%s' created by this "
+                        "run (no session was ever started)", name);
+            }
             return -1;
         }
     }
@@ -529,9 +508,12 @@ void set_nonblock(int fd)
     (void)fd;   /* wintun receive is always non-blocking, send blocking */
 }
 
-/* Core wintun write with a retry budget. max_ms <= 0 disables the
- * budget check (tun_write's unlimited legacy 20-iteration behaviour);
- * stop (may be NULL) is re-checked at the top of every retry iteration.
+/* Core wintun write with a retry budget. max_ms == 0 (and any negative
+ * value, the tun_write legacy path) means NO deadline: retry indefinitely
+ * (true contract, not the old 20-iteration ~200 ms cap) until the send
+ * succeeds, stop is set, or a hard/driver failure is reported. A positive
+ * max_ms is a millisecond budget now honoured in full. stop (may be NULL)
+ * is re-checked at the top of every retry iteration.
  * NOTE: the DLL's own blocking (WintunAllocateSendPacket / the old
  * blocking send) cannot be interrupted from this layer, so the budget
  * only bounds the gaps between failed attempts, not the DLL call itself. */
@@ -550,9 +532,11 @@ static ptrdiff_t tun_write_bounded(int fd, const void *buf, size_t len,
          * send itself cannot fail. A NULL alloc normally means the
          * session is gone (or the packet exceeds WINTUN_MAX_IP_PACKET_SIZE),
          * but on real Windows it can also be a transient driver stall
-         * under load; retry briefly before declaring the session dead. */
+         * under load; retry (Sleep(10) keeps the retry from hot-spinning)
+         * up to the max_ms deadline, or forever when max_ms == 0. */
         BYTE *dst = NULL;
-        for (int i = 0; i < 20 && dst == NULL; i++) {
+        unsigned long spins = 0;   /* conservative anti-hot-spin logger */
+        while (dst == NULL) {
             if (stop != NULL && *stop) {
                 errno = EINTR;
                 return -1;
@@ -566,19 +550,22 @@ static ptrdiff_t tun_write_bounded(int fd, const void *buf, size_t len,
                     errno = EAGAIN;
                     return -1;
                 }
+                /* log (once) so a pathological permanent stall is visible,
+                 * but KEEP retrying: max_ms == 0 has no deadline */
+                if (++spins == 5000)
+                    log_err("tun: WintunAllocateSendPacket still failing "
+                            "after %lu retries; continuing (max_ms == 0 "
+                            "waits indefinitely)", spins);
                 Sleep(10);
             }
-        }
-        if (dst == NULL) {
-            errno = EIO;
-            return -1;
         }
         memcpy(dst, buf, len);
         iwan_wintun.send_packet(s->session, dst);
     } else {
         /* wintun <= 0.13: BOOL send(Session, Packet, PacketSize) */
         BOOL ok = FALSE;
-        for (int i = 0; i < 20 && !ok; i++) {
+        unsigned long spins = 0;   /* conservative anti-hot-spin logger */
+        while (!ok) {
             if (stop != NULL && *stop) {
                 errno = EINTR;
                 return -1;
@@ -591,12 +578,14 @@ static ptrdiff_t tun_write_bounded(int fd, const void *buf, size_t len,
                     errno = EAGAIN;
                     return -1;
                 }
+                /* log (once) so a pathological permanent failure is
+                 * visible, but KEEP retrying: max_ms == 0 has no deadline */
+                if (++spins == 5000)
+                    log_err("tun: WintunSendPacket (old) still failing "
+                            "after %lu retries; continuing (max_ms == 0 "
+                            "waits indefinitely)", spins);
                 Sleep(10);
             }
-        }
-        if (!ok) {
-            errno = EIO;
-            return -1;
         }
     }
     return (ptrdiff_t)len;
@@ -610,15 +599,15 @@ ptrdiff_t tun_write(int fd, const void *buf, size_t len)
 int tun_write_retry(int fd, const uint8_t *pkt, size_t len, int max_ms,
                     atomic_bool *stop)
 {
-    /* FIND-W-3: align with tun.h's contract ("max_ms == 0 waits
+    /* FIND-W-3 + R16: align with tun.h's contract ("max_ms == 0 waits
      * indefinitely") and with the POSIX backend: max_ms <= 0 means NO
-     * budget — keep retrying (subject to stop) instead of the old
-     * implicit 200ms window here, which silently contradicted the
-     * cross-platform contract and dropped packets on Windows under
-     * load. tun_write_bounded itself already treats max_ms <= 0 as "no
-     * deadline" and its loop re-checks stop at the top of every
-     * iteration; the DLL's internal blocking cannot be interrupted from
-     * this layer (documented at tun_write_bounded). */
+     * budget — keep retrying (subject to stop) instead of any fixed
+     * iteration window. tun_write_bounded is time/condition-driven: with
+     * max_ms == 0 the loop retries until success or stop (truly
+     * indefinite), with a positive max_ms it honours the full millisecond
+     * budget before returning EAGAIN; stop is re-checked at the top of
+     * every iteration. The DLL's internal blocking cannot be interrupted
+     * from this layer (documented at tun_write_bounded). */
     if (stop != NULL && *stop)
         return -1;
     return tun_write_bounded(fd, pkt, len, max_ms,

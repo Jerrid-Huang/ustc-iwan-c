@@ -1,10 +1,10 @@
 /* wintun_fetch.c — locate / interactively fetch wintun.dll (Windows only)
  *
  * TUN mode needs wintun.dll next to the executable. When it is missing:
- *   - interactive stdin: ask once, then download the LATEST build from
- *     https://www.wintun.net/ (page is scraped for the newest
- *     builds/wintun-<ver>.zip link), extract the arch-matching DLL via
- *     PowerShell and drop it beside the exe;
+ *   - interactive stdin: ask once, then download the PINNED build
+ *     (WINTUN_PINNED_VERSION, matched by the SHA-256 pin in
+ *     wintun_pin.h) from wintun.net as wintun-<ver>.zip, extract the
+ *     arch-matching DLL via PowerShell and drop it beside the exe;
  *   - non-interactive stdin: print the manual download recipe instead of
  *     prompting, so services/scripts never hang on a question.
  *
@@ -23,7 +23,17 @@
 #include "util.h"
 #include "wintun_pin.h"
 
-#define WINTUN_PAGE_URL "https://www.wintun.net/"
+/* M2 (FIND): fetching "the latest" build while the SHA-256 pin in
+ * wintun_pin.h is fixed to exactly WINTUN_PINNED_VERSION is
+ * self-contradictory — the moment upstream ships anything newer (or drops
+ * 0.14.1), the downloaded DLL fails the pin and the auto-install breaks
+ * permanently (fail-closed but functionally dead). So we deliberately
+ * fetch the one version the pin can accept, from the official release
+ * URL below (wintun.net/builds/wintun-<ver>.zip, same naming the index
+ * page uses). Upgrading wintun now requires bumping WINTUN_PINNED_VERSION
+ * AND the matching hash(es) in wintun_pin.h together — no "latest"
+ * tracking by design. */
+#define WINTUN_PINNED_VERSION "0.14.1"
 #define WINTUN_ZIP_FMT  "https://www.wintun.net/builds/wintun-%s.zip"
 #define PS_CMD_MAX      1024
 
@@ -106,37 +116,6 @@ static char *ps_capture(const char *ps_expr){
     return buf;
 }
 
-/* parse the wintun.net index page for the highest builds/wintun-<v>.zip */
-static int latest_zip_version(const char *html, char *ver_out, size_t cap)
-{
-    const char *needle = "builds/wintun-";
-    unsigned best_a = 0, best_b = 0, best_c = 0;
-    int found = 0;
-    const char *p = html;
-    while ((p = strstr(p, needle)) != NULL) {
-        p += strlen(needle);
-        unsigned a, b, c;
-        if (sscanf(p, "%u.%u.%u", &a, &b, &c) == 3) {
-            /* only accept it if this really is followed by .zip */
-            const char *rest = p;
-            while (*rest && (*rest == '.' ||
-                   (*rest >= '0' && *rest <= '9')))
-                rest++;
-            if (strncmp(rest, ".zip", 4) != 0)
-                continue;
-            if (!found || a > best_a || (a == best_a && b > best_b) ||
-                (a == best_a && b == best_b && c > best_c)) {
-                best_a = a; best_b = b; best_c = c;
-                found = 1;
-            }
-        }
-    }
-    if (!found)
-        return -1;
-    snprintf(ver_out, cap, "%u.%u.%u", best_a, best_b, best_c);
-    return 0;
-}
-
 static int arch_tag(char *out, size_t cap)
 {
 #if defined(__aarch64__) || defined(_M_ARM64)
@@ -173,7 +152,8 @@ int wintun_ensure(void)
     }
 
     printf("wintun.dll not found at %s\n", dll);
-    printf("Download the latest build from wintun.net now? [Y/n]: ");
+    printf("Download the pinned wintun build (%s) from wintun.net now? "
+           "[Y/n]: ", WINTUN_PINNED_VERSION);
     fflush(stdout);
     char ans[16];
     if (!fgets(ans, sizeof ans, stdin)) {
@@ -188,21 +168,15 @@ int wintun_ensure(void)
     char dir[MAX_PATH];
     exe_dir(dir, sizeof dir);
 
-    log_info("fetching the wintun.net index page...");
-    char *html = ps_capture(
-        "(Invoke-WebRequest -UseBasicParsing '" WINTUN_PAGE_URL "').Content");
-    if (!html) {
-        log_err("cannot reach " WINTUN_PAGE_URL);
-        return -1;
-    }
+    /* M2: use the pinned version directly (WINTUN_PINNED_VERSION), not
+     * whatever the wintun.net index currently headlines. The pin gate
+     * below (wintun_pin_ok_a) can only accept WINTUN_PINNED_VERSION's
+     * DLL, so there is no point round-tripping through a "latest" page
+     * scrape — that was exactly the self-contradiction that broke the
+     * auto-install on the next upstream release. */
     char ver[32];
-    if (latest_zip_version(html, ver, sizeof ver) != 0) {
-        free(html);
-        log_err("cannot find a wintun build on the index page");
-        return -1;
-    }
-    free(html);
-    log_info("latest wintun build: %s", ver);
+    snprintf(ver, sizeof ver, "%s", WINTUN_PINNED_VERSION);
+    log_info("fetching pinned wintun build: %s", ver);
 
     char arch[16];
     if (arch_tag(arch, sizeof arch) != 0) {
