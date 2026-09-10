@@ -2184,6 +2184,17 @@ void reap_flows(void) {
                  *     64-slot table / fd / flow entry is pinned
                  *     permanently. No progress for 30s -> force-kill it
                  *     here too.
+                 *   - R22-B/C: attached graceful flow in NS_CLOSED
+                 *     (peer already FIN'd, we are in LAST_ACK/TIME_WAIT)
+                 *     whose trailing rxq is stuck (local client stopped
+                 *     reading). It is NOT removable (rxq.len > 0) and
+                 *     NOT covered by ns_tick's FIN_WAIT/LAST_ACK/SYN_SENT
+                 *     timeouts, and conn_reap_if_dead cannot reclaim it
+                 *     while this flow still holds the slot ref -> the
+                 *     slot+pcb+flow would be pinned forever. Treat it
+                 *     like CLOSE_WAIT: no progress for 30s -> force-kill
+                 *     (ns_abort is TW-safe and clears c->pcb, so the
+                 *     later silent lwIP TW free can never dangle).
                  * Semantics: state_ms = when the flow *state* last
                  * changed (wall clock); last_progress_ms = when we last
                  * actually *drained* bytes to the client (progress
@@ -2194,7 +2205,8 @@ void reap_flows(void) {
                         ST_CLOSING_TIMEOUT_MS &&
                     (f->state == ST_CLOSING ||
                      (f->state == ST_ESTABLISHED &&
-                      c->state == NS_CLOSE_WAIT))) {
+                      (c->state == NS_CLOSE_WAIT ||
+                       c->state == NS_CLOSED)))) {
                     ns_abort(&g_ns, f->ns_idx);
                     ns_flow_unref(f->ns_idx);
                     f->ns_idx = -1;
