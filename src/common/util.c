@@ -12,6 +12,7 @@
 #include <sys/types.h>
 
 #ifndef _WIN32
+#include <signal.h>   /* kill/SIGKILL for the bounded cmd_capture reap */
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -151,6 +152,13 @@ bool ip_run_quiet(char *const args[])
 #endif
 }
 
+/* Capture stdout of `ip ...` (bounded semantics, platform-aligned):
+ * Linux forks/reads itself but reaps with the same 60s + SIGKILL policy
+ * as port.c port_cmd_capture (R4 fix) — a wedged `ip`/helper must not
+ * hang route configuration or the daemon forever, and on timeout the
+ * captured-so-far output is returned (partial output beats an indefinite
+ * wedge, exactly like the Windows branch, which delegates to
+ * port_cmd_capture's own 60s+SIGKILL below). */
 char *cmd_capture(char *const args[])
 {
 #ifndef _WIN32
@@ -185,6 +193,11 @@ char *cmd_capture(char *const args[])
     size_t len = 0;
     int st = 0;
     bool read_err = false;
+    bool timed_out = false;
+    /* single 60s budget shared by the bounded read phase and the bounded
+     * reap below (one deadline for the whole capture, mirroring the
+     * Windows branch / port_cmd_capture's 60s+SIGKILL) */
+    uint64_t deadline = now_ms() + 60000;
     char *out = malloc(cap);
     if (!out) {
         close(fds[0]);
@@ -205,6 +218,33 @@ char *cmd_capture(char *const args[])
             out = nr;
             cap = ncap;
         }
+        /* bounded read: a plain read() could block forever if the child
+         * hangs without writing and without closing stdout, so the 60s
+         * budget would never be reached. Poll with the remaining budget
+         * before every read. */
+        uint64_t now = now_ms();
+        int remaining = deadline > now ? (int)(deadline - now) : 0;
+        if (remaining == 0) {
+            timed_out = true;
+            break;
+        }
+        struct pollfd pfd;
+        pfd.fd = fds[0];
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int pr = port_poll(&pfd, 1, remaining);
+        if (pr == 0) {
+            timed_out = true;   /* no data within the 60s budget */
+            break;
+        }
+        if (pr < 0) {
+            if (errno == EINTR)
+                continue;       /* retry the poll */
+            read_err = true;    /* hard poll error: fail like read errors */
+            break;
+        }
+        /* pr > 0: POLLIN/POLLHUP/POLLERR — proceed to read; EOF (HUP)
+         * reads as 0 and hard errors set read_err below */
         ssize_t n = read(fds[0], out + len, cap - len - 1);
         if (n < 0) {
             if (errno == EINTR)
@@ -219,13 +259,49 @@ char *cmd_capture(char *const args[])
         len += (size_t)n;
     }
     close(fds[0]);
-    while (waitpid(pid, &st, 0) < 0 && errno == EINTR)
-        ;
-    if (read_err || len == 0 || (WIFEXITED(st) && WEXITSTATUS(st) == 127)) {
+    if (timed_out) {
+        /* the 60s read budget expired (child hung without writing and
+         * without closing stdout): the child is still alive, so SIGKILL
+         * it NOW and let the reap loop below just collect it — this
+         * avoids a second full 60s wait inside the reap. */
+        kill(pid, SIGKILL);
+    }
+    /* bounded reap, same policy as port.c port_cmd_capture (R4 fix):
+     * poll with WNOHANG so a signal cannot wedge us; EINTR only retries
+     * the poll. If the child is still alive at the (shared) deadline we
+     * SIGKILL it and keep reaping (the SIGKILLed child still needs a
+     * waitpid to reclaim it), then return whatever we captured. */
+    for (;;) {
+        pid_t r = waitpid(pid, &st, WNOHANG);
+        if (r == pid)
+            break;
+        if (r < 0) {
+            if (errno == EINTR)
+                continue;   /* retry the poll */
+            break;          /* ECHILD etc.: nothing more to reap */
+        }
+        if (now_ms() >= deadline) {
+            timed_out = true;
+            kill(pid, SIGKILL);
+            continue;   /* keep reaping until waitpid returns the pid */
+        }
+        port_sleep_ms(10);
+    }
+    out[len] = '\0';
+    if (timed_out) {
+        /* we SIGKILLed the child ourselves: partial output is the
+         * deliberate result here, so WIFSIGNALED(st) (set for our own
+         * SIGKILL) must NOT drop through to the failure path below —
+         * same policy as the Windows branch / port_cmd_capture. */
+        log_err("cmd_capture: %s timed out after 60s; returning partial "
+                "output", args[0]);
+        return out;
+    }
+    if (read_err || len == 0 || (WIFEXITED(st) && WEXITSTATUS(st) == 127) ||
+        WIFSIGNALED(st)) {
         free(out);
         return NULL;
     }
-    out[len] = '\0';
     return out;
 #else
     char **argv = ip_argv(args);

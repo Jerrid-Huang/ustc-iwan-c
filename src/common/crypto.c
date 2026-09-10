@@ -53,6 +53,13 @@ void hmac_sha256(const uint8_t *key, size_t klen,
     }
 }
 
+/* AES-128-ECB(md5("mw"+username))[zero-padded password].
+   Returns 0 on success, -1 on failure. Contract: on EVERY failure path
+   (OOM before keymat, ctx==NULL, any EVP error) out is zeroed first, so
+   a caller that neglects to check the return value never ships
+   uninitialized stack bytes (e.g. the server OPEN ct field). Successful
+   encryption overwrites all 16 bytes, so the initial zeroing is
+   semantically inert on the success path. */
 int encrypt_password(const char *plain, const char *username, uint8_t out[16])
 {
     size_t ulen = strlen(username);
@@ -63,6 +70,11 @@ int encrypt_password(const char *plain, const char *username, uint8_t out[16])
     int ok = -1;
     int outl = 0;
     int finl = 0;
+
+    /* zero first: the keymat OOM early-return below must not leave out
+     * unwritten (M-2), which would otherwise surface uninitialized stack
+     * bytes to any caller that skips the return-code check */
+    memset(out, 0, 16);
 
     if (!keymat)
         return -1;

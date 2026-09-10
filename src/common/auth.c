@@ -339,7 +339,12 @@ int get_ct(const char *user, const char *pass, const char *ct_pass_hex,
             return -1;
         return 0;
     }
-    encrypt_password(pass, user, out);
+    /* M-2: propagate OOM/failure instead of returning success with
+     * (previously possibly-uninitialized) bytes in out. encrypt_password
+     * zeroes out on failure, but ignoring the code would still push an
+     * all-zero ct onto the wire as if it were valid. */
+    if (encrypt_password(pass, user, out) != 0)
+        return -1;
     return 0;
 }
 

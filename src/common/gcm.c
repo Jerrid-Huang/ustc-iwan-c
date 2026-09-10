@@ -70,6 +70,10 @@ char *decrypt_password(const char *encrypted_b64, const char *app_secret,
     snprintf(label, label_len + 1, "%s|%s", app_secret, aad);
 
     sha256(label, label_len, key);
+    /* label embeds the app_secret-derived AAD (app_secret|domain|username):
+     * scrub it before release, matching key/plain handling below */
+    if (label)
+        OPENSSL_cleanse(label, label_len);
     free(label);
 
     data = b64url_decode(encrypted_b64, &data_len);

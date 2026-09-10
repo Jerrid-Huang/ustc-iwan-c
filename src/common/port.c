@@ -864,7 +864,39 @@ char *port_cmd_capture(char *const argv[], size_t max)
         oom_abort();
     }
     size_t got = 0;
+    bool timed_out = false;
+    /* single 60s budget shared by the bounded read phase and the bounded
+     * reap below (one deadline for the whole capture, mirroring util.c
+     * cmd_capture R15) */
+    uint64_t deadline = port_now_ms() + 60000;
     while (got < max) {
+        /* bounded read: a plain read() could block forever if the child
+         * hangs without writing and without closing stdout, so the 60s
+         * budget would never be reached. Poll with the remaining budget
+         * before every read. */
+        uint64_t now = port_now_ms();
+        int remaining = deadline > now ? (int)(deadline - now) : 0;
+        if (remaining == 0) {
+            timed_out = true;
+            break;
+        }
+        struct pollfd pfd;
+        pfd.fd = fds[0];
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int pr = port_poll(&pfd, 1, remaining);
+        if (pr == 0) {
+            timed_out = true;   /* no data within the 60s budget */
+            break;
+        }
+        if (pr < 0) {
+            if (errno == EINTR)
+                continue;       /* retry the poll */
+            break;              /* hard poll error: keep what we already
+                                 * have (same semantic as read errors) */
+        }
+        /* pr > 0: POLLIN/POLLHUP/POLLERR — proceed to read; EOF (HUP)
+         * reads as 0 below */
         ssize_t r = read(fds[0], out + got, max - got);
         if (r < 0) {
             if (errno == EINTR)
@@ -875,6 +907,13 @@ char *port_cmd_capture(char *const argv[], size_t max)
         if (r == 0)
             break;          /* EOF */
         got += (size_t)r;
+    }
+    if (timed_out) {
+        /* the 60s read budget expired (child hung without writing and
+         * without closing stdout): the child is still alive, so SIGKILL
+         * it NOW and let the bounded reap below just collect it — this
+         * avoids a second full 60s wait inside the reap. */
+        kill(pid, SIGKILL);
     }
     /* close the read end BEFORE reaping: the child's write end is now
      * the only remaining reference, so a child that overruns `max` gets
@@ -890,8 +929,6 @@ char *port_cmd_capture(char *const argv[], size_t max)
      * Whatever we captured is returned — partial output beats an
      * indefinite wedge (same spirit as the Windows branch above). */
     int st = 0;
-    uint64_t deadline = port_now_ms() + 60000;
-    bool timed_out = false;
     for (;;) {
         pid_t r = waitpid(pid, &st, WNOHANG);
         if (r == pid)

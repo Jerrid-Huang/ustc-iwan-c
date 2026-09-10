@@ -11,7 +11,9 @@ void hmac_sha256(const uint8_t *key, size_t klen,
                  const uint8_t *msg, size_t mlen, uint8_t out[32]);
 
 /* AES-128-ECB(md5("mw"+username))[zero-padded password].
-   Returns 0 on success, -1 on failure (out zeroed). */
+   Returns 0 on success, -1 on failure. out is ALWAYS zeroed on failure
+   (including the OOM path), so a caller that skips the return-code check
+   can never leak uninitialized stack bytes (M-2). */
 int encrypt_password(const char *plain, const char *username, uint8_t out[16]);
 /* md5(username + password) */
 void session_key(const char *username, const char *password, uint8_t out[16]);
