@@ -516,27 +516,58 @@ struct srv_pool_ud {
     struct srv_dl_batch b[TUN_POOL_MAX];  /* one batch state per queue */
 };
 
-/* flush the batch with one sendmmsg; partial sends drop the rest (the
- * socket is non-blocking, so EAGAIN means the send buffer is full) */
+/* flush the batch with one sendmmsg. On EAGAIN the unsent remainder is
+ * RETAINED at the front of the batch for the next flush (backpressure,
+ * not loss — dropping up to SRV_DL_BATCH packets at once on a single
+ * congestion event amplified every client's RTO simultaneously, R28-C1).
+ * The reader retries on its next TUN read; a permanently-full peer
+ * simply backpressures (bounded at SRV_DL_BATCH, see the guard in
+ * srv_tun_pkt). */
 static void srv_dl_flush(struct srv_dl_batch *b, int fd)
 {
     int n = b->n, sent = 0;
 
-    b->n = 0;
+    if (n == 0)
+        return;
     while (sent < n) {
         int r = port_sendmmsg(fd, &b->msgs[sent], (unsigned)(n - sent), 0);
-        if (r <= 0) {
-            if (r < 0 && errno == EINTR)
-                continue;
-            break;   /* EAGAIN / fatal: drop the rest (same contract) */
-        }
+        if (r < 0 && errno == EINTR)
+            continue;
+        if (r <= 0)
+            break;   /* EAGAIN / fatal: keep the rest */
         for (int i = 0; i < r; i++)
             PROF_ADD(g_prof_srv_dlsend,
                      b->iovs[(size_t)(sent + i) * 2 + 1].iov_len);
         sent += r;
     }
-    if (sent < n)
-        server_add_send_drops((unsigned long long)(n - sent));
+    if (sent == n) {
+        b->n = 0;
+        return;
+    }
+    /* compact [sent..n) to the front; the retained msgs/iovs must be
+     * re-pointed after the sub-array memmoves (hdrs/pl/peers moved too). */
+    {
+        int kept = n - sent;
+        /* whole-array forms: keeps the fortified memmove bound sane (the
+         * [i][0] spellings model a single row and trip -Wstringop-overflow) */
+        memmove(b->hdrs, b->hdrs + sent, (size_t)kept * IWAN_HDR_LEN);
+        memmove(b->pl, b->pl + sent, (size_t)kept * SRV_DL_SLOT);
+        memmove(b->peers, b->peers + sent,
+                (size_t)kept * sizeof b->peers[0]);
+        memmove(b->msgs, &b->msgs[sent], (size_t)kept * sizeof b->msgs[0]);
+        memmove(b->iovs, &b->iovs[sent * 2],
+                (size_t)kept * 2 * sizeof b->iovs[0]);
+        for (int i = 0; i < kept; i++) {
+            size_t hl = b->iovs[i * 2].iov_len;
+            size_t plen = b->iovs[i * 2 + 1].iov_len;
+            b->iovs[i * 2].iov_base = b->hdrs[i];
+            b->iovs[i * 2].iov_len = hl;
+            b->iovs[i * 2 + 1].iov_base = b->pl[i];
+            b->iovs[i * 2 + 1].iov_len = plen;
+            b->msgs[i].msg_hdr.msg_iov = &b->iovs[i * 2];
+        }
+        b->n = kept;
+    }
 }
 
 static void srv_tun_pkt(void *ud, uint8_t *pkt, size_t len, bool last)
@@ -563,22 +594,29 @@ static void srv_tun_pkt(void *ud, uint8_t *pkt, size_t len, bool last)
         srv_dl_flush(b, fd);
         handle_tun_downlink(pu->ctx, pkt, len, fd);
     } else if (tun_prep_downlink(pu->ctx, pkt, len, &snap, hdr)) {
-        int i = b->n;
-        memcpy(b->hdrs[i], hdr, IWAN_HDR_LEN);
-        memcpy(b->pl[i], pkt, len);
-        b->peers[i] = snap.peer;
-        b->iovs[i * 2].iov_base = b->hdrs[i];
-        b->iovs[i * 2].iov_len = IWAN_HDR_LEN;
-        b->iovs[i * 2 + 1].iov_base = b->pl[i];
-        b->iovs[i * 2 + 1].iov_len = len;
-        memset(&b->msgs[i], 0, sizeof b->msgs[i]);
-        b->msgs[i].msg_hdr.msg_name = &b->peers[i];
-        b->msgs[i].msg_hdr.msg_namelen = sizeof b->peers[i];
-        b->msgs[i].msg_hdr.msg_iov = &b->iovs[i * 2];
-        b->msgs[i].msg_hdr.msg_iovlen = 2;
-        b->n++;
-        if (b->n == SRV_DL_BATCH)
-            srv_dl_flush(b, fd);
+        if (b->n >= SRV_DL_BATCH) {
+            /* R28-C1: the send buffer is full and the retained batch is at
+             * capacity (the flush could not drain it) — drop just this one
+             * packet rather than overflow the batch arrays. */
+            server_add_send_drops(1);
+        } else {
+            int i = b->n;
+            memcpy(b->hdrs[i], hdr, IWAN_HDR_LEN);
+            memcpy(b->pl[i], pkt, len);
+            b->peers[i] = snap.peer;
+            b->iovs[i * 2].iov_base = b->hdrs[i];
+            b->iovs[i * 2].iov_len = IWAN_HDR_LEN;
+            b->iovs[i * 2 + 1].iov_base = b->pl[i];
+            b->iovs[i * 2 + 1].iov_len = len;
+            memset(&b->msgs[i], 0, sizeof b->msgs[i]);
+            b->msgs[i].msg_hdr.msg_name = &b->peers[i];
+            b->msgs[i].msg_hdr.msg_namelen = sizeof b->peers[i];
+            b->msgs[i].msg_hdr.msg_iov = &b->iovs[i * 2];
+            b->msgs[i].msg_hdr.msg_iovlen = 2;
+            b->n++;
+            if (b->n == SRV_DL_BATCH)
+                srv_dl_flush(b, fd);
+        }
     }
     if (last)
         srv_dl_flush(b, fd);
