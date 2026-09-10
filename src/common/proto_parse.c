@@ -35,10 +35,15 @@ int pp_http_probe(const uint8_t *d, size_t n)
             return n == lens[i] ? -1 : 0;   /* wait / wrong delimiter */
         }
     }
-    /* first byte could still start a method whose token is incomplete */
+    /* First byte could still start a method whose token is incomplete.
+     * Exact-length full matches already returned above, so this only
+     * needs to catch proper prefixes: 'P' methods are PUT(3)/POST(4)/
+     * PATCH(5) and 'T' is TRACE(5), so a fragmented PATCH/TRACE at
+     * n=3,4 and POST at n=3 must wait rather than fall through. */
     if (d[0] == 'C' || d[0] == 'O' || d[0] == 'D' ||
-        (n < 3 && (d[0] == 'G' || d[0] == 'P' || d[0] == 'T')) ||
-        (n < 4 && d[0] == 'H'))
+        (d[0] == 'G' && n < 3) ||
+        (d[0] == 'H' && n < 4) ||
+        ((d[0] == 'P' || d[0] == 'T') && n < 5))
         return -1;
     return 0;
 }
@@ -271,8 +276,13 @@ int pp_socks_request(const uint8_t *d, size_t n, uint8_t *cmd,
 
     if (n < 4)
         return -1;
-    if (d[0] != 5)
-        return -1;
+    if (d[0] != 5) {
+        /* RFC 1928: wrong VER -> immediate general failure (rep=1).
+         * Return 0 (not -1) so callers send the error reply and close
+         * instead of holding the slot waiting for more bytes. */
+        *rep = 1;
+        return 0;
+    }
     *cmd = d[1];
     *rep = 0;
     if (d[1] != 1) {            /* only CONNECT is implemented */

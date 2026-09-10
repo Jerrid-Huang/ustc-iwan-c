@@ -1128,6 +1128,22 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
     pump_prof_gate_init();   /* C4: parse IWAN_PUMP_PROF once, up front */
     ctx.tun_fd = tun_fd;
     ctx.sockfd = sockfd;
+    /* R33-FIX-B: the session socket comes from udp_connect() as a
+     * BLOCKING datagram socket with SO_SNDTIMEO=3s. The pump's
+     * backpressure design (send_batch/send_gso EAGAIN branches,
+     * pump_send_retry ~5ms budget) requires O_NONBLOCK: without it, an
+     * uplink-congested sndbuf makes each send block up to 3s while
+     * holding send_lock, serializing every reader thread and
+     * keepalive/ECHO_RES and starving keepalives into a false
+     * session-loss reconnect. iwan_client.c/oidc_connect.c only set
+     * nonblock under _WIN32 (their comment claimed "the pump sets this
+     * itself" on Linux, but run_pump never did). Set it here
+     * unconditionally on both platforms; port_set_nonblock is
+     * idempotent (fcntl O_NONBLOCK / ioctlsocket FIONBIO). Failure is
+     * non-fatal: log and continue with a blocking socket rather than
+     * aborting the tunnel. */
+    if (port_set_nonblock(sockfd, true) != 0)
+        log_err("set nonblock on TUN UDP socket: %s", strerror(errno));
     ctx.sid = sid;
     ctx.tok = tok;
     {

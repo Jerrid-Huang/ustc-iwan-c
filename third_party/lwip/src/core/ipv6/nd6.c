@@ -105,7 +105,9 @@ static netif_addr_idx_t nd6_cached_destination_index;
 /* Multicast address holder. */
 static ip6_addr_t multicast_address;
 
+#if LWIP_IPV6_SEND_ROUTER_SOLICIT
 static u8_t nd6_tmr_rs_reduction;
+#endif /* LWIP_IPV6_SEND_ROUTER_SOLICIT */
 
 /* Static buffer to parse RA packet options */
 union ra_options {
@@ -2468,6 +2470,10 @@ nd6_restart_netif(struct netif *netif)
 #if LWIP_IPV6_SEND_ROUTER_SOLICIT
   /* Send Router Solicitation messages (see RFC 4861, ch. 6.3.7). */
   netif->rs_count = LWIP_ND6_MAX_MULTICAST_SOLICIT;
+#else /* !LWIP_IPV6_SEND_ROUTER_SOLICIT */
+  /* R33-FIX-A: Router Solicitations are disabled (point-to-point tunnel
+   * with hwaddr_len 0 — see lwipopts.h), so netif is unused here. */
+  LWIP_UNUSED_ARG(netif);
 #endif /* LWIP_IPV6_SEND_ROUTER_SOLICIT */
 }
 

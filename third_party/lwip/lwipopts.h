@@ -45,6 +45,17 @@
  * segments would be 40+20+1460=1520B > the 1500 inner MTU. Off, the
  * v6 MTU is netif->mtu and the effective v6 MSS becomes 1500-60=1440. */
 #define LWIP_ND6_ALLOW_RA_UPDATES 0
+/* Never send Router Solicitations. This netif is a point-to-point tunnel:
+ * hwaddr_len == 0 (no link-layer address) and there is no router on the far
+ * end, so router discovery is meaningless. lwIP's default
+ * (LWIP_IPV6_SEND_ROUTER_SOLICIT = LWIP_IPV6 = 1) would instead have nd6_tmr
+ * call nd6_send_rs(), which emits an 8-byte Source-LLADDR option whose
+ * addr bytes are SMEMCPY'd from netif->hwaddr for 0 bytes, leaving the rest
+ * padded from uninitialized pbuf heap (6 bytes of heap leaked per packet
+ * onto the wire via sendmmsg). 0 = never solicit, consistent with RA
+ * updates already being off above. With this guard the whole nd6_send_rs()
+ * implementation is compiled out of nd6.c. */
+#define LWIP_IPV6_SEND_ROUTER_SOLICIT 0
 #define LWIP_TCP          1
 #define LWIP_UDP          0
 #define LWIP_RAW          0

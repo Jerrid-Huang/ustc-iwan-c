@@ -89,6 +89,7 @@ int udp_gso_prepare(int fd, size_t mss, int *ok, size_t *gso_mss,
          * re-probe was unreachable. When gso_mss is 0 there is no armed
          * value to be conservative about: re-arm immediately. A genuine
          * setsockopt failure lands in the *ok==0 M11 path. */
+        int re_armed = 0;
         if ((*gso_mss == 0 || *streak >= IWAN_GSO_HYST)) {
             int m = (int)mss;
             if (port_setsockopt(fd, SOL_UDP, UDP_SEGMENT, &m, sizeof m) != 0) {
@@ -98,8 +99,22 @@ int udp_gso_prepare(int fd, size_t mss, int *ok, size_t *gso_mss,
             }
             *gso_mss = mss;
             *streak = 0;
+            re_armed = 1;
         }
-        return 0;   /* this batch goes out via sendmmsg */
+        /* R33-E: when a re-arm just succeeded above, the socket is now
+         * armed with EXACTLY this batch's mss, so this uniform batch can
+         * and should go out via GSO — return 1 instead of 0. Before this
+         * fix the unconditional return 0 mapped to TX_FALLBACK in
+         * send_gso, whose caller (pump_tx_send) then ran send_batch, and
+         * send_batch's first action (udp_gso_clear) wiped the just-armed
+         * option: after the first mixed-size batch GSO stayed disabled
+         * for the whole session plus one pointless arm/clear setsockopt
+         * pair per uniform batch (M11's *ok==0 re-probe path already
+         * returned 1 on success, proving the asymmetry). When the C1
+         * hysteresis says NOT to re-arm yet (gso_mss != 0 and
+         * streak < IWAN_GSO_HYST), keep returning 0 so this batch still
+         * falls back to sendmmsg as designed. */
+        return re_armed ? 1 : 0;   /* 0: this batch goes out via sendmmsg */
     }
     if (*ok) {
         /* armed mss matches: reset the hysteresis tracker */

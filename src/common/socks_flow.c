@@ -1552,9 +1552,9 @@ static void handshake_request(Flow *f)
     if (pp_socks_request(f->input.data, f->input.len, &cmd, &rep, &t) != 0)
         return;                  /* frame incomplete: wait */
     if (rep != 0) {
-        /* VER is 5 here: pp_socks_request rejects anything else.
-         * unsupported command / bad RSV -> rep 7; unsupported or
-         * empty address type -> rep 8 */
+        /* VER is 5 here: pp_socks_request already returned rep=1 for
+         * any other VER. unsupported command / bad RSV -> rep 7;
+         * unsupported or empty address type -> rep 8 */
         queue_socks_error(f, rep);
         return;
     }
