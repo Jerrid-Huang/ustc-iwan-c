@@ -262,6 +262,29 @@ static void restore_owner(const char *path, const char *dir, bool dir_created)
 #endif
 }
 
+/* R14-M-1: does the path's directory component resolve to the filesystem
+ * ROOT? Covers both
+ *   - "/servers.json"   — the only separator is at path[0], so dir is
+ *     NULL after the split below (the original R13-M-5 guard), and
+ *   - "///servers.json" — --config-dir "//" joins into this, the last
+ *     separator is NOT the first char, dir becomes "//", and stripping
+ *     every leading separator leaves no real directory name: the
+ *     effective parent is still "/".
+ * A relative path with no leading separator ("servers.json",
+ * "dir/servers.json") never resolves to the root and is left alone, and
+ * a legitimate absolute path ("/etc/iwan", "/home/u/.config/iwan") has a
+ * real name after the leading separator, so it keeps working. */
+static bool dir_component_is_root(const char *path, const char *dir)
+{
+    if (path[0] != '/' && path[0] != '\\')
+        return false;               /* relative: no root resolution */
+    if (!dir)
+        return true;                /* "/servers.json" */
+    while (*dir == '/' || *dir == '\\')
+        dir++;                      /* strip "//".. -> "" */
+    return *dir == '\0';            /* separators only => the root */
+}
+
 void oidc_save_config(const char *path, const Config *cf)
 {
     if (!cf->servers || json_type(cf->servers) != JSON_ARR ||
@@ -284,18 +307,24 @@ void oidc_save_config(const char *path, const Config *cf)
         dir[slash - path] = '\0';
         dir_created = mkdir_p(dir);
     }
-    /* R13-M-5 defensive guard: a path with a leading separator but no
-     * directory component at all (slash == path) resolves to the
-     * filesystem ROOT — exactly what happens when --config-dir is an
-     * empty string (main joins "" + "/servers.json" into
-     * "/servers.json"). Writing there as root (sudo re-exec) is a
-     * misconfiguration, never a legitimate save: refuse loudly instead
-     * of open(NULL)/root-write UB. (The authoritative rejection belongs
-     * at CLI parse time in oidc_cli.c / iwan_client_oidc.c, which are
-     * outside this file's ownership — see the R13 report.) */
-    if (slash && slash == path)
+    /* R13-M-5 + R14-M-1 root-write guard: refuse to save into the
+     * filesystem ROOT. R13-M-5 covered a single leading separator
+     * (slash == path -> dir stays NULL), i.e. --config-dir "" joining
+     * into "/servers.json". R14-M-1 extends it to "leading consecutive
+     * separators": --config-dir "//" joins into "///servers.json",
+     * whose last separator is NOT the first char, so dir becomes "//" —
+     * mkdir_p("//") only touches "/" (EEXIST, does not die) and the old
+     * slash==path test let the root write straight through. Strip every
+     * leading separator from dir: no real directory name left => the
+     * effective parent is still "/". Writing there as root (sudo
+     * re-exec) is a misconfiguration, never a legitimate save: refuse
+     * loudly instead of open(NULL)/root-write UB. (The authoritative
+     * rejection also belongs at CLI parse time in oidc_cli.c /
+     * iwan_client_oidc.c — see the R13/R14 reports.) */
+    if (dir_component_is_root(path, dir))
         oidc_die("refusing to save config into the filesystem root "
-                 "(path \"%s\"): is --config-dir empty?", path);
+                 "(path \"%s\"): is --config-dir empty or all "
+                 "separators?", path);
     /* write a sibling temp file, then rename() over the target so the
      * config is replaced atomically: a concurrent reader never sees a
      * half-written file. Same directory keeps rename() on one filesystem.

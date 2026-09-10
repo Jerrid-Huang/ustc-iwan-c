@@ -191,6 +191,27 @@ static const char *const short_aliases[][2] = {
     { NULL, NULL },
 };
 
+/* R14-M-2: an empty or all-whitespace --config-dir joins with
+ * "/servers.json" into "/servers.json" (and "--config-dir '//'" into
+ * "///servers.json"), which would make oidc_save_config write into the
+ * filesystem ROOT as root (sudo re-exec). This CLI parse gate is the
+ * first authoritative check; oidc_config.c's save guard is the second
+ * (backstop for any other caller). */
+static bool validate_config_dir(const char *val, char *err, size_t errsz)
+{
+    const char *p = val;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' ||
+           *p == '\v' || *p == '\f')
+        p++;
+    if (*p == '\0') {
+        snprintf(err, errsz, "must not be empty or all whitespace "
+                 "(it would make the config path resolve to the "
+                 "filesystem root)");
+        return false;
+    }
+    return true;
+}
+
 void oidc_parse_cli(int argc, char **argv, Opts *o, Cli *usage)
 {
     /* called first thing from main: cover the whole process before any
@@ -201,7 +222,7 @@ void oidc_parse_cli(int argc, char **argv, Opts *o, Cli *usage)
     g_usage = usage;
 
     cli_opt opts[] = {
-        { "config-dir",   CLI_OPT_STR,  &o->config_dir,    "<CONFIG_DIR>",    NULL },
+        { "config-dir",   CLI_OPT_STR,  &o->config_dir,    "<CONFIG_DIR>",    validate_config_dir },
         { "fetch",        CLI_OPT_BOOL, &o->fetch,         NULL,             NULL },
         { "list",         CLI_OPT_BOOL, &o->list,          NULL,             NULL },
         { "connect",      CLI_OPT_BOOL, &o->connect,       NULL,             NULL },

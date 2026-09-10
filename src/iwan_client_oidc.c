@@ -59,7 +59,13 @@ int main(int argc, char **argv)
         usage_error(&usage,
                     "--socks-token and --socks-no-token are mutually "
                     "exclusive");
-    if (o.socks && o.allow_remote && !o.socks_token && !o.socks_no_token)
+    /* H-1 (R14): judge the token's CONTENT, not just the pointer — an
+     * empty string is "no token" and must never open a remote SOCKS
+     * proxy without --socks-no-token. Defence-in-depth behind
+     * validate_token_len (first gate; parallel agent A): even a direct
+     * config path that lands an empty token here hits this second gate. */
+    if (o.socks && o.allow_remote &&
+        (!o.socks_token || !*o.socks_token) && !o.socks_no_token)
         usage_error(&usage,
                     "--allow-remote requires an explicit SOCKS proxy "
                     "password: pass --socks-token <PASS>, or "
@@ -69,6 +75,37 @@ int main(int argc, char **argv)
      * no-op; POSIX: euid 0 -> no-op) */
     if (do_connect && !o.socks)
         oidc_elevate_root(argc, argv);
+
+    /* M-2/M-1 (R14): --config-dir is validated here at CLI level, before
+     * resolve_config_dir, so NO entry path (direct call included) can
+     * reach the config write with a root-only directory.
+     *   - M-2: empty/whitespace degenerates to "/servers.json" (a root
+     *     write). oidc_config.c already refuses that when actually saving
+     *     (R13), but the rejection belongs at CLI parse time too.
+     *   - M-1: a value made only of separators ("/", "//", "///")
+     *     collapses to the filesystem root as well, yet keeps a
+     *     strrchr()-visible leading part ("//"), so it slips past
+     *     oidc_config.c's single-slash guard. Reject it here.
+     * For non-rooted values, resolve_config_dir passes them through, so
+     * checking the raw value covers both cases. Permissible absolute
+     * paths like /home/user (a directory name follows the leading
+     * separators) are unaffected, and the "~/" expansion stays untouched. */
+    {
+        const char *cd = o.config_dir;
+        size_t i = 0;
+        while (cd[i] == ' ' || cd[i] == '\t' || cd[i] == '\r' || cd[i] == '\n')
+            i++;
+        bool only_slashes = cd[0] == '/';
+        size_t j;
+        for (j = 1; only_slashes && cd[j]; j++)
+            only_slashes = (cd[j] == '/');
+        if (cd[i] == '\0')
+            usage_error(&usage, "config-dir must not be empty");
+        if (only_slashes)
+            usage_error(&usage,
+                        "config-dir must name a directory, not the "
+                        "filesystem root");
+    }
 
     char *dir = resolve_config_dir(o.config_dir);
     if (!dir)

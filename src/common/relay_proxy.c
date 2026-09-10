@@ -1576,7 +1576,11 @@ int relay_proxy_start(const char *listen_str, const char *auth_token,
                 "pass --allow-remote to override", listen_str);
         return -1;
     }
-    if (!loop && !auth_token && !open_proxy) {
+    /* H-1 (R14): the allow-remote guard judges the token's CONTENT, not
+     * just the pointer — an empty string is "no token" too, so a remote
+     * bind with `--socks-token ""` and no --socks-no-token must be
+     * refused (empty must never be mistaken for a set password). */
+    if (!loop && !(auth_token && *auth_token) && !open_proxy) {
         log_err("relay proxy: --allow-remote requires --socks-token or "
                 "--socks-no-token");
         return -1;
@@ -1593,7 +1597,13 @@ int relay_proxy_start(const char *listen_str, const char *auth_token,
     if (!rp)
         return -1;
     rp->listener = -1;
-    if (auth_token)
+    /* H-1 (R14): register an EMPTY token as NO token (rp->token = NULL),
+     * unifying with the proxy's empty-string semantics so an empty value
+     * can never be misread as "a password is set". rp_handle_socks /
+     * pp_socks_auth_ok key off `token != NULL`: with NULL they select
+     * method 0x00 / courtesy and validate the RFC1929 frame as nothing
+     * (same as if --socks-token had never been passed). */
+    if (auth_token && *auth_token)
         rp->token = xstrdup(auth_token);
     fd = port_socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0)

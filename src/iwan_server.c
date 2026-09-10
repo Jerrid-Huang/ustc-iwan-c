@@ -166,15 +166,33 @@ static void parse_opts(int argc, char **argv, struct opts *o)
             snprintf(o->dns, sizeof o->dns, "%s", optarg);
             break;
         case 'u':
+            /* M5: same over-length guard as -t — a too-long path would be
+             * silently truncated and open the wrong users file */
+            if (strlen(optarg) >= sizeof o->users)
+                usage_error(argv[0],
+                            "error: users file path too long (max %zu)",
+                            sizeof o->users - 1);
             snprintf(o->users, sizeof o->users, "%s", optarg);
             break;
         case 'n':
+            /* M5: same over-length guard as -t — a truncated interface name
+             * would target the wrong NIC in iptables MASQUERADE */
+            if (strlen(optarg) >= sizeof o->nat_if)
+                usage_error(argv[0],
+                            "error: NAT interface name too long (max %zu)",
+                            sizeof o->nat_if - 1);
             snprintf(o->nat_if, sizeof o->nat_if, "%s", optarg);
             break;
         case 'T':
             o->no_tun = true;
             break;
         case 'U':
+            /* M5: same over-length guard as -t — a truncated account name
+             * would fail the getpwnam exact match and open the wrong user */
+            if (strlen(optarg) >= sizeof o->user)
+                usage_error(argv[0],
+                            "error: user name too long (max %zu)",
+                            sizeof o->user - 1);
             snprintf(o->user, sizeof o->user, "%s", optarg);
             break;
         case 'h':

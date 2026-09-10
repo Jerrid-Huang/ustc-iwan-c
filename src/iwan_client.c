@@ -672,8 +672,14 @@ static int cmd_proxy(int argc, char **argv, int start)
                 "mutually exclusive");
         err_usage_exit(usage_required("proxy"));
     }
-    if (o.allow_remote && !o.socks_token && !o.socks_no_token &&
-        o.listen_str)
+    /* H-1 (R14): judge the token's CONTENT, not just the pointer — an
+     * empty string is "no token" too and must never open a remote proxy
+     * without --socks-no-token. Defence-in-depth: even if
+     * validate_token_len misses an empty value or the option is set by a
+     * direct/config path, empty != a configured password. --socks-no-token
+     * (explicit open) and its mutual-exclusion check above are unchanged. */
+    if (o.allow_remote && (!o.socks_token || !*o.socks_token) &&
+        !o.socks_no_token && o.listen_str)
         err_remote_token("proxy");
 
 #ifdef _WIN32
@@ -876,12 +882,23 @@ static int cmd_socks(int argc, char **argv, int start)
                 "mutually exclusive");
         err_usage_exit(usage_required("socks"));
     }
-    if (o.allow_remote && !o.socks_token && !o.socks_no_token)
+    /* H-1 (R14): same as the proxy command — judge the token's CONTENT.
+     * `--socks-token ""` is "no token", so an empty value must never
+     * unlock a remote bind without --socks-no-token. */
+    if (o.allow_remote && (!o.socks_token || !*o.socks_token) &&
+        !o.socks_no_token)
         err_remote_token("socks");
 
     /* keep the plaintext pass until the session ends: reconnects need
      * it to re-derive the session key (server re-OPEN keeps the IP) */
     bool reconnecting = false;
+    /* M-3 (R14): distinguish "at least one session actually ran" from
+     * "every attempt failed at startup". A startup-only failure must
+     * exit non-zero instead of masquerading as a clean user-stopped run
+     * (Ctrl-C during the retry loop used to end with return 0 even when
+     * run_socks never succeeded once). */
+    bool ran_session = false;
+    bool saw_startup_fail = false;
     for (;;) {
         AuthResult res;
         int sockfd = authenticate(&o, DO_AUTH_PUMP, &res);
@@ -971,10 +988,19 @@ static int cmd_socks(int argc, char **argv, int start)
          *                          by g_user_stop), matching the task's
          *                          "keep current retry behaviour, only add
          *                          the distinguishing log". */
-        if (rc == 0)
-            break;   /* user stopped it */
-        if (rc < 0)
+        /* M-3: rc>0 (session lost) and rc==0 (user stopped a live
+         * tunnel) both prove a session really ran at least once.
+         * rc<0 is a startup failure only and records the opposite. */
+        if (rc > 0)
+            ran_session = true;
+        if (rc == 0) {
+            ran_session = true;   /* user stopped an actually-running tunnel */
+            break;                /* user stopped it */
+        }
+        if (rc < 0) {
+            saw_startup_fail = true;
             log_err("SOCKS startup failed (rc=%d); will retry in 1s...", rc);
+        }
         reconnecting = true;
         if (rc > 0)
             log_err("tunnel session lost; reconnecting in 1s...");
@@ -984,6 +1010,12 @@ static int cmd_socks(int argc, char **argv, int start)
     }
     cleanse_str(o.pass);
     cleanse_str(o.ct_pass);
+    /* M-3: if every single attempt died at startup and no session ever
+     * ran, a non-zero exit is the honest signal (a Ctrl-C'd retry loop
+     * must not look like a success). Otherwise keep the existing
+     * semantics: user-stopped (rc==0) or reconnect path returns 0. */
+    if (saw_startup_fail && !ran_session)
+        return 1;
     return 0;
 }
 

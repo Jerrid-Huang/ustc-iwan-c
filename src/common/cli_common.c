@@ -58,9 +58,21 @@ bool valid_listen(const char *val, char *err, size_t errsz)
 
 /* RFC1929 (SOCKS5 username/password) carries the password in a
  * one-byte length field: longer tokens can never authenticate and
- * would silently deny every peer. Reject at parse time. */
+ * would silently deny every peer. Reject at parse time.
+ *
+ * R14 H-1: an EMPTY token is equally dangerous in the opposite
+ * direction. Callers key "is auth configured?" off the option being
+ * non-NULL, and both --socks-token= and --socks-token "" arrive here as
+ * a non-NULL "" — so an empty value used to "pass" this check, get stored
+ * as a set token, and silently turn --allow-remote into an open
+ * (passwordless) proxy. Empty must be rejected outright. */
 bool validate_token_len(const char *val, char *err, size_t errsz)
 {
+    if (val == NULL || val[0] == '\0') {
+        snprintf(err, errsz,
+                 "must not be empty (empty value would silently disable auth)");
+        return false;
+    }
     if (strlen(val) <= 255)
         return true;
     snprintf(err, errsz, "must be at most 255 bytes (RFC1929 limit)");

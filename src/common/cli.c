@@ -279,4 +279,15 @@ void cli_parse(Cli *c, int argc, char **argv, int start,
                 c->dup_name, c->dup_valname);
         usage_exit(ctl);
     }
+    /* R14-A2 (leak fix): seen_names[] is a grow-only realloc array; the
+     * pointed-to strings are static option names from the caller's opts
+     * table (never individually allocated here), so only the pointer
+     * array itself must be freed. Done on the single normal return — the
+     * -h/--help/-V and error paths exit() the process instead, so the
+     * successful parse was the one leak that outlived the CLI layer (an
+     * ASan build reported it on every well-formed invocation). Null out
+     * and reset so the struct is reusable and never double-freed. */
+    free(c->seen_names);
+    c->seen_names = NULL;
+    c->nseen = 0;
 }
