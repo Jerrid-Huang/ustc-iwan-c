@@ -526,8 +526,12 @@ void send_vpn_keepalive(int sockfd, const SocksConfig *cfg,
 /* inner DATA dispatch: decrypt, validate, and inject a frame into the
  * netstack (or consume it as a tunnel-DNS response).
  * Returns 1 when the buffer was handed to lwIP (the RX pool owns it
- * until lwIP frees the pbuf), 0 when the caller must release it. */
-static int vpn_handle_data(SocksConfig *cfg, uint8_t *b, size_t n)
+ * until lwIP frees the pbuf), 0 when the caller must release it.
+ * When copy is true the buffer is a plain scratch buffer (not a pool
+ * slot), so delivery copies via ns_rx_packet instead of the
+ * zero-copy ns_rx_packet_ref. */
+static int vpn_handle_data(SocksConfig *cfg, uint8_t *b, size_t n,
+                           bool copy)
 {
     uint8_t t = b[0];
     size_t plen = n - 8;
@@ -576,7 +580,11 @@ static int vpn_handle_data(SocksConfig *cfg, uint8_t *b, size_t n)
      * hand them to the TCP stack */
     if (dns_try_handle_response(b + 8, plen))
         return 0;
-    ns_rx_packet_ref(&g_ns, b, n);
+    if (copy)
+        ns_rx_packet(&g_ns, b + 8, plen);   /* inner already XOR-decrypted
+                                             * in place */
+    else
+        ns_rx_packet_ref(&g_ns, b, n);
     return 1;
 }
 
@@ -586,7 +594,7 @@ static int vpn_handle_data(SocksConfig *cfg, uint8_t *b, size_t n)
  * caller must release the RX buffer, 1 when the buffer was handed to
  * lwIP (RX pool owns it). */
 static int vpn_handle_datagram(int sockfd, SocksConfig *cfg, uint8_t *b,
-                               size_t n)
+                               size_t n, bool copy)
 {
     uint8_t t = b[0];
     uint16_t psid = (uint16_t)((b[2] << 8) | b[3]);
@@ -632,7 +640,7 @@ static int vpn_handle_datagram(int sockfd, SocksConfig *cfg, uint8_t *b,
     }
     if (t != PT_DATA && t != PT_DATA_ENC)
         return 0;
-    return vpn_handle_data(cfg, b, n);
+    return vpn_handle_data(cfg, b, n, copy);
 }
 
 /* recvmmsg drain: one syscall per up-to-64 datagrams, MSG_DONTWAIT so
@@ -658,12 +666,19 @@ int receive_vpn(int sockfd, SocksConfig *cfg) {
     static struct iovec rx_iov[RX_VLEN];
     static struct mmsghdr rx_msgs[RX_VLEN];
     void *rx_bufs[RX_VLEN];
+    /* R18 copy-fallback scratch: used only when the zero-copy RX pool
+     * is exhausted (see the got==0 branch below). Not pool slots, so
+     * they are re-pointed per drain just like the iov bases. */
+    static uint8_t copy_buf[RX_VLEN][2048];
+    static struct iovec copy_iov[RX_VLEN];
+    static struct mmsghdr copy_msgs[RX_VLEN];
     static int rx_init;
 
     if (!rx_init) {
         /* static: zero once; the iov bases are re-pointed at the pool
          * buffers on every drain below */
         memset(rx_msgs, 0, sizeof rx_msgs);
+        memset(copy_msgs, 0, sizeof copy_msgs);
         rx_init = 1;
     }
 
@@ -675,8 +690,48 @@ int receive_vpn(int sockfd, SocksConfig *cfg) {
         if (budget <= 0)
             return 0;
         int got = ns_rx_buf_acquire(rx_bufs, RX_VLEN);
-        if (got == 0)
-            return 0;   /* pool exhausted: lwIP still holds buffers */
+        if (got == 0) {
+            /* R07-M2 / R18: the zero-copy RX pool (NS_RX_POOL=256) can be
+             * fully held by lwIP OOSEQ pbufs (8 conns x 32 OOS = 256), so a
+             * plain "return 0" would STOP reading and starve the tunnel's
+             * in-order gap fillers for seconds. Fall back to a bounded
+             * COPYING drain into static scratch (ns_rx_packet -> PBUF_POOL
+             * + pbuf_take): gap fillers reach lwIP, the pool recycles, and
+             * the normal path stays zero-copy with no capacity cliff. */
+            for (;;) {
+                if (budget <= 0)
+                    return 0;
+                for (int i = 0; i < RX_VLEN; i++) {
+                    copy_iov[i].iov_base = copy_buf[i];
+                    copy_iov[i].iov_len = 2048;
+                    copy_msgs[i].msg_hdr.msg_iov = &copy_iov[i];
+                    copy_msgs[i].msg_hdr.msg_iovlen = 1;
+                }
+                int v = port_recvmmsg(sockfd, copy_msgs, RX_VLEN,
+                                      MSG_DONTWAIT, NULL);
+                if (v < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+                    errno != ECONNREFUSED && errno != EINTR) {
+                    log_err("receive_vpn: recvmmsg (copy fallback): %s",
+                            strerror(errno));
+                    cfg->session_lost = true;
+                    return -1;
+                }
+                if (v <= 0)
+                    return 0;   /* drained (copy mode has no pool ownership) */
+                budget -= v;
+                for (int i = 0; i < v; i++) {
+                    ssize_t n = copy_msgs[i].msg_len;
+                    if (n < 8 || (copy_msgs[i].msg_hdr.msg_flags & MSG_TRUNC))
+                        continue;   /* no pool slot to release in copy mode */
+                    int r = vpn_handle_datagram(sockfd, cfg, copy_buf[i],
+                                                (size_t)n, true);
+                    if (r < 0)
+                        return -1;   /* session lost (server CLOSE / fatal) */
+                }
+                if (v < RX_VLEN)
+                    return 0;   /* partial batch: drained */
+            }
+        }
         for (int i = 0; i < got; i++) {
             rx_iov[i].iov_base = rx_bufs[i];
             rx_iov[i].iov_len = RX_SLOT;
@@ -725,7 +780,8 @@ int receive_vpn(int sockfd, SocksConfig *cfg) {
                 ns_rx_buf_release(rx_bufs[i]);
                 continue;
             }
-            int r = vpn_handle_datagram(sockfd, cfg, rx_bufs[i], (size_t)n);
+            int r = vpn_handle_datagram(sockfd, cfg, rx_bufs[i], (size_t)n,
+                                        false);
             if (r < 0) {
                 /* the handler did not take pool ownership: release the
                  * current slot too, or a PT_CLOSE (and any other fatal
