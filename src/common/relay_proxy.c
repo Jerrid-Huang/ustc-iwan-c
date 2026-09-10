@@ -376,10 +376,18 @@ static bool rp_target_blocked(bool guard, int af, const uint8_t *p)
     if (af == 6) {
         static const uint8_t lo[16] = { 0, 0, 0, 0, 0, 0, 0, 0,
                                         0, 0, 0, 0, 0, 0, 0, 1 };
+        static const uint8_t unspec[16] = { 0 };   /* :: */
         static const uint8_t v4map[12] = { 0, 0, 0, 0, 0, 0, 0, 0,
                                            0, 0, 0xff, 0xff };
         if (memcmp(p, lo, 16) == 0)
             return true;                    /* ::1 */
+        /* :: — same rationale as the v4 0.0.0.0 check: on Linux
+         * connect(AF_INET6,[::]) routes to loopback, so this is an
+         * alternate spelling of ::1 that would bypass the gate; a
+         * proxy must not be asked to reach an unspecified address
+         * anyway. */
+        if (memcmp(p, unspec, 16) == 0)
+            return true;                    /* :: */
         if (p[0] == 0xfe && (p[1] & 0xc0) == 0x80)
             return true;                    /* fe80::/10 */
         /* ::ffff:a.b.c.d: the mapped v4 address obeys the v4 rules,
@@ -539,10 +547,13 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
     /* L7: 512 could not hold a maximal legal exchange (RFC1929 frame
      * with 255-byte user + 255-byte pass alone is 513 bytes) plus a
      * pipelined greeting/CONNECT, so legitimate clients could never
-     * finish auth. 2048 covers greeting (257) + auth (513) + CONNECT
-     * (262) with slack. The `n > sizeof b` entry bound below follows
-     * the new size automatically. */
-    uint8_t b[2048];
+     * finish auth. 4096 matches the size of the caller's first[] read
+     * buffer (rp_conn_main), so a single first read that pipelines
+     * greeting + CONNECT + >2 KB of early tunnel data is copied whole
+     * instead of being refused by the `n > sizeof b` entry bound; the
+     * excess is then forwarded upstream by the R4-08-F1 logic below.
+     * The `n > sizeof b` bound still follows the buffer size. */
+    uint8_t b[4096];
     size_t n = first_n;
     /* t is zero-initialized: pp_socks_request returns 0 with rep=1 and
      * skips writing *t when VER!=5, so the debug log below must not
@@ -552,10 +563,10 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
 
     if (n == 0)
         return -1;              /* nothing at all is still fatal */
-    /* pre-auth bound: `first` holds up to a full 4096B read but every
-     * parser below works out of b[2048] (later reads all guard
-     * n >= sizeof b). An oversized first packet is not a valid SOCKS5
-     * greeting — refuse it before the copy. */
+    /* pre-auth bound: b is sized to hold a full first[] read (4096B),
+     * so a legitimate pipelined greeting never trips this; only a true
+     * oversized first packet (impossible from the caller today) is
+     * refused here. The later reads all guard n >= sizeof b. */
     if (n > sizeof b)
         return -1;
     memcpy(b, first, n);

@@ -591,9 +591,14 @@ bool ns_init(Netstack *ns, uint32_t inner_ip, uint32_t gw, uint16_t mtu)
     }
     n->mtu = (mtu > 1500) ? 1500 : mtu;
     n->state = ns;
-    /* no link layer on a point-to-point tunnel: hwaddr_len stays 0 so
-     * nothing (ND6 options, ARP-style paths) ever reads hwaddr[] */
-    n->hwaddr_len = 0;
+    /* point-to-point tunnel has no real link layer, but lwIP ND6 still
+     * emits a 8-byte LLADDR option in NA/NS whenever it is invoked, and
+     * with hwaddr_len == 0 the SMEMCPY copies 0 bytes, leaving 6 bytes
+     * of uninitialized PBUF_RAM heap on the wire (info disclosure).
+     * Give the netif a defined all-zero EUI-48 so the option stays
+     * well-formed and leaks nothing. */
+    n->hwaddr_len = 6;
+    memset(n->hwaddr, 0, sizeof n->hwaddr);
 
     /* inner IPv6 address: fd00::/96 + inner IPv4 (protocol.h). The wire
      * protocol assigns only an IPv4, so the ULA is the deterministic
