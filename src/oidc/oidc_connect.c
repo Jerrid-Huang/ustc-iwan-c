@@ -91,7 +91,10 @@ static int oidc_socks_reauth_cb(void *ud, SocksConfig *cfg, int *out_fd)
         return -1;
     }
     AuthResult res;
-    int fd = authenticate_ex(rc->user, password, NULL, IWAN_DEFAULT_MTU,
+    /* R25-f3 F1: the OPEN MTU must match the userspace stack's negotiated
+     * size (--socks-mtu, default 1380) — advertising IWAN_DEFAULT_MTU(1400)
+     * made the server size 1400 while socks.c:565 drops 1381-1400B downlink. */
+    int fd = authenticate_ex(rc->user, password, NULL, rc->o->socks_mtu,
                              rc->host, rc->port, DO_AUTH_OIDC, &res);
     if (fd < 0) {
         OPENSSL_cleanse(password, strlen(password));
@@ -290,7 +293,14 @@ void oidc_connect_server(const Opts *o, const Config *cf)
             oidc_die_with_cause("invalid address", eb);
     }
 
-    const char *user = srv_user ? srv_user : "";
+    /* R25-f3 F3: an absent username would silently fail with "invalid
+     * credentials" (empty T_USERNAME never matches a server user); surface
+     * it as a config error instead. */
+    if (!srv_user || !srv_user[0])
+        oidc_die("server \"%s\" has no username in servers.json; add "
+                 "\"username\" (iwan-client defaults to _rev_m_1)",
+                 name ? name : host);
+    const char *user = srv_user;
 
     /* TUN device and route prep are session-independent: prepared once,
      * reused across reconnects (the server keeps the assigned IP on a
@@ -353,7 +363,8 @@ void oidc_connect_server(const Opts *o, const Config *cf)
 #endif
         }
         AuthResult res;
-        int fd = authenticate_ex(user, password, NULL, IWAN_DEFAULT_MTU,
+        /* R25-f3 F1: advertise the socks-mode MTU, not the 1400 default */
+        int fd = authenticate_ex(user, password, NULL, o->socks_mtu,
                                  host, port, DO_AUTH_OIDC, &res);
         if (fd < 0) {
             OPENSSL_cleanse(password, strlen(password));

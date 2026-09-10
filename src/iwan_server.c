@@ -1297,6 +1297,11 @@ int main(int argc, char **argv)
             log_err("cannot start uplink recv thread %d: %s", i + 1,
                     strerror(errno));
             atomic_store_explicit(&g_stop, true, memory_order_relaxed);
+            /* R25-f2 F2-A: without this the process would exit 0 after
+             * "server ready" with zero (or too few) recv threads — a
+             * silent startup black hole. Surface it as a fatal poll error
+             * so server_shutdown returns non-zero. */
+            atomic_store_explicit(&poll_err, 1, memory_order_relaxed);
             break;
         }
         ncreated++;

@@ -1703,7 +1703,11 @@ void update_tcp_states(void) {
             continue;
         TcpConn *c = ns_conn(&g_ns, f->ns_idx);
         NsState st = c ? c->state : NS_CLOSED;
-        if (st == NS_ESTABLISHED) {
+        /* R25-f1 F2: a peer that FINs immediately after our SYN-ACK leaves
+         * the bridge in NS_CLOSE_WAIT (never seen as NS_ESTABLISHED). The
+         * connection still established — send the success reply exactly as
+         * for ESTABLISHED so the accept-then-close server works. */
+        if (st == NS_ESTABLISHED || st == NS_CLOSE_WAIT) {
             if (!f->reply_sent) {
                 if (f->http_connect) {
                     /* HTTP CONNECT tunnel: confirm after the tunnel is up */
@@ -2131,8 +2135,15 @@ void service_local_outputs(void) {
 
         if (f->ns_idx >= 0) {
             TcpConn *c = ns_conn(&g_ns, f->ns_idx);
-            if (c && c->state == NS_CLOSE_WAIT && c->rxq.len == 0 &&
-                f->output.len == 0) {
+            /* R25-f1 F2: an accepted-then-closed server can deliver the
+             * peer FIN in the same round the connect completes, moving the
+             * bridge to NS_CLOSE_WAIT BEFORE update_tcp_states has sent the
+             * SOCKS/HTTP success reply (service_local_outputs runs first).
+             * Only close when the flow is ESTABLISHED and already replied
+             * (reply_sent) — otherwise the reply would be silently dropped
+             * and the client's CONNECT lost. */
+            if (c && c->state == NS_CLOSE_WAIT && f->reply_sent &&
+                c->rxq.len == 0 && f->output.len == 0) {
                 flowdbg(f, "CLOSE_WAIT rxq-empty -> ns_close");
                 port_shutdown(f->fd, SHUT_WR);
                 ns_close(&g_ns, f->ns_idx);

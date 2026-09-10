@@ -879,7 +879,14 @@ static int socks_reauth_tunnel(SocksConfig *cfg)
     /* the tunnel-DNS workers are session-bound: retire them before the
      * old socket closes and reset the wait table for the new session */
     dns_stop();
+    /* R25-f1 F1: publish g_dns_server_ip4 under the same DNS wait mutex the
+     * workers snapshot under (R20 contract) — dns_stop/dns_reset self-lock,
+     * but the write to g_dns_server_ip4 between them does not otherwise; an
+     * unlocked write vs the worker's unlocked read is a formal data race
+     * (the exact class R20 claimed fixed). */
+    dns_session_lock();
     dns_set_server(cfg->dns);
+    dns_session_unlock();
     dns_reset();
     uint8_t oh[8];
     pkt_hdr(cfg->encryption ? PT_DATA_ENC : PT_DATA, cfg->encryption,
@@ -904,7 +911,9 @@ static int socks_reauth_tunnel(SocksConfig *cfg)
                 set_flow_state(f, ST_CLOSING);
             }
         }
+        dns_session_lock();   /* R25-f1 F1: same R20 publish contract */
         ns_set_outer(&g_ns, oh, cfg->xor_key);
+        dns_session_unlock();
         while (ns_tx_peek(&g_ns))
             ns_tx_pop(&g_ns);
         log_info("SOCKS: inner connections kept (same inner IP)");
