@@ -367,7 +367,11 @@ bool capture_default(char gw[16], char dev[16], char metric[16])
     if (out == NULL)
         return false;
     gw[0] = dev[0] = metric[0] = '\0';   /* metric: "" when absent */
-    bool ok = false;
+    /* candidate default rows (gateway + interface), kept in netstat
+     * order so a single-default host behaves exactly as before */
+    char cand_gw[16][16];
+    char cand_dev[16][16];
+    size_t n = 0;
     char *lsave = NULL;
     /* modern netstat -rn prints no metric column (and the old one puts
      * it in the middle), so metric stays empty: on macOS the physical
@@ -405,13 +409,43 @@ bool capture_default(char gw[16], char dev[16], char metric[16])
             free(out);
             return false;
         }
-        copy_token(gw, 16, gt);
-        copy_token(dev, 16, last);
-        ok = true;
-        break;
+        if (n < 16) {
+            copy_token(cand_gw[n], 16, gt);
+            copy_token(cand_dev[n], 16, last);
+            n++;
+        }
     }
     free(out);
-    return ok;
+
+    if (n == 0)
+        return false;
+
+    /* single default: byte-for-byte the historical result */
+    if (n == 1) {
+        copy_token(gw, 16, cand_gw[0]);
+        copy_token(dev, 16, cand_dev[0]);
+        return true;
+    }
+
+    /* multiple defaults: prefer a physical interface (enX: Wi-Fi or
+     * Ethernet) so the server pin rides a real NIC, falling back to the
+     * first valid row; among several physical ones keep the first in
+     * netstat order for stability. */
+    size_t best = 0;
+    bool prefer_en = false;
+    for (size_t i = 0; i < n; i++) {
+        log_info("capture_default: default candidate %zu: via %s on %s",
+                 i + 1, cand_gw[i], cand_dev[i]);
+        if (!prefer_en && strncmp(cand_dev[i], "en", 2) == 0) {
+            prefer_en = true;
+            best = i;
+        }
+    }
+    log_info("capture_default: %zu default route(s); choosing via %s on %s",
+             n, cand_gw[best], cand_dev[best]);
+    copy_token(gw, 16, cand_gw[best]);
+    copy_token(dev, 16, cand_dev[best]);
+    return true;
 }
 #else
 bool capture_default(char gw[16], char dev[16], char metric[16]) {
@@ -664,6 +698,51 @@ rollback:
     return false;
 }
 #elif defined(__APPLE__)
+/* macOS session state: whether THIS process actually installed the
+ * server /32 pin during route_setup. route_teardown must never remove
+ * a route this process did not install — the flag is set only after
+ * `route add -host <srv>/32 <ogw>` succeeds and cleared by teardown,
+ * so a failed-setup rollback removes only our own pin and a
+ * pre-existing user/third-party host route is never touched. */
+static bool srv_pin_installed;
+
+/* true when `netstat -rn -f inet` already shows an identical server /32
+ * pin (destination <srv> or <srv>/32) via the same gateway `ogw`. Used
+ * only on the route_setup add-failure path to distinguish "already
+ * covered by a pre-existing route" from a real failure. */
+static bool mac_pin_exists(const char *srv, const char *ogw)
+{
+    char *args[] = { "netstat", "-rn", "-f", "inet", NULL };
+    char *out = port_cmd_capture(args, 65536);
+    if (out == NULL)
+        return false;
+    char srv32[64];
+    snprintf(srv32, sizeof srv32, "%s/32", srv);
+    bool found = false;
+    char *lsave = NULL;
+    for (char *line = strtok_r(out, "\n", &lsave); line != NULL;
+         line = strtok_r(NULL, "\n", &lsave)) {
+        char *save = NULL;
+        char *tok = strtok_r(line, " \t\r", &save);
+        if (tok == NULL)
+            continue;
+        /* destination may be printed as the bare address or the /32
+         * spelling; match either */
+        if (strcmp(tok, srv) != 0 && strcmp(tok, srv32) != 0)
+            continue;
+        /* the gateway is the token right after the destination */
+        char *gt = strtok_r(NULL, " \t\r", &save);
+        if (gt == NULL)
+            continue;
+        if (strcmp(gt, ogw) == 0) {
+            found = true;
+            break;
+        }
+    }
+    free(out);
+    return found;
+}
+
 bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
                  const char *srv, const char *ogw, const char *odev,
                  const char *metric, const slist_t *routes_with_default) {
@@ -682,17 +761,18 @@ bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
         return false;
     }
     /* pin the server route via the physical gateway so the session
-     * never loops back through the tunnel */
+     * never loops back through the tunnel. NEVER delete a pre-existing
+     * host route here: a bare add failing EEXIST while an identical pin
+     * (same /32 via the same gateway) is already present is fine — that
+     * route was not installed by us, so srv_pin_installed stays false
+     * and teardown will not remove it. */
     if (srv_v4 && !srv_lo) {
-        /* delete-then-add: a crashed previous run leaves the pin in
-         * place and a bare add fails EEXIST (route(8) has no replace
-         * verb) — keep setup idempotent like every other step here */
-        char *pin_del[] = { "route", "-n", "delete", "-host", srv32,
-                            NULL };
-        port_run_cmd(pin_del);   /* best-effort */
         char *pin[] = { "route", "-n", "add", "-host", srv32,
                         (char *)ogw, NULL };
-        if (!mac_run(pin, "route_setup: pin server route")) {
+        if (mac_run(pin, "route_setup: pin server route")) {
+            srv_pin_installed = true;
+        } else if (!mac_pin_exists(srv, ogw)) {
+            /* a real failure: no pre-existing matching pin to rely on */
             route_iface_down(tun);
             return false;
         }
@@ -743,6 +823,10 @@ bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
 
 rollback:
     log_err("route_setup: rolling back applied routes");
+    /* route_teardown deletes the server pin only when srv_pin_installed
+     * is set, which it is only after the pin add above succeeded — so a
+     * failed-setup rollback removes only our own pin, never a
+     * pre-existing user/third-party host route. */
     route_teardown(tun, srv, ogw, odev, metric, routes_with_default);
     return false;
 }
@@ -963,10 +1047,19 @@ void route_teardown(const char *tun, const char *srv, const char *ogw,
     char srv32[64];
     struct in_addr s4;
     snprintf(srv32, sizeof srv32, "%s/32", srv);
+    /* only remove the server /32 pin this process actually installed:
+     * srv_pin_installed is set by route_setup right after its
+     * `route add -host <srv>/32 <ogw>` succeeds. Qualifying the delete
+     * with the gateway makes route(8) target exactly the entry we
+     * created, so a pre-existing /32 via another gateway is never
+     * touched. Clear the flag whether or not the delete succeeds —
+     * afterwards we no longer own a pin. */
     if (inet_pton(AF_INET, srv, &s4) == 1 &&
-        (ntohl(s4.s_addr) >> 24) != 127) {
-        char *d4[] = { "route", "-n", "delete", "-host", srv32, NULL };
+        (ntohl(s4.s_addr) >> 24) != 127 && srv_pin_installed) {
+        char *d4[] = { "route", "-n", "delete", "-host", srv32,
+                       (char *)ogw, NULL };
         port_run_cmd(d4);   /* best-effort */
+        srv_pin_installed = false;
     }
     route_iface_down(tun);
 }

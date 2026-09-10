@@ -1804,6 +1804,14 @@ int port_evfd_create(void)
         evfd_close_fd((int)peer);
         return -1;
     }
+#ifndef _WIN32
+    /* Best-effort: keep the UDP wake socketpair out of forked helper
+     * subprocesses (ifconfig/route/netstat). POSIX-only (port_set_cloexec
+     * lives in the !_WIN32 branch of port.h); a fcntl failure must not
+     * fail evfd_create. */
+    port_set_cloexec((int)s);
+    port_set_cloexec((int)peer);
+#endif
     g_evfd_peer = peer;
     return (int)s;
 }

@@ -980,9 +980,20 @@ int run_socks(int sockfd, SocksConfig *cfg) {
             socklen_t gl = sizeof got;
             if (port_getsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &got, &gl) == 0 &&
                 got < rbuf / 2) {
+#ifdef __linux__
                 log_err("SO_RCVBUF capped at %d (requested %d): raise "
                         "net.core.rmem_max/wmem_max for the high-BDP buffer",
                         got, rbuf);
+#elif defined(__APPLE__) || defined(__FreeBSD__) || \
+      defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__)
+                log_err("SO_RCVBUF capped at %d (requested %d): raise "
+                        "sysctl kern.ipc.maxsockbuf for the high-BDP buffer",
+                        got, rbuf);
+#else
+                log_err("SO_RCVBUF capped at %d (requested %d): raise "
+                        "the system socket buffer limit for the high-BDP buffer",
+                        got, rbuf);
+#endif
             }
         }
     }

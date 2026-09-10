@@ -269,6 +269,12 @@ static inline int port_set_nonblock(int fd, bool nb)
         return -1;
     return fcntl(fd, F_SETFL, nb ? (fl | O_NONBLOCK) : (fl & ~O_NONBLOCK));
 }
+static inline void port_set_cloexec(int fd)
+{
+    int fl = fcntl(fd, F_GETFD, 0);
+    if (fl >= 0)
+        (void)fcntl(fd, F_SETFD, fl | FD_CLOEXEC);
+}
 static inline ssize_t port_send(int fd, const void *buf, size_t len, int flags)
 { return send(fd, buf, len, flags); }
 static inline ssize_t port_recv(int fd, void *buf, size_t len, int flags)
@@ -345,9 +351,13 @@ static inline int port_socket(int domain, int type, int protocol)
      * inspects the exact type bits afterwards. */
     return socket(domain, type | SOCK_CLOEXEC, protocol);
 #  else
-    /* macOS keeps plain socket(): CLOEXEC is Linux-specific, and the
-     * __APPLE__ / other POSIX branches must stay byte-identical. */
-    return socket(domain, type, protocol);
+    /* macOS/BSD has no SOCK_CLOEXEC: mark the fd close-on-exec with
+     * fcntl instead so it cannot leak into forked helper subprocesses
+     * (ifconfig/route/netstat) (L-F3 / M-2). */
+    int fd = socket(domain, type, protocol);
+    if (fd >= 0)
+        port_set_cloexec(fd);
+    return fd;
 #  endif
 }
 static inline int port_accept(int fd, struct sockaddr *addr,
@@ -358,7 +368,12 @@ static inline int port_accept(int fd, struct sockaddr *addr,
      * into helper subprocesses either (L-F3). */
     return accept4(fd, addr, addrlen, SOCK_CLOEXEC);
 #  else
-    return accept(fd, addr, addrlen);
+    /* macOS/BSD has no accept4: mark the accepted fd close-on-exec with
+     * fcntl so it cannot leak into forked helper subprocesses (M-2). */
+    int afd = accept(fd, addr, addrlen);
+    if (afd >= 0)
+        port_set_cloexec(afd);
+    return afd;
 #  endif
 }
 static inline int port_connect(int fd, const struct sockaddr *addr,

@@ -7,7 +7,9 @@
  * UTUN_OPT_IFNAME reports the kernel-assigned interface name.
  * The requested name is an app-level handle only: open_tun records the
  * requested->actual mapping and tun_ifname() translates back for
- * ifconfig/route. A single mapping suffices (one TUN per process).
+ * ifconfig/route. The mapping lives for the whole process lifetime (one
+ * TUN opened once): a fail-closed guard in open_tun refuses a second
+ * live open rather than silently overwriting the singleton mapping.
  *
  * The unit is released when the socket is closed: teardown is plain
  * close(fd), and the interface (with its addresses) disappears.
@@ -60,6 +62,17 @@ int open_tun(const char *name)
     if (!tun_name_valid(name))
         return -1;
 
+    /* Single-TUN contract: g_utun_name/g_requested are a process-level
+     * singleton mapping that lives for the process lifetime (there is no
+     * per-platform close hook to reset it), so refuse a second live open
+     * fail-closed instead of letting it silently overwrite the mapping. */
+    if (g_utun_name[0] != '\0') {
+        log_err("open_tun: a utun interface is already open in this process "
+                "(single-TUN contract)");
+        errno = EBUSY;
+        return -1;
+    }
+
     /* resolve the control id (com.apple.net.utun_control) */
     struct ctl_info ci;
     memset(&ci, 0, sizeof ci);
@@ -67,6 +80,13 @@ int open_tun(const char *name)
     int fd = socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL);
     if (fd < 0)
         return -1;
+    /* best-effort: keep the control fd out of helper subprocesses
+     * (ifconfig/route/netstat); a fcntl failure must not fail open_tun */
+    {
+        int fl = fcntl(fd, F_GETFD, 0);
+        if (fl >= 0)
+            (void)fcntl(fd, F_SETFD, fl | FD_CLOEXEC);
+    }
     if (ioctl(fd, CTLIOCGINFO, &ci) < 0) {
         close(fd);
         return -1;
