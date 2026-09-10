@@ -47,8 +47,8 @@ void on_sig(int sig) {
     atomic_store_explicit(&g_user_stop, true, memory_order_relaxed);
 }
 
-int g_dns_evfd = -1;      /* DNS workers write here to wake the loop */
-int g_sockfd = -1;        /* session UDP socket; set by run_socks, used by tunnel DNS */
+_Atomic int g_dns_evfd = -1;   /* DNS workers read/wake; main writes (R20: atomic) */
+_Atomic int g_sockfd = -1; /* session UDP socket; R20 atomic (DNS-worker readers) */
 SocksConfig *g_socks_cfg; /* SOCKS5 config; set by run_socks, read by flow handshake */
 Flow *g_flows;            /* fixed MAX_FLOWS array, never NULL-terminated */
 
@@ -910,11 +910,14 @@ static int socks_reauth_tunnel(SocksConfig *cfg)
         /* FIND-R19-F5: netif_add failure must not be swallowed — return -1
          * so the caller re-auth retry schedule (reauth_at backoff) fixes
          * the stack instead of running receive_vpn against a dead netif. */
+        dns_session_lock();   /* R20: publish under the DNS wait mutex */
         if (!ns_init(&g_ns, cfg->inner_ip, cfg->gateway, (uint16_t)cfg->mtu)) {
+            dns_session_unlock();
             log_err("SOCKS: stack rebuild failed");
             return -1;
         }
         ns_set_outer(&g_ns, oh, cfg->xor_key);
+        dns_session_unlock();
         socks_reauth_flows();
         log_info("SOCKS: inner IP changed; flows re-established");
     }
@@ -1074,6 +1077,12 @@ int run_socks(int sockfd, SocksConfig *cfg) {
      * Both are fixed before any DNS worker can spawn (workers are only
      * created inside the event loop below). */
     g_sockfd = sockfd;
+    /* R20 (R06 M-3): dns_set_server/ns_init/ns_set_outer publish the
+     * session globals DNS workers build packets from (g_dns_server_ip4,
+     * g_ns.ip/outer_hdr/xor_key) — write them under the DNS wait mutex so
+     * the workers' locked snapshot reads are race-free (previously an
+     * unlocked write vs unlocked read = formal C11 data race). */
+    dns_session_lock();
     dns_set_server(cfg->dns);
 
     /* Rust prints the configured address (config.listen), not the bound one */
@@ -1083,6 +1092,7 @@ int run_socks(int sockfd, SocksConfig *cfg) {
      * listener + session socket (A-1) and return the R13 three-state -1
      * instead of running receive_vpn against a half-built stack. */
     if (!ns_init(&g_ns, cfg->inner_ip, cfg->gateway, (uint16_t)cfg->mtu)) {
+        dns_session_unlock();
         log_err("SOCKS: ns_init failed at startup");
         port_close(listener);
         port_close(sockfd);   /* A-1: own + close sockfd on every return */
@@ -1094,6 +1104,7 @@ int run_socks(int sockfd, SocksConfig *cfg) {
                 cfg->sid, cfg->token, oh);
         ns_set_outer(&g_ns, oh, cfg->xor_key);
     }
+    dns_session_unlock();
 
     g_flows = calloc(MAX_FLOWS, sizeof *g_flows);
     if (!g_flows) {
@@ -1106,7 +1117,8 @@ int run_socks(int sockfd, SocksConfig *cfg) {
      * wait table) so stale entries can never match a fresh session's
      * flows or queries; also retires workers that outlived it */
     dns_reset();
-    g_dns_evfd = port_evfd_create();
+    atomic_store_explicit(&g_dns_evfd, port_evfd_create(),
+                          memory_order_relaxed);
 
     /* run_socks must be re-entrant: clear any stale stop flag BEFORE
      * installing the handlers (a signal arriving between the two would
@@ -1311,7 +1323,8 @@ int run_socks(int sockfd, SocksConfig *cfg) {
     port_close(listener);
     if (g_dns_evfd >= 0) {
         port_evfd_close(g_dns_evfd);
-        g_dns_evfd = -1;
+        atomic_store_explicit(&g_dns_evfd, -1,
+                              memory_order_relaxed);
     }
     for (int i = 0; i < MAX_FLOWS; i++)
         if (g_flows[i].active)

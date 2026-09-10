@@ -107,8 +107,13 @@ typedef struct {
 extern Netstack g_ns;
 extern Flow *g_flows;          /* fixed MAX_FLOWS array, never NULL-terminated */
 extern uint64_t g_next_id;
-extern int g_dns_evfd;         /* -1 = disabled; written by DNS workers */
-extern int g_sockfd;           /* session UDP socket; set by run_socks, used by tunnel DNS */
+extern _Atomic int g_dns_evfd; /* -1 = disabled; written by DNS workers (R20 atomic) */
+/* R20 (R06 M-3): lock/unlock around the session-global writes in the event loop
+ * (g_dns_server_ip4, g_ns.ip/outer_hdr/xor_key) so DNS-worker snapshot reads are
+ * race-free. Implemented in socks_flow.c on g_dns_wait_mu. */
+void dns_session_lock(void);
+void dns_session_unlock(void);
+extern _Atomic int g_sockfd;   /* session UDP socket; R20 atomic (DNS-worker readers) */
 extern SocksConfig *g_socks_cfg; /* SOCKS5 config (auth_token/allow_remote); set by run_socks */
 extern int g_flow_len;         /* active count */
 extern atomic_bool g_stop;     /* shared stop flag (util.h): SIGINT/SIGTERM */

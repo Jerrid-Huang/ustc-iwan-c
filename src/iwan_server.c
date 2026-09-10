@@ -844,7 +844,7 @@ static void *recv_thread_main(void *v)
              * drained — a transient race between poll and recvmmsg, or
              * a wedged receive path (see the MSG_ERRQUEUE drain above) */
             if (last_v <= 0 && (pfd.revents & POLLIN)) {
-                static uint64_t last_pe2;
+                static _Thread_local uint64_t last_pe2;
                 uint64_t nowp = now_ms();
                 if (nowp - last_pe2 >= 1000) {
                     last_pe2 = nowp;
@@ -856,7 +856,7 @@ static void *recv_thread_main(void *v)
         } else if (pfd.revents != 0) {
             /* unexpected poll event (POLLNVAL/POLLHUP on the socket):
              * would busy-spin without receiving anything — log it */
-            static uint64_t last_pe;
+            static _Thread_local uint64_t last_pe;
             uint64_t nowp = now_ms();
             if (nowp - last_pe >= 1000) {
                 last_pe = nowp;

@@ -18,7 +18,9 @@
 #endif
 
 #ifndef IWAN_DEBUG_STRIP
-static int debug_cached = -1;
+/* R20 (T2): debug_enabled() is called from every server recv thread on its
+ * first use — a plain lazy static is a data race across threads. Atomic. */
+static _Atomic int debug_cached = -1;
 #endif
 
 /* process-wide stop flag (see util.h). atomic_bool is lock-free on every
@@ -41,12 +43,14 @@ void oom_abort(void)
 #ifndef IWAN_DEBUG_STRIP
 bool debug_enabled(void)
 {
-    if (debug_cached < 0) {
+    int c = atomic_load_explicit(&debug_cached, memory_order_relaxed);
+    if (c < 0) {
         const char *v = getenv("IWAN_DEBUG");
-        debug_cached = v && *v && strcmp(v, "0") != 0 &&
-                       strcmp(v, "false") != 0 && strcmp(v, "off") != 0;
+        c = v && *v && strcmp(v, "0") != 0 &&
+            strcmp(v, "false") != 0 && strcmp(v, "off") != 0;
+        atomic_store_explicit(&debug_cached, c, memory_order_relaxed);
     }
-    return debug_cached != 0;
+    return c != 0;
 }
 #endif
 

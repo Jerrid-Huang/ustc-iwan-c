@@ -52,7 +52,7 @@
 #define RP_MAX_CONNS            256
 
 struct RelayProxy {
-    int          listener;   /* -1 = stopped */
+    _Atomic int  listener;   /* -1 = stopped; written by stop/accept threads (R20 atomic) */
     atomic_bool  stop;
     char        *token;      /* RFC1929 password copy; NULL = no auth */
 };

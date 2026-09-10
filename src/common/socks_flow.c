@@ -307,6 +307,13 @@ static pthread_mutex_t g_dns_wait_mu = PTHREAD_MUTEX_INITIALIZER;
  * decremented after in_use=false, both under g_dns_wait_mu. */
 static atomic_int g_dns_wait_n;
 
+/* R20 (R06 M-3): the event loop publishes the session globals DNS workers
+ * build packets from (g_ns.ip / g_ns.outer_hdr / g_ns.xor_key /
+ * g_dns_server_ip4) under this same mutex; workers snapshot them under the
+ * lock so the (previously unlocked) build reads are race-free. */
+void dns_session_lock(void) { pthread_mutex_lock(&g_dns_wait_mu); }
+void dns_session_unlock(void) { pthread_mutex_unlock(&g_dns_wait_mu); }
+
 /* true when the session generation changed since this job was spawned,
  * i.e. the tunnel session was torn down and workers must stop (see
  * g_dns_gen above) */
@@ -448,16 +455,19 @@ static size_t dns_build_inner(uint32_t sip, uint32_t dip, uint16_t sport,
     return tot;
 }
 
-/* frame the inner packet with the 8-byte outer header + XOR payload */
+/* frame the inner packet with the 8-byte outer header + XOR payload.
+ * outer/xkey are the worker's locked snapshot of g_ns.outer_hdr/g_ns.xor_key
+ * (R20 R06 M-3: never read the live globals unlocked). */
 static size_t dns_wrap_outer(const uint8_t *inner, size_t inlen,
-                             uint8_t *out, size_t outsz)
+                             uint8_t *out, size_t outsz,
+                             const uint8_t outer[8], const uint8_t xkey[8])
 {
     if (8 + inlen > outsz)
         return 0;
-    memcpy(out, g_ns.outer_hdr, 8);
+    memcpy(out, outer, 8);
     memcpy(out + 8, inner, inlen);
-    if (g_ns.outer_hdr[0] == PT_DATA_ENC)
-        xor_crypt(out + 8, inlen, g_ns.xor_key, 8);
+    if (outer[0] == PT_DATA_ENC)
+        xor_crypt(out + 8, inlen, xkey, 8);
     return 8 + inlen;
 }
 
@@ -790,6 +800,10 @@ static void *dns_worker(void *arg) {
     size_t qlen, inlen, outlen;
     uint64_t last_send;
     int slot = -1;
+    /* R20 (R06 M-3): session-global snapshot taken under g_dns_wait_mu so
+     * the packet build never does an unlocked read of g_ns/g_dns_server_ip4 */
+    uint32_t lip, srv4;
+    uint8_t outer_snap[8], xkey_snap[8];
 
     /* generation gate: a worker that started under a previous session
      * (or whose session was torn down) must not register, send, or
@@ -843,6 +857,12 @@ static void *dns_worker(void *arg) {
             goto done;
         }
         ipid = w->ipid;
+        /* snapshot under the lock (R20): the event loop publishes these
+         * session globals under the same lock, so this read is race-free */
+        lip = g_ns.ip;
+        srv4 = g_dns_server_ip4;
+        memcpy(outer_snap, g_ns.outer_hdr, 8);
+        memcpy(xkey_snap, g_ns.xor_key, 8);
         if (dns_stale(j)) {
             /* session torn down while we registered: retire the slot */
             dns_retire_slot_locked(slot, sport, id);
@@ -852,11 +872,12 @@ static void *dns_worker(void *arg) {
     }
     pthread_mutex_unlock(&g_dns_wait_mu);
 
-    inlen = dns_build_inner(g_ns.ip, g_dns_server_ip4, sport, ipid, q,
+    inlen = dns_build_inner(lip, srv4, sport, ipid, q,
                             qlen, inner, sizeof inner);
     if (inlen == 0)
         goto fail;
-    outlen = dns_wrap_outer(inner, inlen, out, sizeof out);
+    outlen = dns_wrap_outer(inner, inlen, out, sizeof out,
+                            outer_snap, xkey_snap);
     if (outlen == 0)
         goto fail;
     /* first send, gated on the generation under the wait-table lock:
@@ -935,13 +956,15 @@ done:
      * already be closed (and reused), and the loop is not waiting.
      * Same lock serializes this write against the evfd close. */
     pthread_mutex_lock(&g_dns_wait_mu);
-    if (atomic_load(&g_dns_gen) == j->gen && g_dns_evfd >= 0) {
+    if (atomic_load(&g_dns_gen) == j->gen &&
+        atomic_load_explicit(&g_dns_evfd, memory_order_acquire) >= 0) {
         /* EAGAIN means the eventfd counter is already non-zero: the loop
          * is (or will be) awake, so a failed wake is not an error.
          * port_evfd_wake returns -1 with errno == EAGAIN on Linux when
          * the counter is already set; on Windows the UDP-pair wake send
          * always succeeds, so this branch is inert there. */
-        if (port_evfd_wake(g_dns_evfd) != 0 && errno != EAGAIN)
+        int evfd = atomic_load_explicit(&g_dns_evfd, memory_order_acquire);
+        if (port_evfd_wake(evfd) != 0 && errno != EAGAIN)
             log_debug("dns evfd wake: %s", strerror(errno));
     }
     pthread_mutex_unlock(&g_dns_wait_mu);

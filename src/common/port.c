@@ -1744,7 +1744,8 @@ typedef int evfd_peer_t;
 #define EVFD_INVALID (-1)
 #endif
 
-static evfd_peer_t g_evfd_peer = EVFD_INVALID;
+/* R20: read by DNS workers (port_evfd_wake) while the event loop creates/closes it; _Atomic makes every access a seq-cst load/store so the formal data race is gone (the logical close-vs-wake ordering remains the gen+wait_mu handshake in socks_flow.c). */
+static _Atomic evfd_peer_t g_evfd_peer = EVFD_INVALID;
 
 static void evfd_close_fd(int fd)
 {

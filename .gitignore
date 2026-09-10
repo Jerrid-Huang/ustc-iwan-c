@@ -33,3 +33,4 @@ __pycache__/
 # bench output
 bench-multi.out
 build-dbg/
+build-tsan/

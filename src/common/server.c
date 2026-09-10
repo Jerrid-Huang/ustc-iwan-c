@@ -132,6 +132,12 @@ static int echo_seq_advance(uint8_t af, const uint32_t *c4,
     uint32_t len = (uint32_t)paylen;
     if (flags & (TCP_SYN | TCP_FIN))
         len++;               /* SYN/FIN each consume one sequence number */
+    /* R20 (R09 M-3): echo_lookup released g_echo_mu, but the RMW on
+     * client_max/emit_seq/seeded below is shared state (several SO_REUSEPORT
+     * recv threads) — re-lock around the whole read/modify. The entry is
+     * safe against mid-flight reclamation: a hit or just-created entry has
+     * last_ms=now, so no other thread can idle-reclaim it for 60s. */
+    pthread_mutex_lock(&g_echo_mu);
     if (!ec->seeded) {
         /* First segment for this 4-tuple (in practice its SYN, the only
          * segment that creates an entry): never a retransmit — always a
@@ -150,12 +156,14 @@ static int echo_seq_advance(uint8_t af, const uint32_t *c4,
             /* retransmit: re-echo at the position this content was
              * first mirrored to; counters do not move */
             *seq_out = ec->emit_seq - back;
+            pthread_mutex_unlock(&g_echo_mu);
             return 0;
         }
     }
     *seq_out = ec->emit_seq;
     ec->client_max = s_orig + len;
     ec->emit_seq += len;
+    pthread_mutex_unlock(&g_echo_mu);
     return 0;
 }
 /* shared echo ack/flags rules: the mirrored ack advances past the
@@ -259,13 +267,16 @@ void server_ctx_destroy(struct server_ctx *ctx)
 
 /* ---- uplink per-step timing (IWAN_DEBUG=1, printed once per second) ---- */
 struct up_stats {
-    uint64_t n;
-    uint64_t parse;   /* frame parse + rate_allow + dispatch */
-    uint64_t find;    /* find_session + token + rebind + enc check */
-    uint64_t xor;     /* in-place decryption */
-    uint64_t write;   /* tun_write syscall */
-    uint64_t drop;    /* tun_write EAGAIN/failure drops */
-    uint64_t h1;      /* inner-IPv4 gate drops (malformed/spoofed) */
+    /* R20 (F06-2): each g_up[tid] is RMW'd by recv thread tid while the
+     * primary thread sums AND zeroes it in server_up_stats_print — atomic
+     * fields remove the cross-thread data race on every counter. */
+    _Atomic uint64_t n;
+    _Atomic uint64_t parse;   /* frame parse + rate_allow + dispatch */
+    _Atomic uint64_t find;    /* find_session + token + rebind + enc check */
+    _Atomic uint64_t xor;     /* in-place decryption */
+    _Atomic uint64_t write;   /* tun_write syscall */
+    _Atomic uint64_t drop;    /* tun_write EAGAIN/failure drops */
+    _Atomic uint64_t h1;      /* inner-IPv4 gate drops (malformed/spoofed) */
 };
 
 /* per-recv-thread stats (the multi-threaded uplink sums them on print) */
@@ -275,10 +286,14 @@ static struct up_stats g_up[IWAN_SRV_THREADS_MAX];
  * of the multi-queue fan-out (A/B benchmark switch; cached at startup) */
 static bool srv_tun_single(void)
 {
-    static int v = -1;
-    if (v < 0)
-        v = getenv("IWAN_SRV_TUN_SINGLE") != NULL;
-    return v != 0;
+    /* R20: called from every recv thread's handle_udp — atomic cache */
+    static _Atomic int v = -1;
+    int c = atomic_load_explicit(&v, memory_order_relaxed);
+    if (c < 0) {
+        c = getenv("IWAN_SRV_TUN_SINGLE") != NULL;
+        atomic_store_explicit(&v, c, memory_order_relaxed);
+    }
+    return c != 0;
 }
 static int g_up_nthreads = 1;
 static uint64_t g_up_win;
@@ -304,13 +319,13 @@ void server_up_stats_print(void)
 
     memset(&sum, 0, sizeof sum);
     for (int t = 0; t < g_up_nthreads; t++) {
-        sum.n += g_up[t].n;
-        sum.parse += g_up[t].parse;
-        sum.find += g_up[t].find;
-        sum.xor += g_up[t].xor;
-        sum.write += g_up[t].write;
-        sum.drop += g_up[t].drop;
-        sum.h1 += g_up[t].h1;
+        sum.n += atomic_load_explicit(&g_up[t].n, memory_order_relaxed);
+        sum.parse += atomic_load_explicit(&g_up[t].parse, memory_order_relaxed);
+        sum.find += atomic_load_explicit(&g_up[t].find, memory_order_relaxed);
+        sum.xor += atomic_load_explicit(&g_up[t].xor, memory_order_relaxed);
+        sum.write += atomic_load_explicit(&g_up[t].write, memory_order_relaxed);
+        sum.drop += atomic_load_explicit(&g_up[t].drop, memory_order_relaxed);
+        sum.h1 += atomic_load_explicit(&g_up[t].h1, memory_order_relaxed);
     }
     if (sum.n == 0)
         return;
@@ -331,8 +346,15 @@ void server_up_stats_print(void)
             (unsigned long long)server_dl_pkts(),
             (unsigned long long)atomic_load(&g_dl_drops),
             (unsigned long long)atomic_load(&g_rate_drops));
-    for (int t = 0; t < g_up_nthreads; t++)
-        memset(&g_up[t], 0, sizeof g_up[t]);
+    for (int t = 0; t < g_up_nthreads; t++) {
+        atomic_store_explicit(&g_up[t].n, 0, memory_order_relaxed);
+        atomic_store_explicit(&g_up[t].parse, 0, memory_order_relaxed);
+        atomic_store_explicit(&g_up[t].find, 0, memory_order_relaxed);
+        atomic_store_explicit(&g_up[t].xor, 0, memory_order_relaxed);
+        atomic_store_explicit(&g_up[t].write, 0, memory_order_relaxed);
+        atomic_store_explicit(&g_up[t].drop, 0, memory_order_relaxed);
+        atomic_store_explicit(&g_up[t].h1, 0, memory_order_relaxed);
+    }
     /* dl counter is cumulative (per-second delta is printed by the
      * caller's diff of consecutive lines); do not reset here */
 }
@@ -1091,7 +1113,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
              * header sits at raw+IWAN_HDR_LEN, behind the outer
              * header. */
             if (len <= IWAN_HDR_LEN) {
-                g_up[tid].h1++;
+                atomic_fetch_add_explicit(&g_up[tid].h1, 1, memory_order_relaxed);
                 break;
             }
             {
@@ -1102,7 +1124,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                     ip6_derive_ula(s_ip, want6);
                     if (ip6_pkt_ok(in, inlen, s6, d6) != 0 ||
                         memcmp(s6, want6, 16) != 0) {
-                        g_up[tid].h1++;
+                        atomic_fetch_add_explicit(&g_up[tid].h1, 1, memory_order_relaxed);
                         if (debug_enabled()) {
                             /* short frames can fail the sanity check
                              * before in[4..6] exist — never read past the
@@ -1124,7 +1146,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                 } else {
                     if (ipv4_pkt_ok(in, inlen, &saddr, &daddr) != 0 ||
                         saddr != s_ip) {
-                        g_up[tid].h1++;
+                        atomic_fetch_add_explicit(&g_up[tid].h1, 1, memory_order_relaxed);
                         if (debug_enabled()) {
                             /* short frames can fail the sanity check
                              * before the inner header bytes exist — never
@@ -1179,7 +1201,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                      * the pool the device queue is congested so its
                      * AIMD keeps the write fan-out (never shrinks). */
                     tun_pool_note_stall(ctx->qpool);
-                    g_up[tid].drop++;
+                    atomic_fetch_add_explicit(&g_up[tid].drop, 1, memory_order_relaxed);
                 }
             } else {
                 /* --no-tun test mode: echo the packet back (zero-latency
@@ -1187,15 +1209,15 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                  * be benchmarked without a TUN device or target network */
                 if (echo_mirror(ctx, (uint8_t *)raw + IWAN_HDR_LEN,
                                 len - IWAN_HDR_LEN, sockfd) != 0)
-                    g_up[tid].drop++;
+                    atomic_fetch_add_explicit(&g_up[tid].drop, 1, memory_order_relaxed);
             }
             if (debug_enabled()) {
                 tc = now_ns();
-                g_up[tid].parse += tb - ta;
-                g_up[tid].find += tx0 - tb;
-                g_up[tid].xor += tx1 - tx0;
-                g_up[tid].write += tc - tx1;
-                g_up[tid].n++;
+                atomic_fetch_add_explicit(&g_up[tid].parse, (tb - ta), memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_up[tid].find, (tx0 - tb), memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_up[tid].xor, (tx1 - tx0), memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_up[tid].write, (tc - tx1), memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_up[tid].n, 1, memory_order_relaxed);
             }
             break;
         }

@@ -41,8 +41,13 @@ void pump_win_single_pkt(void *ud, uint8_t *pkt, size_t len, bool last)
 
     if (last)
         return;   /* every packet was handled inline; nothing pending */
-    if (len > (uint32_t)g_prof_tun_rmax)
-        g_prof_tun_rmax = (uint32_t)len;   /* single reader thread */
+    /* R20: non-atomic read-modify-write on an _Atomic is formally UB even
+     * with a single writer (the max is also loaded by the stats path); use
+     * atomic load/store instead. */
+    uint32_t cur = atomic_load_explicit(&g_prof_tun_rmax, memory_order_relaxed);
+    if (len > cur)
+        atomic_store_explicit(&g_prof_tun_rmax, (uint32_t)len,
+                              memory_order_relaxed);
     if (len > 1508)
         atomic_fetch_add(&g_prof_tun_rbig, 1);
     if (len == 0 || len > PUMP_SLOT) {
