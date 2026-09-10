@@ -402,7 +402,7 @@ void oidc_connect_server(const Opts *o, const Config *cf)
 #endif
             /* run_pump does NOT own fd: the caller closes it here */
             rc = run_pump(tun_fd, o->tun, fd, sk, res.sid, res.tok,
-                          1, host, &routes, &routes6,
+                          res.enc, host, &routes, &routes6,
                           res.tun, res.mtu);
             port_close(fd);
         }

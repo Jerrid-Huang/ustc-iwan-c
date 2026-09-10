@@ -585,8 +585,9 @@ bool dns_try_handle_response(const uint8_t *pkt, size_t n)
     int qn;
     const uint8_t *udp, *dns;
 
-    if (n < 20 + 8 + 12 || pkt[9] != 17)
-        return false;
+    if (n < 20 + 8 + 12 || pkt[9] != 17 || (pkt[0] >> 4) != 4)
+        return false;   /* R23-f1 F2: only IPv4 inner frames are DNS-candidate;
+                         * a v6 frame must never be misparsed as v4 here */
     if (atomic_load_explicit(&g_dns_wait_n, memory_order_acquire) == 0)
         return false;   /* no pending tunnel-DNS query: skip lock + scan */
     ihl = (size_t)(pkt[0] & 0x0f) * 4;

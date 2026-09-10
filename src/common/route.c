@@ -239,10 +239,19 @@ int cidr_parse(const char *s, uint32_t *net, int *prefix)
     if (!s2ip4(ip, b))
         return -1;
     char *pend;
+    if (slash[1] < '0' || slash[1] > '9')
+        return -1;   /* strict: reject "/ 8" and "/+8" */
     long p = strtol(slash + 1, &pend, 10);
     if (pend == slash + 1 || *pend != '\0' || p < 0 || p > 32)
         return -1;
     *net = ip4_u32(b);
+    /* R23-F3 F2: a /0 that is not 0.0.0.0/0 is a typo, not a route — the
+     * canonicalization later turns ANY /0 into a default route on all
+     * three backends, so accepting "1.2.3.4/0" would silently replace the
+     * real default with one via the tunnel. Only the true 0.0.0.0/0 is
+     * legal. */
+    if (p == 0 && *net != 0)
+        return -1;
     *prefix = (int)p;
     return 0;
 }

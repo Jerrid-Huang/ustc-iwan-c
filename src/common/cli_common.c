@@ -123,7 +123,7 @@ void socks_cfg_from_auth(SocksConfig *cfg, const AuthResult *res,
     memcpy(cfg->xor_key, sk, sizeof cfg->xor_key);
     cfg->sid = res->sid;
     cfg->token = res->tok;
-    cfg->encryption = 1;
+    cfg->encryption = res->enc;   /* R23-F2: honor OPEN_ACK T_ENCRYPT */
     snprintf(cfg->dns, sizeof cfg->dns, "%s", res->dns);
 }
 

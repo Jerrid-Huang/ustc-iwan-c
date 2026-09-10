@@ -1552,7 +1552,19 @@ bool tun_prep_downlink(struct server_ctx *ctx, uint8_t *ip_pkt, size_t len,
                 return false;
         }
         /* session lookup: the client's ULA embeds its inner IPv4 in the
-         * low 32 bits (protocol.h), so the IPv4 session table applies */
+         * low 32 bits (protocol.h), so the IPv4 session table applies.
+         * R23-F1 (asymmetry with the uplink H1 full-16B ULA check): only a
+         * genuine fd00::/96 client ULA may select a session — an arbitrary
+         * v6 dest whose low 32 bits happen to match a client IP must never
+         * be routed to that session (gate gap). */
+        {
+            bool ula_prefix = d6[0] == IWAN_IP6_ULA_BYTE0;
+            for (int k = 1; k < 12; k++)
+                if (d6[k] != 0)
+                    ula_prefix = false;
+            if (!ula_prefix)
+                return false;
+        }
         pthread_rwlock_rdlock(&ctx->sess_lock);
         {
             struct server_session *s = find_session_by_ip_unlocked(ctx, d6 + 12);

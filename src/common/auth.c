@@ -75,6 +75,8 @@ struct ack_ctx {
     int         err;      /* 0 = none, 1 = AV wrong len, 2 = AV echo mismatch,
                             * 3 = short TLV */
     uint32_t    echo;
+    uint8_t     got;      /* R23-F1: bitmask of mandatory TLVs seen
+                            * (1=T_IP 2=T_GATEWAY 4=T_DNS 8=T_MTU) */
 };
 
 static bool ack_tlv(uint8_t typ, const uint8_t *val, uint8_t vlen, void *ud)
@@ -89,6 +91,7 @@ static bool ack_tlv(uint8_t typ, const uint8_t *val, uint8_t vlen, void *ud)
             return false;
         }
         ip_to_string(val, r->tun);
+        c->got |= 1u;
         break;
     case T_GATEWAY:
         if (vlen < 4) {
@@ -96,6 +99,7 @@ static bool ack_tlv(uint8_t typ, const uint8_t *val, uint8_t vlen, void *ud)
             return false;
         }
         ip_to_string(val, r->gw);
+        c->got |= 2u;
         break;
     case T_DNS:
         if (vlen < 4) {
@@ -103,6 +107,7 @@ static bool ack_tlv(uint8_t typ, const uint8_t *val, uint8_t vlen, void *ud)
             return false;
         }
         ip_to_string(val, r->dns);
+        c->got |= 4u;
         break;
     case T_MTU:
         if (vlen < 2) {
@@ -116,6 +121,16 @@ static bool ack_tlv(uint8_t typ, const uint8_t *val, uint8_t vlen, void *ud)
             r->mtu = m < IWAN_MTU_MIN ? IWAN_MTU_MIN
                                       : (m > IWAN_MTU_MAX ? IWAN_MTU_MAX : m);
         }
+        c->got |= 8u;
+        break;
+    case T_ENCRYPT:
+        /* R23-F2: honor the server's negotiated data-plane encryption flag;
+         * absent means 1 (the reference server always sends it) */
+        if (vlen < 1) {
+            c->err = 3;
+            return false;
+        }
+        r->enc = val[0] ? 1 : 0;
         break;
     case T_AUTH_VERIFY:
         if (vlen != 4) {
@@ -232,6 +247,7 @@ static bool parse_ack(const uint8_t *buf, size_t len, uint32_t expect_nonce,
     memset(r->gw, 0, sizeof r->gw);
     memset(r->dns, 0, sizeof r->dns);
     r->mtu = IWAN_DEFAULT_MTU;
+    r->enc = 1;   /* default when the ACK omits T_ENCRYPT (R23-F2) */
 
     memset(&ctx, 0, sizeof ctx);
     ctx.r = r;
@@ -239,6 +255,13 @@ static bool parse_ack(const uint8_t *buf, size_t len, uint32_t expect_nonce,
     if (parse_tlvs(buf + IWAN_CTRL_LEN, len - IWAN_CTRL_LEN, ack_tlv,
                    &ctx) != 0) {
         set_err(errmsg, errmsg_sz, "malformed TLVs");
+        return false;
+    }
+    /* R23-F1: the reference server always sends these four; accepting a
+     * bare/partial ACK as success would let a forged (header-sig-only)
+     * frame report a bogus "auth OK" with no tun/gw/dns/mtu at all. */
+    if ((ctx.got & 0x0F) != 0x0F) {
+        set_err(errmsg, errmsg_sz, "ACK missing mandatory TLVs");
         return false;
     }
     /* T_AUTH_VERIFY is optional on the wire: the reference server's

@@ -565,11 +565,15 @@ static int vpn_handle_data(SocksConfig *cfg, uint8_t *b, size_t n,
     if (plen < 20 || plen > (size_t)cfg->mtu)
         return 0;
     if ((b[8] >> 4) == 6) {
-        /* inner IPv6 (SOCKS targets over IPv6): structural check only —
-         * spoof protection is the server's job (its H1 gate binds the
-         * source to the session's derived ULA) */
-        uint8_t s6[16], d6[16];
+        /* inner IPv6 (SOCKS targets over IPv6): R23-F1 — mirror the v4
+         * M5 ingress filter: the downlink must be addressed to THIS
+         * session's derived ULA and never claim it as source (defense in
+         * depth on top of the server's H1 gate). */
+        uint8_t s6[16], d6[16], want6[16];
         if (plen < 40 || ip6_pkt_ok(b + 8, plen, s6, d6) != 0)
+            return 0;
+        ip6_derive_ula(cfg->inner_ip, want6);
+        if (memcmp(d6, want6, 16) != 0 || memcmp(s6, want6, 16) == 0)
             return 0;
     } else if (ipv4_pkt_ok(b + 8, plen, &saddr, &daddr) != 0) {
         return 0;

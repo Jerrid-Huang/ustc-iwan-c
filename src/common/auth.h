@@ -12,6 +12,7 @@ typedef struct {
     char     gw[16];
     char     dns[16];
     uint16_t mtu;
+    uint8_t  enc;   /* data-plane encryption flag from OPEN_ACK T_ENCRYPT (R23-F2) */
 } AuthResult;
 
 /* build OPEN packet (appends to out). Returns 0 on success, -1 when the

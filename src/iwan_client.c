@@ -824,7 +824,7 @@ static int cmd_proxy(int argc, char **argv, int start)
         slist_init(&routes6);
         collect_routes6(&routes6, &o.proxy_cidr6);
         rc = run_pump(tun_fd, o.tun, sockfd, sk, res.sid, res.tok,
-                      1, o.server, &routes, &routes6,
+                      res.enc, o.server, &routes, &routes6,
                       res.tun, res.mtu);
         slist_free(&routes6);
         wipe(sk, sizeof sk);

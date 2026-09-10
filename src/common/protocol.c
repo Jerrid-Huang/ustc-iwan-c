@@ -91,6 +91,12 @@ bool s2ip4(const char *s, uint8_t out[4])
     for (int i = 0; i < 4; i++) {
         if (*s < '0' || *s > '9')
             return false;
+        /* R23-F3 F1: reject leading-zero octets ("010", "00") — Linux
+         * ip/ifconfig read them as OCTAL (8) while we'd parse decimal (10),
+         * so the same config would configure the tunnel differently per
+         * backend. "0" alone is fine. */
+        if (*s == '0' && s[1] >= '0' && s[1] <= '9')
+            return false;
         char *end;
         long v = strtol(s, &end, 10);
         if (end == s || v < 0 || v > 255)
