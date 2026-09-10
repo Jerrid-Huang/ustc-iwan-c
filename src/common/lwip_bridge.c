@@ -279,13 +279,19 @@ static int bridge_output_parse(Netstack *ns, const struct pbuf *p,
     size_t ihl, thlen, tot;
 
     *has_payload = 0;
-    if (pbuf_copy_partial(p, h, sizeof h, 0) != sizeof h)
-        return -1;
+    /* R21 (C2): we only need the IP+TCP header bytes, not all 80 — a sub-80B
+     * DATA frame (e.g. 20B IP + 20B TCP + 20B payload) was previously
+     * unparseable and got misclassified as CTL, bypassing the per-conn
+     * fair-share cap. Copy up to 80 and verify against what each family
+     * actually needs. */
+    size_t got = pbuf_copy_partial(p, h, sizeof h, 0);
+    if (got < 20)
+        return -1;   /* not even an IPv4 header */
 
     if ((h[0] >> 4) == 6) {
         /* IPv6: fixed 40-byte header, next header must be TCP (we never
-         * generate extension headers) */
-        if (h[6] != 6)
+         * generate extension headers); need 40 hdr + 20 TCP to read ports */
+        if (got < 60 || h[6] != 6)
             return -1;
         tot = ((size_t)h[4] << 8) | h[5];   /* payload length */
         t = h + 40;
@@ -297,8 +303,10 @@ static int bridge_output_parse(Netstack *ns, const struct pbuf *p,
         dport = (uint16_t)((t[2] << 8) | t[3]);
     } else {
         ihl = (size_t)(h[0] & 0x0f) * 4;
-        if (ihl < 20 || ihl > sizeof h - 20)
+        if (ihl < 20 || ihl > 60)
             return -1;
+        if (got < ihl + 20)
+            return -1;   /* not enough for a full TCP header (ports/thlen) */
         t = h + ihl;
         thlen = (size_t)(t[12] >> 4) * 4;
         if (thlen < 20 || ihl + thlen > sizeof h)

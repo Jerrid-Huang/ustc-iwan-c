@@ -2073,7 +2073,16 @@ void service_local_outputs(void) {
                                     .iov_len = want };
                 ssize_t n = port_writev(f->fd, &io, 1);
                 if (n > 0) {
-                    if ((size_t)n == want) {
+                    /* R21 (F1-A): "full drain" must compare against the
+                     * ACTUAL buffered length, not the capped `want`: when
+                     * rxq.len > LOCAL_WRITE_LIMIT (in-flight overrun past a
+                     * full TCP window), n == want only means the cap was
+                     * written — buf_clear here would silently drop the
+                     * unsent tail while conn_reconcile_rxq tcp_recved()s
+                     * those bytes upstream (permanent stream corruption).
+                     * The ==len case is the common lossless path and still
+                     * takes the O(1) reset. */
+                    if ((size_t)n == c->rxq.len) {
                         /* full drain (the common case): the payload is
                          * already on the local socket, so reset the
                          * buffer without the O(n) memmove — with a
