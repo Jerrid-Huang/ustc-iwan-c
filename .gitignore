@@ -34,3 +34,4 @@ __pycache__/
 bench-multi.out
 build-dbg/
 build-tsan/
+build-wstrict/
