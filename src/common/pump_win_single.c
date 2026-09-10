@@ -101,6 +101,7 @@ void pump_win_single_pkt(void *ud, uint8_t *pkt, size_t len, bool last)
             continue;
         }
         err_printf("[TUN->UDP] send: %s\n", strerror(errno));
+        ctx->session_lost = true;
         g_stop = 1;
         break;
     }

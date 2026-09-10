@@ -544,7 +544,10 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
      * the new size automatically. */
     uint8_t b[2048];
     size_t n = first_n;
-    pp_target t;
+    /* t is zero-initialized: pp_socks_request returns 0 with rep=1 and
+     * skips writing *t when VER!=5, so the debug log below must not
+     * read uninitialized af/port. */
+    pp_target t = {0};
     uint8_t method = 0, cmd = 0, rep = 0;
 
     if (n == 0)

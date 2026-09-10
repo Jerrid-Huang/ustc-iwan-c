@@ -295,6 +295,7 @@ static int send_batch(pump_ctx_t *ctx, struct mmsghdr *msgs, unsigned n)
             continue;
         }
         err_printf("[TUN->UDP] sendmmsg: %s\n", strerror(errno));
+        ctx->session_lost = true;
         g_stop = 1;
         return TX_FATAL;
     }

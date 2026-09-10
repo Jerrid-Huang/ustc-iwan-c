@@ -637,7 +637,7 @@ struct tun_pool {
     tun_pkt_fn cb;
     void *ud;
     atomic_bool *abort;    /* shared process stop flag (util.h g_stop) */
-    tun_exit_fn exit_cb;
+    _Atomic tun_exit_fn exit_cb;
     volatile LONG stop;
     HANDLE thread;         /* reader thread; NULL after destroy */
 };
@@ -703,8 +703,10 @@ static unsigned __stdcall tun_reader_main(void *ud)
     }
     /* per-thread cleanup runs on this exiting reader thread, strictly
      * after the final flush callback (client pump frees its TLS batch) */
-    if (pool->exit_cb)
-        pool->exit_cb();
+    tun_exit_fn ec = atomic_load_explicit(&pool->exit_cb,
+                                          memory_order_acquire);
+    if (ec)
+        ec();
     return 0;
 }
 
@@ -728,7 +730,7 @@ struct tun_pool *tun_pool_create(const char *name, int fd0, int maxq,
     pool->cb = cb;
     pool->ud = ud;
     pool->abort = abort;
-    pool->exit_cb = NULL;
+    atomic_init(&pool->exit_cb, NULL);
     pool->stop = 0;
     pool->thread = (HANDLE)_beginthreadex(NULL, 0, tun_reader_main, pool, 0,
                                           &thrid);
@@ -767,7 +769,7 @@ void tun_pool_note_stall(struct tun_pool *pool)
 void tun_pool_set_exit_cb(struct tun_pool *pool, tun_exit_fn cb)
 {
     if (pool)
-        pool->exit_cb = cb;
+        atomic_store_explicit(&pool->exit_cb, cb, memory_order_release);
 }
 
 void tun_pool_tick(struct tun_pool *pool)

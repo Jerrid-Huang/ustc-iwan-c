@@ -389,7 +389,7 @@ struct tun_pool {
     tun_pkt_fn cb;
     void *ud;
     atomic_bool *abort;
-    tun_exit_fn exit_cb;   /* per-reader-thread cleanup, may be NULL */
+    _Atomic tun_exit_fn exit_cb;   /* per-reader-thread cleanup, may be NULL */
     atomic_int nq;         /* live queue count; read by uplink writers
                             * (server recv threads), written by the
                             * pool owner (tun_pool_tick) */
@@ -491,8 +491,10 @@ static void *tun_reader_main(void *ud)
     /* per-thread cleanup runs on this exiting reader thread, strictly
      * after the final flush callback, so a batch-oriented callback can
      * still use its TLS buffer until here (client pump frees its batch) */
-    if (pool->exit_cb)
-        pool->exit_cb();
+    tun_exit_fn ec = atomic_load_explicit(&pool->exit_cb,
+                                          memory_order_acquire);
+    if (ec)
+        ec();
     return NULL;
 }
 
@@ -576,7 +578,7 @@ struct tun_pool *tun_pool_create_pre(const char *name, int fd0, int maxq,
     pool->cb = cb;
     pool->ud = ud;
     pool->abort = abort;
-    pool->exit_cb = NULL;
+    atomic_init(&pool->exit_cb, NULL);
     pool->maxq = maxq > TUN_POOL_MAX ? TUN_POOL_MAX : (maxq < 1 ? 1 : maxq);
     snprintf(pool->tunname, sizeof pool->tunname, "%s", name);
     q = &pool->qs[0];
@@ -671,7 +673,7 @@ void tun_pool_note_stall(struct tun_pool *pool)
 void tun_pool_set_exit_cb(struct tun_pool *pool, tun_exit_fn cb)
 {
     if (pool)
-        pool->exit_cb = cb;
+        atomic_store_explicit(&pool->exit_cb, cb, memory_order_release);
 }
 
 void tun_pool_destroy(struct tun_pool *pool)

@@ -1251,7 +1251,8 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
         break;
 
     case PT_PING_REQ:
-    case PT_ECHO_REQ:
+    case PT_ECHO_REQ: {
+        int valid = 0; /* ECHO_RES only for a verified (found+tok) session */
         if (!verify_sig(raw, len))
             return;
         /* Common path (same peer, valid token) takes only the read
@@ -1260,14 +1261,20 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
          * A peer change (rebind) upgrades to the write lock — gated on
          * the source's token-mismatch history (F4) so a guessed token
          * cannot claim the session from an address that has been
-         * spraying. The PING_RSP / ECHO_RES reply is still sent
-         * regardless: it is a liveness oracle by design and must not
-         * become a token oracle. */
+         * spraying. R34-1: ECHO_RES is only a per-session keepalive
+         * acknowledgement — it must not be a liveness oracle, so it is
+         * sent only when the session was found AND its token matched
+         * (the same condition that refreshed last_active above). PING_RSP
+         * stays unconditional: `iwan ping` is an unauthenticated server
+         * reachability probe with the fixed wildcard IWAN_PING_SID /
+         * IWAN_PING_TOK and is never read by the tunnel's stale-session
+         * watchdog. */
         pthread_rwlock_rdlock(&ctx->sess_lock);
         s = find_session_unlocked(ctx, sid);
         if (s && CRYPTO_memcmp(&s->token, &tok, sizeof tok) == 0) {
             if (memcmp(&s->peer, peer, sizeof *peer) == 0) {
                 atomic_store(&s->last_active_ms, now_ms()); /* keepalive */
+                valid = 1;
                 pthread_rwlock_unlock(&ctx->sess_lock);
             } else {
                 pthread_rwlock_unlock(&ctx->sess_lock);
@@ -1277,12 +1284,17 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                     rate_token_zero(peer, now)) {
                     s->peer = *peer;
                     atomic_store(&s->last_active_ms, now_ms());
+                    valid = 1;
                 }
                 pthread_rwlock_unlock(&ctx->sess_lock);
             }
         } else {
             pthread_rwlock_unlock(&ctx->sess_lock);
         }
+        if (typ == PT_ECHO_REQ && !valid)
+            break; /* unknown session / bad token: silent drop, like the
+                    * PT_DATA path — the client's watchdog then concludes
+                    * the tunnel is dead and reconnects */
         buf_init(&b);
         if (typ == PT_PING_REQ)
             ctrl_hdr(&b, PT_PING_RSP, 0, IWAN_PING_SID, IWAN_PING_TOK);
@@ -1291,6 +1303,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
         udp_send(sockfd, peer, b.data, b.len);
         buf_free(&b);
         break;
+    }
 
     default:
         break; /* drop silently */
