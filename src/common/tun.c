@@ -379,7 +379,8 @@ struct tun_queue {
     struct tun_pool *pool;
     int fd;
     pthread_t th;
-    volatile int stop;
+    _Atomic int stop;   /* R30-f2E: atomic so the reader thread and uplink
+                          * writers never race the pool owner's del/destroy */
     atomic_uint_fast64_t waits; /* poll timeouts in current window */
 };
 
@@ -410,7 +411,8 @@ static void *tun_reader_main(void *ud)
     static _Thread_local uint8_t buf[65536];
 
     t_reader_qid = (int)(q - pool->qs);
-    while (!q->stop && (pool->abort == NULL || !*pool->abort)) {
+    while (!atomic_load_explicit(&q->stop, memory_order_acquire) &&
+       (pool->abort == NULL || !*pool->abort)) {
         int pr = poll(&pfd, 1, TUN_POLL_MS);
         if (pr < 0 && errno != EINTR)
             break;
@@ -511,7 +513,7 @@ static int tun_pool_add_fd(struct tun_pool *pool, int fd)
         struct tun_queue *q = &pool->qs[nq];
         q->pool = pool;
         q->fd = fd;
-        q->stop = 0;
+        atomic_store_explicit(&q->stop, 0, memory_order_relaxed);
         atomic_store(&q->waits, 0);
         if (pthread_create(&q->th, NULL, tun_reader_main, q) != 0)
             return -1;
@@ -552,7 +554,8 @@ static void tun_pool_del(struct tun_pool *pool)
     if (atomic_load(&pool->nq) <= 1)
         return;
     i = atomic_load(&pool->nq) - 1;
-    pool->qs[i].stop = 1;
+    atomic_store_explicit(&pool->qs[i].stop, 1,
+                          memory_order_relaxed);
     atomic_store(&pool->nq, i);
     pthread_join(pool->qs[i].th, NULL);
     tun_detach(pool->qs[i].fd);
@@ -639,10 +642,21 @@ int tun_pool_queues(const struct tun_pool *pool)
  * closing). -1 when the pool is empty. */
 int tun_pool_write_fd(const struct tun_pool *pool, unsigned tid)
 {
-    int nq = atomic_load(&pool->nq);
-    if (nq <= 0)
-        return -1;
-    return pool->qs[tid % (unsigned)nq].fd;
+    /* R30-f2E: tun_pool_del marks the last queue stop==1 BEFORE publishing
+     * the smaller nq and closing it — retrying with the fresh nq closes the
+     * classic "loaded old nq then used the just-removed fd" TOCTOU window.
+     * (The stop flag is atomic; a reader that raced a del can still get an
+     * EBADF in the tiny gap before close, which the caller treats as a
+     * transient drop — this removes the deterministic reuse-of-removed-fd.) */
+    for (int attempt = 0; attempt < 2; attempt++) {
+        int nq = atomic_load(&pool->nq);
+        if (nq <= 0)
+            return -1;
+        const struct tun_queue *q = &pool->qs[tid % (unsigned)nq];
+        if (!atomic_load_explicit(&q->stop, memory_order_acquire))
+            return q->fd;
+    }
+    return -1;   /* still pointing at a queue being removed: caller drops */
 }
 
 /* An uplink writer hit the device queue (EAGAIN / write-budget expiry):
@@ -667,7 +681,8 @@ void tun_pool_destroy(struct tun_pool *pool)
         return;   /* must precede any deref: no-tun servers pass NULL */
     int nq = atomic_load(&pool->nq);
     for (i = 0; i < nq; i++)
-        pool->qs[i].stop = 1;
+        atomic_store_explicit(&pool->qs[i].stop, 1,
+                          memory_order_relaxed);
     for (i = 0; i < nq; i++)
         pthread_join(pool->qs[i].th, NULL);
     for (i = 1; i < nq; i++) {
