@@ -924,7 +924,11 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
         ipu = probe;
         ctx->next_ip = (ipu == ctx->ip_end) ? ctx->ip_base : ipu + 1;
     }
-    tok = rand_u32();
+    /* never mint a zero token: auth.c's parse_ack rejects tok==0 ACKs, so
+     * the user could never connect on that OPEN */
+    do {
+        tok = rand_u32();
+    } while (tok == 0);
 
     /* replace any existing session with the same sid */
     for (i = 0; i < SERVER_MAX_SESSIONS; i++)

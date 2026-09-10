@@ -1,3 +1,4 @@
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -19,6 +20,12 @@ bool gcm_decrypt(const uint8_t key[32], const uint8_t nonce[GCM_NONCE_LEN],
     if (ct_tag_len < GCM_TAG_LEN)
         return false;
     ct_len = ct_tag_len - GCM_TAG_LEN;
+
+    /* EVP_DecryptUpdate takes int lengths: reject anything that would
+     * truncate in the (int) casts below (no ctx allocated yet, so a bare
+     * early return leaks nothing) */
+    if (aad_len > INT_MAX || ct_len > INT_MAX)
+        return false;
 
     ctx = EVP_CIPHER_CTX_new();
     if (!ctx)

@@ -33,6 +33,12 @@
 
 Netstack g_ns;
 
+/* FIND-R2-5: bridge extension defined in lwip_bridge.c but not declared
+ * in lwip_bridge.h (that header stays minimal; socks_flow.c forward-
+ * declares it the same way). Bounds-checked, idempotent: safe to call on
+ * any f->ns_idx value before detaching a flow from the rebuilt stack. */
+void ns_flow_unref(int idx);
+
 /* shared stop flag (util.h): written from the signal handler with a
  * relaxed atomic store (lock-free on every supported target) */
 void on_sig(int sig) {
@@ -817,6 +823,7 @@ static void socks_reauth_flows(void)
         if (!f->active)
             continue;
         if (f->state == ST_RESOLVING) {
+            ns_flow_unref(f->ns_idx);   /* FIND-R19-F5: detach pairs with ref */
             f->ns_idx = -1;
             queue_socks_error(f, 4);
             set_flow_state(f, ST_CLOSING);
@@ -825,11 +832,13 @@ static void socks_reauth_flows(void)
         if (f->ns_idx < 0)
             continue;   /* handshake states: nothing to re-establish */
         if (f->state != ST_CONNECTING && f->state != ST_ESTABLISHED) {
+            ns_flow_unref(f->ns_idx);   /* FIND-R19-F5: detach pairs with ref */
             f->ns_idx = -1;   /* stale index into the rebuilt stack */
             continue;
         }
         uint16_t port = f->tgt_port;
         uint8_t af = f->tgt_af;
+        ns_flow_unref(f->ns_idx);   /* FIND-R19-F5: detach pairs with ref */
         f->ns_idx = -1;
         f->rx_paused = false;
         if (af == 6)
@@ -898,7 +907,13 @@ static int socks_reauth_tunnel(SocksConfig *cfg)
     } else {
         /* the server re-assigned our inner IP: rebuild the stack and
          * re-establish every active flow on the new tunnel */
-        ns_init(&g_ns, cfg->inner_ip, cfg->gateway, (uint16_t)cfg->mtu);
+        /* FIND-R19-F5: netif_add failure must not be swallowed — return -1
+         * so the caller re-auth retry schedule (reauth_at backoff) fixes
+         * the stack instead of running receive_vpn against a dead netif. */
+        if (!ns_init(&g_ns, cfg->inner_ip, cfg->gateway, (uint16_t)cfg->mtu)) {
+            log_err("SOCKS: stack rebuild failed");
+            return -1;
+        }
         ns_set_outer(&g_ns, oh, cfg->xor_key);
         socks_reauth_flows();
         log_info("SOCKS: inner IP changed; flows re-established");
@@ -1064,7 +1079,15 @@ int run_socks(int sockfd, SocksConfig *cfg) {
     /* Rust prints the configured address (config.listen), not the bound one */
     const char *listen_s = cfg->listen_str ? cfg->listen_str : "?";
 
-    ns_init(&g_ns, cfg->inner_ip, cfg->gateway, (uint16_t)cfg->mtu);
+    /* FIND-R19-F5: netif_add failure is a real startup failure — close the
+     * listener + session socket (A-1) and return the R13 three-state -1
+     * instead of running receive_vpn against a half-built stack. */
+    if (!ns_init(&g_ns, cfg->inner_ip, cfg->gateway, (uint16_t)cfg->mtu)) {
+        log_err("SOCKS: ns_init failed at startup");
+        port_close(listener);
+        port_close(sockfd);   /* A-1: own + close sockfd on every return */
+        return -1;   /* R13-M-1: startup failure, NOT a clean user stop */
+    }
     {
         uint8_t oh[8];
         pkt_hdr(cfg->encryption ? PT_DATA_ENC : PT_DATA, cfg->encryption,

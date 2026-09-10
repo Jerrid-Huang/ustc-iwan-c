@@ -504,7 +504,7 @@ static void ns_teardown_pcbs(void)
     }
 }
 
-void ns_init(Netstack *ns, uint32_t inner_ip, uint32_t gw, uint16_t mtu)
+bool ns_init(Netstack *ns, uint32_t inner_ip, uint32_t gw, uint16_t mtu)
 {
     struct netif *old_netif = ns->netif;   /* save before the memset */
 
@@ -571,8 +571,16 @@ void ns_init(Netstack *ns, uint32_t inner_ip, uint32_t gw, uint16_t mtu)
     if (n == NULL)
         oom_abort();
     ns->netif = n;
-    if (netif_add(n, &ip, &mask, &g, ns, bridge_netif_init, ip4_input) == NULL)
-        return;
+    if (netif_add(n, &ip, &mask, &g, ns, bridge_netif_init, ip4_input) == NULL) {
+        /* FIND-R19-F5: netif_add failure is NOT fatal-silent — free the
+         * half-configured netif, clear ns->netif and report so the caller
+         * can fail startup / schedule a re-auth retry instead of leaving a
+         * broken stack (receive_vpn would feed a dead netif to ip4_input). */
+        free(n);
+        ns->netif = NULL;
+        log_err("ns_init: netif_add failed");
+        return false;
+    }
     n->mtu = (mtu > 1500) ? 1500 : mtu;
     n->state = ns;
     /* no link layer on a point-to-point tunnel: hwaddr_len stays 0 so
@@ -600,6 +608,7 @@ void ns_init(Netstack *ns, uint32_t inner_ip, uint32_t gw, uint16_t mtu)
     netif_set_link_up(n);
     netif_set_up(n);
     netif_set_default(n);
+    return true;
 }
 
 void ns_set_outer(Netstack *ns, const uint8_t hdr[8], const uint8_t key[8])

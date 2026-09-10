@@ -200,6 +200,13 @@ static Json *parse_string(struct P *p)
                     free(b.d);
                     return NULL;
                 }
+                if (cp == 0) {
+                    /* U+0000 would embed a NUL in the C string and silently
+                     * truncate keys/values in later strcmp lookups */
+                    p_fail(p, 5, 0, "NUL escape (\\u0000) is not allowed");
+                    free(b.d);
+                    return NULL;
+                }
                 /* a high surrogate (U+D800-U+DBFF) must be immediately
                  * followed by a \uXXXX low surrogate (U+DC00-U+DFFF) to
                  * spell one supplementary code point; merge the pair into
@@ -563,6 +570,11 @@ Json *json_parse_ex(const char *text, char *err, size_t errsz)
     struct P p;
     Json *v;
 
+    if (!text) {
+        if (err && errsz)
+            snprintf(err, errsz, "%s", "json_parse_ex: NULL input");
+        return NULL;
+    }
     p.start = text;
     p.s = text;
     p.end = text + strlen(text);
@@ -738,6 +750,8 @@ char *json_escape(const char *s)
             n += 1;
     }
     out = malloc(n + 1);
+    if (!out)
+        oom_abort();   /* never NULL-halts on OOM (json.c convention) */
     o = out;
     for (const char *p = s; *p; p++) {
         unsigned char c = (unsigned char)*p;

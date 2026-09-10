@@ -99,6 +99,8 @@ void oidc_urlenc(const char *s, buf_t *out)
 static char *oidc_urldec(const char *s, size_t n)
 {
     char *out = malloc(n + 1);
+    if (!out)
+        oom_abort();   /* OOM: never NULL-deref when writing through out */
     size_t o = 0;
     for (size_t i = 0; i < n; i++) {
         if (s[i] == '%' && i + 2 < n) {
@@ -141,6 +143,8 @@ void oidc_esc_put(buf_t *b, const char *s)
  * newly allocated URL-decoded value (caller frees) or NULL when absent */
 char *oidc_url_param(const char *s, const char *name)
 {
+    if (!s)
+        return NULL;   /* defensive: all in-tree callers pass non-NULL */
     const char *q = strchr(s, '?');
     if (!q)
         return NULL;

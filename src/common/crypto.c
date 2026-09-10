@@ -306,8 +306,14 @@ uint8_t *b64url_decode(const char *s, size_t *out_len)
 
 char *b64url_no_pad(const uint8_t *data, size_t len)
 {
+    /* cap = ((len+2)/3)*4+1 overflows when len > ((SIZE_MAX-1)/4)*3 - 2;
+     * fail like every other OOM path here rather than wrap to a tiny cap */
+    if (len > ((SIZE_MAX - 1) / 4) * 3 - 2)
+        oom_abort();
     size_t cap = ((len + 2) / 3) * 4 + 1;
     char *out = malloc(cap);
+    if (!out)
+        oom_abort();   /* matches the "never NULL-halts on OOM" contract */
     int n = EVP_EncodeBlock((unsigned char *)out, data, (int)len);
     if (n < 0) {
         free(out);

@@ -159,6 +159,24 @@ bool ip_run_quiet(char *const args[])
  * captured-so-far output is returned (partial output beats an indefinite
  * wedge, exactly like the Windows branch, which delegates to
  * port_cmd_capture's own 60s+SIGKILL below). */
+#ifndef _WIN32
+/* R19: bounded reap for the OOM read-abort paths — mirror the normal
+ * path's 60s + SIGKILL policy so a wedged child cannot hang the
+ * daemon even when we are abandoning the capture. */
+static void cmd_capture_reap_bounded(pid_t pid, int *st, uint64_t deadline)
+{
+    for (;;) {
+        if (waitpid(pid, st, WNOHANG) == pid)
+            return;
+        if (now_ms() >= deadline) {
+            kill(pid, SIGKILL);
+            continue;
+        }
+        port_sleep_ms(10);
+    }
+}
+#endif
+
 char *cmd_capture(char *const args[])
 {
 #ifndef _WIN32
@@ -201,7 +219,7 @@ char *cmd_capture(char *const args[])
     char *out = malloc(cap);
     if (!out) {
         close(fds[0]);
-        waitpid(pid, &st, 0);
+        cmd_capture_reap_bounded(pid, &st, deadline);
         return NULL;
     }
     for (;;) {
@@ -212,7 +230,7 @@ char *cmd_capture(char *const args[])
             if (!nr) {
                 free(out);
                 close(fds[0]);
-                waitpid(pid, &st, 0);
+                cmd_capture_reap_bounded(pid, &st, deadline);
                 return NULL;
             }
             out = nr;
@@ -466,6 +484,8 @@ void slist_push_csv(slist_t *s, const char *csv)
         if (start < end) {
             size_t n = (size_t)(end - start);
             char *piece = malloc(n + 1);
+            if (!piece)
+                oom_abort();   /* never NULL-halts on OOM (matches xstrdup) */
             memcpy(piece, start, n);
             piece[n] = '\0';
             slist_push(s, piece);

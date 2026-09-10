@@ -610,7 +610,8 @@ static int cmd_auth(int argc, char **argv, int start)
 
     AuthResult res;
     int fd = authenticate(&o, DO_AUTH_AUTH, &res);
-    cleanse_str(o.pass);   /* last use of the pass */
+    cleanse_str(o.pass);     /* last use of the pass */
+    cleanse_str(o.ct_pass);  /* last use of the client-token pass */
     if (fd < 0) {
         log_err("Error: auth failed");
         return 1;
@@ -690,10 +691,14 @@ static int cmd_proxy(int argc, char **argv, int start)
     if (!port_is_admin()) {
         if (port_elevate_self(argc, argv) == 0) {
             log_info("TUN mode needs administrator; relaunching elevated...");
+            cleanse_str(o.pass);
+            cleanse_str(o.ct_pass);
             return 0;
         }
         log_err("Error: TUN mode requires administrator privileges "
                 "(elevation declined)");
+        cleanse_str(o.pass);
+        cleanse_str(o.ct_pass);
         return 1;
     }
 #endif
@@ -707,6 +712,8 @@ static int cmd_proxy(int argc, char **argv, int start)
         log_err("Error: invalid TUN device name '%s'", o.tun);
         slist_free(&routes);
         free_route_opts(&o);
+        cleanse_str(o.pass);
+        cleanse_str(o.ct_pass);
         return 1;
     }
 
@@ -723,6 +730,8 @@ static int cmd_proxy(int argc, char **argv, int start)
     if (wintun_ensure() != 0) {
         slist_free(&routes);
         free_route_opts(&o);
+        cleanse_str(o.pass);
+        cleanse_str(o.ct_pass);
         return 1;
     }
 #endif
@@ -738,6 +747,8 @@ static int cmd_proxy(int argc, char **argv, int start)
 #endif
         slist_free(&routes);
         free_route_opts(&o);
+        cleanse_str(o.pass);
+        cleanse_str(o.ct_pass);
         return 1;
     }
     set_nonblock(tun_fd);
@@ -752,6 +763,8 @@ static int cmd_proxy(int argc, char **argv, int start)
         tun_close(tun_fd);
         slist_free(&routes);
         free_route_opts(&o);
+        cleanse_str(o.pass);
+        cleanse_str(o.ct_pass);
         return 1;
     }
 

@@ -154,15 +154,21 @@ static void track_flag(Cli *c, const cli_opt *o, const cli_ctl *ctl)
             }
             return;   /* CSV: repeated freely; usage renders the flag once */
         }
-    /* record the option for duplicate detection */
+    /* record the option for duplicate detection. OOM is fatal per the
+     * repo convention: silently skipping the enqueue would disable
+     * duplicate detection for the rest of the run. Overflow of
+     * ((size_t)c->nseen + 1) * sizeof *ns is impossible in practice:
+     * nseen is an int bounded by the number of distinct options on the
+     * command line (<= argc, far below INT_MAX), and even INT_MAX * 8
+     * bytes is nowhere near SIZE_MAX. */
     {
         char **ns = realloc(c->seen_names,
                             ((size_t)c->nseen + 1) * sizeof *ns);
-        if (ns) {
-            c->seen_names = ns;
-            c->seen_names[c->nseen] = (char *)o->name;
-            c->nseen++;
-        }
+        if (!ns)
+            oom_abort();
+        c->seen_names = ns;
+        c->seen_names[c->nseen] = (char *)o->name;
+        c->nseen++;
     }
     if (c->nusage < CLI_MAX_USAGE) {
         snprintf(c->usage_names[c->nusage],

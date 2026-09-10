@@ -303,6 +303,8 @@ void oidc_save_config(const char *path, const Config *cf)
     bool dir_created = false;
     if (slash && slash != path) {
         dir = malloc((size_t)(slash - path) + 1);
+        if (!dir)
+            oom_abort();
         memcpy(dir, path, (size_t)(slash - path));
         dir[slash - path] = '\0';
         dir_created = mkdir_p(dir);
@@ -333,6 +335,8 @@ void oidc_save_config(const char *path, const Config *cf)
      * not become an arbitrary-root-file truncate/overwrite primitive */
     size_t tlen = strlen(path) + sizeof ".tmp";
     char *tmp = malloc(tlen);
+    if (!tmp)
+        oom_abort();
     snprintf(tmp, tlen, "%s.tmp", path);
     /* unpredictable temp name + exclusive create on BOTH platforms:
      * O_NOFOLLOW alone cannot stop a pre-planted HARDLINK, and a fixed
@@ -373,12 +377,25 @@ void oidc_save_config(const char *path, const Config *cf)
 #else
     (void)fchmod(fileno(f), 0600);
 #endif
-    if (fputs(cf->pretty, f) == EOF || fflush(f) != 0 ||
+    /* run fclose even when an earlier write/fsync step failed (the old
+     * short-circuit && chain skipped it and leaked the fd until process
+     * exit); any error still fails the save and unlinks the temp file */
+    bool write_ok = true;
+    if (fputs(cf->pretty, f) == EOF || fflush(f) != 0)
+        write_ok = false;
 #ifdef _WIN32
-        _commit(fileno(f)) != 0 || fclose(f) != 0) {
+    if (_commit(fileno(f)) != 0)
+        write_ok = false;
+#else
+    if (fsync(fileno(f)) != 0)
+        write_ok = false;
+#endif
+    if (fclose(f) != 0)
+        write_ok = false;
+    if (!write_ok) {
+#ifdef _WIN32
         _unlink(tmp);
 #else
-        fsync(fileno(f)) != 0 || fclose(f) != 0) {
         unlink(tmp);
 #endif
         oidc_die("cannot write config to %s: %s", path, strerror(errno));

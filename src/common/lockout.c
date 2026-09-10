@@ -9,6 +9,8 @@ void lockout_note(lockout_rec *tbl, int n, const void *key, size_t klen,
                   bool success, unsigned max_fails, unsigned window_ms,
                   pthread_mutex_t *mu)
 {
+    if (n <= 0)
+        return;
     lockout_rec *e = NULL, *oldest = NULL, *earliest = &tbl[0];
     uint64_t now;
 

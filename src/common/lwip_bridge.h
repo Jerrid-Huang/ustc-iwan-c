@@ -123,7 +123,10 @@ typedef struct Netstack {
 } Netstack;
 
 /* ---------------- ns_* API (signatures match netstack.h) ---------------- */
-void ns_init(Netstack *ns, uint32_t inner_ip, uint32_t gw, uint16_t mtu);
+/* Returns true on success, false when netif_add fails (the half-configured
+ * netif is freed and ns->netif cleared, so callers must not use the stack
+ * until a retried init succeeds). */
+bool ns_init(Netstack *ns, uint32_t inner_ip, uint32_t gw, uint16_t mtu);
 void ns_set_outer(Netstack *ns, const uint8_t hdr[8], const uint8_t key[8]);
 int  ns_connect(Netstack *ns, uint16_t lport, uint32_t rip, uint16_t rport);
 /* IPv6 remote: rip6 is 16 raw bytes. Native (netstack.h) has no IPv6
