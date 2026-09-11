@@ -12,18 +12,31 @@
  * pass every gate but the two places that went through libc's fprintf
  * (that exact split is R3-H1: auth.c:416 broke the mingw build while
  * oidc_config.c's err_printf was silently unchecked).
- * MinGW targets msvcrt's printf, whose archetype rejects %zu even though
- * the header redirects the call to __mingw_* (see json.c:55): ms_printf
- * is the archetype that matches what the Windows build enforces, so a
- * %zu in a log call is caught at compile time instead of shipping.
- * NOTE: __MINGW_PRINTF_FORMAT cannot be used here — the MinGW headers
- * define it only after this point of the include graph (measured). */
-#if defined(__MINGW32__) && defined(__GNUC__)
-#  define IWAN_PRINTF_FMT ms_printf
-#elif defined(__GNUC__)
-#  define IWAN_PRINTF_FMT gnu_printf
-#endif
+ *
+ * The archetype is the plain `printf`, i.e. "whatever the target libc's
+ * printf is" — exactly the contract of these wrappers, which all forward
+ * `fmt` to vfprintf/vsnprintf. Measured on this tree:
+ *   - gcc/Linux and clang/Linux: %zu is valid (gnu semantics), other
+ *     mismatches are still rejected;
+ *   - MinGW gcc, under the win64 build flags: the same attribute yields
+ *     byte-identical diagnostics to a direct libc fprintf call — both
+ *     reject %zu with "unknown conversion type character 'z' in format"
+ *     — so a %zu in a log call is caught in win-cross exactly the way
+ *     R3-H1's auth.c:416 direct fprintf was, instead of shipping a
+ *     broken deliverable.
+ * The named archetypes are NOT portable, measured on this tree:
+ *   gnu_printf — clang: "'format' attribute argument not supported"
+ *                (with -Werror that breaks the CI clang leg);
+ *   ms_printf  — gcc/Linux: "unrecognized format function type", and
+ *                clang rejects it too;
+ *   gnu_printf — MinGW gcc accepts it but treats %zu as valid, which
+ *                would silently defeat the Windows check.
+ * NOTE: __MINGW_PRINTF_FORMAT cannot be used here either — it is not
+ * guaranteed to be defined at this point of the include graph (util.h
+ * pulls in no libc stdio header), and util.h is included very early
+ * everywhere. */
 #if defined(__GNUC__)
+#  define IWAN_PRINTF_FMT printf
 #  define IWAN_PRINTF_LIKE(a, b) __attribute__((format(IWAN_PRINTF_FMT, a, b)))
 #else
 #  define IWAN_PRINTF_LIKE(a, b)   /* non-GCC: no checking */
