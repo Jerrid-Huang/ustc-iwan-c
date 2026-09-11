@@ -13,7 +13,15 @@ bool gcm_decrypt(const uint8_t key[32], const uint8_t nonce[GCM_NONCE_LEN],
                  const uint8_t *aad, size_t aad_len,
                  uint8_t *plain_out, size_t *plain_len) {
     bool ok = false;
-    int outl = 0, outl2 = 0;
+    /* R37 (R1-C-1): the AAD-only EVP_DecryptUpdate() below gets its OWN
+     * output-length variable. OpenSSL still writes to *outl for that call
+     * (it reports the AAD length, seen as outl=17 "produced" bytes even
+     * though out == NULL). Sharing `outl` with the ciphertext call is
+     * harmless only while ct_len > 0, because that second call overwrites
+     * it; with an EMPTY ciphertext the call at line 42 is skipped by the
+     * `ct_len > 0` guard and *plain_len at the end would claim aad_len
+     * bytes of decrypted plaintext that were never produced. */
+    int outl = 0, outl2 = 0, aadl = 0;
     EVP_CIPHER_CTX *ctx = NULL;
     size_t ct_len;
 
@@ -37,7 +45,7 @@ bool gcm_decrypt(const uint8_t key[32], const uint8_t nonce[GCM_NONCE_LEN],
         goto done;
     if (EVP_DecryptInit_ex(ctx, NULL, NULL, key, nonce) != 1)
         goto done;
-    if (aad_len > 0 && EVP_DecryptUpdate(ctx, NULL, &outl, aad, (int)aad_len) != 1)
+    if (aad_len > 0 && EVP_DecryptUpdate(ctx, NULL, &aadl, aad, (int)aad_len) != 1)
         goto done;
     if (ct_len > 0 && EVP_DecryptUpdate(ctx, plain_out, &outl, ct_tag, (int)ct_len) != 1)
         goto done;
@@ -61,7 +69,7 @@ char *decrypt_password(const char *encrypted_b64, const char *app_secret,
     char *aad, *label;
     uint8_t key[32];
     uint8_t *data = NULL, *plain = NULL;
-    size_t data_len = 0, plain_len = 0;
+    size_t data_len = 0, plain_len = 0, ct_len = 0;
     char *result = NULL;
 
     aad = malloc(aad_len + 1);
@@ -87,7 +95,18 @@ char *decrypt_password(const char *encrypted_b64, const char *app_secret,
     if (!data || data_len < GCM_NONCE_LEN + GCM_TAG_LEN)
         goto out;
 
-    plain = malloc(data_len - GCM_NONCE_LEN - GCM_TAG_LEN);
+    ct_len = data_len - GCM_NONCE_LEN - GCM_TAG_LEN;
+    /* R37 (R1-C-1): ct_len == 0 is a LEGAL blob — nonce || <no ciphertext>
+     * || tag, where the tag authenticates an empty plaintext, i.e. the
+     * wire form of an empty password. malloc(0) may return NULL or a
+     * unique 1-byte region, and gcm_decrypt's contract promises room for
+     * ct_len bytes, so ask for at least one byte: the byte is scratch
+     * (plain_len still governs the copy below), and it keeps the plain
+     * pointer a real object even for the empty case. The empty result is
+     * returned as "" — the same value the aad_len == 0 empty-ct case has
+     * always produced, and the value oidc_config.c already treats as "no
+     * password". */
+    plain = malloc(ct_len ? ct_len : 1);
     if (!plain)
         goto out;
 
@@ -108,7 +127,7 @@ out:
      * cannot optimize away) */
     OPENSSL_cleanse(key, sizeof key);
     if (plain)
-        OPENSSL_cleanse(plain, data_len - GCM_NONCE_LEN - GCM_TAG_LEN);
+        OPENSSL_cleanse(plain, ct_len);
     free(plain);
     free(data);
     free(aad);

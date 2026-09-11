@@ -22,6 +22,15 @@ static void usage_error(const Cli *usage, const char *msg)
     exit(2);
 }
 
+/* R37-FIX-A2: the root-write guard implementation lives in oidc_config.c
+ * next to normalize_path(); this early gate and the oidc_save_config()
+ * backstop must share it. Declared locally because oidc.h was outside
+ * this fix's file scope. */
+bool oidc_config_dir_resolves_to_root(const char *dir);
+/* R37-FIX-A2b (R2-B2-1): same canonicalization the save backstop uses, so
+ * the path opened by --list/--connect is the one --fetch wrote. */
+char *oidc_config_canon_path(const char *path);
+
 int main(int argc, char **argv)
 {
 #ifdef _WIN32
@@ -89,7 +98,13 @@ int main(int argc, char **argv)
      * For non-rooted values, resolve_config_dir passes them through, so
      * checking the raw value covers both cases. Permissible absolute
      * paths like /home/user (a directory name follows the leading
-     * separators) are unaffected, and the "~/" expansion stays untouched. */
+     * separators) are unaffected, and the "~/" expansion stays untouched.
+     *   - R37-FIX-A2: "/..", "/foo/..", "/tmp/../..", "C:\" and friends
+     *     are not "all separators" but still RESOLVE to the root once ".."
+     *     is applied, so the old text check passed them straight to
+     *     oidc_save_config() (as root: /servers.json + chown of the
+     *     resolved dir). oidc_config_dir_resolves_to_root() is the same
+     *     normalization the save guard uses. */
     {
         const char *cd = o.config_dir;
         size_t i = 0;
@@ -101,7 +116,7 @@ int main(int argc, char **argv)
             only_slashes = (cd[j] == '/');
         if (cd[i] == '\0')
             usage_error(&usage, "config-dir must not be empty");
-        if (only_slashes)
+        if (only_slashes || oidc_config_dir_resolves_to_root(cd))
             usage_error(&usage,
                         "config-dir must name a directory, not the "
                         "filesystem root");
@@ -110,12 +125,34 @@ int main(int argc, char **argv)
     char *dir = resolve_config_dir(o.config_dir);
     if (!dir)
         oidc_die("cannot determine home directory; set HOME or run via sudo");
+    /* R37-FIX-A2: "~/" is expanded only here, so "~/../.." is invisible to
+     * the raw-value gate above; now that the value is absolute, re-run the
+     * very same guard before any path is joined, opened or saved */
+    if (oidc_config_dir_resolves_to_root(dir)) {
+        free(dir);
+        usage_error(&usage,
+                    "config-dir must name a directory, not the "
+                    "filesystem root");
+    }
     size_t plen = strlen(dir) + strlen("/servers.json") + 1;
     char *path = malloc(plen);
     if (!path)
         oom_abort();
     snprintf(path, plen, "%s/servers.json", dir);
     free(dir);
+    /* R37-FIX-A2b (R2-B2-1): canonicalize ONCE, here at the CLI boundary,
+     * so save / load / the proxy.conf sibling / every diagnostic all use
+     * the SAME string. oidc_save_config() normalizes internally too, but
+     * doing it only there left oidc_load_config() fopen()ing the raw
+     * spelling: with a ".." (or, before this revision, a '\') component
+     * the two resolved to different files, so --fetch wrote a config that
+     * --list/--connect could not read. The result is already normalized,
+     * so the save backstop is a no-op here. */
+    {
+        char *cpath = oidc_config_canon_path(path);
+        free(path);
+        path = cpath;
+    }
 
     Config cf;
     memset(&cf, 0, sizeof cf);

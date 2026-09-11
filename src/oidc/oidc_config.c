@@ -103,6 +103,246 @@ static bool mkdir_p(const char *path)
     return created;
 }
 
+static bool is_path_sep(char c)
+{
+    /* R37-FIX-A2b (R2-B2-2): '\' is a separator ONLY on Windows. The
+     * previous revision accepted it on POSIX as well, which turned the
+     * relative spelling "\etc" into the ABSOLUTE "/etc": the root guard
+     * saw a non-root path and let it through, while the kernel — for
+     * which '\' is an ordinary character — would have kept it in the cwd.
+     * As root (sudo re-exec) that wrote /etc/servers.json and chown()ed it
+     * to SUDO_UID; before that revision the same spelling died cleanly in
+     * the root guard. On POSIX only '/' starts or divides components.
+     * (mkdir_p() below still treats '\' as a separator on POSIX: that only
+     * ever creates an extra intermediate directory, it can never change
+     * which file open()/rename()/chown() act on — those hand the path to
+     * the kernel, which splits on '/' alone.) */
+#ifdef _WIN32
+    return c == '/' || c == '\\';
+#else
+    return c == '/';
+#endif
+}
+
+#ifdef _WIN32
+static bool is_ascii_alpha(char c)
+{
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+}
+#endif
+
+/* Prefix a relative path with the current directory. Returns NULL when
+ * getcwd() is unavailable (deleted cwd); the caller then keeps the
+ * relative spelling rather than guessing. */
+static char *join_cwd(const char *path)
+{
+    char cwd[4096];
+#ifdef _WIN32
+    if (!_getcwd(cwd, (int)sizeof cwd))
+#else
+    if (!getcwd(cwd, sizeof cwd))
+#endif
+        return NULL;
+    size_t cl = strlen(cwd);
+    size_t pl = strlen(path);
+    char *out = malloc(cl + 1 + pl + 1);
+    if (!out)
+        oom_abort();
+    memcpy(out, cwd, cl);
+    out[cl] = '/';
+    memcpy(out + cl + 1, path, pl + 1);
+    return out;
+}
+
+/* R37-FIX-A2 (HIGH, R1-D-a-1 / R1-D-3): component-wise canonicalization of
+ * a config path. The guard that refuses to write into the filesystem root
+ * used to look at the RAW spelling, so `--config-dir /foo/..` (and "/..",
+ * "/tmp/../..", "~/../..") passed it, joined into "/foo/../servers.json",
+ * and as root (sudo re-exec) wrote /servers.json and — via mkdir_p +
+ * restore_owner — chown()ed "/" to the invoking user.
+ *
+ * Canonicalization is textual on purpose: realpath() resolves symlinks, and
+ * this result decides "is the target the root?" and is handed to chown();
+ * following a symlink there is exactly what must NOT happen.
+ *   - a RELATIVE spelling is first joined with the cwd (see join_cwd), so
+ *     ".." is resolved against the real root and the result denotes the
+ *     same object the kernel resolves the raw spelling to;
+ *   - both '/' and '\' are separators (see is_path_sep);
+ *   - "." and empty components (repeated/trailing separators) vanish;
+ *   - ".." pops the previous real component; at/above a root marker it is
+ *     a no-op ("/.." == "/", "C:\.." == "C:\", UNC share root stays);
+ *   - Windows drive ("C:", "C:/", "C:\") and UNC ("\\server\share")
+ *     prefixes are the root marker and are never popped, so every
+ *     spelling of a drive/share root normalizes to the marker itself.
+ * A legitimate absolute path ("/etc/iwan", "/home/u/.config/iwan") is
+ * returned unchanged apart from the "."/".."/separator clean-up.
+ *
+ * Returns a malloc'd canonical path, or NULL on allocation failure.
+ * *is_root is set when nothing but a root marker is left (i.e. the path
+ * IS the filesystem/drive/share root). The result is never the empty
+ * string (a fully-popped relative path becomes "."), so callers may pass
+ * it straight to mkdir_p()/open(). */
+static char *normalize_path(const char *path, bool *is_root)
+{
+    /* R37-FIX-A2 (2nd half): resolve a relative spelling against the cwd
+     * FIRST. Without this the previous attempt merely dropped leading ".."
+     * ("../cfg" -> "cfg"), which silently retargeted the save while
+     * oidc_load_config() still opened the raw spelling: --fetch wrote
+     * ./cfg/servers.json and --list then read ../cfg/servers.json. It also
+     * left a relative root escape open (--config-dir ../../.. from a
+     * shallow cwd resolves to "/" — the guard saw only the text and let a
+     * root write through). Joining makes guard, mkdir_p(), rename() and
+     * chown() all see the real target. (_WIN32 drive-relative "C:foo" is
+     * left alone: cwd-joining would change its meaning.) */
+    char *joined = NULL;
+    if (path[0] != '\0' && !is_path_sep(path[0])
+#ifdef _WIN32
+        && path[1] != ':'
+#endif
+        ) {
+        joined = join_cwd(path);
+        if (joined)
+            path = joined;
+    }
+    size_t n = strlen(path);
+    char *out = malloc(n + 4);   /* + "C:" -> "C:/" and the NUL */
+    if (!out) {
+        free(joined);
+        return NULL;
+    }
+    size_t olen = 0;
+    size_t i = 0;
+    bool rooted = false;
+
+#ifdef _WIN32
+    if (n >= 2 && is_ascii_alpha(path[0]) && path[1] == ':' &&
+        (n == 2 || is_path_sep(path[2]))) {
+        /* drive-absolute; "C:" alone is the drive root here because the
+         * caller joins it with a separator ("C:" + "/servers.json") */
+        out[olen++] = path[0];
+        out[olen++] = ':';
+        out[olen++] = '/';
+        rooted = true;
+        i = 2;
+        while (i < n && is_path_sep(path[i]))
+            i++;
+    } else if (n >= 2 && is_path_sep(path[0]) && is_path_sep(path[1])) {
+        /* UNC: "\\server\share" is the root marker — keep both components
+         * so ".." can never climb above the share root */
+        rooted = true;
+        i = 2;
+        out[olen++] = '\\';
+        for (int comp = 0; comp < 2; comp++) {
+            while (i < n && is_path_sep(path[i]))
+                i++;
+            if (i >= n)
+                break;
+            size_t s = i;
+            while (i < n && !is_path_sep(path[i]))
+                i++;
+            out[olen++] = comp == 0 ? '\\' : '/';
+            memcpy(out + olen, path + s, i - s);
+            olen += i - s;
+        }
+        while (i < n && is_path_sep(path[i]))
+            i++;
+    } else
+#endif
+    if (n > 0 && is_path_sep(path[0])) {
+        rooted = true;
+        out[olen++] = '/';
+        i = 1;
+        while (i < n && is_path_sep(path[i]))
+            i++;                     /* "//".. collapses to the root */
+    }
+    const size_t root_end = olen;    /* ".." may not pop past this */
+
+    while (i < n) {
+        while (i < n && is_path_sep(path[i]))
+            i++;                     /* repeated/trailing separators */
+        size_t s = i;
+        while (i < n && !is_path_sep(path[i]))
+            i++;
+        size_t clen = i - s;
+        if (clen == 0)
+            break;                   /* trailing separator(s) */
+        const char *c = path + s;
+        if (clen == 1 && c[0] == '.')
+            continue;                /* "." is not a component */
+        if (clen == 2 && c[0] == '.' && c[1] == '.') {
+            if (olen > root_end) {
+                while (olen > root_end && !is_path_sep(out[olen - 1]))
+                    olen--;          /* drop the previous component */
+                if (olen > root_end)
+                    olen--;          /* and its separator */
+            } else if (!rooted) {
+                /* nothing left to pop and no root marker to stop at: only
+                 * reachable when join_cwd() failed (deleted cwd). Keep the
+                 * ".." rather than dropping it — dropping it would make
+                 * the string denote a different directory than the caller
+                 * spelled (and than oidc_load_config() opens). */
+                if (olen > 0 && !is_path_sep(out[olen - 1]))
+                    out[olen++] = '/';
+                out[olen++] = '.';
+                out[olen++] = '.';
+            }
+            continue;                /* else: no-op at/above the root */
+        }
+        if (olen > 0 && !is_path_sep(out[olen - 1]))
+            out[olen++] = '/';
+        memcpy(out + olen, c, clen);
+        olen += clen;
+    }
+    *is_root = rooted && olen == root_end;
+    if (olen == 0)
+        out[olen++] = '.';           /* relative, all components popped */
+    out[olen] = '\0';
+    free(joined);
+    return out;
+}
+
+/* R37-FIX-A2: does this --config-dir value resolve to the filesystem root
+ * no matter how it is spelled? Shared by the CLI gates (oidc_cli.c,
+ * iwan_client_oidc.c) and the oidc_save_config() backstop, so a spelling
+ * one of them accepts can never be a spelling another one rejects.
+ * (The prototype is repeated in those two .c files: adding it to oidc.h
+ * was outside this fix's file scope.)
+ * Relative values are resolved against the cwd exactly like the save path,
+ * so "--config-dir ../../.." from a shallow cwd is recognized as a root
+ * write instead of being silently rewritten.
+ * An empty/NULL value is NOT reported as root here — the CLI gates reject
+ * empty separately with a clearer message, and the save backstop treats
+ * "/servers.json" (a value with no directory component) as root itself. */
+bool oidc_config_dir_resolves_to_root(const char *dir)
+{
+    if (!dir || dir[0] == '\0')
+        return false;
+    bool root = false;
+    char *np = normalize_path(dir, &root);
+    if (!np)
+        oom_abort();
+    free(np);
+    return root;
+}
+
+/* R37-FIX-A2b (R2-B2-1): the ONE canonical spelling of the config file
+ * path for the whole process. main() calls this once, right after joining
+ * --config-dir with "/servers.json", and hands the result to
+ * oidc_save_config(), oidc_load_config(), the proxy.conf sibling and every
+ * diagnostic — otherwise --fetch writes the normalized path while
+ * --list/--connect fopen() the raw spelling, and any ".." (or, before this
+ * revision, "\") component makes the two disagree. normalize_path() inside
+ * oidc_save_config() stays as an idempotent backstop for direct callers.
+ * Never returns the empty string; the caller owns the result. */
+char *oidc_config_canon_path(const char *path)
+{
+    bool root = false;
+    char *np = normalize_path(path, &root);
+    if (!np)
+        oom_abort();
+    return np;
+}
+
 void oidc_fetch_config(Config *cf)
 {
     char *kp = NULL;
@@ -235,7 +475,10 @@ void oidc_fetch_config(Config *cf)
 
 /* --all re-execs via sudo, so the fresh file (and any dir we just
  * created) are root-owned; hand both back to the invoking user, or
- * the next non-sudo run cannot read or rewrite the config */
+ * the next non-sudo run cannot read or rewrite the config.
+ * R37-FIX-A2: both arguments are now the NORMALIZED paths from
+ * oidc_save_config() — chown() must never receive a raw "…/.." spelling,
+ * which the kernel resolves (chown("/foo/..") is chown("/")). */
 static void restore_owner(const char *path, const char *dir, bool dir_created)
 {
 #ifndef _WIN32
@@ -262,28 +505,10 @@ static void restore_owner(const char *path, const char *dir, bool dir_created)
 #endif
 }
 
-/* R14-M-1: does the path's directory component resolve to the filesystem
- * ROOT? Covers both
- *   - "/servers.json"   — the only separator is at path[0], so dir is
- *     NULL after the split below (the original R13-M-5 guard), and
- *   - "///servers.json" — --config-dir "//" joins into this, the last
- *     separator is NOT the first char, dir becomes "//", and stripping
- *     every leading separator leaves no real directory name: the
- *     effective parent is still "/".
- * A relative path with no leading separator ("servers.json",
- * "dir/servers.json") never resolves to the root and is left alone, and
- * a legitimate absolute path ("/etc/iwan", "/home/u/.config/iwan") has a
- * real name after the leading separator, so it keeps working. */
-static bool dir_component_is_root(const char *path, const char *dir)
-{
-    if (path[0] != '/' && path[0] != '\\')
-        return false;               /* relative: no root resolution */
-    if (!dir)
-        return true;                /* "/servers.json" */
-    while (*dir == '/' || *dir == '\\')
-        dir++;                      /* strip "//".. -> "" */
-    return *dir == '\0';            /* separators only => the root */
-}
+/* R14-M-1's dir_component_is_root() lived here and only stripped leading
+ * separators; R37-FIX-A2 replaced it with normalize_path() +
+ * oidc_config_dir_resolves_to_root() above, which also sees through ".",
+ * "..", repeated/trailing separators and Windows drive/UNC roots. */
 
 void oidc_save_config(const char *path, const Config *cf)
 {
@@ -292,9 +517,23 @@ void oidc_save_config(const char *path, const Config *cf)
         oidc_die("cannot save config: server list is empty "
                  "(refusing to write an unusable config)");
 
+    /* R37-FIX-A2 (HIGH): every decision AND every filesystem action below
+     * uses ONE canonical spelling of the path. Normalizing only the guard
+     * would leave mkdir_p()/chown() on the raw "…/.." string — which is how
+     * `--config-dir /foo/..` both created "/foo" and chown()ed "/" (the
+     * kernel resolves "..", our text check did not). */
+    const char *opath = path;
+    bool path_is_root = false;
+    char *npath = normalize_path(path, &path_is_root);
+    if (!npath)
+        oom_abort();
+    path = npath;
+
     /* Windows users may pass C:\a\b: look for both separators and keep
      * the later one ('\' is an ordinary char on POSIX, so this is a
-     * no-op there) */
+     * no-op there). The normalized path has no "."/".."/repeated/trailing
+     * separator left (and a relative spelling is now absolute), so this
+     * really is the parent directory. */
     const char *slash = strrchr(path, '/');
     const char *bslash = strrchr(path, '\\');
     if (bslash && (!slash || bslash > slash))
@@ -307,26 +546,34 @@ void oidc_save_config(const char *path, const Config *cf)
             oom_abort();
         memcpy(dir, path, (size_t)(slash - path));
         dir[slash - path] = '\0';
-        dir_created = mkdir_p(dir);
     }
-    /* R13-M-5 + R14-M-1 root-write guard: refuse to save into the
-     * filesystem ROOT. R13-M-5 covered a single leading separator
+    /* R13-M-5 + R14-M-1 + R37-FIX-A2 root-write guard: refuse to save into
+     * the filesystem ROOT. R13-M-5 covered a single leading separator
      * (slash == path -> dir stays NULL), i.e. --config-dir "" joining
-     * into "/servers.json". R14-M-1 extends it to "leading consecutive
-     * separators": --config-dir "//" joins into "///servers.json",
-     * whose last separator is NOT the first char, so dir becomes "//" —
-     * mkdir_p("//") only touches "/" (EEXIST, does not die) and the old
-     * slash==path test let the root write straight through. Strip every
-     * leading separator from dir: no real directory name left => the
-     * effective parent is still "/". Writing there as root (sudo
-     * re-exec) is a misconfiguration, never a legitimate save: refuse
-     * loudly instead of open(NULL)/root-write UB. (The authoritative
-     * rejection also belongs at CLI parse time in oidc_cli.c /
-     * iwan_client_oidc.c — see the R13/R14 reports.) */
-    if (dir_component_is_root(path, dir))
+     * into "/servers.json". R14-M-1 extended it to "leading consecutive
+     * separators" (--config-dir "//" -> "///servers.json"). Both looked at
+     * the raw spelling only: `..` is not a separator, so "/foo/..",
+     * "/..", "/tmp/../..", "~/../.." and "C:\" sailed through, and the
+     * sudo re-exec wrote /servers.json as root. The check now runs on the
+     * NORMALIZED (cwd-joined, for relative spellings) parent, BEFORE
+     * mkdir_p() (so no "/foo" is left behind) and long before chown().
+     * Writing there as root is a misconfiguration, never a legitimate
+     * save: refuse loudly. */
+    bool parent_is_root = false;
+    if (!dir)
+        /* no directory component: a leading separator means the parent IS
+         * the root ("/servers.json"); a plain relative name means the
+         * current directory */
+        parent_is_root = is_path_sep(path[0]);
+    else
+        parent_is_root = oidc_config_dir_resolves_to_root(dir);
+    if (path_is_root || parent_is_root)
         oidc_die("refusing to save config into the filesystem root "
-                 "(path \"%s\"): is --config-dir empty or all "
-                 "separators?", path);
+                 "(path \"%s\" resolves to \"%s\"): is --config-dir "
+                 "empty, all separators, or pointing at the root?",
+                 opath, path);
+    if (dir)
+        dir_created = mkdir_p(dir);
     /* write a sibling temp file, then rename() over the target so the
      * config is replaced atomically: a concurrent reader never sees a
      * half-written file. Same directory keeps rename() on one filesystem.
@@ -442,6 +689,7 @@ void oidc_save_config(const char *path, const Config *cf)
     free(dir);
     oidc_eprintf("  Saved %zu server(s) to %s\n", json_arr_len(cf->servers),
                  path);
+    free(npath);
 }
 
 void oidc_load_config(const char *path, Config *cf)

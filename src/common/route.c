@@ -852,6 +852,26 @@ rollback:
 static bool srv_default_installed;
 static bool srv_pin_installed;
 
+/* R1-C-C-2: canonical "a.b.c.d/plen" network string. iproute2 (verified
+ * on 6.3..6.17) rejects a prefix with host bits set at parse time
+ * ("Invalid prefix for given prefix length"), and the permissive builds
+ * store the masked key anyway — so `ip route` must be handed the network
+ * address, not the raw user string ("10.0.0.5/24" -> "10.0.0.0/24").
+ * Returns false when `c` is not A.B.C.D/n; the caller then keeps the raw
+ * string (old behavior, never worse than before). */
+static bool canon_v4_cidr(const char *c, char out[24]) {
+    uint32_t net;
+    int prefix;
+    if (cidr_parse(c, &net, &prefix) != 0)
+        return false;
+    uint32_t mask = prefix == 0 ? 0 : ~((1u << (32 - prefix)) - 1);
+    uint32_t canon = net & mask;
+    snprintf(out, 24, "%u.%u.%u.%u/%d", (canon >> 24) & 0xFF,
+             (canon >> 16) & 0xFF, (canon >> 8) & 0xFF, canon & 0xFF,
+             prefix);
+    return true;
+}
+
 bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
                  const char *srv, const char *ogw, const char *odev,
                  const char *metric, const slist_t *routes_with_default) {
@@ -921,6 +941,16 @@ bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
                 log_debug("route_setup: no local subnet on %s to preserve",
                           odev);
             }
+            /* R1-C-C-1: deliberately NOT carrying `metric` here. A
+             * metric-less replace installs a priority-0 tunnel default
+             * that beats every metric>0 default (the hijack always
+             * works) while the pre-VPN default stays in the table; if
+             * the process dies the TUN device unregisters and takes its
+             * route with it, so the untouched physical default
+             * self-heals. Replacing the physical default at its own
+             * metric instead would (a) lose it for good on a crash and
+             * (b) fail to hijack when another lower-metric default
+             * exists. The restore path below owns the pre-VPN entry. */
             char *r2[] = { "route", "replace", "default", "dev",
                            (char *)tun, NULL };
             if (!ip_run(r2)) {
@@ -935,10 +965,14 @@ bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
              * tears the pre-existing physical default away. */
             srv_default_installed = true;
         } else {
-            char *r3[] = { "route", "replace", (char *)c, "dev",
+            char netstr[24];
+            const char *target = c;
+            if (canon_v4_cidr(c, netstr))
+                target = netstr;
+            char *r3[] = { "route", "replace", (char *)target, "dev",
                            (char *)tun, NULL };
             if (!ip_run(r3)) {
-                log_err("route_setup: route replace %s dev %s failed", c,
+                log_err("route_setup: route replace %s dev %s failed", target,
                         tun);
                 goto rollback_routes;
             }
@@ -1114,11 +1148,26 @@ void route_teardown(const char *tun, const char *srv, const char *ogw,
              * keeping its metric (captured by capture_default) so route
              * precedence matches the pre-VPN state — a metric-less
              * restore would install a priority-0 default that shadows
-             * (or is shadowed by) other defaults */
+             * (or is shadowed by) other defaults.
+             *
+             * R1-C-C-1: `replace`, NOT `add`. The kernel matches route
+             * aliases by (prefix, dscp, fib_priority), so setup's
+             * metric-less `replace default dev <tun>` does not replace a
+             * DHCP default carrying e.g. metric 100 — both coexist and
+             * the physical one is still in the table here. `add` would
+             * then fail EEXIST and the device-only fallback below would
+             * install a priority-0 on-link default that shadows the real
+             * one: the host kept "a" default route but every off-link
+             * packet went to ARP on the physical NIC (silent, host-wide
+             * outage after a clean exit). `replace` is idempotent when
+             * the original route is still present (rc=0, no change) and
+             * re-creates it when it is genuinely gone, so the
+             * destructive fallback is only reached when the kernel
+             * really refuses the restore. */
             char *d2[10];
             int di = 0;
             d2[di++] = "route";
-            d2[di++] = "add";
+            d2[di++] = "replace";
             d2[di++] = "default";
             d2[di++] = "via";
             d2[di++] = (char *)ogw;
@@ -1147,11 +1196,18 @@ void route_teardown(const char *tun, const char *srv, const char *ogw,
         } else {
             /* only remove the entry we installed on the tunnel dev; an
              * unqualified del could clobber a same-prefix route on
-             * another device */
-            char *d3[] = { "route", "del", (char *)c, "dev",
+             * another device. The target is canonicalized exactly like
+             * route_setup installs it (R1-C-C-2), so the delete always
+             * addresses the key the kernel actually stored */
+            char netstr[24];
+            const char *target = c;
+            if (canon_v4_cidr(c, netstr))
+                target = netstr;
+            char *d3[] = { "route", "del", (char *)target, "dev",
                            (char *)tun, NULL };
             if (!ip_run(d3))
-                log_debug("route_teardown: route del %s: not present", c);
+                log_debug("route_teardown: route del %s: not present",
+                          target);
         }
     }
     char srv32[64];

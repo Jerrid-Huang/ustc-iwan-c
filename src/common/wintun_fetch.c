@@ -35,7 +35,20 @@
  * tracking by design. */
 #define WINTUN_PINNED_VERSION "0.14.1"
 #define WINTUN_ZIP_FMT  "https://www.wintun.net/builds/wintun-%s.zip"
-#define PS_CMD_MAX      1024
+/* R37/FIX-R1-A3: these caps used to be 1024 / MAX_PATH, which made GCC's
+ * -Wformat-truncation=1 conclude that the two-path PowerShell command lines
+ * and the tmpdir-derived paths below could not fit (7 warnings that broke
+ * the -DIWAN_WERROR=ON Windows cross build). Size every buffer to the worst
+ * case its inputs can actually expand to, and check each snprintf return
+ * value at the call site — nothing here may truncate silently. */
+/* A MAX_PATH-sized directory plus an appended component, and with room for
+ * ps_squote() doubling every embedded quote (2 * (MAX_PATH - 1) bytes). */
+#define PS_PATH_MAX     (2 * MAX_PATH)
+/* A path derived from another PS_PATH_MAX buffer (tmpdir + "\wintun\bin\x"). */
+#define PS_PATH_DERIVED_MAX (PS_PATH_MAX + 64)
+/* PowerShell command line: worst case is two escaped PS_PATH_MAX paths plus
+ * the surrounding literal ("Expand-Archive -Path '...' -DestinationPath '...'"). */
+#define PS_CMD_MAX      (2 * PS_PATH_MAX + 128)
 
 static void exe_dir(char *out, size_t cap)
 {
@@ -53,8 +66,13 @@ static void dll_path(char *out, size_t cap)
 {
     char dir[MAX_PATH];
     exe_dir(dir, sizeof dir);
-    snprintf(out, cap, "%s%swintun.dll", dir,
-             dir[0] && dir[strlen(dir) - 1] == '\\' ? "" : "\\");
+    int n = snprintf(out, cap, "%s%swintun.dll", dir,
+                     dir[0] && dir[strlen(dir) - 1] == '\\' ? "" : "\\");
+    if (n < 0 || (size_t)n >= cap) {
+        if (cap > 0)
+            out[0] = '\0';   /* truncated: report "no path" (callers already
+                              * treat an empty result as failure) */
+    }
 }
 
 static int file_exists(const char *path)
@@ -83,9 +101,15 @@ static void ps_squote(char *out, size_t cap, const char *src)
 
 /* run a command and capture its stdout (line-oriented use only) */
 static char *ps_capture(const char *ps_expr){
-    char cmd[PS_CMD_MAX];
-    snprintf(cmd, sizeof cmd,
-             "powershell -NoProfile -Command \"%s\"", ps_expr);
+    /* +64 covers the wrapper below, so any expression built into a
+     * PS_CMD_MAX buffer fits; a longer one is reported, not truncated. */
+    char cmd[PS_CMD_MAX + 64];
+    int n = snprintf(cmd, sizeof cmd,
+                     "powershell -NoProfile -Command \"%s\"", ps_expr);
+    if (n < 0 || (size_t)n >= sizeof cmd) {
+        log_err("internal error: PowerShell command line too long (%d bytes)", n);
+        return NULL;
+    }
     FILE *p = _popen(cmd, "r");
     if (!p)
         return NULL;
@@ -118,32 +142,38 @@ static char *ps_capture(const char *ps_expr){
 
 static int arch_tag(char *out, size_t cap)
 {
+    int n;
 #if defined(__aarch64__) || defined(_M_ARM64)
-    snprintf(out, cap, "arm64");
+    n = snprintf(out, cap, "arm64");
 #elif defined(__x86_64__) || defined(_M_X64)
-    snprintf(out, cap, "amd64");
+    n = snprintf(out, cap, "amd64");
 #elif defined(__i386__) || defined(_M_IX86)
-    snprintf(out, cap, "x86");
+    n = snprintf(out, cap, "x86");
 #else
     return -1;
 #endif
-    return 0;
+    return (n < 0 || (size_t)n >= cap) ? -1 : 0;   /* -1 = "unsupported" */
 }
 
 int wintun_ensure(void)
 {
-    char dll[MAX_PATH];
+    char dll[PS_PATH_MAX];
     dll_path(dll, sizeof dll);
     if (dll[0] == '\0')
         return -1;
     if (file_exists(dll))
         return 0;
 
+    int n = 0;
     char manual[1024];
-    snprintf(manual, sizeof manual,
-             "download https://www.wintun.net/ , open the zip and copy "
-             "bin\\<arch>\\wintun.dll to %s",
-             dll);
+    n = snprintf(manual, sizeof manual,
+                 "download https://www.wintun.net/ , open the zip and copy "
+                 "bin\\<arch>\\wintun.dll to %s",
+                 dll);
+    if (n < 0 || (size_t)n >= sizeof manual) {
+        log_err("internal error: wintun installation hint too long");
+        return -1;
+    }
 
     if (!_isatty(_fileno(stdin))) {
         log_err("wintun.dll not found at %s (non-interactive stdin: %s)",
@@ -175,7 +205,11 @@ int wintun_ensure(void)
      * scrape — that was exactly the self-contradiction that broke the
      * auto-install on the next upstream release. */
     char ver[32];
-    snprintf(ver, sizeof ver, "%s", WINTUN_PINNED_VERSION);
+    n = snprintf(ver, sizeof ver, "%s", WINTUN_PINNED_VERSION);
+    if (n < 0 || (size_t)n >= sizeof ver) {
+        log_err("internal error: pinned wintun version does not fit");
+        return -1;
+    }
     log_info("fetching pinned wintun build: %s", ver);
 
     char arch[16];
@@ -184,33 +218,54 @@ int wintun_ensure(void)
         return -1;
     }
 
-    char zip[MAX_PATH], tmpdir[MAX_PATH];
-    snprintf(zip, sizeof zip, "%s%swintun-%s.zip", dir,
-             dir[0] && dir[strlen(dir) - 1] == '\\' ? "" : "\\", ver);
-    snprintf(tmpdir, sizeof tmpdir, "%s%swintun-tmp", dir,
-             dir[0] && dir[strlen(dir) - 1] == '\\' ? "" : "\\");
+    char zip[PS_PATH_MAX], tmpdir[PS_PATH_MAX];
+    n = snprintf(zip, sizeof zip, "%s%swintun-%s.zip", dir,
+                 dir[0] && dir[strlen(dir) - 1] == '\\' ? "" : "\\", ver);
+    if (n < 0 || (size_t)n >= sizeof zip) {
+        log_err("internal error: local zip path too long");
+        return -1;
+    }
+    n = snprintf(tmpdir, sizeof tmpdir, "%s%swintun-tmp", dir,
+                 dir[0] && dir[strlen(dir) - 1] == '\\' ? "" : "\\");
+    if (n < 0 || (size_t)n >= sizeof tmpdir) {
+        log_err("internal error: temp extraction path too long");
+        return -1;
+    }
 
     char cmd[PS_CMD_MAX];
-    char zipq[PS_CMD_MAX], tmpq[PS_CMD_MAX];
+    char zipq[PS_PATH_MAX], tmpq[PS_PATH_MAX];
     ps_squote(zipq, sizeof zipq, zip);
     ps_squote(tmpq, sizeof tmpq, tmpdir);
     /* FIND-W-1: the two %s slots were reversed — the URL wants the
      * VERSION (wintun-%s.zip), -OutFile wants the local zip path. As
      * written, every download produced a 404 URL + a file named "0.14.1" */
-    snprintf(cmd, sizeof cmd,
-             "(Invoke-WebRequest -UseBasicParsing '" WINTUN_ZIP_FMT "')"
-             " -OutFile '%s'", ver, zipq);
+    n = snprintf(cmd, sizeof cmd,
+                 "(Invoke-WebRequest -UseBasicParsing '" WINTUN_ZIP_FMT "')"
+                 " -OutFile '%s'", ver, zipq);
+    if (n < 0 || (size_t)n >= sizeof cmd) {
+        log_err("internal error: PowerShell download command too long");
+        return -1;
+    }
     log_info("downloading wintun-%s.zip ...", ver);
     ps_capture(cmd);
 
-    snprintf(cmd, sizeof cmd,
-             "Expand-Archive -Path '%s' -DestinationPath '%s' -Force",
-             zipq, tmpq);
+    n = snprintf(cmd, sizeof cmd,
+                 "Expand-Archive -Path '%s' -DestinationPath '%s' -Force",
+                 zipq, tmpq);
+    if (n < 0 || (size_t)n >= sizeof cmd) {
+        log_err("internal error: PowerShell expand command too long");
+        return -1;
+    }
     ps_capture(cmd);
 
-    char src[MAX_PATH];
+    char src[PS_PATH_DERIVED_MAX];
     /* Expand-Archive preserves the zip's top-level wintun/ folder */
-    snprintf(src, sizeof src, "%s\\wintun\\bin\\%s\\wintun.dll", tmpdir, arch);
+    n = snprintf(src, sizeof src, "%s\\wintun\\bin\\%s\\wintun.dll", tmpdir,
+                 arch);
+    if (n < 0 || (size_t)n >= sizeof src) {
+        log_err("internal error: extracted DLL path too long");
+        return -1;
+    }
     if (!file_exists(src)) {
         log_err("wintun-%s.zip does not contain bin\\%s\\wintun.dll",
                 ver, arch);
@@ -235,16 +290,32 @@ int wintun_ensure(void)
     /* best-effort cleanup of the temp artifacts */
     DeleteFileA(zip);
     {
-        char sub[MAX_PATH];
-        snprintf(sub, sizeof sub, "%s\\wintun\\bin\\%s", tmpdir, arch);
-        DeleteFileA(sub);          /* fails while dirs exist; ignore */
-        snprintf(sub, sizeof sub, "%s\\wintun\\bin\\%s", tmpdir, arch);
-        RemoveDirectoryA(sub);
-        snprintf(sub, sizeof sub, "%s\\wintun\\bin", tmpdir);
-        RemoveDirectoryA(sub);
-        snprintf(sub, sizeof sub, "%s\\wintun", tmpdir);
-        RemoveDirectoryA(sub);
-        RemoveDirectoryA(tmpdir);
+        /* Build the longest cleanup path once — tmpdir\wintun\bin\<arch> —
+         * and derive the shorter ones by trimming it. The old code issued
+         * four snprintf calls (two of them byte-identical) into a MAX_PATH
+         * buffer, which is where -Wformat-truncation fired. On truncation we
+         * skip the removals rather than silently deleting a shorter prefix
+         * of the intended path; the DLL itself is already installed. */
+        char bin[PS_PATH_DERIVED_MAX];
+        n = snprintf(bin, sizeof bin, "%s\\wintun\\bin\\%s", tmpdir, arch);
+        if (n < 0 || (size_t)n >= sizeof bin) {
+            log_err("internal error: cleanup path too long; leaving %s",
+                    tmpdir);
+        } else {
+            char *tail = strrchr(bin, '\\');   /* points at "\<arch>" */
+            DeleteFileA(bin);          /* fails while dirs exist; ignore */
+            RemoveDirectoryA(bin);
+            if (tail) {
+                *tail = '\0';
+                RemoveDirectoryA(bin);         /* tmpdir\wintun\bin */
+                tail = strrchr(bin, '\\');
+                if (tail) {
+                    *tail = '\0';
+                    RemoveDirectoryA(bin);     /* tmpdir\wintun */
+                }
+            }
+            RemoveDirectoryA(tmpdir);
+        }
     }
 
     printf("wintun.dll installed: %s\n", dll);

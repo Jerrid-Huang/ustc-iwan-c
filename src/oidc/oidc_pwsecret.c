@@ -9,6 +9,34 @@
 #include "util.h"   /* hex_nibble */
 #include "common.h"  /* xstrdup */
 
+/* R37-FIX-C1 (L35): is this stored value a reference to the platform's
+ * sealed store, or a plaintext password? The rule differs per platform and
+ * must be no looser than what oidc_wrap_password() actually writes:
+ *   - Windows writes "WDP1:" + hex payload, so the marker is
+ *     self-delimiting and a prefix test is exact enough (the payload is
+ *     validated by pw_hex_decode_wdp());
+ *   - macOS writes EXACTLY the 4-byte "WKC1" with no payload. Matching it
+ *     with strncmp(...,4) made every plaintext password that merely STARTS
+ *     with "WKC1" look like a Keychain reference: unwrap then read a stale
+ *     Keychain entry (or failed) and the user could never log in with that
+ *     password (fail-closed, but a real functional defect). Requiring the
+ *     whole string fixes it without touching the stored format — every
+ *     value macOS ever wrote is exactly "WKC1" and keeps working;
+ *   - every other platform has no sealed store, so nothing is a reference.
+ * The function is compiled on all platforms so the decision can be
+ * unit-driven (see .cc_tmp/r37/wg5c/). */
+static bool pw_is_sealed(const char *stored)
+{
+#if defined(_WIN32)
+    return strncmp(stored, "WDP1:", 5) == 0;
+#elif defined(__APPLE__)
+    return strcmp(stored, "WKC1") == 0;
+#else
+    (void)stored;
+    return false;
+#endif
+}
+
 #ifdef _WIN32
 #include <dpapi.h>
 
@@ -105,7 +133,7 @@ char *oidc_unwrap_password(const char *stored, const char *domain,
 {
     (void)domain;
     (void)user;
-    if (strncmp(stored, "WDP1:", 5) == 0)
+    if (pw_is_sealed(stored))
         return pw_hex_decode_wdp(stored + 5);
     return xstrdup(stored);
 }
@@ -152,7 +180,7 @@ char *oidc_wrap_password(const char *blob, const char *domain,
 char *oidc_unwrap_password(const char *stored, const char *domain,
                            const char *user)
 {
-    if (strncmp(stored, "WKC1", 4) != 0)
+    if (!pw_is_sealed(stored))
         return xstrdup(stored);
     CFStringRef acc = pw_acc(domain, user);
     const void *keys[] = { kSecClass, kSecAttrService, kSecAttrAccount,
@@ -198,6 +226,10 @@ char *oidc_unwrap_password(const char *stored, const char *domain,
 {
     (void)domain;
     (void)user;
+    /* no sealed store on this platform: pw_is_sealed() is constant false,
+     * so this is byte-identical to the previous "return the stored value"
+     * (the reference also keeps the helper from being 'unused' here) */
+    (void)pw_is_sealed;
     return xstrdup(stored);
 }
 #endif

@@ -50,6 +50,12 @@
  * connection runs its handshake on its own thread; beyond this cap
  * the accept thread sheds the new connection (close, no thread). */
 #define RP_MAX_CONNS            256
+/* R37 R1-B-2: cap on ESTABLISHED relayed connections (the handshake-thread
+ * cap above is released as soon as a connection is handed to the relay, so
+ * it never bounded the fd count). Two fds per connection + up to ~1 MiB
+ * pend each, so this is the real fd-pressure bound; excess connections are
+ * refused with a log line rather than silently black-holed. */
+#define RP_MAX_ESTABLISHED      (RP_MAX_CONNS * 2)
 
 struct RelayProxy {
     _Atomic int  listener;   /* -1 = stopped; written by stop/accept threads (R20 atomic) */
@@ -66,6 +72,11 @@ struct RelayProxy *g_rp_current;
  * accept thread before the thread is spawned, decremented by
  * rp_conn_main on EVERY exit path). */
 static atomic_int g_rp_conn_n;
+
+/* R37 R1-B-2: number of ESTABLISHED relayed connections (incremented by
+ * rp_add once the pair is reserved, decremented when the rp_conn is
+ * closed and freed in rp_reap_maybe, or on every rp_add failure path). */
+static atomic_int g_rp_est_n;
 
 /* ---- handshake watchdog (M6b) ----
  * RP_HANDSHAKE_TIMEOUT_MS remains the ceiling for a SINGLE poll, but
@@ -615,12 +626,14 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
             if (pr > 0) {
                 /* M6c: a well-formed frame with the wrong token is
                  * a counted auth failure */
-                bool ok = pp_socks_auth_ok(pass, plen, token);
-                uint8_t rr[2] = {1, ok ? 0 : 1};
-                if (!ok)
+                /* R37 R1-B-7: must not shadow the greeting's `ok[2]`
+                 * (build-wstrict's -Wshadow -Werror) */
+                bool authed = pp_socks_auth_ok(pass, plen, token);
+                uint8_t rr[2] = {1, authed ? 0 : 1};
+                if (!authed)
                     rp_fail_note(fk, false);
                 (void)rp_send_full(hs, fd, rr, sizeof rr);
-                if (!ok)
+                if (!authed)
                     return -1;
                 if (token)
                     rp_fail_note(fk, true);   /* success clears */
@@ -632,8 +645,20 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
                 }
                 break;
             }
-            if (pr == 0)
-                return -1;      /* complete but malformed */
+            if (pr == 0) {
+                /* R37 R1-B-5: pp_socks_auth_frame() returns 0 both for a
+                 * genuinely malformed frame AND for a WELL-FORMED RFC1929
+                 * frame whose username exceeds our 64-byte buffer
+                 * (RFC1929 ULEN is 1 byte, so up to 255 is legal). The
+                 * old code closed the connection with no reply, so e.g.
+                 * `curl -U <64+-char-user>:<token>` looked like a protocol
+                 * error instead of an auth failure. Answer {1,1} and count
+                 * it toward the peer's brute-force budget. */
+                uint8_t rr[2] = {1, 1};
+                rp_fail_note(fk, false);
+                (void)rp_send_full(hs, fd, rr, sizeof rr);
+                return -1;      /* complete but unparseable/oversized */
+            }
             if (n >= sizeof b)
                 return -1;
             {
@@ -943,8 +968,28 @@ static bool rp_arr_add(struct rp_conn ***arr, size_t *n, size_t *cap,
  * are closed here and the caller must not touch them again */
 static void rp_add(int c, int u)
 {
-    struct rp_conn *cn = calloc(1, sizeof *cn);
+    struct rp_conn *cn;
+
+    /* R37 R1-B-2: RP_MAX_CONNS caps concurrent HANDSHAKE threads only —
+     * an established-but-idle relayed connection was never bounded (600
+     * idle connections = 1200 fds and climbing). That is enough fd
+     * pressure to push the client (root under TUN) into EMFILE, which in
+     * turn killed the accept thread (R1-B-1). Bound the established set
+     * explicitly and refuse with a log line instead of silently
+     * black-holing the peer. No idle timeout is added: SSH and other
+     * long-lived idle sessions are legitimate. */
+    if (atomic_load(&g_rp_est_n) >= RP_MAX_ESTABLISHED) {
+        log_err("rp: relay connection limit %d reached, refusing connection",
+                RP_MAX_ESTABLISHED);
+        port_close(c);
+        port_close(u);
+        return;
+    }
+    atomic_fetch_add(&g_rp_est_n, 1);
+
+    cn = calloc(1, sizeof *cn);
     if (!cn) {
+        atomic_fetch_sub(&g_rp_est_n, 1);
         port_close(c);
         port_close(u);
         return;
@@ -956,8 +1001,18 @@ static void rp_add(int c, int u)
     cn->dn.from = u;
     cn->dn.to = c;
     atomic_store(&cn->dirs, 2);
-    port_set_nonblock(c, true);
-    port_set_nonblock(u, true);
+    /* R37 R1-B-4: a fd left in BLOCKING mode would stall the whole
+     * direction thread (it serves every connection at once), so refuse
+     * the connection instead of silently ignoring a failed fcntl —
+     * rp_connect_target already treats the same failure as fatal. */
+    if (port_set_nonblock(c, true) != 0 || port_set_nonblock(u, true) != 0) {
+        log_err("rp: cannot switch connection to non-blocking mode: dropped");
+        atomic_fetch_sub(&g_rp_est_n, 1);
+        port_close(c);
+        port_close(u);
+        free(cn);
+        return;
+    }
 
     pthread_mutex_lock(&g_rp_mu);
     bool ok = rp_arr_add(&g_rp_up, &g_rp_up_n, &g_rp_up_cap, cn);
@@ -980,6 +1035,7 @@ static void rp_add(int c, int u)
     }
     pthread_mutex_unlock(&g_rp_mu);
     if (!ok) {
+        atomic_fetch_sub(&g_rp_est_n, 1);   /* R1-B-2: undo the reservation */
         port_close(c);
         port_close(u);
         free(cn);
@@ -1001,6 +1057,7 @@ static void rp_reap_maybe(struct rp_conn *cn)
         free(cn->up.pend);
         free(cn->dn.pend);
         free(cn);
+        atomic_fetch_sub(&g_rp_est_n, 1);   /* R1-B-2: connection gone */
     }
 }
 
@@ -1024,6 +1081,42 @@ static void rp_snap_unref_all(struct rp_conn **snap, size_t n)
     for (size_t i = 0; i < n; i++)
         if (atomic_fetch_sub(&snap[i]->in_use, 1) == 1)
             rp_reap_maybe(snap[i]);
+}
+
+/* R37 R2 (R1-B-3): a direction thread that exits EARLY (realloc failure,
+ * poll hard error) must still RETIRE the entries it snapshotted. The
+ * retirement loop at the bottom of rp_dir_main is what calls
+ * rp_release(); skipping it leaves this direction's `dirs` count above
+ * zero forever, so rp_reap_maybe never closes the two sockets or frees
+ * the rp_conn — and, since R1-B-2, g_rp_est_n never decrements either, so
+ * RP_MAX_ESTABLISHED would eventually refuse every new connection for the
+ * rest of the process (a permanent relay outage, not just an fd leak).
+ *
+ * Retires only entries still present in THIS direction's array (the array
+ * doubles as the "not yet retired" marker), so an entry already retired by
+ * the normal path can never be released twice. Must run under g_rp_mu,
+ * before rp_snap_unref_all() for the same snapshot. */
+static void rp_dir_drain_all(bool up_dir, struct rp_conn **snap, size_t n,
+                             struct rp_conn ***arrp, size_t *np)
+{
+    for (size_t i = 0; i < n; i++) {
+        struct rp_conn *cn = snap[i];
+        struct rp_ent *e = up_dir ? &cn->up : &cn->dn;
+        size_t j;
+
+        for (j = 0; j < *np; j++)
+            if ((*arrp)[j] == cn)
+                break;
+        if (j == *np)
+            continue;              /* already retired: not ours to release */
+        if (!e->wr_closed) {
+            port_shutdown(e->to, 1);   /* same half-close as from_eof */
+            e->wr_closed = true;
+        }
+        (*arrp)[j] = (*arrp)[--*np];
+        atomic_fetch_add(&g_rp_arr_gen, 1);
+        rp_release(cn);
+    }
 }
 
 static bool rp_pend(struct rp_ent *e, const uint8_t *p, size_t n)
@@ -1137,6 +1230,7 @@ static void *rp_dir_main(void *ud)
             struct pollfd *n2 = realloc(pf, (n * 2) * sizeof *n2);
             if (!n2) {
                 pthread_mutex_lock(&g_rp_mu);
+                rp_dir_drain_all(up_dir, snap, n, arrp, np);   /* R2: retire */
                 rp_snap_unref_all(snap, n);
                 pthread_mutex_unlock(&g_rp_mu);
                 goto cleanup;   /* L3: free pf/slot buffers too */
@@ -1148,6 +1242,7 @@ static void *rp_dir_main(void *ud)
             int *ns = realloc(slot_from, n * sizeof *ns);
             if (!ns) {
                 pthread_mutex_lock(&g_rp_mu);
+                rp_dir_drain_all(up_dir, snap, n, arrp, np);   /* R2: retire */
                 rp_snap_unref_all(snap, n);
                 pthread_mutex_unlock(&g_rp_mu);
                 goto cleanup;   /* L3: free pf/slot buffers too */
@@ -1156,6 +1251,7 @@ static void *rp_dir_main(void *ud)
             ns = realloc(slot_to, n * sizeof *ns);
             if (!ns) {
                 pthread_mutex_lock(&g_rp_mu);
+                rp_dir_drain_all(up_dir, snap, n, arrp, np);   /* R2: retire */
                 rp_snap_unref_all(snap, n);
                 pthread_mutex_unlock(&g_rp_mu);
                 goto cleanup;   /* L3: free pf/slot buffers too */
@@ -1218,6 +1314,7 @@ static void *rp_dir_main(void *ud)
                 continue;
             }
             pthread_mutex_lock(&g_rp_mu);
+            rp_dir_drain_all(up_dir, snap, n, arrp, np);       /* R2: retire */
             rp_snap_unref_all(snap, n);
             pthread_mutex_unlock(&g_rp_mu);
             break;              /* poll failed: stop relaying */
@@ -1516,7 +1613,25 @@ static void *rp_accept_main(void *ud)
         if (fd < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
                 continue;
-            break;
+            /* R37 R1-B-1: every other error accept(2) returns on Linux is
+             * TRANSIENT — EMFILE/ENFILE (fd table full), ENOBUFS/ENOMEM
+             * (kernel memory pressure), ECONNABORTED (peer RST before we
+             * accepted), EPROTO/ENETDOWN/EHOSTDOWN/ENETUNREACH (pending
+             * network error). The old code `break`ed out of the loop for
+             * all of them, and this thread is detached with no restart:
+             * the listener stayed open, so connect() kept succeeding while
+             * nothing was ever accepted again — a silent local-proxy black
+             * hole until process exit, with no log line anywhere. Only a
+             * dead/invalid listener fd is fatal now. */
+            if (errno == EBADF || errno == EINVAL || errno == ENOTSOCK) {
+                log_err("rp: listener accept failed fatally (errno=%d): "
+                        "relay listener stopped", errno);
+                break;
+            }
+            log_debug("rp: transient accept error (errno=%d), backing off",
+                      errno);
+            port_sleep_ms(50);   /* bounded: no hot spin under EMFILE */
+            continue;
         }
 
         /* M6c/L6: drop sources locked out for RFC1929 brute force
@@ -1558,7 +1673,22 @@ static void *rp_accept_main(void *ud)
         atomic_fetch_add(&g_rp_conn_n, 1);
 
         pthread_t th;
-        if (pthread_create(&th, NULL, rp_conn_main, ca) != 0) {
+        /* R37 L3 (HEAD-R2 §2.2): pthread_create returns the error number
+         * and does NOT set errno, so a failure here must be reported with
+         * strerror(rc). Rate-limited to one line per second — a thread
+         * limit (EAGAIN) or OOM (ENOMEM) would otherwise flood the log
+         * from this accept loop. */
+        int crc = pthread_create(&th, NULL, rp_conn_main, ca);
+        if (crc != 0) {
+            static _Atomic uint64_t last_spawn_warn_ms;
+            uint64_t nw = now_ms();
+            if (nw - atomic_load_explicit(&last_spawn_warn_ms,
+                                          memory_order_relaxed) >= 1000) {
+                atomic_store_explicit(&last_spawn_warn_ms, nw,
+                                      memory_order_relaxed);
+                log_err("rp: cannot spawn connection thread (rc=%d: %s); "
+                        "dropping connection", crc, strerror(crc));
+            }
             atomic_fetch_sub(&g_rp_conn_n, 1);
             port_close(fd);
             free(ca);
@@ -1657,7 +1787,11 @@ int relay_proxy_start(const char *listen_str, const char *auth_token,
              * zombie), close the listening fd, clear the pointer; stop
              * has already been raised for it to exit */
             atomic_store(&g_rp_stop, 1);
-            log_err("relay proxy: relay threads: %s", strerror(errno));
+            /* R37 L3: strerror() must be fed the pthread_* RETURN CODE,
+             * not errno (pthread_* do not touch errno — the old line
+             * printed "Success" for a real EAGAIN/ENOMEM failure). */
+            log_err("relay proxy: cannot start relay threads (rc=%d: %s)",
+                    rc, strerror(rc));
             if (tu_created)
                 pthread_detach(tu);
             g_rp_current = NULL;
@@ -1670,7 +1804,11 @@ int relay_proxy_start(const char *listen_str, const char *auth_token,
     pthread_detach(td);
     g_rp_current = rp;
 
-    if (pthread_create(&accept_th, NULL, rp_accept_main, rp) != 0) {
+    /* R37 L3: this spawn failure point previously had NO log line at all
+     * (the relay silently never accepted anything). Report the pthread
+     * return code, never errno. */
+    int arc = pthread_create(&accept_th, NULL, rp_accept_main, rp);
+    if (arc != 0) {
         /* M5/L2: accept failed — the two direction threads are already
          * detached and running with g_rp_stop=0 and g_rp_current=rp.
          * Without this cleanup g_rp_current would dangle past this rp's
@@ -1679,6 +1817,8 @@ int relay_proxy_start(const char *listen_str, const char *auth_token,
          * array concurrently (data corruption). Stop them and clear the
          * dangling pointer, aligned with the relay-thread failure path
          * above, before closing the listener. */
+        log_err("relay proxy: cannot start accept thread (rc=%d: %s); "
+                "relay not started", arc, strerror(arc));
         atomic_store(&g_rp_stop, 1);
         g_rp_current = NULL;
         port_close(fd);

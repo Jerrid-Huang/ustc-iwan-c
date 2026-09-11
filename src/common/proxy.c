@@ -186,7 +186,12 @@ static int send_ctrl(pump_ctx_t *ctx, uint8_t typ, uint8_t enc, uint16_t sid,
 /* no downlink for this long => session lost: the server purged or
  * rebooted the session. Not all servers answer ECHO_REQ keepalives (a
  * live-but-silent session then produces no downlink at all), so the
- * threshold is overridable: IWAN_RX_STALE_MS (default 120s, 10s..24h).
+ * threshold is overridable: IWAN_RX_STALE_MS (default 120s,
+ * 30s..24h). The lower bound MUST stay well above PUMP_KEEPALIVE_MS:
+ * the watchdog runs at the top of the loop, before this iteration's
+ * ECHO_REQ and a whole RTT before its answer, so a threshold equal to
+ * the keepalive period declared a perfectly healthy session stale on
+ * every cycle (R1E-1; socks.c uses the same 30s bound).
  *
  * 120s (not 60s): the USTC servers answer every ECHO_REQ, so a long
  * downlink silence means the return path is dropping UDP, not that the
@@ -208,9 +213,10 @@ static unsigned pump_rx_stale_ms(void)
         return cached;
     parsed = 1;
     cached = (unsigned)env_ms_range("IWAN_RX_STALE_MS",
-                                    PUMP_RX_STALE_MS_DEFAULT, 10000,
+                                    PUMP_RX_STALE_MS_DEFAULT,
+                                    3 * (long long)PUMP_KEEPALIVE_MS,
                                     86400000, 1, "(0 to disable, "
-                                                 "10s..24h)");
+                                                 "30s..24h)");
     return cached;
 }
 #define PUMP_POLL_CEIL_MS 1000  /* cap on the recvmmsg park timeout */
@@ -220,8 +226,9 @@ static unsigned pump_rx_stale_ms(void)
  * (pace_bucket / pace_bucket_init / pace_take), same policy as socks.c.
  * The bucket is not thread-safe, so pace_take runs under send_lock. */
 
-/* flush a TX batch after this much time instead of always waiting for it
- * to fill: bounds the added latency under sustained load (batch fill) */
+/* flush a TX batch after PUMP_MAX_LAT_US instead of always waiting for
+ * it to fill: bounds the added latency under sustained load (the macro
+ * lives in proxy_internal.h so pump_win_single.c sees the same value) */
 
 static _Thread_local pump_tx_t g_tx;   /* Linux per-reader batch */
 
@@ -511,6 +518,10 @@ static void pump_tun_pkt(void *ud, uint8_t *pkt, size_t len, bool last)
             q->batch = malloc((size_t)PUMP_BATCH * slot);
             if (!q->batch) {
                 log_err("out of memory");
+                /* R1-B2-1: mark it abnormal like every other pump-fatal
+                 * stop, so a TUN-write -1 that observes this g_stop
+                 * still yields rc=1 (reconnect) instead of rc=0 */
+                ctx->session_lost = true;
                 g_stop = 1;
                 return;
             }
@@ -628,9 +639,10 @@ static void *udp2tun_thread(void *ud) {
         uint64_t now = now_ms();
         if (pump_rx_stale_ms() != 0 && now - last_rx > pump_rx_stale_ms()) {
             /* the server answers our ECHO_REQ keepalives, so a live
-             * session always produces downlink within ~10s; 60s of
-             * silence means the session is gone (server purge/reboot)
-             * even if the socket itself still sends */
+             * session always produces downlink within ~10s;
+             * IWAN_RX_STALE_MS of silence (default 120s) means the
+             * session is gone (server purge/reboot) even if the socket
+             * itself still sends */
             log_err("[UDP->TUN] no downlink for %llu ms; session lost",
                     (unsigned long long)(now - last_rx));
             ctx->session_lost = true;
@@ -675,10 +687,10 @@ static void *udp2tun_thread(void *ud) {
              * Windows emulation regresses to returning 0 for an empty
              * queue, incl. a spurious EINTR/ECONNRESET on an empty one):
              * it parks exactly like EAGAIN instead of falling through to
-             * `last_rx = now_ms()`, which (a) reset the 60s stale-
-             * downlink watchdog on every spurious wake and (b) with a
-             * repeating ICMP ECONNRESET did not park, busy-looping the
-             * core (the same shape M12 fixed for EAGAIN). */
+             * `last_rx = now_ms()`, which (a) reset the stale-downlink
+             * watchdog (IWAN_RX_STALE_MS) on every spurious wake and (b)
+             * with a repeating ICMP ECONNRESET did not park, busy-looping
+             * the core (the same shape M12 fixed for EAGAIN). */
             atomic_fetch_add(&g_prof_recv_empty, 1);
             uint64_t ka_ms = last_ka + PUMP_KEEPALIVE_MS;
             uint64_t now_msv = now_ms();
@@ -709,7 +721,6 @@ static void *udp2tun_thread(void *ud) {
             g_stop = 1;   /* any pump-fatal error stops the tunnel */
             break;
         }
-        last_rx = now_ms();   /* any datagram resets the stale clock */
 #ifndef IWAN_DEBUG_STRIP
         {
             static struct prof_state pst_rx, pst_tx;
@@ -734,6 +745,14 @@ static void *udp2tun_thread(void *ud) {
                 atomic_fetch_add(&g_prof_recv_badtok, 1);
                 continue;
             }
+            /* R1E-2: only a frame that PASSED the sid/token gate is a
+             * genuine downlink for THIS session, so the stale-session
+             * clock is refreshed HERE and not on "any datagram" as
+             * before: a forged/stale frame (wrong sid or token) could
+             * otherwise keep the watchdog asleep forever and leave the
+             * client a zombie. Mirrors the A-4 fix in socks.c
+             * (vpn_handle_datagram). */
+            last_rx = now_ms();
             if (t == PT_CLOSE) {
                 /* control packets carry the 16-byte header sig */
                 if (!verify_sig(m, (size_t)n))
@@ -792,6 +811,9 @@ static void *udp2tun_thread(void *ud) {
              * carries IPv6 downlink (--proxy-cidr6 / --proxy-domain6)
              * and must not reject it with the IPv4-only gate. */
             size_t plen = (size_t)(n - 8);
+            if (plen == 0)
+                continue;   /* R1-B2-9: len==8 frame: no inner byte to
+                             * dispatch on (m[8] was never written) */
             if ((m[8] >> 4) == 6) {
                 /* inner IPv6: mirror the SOCKS R23-F1 gate */
                 uint8_t s6[16], d6[16], want6[16];
@@ -843,8 +865,34 @@ static void *udp2tun_thread(void *ud) {
                                      PUMP_SEND_RETRY_MS, &g_stop);
             pump_prof_add(&ctx->prof[PP_TUNWRITE], now_us() - tw0);
             if (wr != 0) {
-                if (!g_stop)
-                    log_err("tun write: %s", strerror(errno));
+                /* R1-B2-1/-3: -1 has three different causes and the old
+                 * "wr != 0 => session lost" treated all of them as a
+                 * dead device. Classify on WHO stopped / which errno:
+                 *  - g_user_stop: Ctrl-C. tun_write_retry noticed the
+                 *    stop flag and returned without touching errno; this
+                 *    is the caller's clean-stop path (rc=0), NOT a lost
+                 *    session (previously the 1s fake "reconnecting"
+                 *    delay + exit code 1 on every Ctrl-C under load).
+                 *  - g_stop: another thread already declared the reason
+                 *    (its writer sets session_lost), or the pump_tun_pkt
+                 *    OOM below did — rc must stay 1 there.
+                 *  - EAGAIN/EWOULDBLOCK: the 5ms budget expired while
+                 *    the TUN write side was transiently full (tun.c:349,
+                 *    tun_win.c driver stalls). Per the comment above the
+                 *    frame is simply dropped and inner TCP recovers;
+                 *    tearing the session down here made a healthy tunnel
+                 *    reconnect on backpressure.
+                 * Anything else (ENODEV/EIO/EMSGSIZE/EINVAL) is fatal. */
+                if (g_user_stop)
+                    break;   /* user stop: clean, caller returns 0 */
+                if (g_stop)
+                    break;   /* stop already classified by its writer */
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    log_debug("tun write: transient %s, frame dropped",
+                              strerror(errno));
+                    continue;
+                }
+                log_err("tun write: %s", strerror(errno));
                 /* device gone (ENODEV/EIO): the session is unrecoverable
                  * from this end too — reconnect (rc=1) rather than
                  * reporting a clean user stop */
@@ -860,8 +908,18 @@ static void *udp2tun_thread(void *ud) {
 }
 
 static void on_signal(int sig) {
+#ifndef _WIN32
+    /* R1-B2-6: this runs in signal context, so only async-signal-safe
+     * calls are allowed — the old err_printf() took the stderr lock and
+     * could malloc (util.c:374-383). A constant write() is safe; on
+     * Windows the handler runs on the console-callback thread, where
+     * stdio is fine. */
+    if (sig == SIGINT)
+        (void)!write(STDERR_FILENO, "\nSIGINT -- shutting down...\n", 29);
+#else
     if (sig == SIGINT)
         err_printf("\nSIGINT -- shutting down...\n");
+#endif
     g_stop = 1;
     g_user_stop = 1;
 }
@@ -872,6 +930,43 @@ static void install_signals(void) {
      * No save/restore — the old code installed with NULL oldact, and
      * the handler lives for the process lifetime either way. */
     port_set_stop_handler(on_signal);
+}
+
+/* R37-M4: IWAN_PUMP_QUEUES override for the reader-pool queue count.
+ * Mirrors the repo's other env parsers (env_ms_range, util.c:413-438):
+ * strtol with an end pointer, rejecting an empty or partly consumed
+ * string. The old `strtol(v, NULL, 10)` silently accepted "1abc", "1.5",
+ * "1e3" and "1 " as a queue count, and silently fell back for 0/9.. with
+ * no diagnostic. Deliberately one notch stricter than env_ms_range: the
+ * first character must be a decimal digit, so " 1" and "+1" (whitespace
+ * and sign that strtol would skip) are rejected as well. No legal count
+ * needs them, and M4 lists both as silently-accepted garbage. Legal
+ * values 1..TUN_POOL_MAX keep exactly their old meaning (the override
+ * still beats the ncpu-derived cap); anything else keeps the computed
+ * default and only adds the warning the old code lacked. */
+static int pump_queues_env(int defq) {
+    const char *v = getenv("IWAN_PUMP_QUEUES");
+    char *end;
+    long qn;
+
+    if (!v || !v[0])
+        return defq;
+    if (v[0] < '0' || v[0] > '9')
+        goto bad;
+    errno = 0;
+    qn = strtol(v, &end, 10);
+    if (errno != 0 || end == v || *end != '\0')
+        goto bad;
+    if (qn < 1 || qn > TUN_POOL_MAX) {
+        log_err("IWAN_PUMP_QUEUES: %s out of range 1..%d; using %d", v,
+                TUN_POOL_MAX, defq);
+        return defq;
+    }
+    return (int)qn;
+bad:
+    log_err("IWAN_PUMP_QUEUES: invalid value '%s' (1..%d); using %d", v,
+            TUN_POOL_MAX, defq);
+    return defq;
 }
 
 static bool slist_has(const slist_t *s, const char *str) {
@@ -893,6 +988,35 @@ static void push_unique(slist_t *s, const char *str) {
  * share this skeleton; the family-specific parts are kept in the
  * branches so error text and validation rules stay identical to the
  * two originals. Returns 0 on success, -1 on a malformed target. */
+/* R2-L36: is s a numeric IPv4 spelling that inet_pton() rejects but a
+ * permissive parser (inet_aton / glibc's getaddrinfo) would silently
+ * reinterpret? strtoul(base 0) accepts hex ("0x7f") and octal ("010")
+ * components, and inet_aton accepts 1..4 dotted components ("127.1"), so
+ * any string whose components all parse that way is a DIFFERENT address
+ * than it looks. cidr_parse (the "/n" branch) rejects all of these, so
+ * accepting them here made one --proxy-cidr parameter mean two things.
+ * Strings that do not parse numerically at all (real domain names such as
+ * "dns.example", where 'd'/'s'/'n' are not digits) return false and keep
+ * going to getaddrinfo(). */
+static bool numeric_v4_spelling(const char *s)
+{
+    if (strchr(s, '.') == NULL)
+        return false;                  /* "127" alone is a domain, not v4 */
+    int parts = 0;
+    for (const char *q = s; ; ) {
+        char *end;
+        (void)strtoul(q, &end, 0);     /* base 0: 0x.. hex, 0.. octal */
+        if (end == q)
+            return false;              /* not numeric -> domain */
+        parts++;
+        if (*end == '\0')
+            return parts <= 4;         /* 1..4 components: inet_aton form */
+        if (*end != '.')
+            return false;
+        q = end + 1;
+    }
+}
+
 static int expand_route_targets_fam(const slist_t *targets, slist_t *out,
                                     int family)
 {
@@ -946,6 +1070,15 @@ static int expand_route_targets_fam(const slist_t *targets, slist_t *out,
                     free(t);
                     return -1;
                 }
+                /* R1-B2-5: mirror cidr_parse's strict first-digit check
+                 * (route.c:242-243) — without it "/ 8", "/+8" and a
+                 * bare "/" were accepted and only failed later inside
+                 * `ip -6 route` with a generic error line */
+                if (p[an + 1] < '0' || p[an + 1] > '9') {
+                    log_err("invalid IPv6 CIDR route target '%s'", p);
+                    free(t);
+                    return -1;
+                }
                 plen = strtol(p + an + 1, &end, 10);
                 if (*end != '\0' || plen < 0 || plen > 128) {
                     log_err("invalid IPv6 CIDR route target '%s'", p);
@@ -960,6 +1093,15 @@ static int expand_route_targets_fam(const slist_t *targets, slist_t *out,
                 char r32[64];
                 snprintf(r32, sizeof r32, "%s/32", p);
                 push_unique(out, r32);
+            } else if (numeric_v4_spelling(p)) {
+                /* R2-L36: reject octal/hex/short spellings instead of
+                 * letting getaddrinfo() silently install a different
+                 * network ("010.0.0.0" -> 8.0.0.0/32). Same strictness as
+                 * the CIDR branch above. */
+                log_err("invalid route target '%s' (leading zeros, hex and "
+                        "short forms are not accepted)", p);
+                free(t);
+                return -1;
             } else {
                 struct addrinfo hints;
                 memset(&hints, 0, sizeof hints);
@@ -998,6 +1140,15 @@ static int expand_route_targets_fam(const slist_t *targets, slist_t *out,
                 char r128[64];
                 snprintf(r128, sizeof r128, "%s/128", p);
                 push_unique(out, r128);
+            } else if (strchr(p, ':') != NULL) {
+                /* R2-L36 (v6 parity): a domain name can never contain ':',
+                 * so this was meant as an IPv6 literal and inet_pton already
+                 * rejected it — do not hand it to getaddrinfo(), which
+                 * accepts additional permissive spellings. */
+                log_err("invalid route target '%s' (malformed IPv6 literal)",
+                        p);
+                free(t);
+                return -1;
             } else {
                 /* domain: resolve AF_INET6 */
                 struct addrinfo hints;
@@ -1070,6 +1221,19 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
              const char *auth_tun_ip, uint16_t auth_mtu) {
     char ogw[16] = "", odev[16] = "", ogw_metric[16] = "";
 
+    /* R1-B2-2: install the stop handler BEFORE any blocking setup work.
+     * The route setup below forks `ip` several times (tens..hundreds of
+     * ms); on the first run a SIGINT/SIGHUP landing in that window used
+     * to run the DEFAULT disposition and kill the process after route
+     * replacement but before the handler existed, leaving the host with
+     * no default route (the TUN device unregisters and takes its route
+     * with it; the pre-VPN default is restored only by route_teardown).
+     * With the handler installed first, such a stop sets the flags and
+     * is honored by the g_user_stop check below/after setup, which
+     * rolls the routes back. socks.c installs its handler before its
+     * own setup loop for the same reason. */
+    install_signals();
+
     slist_t routes;
     slist_init(&routes);
     if (expand_route_targets(route_targets, &routes) != 0) {
@@ -1091,6 +1255,9 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
         if (!capture_default(ogw, odev, ogw_metric)) {
             log_err("cannot detect default route");
             slist_free(&routes);
+            slist_free(&routes6);   /* R1-B2-4: routes6 was expanded
+                                     * above; the sibling error paths
+                                     * free both lists */
             return -1;
         }
         log_debug("default route: via %s dev %s%s%s", ogw, odev,
@@ -1146,10 +1313,14 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
                         ogw_metric, &routes, had_routes, &routes6);
         slist_free(&routes);
         slist_free(&routes6);
-        return -1;
+        /* R1-B2-7: rc=0, the caller's "the user stopped it" code, not
+         * the startup-failure code -1 (callers printed "tunnel setup
+         * failed; giving up" and exited 1 for a Ctrl-C, contradicting
+         * the three-state contract; run_socks returns 0 for the same
+         * pre-loop stop, socks.c:984). */
+        return 0;
     }
     g_stop = 0;
-    install_signals();
 
     pump_ctx_t ctx;
     memset(ctx.prof, 0, sizeof ctx.prof);
@@ -1224,12 +1395,7 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
         int maxq = TUN_POOL_MAX;
         if (ncpu > 0 && ncpu < maxq)
             maxq = (int)ncpu;
-        const char *qv = getenv("IWAN_PUMP_QUEUES");
-        if (qv) {
-            long qn = strtol(qv, NULL, 10);
-            if (qn > 0 && qn <= TUN_POOL_MAX)
-                maxq = (int)qn;
-        }
+        maxq = pump_queues_env(maxq);   /* R37-M4: validated, warns */
         ctx.pool = tun_pool_create(tun_name, tun_fd, maxq, maxq,
                                    pump_tun_pkt, &ctx, &g_stop);
         if (!ctx.pool) {

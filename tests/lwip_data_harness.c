@@ -70,7 +70,7 @@ static size_t peer_build(uint8_t *out, uint32_t sip, uint32_t dip,
                          const uint8_t *payload, size_t paylen,
                          uint16_t mss_opt, uint8_t wscale)
 {
-    size_t optlen = (mss_opt ? 4 : 0) + (wscale ? 4 : 0);
+    size_t optlen = (mss_opt ? 4u : 0u) + (wscale ? 4u : 0u);
     size_t thlen = 20 + optlen;
     size_t tot = 20 + thlen + paylen;
     memset(out, 0, 20);
@@ -125,7 +125,7 @@ static size_t peer_build6(uint8_t *out, const uint8_t sip[16],
                           uint8_t flags, const uint8_t *payload,
                           size_t paylen, uint16_t mss_opt, uint8_t wscale)
 {
-    size_t optlen = (mss_opt ? 4 : 0) + (wscale ? 4 : 0);
+    size_t optlen = (mss_opt ? 4u : 0u) + (wscale ? 4u : 0u);
     size_t thlen = 20 + optlen;
     size_t tot = 40 + thlen + paylen;
     memset(out, 0, 40);

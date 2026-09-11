@@ -191,12 +191,24 @@ static const char *const short_aliases[][2] = {
     { NULL, NULL },
 };
 
+/* R37-FIX-A2: the guard implementation lives in oidc_config.c next to
+ * normalize_path(); the CLI gate here and the oidc_save_config() backstop
+ * MUST share it, otherwise a spelling this gate accepts could still be a
+ * root write. (Declared locally because oidc.h was outside the fix's
+ * file scope; moving it there later is a one-line change.) */
+bool oidc_config_dir_resolves_to_root(const char *dir);
+
 /* R14-M-2: an empty or all-whitespace --config-dir joins with
  * "/servers.json" into "/servers.json" (and "--config-dir '//'" into
  * "///servers.json"), which would make oidc_save_config write into the
  * filesystem ROOT as root (sudo re-exec). This CLI parse gate is the
  * first authoritative check; oidc_config.c's save guard is the second
- * (backstop for any other caller). */
+ * (backstop for any other caller).
+ * R37-FIX-A2: also reject every spelling that RESOLVES to the root once
+ * "." and ".." components are applied ("/..", "/foo/..", "/tmp/../..",
+ * "C:\"): those are not "all separators", so the old check let them
+ * through to the (then equally blind) save guard. "~" is expanded later
+ * (see iwan_client_oidc.c), which re-checks the expanded value. */
 static bool validate_config_dir(const char *val, char *err, size_t errsz)
 {
     const char *p = val;
@@ -207,6 +219,12 @@ static bool validate_config_dir(const char *val, char *err, size_t errsz)
         snprintf(err, errsz, "must not be empty or all whitespace "
                  "(it would make the config path resolve to the "
                  "filesystem root)");
+        return false;
+    }
+    if (oidc_config_dir_resolves_to_root(val)) {
+        snprintf(err, errsz, "must not name the filesystem root "
+                 "(all separators, or a \"..\"/drive-root spelling that "
+                 "resolves to it)");
         return false;
     }
     return true;

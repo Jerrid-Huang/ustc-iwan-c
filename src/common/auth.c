@@ -381,6 +381,45 @@ int get_ct(const char *user, const char *pass, const char *ct_pass_hex,
 #define AUTH_SEND_MAX       4
 #define AUTH_RETRY_DELAY_US 1000000
 
+/* M7/R2-B5-1: port_send() returns a byte count and can perform a short
+ * write. The old loop only looked for `< 0` and then went straight to
+ * recv(), so a truncated OPEN (a forced 1-byte send reproduces this:
+ * only 1 byte of the frame left the host) was followed by the whole
+ * ~16s retry cycle and a bare "auth failed", while the server never saw
+ * a complete request. Send the entire frame, resuming on short writes
+ * and EINTR. A zero-byte send means the peer closed without accepting
+ * the frame, and a permanent error is reported with the byte counts so
+ * the failure is diagnosable instead of silent. */
+static int auth_send_open(int fd, const uint8_t *pkt, size_t len) {
+    size_t off = 0;
+    uint64_t t0 = port_now_ms();
+
+    while (off < len) {
+        ssize_t w = port_send(fd, pkt + off, len - off, 0);
+        if (w > 0) {
+            off += (size_t)w;
+            continue;
+        }
+        if (w < 0 && errno == EINTR)
+            continue;   /* interrupted before any byte: retry */
+        /* the AUTH socket is blocking with SO_SNDTIMEO=3s (udp_connect),
+         * so EAGAIN means the send timed out or the buffer is full; give
+         * it the same bounded window as one auth round trip */
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) &&
+            port_now_ms() - t0 < AUTH_TIMEOUT_MS) {
+            port_sleep_us(1000);
+            continue;
+        }
+        if (w == 0)
+            errno = EPIPE;   /* peer closed without taking the frame */
+        fprintf(stderr,
+                "Error: send OPEN (%zu of %zu bytes)\n\nCaused by:\n    %s (os error %d)\n",
+                off, len, strerror(errno), errno);
+        return -1;
+    }
+    return 0;
+}
+
 int do_auth(const char *server, uint16_t port, const uint8_t *open_pkt, size_t open_len,
             uint32_t nonce, int style, AuthResult *r)
 {
@@ -391,10 +430,7 @@ int do_auth(const char *server, uint16_t port, const uint8_t *open_pkt, size_t o
         return -1;
 
     for (int i = 0; i < AUTH_SEND_MAX; i++) {
-        if (port_send(fd, open_pkt, open_len, 0) < 0) {
-            fprintf(stderr,
-                    "Error: send OPEN\n\nCaused by:\n    %s (os error %d)\n",
-                    strerror(errno), errno);
+        if (auth_send_open(fd, open_pkt, open_len) != 0) {
             port_close(fd);
             return -1;
         }

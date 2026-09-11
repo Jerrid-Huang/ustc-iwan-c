@@ -466,6 +466,10 @@ int oidc_ctrl_post(const char *path, const char *body,
     sign_request(path, body, ts, nonce, sig);
 
     char *auth = malloc(strlen(kp_token) + 32);
+    if (!auth)
+        oidc_die("out of memory");   /* fail closed: same as the state-file
+                                      * allocation above; snprintf(NULL, ...)
+                                      * would SEGV */
     snprintf(auth, strlen(kp_token) + 32, "Authorization: Bearer %s",
              kp_token);
     char ts_hdr[64];

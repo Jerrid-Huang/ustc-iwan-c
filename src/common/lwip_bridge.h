@@ -8,9 +8,10 @@
  * IWAN_TCP_STACK CMake option; see tcpstack.h.
  *
  * The public surface (types + function signatures + the 3 Netstack fields
- * and 4 TcpConn fields the socks layer reads) is kept byte-compatible with
- * netstack.h. Bridge-internal state (the lwIP netif, tx queue, scratch
- * buffers) is additional and never touched by the socks layer.
+ * and 4 TcpConn fields the socks layer reads) matches the removed historical
+ * netstack.h implementation, so socks.c / socks_flow.c compile unchanged.
+ * Bridge-internal state (the lwIP netif, tx queue, scratch buffers) is
+ * additional and never touched by the socks layer.
  */
 
 #include <stdbool.h>
@@ -119,7 +120,6 @@ typedef struct Netstack {
                                      * stale entry can never mis-route */
     uint8_t  q_used[NS_MAX_CONN];   /* per-conn tx-queue slots (fair share) */
     uint32_t connect_timeout_ms;
-    int      active_count;          /* live conns (idle sleep optimization) */
 } Netstack;
 
 /* ---------------- ns_* API (signatures match netstack.h) ---------------- */
@@ -140,10 +140,17 @@ int  ns_send_commit(Netstack *ns, int idx, size_t n);
 void ns_close(Netstack *ns, int idx);
 void ns_abort(Netstack *ns, int idx);
 void ns_rx_packet(Netstack *ns, const uint8_t *pkt, size_t n);
-/* Zero-copy RX path: acquire() hands out receive buffers that the VPN
- * recv loop fills directly with a datagram (outer header first); pass the
- * buffer base + outer length to ns_rx_packet_ref, which wraps the inner
- * packet in a lwIP PBUF_REF custom pbuf and returns the buffer to the
+/* Capacity of one zero-copy RX pool slot (lwip_bridge.c: NS_RX_POOL slots of
+ * this size, inner-packet payload capacity NS_RX_SLOT - IWAN_HDR_LEN). The
+ * VPN recv loop fills the acquired buffers directly, so its iov_len MUST be
+ * this value — socks.c uses the macro and _Static_asserts its own RX_SLOT
+ * against it instead of keeping a private copy that could drift. */
+#define NS_RX_SLOT 2048
+
+/* Zero-copy RX path: acquire() hands out receive buffers of NS_RX_SLOT bytes
+ * that the VPN recv loop fills directly with a datagram (outer header first);
+ * pass the buffer base + outer length to ns_rx_packet_ref, which wraps the
+ * inner packet in a lwIP PBUF_REF custom pbuf and returns the buffer to the
  * pool only when lwIP frees it. Callers that drop a datagram must call
  * ns_rx_buf_release() themselves. */
 int  ns_rx_buf_acquire(void **bufs, int max);
@@ -160,5 +167,17 @@ const uint8_t *ns_tx_item_buf(const struct TxItem *it);
  * tcp_txnow() retries the pending output immediately instead of waiting
  * for an ACK/timer/RTO. No-op on the native stack. */
 void ns_tx_kick(Netstack *ns);
+
+/* ---------------- bridge extensions (socks_flow.c) ---------------- */
+/* FIND-R2-5 slot lifetime: ns_flow_ref marks a conn slot as referenced by a
+ * live Flow (f->ns_idx), ns_flow_unref releases it; conn_slot_alloc refuses a
+ * referenced slot, which is what keeps a stale f->ns_idx from aliasing a
+ * reuse. Both run on the single event-loop thread that also drives lwIP, so
+ * they need no locking. */
+int  ns_flow_ref(int idx);
+void ns_flow_unref(int idx);
+/* FIND-F03-3: does lwIP still hold local port p (TIME_WAIT pcb, or a pcb
+ * parked in LAST_ACK)? alloc_port uses it to avoid a tcp_bind ERR_USE. */
+bool ns_port_tw_held(uint16_t p);
 
 #endif /* IWAN_LWIP_BRIDGE_H */

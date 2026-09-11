@@ -27,8 +27,15 @@ int  tun_attach(const char *name);   /* extra queue fd or -1 */
  * failure). The server calls this while still root so the de-privileged
  * child can pass the fds to tun_pool_create_pre and keep a real
  * multi-queue fan-out. Returns the number actually opened (0 on non-Linux
- * where tun_attach is unavailable). */
+ * where tun_attach is unavailable).
+ * R37 R1E-2: Linux/macOS only — the Windows backend (tun_win.c) is a
+ * single-queue wintun pool and implements none of the multi-queue API
+ * (tun_attach_many, tun_pool_create_pre, tun_reader_qid); declaring them
+ * there promised symbols that do not exist (link-time undefined reference).
+ * The only callers live in the Linux-only iwan-server target. */
+#ifndef _WIN32
 int  tun_attach_many(const char *name, int *fds, int maxn);
+#endif
 
 /* The interface name to hand to ifconfig/route etc. Linux/Windows:
  * the requested name IS the interface. macOS: utun devices are named
@@ -130,11 +137,13 @@ struct tun_pool *tun_pool_create(const char *name, int fd0, int maxq,
  * ordinary extra queues (closed by tun_pool_destroy), and any the pool
  * does not need are closed during create. Pass prefds=NULL/npre=0 for the
  * plain behavior. The server uses this to keep a real multi-queue fan-out
- * after fork+setuid (see tun_attach_many). */
+ * after fork+setuid (see tun_attach_many). Linux/macOS only (R37 R1E-2). */
+#ifndef _WIN32
 struct tun_pool *tun_pool_create_pre(const char *name, int fd0, int maxq,
                                      int initq, const int *prefds, int npre,
                                      tun_pkt_fn cb, void *ud,
                                      atomic_bool *abort);
+#endif
 /* actual number of reader threads currently running: adapts (AIMD
  * grow/shrink) on Linux, always 1 on Windows (wintun is single-queue) */
 int tun_pool_queues(const struct tun_pool *p);
@@ -148,8 +157,13 @@ void tun_pool_note_stall(struct tun_pool *p);
 /* queue index of the calling reader thread (0-based, set at thread
  * start): lets a per-queue consumer (server downlink fd + batch state)
  * pick its own state inside the packet callback without changing the
- * callback signature. Always 0 on Windows (single-queue wintun pool). */
+ * callback signature. Linux/macOS only (R37 R1E-2: the Windows wintun
+ * backend is single-queue and has no such thread-local, so the previous
+ * "Always 0 on Windows" promise described a function that did not exist
+ * there). */
+#ifndef _WIN32
 int tun_reader_qid(void);
+#endif
 void tun_pool_set_exit_cb(struct tun_pool *p, tun_exit_fn cb);
 void tun_pool_tick(struct tun_pool *p);
 void tun_pool_destroy(struct tun_pool *p);

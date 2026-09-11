@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "profile.h"
 #include "util.h"
@@ -9,7 +10,12 @@ atomic_int g_prof_on;
 #ifndef IWAN_DEBUG_STRIP
 void prof_init(void)
 {
-    if (getenv("IWAN_PROFILE"))
+    /* R37 WG6 #4: "set" was not the documented contract (profile.h says
+     * IWAN_PROFILE=1); treat the usual off-spellings as off, matching
+     * debug_enabled() in util.c */
+    const char *v = getenv("IWAN_PROFILE");
+    if (v && *v && strcmp(v, "0") != 0 && strcmp(v, "false") != 0 &&
+        strcmp(v, "no") != 0 && strcmp(v, "off") != 0)
         atomic_store(&g_prof_on, 1);
 }
 #endif

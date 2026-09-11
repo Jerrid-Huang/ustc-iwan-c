@@ -58,7 +58,7 @@ static void peer_send(const Peer *pp, uint32_t seq, uint32_t ack, uint8_t flags,
                       uint8_t wscale)
 {
     uint8_t out[2048];
-    size_t optlen = (mss_opt ? 4 : 0) + (wscale ? 4 : 0);
+    size_t optlen = (mss_opt ? 4u : 0u) + (wscale ? 4u : 0u);
     size_t thlen = 20 + optlen;
     size_t tot = 20 + thlen + paylen;
     memset(out, 0, 20);

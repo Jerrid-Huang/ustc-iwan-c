@@ -67,8 +67,9 @@
  * loop (socks.c receive_vpn) fills them directly with one datagram, so
  * the rx_buf -> pbuf memcpy is gone. A buffer returns to the pool only
  * when lwIP frees the pbuf (custom_free_function), which is safe: the
- * recv loop cannot reuse it while lwIP still holds a reference. */
-#define NS_RX_SLOT 2048
+ * recv loop cannot reuse it while lwIP still holds a reference.
+ * NS_RX_SLOT (the per-slot capacity the recv loop's iov_len must use) is
+ * published in lwip_bridge.h so socks.c references the same macro. */
 #define NS_RX_POOL 256
 
 struct ns_rx_slot {
@@ -658,6 +659,66 @@ static int ns_flow_held(int idx)
     return g_flow_ref[idx] != 0;
 }
 
+/* R37 R1-A-9: lwIP frees a pcb *silently* in two places — tcp_alloc()'s
+ * tcp_kill_timewait() (MEMP_NUM_TCP_PCB exhausted) and tcp_slowtmr()'s
+ * TIME_WAIT expiry — with no err callback, and tcp_alloc hands the very same
+ * memp element to the pcb it is allocating. A TcpConn slot that still points
+ * at the old pcb therefore (a) dangles and (b) can ALIAS an unrelated live
+ * connection, so ns_tick's conn_reconcile_rxq() would tcp_recved() into the
+ * new connection's rcv_wnd and ns_abort() on the stale slot would kill it.
+ * Two independent tests catch both halves:
+ *   - identity: every live bridge pcb has callback_arg == its TcpConn
+ *     (tcp_arg in conn_pcb_new). Once lwIP recycled the element for another
+ *     connection that field holds the OTHER slot's pointer, so the stale
+ *     slot fails here even though its pointer is on a list again.
+ *   - membership: a silently freed element that has not been recycled yet
+ *     sits in lwIP's memp free list and is on none of tcp_bound_pcbs /
+ *     tcp_active_pcbs / tcp_tw_pcbs (MEMP_OVERFLOW_CHECK is 0, so the freed
+ *     payload is not pattern-filled), so the stale slot fails here too.
+ * Both walks read lwIP's own lists directly, exactly like ns_port_tw_held,
+ * and run on the single event-loop thread that owns lwIP: no locking. */
+static bool conn_pcb_alive(const TcpConn *c)
+{
+    const struct tcp_pcb *p;
+    if (c->pcb->callback_arg != (const void *)c)
+        return false;
+    for (p = tcp_active_pcbs; p != NULL; p = p->next)
+        if (p == c->pcb)
+            return true;
+    for (p = tcp_tw_pcbs; p != NULL; p = p->next)
+        if (p == c->pcb)
+            return true;
+    for (p = tcp_bound_pcbs; p != NULL; p = p->next)
+        if (p == c->pcb)
+            return true;
+    return false;
+}
+
+/* Reclaim every slot whose pcb lwIP released behind the bridge's back.
+ * Mirrors R2-1 / ns_abort's unconditional slot clear (and R07-FIX B-4's
+ * rxq/rxq_unrecved invariant): pcb=NULL so no later call can touch the freed
+ * or recycled element, reap_pending=1 for the same one-round reuse
+ * protection bridge_err gives, and the undelivered downlink tail is dropped
+ * because a slot with pcb==NULL is detached by the flow layer before it can
+ * be drained (same data loss ns_abort documents). Called from ns_tick (top
+ * and after sys_check_timeouts, so neither conn_reconcile_rxq nor the
+ * caller's reap can act on a stale pcb) and right after every successful
+ * connect, because ns_connect is the only path that can trigger
+ * tcp_alloc -> tcp_kill_timewait in the middle of a round. */
+static void conn_sweep_stale(Netstack *ns)
+{
+    for (int i = 0; i < NS_MAX_CONN; i++) {
+        TcpConn *c = &ns->conns[i];
+        if (c->pcb == NULL || conn_pcb_alive(c))
+            continue;
+        c->pcb = NULL;
+        c->state = NS_CLOSED;
+        c->reap_pending = 1;
+        c->rxq_unrecved = 0;
+        buf_free(&c->rxq);
+    }
+}
+
 /* slot allocation + pcb setup shared by ns_connect / ns_connect6 */
 static int conn_slot_alloc(Netstack *ns, TcpConn **out)
 {
@@ -717,8 +778,15 @@ static int conn_connect_af(Netstack *ns, uint16_t lport, uint8_t af,
     c->rport = rport;
 
     struct tcp_pcb *pcb = conn_pcb_new(c);
-    if (pcb == NULL)
+    if (pcb == NULL) {
+        /* R2-L29 (R1-A-9 regression): tcp_new() runs tcp_alloc, whose
+         * pool-exhaustion path (tcp_kill_timewait) silently frees the oldest
+         * TIME_WAIT pcb even when the allocation then fails. Sweep before
+         * returning, or the slot owning that pcb stays dangling for the rest
+         * of the round. */
+        conn_sweep_stale(ns);
         return -1;
+    }
 
     ip_addr_t ip;
     if (af == 6) {
@@ -744,6 +812,12 @@ static int conn_connect_af(Netstack *ns, uint16_t lport, uint8_t af,
     c->pcb = pcb;
     c->state = NS_SYN_SENT;
     ns->lport_map[lport] = (int8_t)idx;   /* O(1) output-parse hint */
+    /* R37 R1-A-9: tcp_new() above may have run tcp_alloc ->
+     * tcp_kill_timewait() and recycled an older slot's TIME_WAIT pcb in
+     * place. Re-validate every slot NOW, before the rest of this event-loop
+     * round (other flows' spill in service_local_inputs) can write through a
+     * stale slot into this new connection's pcb. */
+    conn_sweep_stale(ns);
     return idx;
 
 fail:
@@ -756,6 +830,17 @@ fail:
      * use-after-free write into the returned memp (FIND-F03-2). */
     tcp_abort(pcb);   /* async bridge_err already ran; pcb now free */
     c->pcb = NULL;
+    /* R2-L29 (R1-A-9 regression): conn_pcb_new's tcp_new() above may have
+     * silently freed ANOTHER slot's TIME_WAIT pcb (tcp_alloc ->
+     * tcp_kill_timewait) even though this connect then failed at
+     * tcp_bind/tcp_connect. Without this sweep that slot keeps a dangling
+     * c->pcb for the rest of the round, and ns_send_reservev/ns_send_commit
+     * would read or write the freed (or already recycled) memp element.
+     * Run it AFTER tcp_abort so lwIP's lists and the memp pool are final:
+     * tcp_abort frees this attempt's pcb and the sweep skips pcb==NULL
+     * slots, so it can neither touch nor resurrect it. The idx<0 exit above
+     * returns before any tcp_new() call and needs no sweep. */
+    conn_sweep_stale(ns);
     return -1;
 }
 
@@ -1040,6 +1125,13 @@ int ns_tick(Netstack *ns, uint64_t now)
     int64_t next = NS_TICK_MAX_MS;
     int any_active = 0;
 
+    /* R37 R1-A-9: before anything in this round touches a pcb, drop the
+     * slots whose pcb lwIP already freed silently (tcp_kill_timewait /
+     * tcp_slowtmr TW expiry). Without this, conn_reconcile_rxq() below would
+     * tcp_recved() a freed-or-recycled pcb (UAF write / cross-connection
+     * window corruption). */
+    conn_sweep_stale(ns);
+
     for (int i = 0; i < NS_MAX_CONN; i++) {
         TcpConn *c = &ns->conns[i];
         if (c->pcb == NULL) {
@@ -1103,6 +1195,10 @@ int ns_tick(Netstack *ns, uint64_t now)
     /* drive lwIP timers: RTO retransmit, fast timer, slow timer (poll),
      * delayed ACK. sys_timeouts_sleeptime() reports the next lwIP timeout. */
     sys_check_timeouts();
+    /* R37 R1-A-9: tcp_slowtmr may just have expired TIME_WAIT pcbs without a
+     * callback; re-validate before the caller's reap_flows() (which
+     * ns_aborts slots) and before the next round's uplink writes. */
+    conn_sweep_stale(ns);
     u32_t lwip_d = sys_timeouts_sleeptime();
     if (any_active && (int64_t)lwip_d < next)
         next = (int64_t)lwip_d;

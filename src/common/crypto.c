@@ -214,8 +214,16 @@ int hex_decode(const char *hex, size_t hexlen, uint8_t *out, size_t outcap)
     if (n > outcap)
         return -1;
     for (size_t i = 0; i < n; i++) {
-        int hi = hex_nibble((unsigned char)hex[2 * i]);
-        int lo = hex_nibble((unsigned char)hex[2 * i + 1]);
+        /* hex_nibble (util.h) takes a plain `char` and accepts only the
+         * three ASCII digit ranges; every other byte — including every
+         * negative `char` (0x80..0xFF on the wire) — falls through to its
+         * -1 "invalid" result. Widening the argument to `unsigned char`
+         * first was a no-op, because the parameter converts it straight
+         * back to `char`; it only produced -Wsign-conversion noise. The
+         * byte/signed-char domains therefore classify identically and the
+         * cast is dropped. */
+        int hi = hex_nibble(hex[2 * i]);
+        int lo = hex_nibble(hex[2 * i + 1]);
         if (hi < 0 || lo < 0)
             return -1;
         out[i] = (uint8_t)((hi << 4) | lo);

@@ -2,6 +2,38 @@
 #include "crypto.h"   /* -> common.h -> winsock2 before windows.h */
 #include "wintun_pin.h"
 
+/* R37 WG6 #3: pin comparison, moved out of the _WIN32 body so the host
+ * test TU can drive the real code. Constant-time-ish: no early exit, the
+ * result is a single OR-accumulated difference. A non-hex pin digit yields
+ * the out-of-range value 0x100 instead of the old sscanf()-failure "0", so
+ * a malformed pin can never match a real digest byte (fail-closed) — the
+ * old code made every non-hex nibble compare equal to a 0x0 hash nibble.
+ * static inline: unused on non-Windows builds without -Wunused-function. */
+static inline int pin_hexval(char c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+static inline bool pin_matches(const char *want, const uint8_t hash[32])
+{
+    if (!want || strlen(want) != 64)
+        return false;   /* no/unset/odd-length pin: never a match */
+    unsigned diff = 0;
+    for (int i = 0; i < 32; i++) {
+        int hi = pin_hexval(want[i * 2]);
+        int lo = pin_hexval(want[i * 2 + 1]);
+        unsigned a = (hi < 0 || lo < 0) ? 0x100u : (unsigned)(hi * 16 + lo);
+        diff |= a ^ hash[i];
+    }
+    return diff == 0;
+}
+
 #ifdef _WIN32
 
 #include <stdio.h>
@@ -43,22 +75,9 @@ bool wintun_pin_ok(const wchar_t *path)
     sha256(buf, total, hash);
     free(buf);
 
-    char hex[65];
-    for (int i = 0; i < 32; i++)
-        snprintf(hex + i * 2, 3, "%02x", hash[i]);
-
-    /* constant-time-ish compare against the pin */
-    if (strlen(want) != 64)
-        return false;
-    unsigned diff = 0;
-    for (int i = 0; i < 32; i++) {
-        unsigned a, b;
-        if (sscanf(want + i * 2, "%02x", &a) != 1)
-            a = 0;
-        b = hash[i];
-        diff |= a ^ b;
-    }
-    return diff == 0;
+    /* constant-time-ish compare against the pin; malformed pins fail
+     * closed (see pin_matches) */
+    return pin_matches(want, hash);
 }
 
 /* narrow (ANSI) wrapper for wintun_fetch.c, which works in char paths */

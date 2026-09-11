@@ -39,7 +39,7 @@ Usage: iwan-client-oidc [OPTIONS] --fetch | --list | --connect | --all
 | `--config-dir <DIR>` | 配置目录（默认 `~/.config/iwan`；Windows：`%USERPROFILE%\.config\iwan`） |
 | `--tun <TUN>` | TUN 设备名（默认 `iwan0`） |
 | `--socks` | 改用纯 SOCKS5 模式（免 root，无需 TUN 设备） |
-| `--socks-listen <ADDR:PORT>` | SOCKS 模式：代理监听地址（默认 `127.0.0.1:1080`）；**TUN 模式：可选附加** SOCKS5+HTTP 代理（默认不启用） |
+| `--socks-listen <ADDR:PORT>` | SOCKS 模式：代理监听地址（默认 `127.0.0.1:1080`）；**TUN 模式：同样默认启用**的附加 SOCKS5+HTTP 代理监听地址（默认 `127.0.0.1:1080`，与 `--help` 一致）。该端口若已被占用，TUN 连接会以 `cannot start the SOCKS5+HTTP proxy` 失败退出（不静默降级） |
 | `--socks-mtu <MTU>` | SOCKS 模式下内层 TCP 的 MSS/MTU（默认 `1380`） |
 | `--socks-token <TOKEN>` | SOCKS5 RFC1929 密码认证（与 `--socks-no-token` 互斥） |
 | `--socks-no-token` | 显式允许无密码代理（配合 `--allow-remote`） |
@@ -169,7 +169,7 @@ sudo ./iwan-server --port 6001 --tun iwan-srv \
 | `-u, --users <FILE>` | 用户文件（`username:password` 每行，权限 600） |
 | `-n, --nat-if <IF>` | 做 NAT 的物理网卡（自动配置 iptables MASQUERADE） |
 | `-T, --no-tun` | 测试模式：不开 TUN，把包镜像回客户端（免 root） |
-| `-U, --user <USER>` | 单用户模式（与 `--users` 文件二选一） |
+| `--user <NAME>` | setup 完成后降权到该用户（默认 `nobody`）；用户文件仍必需。注意：**没有** `-U` 短选项（仅长选项，`--help` 也只列 `--user`；`iwan-server -U x` 报 invalid option） |
 | `-h, --help` | 帮助 |
 
 服务器启动时自动启用 IPv4 转发并配置 iptables MASQUERADE（需要 root，`--no-tun` 测试模式除外）。

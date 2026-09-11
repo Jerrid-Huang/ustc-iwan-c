@@ -39,7 +39,25 @@ static int open_tun_flags(const char *name, int extra_flags) {
     if (fd < 0)
         return -1;
     memset(&ifr, 0, sizeof ifr);
-    ifr.ifr_flags = IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE | extra_flags;
+    /* ifr_flags is a kernel-ABI *bit container* (`short`, 16 bits), not an
+     * arithmetic value: TUNSETIFF only tests its bits, and IFF_TUN_EXCL
+     * (0x8000) deliberately sets the top one, so the combined value 0x9101
+     * exceeds SHRT_MAX. Build the mask in unsigned, refuse anything that
+     * does not fit the 16-bit field (defence in depth — today's only
+     * callers pass IFF_TUN_EXCL or 0), then copy the exact bit pattern in,
+     * instead of an implementation-defined int->short conversion. */
+    _Static_assert(sizeof(uint16_t) == sizeof ifr.ifr_flags,
+                   "TUNSETIFF flag field must be exactly 16 bits");
+    unsigned int flags =
+        (unsigned int)(IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE) |
+        (unsigned int)extra_flags;
+    if (flags > 0xFFFFu) {
+        close(fd);
+        errno = EINVAL;
+        return -1;
+    }
+    uint16_t raw_flags = (uint16_t)flags;
+    memcpy(&ifr.ifr_flags, &raw_flags, sizeof raw_flags);
     strncpy(ifr.ifr_name, name, IFNAMSIZ - 1);
     if (ioctl(fd, TUNSETIFF, &ifr) < 0) {
         int e = errno;

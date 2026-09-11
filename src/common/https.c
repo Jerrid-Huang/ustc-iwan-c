@@ -205,7 +205,7 @@ static int https_te_is_chunked(const char *val)
 int https_url_split(const char *url, char **host_out, char **path_out)
 {
     static const char scheme[] = "https://";
-    const char *auth, *slash, *at, *cut;
+    const char *auth, *slash, *cut;
     size_t alen;
 
     /* strncasecmp reads exactly 8 bytes but stops at the NUL of a
@@ -229,14 +229,16 @@ int https_url_split(const char *url, char **host_out, char **path_out)
     alen = (size_t)(cut - auth);
     if (alen == 0)
         return 0;
-    at = memchr(auth, '@', alen);
-    if (at) {
-        /* strip userinfo; the host is what follows the last '@' */
-        alen -= (size_t)(at + 1 - auth);
-        auth = at + 1;
-        if (alen == 0)
-            return 0;
-    }
+    /* R37 WG6 #2: userinfo is REJECTED, as https.h has always documented.
+     * The old code stripped everything up to the FIRST '@' and returned
+     * success (while the comment claimed "last '@'"), which made the
+     * host/path split depend on which parser looks at it
+     * ("https://host/x@evil/y": we see evil, a naive consumer sees host) —
+     * and this URL comes from remote input (Location redirect, jwks_uri).
+     * No legitimate IdP puts userinfo there, and an explicit port is
+     * rejected right below for exactly the same reason. */
+    if (memchr(auth, '@', alen))
+        return 0;
     if (memchr(auth, ':', alen))
         return 0;   /* explicit port: unsupported */
     *host_out = malloc(alen + 1);
@@ -1107,6 +1109,18 @@ static int https_tls_read(SSL *ssl, int fd, struct sbuf *resp,
     char buf[HTTPS_READ_CHUNK];
     long long content_len = -1;   /* -1: unknown (EOF-delimited) */
     size_t body_start = 0;
+    /* R1-B1-1: the header scan below used to restart at byte 0 after every
+     * 4 KiB read, so a peer that pushes the terminator late (or never)
+     * made the read O(n^2) — 12 MiB of header cost ~10 s of CPU (CWE-407,
+     * remotely triggerable). Each needle is now scanned at most once per
+     * byte: a hit is permanent (the buffer only ever grows) and a miss
+     * resumes at the last offset that can still start a match. The
+     * Content-Length parse is likewise a pure function of
+     * resp->d[0..body_start), so body_start doubles as its memo key and
+     * a huge header block is not re-parsed on every read. */
+    bool crlf_hit = false, lf_hit = false;
+    size_t crlf_pos = 0, lf_pos = 0;
+    size_t crlf_probe = 0, lf_probe = 0;
 
     for (;;) {
         uint64_t remain;
@@ -1137,14 +1151,34 @@ static int https_tls_read(SSL *ssl, int fd, struct sbuf *resp,
                  * instead of waiting for the peer to close (a
                  * keep-alive server would otherwise stall every
                  * request until the 60s deadline) */
-                const char *he = sbuf_find(resp->d, resp->len, "\r\n\r\n", 4);
-                size_t hesz = he ? 4 : 0;
-                if (!he) {
-                    he = sbuf_find(resp->d, resp->len, "\n\n", 2);
-                    hesz = he ? 2 : 0;
+                if (!crlf_hit) {
+                    const char *p = sbuf_find(resp->d + crlf_probe,
+                                              resp->len - crlf_probe,
+                                              "\r\n\r\n", 4);
+                    if (p) {
+                        crlf_hit = true;
+                        crlf_pos = (size_t)(p - resp->d);
+                    } else if (resp->len >= 4) {
+                        crlf_probe = resp->len - 3;
+                    }
                 }
-                if (he) {
-                    body_start = (size_t)(he - resp->d) + hesz;
+                if (!crlf_hit && !lf_hit) {
+                    const char *p = sbuf_find(resp->d + lf_probe,
+                                              resp->len - lf_probe,
+                                              "\n\n", 2);
+                    if (p) {
+                        lf_hit = true;
+                        lf_pos = (size_t)(p - resp->d);
+                    } else if (resp->len >= 2) {
+                        lf_probe = resp->len - 1;
+                    }
+                }
+                if ((crlf_hit || lf_hit) &&
+                    body_start != (crlf_hit ? crlf_pos + 4 : lf_pos + 2)) {
+                    /* the terminator choice can still move from LF-only to
+                     * CRLF (preferred) while content_len is unknown; that
+                     * is the only case that re-parses */
+                    body_start = crlf_hit ? crlf_pos + 4 : lf_pos + 2;
                     content_len =
                         https_content_length(resp->d, body_start);
                     if (content_len == 0)

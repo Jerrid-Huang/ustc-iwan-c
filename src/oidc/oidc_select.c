@@ -48,6 +48,69 @@ static int utf8_width(const char *s)
     return w;
 }
 
+/* R37-FIX-B1 (R1-D-a-2 / R1-D-5): the server name/host are remote
+ * controlled (controller /m/config, or a hand-edited servers.json where
+ * \u001b etc. is decoded back to raw bytes) and were printf()d verbatim:
+ * ESC/BEL/CR/LF/OSC sequences let a name retitle the terminal, clear the
+ * screen or forge extra "server" lines in the --all selection list.
+ * Replace every control byte with '?' like auth.c does for peer-supplied
+ * text — but unlike that byte-wise filter, walk valid UTF-8 sequences as
+ * units: U+0080..U+009F (C1, still an 8-bit CSI on some terminals) is
+ * neutralized whether it arrives raw or as a legal 2-byte sequence, while
+ * ordinary multi-byte text (Chinese names included) is copied untouched.
+ * Only the display path uses this; matching/storage keep the raw value. */
+static char *printable_dup(const char *s)
+{
+    size_t n = strlen(s);
+    char *out = malloc(n + 1);
+    if (!out)
+        oom_abort();
+    size_t o = 0;
+    for (size_t i = 0; i < n;) {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x80) {
+            out[o++] = (c < 0x20 || c == 0x7f) ? '?' : (char)c;
+            i++;
+            continue;
+        }
+        /* valid UTF-8 lead? 0xC0/0xC1 and 0xF5.. can only start an
+         * overlong/out-of-range sequence, so they are not text either */
+        size_t need = (c >= 0xC2 && c <= 0xDF) ? 2 :
+                      (c >= 0xE0 && c <= 0xEF) ? 3 :
+                      (c >= 0xF0 && c <= 0xF4) ? 4 : 0;
+        uint32_t cp = 0;
+        if (need) {
+            if (need > n - i) {
+                need = 0;            /* truncated sequence at the end */
+            } else {
+                cp = (uint32_t)(c & (0xFFu >> (need + 1)));
+                size_t k = 1;
+                while (k < need && ((unsigned char)s[i + k] & 0xC0) == 0x80) {
+                    cp = (cp << 6) |
+                         (uint32_t)((unsigned char)s[i + k] & 0x3F);
+                    k++;
+                }
+                if (k != need)
+                    need = 0;        /* bad continuation byte */
+            }
+        }
+        if (need) {
+            if (cp >= 0x80 && cp <= 0x9F) {
+                out[o++] = '?';      /* C1 control, whatever its encoding */
+            } else {
+                memcpy(out + o, s + i, need);
+                o += need;
+            }
+            i += need;
+        } else {
+            out[o++] = '?';          /* stray lead/continuation byte */
+            i++;
+        }
+    }
+    out[o] = '\0';
+    return out;
+}
+
 void oidc_print_servers(Json *servers)
 {
     size_t n = json_arr_len(servers);
@@ -74,10 +137,14 @@ void oidc_print_servers(Json *servers)
                 port = pv;
         }
         const char *nm = name ? name : "";
-        int w = utf8_width(nm);
+        char *nm_s = printable_dup(nm);
+        char *host_s = printable_dup(host ? host : "");
+        int w = utf8_width(nm_s);
         int pad = w < 30 ? 30 - w : 0;
         printf("%2llu. %s%*s %s:%lu\n", (unsigned long long)(i + 1),
-               nm, pad, "", host ? host : "", (unsigned long)port);
+               nm_s, pad, "", host_s, (unsigned long)port);
+        free(nm_s);
+        free(host_s);
     }
 }
 
@@ -105,10 +172,14 @@ static Json *match_host_port(Json *s, const char *spec, const char *last,
     if (pr < 0) {
         /* a broken port only matters if this entry is the one
          * the spec addresses by host */
-        if (strcasecmp(shost, hhost) == 0)
+        if (strcasecmp(shost, hhost) == 0) {
+            /* R37-FIX-B1: the same remote-controlled name reaches the
+             * terminal here through oidc_die (which exits, so the
+             * printable copy needs no free) */
             oidc_die("invalid port %g for server \"%s\" "
                      "(must be an integer in 1..65535)",
-                     pv, name ? name : host);
+                     pv, printable_dup(name ? name : host));
+        }
         return NULL;
     }
     if (pr == 0)

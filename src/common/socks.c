@@ -33,11 +33,11 @@
 
 Netstack g_ns;
 
-/* FIND-R2-5: bridge extension defined in lwip_bridge.c but not declared
- * in lwip_bridge.h (that header stays minimal; socks_flow.c forward-
- * declares it the same way). Bounds-checked, idempotent: safe to call on
- * any f->ns_idx value before detaching a flow from the rebuilt stack. */
-void ns_flow_unref(int idx);
+/* FIND-R2-5: ns_flow_unref (bridge extension, declared in lwip_bridge.h —
+ * R37 R1E-1 removed the local forward declarations from this file and
+ * socks_flow.c) releases a flow's reference on a rebuildable conn slot.
+ * Bounds-checked, idempotent: safe to call on any f->ns_idx value before
+ * detaching a flow from the rebuilt stack. */
 
 /* shared stop flag (util.h): written from the signal handler with a
  * relaxed atomic store (lock-free on every supported target) */
@@ -77,10 +77,17 @@ static unsigned socks_rx_stale_ms(void)
     if (parsed)
         return cached;
     parsed = 1;
+    /* R37 R1E-1: the lower bound used to be 10000 ms, exactly
+     * SOCKS_KEEPALIVE_MS — a keepalive-only tunnel (no downlink payload for a
+     * whole keepalive period, which is the normal idle case) was then judged
+     * "stale" every 10s and re-authenticated in a loop. Keep the bound at
+     * 3 keepalive periods so at least two keepalives are missed before the
+     * tunnel is declared silent; proxy.c (TUN mode) uses the same floor. */
     cached = (unsigned)env_ms_range("IWAN_RX_STALE_MS",
-                                    SOCKS_RX_STALE_MS_DEFAULT, 10000,
+                                    SOCKS_RX_STALE_MS_DEFAULT,
+                                    3 * SOCKS_KEEPALIVE_MS,
                                     86400000, 1, "(0 to disable, "
-                                                 "10s..24h)");
+                                                 "30s..24h)");
     return cached;
 }
 #define LISTEN_BACKLOG   64
@@ -515,7 +522,7 @@ void send_vpn_keepalive(int sockfd, const SocksConfig *cfg,
     buf_t p;
     buf_init(&p);
     ctrl_hdr(&p, PT_ECHO_REQ, cfg->encryption, cfg->sid, cfg->token);
-    if (port_send(sockfd, p.data, (int)p.len, 0) < 0) {
+    if (port_send(sockfd, p.data, p.len, 0) < 0) {
         /* transient failures (roaming, carrier hiccup) recover; the
          * main loop re-auths the tunnel once the counter hits the max */
         SocksConfig *c = (SocksConfig *)cfg;
@@ -643,7 +650,7 @@ static int vpn_handle_datagram(int sockfd, SocksConfig *cfg, uint8_t *b,
         /* a failed reply is not worth tearing the session down for: the
          * next ECHO_REQ gets an answer (or the keepalive machinery
          * detects a dead socket) */
-        if (port_send(sockfd, p.data, (int)p.len, 0) < 0)
+        if (port_send(sockfd, p.data, p.len, 0) < 0)
             log_err("SOCKS ECHO_RES send failed: %s", strerror(errno));
         buf_free(&p);
         return 0;
@@ -672,14 +679,20 @@ static int vpn_handle_datagram(int sockfd, SocksConfig *cfg, uint8_t *b,
  * race at full ring (spurious -ENOBUFS that kills the multishot,
  * kernel io_ring_buffer_select). Keep recvmmsg + poll. */
 int receive_vpn(int sockfd, SocksConfig *cfg) {
-    enum { RX_VLEN = 64, RX_SLOT = 2048 };
+    enum { RX_VLEN = 64, RX_SLOT = NS_RX_SLOT };
+    /* R37 R1E-3: the recvmmsg iov_len below is what the kernel writes into
+     * each zero-copy pool slot, so it must equal the bridge's slot capacity.
+     * Referencing the header macro (instead of the private 2048 this file
+     * used to carry) makes any drift a compile error rather than a pool
+     * overflow. The copy-fallback scratch mirrors the same size. */
+    _Static_assert(RX_SLOT == NS_RX_SLOT, "RX slot size must match the bridge pool");
     static struct iovec rx_iov[RX_VLEN];
     static struct mmsghdr rx_msgs[RX_VLEN];
     void *rx_bufs[RX_VLEN];
     /* R18 copy-fallback scratch: used only when the zero-copy RX pool
      * is exhausted (see the got==0 branch below). Not pool slots, so
      * they are re-pointed per drain just like the iov bases. */
-    static uint8_t copy_buf[RX_VLEN][2048];
+    static uint8_t copy_buf[RX_VLEN][RX_SLOT];
     static struct iovec copy_iov[RX_VLEN];
     static struct mmsghdr copy_msgs[RX_VLEN];
     static int rx_init;
@@ -713,7 +726,7 @@ int receive_vpn(int sockfd, SocksConfig *cfg) {
                     return 0;
                 for (int i = 0; i < RX_VLEN; i++) {
                     copy_iov[i].iov_base = copy_buf[i];
-                    copy_iov[i].iov_len = 2048;
+                    copy_iov[i].iov_len = RX_SLOT;
                     copy_msgs[i].msg_hdr.msg_iov = &copy_iov[i];
                     copy_msgs[i].msg_hdr.msg_iovlen = 1;
                 }
@@ -827,7 +840,13 @@ static void socks_reauth_flows(void)
         if (!f->active)
             continue;
         if (f->state == ST_RESOLVING) {
-            ns_flow_unref(f->ns_idx);   /* FIND-R19-F5: detach pairs with ref */
+            /* R37 R1-A-10: no ns_flow_unref here. This function runs only
+             * after ns_init(), which already wiped g_flow_ref; f->ns_idx is
+             * the PRE-rebuild slot number, so the unref could only clear a
+             * ref that an earlier-processed flow has just taken for its NEW
+             * slot (same lowest-free allocation order), defeating the
+             * FIND-R2-5/F03-1 ownership guard. Bare detach is the correct
+             * pairing here. */
             f->ns_idx = -1;
             queue_socks_error(f, 4);
             set_flow_state(f, ST_CLOSING);
@@ -836,14 +855,15 @@ static void socks_reauth_flows(void)
         if (f->ns_idx < 0)
             continue;   /* handshake states: nothing to re-establish */
         if (f->state != ST_CONNECTING && f->state != ST_ESTABLISHED) {
-            ns_flow_unref(f->ns_idx);   /* FIND-R19-F5: detach pairs with ref */
-            f->ns_idx = -1;   /* stale index into the rebuilt stack */
+            f->ns_idx = -1;   /* stale index into the rebuilt stack
+                               * (R37 R1-A-10: no unref, see above) */
             continue;
         }
         uint16_t port = f->tgt_port;
         uint8_t af = f->tgt_af;
-        ns_flow_unref(f->ns_idx);   /* FIND-R19-F5: detach pairs with ref */
         f->ns_idx = -1;
+        /* R37 R1-A-10: no ns_flow_unref here either — the ref for the new
+         * slot is taken by open_tcp_connection{6} below. */
         f->rx_paused = false;
         if (af == 6)
             open_tcp_connection6(f, f->tgt_ip6, port);
@@ -1323,7 +1343,7 @@ int run_socks(int sockfd, SocksConfig *cfg) {
         buf_t p;
         buf_init(&p);
         ctrl_hdr(&p, PT_CLOSE, cfg->encryption, cfg->sid, cfg->token);
-        (void)port_send(sockfd, p.data, (int)p.len, 0);
+        (void)port_send(sockfd, p.data, p.len, 0);
         buf_free(&p);
     }
 

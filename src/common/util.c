@@ -10,6 +10,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
+#ifndef _WIN32
+#include <sys/stat.h>   /* stat: root-owned TLS anchor check (see below) */
+#endif
 
 #ifndef _WIN32
 #include <signal.h>   /* kill/SIGKILL for the bounded cmd_capture reap */
@@ -54,6 +57,29 @@ bool debug_enabled(void)
 }
 #endif
 
+#ifndef _WIN32
+/* R37 WG6 #1: SSL_CERT_FILE/SSL_CERT_DIR are read LATER by the (possibly
+ * root) process as its only TLS trust anchors (https.c:402). sudo's default
+ * env_reset already drops them, but with 'env_keep += "SSL_CERT_FILE"',
+ * '!env_reset' or 'sudo -E' a user-written file would become the root
+ * process's trust anchor -> user-controlled CA -> MITM of the elevated
+ * request. Keep the variable only while the anchor is root-owned and not
+ * group/other-writable (the standard way to install a corporate CA);
+ * everything else is dropped so the loader falls back to the system
+ * bundles (which include the Homebrew paths https.c:394-401 probes). */
+static void keep_root_owned_anchor(const char *name)
+{
+    const char *v = getenv(name);
+    struct stat st;
+
+    if (!v || !v[0])
+        return;
+    if (stat(v, &st) != 0 || st.st_uid != 0 ||
+        (st.st_mode & (S_IWGRP | S_IWOTH)))
+        unsetenv(name);
+}
+#endif
+
 /* Neutralize PATH and loader-injection environment before exec'ing helper
  * binaries: the daemon may run as root, and a hostile PATH entry (or
  * LD_PRELOAD) would execute attacker code with root privileges. */
@@ -71,6 +97,8 @@ void exec_sanitize(void)
     unsetenv("DYLD_LIBRARY_PATH");
     unsetenv("DYLD_FRAMEWORK_PATH");
     unsetenv("DYLD_FALLBACK_LIBRARY_PATH");
+    keep_root_owned_anchor("SSL_CERT_FILE");
+    keep_root_owned_anchor("SSL_CERT_DIR");
 #else
     /* no exec of helper binaries on Windows (port_run_cmd uses
      * CreateProcess); kept as a defined no-op so callers compile */

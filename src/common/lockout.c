@@ -84,6 +84,11 @@ void lockout_note(lockout_rec *tbl, int n, const void *key, size_t klen,
         memcpy(e->key, key, klen);
         e->fail = 1;
         e->first_fail_ms = now;
+        /* R1-D-c-1: the fresh-entry path returns early, so it must apply
+         * the threshold itself — max_fails == 1 has to ban on this very
+         * first failure (a 2nd try would otherwise always be allowed). */
+        if (e->fail >= (int)max_fails)
+            e->blocked_until_ms = now + window_ms;
         if (mu)
             pthread_mutex_unlock(mu);
         return;

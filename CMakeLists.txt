@@ -66,6 +66,26 @@ option(IWAN_LINUX_STATIC "Linux: link fully static binaries" OFF)
 option(IWAN_STATIC       "Windows: statically link OpenSSL + runtime libs" OFF)
 option(IWAN_BPF          "Linux: compile and embed the tun steering eBPF program" ON)
 option(IWAN_WERROR       "Treat compiler warnings as errors" OFF)
+# Strict warning gate for the project's OWN sources (src/, tests/). It is
+# applied per target with target_compile_options — never through
+# CMAKE_C_FLAGS/add_compile_options, which reach every target: the vendored
+# lwIP does not build clean under -Wconversion/-Wshadow, so a global flag
+# set killed the gate inside third_party/ before iwan_core was ever
+# compiled, and "src/ is warning-free" could not be verified (R37 R1-C-7 /
+# R1-B-7). third_party/lwip keeps the global -Wall -Wextra and stays
+# pristine.
+option(IWAN_STRICT       "Strict warning gate for project sources (src/, tests/)" OFF)
+# The documented CI invariant: -Wall -Wextra -Wpedantic -Wshadow
+# -Wconversion -Wsign-conversion -Werror.
+set(IWAN_STRICT_FLAGS
+  -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion -Werror)
+# Opt-in extras (IWAN_STRICT=ON + IWAN_STRICT_EXTRA=ON): const-correctness /
+# float-equality style diagnostics that the existing code deliberately does
+# not follow (`char *argv[] = {"literal", ...}` is used throughout), so they
+# stay out of the default gate instead of being silently suppressed.
+option(IWAN_STRICT_EXTRA "Add -Wwrite-strings/-Wfloat-equal/... to IWAN_STRICT" OFF)
+set(IWAN_STRICT_EXTRA_FLAGS
+  -Wfloat-equal -Wcast-align -Wpointer-arith -Wwrite-strings -fno-common)
 set(IWAN_OPENSSL_DIR "" CACHE PATH "OpenSSL sysroot (include/ + lib/ or lib64/)")
 # ---------------------------------------------------------------------------
 # Global flags — the old Makefile's CFLAGS/LDFLAGS, split per platform.
@@ -449,6 +469,24 @@ if(UNIX AND NOT APPLE)
   add_executable(iwan-server src/iwan_server.c)
   target_include_directories(iwan-server PRIVATE src/common)
   target_link_libraries(iwan-server PRIVATE iwan_core)
+endif()
+
+# Strict gate, applied to every target built from our own sources (iwan_core
+# pulls in src/common + the generated BPF payload; tests/ harnesses are
+# built only with -DBUILD_TESTING=ON). lwip is deliberately absent: it is
+# vendored code and keeps the global -Wall -Wextra only.
+if(IWAN_STRICT)
+  set(_iwan_strict_flags ${IWAN_STRICT_FLAGS})
+  if(IWAN_STRICT_EXTRA)
+    list(APPEND _iwan_strict_flags ${IWAN_STRICT_EXTRA_FLAGS})
+  endif()
+  foreach(_tgt iwan_core iwan_oidc iwan-client iwan-client-oidc iwan-server
+               socks_handshake_harness lwip_data_harness lwip_fairness_harness)
+    if(TARGET ${_tgt})
+      target_compile_options(${_tgt} PRIVATE ${_iwan_strict_flags})
+    endif()
+  endforeach()
+  unset(_iwan_strict_flags)
 endif()
 
 # ---------------------------------------------------------------------------

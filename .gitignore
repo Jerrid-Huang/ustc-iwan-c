@@ -35,3 +35,5 @@ bench-multi.out
 build-dbg/
 build-tsan/
 build-wstrict/
+build-*/
+bughunt/

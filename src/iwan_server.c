@@ -862,10 +862,12 @@ static void *recv_thread_main(void *v)
              * consumed in one syscall round */
             int last_v = 1;
             for (;;) {
-                int v = recvmmsg(a->fd, msgs, UDP_RXBATCH, MSG_DONTWAIT,
-                                 NULL);
-                if (v > 0) {
-                    for (int i = 0; i < v; i++) {
+                /* R37 WG1a: `v` would shadow recv_thread_main's parameter
+                 * `void *v` under -Wshadow -Werror (no semantic change) */
+                int nready = recvmmsg(a->fd, msgs, UDP_RXBATCH, MSG_DONTWAIT,
+                                      NULL);
+                if (nready > 0) {
+                    for (int i = 0; i < nready; i++) {
                         if (msgs[i].msg_len <= 0)
                             continue;
                         PROF_ADD(g_prof_srv_recv, (size_t)msgs[i].msg_len);
@@ -875,14 +877,14 @@ static void *recv_thread_main(void *v)
                                    (size_t)msgs[i].msg_len, &peers[i], a->fd,
                                    a->tid);
                     }
-                    last_v = v;
-                    if (v < UDP_RXBATCH)
+                    last_v = nready;
+                    if (nready < UDP_RXBATCH)
                         break; /* partial batch: drained */
                     continue;
                 }
-                if (v < 0 && errno == EINTR)
+                if (nready < 0 && errno == EINTR)
                     continue;
-                last_v = v;
+                last_v = nready;
                 break; /* EAGAIN: drained, or ICMP error */
             }
             /* diagnostic: poll reported readable but nothing was
@@ -1082,40 +1084,54 @@ int main(int argc, char **argv)
     ctx.tun_fd = -1;
 
     {
-        uint32_t sipu = ip4_u32(sip), dipu = ip4_u32(dip);
+        uint32_t sipu = ip4_u32(sip);
         if (sipu >= ctx.ip_base && sipu <= ctx.ip_end) {
             fprintf(stderr, "error: --server-ip %s falls inside the client "
                             "pool; pick an address outside [first,last]\n",
                     o.server_ip);
             return 1;
         }
-        if (dipu >= ctx.ip_base && dipu <= ctx.ip_end) {
-            fprintf(stderr, "error: --dns %s falls inside the client pool\n",
-                    o.dns);
-            return 1;
-        }
     }
 
-    /* M5: server_ip and --dns must lie INSIDE the advertised --subnet.
-     * The old code only checked they were outside the client pool, so a
-     * misconfiguration could silently start with an unreachable peer or a
-     * public address polluting the host's routing.  subnet_base/mask are
+    /* M5: server_ip must lie INSIDE the advertised --subnet: an out-of-
+     * subnet gateway is unconditionally broken (every client would be
+     * configured with an unreachable next hop). subnet_base/mask are
      * already parsed (above); a plain per-bit AND is the membership test. */
     {
         uint32_t mask32 = 0xFFFFFFFFu << (32 - o.mask);
-        uint32_t sipu = ip4_u32(sip), dipu = ip4_u32(dip);
+        uint32_t sipu = ip4_u32(sip);
         if ((sipu & mask32) != subnet_base) {
             fprintf(stderr, "error: --server-ip %s is outside --subnet %s "
                             "(must be within %s)\n",
                     o.server_ip, o.subnet, subnet_net);
             return 1;
         }
-        if ((dipu & mask32) != subnet_base) {
-            fprintf(stderr, "error: --dns %s is outside --subnet %s "
-                            "(must be within %s)\n",
-                    o.dns, o.subnet, subnet_net);
-            return 1;
-        }
+    }
+
+    /* R37 R1-D-2: --dns is only WARNED about, never fatal. T_DNS/T_IP hand
+     * the resolver to the client as a tunnel-reachable address, so it may
+     * legitimately be (a) inside the client pool — an in-tunnel resolver —
+     * or (b) outside --subnet altogether — a public resolver reached
+     * through the tunnel, which is exactly what the documented default
+     * (114.114.114.114, see usage()) is. Making either case fatal meant the
+     * usage's own default combination could never start, and the only
+     * accepted values left were the network address, the server's own
+     * address and the broadcast address. Both cases now print a diagnostic
+     * and continue; a syntactically invalid address is still rejected by
+     * the option parser before this point. */
+    {
+        uint32_t mask32 = 0xFFFFFFFFu << (32 - o.mask);
+        uint32_t dipu = ip4_u32(dip);
+        if (dipu >= ctx.ip_base && dipu <= ctx.ip_end)
+            fprintf(stderr, "warning: --dns %s falls inside the client pool "
+                            "of --subnet %s; it may collide with an address "
+                            "handed out to a client\n",
+                    o.dns, o.subnet);
+        if ((dipu & mask32) != subnet_base)
+            fprintf(stderr, "warning: --dns %s is outside --subnet %s; "
+                            "clients can reach it only if the tunnel/routes "
+                            "allow it\n",
+                    o.dns, subnet_net);
     }
 
     if (o.no_tun) {
@@ -1229,15 +1245,17 @@ int main(int argc, char **argv)
              * one that exited). */
             sigprocmask(SIG_SETMASK, &oldmask, NULL);
             for (;;) {
-                int st;
-                if (waitpid(pid, &st, 0) < 0) {
+                /* R37 WG1a: `st` must not shadow the `struct stat st` of
+                 * the parent branch under -Wshadow -Werror */
+                int wst;
+                if (waitpid(pid, &wst, 0) < 0) {
                     if (errno == EINTR)
                         continue;
                     server_cleanup_nat();
                     return 1;
                 }
                 server_cleanup_nat();
-                return WIFEXITED(st) ? WEXITSTATUS(st) : 1;
+                return WIFEXITED(wst) ? WEXITSTATUS(wst) : 1;
             }
         }
         /* child: continue as the unprivileged server process */

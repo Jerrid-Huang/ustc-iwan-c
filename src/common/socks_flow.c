@@ -36,16 +36,13 @@
 #include "socks_internal.h"
 #include "util.h"
 
-/* FIND-R2-4 / FIND-R2-5: bridge extensions that live in lwip_bridge.c but
- * are not declared in lwip_bridge.h (that header is outside this round's
- * editable set). ns_flow_ref/ns_flow_unref maintain the per-slot
- * flow-reference counter this layer must bump at every f->ns_idx
- * assignment/detach; ns_port_tw_held reports whether lwIP's TIME_WAIT list
- * still holds an ephemeral port. Both run on the single event-loop thread
- * that also drives lwIP, so they need no locking. */
-int  ns_flow_ref(int idx);
-void ns_flow_unref(int idx);
-bool ns_port_tw_held(uint16_t p);
+/* R37 R1E-1: ns_flow_ref/ns_flow_unref maintain the per-slot flow-reference
+ * counter this layer must bump at every f->ns_idx assignment/detach, and
+ * ns_port_tw_held reports whether lwIP's TIME_WAIT list still holds an
+ * ephemeral port. They run on the single event-loop thread that also drives
+ * lwIP, so they need no locking. All three are declared in the bridge header
+ * (they used to be hand-written prototypes here, which let the signature
+ * drift silently between the two TUs). */
 
 #define LOCAL_WRITE_LIMIT   262144
 #define LOCAL_IOV_MAX       45     /* zero-copy readv feed: reserve slots
@@ -812,7 +809,19 @@ static void *dns_worker(void *arg) {
      * reused by another open() */
     if (dns_stale(j))
         goto done;
-    if (g_dns_server_ip4 == 0 || j->qtype == 0) {
+    /* R37 R1-A-5: publish-contract read. dns_set_server() writes
+     * g_dns_server_ip4 under g_dns_wait_mu (dns_session_lock, R25-f1 F1 /
+     * R20), so the worker must snapshot it under the same lock — reading it
+     * here unlocked (as it did) was the remaining half of that fix and could
+     * pick the wrong resolution path (system vs tunnel resolver) mid
+     * re-auth. No new lock order: g_dns_wait_mu is already this worker's
+     * first and only lock, and it is released before the branch below
+     * (dns_query_local can block for seconds). The value is re-read under
+     * the lock further down; reusing srv4 keeps the two snapshots in sync. */
+    pthread_mutex_lock(&g_dns_wait_mu);
+    srv4 = g_dns_server_ip4;
+    pthread_mutex_unlock(&g_dns_wait_mu);
+    if (srv4 == 0 || j->qtype == 0) {
         /* no tunnel DNS (dns=0.0.0.0) or a local-fallback worker:
          * resolve via the system resolver — no session socket involved,
          * so the socket-safety generation gate above suffices there.
@@ -821,13 +830,13 @@ static void *dns_worker(void *arg) {
          * be re-checked after the call, or the stale worker injects an
          * old IP into a new session's same-numbered flow (SUMMARY-2 H3;
          * dns_drain's generation filter is the second layer). */
-        uint32_t lip = 0;
+        uint32_t lip4 = 0;
         uint8_t lip6[16] = {0}, af = 4;
-        bool resolved = dns_query_local(j->domain, &af, &lip, lip6);
+        bool resolved = dns_query_local(j->domain, &af, &lip4, lip6);
         if (dns_stale(j))
             goto done;   /* session torn down while we resolved */
         if (resolved)
-            dns_push_g(j->gen, j->flow_id, true, af, lip, lip6, j->port);
+            dns_push_g(j->gen, j->flow_id, true, af, lip4, lip6, j->port);
         else
             dns_push_g(j->gen, j->flow_id, false, 4, 0, NULL, j->port);
         goto done;
@@ -891,7 +900,7 @@ static void *dns_worker(void *arg) {
         pthread_mutex_unlock(&g_dns_wait_mu);
         goto done;
     }
-    if (port_send(g_sockfd, out, (int)outlen, 0) < 0 && errno != EAGAIN &&
+    if (port_send(g_sockfd, out, outlen, 0) < 0 && errno != EAGAIN &&
         errno != EWOULDBLOCK) {
         /* hard send error (ENETUNREACH, EPERM, ...): fail fast — a
          * retry loop cannot succeed, and the flow would only see its
@@ -929,7 +938,7 @@ static void *dns_worker(void *arg) {
                 /* resend under the lock: dns_stop() (generation bump +
                  * socket close) can only run between these critical
                  * sections, never mid-send */
-                if (port_send(g_sockfd, out, (int)outlen, 0) >= 0)
+                if (port_send(g_sockfd, out, outlen, 0) >= 0)
                     last_send = now;
                 /* EAGAIN/short send: last_send stays, the next 250ms
                  * tick retries */
@@ -1055,6 +1064,19 @@ void queue_socks_error(Flow *f, uint8_t rep) {
     if (debug_enabled())
         log_debug("[flow %lu] socks error rep=%u (state %d)",
                   (unsigned long)f->id, rep, f->state);
+    if (f->reply_sent) {
+        /* R37 R1-A-2: the CONNECT success reply is already on the wire, so
+         * every byte after it belongs to the tunnelled stream — appending a
+         * second SOCKS5/HTTP reply here would inject protocol bytes into the
+         * client's data (TLS/HTTP corruption) and then close the flow. This
+         * is reachable from the re-auth re-establish path (open_tcp_conn_af,
+         * via socks_reauth_flows) when the rebuilt stack has no free slot:
+         * tear the flow down silently, no protocol-level reply. Mirrors
+         * update_tcp_states, which already reports a post-reply failure as
+         * ST_CLOSING only. */
+        set_flow_state(f, ST_CLOSING);
+        return;
+    }
     if (f->http_mode) {
         /* HTTP proxy clients expect an HTTP status, not a SOCKS5 frame */
         static const char bad[] = "HTTP/1.1 502 Bad Gateway\r\n\r\n";
@@ -1260,10 +1282,20 @@ static bool socks_target_blocked(const Flow *f, int af, const uint8_t *p)
     if (af == 6) {
         static const uint8_t lo[16] = {
             0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,1 };
+        static const uint8_t unspec[16] = { 0 };   /* :: */
         static const uint8_t v4map[12] = {
             0,0,0,0,0,0,0,0, 0,0,0xff,0xff };
         if (memcmp(p, lo, 16) == 0)
             return true;                              /* ::1 */
+        /* R2-L33: :: — same rationale as the v4 0.0.0.0 check (Linux
+         * connect(AF_INET6,[::]) routes to loopback, so it is an alternate
+         * spelling of ::1 that would bypass the gate) and the same 4-line
+         * branch relay_proxy.c's rp_target_blocked already carries. Keep
+         * the two gates identical: this is the socks side's only loopback
+         * defence. Currently unreachable (the lwIP stack has no loopback
+         * netif), fixed for parity/defence in depth. */
+        if (memcmp(p, unspec, 16) == 0)
+            return true;                              /* :: */
         if (p[0] == 0xfe && (p[1] & 0xc0) == 0x80)
             return true;                              /* fe80::/10 */
         /* ::ffff:a.b.c.d: the mapped v4 address obeys the v4 rules,
@@ -1574,15 +1606,9 @@ static void handshake_request(Flow *f)
     {
         size_t dlen = (size_t)f->input.data[4];
         size_t req_len = 5 + dlen + 2;
-        if (dlen == 0) {
-            /* RFC 1928: a zero-length domain is an address-type error
-             * (rep=8). The frame is 5 + 0 + 2 = 7 bytes; wait until the
-             * full frame has arrived so the reply is not raced. */
-            if (f->input.len < req_len)
-                return;
-            queue_socks_error(f, 8);
-            return;
-        }
+        /* R37 R1-A-6: no zero-length-domain case here — pp_socks_request
+         * already maps l == 0 to rep=8 and returned above (:1554), so this
+         * code only ever sees 1..255. */
         buf_consume(&f->input, req_len);
         flow_start_target(f, &t);
         return;
@@ -1847,6 +1873,12 @@ void service_local_inputs(Flow *fs) {
                     int w = ns_send_commit(&g_ns, f->ns_idx, take);
                     if (w <= 0)
                         break;   /* nothing accepted: keep take in input */
+                    /* R37 R1-A-3: uplink consumption is progress too. The
+                     * no-progress watchdog used to key on downlink drains
+                     * only, so a healthy long upload on a half-closed
+                     * (CLOSE_WAIT) connection was force-killed after 30s
+                     * while every byte was still being ACKed. */
+                    f->last_progress_ms = now_ms();
                     used += (size_t)w;
                     if ((size_t)w < take)
                         break;   /* partial commit: keep the remainder */
@@ -1905,8 +1937,13 @@ void service_local_inputs(Flow *fs) {
                          * accepted (ns_send_commit can return 0/short on
                          * ERR_MEM, independent of snd_buf). */
                         int w = ns_send_commit(&g_ns, f->ns_idx, take);
-                        if (w > 0)
+                        if (w > 0) {
                             left -= (size_t)w;
+                            /* R37 R1-A-3: same as the spill path above —
+                             * bytes accepted by the stack are uplink
+                             * progress for the no-progress watchdog. */
+                            f->last_progress_ms = now_ms();
+                        }
                         if (w < (int)take)
                             break;
                     }
@@ -2004,8 +2041,20 @@ void service_local_inputs(Flow *fs) {
              * input grew unboundedly for up to the 30s DNS window and
              * buf_ensure failure aborted the whole process. */
             if (f->state == ST_RESOLVING &&
-                f->input.len >= IWAN_RESOLV_INPUT_CAP)
+                f->input.len >= IWAN_RESOLV_INPUT_CAP) {
+                /* R37 R1-A-4: skip the flow but ALSO arm the backpressure
+                 * flag. Without it wait_events kept POLLIN registered, the
+                 * socket stayed readable and poll() returned instantly for
+                 * the whole DNS window (measured 620k rounds / 1.5s CPU).
+                 * The flag must be set HERE (after the per-round reset at
+                 * the top of this loop) because wait_events — its only
+                 * consumer — runs later in the same round. The flow is not
+                 * wedged: the flag only suppresses POLLIN until the next
+                 * round, DNS completion moves the flow to ST_CONNECTING and
+                 * the spill path drains input below the cap. */
+                f->rx_paused = true;
                 continue;   /* over the cap: skip this flow this round */
+            }
             uint8_t rbuf[TCP_RX_CHUNK];
             ssize_t n = port_recv(f->fd, rbuf, sizeof rbuf, 0);
             if (n == 0) {
@@ -2083,7 +2132,20 @@ void service_local_outputs(void) {
             }
         }
 
-        if (f->ns_idx >= 0 && f->output.len == 0) {
+        /* R37 R1-A-1: never hand inner payload to the client before the
+         * CONNECT success reply. update_tcp_states queues that reply only at
+         * the END of the round (it runs after this function), so a peer that
+         * sends data together with its SYN-ACK (SMTP/FTP/SSH/MySQL banners,
+         * early HTTP error pages) would otherwise deliver the payload first
+         * and desynchronize the client's protocol parser. reply_sent is the
+         * "the client may receive inner bytes now" flag; output.len == 0
+         * additionally waits until the queued reply has been written out.
+         * Buffering instead of sending cannot wedge the flow: the reply is
+         * queued in the same round the connection establishes (ESTABLISHED
+         * or CLOSE_WAIT), so the drain starts one round later, and a flow
+         * whose reply never appears is an error/close path whose rxq is
+         * discarded by the bounded reap (ST_CLOSING_TIMEOUT_MS). */
+        if (f->ns_idx >= 0 && f->output.len == 0 && f->reply_sent) {
             TcpConn *c = ns_conn(&g_ns, f->ns_idx);
             if (c && c->rxq.len > 0) {
                 size_t want = c->rxq.len > LOCAL_WRITE_LIMIT
@@ -2145,13 +2207,43 @@ void service_local_outputs(void) {
              * SOCKS/HTTP success reply (service_local_outputs runs first).
              * Only close when the flow is ESTABLISHED and already replied
              * (reply_sent) — otherwise the reply would be silently dropped
-             * and the client's CONNECT lost. */
+             * and the client's CONNECT lost.
+             * R37 R1-A-3: and only when no uplink data is still queued for
+             * the connection. A peer FIN closes the peer's SEND direction
+             * only: a client that is still uploading must keep going, and
+             * propagating the FIN now would close our send side (and stop
+             * reading the client) while f->input still holds bytes to
+             * deliver — a healthy long upload on a half-closed connection
+             * was cut off and then reaped as "stuck". The shortcut still
+             * fires as soon as that queue drains. */
             if (c && c->state == NS_CLOSE_WAIT && f->reply_sent &&
-                c->rxq.len == 0 && f->output.len == 0) {
-                flowdbg(f, "CLOSE_WAIT rxq-empty -> ns_close");
+                c->rxq.len == 0 && f->output.len == 0 && f->input.len == 0) {
+                /* R37 R1-A-3 (WG3): deliver the peer's EOF first and our own
+                 * FIN only when the local client has really stopped
+                 * uploading. A peer FIN closes the peer's SEND direction
+                 * only; the local client may still be uploading on this
+                 * half-closed connection. The previous code sent our FIN in
+                 * the same breath, which was reachable even for an actively
+                 * uploading flow: service_local_inputs (which runs just
+                 * before this function) can absorb the whole f->input into
+                 * the stack, so input.len was transiently 0 here and the
+                 * upload's send direction was cut off (lwIP LAST_ACK) and
+                 * then reaped as "dead" with its buffered bytes dropped.
+                 * Now: EOF to the client is immediate and idempotent
+                 * (shutdown(SHUT_WR) on an already-shut socket returns 0 on
+                 * Linux), and last_progress_ms — refreshed by every uplink
+                 * byte accepted in service_local_inputs (R1-A-3) — decides
+                 * when our FIN may go out. A client that keeps uploading
+                 * keeps the flow alive; one that went idle for a full close
+                 * timeout is closed exactly as the old code did, still
+                 * bounded, and still with a clean FIN rather than a RST. */
                 port_shutdown(f->fd, SHUT_WR);
-                ns_close(&g_ns, f->ns_idx);
-                set_flow_state(f, ST_CLOSING);
+                if (now_ms() - f->last_progress_ms >=
+                        ST_CLOSING_TIMEOUT_MS) {
+                    flowdbg(f, "CLOSE_WAIT drained + idle -> ns_close");
+                    ns_close(&g_ns, f->ns_idx);
+                    set_flow_state(f, ST_CLOSING);
+                }
             }
         }
     }
@@ -2186,8 +2278,10 @@ void reap_flows(void) {
                  * NO-PROGRESS watchdog keyed on last_progress_ms, not a
                  * pure wall-clock from ST_CLOSING entry (state_ms). Every
                  * actual drain of rxq/output to the client refreshes
-                 * last_progress_ms (service_local_outputs), so a client
-                 * that IS slowly reading (peer already FIN'd, trailing
+                 * last_progress_ms (service_local_outputs) and so does every
+                 * byte accepted from the local client into the netstack
+                 * (service_local_inputs, R37 R1-A-3), so a client that IS
+                 * slowly reading (peer already FIN'd, trailing
                  * rxq still being drained) is never killed while it makes
                  * progress — that wall-clock regression (R6 H-1's 30s
                  * pure-timeout killing a legitimately slow-draining
@@ -2223,14 +2317,41 @@ void reap_flows(void) {
                  *     (ns_abort is TW-safe and clears c->pcb, so the
                  *     later silent lwIP TW free can never dangle).
                  * Semantics: state_ms = when the flow *state* last
-                 * changed (wall clock); last_progress_ms = when we last
-                 * actually *drained* bytes to the client (progress
-                 * clock). The watchdog keys off progress, so a healthy
+                 * changed (wall clock); last_progress_ms = when the flow
+                 * last moved bytes in EITHER direction (progress clock).
+                 * The watchdog keys off progress, so a healthy
                  * long-lived flow is never at risk while a wedged one is
                  * hard-bounded at ST_CLOSING_TIMEOUT_MS. */
                 if (now_ms() - f->last_progress_ms >=
                         ST_CLOSING_TIMEOUT_MS &&
                     (f->state == ST_CLOSING ||
+                     /* R37 R1-A-3 + R2-L1: an ESTABLISHED flow in
+                      * CLOSE_WAIT/NS_CLOSED is "stuck" when the progress
+                      * clock has not moved for a full window.
+                      * last_progress_ms is a BIDIRECTIONAL clock: every
+                      * uplink byte the stack accepts refreshes it in
+                      * service_local_inputs (R1-A-3) and every downlink
+                      * drain refreshes it in service_local_outputs. A
+                      * continuously-uploading half-closed flow therefore
+                      * stays alive on its own (measured: since_progress
+                      * 1 ms while 16 MB were ACKed) — the A-3 protection
+                      * does NOT depend on the rxq/output requirement that
+                      * used to be here.
+                      * R2-L1: that requirement is exactly what removed the
+                      * 30s upper bound. With rxq and output empty and the
+                      * peer no longer ACKing, ns_send_commit stops accepting
+                      * bytes (no refresh), f->input stays non-empty (so the
+                      * CLOSE_WAIT shortcut in service_local_outputs never
+                      * closes it) and rxq/output stay empty (so the old
+                      * clause never matched): the flow pinned its fd, flow
+                      * slot and conn slot forever. Dropping the clause
+                      * restores a bounded "no progress at all" window while
+                      * keeping the uplink-aware clock — this is NOT the old
+                      * downlink-only criterion. A genuinely idle half-closed
+                      * flow (f->input empty too) is still finished by the
+                      * CLOSE_WAIT shortcut's clean ns_close on the same
+                      * timeout, and a healthy ESTABLISHED conn is untouched
+                      * (requires NS_CLOSE_WAIT/NS_CLOSED). */
                      (f->state == ST_ESTABLISHED &&
                       (c->state == NS_CLOSE_WAIT ||
                        c->state == NS_CLOSED)))) {

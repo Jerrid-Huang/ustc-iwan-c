@@ -28,6 +28,26 @@ struct server_session {
     uint8_t xor_key[8];      /* session_key(user,pass)[0..7] */
     uint8_t enc;
     atomic_uint_fast64_t last_active_ms; /* monotonic ms */
+    /* R37 R1-D-1: per-session DATA/CLOSE token-guess budget. Two counters
+     * because "who is guessing" changes what a guess costs:
+     *   tok_mis_cnt   - wrong-token frames from a source that is NOT the
+     *                   session's current peer (the generic brute-force
+     *                   path, and the same-NAT stale-device path);
+     *   tok_mis_bound - wrong-token frames that claim the session's
+     *                   current peer address verbatim. CHARGED BUT NEVER
+     *                   GATED (R37 R2): a third party can spend this
+     *                   counter by forging the peer's ip:port, so using it
+     *                   as a pre-compare budget would blackhole the real
+     *                   peer's own (correct-token) data. It saturates at
+     *                   RATE_TOKEN_MISMATCH_BOUND_MAX for observability
+     *                   (a bound-address mismatch storm is the signature
+     *                   of source spoofing); only tok_mis_cnt gates.
+     * Both are windowed by tok_mis_win and mutated only under
+     * ctx->sess_lock's WRITE lock; the pre-check reads tok_mis_cnt under
+     * the READ lock. Budgets and rationale live in server.c
+     * (RATE_TOKEN_MISMATCH_*). */
+    uint32_t tok_mis_cnt, tok_mis_bound;
+    uint64_t tok_mis_win;   /* window start (monotonic ms); 0 = none yet */
     char user[SERVER_USER_MAX + 1]; /* owning account; one slot per user */
 };
 
