@@ -785,24 +785,51 @@ static void *udp2tun_thread(void *ud) {
             if (t == PT_DATA_ENC)
                 xor_crypt(m + 8, (size_t)(n - 8), ctx->xor_key, 8);
             PROF_ADD(g_prof_pump_rx, (size_t)(n - 8));
-            /* validate the inner IPv4 packet before injecting it into the
+            /* validate the inner packet before injecting it into the
              * TUN device (same gate as the SOCKS path): a malformed frame
-             * must not reach the kernel stack */
-            uint32_t saddr, daddr;
-            if (ipv4_pkt_ok(m + 8, (size_t)(n - 8), &saddr, &daddr) != 0) {
-                log_debug("drop inner packet: bad IPv4 header (%zu bytes)",
-                          (size_t)(n - 8));
-                continue;
-            }
-            /* ingress filter (audit M5): a downlink frame must be
-             * addressed to THIS session's IP and must never claim our
-             * own address as source — anything else is an injector's
-             * forgery (reflection / self-spoof), not traffic the guest
-             * solicited */
-            if (daddr != ctx->inner_ip || saddr == ctx->inner_ip) {
-                log_debug("drop inner packet: addr filter (%08x->%08x)",
-                          saddr, daddr);
-                continue;
+             * must not reach the kernel stack. Dispatch on the inner
+             * version byte like vpn_rx_packet() does: TUN mode also
+             * carries IPv6 downlink (--proxy-cidr6 / --proxy-domain6)
+             * and must not reject it with the IPv4-only gate. */
+            size_t plen = (size_t)(n - 8);
+            if ((m[8] >> 4) == 6) {
+                /* inner IPv6: mirror the SOCKS R23-F1 gate */
+                uint8_t s6[16], d6[16], want6[16];
+                if (plen < 40 ||
+                    ip6_pkt_ok(m + 8, plen, s6, d6) != 0) {
+                    log_debug("drop inner packet: bad IPv6 header (%zu bytes)",
+                              plen);
+                    continue;
+                }
+                ip6_derive_ula(ctx->inner_ip, want6);
+                /* ingress filter (audit M5, v6): a downlink frame must be
+                 * addressed to THIS session's derived ULA and must never
+                 * claim it as source — anything else is an injector's
+                 * forgery (reflection / self-spoof), not traffic the
+                 * guest solicited */
+                if (memcmp(d6, want6, 16) != 0 ||
+                    memcmp(s6, want6, 16) == 0) {
+                    log_debug("drop inner packet: v6 addr filter");
+                    continue;
+                }
+            } else {
+                /* inner IPv4 (existing gate, unchanged) */
+                uint32_t saddr, daddr;
+                if (ipv4_pkt_ok(m + 8, plen, &saddr, &daddr) != 0) {
+                    log_debug("drop inner packet: bad IPv4 header (%zu bytes)",
+                              plen);
+                    continue;
+                }
+                /* ingress filter (audit M5): a downlink frame must be
+                 * addressed to THIS session's IP and must never claim our
+                 * own address as source — anything else is an injector's
+                 * forgery (reflection / self-spoof), not traffic the guest
+                 * solicited */
+                if (daddr != ctx->inner_ip || saddr == ctx->inner_ip) {
+                    log_debug("drop inner packet: addr filter (%08x->%08x)",
+                              saddr, daddr);
+                    continue;
+                }
             }
             /* C2 (bounded part): TUN writes are one frame per call (a
              * multi-iovec writev would be coalesced into ONE frame the

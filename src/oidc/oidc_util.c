@@ -34,7 +34,7 @@ void oidc_pause_if_relaunched(void)
 #endif
 }
 
-void oidc_die(const char *fmt, ...)
+_Noreturn void oidc_die(const char *fmt, ...)
 {
     va_list ap;
     fputs("Error: ", stderr);
@@ -48,7 +48,7 @@ void oidc_die(const char *fmt, ...)
     exit(1);
 }
 
-void oidc_die_with_cause(const char *msg, const char *cause)
+_Noreturn void oidc_die_with_cause(const char *msg, const char *cause)
 {
     fprintf(stderr, "Error: %s\n\nCaused by:\n    %s\n", msg, cause);
 #ifdef _WIN32

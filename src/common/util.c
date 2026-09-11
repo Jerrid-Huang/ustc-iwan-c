@@ -34,7 +34,7 @@ void util_ignore_sigpipe(void)
     port_ignore_sigpipe();
 }
 
-void oom_abort(void)
+_Noreturn void oom_abort(void)
 {
     fprintf(stderr, "out of memory\n");
     abort();

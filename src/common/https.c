@@ -55,12 +55,15 @@ static long hex_parse_sz(const char *s, size_t n)
 
 /* Decode a chunked body into out. Returns 1 on success; 0 with *err set
  * when the stream is malformed (bad hex size, chunk overrunning the
- * buffer, or garbage after the terminal chunk). The caller reports the
- * failure instead of silently shipping a truncated body. */
+ * buffer, or the body ends without a terminal zero-size chunk, i.e. a
+ * truncated transfer). Trailer junk after the terminal chunk is ignored.
+ * The caller reports the failure instead of silently shipping a
+ * truncated body. */
 static int chunk_decode(const char *in, size_t in_len, struct sbuf *out,
                         char *err, size_t errsz)
 {
     size_t i = 0;
+    int saw_terminal = 0;   /* 1 once a zero-size chunk has been parsed */
     while (i < in_len) {
         size_t j = i;
         long sz;
@@ -78,6 +81,7 @@ static int chunk_decode(const char *in, size_t in_len, struct sbuf *out,
             j++;
         if (sz == 0) {
             /* terminal chunk: only trailer junk may follow; ignore it */
+            saw_terminal = 1;
             break;
         }
         if ((size_t)sz > in_len - j) {
@@ -90,6 +94,10 @@ static int chunk_decode(const char *in, size_t in_len, struct sbuf *out,
         while (j < in_len && (in[j] == '\r' || in[j] == '\n'))
             j++;
         i = j;
+    }
+    if (!saw_terminal) {
+        snprintf(err, errsz, "chunked body truncated: missing terminal chunk");
+        return 0;
     }
     return 1;
 }

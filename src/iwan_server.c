@@ -545,7 +545,12 @@ static void srv_dl_flush(struct srv_dl_batch *b, int fd)
         return;
     }
     /* compact [sent..n) to the front; the retained msgs/iovs must be
-     * re-pointed after the sub-array memmoves (hdrs/pl/peers moved too). */
+     * re-pointed after the sub-array memmoves (hdrs/pl/peers moved too).
+     * msg_name/msg_namelen are re-pointed as well: the moved msgs[] array
+     * still references the OLD b->peers[] cell addresses, and since the UDP
+     * fds are unconnected, msg_name is authoritative for delivery — keeping
+     * it stale would send the retained downlink to the WRONG client once the
+     * next srv_tun_pkt re-staging overwrites those old cells. */
     {
         int kept = n - sent;
         /* whole-array forms: keeps the fortified memmove bound sane (the
@@ -565,6 +570,8 @@ static void srv_dl_flush(struct srv_dl_batch *b, int fd)
             b->iovs[i * 2 + 1].iov_base = b->pl[i];
             b->iovs[i * 2 + 1].iov_len = plen;
             b->msgs[i].msg_hdr.msg_iov = &b->iovs[i * 2];
+            b->msgs[i].msg_hdr.msg_name = &b->peers[i];
+            b->msgs[i].msg_hdr.msg_namelen = sizeof b->peers[0];
         }
         b->n = kept;
     }

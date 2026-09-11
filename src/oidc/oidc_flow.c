@@ -271,21 +271,31 @@ static Json *exchange_code(const char *code, const char *code_verifier)
         char msg[512];
         snprintf(msg, sizeof msg, "token exchange failed (HTTP %d): %s", st,
                  resp && *resp ? resp : "no response (transport error)");
+        /* FIX-E: scrub the raw OAuth request body (code + PKCE
+         * code_verifier) and the response (tokens) before release */
+        OPENSSL_cleanse(body.data, body.len);
         buf_free(&body);
+        if (resp)
+            OPENSSL_cleanse(resp, strlen(resp));
         free(resp);
         oidc_die("%s", msg);
     }
+    OPENSSL_cleanse(body.data, body.len);
     buf_free(&body);
     if (st != 200) {
         /* R4-03-4: same ordering — format before freeing resp */
         char msg[512];
         snprintf(msg, sizeof msg, "token exchange failed HTTP %d: %s", st,
                  resp ? resp : "");
+        if (resp)
+            OPENSSL_cleanse(resp, strlen(resp));
         free(resp);
         oidc_die("%s", msg);
     }
 
     Json *tok = json_parse(resp);
+    if (resp)
+        OPENSSL_cleanse(resp, strlen(resp));
     free(resp);
     if (!tok)
         oidc_die("cannot parse token response");

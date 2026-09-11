@@ -26,7 +26,7 @@ char *cmd_capture(char *const args[]);
 
 /* allocation failure is fatal: growable buffers and string helpers have no
  * error path, so report and abort instead of dereferencing NULL */
-void oom_abort(void);
+_Noreturn void oom_abort(void);
 
 void log_info(const char *fmt, ...);   /* -> stdout */
 void log_err(const char *fmt, ...);    /* -> stderr */

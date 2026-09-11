@@ -1625,6 +1625,10 @@ void handle_dns_results(void) {
                                   q[k].ip6[7], q[k].ip6[8], q[k].ip6[9],
                                   q[k].ip6[10], q[k].ip6[11], q[k].ip6[12],
                                   q[k].ip6[13], q[k].ip6[14], q[k].ip6[15]);
+                    /* must stay consistent with flow_start_target: the
+                     * reply dispatch (update_tcp_states) keys on
+                     * f->target_af == 6 for a v6-format (atyp=4) reply */
+                    f->target_af = 6;
                     flow_open_gated(f, 6, 0, q[k].ip6, q[k].port);
                 } else {
                     if (debug_enabled())

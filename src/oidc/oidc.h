@@ -59,8 +59,8 @@ typedef struct {
 } Opts;
 
 /* oidc_util.c */
-void oidc_die(const char *fmt, ...);
-void oidc_die_with_cause(const char *msg, const char *cause);
+_Noreturn void oidc_die(const char *fmt, ...);
+_Noreturn void oidc_die_with_cause(const char *msg, const char *cause);
 void oidc_pause_if_relaunched(void);
 /* oidc_eprintf is the raw-stderr printer (no newline, no flush) shared
  * with the core CLI helpers: err_printf (util.h) has the identical
