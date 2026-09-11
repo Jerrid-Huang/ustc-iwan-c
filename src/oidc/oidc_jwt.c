@@ -103,14 +103,24 @@ static Json *fetch_json(const char *host, const char *path, const char *what)
     Json *j;
 
     if (!https_get(host, path, &st, &body)) {
+        /* R37-WG-G (L28): the response body is remote controlled — the
+         * terminal copy is neutralized. The raw `body` buffer is still
+         * the one freed here and parsed below: no verdict depends on
+         * the sanitized string. */
+        char *body_s = oidc_printable_dup(body && *body ? body
+                                                        : "no response");
         oidc_eprintf("oidc_jwt_verify: cannot fetch %s (HTTP %d): %s\n",
-                     what, st, body && *body ? body : "no response");
+                     what, st, body_s);
+        free(body_s);
         free(body);
         return NULL;
     }
     if (st != 200) {
+        /* L28: same as above, non-200 branch */
+        char *body_s = oidc_printable_dup(body && *body ? body : "no body");
         oidc_eprintf("oidc_jwt_verify: %s returned HTTP %d: %s\n", what, st,
-                     body && *body ? body : "no body");
+                     body_s);
+        free(body_s);
         free(body);
         return NULL;
     }
@@ -224,8 +234,13 @@ static Json *decode_jwt_parts(const char *jwt, const char **sig,
         goto fail;
     }
     if (strcmp(alg, "RS256") != 0) {
+        /* R37-WG-G (L28): header alg is attacker supplied. The accept
+         * decision above is a strcmp() on the RAW value; only the copy
+         * handed to the terminal is filtered. */
+        char *alg_s = oidc_printable_dup(alg);
         oidc_eprintf("oidc_jwt_verify: unsupported alg \"%s\" "
-                     "(RS256 only)\n", alg);
+                     "(RS256 only)\n", alg_s);
+        free(alg_s);
         goto fail;
     }
     if (!json_get_str(hdr_j, "kid")) {
@@ -281,6 +296,8 @@ static int validate_claims(Json *pay_j, const char *aud, const char *iss)
         }
     }
     if (!aud_matches(pay_j, aud)) {
+        /* aud is the caller's local OIDC_CLIENT_ID constant (oidc_flow.c
+         * passes the literal), so it is deliberately NOT filtered. */
         oidc_eprintf("oidc_jwt_verify: id_token aud does not include "
                      "\"%s\"\n", aud);
         return -1;
@@ -293,8 +310,13 @@ static int validate_claims(Json *pay_j, const char *aud, const char *iss)
         if (audc && json_type(audc) == JSON_ARR) {
             const char *azp = json_get_str(pay_j, "azp");
             if (!azp || strcmp(azp, aud) != 0) {
+                /* R37-WG-G (L28): azp is issuer controlled; the strcmp()
+                 * above still compares the raw claim, only the printed
+                 * copy is filtered. `aud` is a local constant. */
+                char *azp_s = oidc_printable_dup(azp ? azp : "(missing)");
                 oidc_eprintf("oidc_jwt_verify: id_token azp \"%s\" != "
-                             "\"%s\"\n", azp ? azp : "(missing)", aud);
+                             "\"%s\"\n", azp_s, aud);
+                free(azp_s);
                 return -1;
             }
         }
@@ -302,8 +324,13 @@ static int validate_claims(Json *pay_j, const char *aud, const char *iss)
     {
         const char *tiss = json_get_str(pay_j, "iss");
         if (!tiss || strcmp(tiss, iss) != 0) {
+            /* R37-WG-G (L28): the claim is issuer controlled, the
+             * expected `iss` is the caller's local "https://auth…"
+             * literal. Comparison stays on the raw strings. */
+            char *tiss_s = oidc_printable_dup(tiss ? tiss : "(missing)");
             oidc_eprintf("oidc_jwt_verify: id_token iss \"%s\" != \"%s\"\n",
-                         tiss ? tiss : "(missing)", iss);
+                         tiss_s, iss);
+            free(tiss_s);
             return -1;
         }
     }
@@ -325,8 +352,15 @@ static Json *fetch_jwks(const char *iss)
         return NULL;
     dis_iss = json_get_str(disc, "issuer");
     if (!dis_iss || strcmp(dis_iss, iss) != 0) {
+        /* R37-WG-G (L28): discovery fields are remote controlled (the
+         * document is fetched over TLS from the issuer host but its
+         * contents are still attacker-influenced text). The pinning
+         * strcmp() above uses the raw claim. */
+        char *dis_iss_s = oidc_printable_dup(dis_iss ? dis_iss
+                                                     : "(missing)");
         oidc_eprintf("oidc_jwt_verify: discovery issuer \"%s\" != \"%s\"\n",
-                     dis_iss ? dis_iss : "(missing)", iss);
+                     dis_iss_s, iss);
+        free(dis_iss_s);
         goto out;
     }
     jwks_uri = json_get_str(disc, "jwks_uri");
@@ -336,7 +370,10 @@ static Json *fetch_jwks(const char *iss)
         goto out;
     }
     if (!https_url_split(jwks_uri, &jhost, &jpath)) {
-        oidc_eprintf("oidc_jwt_verify: invalid jwks_uri \"%s\"\n", jwks_uri);
+        /* L28: display only — the rejected URL is parsed as-is above */
+        char *uri_s = oidc_printable_dup(jwks_uri);
+        oidc_eprintf("oidc_jwt_verify: invalid jwks_uri \"%s\"\n", uri_s);
+        free(uri_s);
         goto out;
     }
     jwks = fetch_json(jhost, jpath, "JWKS");
@@ -372,12 +409,20 @@ static EVP_PKEY *select_jwks_key(Json *jwks, const char *kid)
         if (pkey)
             return pkey;
     }
-    if (!saw_kid)
+    if (!saw_kid) {
+        /* R37-WG-G (L28): `kid` comes from the JWT header, the JWKS is
+         * remote. The key hunt above (strcmp against kkid) used the raw
+         * kid; only these two diagnostics are filtered. */
+        char *kid_s = oidc_printable_dup(kid ? kid : "(missing)");
         oidc_eprintf("oidc_jwt_verify: JWKS has no key with kid \"%s\"\n",
-                     kid);
-    else
+                     kid_s);
+        free(kid_s);
+    } else {
+        char *kid_s = oidc_printable_dup(kid ? kid : "(missing)");
         oidc_eprintf("oidc_jwt_verify: no usable RSA/sig key with "
-                     "kid \"%s\"\n", kid);
+                     "kid \"%s\"\n", kid_s);
+        free(kid_s);
+    }
     return NULL;
 }
 

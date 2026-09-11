@@ -5,11 +5,11 @@
  * Dispatch header for the SOCKS-mode userspace TCP stack. The SOCKS layer
  * (socks.c / socks_flow.c) talks to it through the ns_* API. The vendored
  * lwIP bridge is the only implementation (the native netstack.c rollback
- * was removed); IWAN_NS_IPV6 stays a compile-time switch so the IPv4-only
- * fallback branch in socks_flow.c remains visible and testable.
+ * was removed). Inner IPv6 is a RUNTIME choice — the client's
+ * --socks-ipv6 flag (socks_flow.c g_socks_cfg->ipv6) — not a compile-time
+ * switch: there is no IWAN_NS_IPV6 macro and no IPv4-only fallback build.
  */
 
-#define IWAN_NS_IPV6 1   /* the lwIP bridge speaks inner IPv6 */
 #include "lwip_bridge.h"
 
 #endif /* IWAN_TCPSTACK_H */

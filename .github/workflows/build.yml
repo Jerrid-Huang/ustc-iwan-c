@@ -51,7 +51,7 @@ jobs:
           sudo apt-get install -y clang libssl-dev linux-libc-dev
 
       - name: Configure
-        run: cmake -B build -DCMAKE_C_COMPILER=${{ matrix.cc }} -DIWAN_WERROR=ON
+        run: cmake -B build -DCMAKE_C_COMPILER=${{ matrix.cc }} -DIWAN_WERROR=ON -DIWAN_STRICT=ON
 
       - name: Build (${{ matrix.cc }})
         run: |

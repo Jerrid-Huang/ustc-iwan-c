@@ -1,4 +1,5 @@
 /* wintun_pin.c — SHA-256 pin verification (Windows only; see .h) */
+#include <string.h>   /* strlen: pin_matches() is compiled on every host */
 #include "crypto.h"   /* -> common.h -> winsock2 before windows.h */
 #include "wintun_pin.h"
 
@@ -39,7 +40,6 @@ static inline bool pin_matches(const char *want, const uint8_t hash[32])
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
-#include <string.h>
 #include <wchar.h>
 
 bool wintun_pin_ok(const wchar_t *path)

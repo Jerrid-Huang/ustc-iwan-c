@@ -1921,12 +1921,16 @@ void service_local_inputs(Flow *fs) {
                     break;       /* stack full: backpressure */
                 }
                 ssize_t r2 = port_readv(f->fd, iov, nv);
-                if (r2 < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                /* R37 R3-L5: EINTR is a retry, not a dead client — the
+                 * next event-loop round reads again (ns_close/ns_abort
+                 * here RST the client and discard f->output) */
+                if (r2 < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+                    errno != EINTR) {
                     log_debug("[flow %lu] readv fd=%d nv=%d err=%s "
-                              "iov0=%p/%zu",
+                              "iov0=%p/%llu",
                               (unsigned long)f->id, f->fd, nv,
                               strerror(errno), iov[0].iov_base,
-                              iov[0].iov_len);
+                              (unsigned long long)iov[0].iov_len);
                 }
                 if (r2 > 0) {
                     size_t left = (size_t)r2;
@@ -2083,8 +2087,10 @@ void service_local_inputs(Flow *fs) {
                     f->local_eof = true;
                     set_flow_state(f, ST_CLOSING);
                 }
-            } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                /* hard read error during the handshake: the flow has no
+            } else if (errno != EAGAIN && errno != EWOULDBLOCK &&
+                       errno != EINTR) {
+                /* hard read error during the handshake (R37 R3-L5: EINTR
+                 * is retried next round, not treated as hard): the flow has no
                  * netstack conn, so close it unconditionally — leaving
                  * ST_GREETING would hold the fd/slot until the 30s
                  * timeout while poll busy-spins on the dead fd */
@@ -2119,7 +2125,11 @@ void service_local_outputs(void) {
                 /* R07 M-1/M-3: any actual byte written to the client is
                  * progress — resets the no-progress watchdog */
                 f->last_progress_ms = now_ms();
-            } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK ||
+                                 errno == EINTR)) {
+                /* R37 R3-L5: EINTR keeps the queued output for the next
+                 * round; the old code fell into the hard-error branch and
+                 * buf_clear()ed replies the client never got */
                 break;
             } else {
                 f->local_eof = true;
@@ -2183,7 +2193,7 @@ void service_local_outputs(void) {
                      * no-progress watchdog */
                     f->last_progress_ms = now_ms();
                 } else if (n < 0 && errno != EAGAIN &&
-                           errno != EWOULDBLOCK) {
+                           errno != EWOULDBLOCK && errno != EINTR) {
                     f->local_eof = true;
                     ns_abort(&g_ns, f->ns_idx);
                     f->rxq_waiting = false; /* dead client: no POLLOUT wake */

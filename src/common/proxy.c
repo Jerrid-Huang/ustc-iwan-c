@@ -301,6 +301,30 @@ static int send_batch(pump_ctx_t *ctx, struct mmsghdr *msgs, unsigned n)
                 return TX_DONE;   /* bounded: yield to the receive path */
             continue;
         }
+        if (errno == EMSGSIZE || errno == EINVAL) {
+            /* R37 R3-M4: sendmmsg() reports the errno of the FIRST unsent
+             * datagram. EMSGSIZE (datagram exceeds the path MTU with DF
+             * set: inner MTU > outer) and EINVAL (argument this socket
+             * rejects) are per-datagram FEATURE failures — exactly how
+             * send_gso above classifies them ("a hard GSO error means the
+             * feature is unusable on this socket, not that the tunnel
+             * died"). They must not mark the session lost: the old code
+             * forced a full re-auth/reconnect on every such frame, which
+             * under a persistent MTU mismatch becomes a reconnect storm
+             * and a permanent black hole. Drop just the refused datagram
+             * (sent++ skips it) and keep delivering the rest of the
+             * batch; a genuinely dead fd (EBADF/ENOTCONN/EPIPE/...) still
+             * falls through to the TX_FATAL branch below. */
+            static uint64_t last_diag;
+            uint64_t dt = now_ms();
+            if (dt - last_diag >= 1000) {
+                last_diag = dt;
+                err_printf("[TUN->UDP] sendmmsg: %s (dropping datagram)\n",
+                           strerror(errno));
+            }
+            sent++;
+            continue;
+        }
         err_printf("[TUN->UDP] sendmmsg: %s\n", strerror(errno));
         ctx->session_lost = true;
         g_stop = 1;
@@ -505,8 +529,9 @@ static void pump_tun_pkt(void *ud, uint8_t *pkt, size_t len, bool last)
      * The pool's last=true flush signal carries len==0, so this check
      * lives after the drain path above. */
     if (len == 0 || len > PUMP_SLOT) {
-        log_debug("pump: drop packet, len %zu out of [1, %d]", len,
-                  PUMP_SLOT);
+        /* %llu, never %zu: msvcrt printf (Windows) lacks %zu (json.c:55) */
+        log_debug("pump: drop packet, len %llu out of [1, %d]",
+                  (unsigned long long)len, PUMP_SLOT);
         return;
     }
     if (q->n == 0) {
@@ -819,8 +844,8 @@ static void *udp2tun_thread(void *ud) {
                 uint8_t s6[16], d6[16], want6[16];
                 if (plen < 40 ||
                     ip6_pkt_ok(m + 8, plen, s6, d6) != 0) {
-                    log_debug("drop inner packet: bad IPv6 header (%zu bytes)",
-                              plen);
+                    log_debug("drop inner packet: bad IPv6 header (%llu bytes)",
+                              (unsigned long long)plen);
                     continue;
                 }
                 ip6_derive_ula(ctx->inner_ip, want6);
@@ -838,8 +863,8 @@ static void *udp2tun_thread(void *ud) {
                 /* inner IPv4 (existing gate, unchanged) */
                 uint32_t saddr, daddr;
                 if (ipv4_pkt_ok(m + 8, plen, &saddr, &daddr) != 0) {
-                    log_debug("drop inner packet: bad IPv4 header (%zu bytes)",
-                              plen);
+                    log_debug("drop inner packet: bad IPv4 header (%llu bytes)",
+                              (unsigned long long)plen);
                     continue;
                 }
                 /* ingress filter (audit M5): a downlink frame must be
@@ -988,20 +1013,28 @@ static void push_unique(slist_t *s, const char *str) {
  * share this skeleton; the family-specific parts are kept in the
  * branches so error text and validation rules stay identical to the
  * two originals. Returns 0 on success, -1 on a malformed target. */
-/* R2-L36: is s a numeric IPv4 spelling that inet_pton() rejects but a
- * permissive parser (inet_aton / glibc's getaddrinfo) would silently
- * reinterpret? strtoul(base 0) accepts hex ("0x7f") and octal ("010")
- * components, and inet_aton accepts 1..4 dotted components ("127.1"), so
- * any string whose components all parse that way is a DIFFERENT address
- * than it looks. cidr_parse (the "/n" branch) rejects all of these, so
- * accepting them here made one --proxy-cidr parameter mean two things.
- * Strings that do not parse numerically at all (real domain names such as
- * "dns.example", where 'd'/'s'/'n' are not digits) return false and keep
- * going to getaddrinfo(). */
+/* R2-L36 + R37 R3-L19: is s a numeric IPv4 spelling that inet_pton()
+ * rejects but a permissive parser (inet_aton / glibc's getaddrinfo) would
+ * silently reinterpret? strtoul(base 0) accepts hex ("0x7f") and octal
+ * ("010") components, and inet_aton accepts 1..4 dotted components
+ * ("127.1"), so any string whose components all parse that way is a
+ * DIFFERENT address than it looks. cidr_parse (the "/n" branch) rejects
+ * all of these, so accepting them here made one --proxy-cidr parameter
+ * mean two things.
+ *
+ * The component loop below is the whole test: a string is rejected when
+ * EVERY component is consumed by strtoul(.., 0) and there are at most 4
+ * of them. The old first line ("no dot => a domain") let the DOTLESS
+ * spellings through, which is the same hole: getaddrinfo() read
+ * "--proxy-cidr 1" as 0.0.0.1/32, "0x7f000001" as 127.0.0.1/32,
+ * "0"/"0X1"/"4294967295" likewise — while "1/32" (the CIDR branch) was
+ * rejected. Removing the dot test closes all of them without touching
+ * real names: a domain such as "localhost", "dns.example" or "abc" is
+ * not fully consumed by strtoul (its first character is not a digit or
+ * the string does not end where the number ends), so it still reaches
+ * getaddrinfo(). */
 static bool numeric_v4_spelling(const char *s)
 {
-    if (strchr(s, '.') == NULL)
-        return false;                  /* "127" alone is a domain, not v4 */
     int parts = 0;
     for (const char *q = s; ; ) {
         char *end;
@@ -1270,8 +1303,8 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
             slist_free(&routes6);
             return -1;
         }
-        log_info("tun %s ready: %zu route%s", tun_ifname(tun_name),
-                 routes.n, routes.n == 1 ? "" : "s");
+        log_info("tun %s ready: %llu route%s", tun_ifname(tun_name),
+                 (unsigned long long)routes.n, routes.n == 1 ? "" : "s");
         for (size_t i = 0; i < routes.n; i++)
             log_debug("route %s -> dev %s", routes.v[i],
                       tun_ifname(tun_name));

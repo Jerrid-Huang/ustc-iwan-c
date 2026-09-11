@@ -175,7 +175,28 @@ void accept_connections(int listener) {
              * valid on Windows */
             if (errno == EAGAIN || errno == EWOULDBLOCK)
                 return;
-            log_err("accept SOCKS5 client: %s", strerror(errno));
+            /* R37 R3-M3: a signal-interrupted accept() is not a failure */
+            if (errno == EINTR)
+                continue;
+            /* R37 R3-M3: every other accept() error (EMFILE/ENFILE/
+             * ENOBUFS/ENOMEM/ECONNABORTED/...) leaves the pending
+             * connection in the backlog, so the caller's
+             * poll -> accept -> log cycle would return immediately every
+             * round: measured 98-102% CPU, 1.42M accepts/3s and 31.6 MiB
+             * of stderr in 3s while every local client timed out. Back
+             * off ONE bounded sleep and then return — the main loop must
+             * still run (under EMFILE it is the thing that releases fds)
+             * but at ~20 cycles/s instead of a hot spin. The log is
+             * rate-limited to one line per second so a persistent error
+             * cannot flood stderr either. */
+            static uint64_t last_acc_backoff_ms;
+            uint64_t acc_now = now_ms();
+            if (acc_now - last_acc_backoff_ms >= 1000) {
+                last_acc_backoff_ms = acc_now;
+                log_err("accept SOCKS5 client: %s (backing off)",
+                        strerror(errno));
+            }
+            port_sleep_ms(50);
             return;
         }
         /* Serve only loopback peers by default: an unauthenticated
@@ -437,6 +458,21 @@ per_msg:
                     return (int)sent;
                 continue;
             }
+            if (errno == EMSGSIZE || errno == EINVAL) {
+                /* R37 R3-M4: same classification as the GSO path above —
+                 * a per-datagram reject (too large for the path MTU, or
+                 * an option the datagram cannot carry) is a FEATURE
+                 * failure of this batch, not a dead tunnel. Marking the
+                 * session lost here forced a full re-auth and a
+                 * reconnect storm while the tunnel was healthy (measured
+                 * 6x EMSGSIZE -> 2x "tunnel session lost" -> 3x re-auth
+                 * in 21s). The caller re-arms the unsent inner segments
+                 * (sock_drain_tx), so returning `sent` drops only this
+                 * batch's leftovers and keeps the session. */
+                log_err("SOCKS sendmmsg: %s (batch dropped, session kept)",
+                        strerror(errno));
+                return (int)sent;
+            }
             log_err("SOCKS sendmmsg: %s", strerror(errno));
             /* the tunnel socket itself is broken (not a transient
              * buffer condition): mark the session lost so the main
@@ -566,7 +602,8 @@ static int vpn_handle_data(SocksConfig *cfg, uint8_t *b, size_t n,
         int hn = (int)plen < 32 ? (int)plen : 32;
         for (int i = 0; i < hn; i++)
             sprintf(hex + i * 3, "%02x ", b[8 + i]);
-        log_debug("DATA decrypted (%zuB): %s...", plen, hex);
+        log_debug("DATA decrypted (%lluB): %s...", (unsigned long long)plen,
+                  hex);
     }
     uint32_t saddr, daddr;
     if (plen < 20 || plen > (size_t)cfg->mtu)
@@ -620,9 +657,9 @@ static int vpn_handle_datagram(int sockfd, SocksConfig *cfg, uint8_t *b,
     if (dbg_env("IWAN_RXDBG"))
         fprintf(stderr, "VRX: n=%llu t=%u\n", (unsigned long long)n, t);
     if (debug_enabled())
-        log_debug("VPN RX type=%u n=%zu sid=%u tok=****%04x "
+        log_debug("VPN RX type=%u n=%llu sid=%u tok=****%04x "
                   "(cfg sid=%u tok=****%04x)",
-                  t, n, psid, ptok & 0xFFFFu, cfg->sid,
+                  t, (unsigned long long)n, psid, ptok & 0xFFFFu, cfg->sid,
                   cfg->token & 0xFFFFu);
     if (psid != cfg->sid || ptok != cfg->token)
         return 0;

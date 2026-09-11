@@ -276,16 +276,28 @@ void oidc_connect_server(const Opts *o, const Config *cf)
     double pv;
     int pr = oidc_server_port(srv, &port, &pv);
     if (pr < 0)
+        /* R37-WG-E1 (L28): the name/host of an entry are remote controlled
+         * (controller /m/config; a hand-edited servers.json decodes \u001b
+         * back to a raw ESC). Every terminal copy below is neutralized;
+         * the raw pointers keep feeding matching and the auth stack. */
         oidc_die("invalid port %g for server \"%s\" "
                  "(must be an integer in 1..65535)",
-                 pv, name ? name : host);
+                 pv, oidc_printable_dup(name ? name : host));
     if (pr == 0)
         port = OIDC_DEFAULT_PORT;
     const char *srv_user = json_get_str(srv, "username");
     const char *encrypted_pw = json_get_str(srv, "passWord");
 
-    oidc_eprintf("  Connecting to %s (%s:%u)...\n", name ? name : "", host,
-                 (unsigned)port);
+    {
+        /* L28: printed on every connection attempt — the most likely
+         * sink for a hostile server name to reach the terminal */
+        char *name_s = oidc_printable_dup(name ? name : "");
+        char *host_s = oidc_printable_dup(host);
+        oidc_eprintf("  Connecting to %s (%s:%u)...\n", name_s, host_s,
+                     (unsigned)port);
+        free(name_s);
+        free(host_s);
+    }
 
     {
         char eb[64];
@@ -299,7 +311,7 @@ void oidc_connect_server(const Opts *o, const Config *cf)
     if (!srv_user || !srv_user[0])
         oidc_die("server \"%s\" has no username in servers.json; add "
                  "\"username\" (iwan-client defaults to _rev_m_1)",
-                 name ? name : host);
+                 oidc_printable_dup(name ? name : host));
     const char *user = srv_user;
 
     /* TUN device and route prep are session-independent: prepared once,
@@ -385,6 +397,13 @@ void oidc_connect_server(const Opts *o, const Config *cf)
                 break;
             continue;
         }
+        /* R37-WG-E1 (L28) ruling: res.tun/gw/dns are the only
+         * server-supplied strings on this line, and they cannot carry a
+         * control byte: auth.c fills them exclusively through
+         * ip_to_string() ("%d.%d.%d.%d", auth.c:93/101/109) or leaves
+         * them empty, and the ACK fields are frozen wire values that must
+         * stay raw for check_gw_server()/run_pump() below. Deliberately
+         * not filtered. */
         oidc_eprintf("  OK  tun=%s gw=%s dns=%s mtu=%u\n", res.tun, res.gw,
                      res.dns, (unsigned)res.mtu);
         check_gw_server(host, res.gw);   /* F8 */

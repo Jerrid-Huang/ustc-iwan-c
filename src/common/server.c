@@ -271,7 +271,11 @@ static unsigned g_rate_echo_max = RATE_ECHO_MAX_DEFAULT;
 static pthread_mutex_t g_log_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static uint64_t server_dl_pkts(void);
-static void srv_log(const char *fmt, ...)
+/* R37-F3 (R3-M5): printf-like wrapper (vfprintf(stdout, fmt, ap)) — see
+ * util.h; without the attribute its call sites were unchecked. On a
+ * function definition GCC wants the attribute before the declarator. */
+static void IWAN_PRINTF_LIKE(1, 2)
+srv_log(const char *fmt, ...)
 {
     va_list ap;
 
@@ -397,7 +401,30 @@ void server_up_stats_print(void)
 /* best-effort scrub of secrets, immune to optimizer elision */
 /* wipe: shared constant-time erasure from crypto.h */
 
-/* printable-only copy of an attacker-controlled string for logging */
+/* printable-only copy of an attacker-controlled string for logging.
+ *
+ * R3-L20: C0 + DEL alone is not enough — the C1 block (0x80..0x9F) holds
+ * the 8-bit CSI (0x9B), OSC (0x9D) and the other escape introducers, so
+ * a username like "\x9b31m" (8-bit SGR) or "\x9b2J" (erase display) went
+ * to stdout raw and let an unauthenticated OPEN forge terminal output.
+ * The C1 range is also the UTF-8 continuation-byte range, so a
+ * byte-wise escape would corrupt every multi-byte character that
+ * contains one (the U+20AC sign is E2 82 AC). Decode instead: a structurally
+ * valid UTF-8 sequence is copied verbatim; a bare C1 byte, and the
+ * two-byte UTF-8 encoding of a C1 code point (C2 80..C2 9F), are
+ * neutralised. Bytes >= 0xA0 that are not a valid lead byte are left
+ * alone, exactly as before. */
+static size_t utf8_seq_len(unsigned char c)
+{
+    if (c >= 0xC2 && c <= 0xDF)
+        return 2;
+    if (c >= 0xE0 && c <= 0xEF)
+        return 3;
+    if (c >= 0xF0 && c <= 0xF4)
+        return 4;
+    return 0;   /* ASCII, continuation byte, overlong lead, 0xF5..0xFF */
+}
+
 static void log_escape(const char *in, char out[], size_t outsz)
 {
     size_t i = 0;
@@ -405,7 +432,28 @@ static void log_escape(const char *in, char out[], size_t outsz)
         return;
     while (*in && i + 1 < outsz) {
         unsigned char c = (unsigned char)*in;
-        if (c < 0x20 || c == 0x7f)
+        size_t seq = utf8_seq_len(c);
+        if (seq >= 2) {
+            size_t k;
+            for (k = 1; k < seq; k++) {
+                if (((unsigned char)in[k] & 0xC0) != 0x80)
+                    break;
+            }
+            if (k == seq) {
+                if (i + seq + 1 > outsz)
+                    break;              /* no room for the whole char */
+                /* C2 80..C2 9F is U+0080..U+009F: a C1 control, not text */
+                if (seq != 2 || c != 0xC2 ||
+                    (unsigned char)in[1] < 0x80 ||
+                    (unsigned char)in[1] > 0x9F) {
+                    memcpy(out + i, in, seq);
+                    i += seq;
+                    in += seq;
+                    continue;
+                }
+            }
+        }
+        if (c < 0x20 || c == 0x7f || (c >= 0x80 && c <= 0x9f))
             c = '?';
         out[i++] = (char)c;
         in++;

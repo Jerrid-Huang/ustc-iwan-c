@@ -4,6 +4,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>   /* LLONG_MAX/ULLONG_MAX for parse_ll_strict */
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -97,6 +98,21 @@ void exec_sanitize(void)
     unsetenv("DYLD_LIBRARY_PATH");
     unsetenv("DYLD_FRAMEWORK_PATH");
     unsetenv("DYLD_FALLBACK_LIBRARY_PATH");
+    /* R37 R3-M6: these three select CODE, not just a trust anchor — a
+     * config file may load providers/engines, and the other two name the
+     * directories those loadable objects are searched in. sudo's
+     * env_reset drops them by default, but 'env_keep += "OPENSSL_CONF"',
+     * '!env_reset' or 'sudo -E' would hand a user-controlled file or
+     * directory to the ROOT re-exec (oidc_connect.c execs /usr/bin/sudo
+     * right after this call) => arbitrary code as root. There is no
+     * legitimate non-default value to preserve here: the corporate-CA
+     * case is covered by the root-owned SSL_CERT_FILE/SSL_CERT_DIR
+     * anchors kept below, and a system-wide provider/engine setup
+     * belongs in the compiled-in /etc/ssl/openssl.cnf, which OpenSSL
+     * loads with no environment variable at all. Drop all three. */
+    unsetenv("OPENSSL_CONF");
+    unsetenv("OPENSSL_MODULES");
+    unsetenv("OPENSSL_ENGINES");
     keep_root_owned_anchor("SSL_CERT_FILE");
     keep_root_owned_anchor("SSL_CERT_DIR");
 #else
@@ -126,22 +142,13 @@ static char **ip_argv(char *const args[])
 }
 
 #ifndef _WIN32
-static bool run_ip_child(char *const args[], bool quiet)
+static bool run_ip_child(char *const args[])
 {
     pid_t pid = fork();
     if (pid < 0)
         return false;
     if (pid == 0) {
         exec_sanitize();
-        if (quiet) {
-            int fd = open("/dev/null", O_RDWR);
-            if (fd >= 0) {
-                dup2(fd, STDOUT_FILENO);
-                dup2(fd, STDERR_FILENO);
-                if (fd > STDERR_FILENO)
-                    close(fd);
-            }
-        }
         char **argv = ip_argv(args);
         if (!argv)
             _exit(127);
@@ -149,8 +156,17 @@ static bool run_ip_child(char *const args[], bool quiet)
         _exit(127);
     }
     int st = 0;
-    while (waitpid(pid, &st, 0) < 0 && errno == EINTR)
+    pid_t w;
+    while ((w = waitpid(pid, &st, 0)) < 0 && errno == EINTR)
         ;
+    /* R37 R3-L7: a non-EINTR waitpid failure (ECHILD after a SIGCHLD
+     * handler with SA_NOCLDWAIT, EINVAL, ...) used to fall through with
+     * st still 0 => WIFEXITED(0) true and WEXITSTATUS(0) == 0 => ip_run
+     * reported success for a command whose exit status is unknown
+     * (route_setup would then believe the host was hijacked). port.c's
+     * port_run_cmd returns -1 here; match it. */
+    if (w < 0)
+        return false;
     if (!WIFEXITED(st))
         return false;
     return WEXITSTATUS(st) == 0;
@@ -161,7 +177,7 @@ static bool run_ip_child(char *const args[], bool quiet)
 bool ip_run(char *const args[])
 {
 #ifndef _WIN32
-    return run_ip_child(args, false);
+    return run_ip_child(args);
 #else
     char **argv = ip_argv(args);
     if (!argv)
@@ -169,18 +185,6 @@ bool ip_run(char *const args[])
     int rc = port_run_cmd(argv);
     free(argv);
     return rc == 0;
-#endif
-}
-
-bool ip_run_quiet(char *const args[])
-{
-#ifndef _WIN32
-    return run_ip_child(args, true);
-#else
-    /* Divergence: port_run_cmd cannot redirect the child's stdout/stderr,
-     * so output is not swallowed on Windows (CREATE_NO_WINDOW keeps it off
-     * the console). Callers treat ip_run_quiet as best-effort. */
-    return ip_run(args);
 #endif
 }
 
@@ -432,6 +436,53 @@ bool dbg_env(const char *name)
     }
 }
 
+/* Strict decimal parse for the numeric env vars (R37 R3 / L18): the WHOLE
+ * string must be a canonical decimal integer. strtoll() (used here before)
+ * silently accepted leading whitespace (" 1") and an explicit '+' ("+1"),
+ * while parse_uint() — the parser behind IWAN_SRV_THREADS and the CLI
+ * numbers — rejects both, so "IWAN_AUTH_FAIL_MAX=' 1'" quietly tightened
+ * the brute-force lockout to 1 failure while "IWAN_SRV_THREADS=' 1'" warned
+ * and fell back to the default. Both domains now reject the same spellings
+ * (leading/trailing whitespace, '+', trailing garbage, empty, overflow):
+ * the caller logs the value and keeps its default. A leading '-' is kept
+ * for API generality (env_ms_range takes signed bounds); the min/max check
+ * in the caller still rejects negatives for every current variable.
+ * Returns 0 and stores the value on success, -1 otherwise. */
+static int parse_ll_strict(const char *s, long long *out)
+{
+    if (!s || !*s)
+        return -1;
+    const char *p = s;
+    int neg = 0;
+    if (*p == '-') {
+        neg = 1;
+        p++;
+    }
+    if (*p < '0' || *p > '9')
+        return -1;
+    unsigned long long v = 0;
+    for (; *p; p++) {
+        if (*p < '0' || *p > '9')
+            return -1;
+        unsigned d = (unsigned)(*p - '0');
+        if (v > (ULLONG_MAX - d) / 10ULL)
+            return -1;                 /* overflow: out of range */
+        v = v * 10ULL + d;
+    }
+    if (neg) {
+        if (v > (unsigned long long)LLONG_MAX + 1ULL)
+            return -1;
+        *out = (v == (unsigned long long)LLONG_MAX + 1ULL)
+                   ? LLONG_MIN
+                   : -(long long)v;
+    } else {
+        if (v > (unsigned long long)LLONG_MAX)
+            return -1;
+        *out = (long long)v;
+    }
+    return 0;
+}
+
 /* Parse an environment variable as a millisecond duration. Returns defval
  * when the variable is unset/empty, when it fails to parse, or when it is
  * out of [min, max]; a warning is logged for the bad-value cases. When
@@ -443,14 +494,11 @@ long long env_ms_range(const char *name, long long defval, long long min,
                        const char *range_desc)
 {
     const char *v = getenv(name);
-    char *end;
     long long n;
 
     if (!v || !v[0])
         return defval;
-    errno = 0;
-    n = strtoll(v, &end, 10);
-    if (errno != 0 || end == v || *end != '\0') {
+    if (parse_ll_strict(v, &n) != 0) {
         log_err("%s: invalid value '%s' (%s); using default",
                 name, v, range_desc);
         return defval;
@@ -631,7 +679,14 @@ void pace_bucket_init(pace_bucket *b)
         const char *v = getenv("IWAN_SEND_PACING_PPS");
         uint64_t pps = 0;
         if (v && *v) {
-            if (parse_uint(v, 10000000, &pps) == 0 && pps > 0) {
+            /* R37 L16: 0 is the documented "pacing disabled" sentinel
+             * (util.h) and is exactly what an unset variable yields, so
+             * an explicit "0" must be accepted silently — the old
+             * `&& pps > 0` test reported it as an invalid value and
+             * printed a bogus error (IWAN_RX_STALE_MS=0 has always been
+             * accepted via allow_zero). The resulting state is identical:
+             * pps==0 -> pace_take() returns immediately. */
+            if (parse_uint(v, 10000000, &pps) == 0) {
                 cached_pps = (uint32_t)pps;
             } else {
                 log_err("invalid IWAN_SEND_PACING_PPS '%s': pacing disabled",

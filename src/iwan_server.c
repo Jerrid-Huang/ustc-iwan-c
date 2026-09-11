@@ -109,14 +109,21 @@ static void usage(const char *prog, FILE *out)
     fprintf(out, "  -d, --dns <IP>         DNS server advertised to clients (default 114.114.114.114)\n");
     fprintf(out, "  -u, --users <FILE>     users file, one user:pass per line (default /etc/iwan/users.txt)\n");
     fprintf(out, "  -n, --nat-if <IF>      outbound interface for MASQUERADE (default eth0)\n");
-    fprintf(out, "      --no-tun           (testing) skip TUN device\n");
+    fprintf(out, "  -T, --no-tun           (testing) skip TUN device\n");
     fprintf(out, "      --user <NAME>      drop root privileges to this user after setup (default nobody)\n");
     fprintf(out, "  -h, --help             show this help\n");
+    fprintf(out, "  note: an option given twice takes its LAST value; unlike\n");
+    fprintf(out, "        iwan-client, no 'cannot be used multiple times' error\n");
 }
 
 /* exit-code convention (matches iwan-client): usage errors exit 2 with
- * the usage text on stderr; runtime errors exit 1 */
-static void usage_error(const char *prog, const char *fmt, ...)
+ * the usage text on stderr; runtime errors exit 1.
+ * R37-F3 (R3-M5): this is a variadic printf wrapper forwarding `fmt` to
+ * vfprintf, so it carries the same compile-time format checking as the
+ * shared loggers (IWAN_PRINTF_LIKE, util.h). `fmt` is argument 2. On a
+ * function *definition* GCC wants the attribute before the declarator. */
+static void IWAN_PRINTF_LIKE(2, 3)
+usage_error(const char *prog, const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
@@ -1108,25 +1115,29 @@ int main(int argc, char **argv)
         }
     }
 
-    /* R37 R1-D-2: --dns is only WARNED about, never fatal. T_DNS/T_IP hand
-     * the resolver to the client as a tunnel-reachable address, so it may
-     * legitimately be (a) inside the client pool — an in-tunnel resolver —
-     * or (b) outside --subnet altogether — a public resolver reached
-     * through the tunnel, which is exactly what the documented default
-     * (114.114.114.114, see usage()) is. Making either case fatal meant the
-     * usage's own default combination could never start, and the only
-     * accepted values left were the network address, the server's own
-     * address and the broadcast address. Both cases now print a diagnostic
-     * and continue; a syntactically invalid address is still rejected by
-     * the option parser before this point. */
+    /* R37 R1-D-2: a --dns OUTSIDE the client pool is only warned about,
+     * never fatal. T_DNS/T_IP hand the resolver to the client as a
+     * tunnel-reachable address, and a public resolver outside --subnet
+     * (exactly the documented default 114.114.114.114) is reached
+     * through the tunnel — making that fatal meant the usage's own
+     * default combination could never start. An in-pool --dns is a
+     * different case and stays fatal (L31): the pool allocator
+     * (server.c next_ip) only skips addresses held by a live session and
+     * never reserves ctx.dns, so it WILL hand the DNS address out on an
+     * OPEN — measured: the first client got tun == dns == 198.18.0.2 and
+     * the fourth got .5 with -d 198.18.0.5. A resolver address shared
+     * with a client is a guaranteed conflict, not a warning. */
     {
         uint32_t mask32 = 0xFFFFFFFFu << (32 - o.mask);
         uint32_t dipu = ip4_u32(dip);
-        if (dipu >= ctx.ip_base && dipu <= ctx.ip_end)
-            fprintf(stderr, "warning: --dns %s falls inside the client pool "
-                            "of --subnet %s; it may collide with an address "
-                            "handed out to a client\n",
+        if (dipu >= ctx.ip_base && dipu <= ctx.ip_end) {
+            fprintf(stderr, "error: --dns %s falls inside the client pool "
+                            "of --subnet %s; it is not reserved by the pool "
+                            "allocator, so a client would be handed the "
+                            "same address (pick a DNS outside the pool)\n",
                     o.dns, o.subnet);
+            return 1;
+        }
         if ((dipu & mask32) != subnet_base)
             fprintf(stderr, "warning: --dns %s is outside --subnet %s; "
                             "clients can reach it only if the tunnel/routes "
@@ -1331,8 +1342,39 @@ int main(int argc, char **argv)
                     "/dev/net/tun access or queue setup limited -- steering "
                     "may be single-queue\n", nq, initq);
     }
-    printf("listening UDP 0.0.0.0:%u (%d recv thread%s)\n",
-           (unsigned)o.port, recv_threads, recv_threads > 1 ? "s" : "");
+    /* L23: report the port the kernel actually bound to udp_fds[0], not
+     * the requested one. `-p 0` asks for an ephemeral port, and with
+     * SO_REUSEPORT each socket is bound independently — measured: the
+     * kernel picked FOUR different ephemeral ports for the four recv
+     * sockets, so the old "listening UDP 0.0.0.0:0" line advertised a
+     * port that does not exist and no single port reaches the whole
+     * fan-out. Keep running (--port 0 stays accepted) but make the log
+     * honest and call the unusable fan-out out loud. */
+    {
+        struct sockaddr_in ba;
+        socklen_t blen = sizeof ba;
+        uint16_t bound_port = o.port;
+        if (getsockname(udp_fds[0], (struct sockaddr *)&ba, &blen) == 0)
+            bound_port = ntohs(ba.sin_port);
+        for (int i = 1; i < nfds; i++) {
+            struct sockaddr_in b2;
+            socklen_t l2 = sizeof b2;
+            if (getsockname(udp_fds[i], (struct sockaddr *)&b2, &l2) == 0 &&
+                ntohs(b2.sin_port) != bound_port) {
+                fprintf(stderr,
+                        "warning: SO_REUSEPORT sockets bound to different "
+                        "ports (fd[0]=%u, fd[%d]=%u); with an ephemeral "
+                        "--port 0 there is no single port clients can "
+                        "connect to -- pass a fixed --port\n",
+                        (unsigned)bound_port, i,
+                        (unsigned)ntohs(b2.sin_port));
+                break;
+            }
+        }
+        printf("listening UDP 0.0.0.0:%u (%d recv thread%s)\n",
+               (unsigned)bound_port, recv_threads,
+               recv_threads > 1 ? "s" : "");
+    }
     printf("server ready.\n");
     fflush(stdout);   /* readiness contract: callers grep the log */
 

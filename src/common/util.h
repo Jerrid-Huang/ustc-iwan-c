@@ -6,6 +6,29 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* R37-F3 (R3-M5): format checking for our own printf-like wrappers.
+ * Without this attribute the compiler did not check any of the 250+
+ * log/error call sites at all, which is how a %zu in a log call could
+ * pass every gate but the two places that went through libc's fprintf
+ * (that exact split is R3-H1: auth.c:416 broke the mingw build while
+ * oidc_config.c's err_printf was silently unchecked).
+ * MinGW targets msvcrt's printf, whose archetype rejects %zu even though
+ * the header redirects the call to __mingw_* (see json.c:55): ms_printf
+ * is the archetype that matches what the Windows build enforces, so a
+ * %zu in a log call is caught at compile time instead of shipping.
+ * NOTE: __MINGW_PRINTF_FORMAT cannot be used here — the MinGW headers
+ * define it only after this point of the include graph (measured). */
+#if defined(__MINGW32__) && defined(__GNUC__)
+#  define IWAN_PRINTF_FMT ms_printf
+#elif defined(__GNUC__)
+#  define IWAN_PRINTF_FMT gnu_printf
+#endif
+#if defined(__GNUC__)
+#  define IWAN_PRINTF_LIKE(a, b) __attribute__((format(IWAN_PRINTF_FMT, a, b)))
+#else
+#  define IWAN_PRINTF_LIKE(a, b)   /* non-GCC: no checking */
+#endif
+
 #ifdef IWAN_DEBUG_STRIP
 #define log_debug(...) ((void)0)
 static inline bool debug_enabled(void) { return false; }
@@ -17,7 +40,6 @@ bool debug_enabled(void);
 void exec_sanitize(void);
 /* run `ip` with argv (NULL-terminated, excluding argv[0]="ip"). Returns exit==0. */
 bool ip_run(char *const args[]);
-bool ip_run_quiet(char *const args[]);
 /* capture stdout of a command (NULL-terminated argv, excluding argv[0]).
  * Returns malloc'd string or NULL. NOTE: NULL is returned both when the
  * command fails AND when it succeeds with empty output (callers so far
@@ -28,23 +50,26 @@ char *cmd_capture(char *const args[]);
  * error path, so report and abort instead of dereferencing NULL */
 _Noreturn void oom_abort(void);
 
-void log_info(const char *fmt, ...);   /* -> stdout */
-void log_err(const char *fmt, ...);    /* -> stderr */
+void log_info(const char *fmt, ...) IWAN_PRINTF_LIKE(1, 2);   /* -> stdout */
+void log_err(const char *fmt, ...) IWAN_PRINTF_LIKE(1, 2);    /* -> stderr */
 #ifndef IWAN_DEBUG_STRIP
-void log_debug(const char *fmt, ...);  /* -> stderr if IWAN_DEBUG */
+void log_debug(const char *fmt, ...) IWAN_PRINTF_LIKE(1, 2);  /* -> stderr if IWAN_DEBUG */
 #endif
 /* raw stderr printf (no newline, no flush): the shared implementation
  * behind the eprintf/oidc_eprintf helpers (log_err appends a newline
  * instead) */
-void err_printf(const char *fmt, ...);
+void err_printf(const char *fmt, ...) IWAN_PRINTF_LIKE(1, 2);
 
-/* diagnostic env flags (IWAN_RXDBG / IWAN_RETX / IWAN_FLOWDBG): parsed
- * once per name and cached; any value other than 0/false/off enables */
+/* diagnostic env flags (IWAN_RXDBG / IWAN_FLOWDBG): parsed once per name
+ * and cached; any value other than 0/false/off enables */
 bool dbg_env(const char *name);
 
 /* parse a millisecond duration from env var `name`; see util.c. Returns
  * defval when unset/empty/unparseable/out-of-range (with a warning);
- * allow_zero lets an explicit 0 (the "disabled" sentinel) pass through. */
+ * allow_zero lets an explicit 0 (the "disabled" sentinel) pass through.
+ * The value must be a canonical decimal integer: leading/trailing
+ * whitespace, a '+' sign and trailing garbage are rejected, matching
+ * parse_uint (the parser behind the CLI numbers and IWAN_SRV_THREADS). */
 long long env_ms_range(const char *name, long long defval, long long min,
                        long long max, int allow_zero,
                        const char *range_desc);
@@ -129,7 +154,9 @@ uint64_t now_us(void);
  * socks.c and proxy.c.
  *
  * Enabled only when the environment variable IWAN_SEND_PACING_PPS is set
- * to a positive rate (default: 0 = disabled). The pacing exists because
+ * to a rate in 1..10000000 packets/s; unset/empty and an explicit 0 (the
+ * documented "disabled" sentinel) both leave pacing off (default: 0 =
+ * disabled). The pacing exists because
  * the Rust reference server's single-threaded drain (~360k pps) silently
  * drops UDP bursts past its rcvbuf, collapsing the inner TCP into an RTO
  * storm; the C server in this repo has no such ceiling, so no pacing is

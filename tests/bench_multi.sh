@@ -17,6 +17,9 @@ cd "$(dirname "$0")/.."
 # CLIENTS_LIST means concurrent connections through it; "down"
 # benchmarks the download direction. Positional because env vars
 # don't pass sudo)
+# The [debug] and [prof] arguments (and any exported IWAN_DEBUG/
+# IWAN_PROFILE/IWAN_PUMP_PROF) need a -DIWAN_DEBUG_STRIP=OFF build; the
+# script refuses to run and prints the reconfigure command otherwise.
 if [ -n "${1:-}" ]; then
     export IWAN_SRV_THREADS="$1"
 fi
@@ -25,6 +28,7 @@ if [ -n "${2:-}" ]; then
 fi
 if [ "${3:-}" = "debug" ]; then
     export IWAN_DEBUG=1   # server prints per-second uplink/drop stats
+                          # (needs a -DIWAN_DEBUG_STRIP=OFF build)
 fi
 if [ "${4:-}" = "proxy" ]; then
     PROXY_MODE=1
@@ -33,8 +37,47 @@ if [ "${5:-}" = "down" ]; then
     export DIR=down
 fi
 if [ "${5:-}" = "prof" ] || [ "${6:-}" = "prof" ]; then
-    export IWAN_PROFILE=1   # TEMP: stage instrumentation for the A/B (remove)
+    export IWAN_PROFILE=1  # server stage counters (needs
+                           # -DIWAN_DEBUG_STRIP=OFF; see the self-check)
 fi
+
+# --- L20 build-type self-check --------------------------------------
+# IWAN_DEBUG / IWAN_PUMP_PROF / IWAN_PROFILE are not compiled into a
+# build configured with IWAN_DEBUG_STRIP=ON, and CMakeLists.txt:48-58
+# defaults that option to ON for EVERY non-Debug build type (Release
+# included) — while this script itself builds Release at "== build ==".
+# A benchmark run would then silently report empty [prof]/per-second
+# output; refuse to continue instead.
+DIAG_WANTED=0
+if [ "${3:-}" = "debug" ] || [ "${5:-}" = "prof" ] || [ "${6:-}" = "prof" ]; then
+    DIAG_WANTED=1
+fi
+if [ -n "${IWAN_DEBUG:-}" ] || [ -n "${IWAN_PROFILE:-}" ] || \
+   [ -n "${IWAN_PUMP_PROF:-}" ]; then
+    DIAG_WANTED=1
+fi
+diag_build_check() {
+    [ "$DIAG_WANTED" = 1 ] || return 0
+    local strip=unknown
+    if [ -f build/CMakeCache.txt ]; then
+        strip=$(sed -n 's/^IWAN_DEBUG_STRIP:BOOL=//p' build/CMakeCache.txt)
+    fi
+    case "$strip" in
+        OFF) return 0 ;;
+        unknown) return 0 ;;   # not configured yet; the post-build call rechecks
+    esac
+    cat >&2 <<'EOF'
+error: this build cannot emit the diagnostics this benchmark requested.
+  IWAN_DEBUG / IWAN_PUMP_PROF / IWAN_PROFILE are only parsed when the
+  build was configured with -DIWAN_DEBUG_STRIP=OFF (CMakeLists.txt makes
+  the default ON for every non-Debug build type, Release included).
+  Continuing would produce silently EMPTY [prof]/per-second output.
+  Fix:  cmake -B build -DCMAKE_BUILD_TYPE=Release -DIWAN_DEBUG_STRIP=OFF
+        cmake --build build -j"$(nproc)"
+EOF
+    exit 1
+}
+diag_build_check
 
 CLIENTS_LIST=${CLIENTS_LIST:-"1 2 4 8"}
 CONNS=${CONNS:-1}              # TCP conns per client
@@ -89,6 +132,7 @@ sleep 0.3
 echo "== build =="
 cmake -B build -DCMAKE_BUILD_TYPE=Release >/dev/null
 cmake --build build -j"$(nproc)" >/dev/null
+diag_build_check   # authoritative re-check: build/ is configured now
 
 # distinct users: one session per client (same-username re-OPEN would
 # rebind the single session and thrash)

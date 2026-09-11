@@ -53,8 +53,9 @@ void pump_win_single_pkt(void *ud, uint8_t *pkt, size_t len, bool last)
     if (len == 0 || len > PUMP_SLOT) {
         if (len > PUMP_SLOT)
             atomic_fetch_add(&g_prof_tun_rdrop, 1);
-        log_debug("pump: drop packet, len %zu out of [1, %d]", len,
-                  PUMP_SLOT);
+        /* %llu not %zu: msvcrt printf (Windows) lacks %zu */
+        log_debug("pump: drop packet, len %llu out of [1, %d]",
+                  (unsigned long long)len, PUMP_SLOT);
         return;
     }
     if (g_stop)

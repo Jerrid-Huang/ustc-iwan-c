@@ -606,15 +606,44 @@ long port_cpu_count(void)
 #endif
 }
 
+#ifdef _WIN32
+/* R37 WG-E2 (R3-L22): a Windows home directory must be fully qualified —
+ * drive-absolute ("X:\..." / "X:/...") or UNC ("\\server\share") — the
+ * same paranoia config.c applies to $HOME on POSIX. Without this check a
+ * malformed USERPROFILE ("relative\dir") or HOMEPATH ("foo" with
+ * HOMEDRIVE=C:) resolved the config directory (servers.json: server,
+ * user, token, password) into the CWD or onto a drive-relative path an
+ * attacker-influenced environment can choose. */
+static bool port_win_abs_path(const char *p)
+{
+    if (!p || !p[0])
+        return false;
+    if (((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) &&
+        p[1] == ':' && (p[2] == '\\' || p[2] == '/'))
+        return true;
+    if ((p[0] == '\\' || p[0] == '/') && (p[1] == '\\' || p[1] == '/') &&
+        p[2] && p[2] != '\\' && p[2] != '/')
+        return true;   /* UNC: \\server\share */
+    return false;
+}
+#endif
+
 char *port_home_dir(void)
 {
 #ifdef _WIN32
     const char *home = getenv("USERPROFILE");
-    if (home && home[0])
+    if (port_win_abs_path(home))
         return strdup(home);
     const char *hd = getenv("HOMEDRIVE");
     const char *hp = getenv("HOMEPATH");
-    if (hd && hp && hd[0]) {
+    /* "X:" + a separator-led path is the only combination that yields a
+     * fully-qualified path; anything else (missing colon, "foo" without
+     * the leading separator, ...) is rejected so the caller falls back to
+     * $HOME's absolute-path check or reports "undeterminable". */
+    if (hd && hp && hp[0] &&
+        ((hd[0] >= 'A' && hd[0] <= 'Z') || (hd[0] >= 'a' && hd[0] <= 'z')) &&
+        hd[1] == ':' && hd[2] == '\0' &&
+        (hp[0] == '\\' || hp[0] == '/')) {
         size_t n = strlen(hd) + strlen(hp);
         char *buf = malloc(n + 1);
         if (buf) {
@@ -1000,7 +1029,8 @@ static int evfd_drain_loop(int fd)
  * complete for every error the code checks: EAGAIN/EWOULDBLOCK,
  * EINTR, ECONNRESET, ECONNREFUSED, ETIMEDOUT, ENETUNREACH,
  * EHOSTUNREACH, ENOBUFS, EINVAL, EAFNOSUPPORT, EADDRINUSE,
- * EADDRNOTAVAIL, EISCONN, ENOTCONN, EOPNOTSUPP, EMSGSIZE, EACCES. */
+ * EADDRNOTAVAIL, EISCONN, ENOTCONN, EOPNOTSUPP, EMSGSIZE, EACCES,
+ * EBADF (WSAENOTSOCK). */
 static int wsa_errno(int e)
 {
     switch (e) {
@@ -1009,6 +1039,7 @@ static int wsa_errno(int e)
     case WSAEINPROGRESS:      return EINPROGRESS;
     case WSAEALREADY:         return EALREADY;
     case WSANOTINITIALISED:   return EINVAL;
+    case WSAENOTSOCK:         return EBADF;
     case WSAEFAULT:           return EFAULT;
     case WSAESHUTDOWN:        return EINVAL;
     case WSAEHOSTDOWN:        return ENETUNREACH;
@@ -1699,6 +1730,12 @@ int port_setsockopt(int fd, int level, int optname, const void *optval,
 
 int port_poll(struct pollfd *fds, nfds_t nfds, int timeout_ms)
 {
+    struct pollfd small[32];
+    struct pollfd *use = fds;
+    nfds_t n = nfds, bad = 0;
+    bool heap = false;
+    int r;
+
     /* POSIX poll(NULL, 0, t) is a timed sleep, but WSAPoll rejects an
      * empty pollset with WSAEINVAL. Several callers rely on the timeout
      * wakeup (the relay proxy direction threads park here before the
@@ -1709,11 +1746,62 @@ int port_poll(struct pollfd *fds, nfds_t nfds, int timeout_ms)
                                       : (unsigned)timeout_ms);
         return 0;
     }
-    int r = WSAPoll(fds, nfds, timeout_ms < 0 ? -1 : timeout_ms);
+    /* R37 WG-E2 (R3-L14): POSIX poll() ignores slots with a negative fd
+     * and reports revents=0 for them, while WSAPoll fails the WHOLE set
+     * with WSAENOTSOCK (and sets POLLNVAL in the slot). Callers are
+     * written against the POSIX contract, so strip such slots, poll the
+     * rest, and write revents back by index (port.h documents this).
+     * On Windows SOCKET is unsigned, so the -1 sentinel arrives as
+     * INVALID_SOCKET; a caller's `fd = -1` converts to exactly that. */
+    for (nfds_t i = 0; i < nfds; i++) {
+        if (fds[i].fd == INVALID_SOCKET) {
+            fds[i].revents = 0;
+            bad++;
+        }
+    }
+    if (bad) {
+        n = nfds - bad;
+        if (n == 0) {
+            /* every slot is negative: POSIX sleeps out the timeout */
+            port_sleep_ms(timeout_ms < 0 ? (unsigned)-1
+                                          : (unsigned)timeout_ms);
+            return 0;
+        }
+        if (n > (nfds_t)32u) {
+            use = malloc((size_t)n * sizeof *use);
+            if (!use) {
+                errno = ENOMEM;
+                return -1;
+            }
+            heap = true;
+        } else {
+            use = small;
+        }
+        n = 0;
+        for (nfds_t i = 0; i < nfds; i++) {
+            if (fds[i].fd == INVALID_SOCKET)
+                continue;
+            use[n] = fds[i];
+            use[n].revents = 0;
+            n++;
+        }
+    }
+    r = WSAPoll(use, n, timeout_ms < 0 ? -1 : timeout_ms);
+    if (bad && r != SOCKET_ERROR) {
+        nfds_t k = 0;
+
+        for (nfds_t i = 0; i < nfds; i++) {
+            if (fds[i].fd == INVALID_SOCKET)
+                continue;
+            fds[i].revents = use[k++].revents;
+        }
+    }
+    if (heap)
+        free(use);
     if (r == SOCKET_ERROR) {
         int e = WSAGetLastError();
         errno = wsa_errno(e);
-            log_debug("port_poll: winsock error %d -> errno %d", e, errno);
+        log_debug("port_poll: winsock error %d -> errno %d", e, errno);
         return -1;
     }
     return r;

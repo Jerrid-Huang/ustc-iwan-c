@@ -42,12 +42,12 @@ SUBNET=172.16.0.0/16
 # at 8 MiB/conn it fails ~80% of runs. Real links never reach that
 # rate; single-direction throughput is covered by bench.sh.
 BULK_MB=${BULK_MB:-2}
-# IWAN_TEST_DEBUG=1: run with IWAN_DEBUG/IWAN_RETX, tee everything to
-# /tmp/iwan-test-debug.log, and on failure print a filtered diagnostic
-# tail (flow/retx/drop lines + kernel UDP drop counters)
+# IWAN_TEST_DEBUG=1: run with IWAN_DEBUG/IWAN_RXDBG/IWAN_FLOWDBG, tee
+# everything to /tmp/iwan-test-debug.log, and on failure print a filtered
+# diagnostic tail (flow/retx/drop lines + kernel UDP drop counters)
 DIAG=${IWAN_TEST_DEBUG:-0}
 if [ "$DIAG" = 1 ]; then
-    export IWAN_DEBUG=1 IWAN_RETX=1 IWAN_RXDBG=1 IWAN_FLOWDBG=1
+    export IWAN_DEBUG=1 IWAN_RXDBG=1 IWAN_FLOWDBG=1
     DIAG_LOG=/tmp/iwan-test-debug.log
     exec > >(tee "$DIAG_LOG") 2>&1
 fi

@@ -330,7 +330,13 @@ static int rp_connect_literal(int af, const void *addr, uint16_t port,
     }
     if (port_connect(fd, (struct sockaddr *)&ss, salen) == 0) {
         /* immediate success */
-    } else if (errno == EINPROGRESS) {
+    } else if (errno == EINPROGRESS || errno == EINTR) {
+        /* R37 R3-L3: POSIX says a signal-interrupted connect() on a
+         * nonblocking socket does NOT abort the attempt — the connection
+         * is still being established, so wait for POLLOUT like
+         * EINPROGRESS instead of reporting "Interrupted system call" as
+         * an immediate connect failure (a single-address host then failed
+         * outright). */
         /* rp_poll_retry: EINTR keeps waiting within the timeout instead
          * of aborting the connect (M1) */
         struct pollfd pfd = { .fd = fd, .events = POLLOUT };
@@ -472,7 +478,9 @@ static int rp_connect_target(int *fd_out, const char *host, uint16_t port,
         }
         if (port_connect(fd, ai->ai_addr, ai->ai_addrlen) == 0)
             last = fd;
-        else if (errno == EINPROGRESS) {
+        else if (errno == EINPROGRESS || errno == EINTR) {
+            /* R37 R3-L3: see rp_connect_literal — EINTR does not abort a
+             * nonblocking connect */
             /* rp_poll_retry: EINTR keeps this candidate waiting within
              * the timeout instead of skipping it (M1) */
             struct pollfd pfd = { .fd = fd, .events = POLLOUT };
@@ -943,6 +951,26 @@ static atomic_int g_rp_stop;
  * misses it) */
 static atomic_uint_fast64_t g_rp_arr_gen;
 
+/* R37 R3 (WG-C, R1-B-3 structural): direction-thread liveness.
+ *
+ * The two global direction threads are the ONLY things that ever retire
+ * an entry from their array (rp_release -> dirs 0 -> rp_reap_maybe ->
+ * close/free + g_rp_est_n--). A thread that exited can never do that
+ * again, so every entry registered in its array AFTER the exit would
+ * keep dirs > 0 forever. rp_add therefore refuses to register into an
+ * array whose owner is gone, and the exit itself retires everything
+ * still registered (see cleanup: in rp_dir_main).
+ *
+ * The marker is per relay INSTANCE (`g_rp_gen`, bumped by every
+ * relay_proxy_start): a marker left behind by a previous instance must
+ * not poison a restarted relay. `g_rp_dir_dead_gen[0]` is the up
+ * direction, `[1]` the down direction; the value is the generation in
+ * which that thread exited, 0 = never / alive. Both the marker and the
+ * reads in rp_add happen under g_rp_mu (g_rp_gen is atomic and is only
+ * bumped before the instance's threads exist). */
+static atomic_uint g_rp_gen = 1;         /* current relay instance (1-based) */
+static unsigned g_rp_dir_dead_gen[2];    /* guarded by g_rp_mu */
+
 /* [prof] relay byte counters (up = client->upstream, dn = reverse) */
 atomic_uint_fast64_t g_prof_rp_up_recv, g_prof_rp_up_send;
 atomic_uint_fast64_t g_prof_rp_dn_recv, g_prof_rp_dn_send;
@@ -1015,7 +1043,16 @@ static void rp_add(int c, int u)
     }
 
     pthread_mutex_lock(&g_rp_mu);
-    bool ok = rp_arr_add(&g_rp_up, &g_rp_up_n, &g_rp_up_cap, cn);
+    /* R37 R3 (WG-C, R1-B-3 structural): never register into an array
+     * whose direction thread is gone for THIS relay instance — nobody
+     * would ever retire that entry (its `dirs` count stays > 0, the
+     * rp_conn is never closed/freed and g_rp_est_n never decrements).
+     * The marker is written under this same mutex, so an entry is either
+     * registered before the exit (and retired by rp_dir_main's cleanup)
+     * or refused here — there is no window in between. */
+    unsigned gen = atomic_load(&g_rp_gen);
+    bool dead = g_rp_dir_dead_gen[0] == gen || g_rp_dir_dead_gen[1] == gen;
+    bool ok = !dead && rp_arr_add(&g_rp_up, &g_rp_up_n, &g_rp_up_cap, cn);
     if (ok)
         ok = rp_arr_add(&g_rp_dn, &g_rp_dn_n, &g_rp_dn_cap, cn);
     if (ok)
@@ -1035,6 +1072,9 @@ static void rp_add(int c, int u)
     }
     pthread_mutex_unlock(&g_rp_mu);
     if (!ok) {
+        if (dead)
+            log_err("rp: relay data plane is down (a direction thread "
+                    "exited); refusing new connection");
         atomic_fetch_sub(&g_rp_est_n, 1);   /* R1-B-2: undo the reservation */
         port_close(c);
         port_close(u);
@@ -1083,37 +1123,32 @@ static void rp_snap_unref_all(struct rp_conn **snap, size_t n)
             rp_reap_maybe(snap[i]);
 }
 
-/* R37 R2 (R1-B-3): a direction thread that exits EARLY (realloc failure,
- * poll hard error) must still RETIRE the entries it snapshotted. The
- * retirement loop at the bottom of rp_dir_main is what calls
- * rp_release(); skipping it leaves this direction's `dirs` count above
- * zero forever, so rp_reap_maybe never closes the two sockets or frees
- * the rp_conn — and, since R1-B-2, g_rp_est_n never decrements either, so
- * RP_MAX_ESTABLISHED would eventually refuse every new connection for the
- * rest of the process (a permanent relay outage, not just an fd leak).
+/* R37 R2 (R1-B-3), reworked in R37 R3 (WG-C): a direction thread that
+ * exits (realloc failure, poll hard error, stop) must RETIRE the entries
+ * it still owns. Skipping that leaves this direction's `dirs` count above
+ * zero forever, so rp_reap_maybe never closes the two sockets or frees the
+ * rp_conn — and, since R1-B-2, g_rp_est_n never decrements either, so
+ * RP_MAX_ESTABLISHED eventually refuses every new connection for the rest
+ * of the process (a permanent relay outage, not just an fd leak).
  *
- * Retires only entries still present in THIS direction's array (the array
- * doubles as the "not yet retired" marker), so an entry already retired by
- * the normal path can never be released twice. Must run under g_rp_mu,
- * before rp_snap_unref_all() for the same snapshot. */
-static void rp_dir_drain_all(bool up_dir, struct rp_conn **snap, size_t n,
-                             struct rp_conn ***arrp, size_t *np)
+ * R3 makes this structural instead of per-site: the helper below is called
+ * from the ONE exit point of rp_dir_main (cleanup:), so no early exit —
+ * present or future — can forget it. It takes no snapshot: it walks the
+ * LIVE array of this direction, which is exactly the set of entries this
+ * direction has not released yet (the array doubles as the
+ * "not yet retired" marker), so no entry can be released twice.
+ * Must run under g_rp_mu. */
+static void rp_dir_retire_all(bool up_dir, struct rp_conn ***arrp, size_t *np)
 {
-    for (size_t i = 0; i < n; i++) {
-        struct rp_conn *cn = snap[i];
+    while (*np > 0) {
+        struct rp_conn *cn = (*arrp)[*np - 1];
         struct rp_ent *e = up_dir ? &cn->up : &cn->dn;
-        size_t j;
 
-        for (j = 0; j < *np; j++)
-            if ((*arrp)[j] == cn)
-                break;
-        if (j == *np)
-            continue;              /* already retired: not ours to release */
         if (!e->wr_closed) {
             port_shutdown(e->to, 1);   /* same half-close as from_eof */
             e->wr_closed = true;
         }
-        (*arrp)[j] = (*arrp)[--*np];
+        (*np)--;
         atomic_fetch_add(&g_rp_arr_gen, 1);
         rp_release(cn);
     }
@@ -1187,6 +1222,14 @@ static void *rp_dir_main(void *ud)
     unsigned long long built_gen = 0;
     struct rp_conn **snap = NULL;
     size_t snapcap = 0;
+    /* R37 R3 (WG-C): the snapshot whose in_use references this iteration
+     * holds (snap_refs) and its entry count. cleanup: needs both to drop
+     * the references on an early exit. */
+    size_t snap_n = 0;
+    bool snap_refs = false;
+    /* relay instance this thread belongs to (checked against
+     * g_rp_dir_dead_gen when publishing our own death) */
+    unsigned my_gen = atomic_load(&g_rp_gen);
     uint8_t buf[RP_BUF];
     static _Thread_local struct prof_state pst;
     const char *tag = up_dir ? "rp up recv" : "rp dn recv";
@@ -1197,6 +1240,13 @@ static void *rp_dir_main(void *ud)
         if (n > snapcap) {
             struct rp_conn **ns = realloc(snap, n * sizeof *ns);
             if (!ns) {
+                /* R37 R3 (WG-C, R1-B-3): early exit — cleanup: retires
+                 * this direction's entries and drops any snapshot refs.
+                 * No reference has been taken yet at this point (the
+                 * in_use bumps happen below), and the retire there walks
+                 * the LIVE array, never this buffer: `snap` is still the
+                 * old one of capacity snapcap < n, so its tail is realloc
+                 * residue and its head is a stale snapshot. */
                 pthread_mutex_unlock(&g_rp_mu);
                 goto cleanup;   /* L3: free pf/slot buffers too */
             }
@@ -1210,11 +1260,13 @@ static void *rp_dir_main(void *ud)
             memcpy(snap, *arrp, n * sizeof *snap);
         /* hold one reference per snapshot entry while this iteration
          * dereferences them outside g_rp_mu; dropped at the loop
-         * bottom (or on the early exits below). Under the same
+         * bottom (or by cleanup: on an early exit). Under the same
          * critical section as the memcpy, so every snapshotted conn
          * is ref-protected before the lock is released. */
         for (size_t i = 0; i < n; i++)
             atomic_fetch_add(&snap[i]->in_use, 1);
+        snap_n = n;
+        snap_refs = true;
         /* M6: record the array generation inside the same critical
          * section as the snapshot. Read after the unlock it could pair
          * a fresh generation with a stale snapshot, making the gen check
@@ -1228,34 +1280,19 @@ static void *rp_dir_main(void *ud)
 
         if (n * 2 > pfcap) {
             struct pollfd *n2 = realloc(pf, (n * 2) * sizeof *n2);
-            if (!n2) {
-                pthread_mutex_lock(&g_rp_mu);
-                rp_dir_drain_all(up_dir, snap, n, arrp, np);   /* R2: retire */
-                rp_snap_unref_all(snap, n);
-                pthread_mutex_unlock(&g_rp_mu);
-                goto cleanup;   /* L3: free pf/slot buffers too */
-            }
+            if (!n2)
+                goto cleanup;   /* L3 + R3: retire/unref handled there */
             pf = n2;
             pfcap = n * 2;
         }
         if (n > slotcap) {
             int *ns = realloc(slot_from, n * sizeof *ns);
-            if (!ns) {
-                pthread_mutex_lock(&g_rp_mu);
-                rp_dir_drain_all(up_dir, snap, n, arrp, np);   /* R2: retire */
-                rp_snap_unref_all(snap, n);
-                pthread_mutex_unlock(&g_rp_mu);
-                goto cleanup;   /* L3: free pf/slot buffers too */
-            }
+            if (!ns)
+                goto cleanup;   /* L3 + R3: retire/unref handled there */
             slot_from = ns;
             ns = realloc(slot_to, n * sizeof *ns);
-            if (!ns) {
-                pthread_mutex_lock(&g_rp_mu);
-                rp_dir_drain_all(up_dir, snap, n, arrp, np);   /* R2: retire */
-                rp_snap_unref_all(snap, n);
-                pthread_mutex_unlock(&g_rp_mu);
-                goto cleanup;   /* L3: free pf/slot buffers too */
-            }
+            if (!ns)
+                goto cleanup;   /* L3 + R3: retire/unref handled there */
             slot_to = ns;
             slotcap = n;
             pf_dirty = true;
@@ -1310,13 +1347,16 @@ static void *rp_dir_main(void *ud)
                  * reference left behind here would dangle forever */
                 pthread_mutex_lock(&g_rp_mu);
                 rp_snap_unref_all(snap, n);
+                snap_refs = false;
                 pthread_mutex_unlock(&g_rp_mu);
                 continue;
             }
-            pthread_mutex_lock(&g_rp_mu);
-            rp_dir_drain_all(up_dir, snap, n, arrp, np);       /* R2: retire */
-            rp_snap_unref_all(snap, n);
-            pthread_mutex_unlock(&g_rp_mu);
+            /* R37 R3 (WG-C): a hard poll error ends this direction
+             * thread. The old code stopped relaying without a single log
+             * line (same "silent black hole" shape as R1-B-1); report it,
+             * then let cleanup: retire the entries. */
+            log_err("rp: %s poll failed: %s; stopping relay",
+                    up_dir ? "up" : "down", strerror(errno));
             break;              /* poll failed: stop relaying */
         }
         if (prof_print(tag, &pst,
@@ -1496,11 +1536,49 @@ static void *rp_dir_main(void *ud)
          * leave a retired conn closes and frees it (rp_reap_maybe,
          * lock held) */
         rp_snap_unref_all(snap, n);
+        snap_refs = false;
         pthread_mutex_unlock(&g_rp_mu);
     }
 cleanup:
-    /* L3: every exit path lands here so the local buffers are always
-     * released (realloc-failure early exits used to leak them) */
+    /* R37 R3 (WG-C, R1-B-3 structural): SINGLE choke point for every
+     * exit of this thread. Retiring here — instead of at each early exit
+     * — is what makes the defect class impossible: a new `goto cleanup`
+     * cannot forget it. rp_dir_retire_all() walks the LIVE array (the
+     * `snap` buffer may be stale/realloc residue at the realloc-failure
+     * exit) and releases every entry this direction still owns; nothing
+     * else can have released them (the array doubles as the "not yet
+     * retired" marker), so no entry is released twice.
+     *
+     * Order matters: retire first, then drop our own snapshot
+     * references. rp_dir_retire_all() dereferences the entries, and
+     * rp_snap_unref_all() may free one (the last reference out of a
+     * retired conn) — dropping it first could free a conn the retire
+     * still wants to touch. At the snap-realloc exit snap_refs is false
+     * (no reference taken yet), so only the retire runs.
+     *
+     * Then publish this direction's death and take the relay down: from
+     * here on nothing would ever retire an entry registered in this
+     * array again (the post-exit registration hole the R3 review
+     * named), so rp_add refuses new connections and g_rp_stop makes the
+     * other direction thread retire its own array and exit too — the
+     * whole data plane is torn down instead of silently leaking. */
+    pthread_mutex_lock(&g_rp_mu);
+    rp_dir_retire_all(up_dir, arrp, np);
+    if (snap_refs) {
+        rp_snap_unref_all(snap, snap_n);
+        snap_refs = false;
+    }
+    /* L3: the local buffers are always released below (realloc-failure
+     * early exits used to leak them) */
+    bool expected_stop = atomic_load(&g_rp_stop) != 0;
+    g_rp_dir_dead_gen[up_dir ? 1 : 0] = my_gen;   /* my_gen >= 1 */
+    pthread_mutex_unlock(&g_rp_mu);
+    if (!expected_stop) {
+        log_err("rp: %s direction thread exited (relay data plane down; "
+                "new connections refused)", up_dir ? "up" : "down");
+        /* wind the other direction thread down as well */
+        atomic_store(&g_rp_stop, 1);
+    }
     free(pf);
     free(snap);
     free(slot_from);
@@ -1533,11 +1611,24 @@ static void *rp_conn_main(void *ud)
      * starts here (connection entry), not per read */
     rp_hs_init(&hs);
 
-    if (rp_hs_poll(&hs, fd) <= 0)
-        goto out;
-    n = rp_hs_recv(&hs, fd, first, sizeof first);
-    if (n <= 0)
-        goto out;
+    /* R37 R3-M1: the accepted fd is nonblocking (rp_accept_main), so the
+     * budgeted poll below can report readiness while the read still
+     * returns EAGAIN (spurious wakeup, or the peer's segment was already
+     * discarded). Retry within the budget instead of dropping the
+     * connection; every other handshake read/write already polls on
+     * EAGAIN (rp_read_full / rp_send_full), so this is the only bare
+     * first read. */
+    for (;;) {
+        if (rp_hs_poll(&hs, fd) <= 0)
+            goto out;
+        n = rp_hs_recv(&hs, fd, first, sizeof first);
+        if (n >= 0)
+            break;
+        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+            goto out;
+    }
+    if (n == 0)
+        goto out;               /* peer closed before sending anything */
 
     if (first[0] == 5) {
         up = rp_handle_socks(fd, first, (size_t)n, rp->token, &hs,
@@ -1605,13 +1696,53 @@ static void *rp_accept_main(void *ud)
     while (!atomic_load(&rp->stop)) {
         struct pollfd pfd = { .fd = rp->listener, .events = POLLIN };
         int pr = port_poll(&pfd, 1, 1000);
-        if (pr < 0 && errno != EINTR)
-            break;
-        if (pr <= 0)
+        if (pr < 0) {
+            if (errno == EINTR)
+                continue;
+            /* R37 R3-M2: poll(2) on the listener can fail TRANSIENTLY
+             * (ENOMEM/ENOBUFS under memory pressure). The old code broke
+             * out of the loop for any non-EINTR error: the accept thread
+             * disappeared while the listener stayed open, so connect()
+             * kept succeeding and nothing was ever accepted again — with
+             * no log line at all (the same silent black hole R1-B-1
+             * removed from the accept() path). Only a dead/invalid
+             * listener fd is fatal. */
+            if (errno == EBADF || errno == EINVAL || errno == ENOTSOCK) {
+                log_err("rp: listener poll failed fatally (errno=%d): "
+                        "relay listener stopped", errno);
+                break;
+            }
+            /* R37 R3-M2: at least ONE visible line even in Release builds
+             * (log_debug is compiled out there), then rate-limited to one
+             * line per second so a persistent error cannot flood stderr —
+             * same shape as the thread-spawn warning below. */
+            static uint64_t last_poll_warn_ms;
+            uint64_t pw = now_ms();
+            if (pw - last_poll_warn_ms >= 1000) {
+                last_poll_warn_ms = pw;
+                log_err("rp: listener poll failed transiently (errno=%d): "
+                        "backing off", errno);
+            }
+            port_sleep_ms(50);   /* bounded: no hot spin */
             continue;
+        }
+        /* R37 R3-L1: a listener that reports an error/hangup WITHOUT POLLIN
+         * keeps poll() returning immediately while accept() finds nothing:
+         * the old code spun at ~100% of a core (measured 501 ticks/5s).
+         * Remember the condition, still TRY one accept() below (an error
+         * report does not prove that no connection is pending), and back
+         * off when accept() then says EAGAIN. */
+        bool poll_err_only = !(pfd.revents & POLLIN) &&
+                             (pfd.revents & (POLLERR | POLLHUP |
+                                             POLLNVAL));
         int fd = port_accept(rp->listener, NULL, NULL);
         if (fd < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (poll_err_only)
+                    port_sleep_ms(50);   /* bounded: no hot spin */
+                continue;
+            }
+            if (errno == EINTR)
                 continue;
             /* R37 R1-B-1: every other error accept(2) returns on Linux is
              * TRANSIENT — EMFILE/ENFILE (fd table full), ENOBUFS/ENOMEM
@@ -1631,6 +1762,26 @@ static void *rp_accept_main(void *ud)
             log_debug("rp: transient accept error (errno=%d), backing off",
                       errno);
             port_sleep_ms(50);   /* bounded: no hot spin under EMFILE */
+            continue;
+        }
+
+        /* R37 R3-M1: hand the connection thread a NONBLOCKING fd. Linux
+         * accept() returns a blocking socket, and the handshake's reads
+         * (rp_read_full -> rp_hs_recv -> port_recv) then block forever on
+         * a peer that sends one byte and goes silent: the RP_HS_TOTAL_MS
+         * budget only lives in rp_hs_poll(), which is reached when the
+         * read returns EAGAIN. With the fd nonblocking, EAGAIN surfaces
+         * and the existing budgeted poll loops close the connection at
+         * the 30s deadline, so RP_MAX_CONNS half-open connections can no
+         * longer pin every connection thread — and the relay — forever.
+         * rp_add switches the same fd for the relay later, so this only
+         * moves that switch before the handshake; a failed switch is
+         * fatal for this connection (a blocking fd would reintroduce the
+         * stall). */
+        if (port_set_nonblock(fd, true) != 0) {
+            log_err("rp: cannot switch accepted fd to non-blocking mode: "
+                    "dropped");
+            port_close(fd);
             continue;
         }
 
@@ -1769,6 +1920,10 @@ int relay_proxy_start(const char *listen_str, const char *auth_token,
 
     /* start the two global direction threads up front */
     atomic_store(&g_rp_stop, 0);
+    /* R37 R3 (WG-C): new relay instance — a death marker left behind by a
+     * previous instance must not make rp_add refuse this one. Bumped
+     * before any thread of this instance exists (no lock needed). */
+    atomic_fetch_add(&g_rp_gen, 1);
     pthread_t tu, td;
     bool tu_created = false;
     {
@@ -1848,9 +2003,12 @@ void relay_proxy_stop(struct RelayProxy *rp)
     /* the global direction threads observe stop on their next
      * poll timeout (RP_POLL_MS) */
     atomic_store(&g_rp_stop, 1);
-    /* detached accept thread exits on its next poll; in-flight relay
-     * threads keep their own sockets until process exit. The struct is
-     * deliberately NOT freed: a live connection thread may still read
-     * rp->token (one proxy per process — the leak is bounded by the
-     * process lifetime). */
+    /* detached accept thread exits on its next poll. R37 R3 (WG-C):
+     * the direction threads' cleanup: now retires every connection they
+     * still own on the way out, so in-flight relayed connections are
+     * half-closed, reaped and their fds closed at shutdown instead of
+     * being kept until process exit. The struct is deliberately NOT
+     * freed: a live connection thread may still read rp->token (one
+     * proxy per process — the leak is bounded by the process
+     * lifetime). */
 }

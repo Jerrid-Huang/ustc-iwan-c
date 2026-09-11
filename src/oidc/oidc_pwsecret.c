@@ -141,12 +141,19 @@ char *oidc_unwrap_password(const char *stored, const char *domain,
 #include <Security/Security.h>
 
 /* "WKC1" marker: the real value (the plaintext password) lives in the
- * login Keychain under service "ustc-iwan-c" / account "domain|user". */
+ * login Keychain under service "ustc-iwan-c" / account "domain|user".
+ * R37 WG-E2 (R3-L16): the account key is built into a fixed 512-byte
+ * buffer; a truncated key would silently collide with another
+ * (domain,user) pair, so a value that does not fit is rejected (NULL —
+ * this TU's error channel) instead of being used. */
 static CFStringRef pw_acc(const char *domain, const char *user)
 {
     char acc[512];
-    snprintf(acc, sizeof acc, "%s|%s", domain ? domain : "",
-             user ? user : "");
+    int n = snprintf(acc, sizeof acc, "%s|%s", domain ? domain : "",
+                     user ? user : "");
+
+    if (n < 0 || (size_t)n >= sizeof acc)
+        return NULL;   /* truncated (or encoding failure): never guess */
     return CFStringCreateWithCString(kCFAllocatorDefault, acc,
                                      kCFStringEncodingUTF8);
 }
@@ -155,9 +162,13 @@ char *oidc_wrap_password(const char *blob, const char *domain,
                          const char *user)
 {
     CFStringRef acc = pw_acc(domain, user);
-    CFDataRef data = CFDataCreate(kCFAllocatorDefault,
-                                  (const UInt8 *)blob,
-                                  (CFIndex)strlen(blob) + 1);
+    CFDataRef data;
+
+    if (!acc)
+        return NULL;
+    data = CFDataCreate(kCFAllocatorDefault,
+                        (const UInt8 *)blob,
+                        (CFIndex)strlen(blob) + 1);
     if (!data) {
         CFRelease(acc);
         return NULL;
@@ -188,7 +199,11 @@ char *oidc_unwrap_password(const char *stored, const char *domain,
     const void *vals[] = { kSecClassGenericPassword,
                            CFSTR("ustc-iwan-c-pwsecret"), acc,
                            kCFBooleanTrue, kSecMatchLimitOne };
-    CFDictionaryRef d = CFDictionaryCreate(
+    CFDictionaryRef d;
+
+    if (!acc)
+        return NULL;   /* oversized key: never look up a colliding entry */
+    d = CFDictionaryCreate(
         kCFAllocatorDefault, keys, vals, 5,
         &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     CFTypeRef out = NULL;

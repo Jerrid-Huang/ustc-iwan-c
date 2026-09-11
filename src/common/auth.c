@@ -23,7 +23,12 @@
 #include "util.h"   /* err_printf: the shared stderr printf (replaces the
                      * per-module eprintf this file used to carry) */
 
-static void set_err(char *errmsg, size_t sz, const char *fmt, ...)
+/* R37-F3 (R3-M5): variadic printf wrapper (vsnprintf into errmsg) — the
+ * message buffer this file hands back to its callers is now format-
+ * checked like the shared loggers (errmsg=1, sz=2, fmt=3). On a function
+ * *definition* GCC wants the attribute before the declarator. */
+static void IWAN_PRINTF_LIKE(3, 4)
+set_err(char *errmsg, size_t sz, const char *fmt, ...)
 {
     if (!errmsg || sz == 0)
         return;
@@ -293,7 +298,27 @@ int udp_connect(const char *host, uint16_t port, int timeout_ms)
     hints.ai_protocol = IPPROTO_UDP;
     g = getaddrinfo(host, svc, &hints, &res);
     if (g != 0) {
-        errno = EINVAL;
+        /* R37-A2: five distinct EAI_* codes used to collapse into a bare
+         * EINVAL, so the caller could only print "auth failed" — an OOM
+         * (EAI_MEMORY) or a resolver system failure looked exactly like a
+         * bad server address. Report the resolver's own text, the same
+         * way https.c:725-730 does for its connect diag, and keep errno
+         * meaningful for the caller.
+         *
+         * Control flow is deliberately unchanged: both callers reach
+         * udp_connect() only after check_server_ip() (cli_common.c:130)
+         * has validated an IP literal, so EAI_NONAME/EAI_AGAIN/EAI_FAIL
+         * are unreachable here and only EAI_MEMORY/EAI_SYSTEM can fire.
+         * EAI_SYSTEM is guarded: it is a POSIX spelling that MinGW-w64
+         * does not define (its getaddrinfo reports no errno-backed
+         * failure), and referencing it unguarded re-breaks win-cross. */
+        errno = (g == EAI_MEMORY) ? ENOMEM :
+#ifdef EAI_SYSTEM
+                (g == EAI_SYSTEM) ? errno :   /* errno already holds it */
+#endif
+                EINVAL;
+        err_printf("Error: resolve %s: %s (os error %d)\n", host,
+                   gai_strerror(g), errno);
         return -1;
     }
 
@@ -412,9 +437,14 @@ static int auth_send_open(int fd, const uint8_t *pkt, size_t len) {
         }
         if (w == 0)
             errno = EPIPE;   /* peer closed without taking the frame */
+        /* R37-A1: %llu, never %zu — msvcrt printf (Windows) lacks %zu and
+         * MinGW-w64 rejects it under -Werror=format= (see json.c:55,
+         * relay_proxy.c:1328 for the same rule). The two size_t args need
+         * the explicit cast because %llu is not size_t on every ABI. */
         fprintf(stderr,
-                "Error: send OPEN (%zu of %zu bytes)\n\nCaused by:\n    %s (os error %d)\n",
-                off, len, strerror(errno), errno);
+                "Error: send OPEN (%llu of %llu bytes)\n\nCaused by:\n    %s (os error %d)\n",
+                (unsigned long long)off, (unsigned long long)len,
+                strerror(errno), errno);
         return -1;
     }
     return 0;
@@ -435,7 +465,8 @@ int do_auth(const char *server, uint16_t port, const uint8_t *open_pkt, size_t o
             return -1;
         }
         if (style == DO_AUTH_AUTH)
-            err_printf("[%d] -> OPEN (%zuB) nonce=%08x\n", i, open_len, nonce);
+            err_printf("[%d] -> OPEN (%lluB) nonce=%08x\n", i,
+                       (unsigned long long)open_len, nonce);
         else if (style == DO_AUTH_PUMP)
             err_printf("[%d] -> OPEN\n", i);
 

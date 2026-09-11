@@ -53,8 +53,20 @@
 
 ## 基准方法
 
+- **前置条件（`IWAN_DEBUG_STRIP`，必读）**：`IWAN_DEBUG` / `IWAN_PUMP_PROF` /
+  `IWAN_PROFILE` 在 `IWAN_DEBUG_STRIP=ON` 下**完全不被解析**（`src/common/util.c`
+  的 `debug_enabled`、`profile.c` 的 `prof_init`、`proxy.c` 的 gate 整段被编译掉），
+  而 `CMakeLists.txt:48-58` 对**所有非 Debug 构建类型**（含默认的 Release）把该选项
+  默认置为 ON。因此"Release + `export IWAN_PROFILE=1`"这一曾被文档化的组合会**静默
+  产出空数据**——实测：真 Release 服务端服务 3 个真实会话，输出中 `^\[prof\]` **0 行**。
+  要采集阶段计数必须改用 `-DIWAN_DEBUG_STRIP=OFF`（保留优化）或 `Debug`：
+  `cmake -B build -DCMAKE_BUILD_TYPE=Release -DIWAN_DEBUG_STRIP=OFF && cmake --build build -j$(nproc)`。
+  `tests/bench.sh` / `tests/bench_multi.sh` 已内置构建类型自检：请求了诊断开关而
+  `build/` 是 strip 构建时**直接报错退出并打印重配置命令**，不会静默跑出空结果。
+  对照：同为诊断开关的 `IWAN_RXDBG` / `IWAN_FLOWDBG` **不受** strip 影响，Release
+  下仍然生效。
 - 聚合吞吐 / 丢包：`sudo ./tests/bench_multi.sh <threads> "<clients>"`（root，TUN）
-- 阶段计数：`IWAN_PROFILE=1`（服务端）、`IWAN_PUMP_PROF=1`（TUN 泵，仅客户端 proxy 模式）
+- 阶段计数：`IWAN_PROFILE=1`（服务端）、`IWAN_PUMP_PROF=1`（TUN 泵，仅客户端 proxy 模式）；**需上面的 `IWAN_DEBUG_STRIP=OFF` 构建**
 - 单轮噪声带 10.7–13.8 Gbit/s（8 客户端）；结论需多轮或用计数器
 - `srv_ticks` 只统计 server 主线程的 /proc/<pid>/stat，**不**含 16 个 recv
   线程；严谨的 server CPU 对比需采样 /proc/<pid>/task/*/stat 或 strace -c

@@ -165,7 +165,13 @@ void port_sleep_us(unsigned us);   /* rounds up to the ms timer on win32 */
 /* ----------------------- process / env / misc ---------------------- */
 
 long port_cpu_count(void);
-/* malloc'd home directory (USERPROFILE on Windows, passwd on POSIX) */
+/* malloc'd home directory (USERPROFILE on Windows, passwd on POSIX).
+ * Windows: only a fully-qualified path is accepted — drive-absolute
+ * (X:\ or X:/) or UNC (\\server\share) for USERPROFILE, and HOMEDRIVE
+ * must be "X:" with HOMEPATH starting in a separator; a malformed
+ * environment yields NULL (never a CWD- or drive-relative path, which
+ * would move the credential store). POSIX: $HOME, then the passwd
+ * entry. */
 char *port_home_dir(void);
 
 /* Install a process-stop handler: SIGINT/SIGTERM/SIGHUP on POSIX
@@ -247,7 +253,10 @@ int port_setsockopt(int fd, int level, int optname, const void *optval,
                     socklen_t optlen);
 
 /* WSAPoll on Windows (sockets only); poll() on POSIX. timeout_ms is
- * ms, -1 waits forever. */
+ * ms, -1 waits forever. Negative-fd slots are ignored with revents=0 on
+ * BOTH platforms (POSIX poll() already does that; the Windows wrapper
+ * strips them because WSAPoll would otherwise fail the whole set with
+ * WSAENOTSOCK) — indices into the caller's array stay valid. */
 int port_poll(struct pollfd *fds, nfds_t nfds, int timeout_ms);
 
 /* ------------------ eventfd substitute (wakeup) -------------------- */

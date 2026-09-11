@@ -79,20 +79,27 @@ static char *home_dir(void)
 
 char *resolve_config_dir(const char *dir)
 {
-    if (strncmp(dir, "~/", 2) != 0)
+    /* R37-WG-E1 (L26): a bare "~" is the home directory, not a literal
+     * directory named "~". Accepting only the "~/" spelling was
+     * inconsistent: "~/.." WAS expanded (to the home parent) while "~"
+     * alone was joined onto the cwd, so --config-dir ~ created a real
+     * "<cwd>/~" directory that only looked like the home directory.
+     * "~user" stays untouched (it is not something this helper has ever
+     * resolved; expanding it needs a getpwnam policy decision). */
+    bool bare = dir[0] == '~' && dir[1] == '\0';
+    if (!bare && strncmp(dir, "~/", 2) != 0)
         return xstrdup(dir);
     char *home = home_dir();
     if (!home)
         return NULL;
-    const char *rest = dir + 2;
+    const char *rest = dir + 1;              /* "" for "~", "/x" for "~/x" */
     size_t hlen = strlen(home);
     size_t rlen = strlen(rest);
-    char *out = malloc(hlen + 1 + rlen + 1);
+    char *out = malloc(hlen + rlen + 1);
     if (!out)
         oom_abort();
     memcpy(out, home, hlen);
-    out[hlen] = '/';
-    memcpy(out + hlen + 1, rest, rlen + 1);
+    memcpy(out + hlen, rest, rlen + 1);
     free(home);
     return out;
 }

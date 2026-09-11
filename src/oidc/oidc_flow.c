@@ -44,15 +44,56 @@ char *oidc_build_dev_body(const char *type, const char *device_id,
  * and validating the pasted redirect URL: a per-user temp file, 0600.
  * (oidc_login has no config-dir handle -- the CLI resolves it in main --
  * so a standard per-user temp location is used.) */
-static char *state_file_path(void)
+#ifndef _WIN32
+/* R37-WG-E1 (L21): XDG_RUNTIME_DIR/TMPDIR are inherited environment, not a
+ * contract: a relative value ("." or "relative/dir") used to drop the state
+ * file into the current working directory — possibly a shared one — and a
+ * value pointing at someone else's directory is not ours to write into.
+ * Accept only an existing absolute directory owned by us or by root (so
+ * /tmp, root-owned and sticky, stays eligible); the mitigations around the
+ * file itself (CSPRNG name, O_EXCL|O_NOFOLLOW, 0600, unlink after use)
+ * already make the fallback location as safe as the intended one. */
+static bool state_dir_ok(const char *dir)
+{
+    struct stat st;
+    if (dir[0] != '/')
+        return false;
+    if (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode))
+        return false;
+    return st.st_uid == getuid() || st.st_uid == (uid_t)0;
+}
+
+/* first usable candidate of XDG_RUNTIME_DIR, TMPDIR; "/tmp" otherwise */
+static const char *state_dir_pick(void)
 {
     const char *dir = getenv("XDG_RUNTIME_DIR");
+    if (dir && *dir) {
+        if (state_dir_ok(dir))
+            return dir;
+        /* never print the value itself: it is attacker-influenced env */
+        log_debug("ignoring XDG_RUNTIME_DIR for the OAuth state file: not "
+                  "an absolute existing directory owned by this user or root");
+    }
+    dir = getenv("TMPDIR");
+    if (dir && *dir) {
+        if (state_dir_ok(dir))
+            return dir;
+        log_debug("ignoring TMPDIR for the OAuth state file: not an "
+                  "absolute existing directory owned by this user or root");
+    }
+    return "/tmp";
+}
+#endif
+
+static char *state_file_path(void)
+{
+    const char *dir;
+#ifndef _WIN32
+    dir = state_dir_pick();
+#else
+    dir = getenv("XDG_RUNTIME_DIR");
     if (!dir || !*dir)
         dir = getenv("TMPDIR");
-#ifndef _WIN32
-    if (!dir || !*dir)
-        dir = "/tmp";
-#else
     if (!dir || !*dir)
         dir = getenv("TEMP");
     if (!dir || !*dir)
@@ -126,16 +167,31 @@ static int load_state_file(const char *path, char *out, size_t outsz)
     int fd = _open(path, _O_RDONLY | _O_BINARY);
     if (fd < 0)
         return -1;
-    int n = _read(fd, out, (unsigned int)(outsz - 1));
+    int n;
+    do {
+        n = _read(fd, out, (unsigned int)(outsz - 1));
+    } while (n < 0 && errno == EINTR);   /* R37-WG-E1 (R3-L4) */
     if (_close(fd) != 0)
-        return -1;
+        log_err("cannot close OAuth state file %s: %s (state kept)",
+                path, strerror(errno));
 #else
     int fd = open(path, O_RDONLY | O_NOFOLLOW);
     if (fd < 0)
         return -1;
-    ssize_t n = read(fd, out, outsz - 1);
+    ssize_t n;
+    /* R37-WG-E1 (R3-L4): a signal delivered mid-read made this return -1,
+     * and the caller reported it as "authorization response state does not
+     * match the saved state (CSRF check failed)" — an ordinary IO hiccup
+     * presented as an attack, forcing a fresh login. Retry EINTR. */
+    do {
+        n = read(fd, out, outsz - 1);
+    } while (n < 0 && errno == EINTR);
+    /* R3-L4: a failing close() does not invalidate the bytes just read;
+     * warn only, the read result below decides. (close() on a read-only
+     * descriptor loses no data.) */
     if (close(fd) != 0)
-        return -1;
+        log_err("cannot close OAuth state file %s: %s (state kept)",
+                path, strerror(errno));
 #endif
     if (n <= 0)
         return -1;
@@ -269,8 +325,15 @@ static Json *exchange_code(const char *code, const char *code_verifier)
          * FIRST — oidc_die consumes its args immediately and resp must
          * still be alive while it is read */
         char msg[512];
+        /* R37-WG-E1 (L28): the token endpoint's response body is remote
+         * controlled — neutralize it for the terminal, keeping the raw
+         * pointer for the cleanse below */
+        char *resp_s = oidc_printable_dup(resp && *resp ? resp
+                                                       : "no response (transport error)");
         snprintf(msg, sizeof msg, "token exchange failed (HTTP %d): %s", st,
-                 resp && *resp ? resp : "no response (transport error)");
+                 resp_s);
+        OPENSSL_cleanse(resp_s, strlen(resp_s));
+        free(resp_s);
         /* FIX-E: scrub the raw OAuth request body (code + PKCE
          * code_verifier) and the response (tokens) before release */
         OPENSSL_cleanse(body.data, body.len);
@@ -285,8 +348,12 @@ static Json *exchange_code(const char *code, const char *code_verifier)
     if (st != 200) {
         /* R4-03-4: same ordering — format before freeing resp */
         char msg[512];
+        /* R37-WG-E1 (L28): same remote-controlled body as above */
+        char *resp_s = oidc_printable_dup(resp ? resp : "");
         snprintf(msg, sizeof msg, "token exchange failed HTTP %d: %s", st,
-                 resp ? resp : "");
+                 resp_s);
+        OPENSSL_cleanse(resp_s, strlen(resp_s));
+        free(resp_s);
         if (resp)
             OPENSSL_cleanse(resp, strlen(resp));
         free(resp);
@@ -416,7 +483,14 @@ void oidc_login(char **kp_out, char **user_out)
     json_free(tok);
     if (!username)
         username = xstrdup("unknown");
-    oidc_eprintf("  Authenticated as %s\n", username);
+    {
+        /* R37-WG-E1 (L28): the name inside the (signature-verified)
+         * id_token is still issuer-controlled text; the returned
+         * *user_out keeps the raw value — only this print is filtered */
+        char *user_s = oidc_printable_dup(username);
+        oidc_eprintf("  Authenticated as %s\n", user_s);
+        free(user_s);
+    }
 
     *kp_out = kp;
     *user_out = username;
@@ -495,8 +569,11 @@ int oidc_ctrl_post(const char *path, const char *body,
          * the heap copy before release (R12 L-7: OPENSSL_cleanse) */
         OPENSSL_cleanse(auth, strlen(auth));
         free(auth);
+        /* R37-WG-E1 (L28): controller response body is remote controlled;
+         * oidc_die() never returns, so the printable copy needs no free */
         oidc_die("request to %s failed (HTTP %d): %s", path, st,
-                 resp && *resp ? resp : "no response (transport error)");
+                 oidc_printable_dup(resp && *resp ? resp
+                                                  : "no response (transport error)"));
     }
     /* R13-M-6: scrub the Bearer heap copy on the success path too */
     OPENSSL_cleanse(auth, strlen(auth));

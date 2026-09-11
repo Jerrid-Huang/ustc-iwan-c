@@ -7,11 +7,17 @@
 # Requires root (TUN devices). Run with sudo:
 #     sudo ./tests/bench.sh
 #     DURATION=10 CONNS="1 2 4 8" sudo ./tests/bench.sh
+# The optional [debug] argument (and any exported IWAN_DEBUG/IWAN_PROFILE/
+# IWAN_PUMP_PROF) needs a -DIWAN_DEBUG_STRIP=OFF build; the script refuses
+# to run and prints the reconfigure command otherwise.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
 # optional positional args: [THREADS] [debug] [mini]
+# "debug" needs a build that still parses IWAN_DEBUG: configure with
+# -DIWAN_DEBUG_STRIP=OFF (a Release build keeps the optimization but must
+# not strip the diagnostics) — see the self-check below.
 if [ -n "${1:-}" ]; then
     export IWAN_SRV_THREADS="$1"
 fi
@@ -22,6 +28,43 @@ MINI=0
 if [ "${3:-}" = "mini" ]; then
     MINI=1
 fi
+
+# --- L20 build-type self-check --------------------------------------
+# IWAN_DEBUG / IWAN_PUMP_PROF / IWAN_PROFILE are not compiled into a
+# build configured with IWAN_DEBUG_STRIP=ON, and CMakeLists.txt:48-58
+# defaults that option to ON for EVERY non-Debug build type (Release
+# included). Benchmarks that request those switches would then silently
+# report empty [prof] / per-second output; refuse to run instead.
+DIAG_WANTED=0
+if [ "${2:-}" = "debug" ]; then
+    DIAG_WANTED=1
+fi
+if [ -n "${IWAN_DEBUG:-}" ] || [ -n "${IWAN_PROFILE:-}" ] || \
+   [ -n "${IWAN_PUMP_PROF:-}" ]; then
+    DIAG_WANTED=1
+fi
+diag_build_check() {
+    [ "$DIAG_WANTED" = 1 ] || return 0
+    local strip=unknown
+    if [ -f build/CMakeCache.txt ]; then
+        strip=$(sed -n 's/^IWAN_DEBUG_STRIP:BOOL=//p' build/CMakeCache.txt)
+    fi
+    case "$strip" in
+        OFF) return 0 ;;
+        unknown) return 0 ;;   # not configured yet; the post-build call rechecks
+    esac
+    cat >&2 <<'EOF'
+error: this build cannot emit the diagnostics this benchmark requested.
+  IWAN_DEBUG / IWAN_PUMP_PROF / IWAN_PROFILE are only parsed when the
+  build was configured with -DIWAN_DEBUG_STRIP=OFF (CMakeLists.txt makes
+  the default ON for every non-Debug build type, Release included).
+  Continuing would produce silently EMPTY [prof]/per-second output.
+  Fix:  cmake -B build -DCMAKE_BUILD_TYPE=Release -DIWAN_DEBUG_STRIP=OFF
+        cmake --build build -j"$(nproc)"
+EOF
+    exit 1
+}
+diag_build_check
 
 if [ "$(id -u)" != 0 ]; then
     echo "error: bench needs root (TUN devices); run with sudo" >&2
@@ -66,6 +109,7 @@ trap cleanup EXIT
 echo "== build =="
 cmake -B build -DCMAKE_BUILD_TYPE=Release >/dev/null
 cmake --build build -j"$(nproc)" >/dev/null
+diag_build_check   # authoritative re-check: build/ is configured now
 
 printf 'test:s3cret\n' > "$WORK/users.txt"
 chmod 600 "$WORK/users.txt"

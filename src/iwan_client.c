@@ -351,8 +351,9 @@ static const char *read_pass_file(const char *path, char *buf, size_t sz)
         exit(1);
     }
     if ((size_t)n == sz - 1 && memchr(buf, '\n', (size_t)n) == NULL) {
-        log_err("Error: pass file '%s' first line too long (max %zu "
-                "bytes)", path, sz - 2);
+        /* %llu not %zu: msvcrt printf (Windows) lacks %zu */
+        log_err("Error: pass file '%s' first line too long (max %llu "
+                "bytes)", path, (unsigned long long)(sz - 2));
         exit(1);
     }
     buf[n] = '\0';
@@ -558,7 +559,9 @@ static int cmd_ping(int argc, char **argv, int start)
         port_close(fd);
         return 1;
     }
-    log_info("-> PING (%zuB) to %s:%u", pkt.len, o.server, (unsigned)o.port);
+    /* %llu not %zu: msvcrt printf (Windows) lacks %zu */
+    log_info("-> PING (%lluB) to %s:%u", (unsigned long long)pkt.len,
+             o.server, (unsigned)o.port);
     buf_free(&pkt);
 
     uint8_t rbuf[PING_BUF_SZ] = { 0 };

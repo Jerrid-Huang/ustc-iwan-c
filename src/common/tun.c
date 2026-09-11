@@ -285,10 +285,34 @@ int tun_attach_many(const char *name, int *fds, int maxn)
     return n;
 }
 
-void set_nonblock(int fd) {
+/* R37 WG-E2 (R3-L6): the old set_nonblock() swallowed fcntl failures, so a
+ * queue fd could silently stay BLOCKING. A blocking reader parks in read()
+ * once the device queue is drained and then never looks at q->stop /
+ * pool->abort again, which makes tun_pool_destroy()'s pthread_join hang
+ * forever (the process can no longer exit). Returns 0 only when O_NONBLOCK
+ * is verifiably in effect; -1 with errno set otherwise. */
+static int set_nonblock_checked(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
-    if (flags >= 0)
-        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    if (flags < 0)
+        return -1;
+    if (!(flags & O_NONBLOCK)) {
+        if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0)
+            return -1;
+        flags = fcntl(fd, F_GETFL, 0);
+        if (flags < 0)
+            return -1;
+    }
+    if (!(flags & O_NONBLOCK)) {
+        errno = EINVAL;   /* flag accepted but not applied: fail closed */
+        return -1;
+    }
+    return 0;
+}
+
+void set_nonblock(int fd) {
+    if (set_nonblock_checked(fd) != 0)
+        log_err("tun: cannot set O_NONBLOCK on fd %d: %s", fd,
+                strerror(errno));
 }
 
 ptrdiff_t tun_write(int fd, const void *buf, size_t len) {
@@ -341,8 +365,17 @@ int tun_write_retry(int fd, const uint8_t *pkt, size_t len, int max_ms,
             len -= (size_t)w;
             continue;
         }
-        if (w < 0 && errno == EINTR)
+        if (w < 0 && errno == EINTR) {
+            /* R37 WG-E2 (R3-L8): this retry used to `continue` past the
+             * max_ms budget check below, so a permanent EINTR made the
+             * 50ms bound (and its "still full after the bound: dropped"
+             * contract) unenforceable — measured >3s for a 50ms budget
+             * with a reader keeping the pipe drained. Check the same
+             * budget here. */
+            if (max_ms > 0 && now_ms() - t0 >= (uint64_t)max_ms)
+                return -1;   /* interrupted past the bound: dropped */
             continue;
+        }
         if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             uint64_t now = now_ms();
             if (max_ms > 0 && now - t0 >= (uint64_t)max_ms)
@@ -528,7 +561,12 @@ static int tun_pool_add_fd(struct tun_pool *pool, int fd)
 
     if (nq >= pool->maxq)
         return -1;
-    set_nonblock(fd);
+    if (set_nonblock_checked(fd) != 0) {
+        log_err("tun pool: fd %d cannot be switched to nonblocking (%s); "
+                "refusing a reader that could block in read() forever",
+                fd, strerror(errno));
+        return -1;
+    }
     {
         struct tun_queue *q = &pool->qs[nq];
         q->pool = pool;
@@ -604,6 +642,16 @@ struct tun_pool *tun_pool_create_pre(const char *name, int fd0, int maxq,
     q->fd = fd0;
     q->stop = 0;
     atomic_store(&q->waits, 0);
+    /* R37 WG-E2 (R3-L6): the pool owns fd0's reader from here on; if the
+     * fd cannot be made nonblocking the reader would block in read() and
+     * tun_pool_destroy() would never join it, so refuse to start. */
+    if (set_nonblock_checked(fd0) != 0) {
+        log_err("tun pool: fd %d cannot be switched to nonblocking (%s); "
+                "refusing to start a reader that could block in read() "
+                "forever", fd0, strerror(errno));
+        free(pool);
+        return NULL;
+    }
     if (pthread_create(&q->th, NULL, tun_reader_main, q) != 0) {
         free(pool);
         return NULL;

@@ -59,7 +59,11 @@ typedef struct {
 } Opts;
 
 /* oidc_util.c */
-_Noreturn void oidc_die(const char *fmt, ...);
+/* IWAN_PRINTF_LIKE comes from util.h (included above): R37-F3 puts the
+ * OIDC CLI's fatal-error printer under the same compile-time format
+ * checking as the core loggers. oidc_die_with_cause takes a plain
+ * message + cause pair (no variadic format), so it stays unannotated. */
+_Noreturn void oidc_die(const char *fmt, ...) IWAN_PRINTF_LIKE(1, 2);
 _Noreturn void oidc_die_with_cause(const char *msg, const char *cause);
 void oidc_pause_if_relaunched(void);
 /* oidc_eprintf is the raw-stderr printer (no newline, no flush) shared
@@ -109,6 +113,12 @@ char *oidc_jwt_segment(const char *jwt, int idx);
 void oidc_print_servers(Json *servers);
 Json *oidc_find_server(Json *servers, const char *spec);
 Json *oidc_select_server(Json *servers);
+/* R37-WG-E1 (L28/L39): a terminal-safe copy of a remote-controlled string
+ * — C0/C1 control bytes, stray/invalid UTF-8 and non-shortest (overlong),
+ * surrogate or >U+10FFFF sequences each become '?'. DISPLAY ONLY: the
+ * raw value must keep being used for matching, comparison and storage.
+ * Caller owns the result (free it; oidc_die paths may rely on _Noreturn). */
+char *oidc_printable_dup(const char *s);
 
 /* oidc_connect.c */
 void oidc_connect_server(const Opts *o, const Config *cf);

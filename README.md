@@ -85,7 +85,7 @@ sudo ./iwan-client-oidc --all
 | `--pass <PASS>` | 密码（与 `--pass-file` 二选一） |
 | `--pass-file <FILE>` | 从文件读密码（避免命令行泄露） |
 | `--ct-pass <PASS>` / `--ct-pass-file <FILE>` | 校内统一认证的"密保口令"（USTC 场景） |
-| `--mtu <MTU>` | 内层 TCP 的 MSS/MTU（默认 `1380`；`proxy` 模式使用 TUN 设备 MTU） |
+| `--mtu <MTU>` | 内层 TCP 的 MSS/MTU。默认按模式而异：`auth` / `proxy` 为 `1400`（`IWAN_DEFAULT_MTU`），`socks` 为 `1380`；`proxy` 模式还会把它应用到 TUN 设备 MTU |
 
 ### proxy（TUN 模式，需要 root）
 
@@ -203,7 +203,7 @@ OpenSSL 需先交叉构建：`ci/build-openssl.sh mingw64 x86_64-w64-mingw32- /p
 
 运行依赖：TUN 模式需要与 exe 同目录的 `wintun.dll`（架构匹配：x86_64→amd64，i686→x86，arm64→arm64，下载 https://www.wintun.net/）；SOCKS5 模式不需要。发布 zip 内已附 README/LICENSE/WINTUN.txt 说明。
 
-> Windows TUN 模式已在真实 Windows 11（tiny11 VM）上全量验证：wintun 适配器创建/复用/删除恢复、netsh IPv4 路由与服务器 pin 路由、IPv6 ULA /96、优雅停止清理，以及 `--listen` 附加 SOCKS5+HTTP 代理均通过 `win-test.ps1`。
+> Windows 交付物由 CI 的 `win-cross` 作业（`.github/workflows/build.yml`）持续验证：MinGW-w64 交叉编译（x86_64 + i686，`-DIWAN_WERROR=ON`）、wine 冒烟运行、Windows 客户端 ↔ Linux 服务端的真实线格式测试，以及针对 Windows 构建的 SOCKS5/RFC1929 握手套件（`tests/socks_handshake.py --harness`，在 wine 下执行）。仓库内**没有** PowerShell 测试脚本；真实 Windows TUN 设备（wintun 适配器、netsh 路由、IPv6 ULA）的验证需真机/虚拟机手工完成，CI 不覆盖。
 
 ## 致谢
 

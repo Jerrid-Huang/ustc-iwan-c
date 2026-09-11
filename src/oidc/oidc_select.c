@@ -58,8 +58,20 @@ static int utf8_width(const char *s)
  * units: U+0080..U+009F (C1, still an 8-bit CSI on some terminals) is
  * neutralized whether it arrives raw or as a legal 2-byte sequence, while
  * ordinary multi-byte text (Chinese names included) is copied untouched.
- * Only the display path uses this; matching/storage keep the raw value. */
-static char *printable_dup(const char *s)
+ * Only the display path uses this; matching/storage keep the raw value.
+ *
+ * R37-WG-E1 (L28): promoted from a file-static helper to the shared one
+ * declared in oidc.h — every remote-controlled string that can reach a
+ * terminal must go through the same filter, not just the --list rows.
+ * R37-WG-E1 (L39): the sequence walk now also rejects non-shortest forms,
+ * UTF-16 surrogates and codepoints above U+10FFFF. A lenient decoder
+ * maps e0 81 9b back to ESC (3-byte overlong) and f0 80 81 9b back to
+ * ESC (4-byte overlong), so without these checks the byte-wise control
+ * filter below could be bypassed by re-encoding the control character.
+ * The codepoint is already accumulated when the checks run, so they are
+ * pure range tests, and a rejected sequence falls through to the
+ * existing byte-wise '?' path exactly like a stray lead byte. */
+char *oidc_printable_dup(const char *s)
 {
     size_t n = strlen(s);
     char *out = malloc(n + 1);
@@ -93,6 +105,17 @@ static char *printable_dup(const char *s)
                 if (k != need)
                     need = 0;        /* bad continuation byte */
             }
+        }
+        if (need) {
+            /* L39: a well-formed-looking sequence is still not text when
+             * it decodes to something other than a scalar value. A 2-byte
+             * overlong is already impossible (the lead must be >= 0xC2,
+             * so cp >= 0x80), the other three widths are not. */
+            if ((need == 3 && cp < 0x800) ||        /* overlong 3-byte */
+                (need == 4 && cp < 0x10000) ||      /* overlong 4-byte */
+                (cp >= 0xD800 && cp <= 0xDFFF) ||   /* UTF-16 surrogate */
+                cp > 0x10FFFF)                      /* not a codepoint */
+                need = 0;
         }
         if (need) {
             if (cp >= 0x80 && cp <= 0x9F) {
@@ -137,8 +160,8 @@ void oidc_print_servers(Json *servers)
                 port = pv;
         }
         const char *nm = name ? name : "";
-        char *nm_s = printable_dup(nm);
-        char *host_s = printable_dup(host ? host : "");
+        char *nm_s = oidc_printable_dup(nm);
+        char *host_s = oidc_printable_dup(host ? host : "");
         int w = utf8_width(nm_s);
         int pad = w < 30 ? 30 - w : 0;
         printf("%2llu. %s%*s %s:%lu\n", (unsigned long long)(i + 1),
@@ -178,7 +201,7 @@ static Json *match_host_port(Json *s, const char *spec, const char *last,
              * printable copy needs no free) */
             oidc_die("invalid port %g for server \"%s\" "
                      "(must be an integer in 1..65535)",
-                     pv, printable_dup(name ? name : host));
+                     pv, oidc_printable_dup(name ? name : host));
         }
         return NULL;
     }

@@ -38,9 +38,10 @@ if(IWAN_LTO)
   set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
 endif()
 
-# Release-by-default (CMAKE_C_FLAGS_RELEASE = -O3; no -DNDEBUG: the
-# code has no runtime assert()s, only _Static_assert, which is
-# NDEBUG-independent).
+# Release-by-default (CMAKE_C_FLAGS_RELEASE = -O3 -DNDEBUG, CMake's
+# built-in default; this project never removes -DNDEBUG). The code has
+# no runtime assert()s — only _Static_assert, which is NDEBUG-independent
+# — so that -DNDEBUG is inert.
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
@@ -148,8 +149,14 @@ elseif(APPLE)
 endif()
 
 # Binaries land in <repo>/bin like the Makefile produced (tests and CI
-# rely on that path); archives stay in the build tree.
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/bin")
+# rely on that path); archives stay in the build tree. An explicit
+# -DCMAKE_RUNTIME_OUTPUT_DIRECTORY wins (R37 R3-L15): the plain set()
+# used to shadow the cache variable, so the documented redirect was
+# silently ignored and concurrent out-of-source builds of one tree
+# overwrote each other's <tree>/bin binaries.
+if(NOT CMAKE_RUNTIME_OUTPUT_DIRECTORY)
+  set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/bin")
+endif()
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 
 find_package(Threads REQUIRED)       # -pthread everywhere (winpthreads on MinGW)

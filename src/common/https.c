@@ -155,8 +155,15 @@ static char *https_hdr_value(const char *hdr, size_t len, const char *name)
         }
         line = next;
     }
-    if (!val.len)
+    if (!val.len) {
+        /* R37 WG-E2 (R3-L11): a matched header with an EMPTY value built
+         * no text, but sbuf_app() already allocated the 256-byte initial
+         * buffer — returning NULL here without freeing leaked it once per
+         * response (remote-controlled: one "Transfer-Encoding:" line per
+         * reply is enough). */
+        free(val.d);
         return NULL;
+    }
     /* trim trailing whitespace */
     while (val.len > 0 &&
            (val.d[val.len - 1] == ' ' || val.d[val.len - 1] == '\t'))
@@ -334,12 +341,13 @@ static int https_set_io_timeo(int fd, int opt, uint64_t ms)
     return port_setsockopt(fd, SOL_SOCKET, opt, &tv, sizeof tv);
 }
 
-/* Load the CA trust anchors into ctx. Linux: SSL_CERT_FILE wins,
-   otherwise the first of the usual per-distro bundle paths (the same
-   candidates the fork-based transport handed to `openssl s_client
-   -CAfile`); no usable bundle -> the historical "no CA bundle found"
-   message. Windows: the system ROOT store via Crypt32. Returns 0 on
-   success, -1 with the specific reason already logged. */
+/* Load the CA trust anchors into ctx. Linux: SSL_CERT_FILE wins when it
+   loads, otherwise (or when it does not load) the first usable bundle of
+   the usual per-distro paths (the same candidates the fork-based
+   transport handed to `openssl s_client -CAfile`); no usable bundle ->
+   -1 (the caller decides about the embedded fallback roots). Windows:
+   the system ROOT store via Crypt32. Returns 0 on success, -1 with the
+   specific reason already logged. */
 static int https_ctx_load_cas(SSL_CTX *ctx)
 {
 #ifdef _WIN32
@@ -403,31 +411,50 @@ static int https_ctx_load_cas(SSL_CTX *ctx)
     };
     const char *ca = getenv("SSL_CERT_FILE");
 
-    /* SSL_CERT_FILE wins even if the file is unreadable; the load below
-     * reports the failure. Otherwise fall back to the bundle paths. */
-    if (!ca || !ca[0]) {
+    if (ca && !ca[0])
         ca = NULL;
-        for (size_t i = 0; i < sizeof cands / sizeof cands[0]; i++)
-            if (access(cands[i], R_OK) == 0) {
-                ca = cands[i];
-                break;
-            }
+    /* R37 WG-E2 (R3-L15): SSL_CERT_FILE still wins when it loads, but a
+     * stale/unreadable value must no longer discard the system trust
+     * anchors — the candidate bundle paths are tried next, one by one,
+     * and only when every one of them failed too does this return -1
+     * (the caller then falls back to the two embedded roots). The log
+     * distinguishes "this file could not be read/loaded" from "no system
+     * CA bundle is usable" instead of blaming the system store for a bad
+     * environment variable. No verification is relaxed anywhere. */
+    if (ca) {
+        char ebuf[256];
+
+        if (SSL_CTX_load_verify_locations(ctx, ca, NULL) == 1)
+            return 0;
+        https_ssl_err(ebuf, sizeof ebuf);
+        log_err("HTTPS: cannot load CA bundle '%s' (SSL_CERT_FILE): %s",
+                ca, ebuf);
     }
-    if (!ca) {
+    for (size_t i = 0; i < sizeof cands / sizeof cands[0]; i++) {
+        char ebuf[256];
+
+        if (access(cands[i], R_OK) != 0)
+            continue;   /* not installed here: try the next candidate */
+        if (SSL_CTX_load_verify_locations(ctx, cands[i], NULL) == 1) {
+            if (ca)
+                log_info("HTTPS: falling back to system CA bundle '%s'",
+                         cands[i]);
+            return 0;
+        }
+        https_ssl_err(ebuf, sizeof ebuf);
+        log_err("HTTPS: CA bundle '%s' exists but is unusable: %s",
+                cands[i], ebuf);
+    }
+    if (ca) {
+        log_err("HTTPS: SSL_CERT_FILE '%s' could not be loaded and no "
+                "system CA bundle could be loaded either", ca);
+    } else {
         log_err("no CA bundle found: set SSL_CERT_FILE or install one of "
                 "/etc/ssl/certs/ca-certificates.crt, "
                 "/etc/pki/tls/certs/ca-bundle.crt, /etc/ssl/cert.pem, "
                 "/etc/pki/tls/cacert.pem");
-        return -1;
     }
-    if (SSL_CTX_load_verify_locations(ctx, ca, NULL) != 1) {
-        char ebuf[256];
-
-        https_ssl_err(ebuf, sizeof ebuf);
-        log_err("HTTPS: cannot load CA bundle '%s': %s", ca, ebuf);
-        return -1;
-    }
-    return 0;
+    return -1;
 #endif
 }
 
@@ -571,9 +598,11 @@ static SSL_CTX *https_ctx_new(bool with_fallback)
             return NULL;
         }
         /* (cache callers never see this NULL: with_fallback continues) */
-        /* system store unusable: fall back to the bundled roots alone */
-        log_err("HTTPS: system CA store unusable; using bundled fallback "
-                "roots only");
+        /* no system bundle usable (the specific reason — a bad
+         * SSL_CERT_FILE, an unusable candidate, or nothing installed —
+         * was just logged by https_ctx_load_cas): bundled roots only */
+        log_err("HTTPS: no usable system CA bundle; using the bundled "
+                "fallback roots only");
     }
     if (with_fallback) {
         int n = https_ctx_add_embedded_cas(ctx);
@@ -657,10 +686,16 @@ static void he_lane_start(he_lane *ln, char *diag, size_t diagsz)
         }
         if (port_connect(fd, ai->ai_addr, ai->ai_addrlen) != 0 &&
             errno != EINPROGRESS && errno != EAGAIN &&
-            errno != EWOULDBLOCK) {
+            errno != EWOULDBLOCK && errno != EINTR) {
             /* nonblocking connect: WSAEWOULDBLOCK -> EAGAIN on Windows,
              * EINPROGRESS on Linux; both mean "wait for POLLOUT".
-             * Anything else is an immediate failure: next address. */
+             * R37 WG-E2 (R3-L3): EINTR means the connect is still in
+             * progress (POSIX resumes it asynchronously), NOT that this
+             * address failed — it must be waited for like EINPROGRESS,
+             * else a single delivered signal fails the whole host when
+             * the resolver returned one address ("Interrupted system
+             * call"). Anything else is an immediate failure: next
+             * address. */
 #ifdef _WIN32
             snprintf(diag, diagsz, "connect: wsa %d (errno %d)",
                      WSAGetLastError(), errno);
@@ -715,6 +750,7 @@ static int https_connect_tcp(const char *host, uint16_t port,
     struct addrinfo *ai;
     char service[8];
     int gai, fd = -1;
+    bool expired = false;
 
     memset(&hints, 0, sizeof hints);
     hints.ai_family = AF_UNSPEC;
@@ -789,7 +825,28 @@ static int https_connect_tcp(const char *host, uint16_t port,
                 pr = port_poll(pfd, npfd, to);
                 if (pr >= 0 || errno != EINTR)
                     break;
+                /* R37 WG-E2 (R3-L2): every EINTR retry must recompute the
+                 * budget. The old loop retried with the ORIGINAL timeout
+                 * and never re-checked the deadline (that check sits
+                 * outside this block), so a steady stream of signals kept
+                 * it polling forever — the documented 60s round-trip bound
+                 * did not exist. Same shape as relay_proxy.c rp_poll_retry. */
+                {
+                    uint64_t now = now_ms();
+
+                    if (now >= deadline_ms) {
+                        expired = true;
+                        break;
+                    }
+                    remain = deadline_ms - now;
+                    to = remain > HTTPS_POLL_MS ? (int)HTTPS_POLL_MS
+                                                : (int)remain;
+                }
             }
+        }
+        if (expired) {
+            snprintf(diag, diagsz, "timed out connecting to %s", host);
+            break;
         }
         if (pr == 0)
             errno = ETIMEDOUT;
@@ -1243,31 +1300,37 @@ static int https_tls_read(SSL *ssl, int fd, struct sbuf *resp,
     }
 }
 
-/* Locate the start of the header lines and of the body in a response. */
+/* Locate the start of the header lines and of the body in a response.
+ * R37 WG-E2 (R3-L10): the header start is derived from the SAME
+ * terminator that delimits the body. The old code located the header
+ * start from the first CRLF and the body from the first CRLFCRLF/LFLF
+ * independently; an LF-only header block followed by a CRLF inside the
+ * body made body < hdr_start, so (size_t)(body - hdr_start) underflowed
+ * (pointer-overflow UB in https_hdr_value's `hdr + len` and the whole
+ * header block — Transfer-Encoding, Location — became invisible). With
+ * one ruler hdr_start <= body holds for every input. */
 static void https_hdr_body(const char *d, size_t len,
                            const char **hdr_start, const char **body)
 {
-    const char *h = strstr(d, "\r\n");
-    if (!h)
-        h = strstr(d, "\n");
-    if (!h)
-        h = d + len;
-    else if (h[0] == '\r')
-        h += 2;
-    else
-        h += 1;
+    const char *term = strstr(d, "\r\n\r\n");
+    size_t tlen = 4;
+    const char *eol;
 
-    *body = strstr(d, "\r\n\r\n");
-    if (*body)
-        *body += 4;
-    else {
-        *body = strstr(d, "\n\n");
-        if (*body)
-            *body += 2;
-        else
-            *body = d + len;
+    if (!term) {
+        term = strstr(d, "\n\n");
+        tlen = 2;
     }
-    *hdr_start = h;
+    if (!term) {
+        /* no header terminator: neither a header block nor a body */
+        *hdr_start = d + len;
+        *body = d + len;
+        return;
+    }
+    /* the first LF after the status line ends it; the header block runs
+     * from there to the terminator */
+    eol = memchr(d, '\n', (size_t)(term - d));
+    *hdr_start = eol ? eol + 1 : term;
+    *body = term + tlen;
 }
 
 /* Parse just the HTTP status code out of a raw response; -1 on malformed. */
@@ -1314,7 +1377,10 @@ static int https_resp_parse(struct sbuf *resp, int *status, char **body_out)
     }
 
     https_hdr_body(resp->d, resp->len, &hdr_start, &body);
-    hdr_len = (size_t)(body - hdr_start);
+    /* belt and braces: https_hdr_body now guarantees body >= hdr_start,
+     * but a negative difference must never reach https_hdr_value again
+     * (that subtraction is what wrapped the pointer and hid the headers) */
+    hdr_len = (body > hdr_start) ? (size_t)(body - hdr_start) : 0;
     te = https_hdr_value(hdr_start, hdr_len, "transfer-encoding");
     if (te) {
         if (!https_te_is_chunked(te)) {
@@ -1397,7 +1463,7 @@ static bool https_transport(const char *host, struct sbuf *req,
              * Windows). A broken/empty system store still gets one
              * attempt with the bundled fallback roots. */
             if (!fallback) {
-                log_info("HTTPS: system CA store unusable; retrying "
+                log_info("HTTPS: no usable system CA bundle; retrying "
                          "with bundled fallback CAs");
                 continue;
             }
@@ -1570,7 +1636,8 @@ static bool https_roundtrip(const char *host, const char *path,
             if (follow) {
                 const char *hs, *bd;
                 https_hdr_body(resp.d, resp.len, &hs, &bd);
-                loc = https_hdr_value(hs, (size_t)(bd - hs), "location");
+                loc = https_hdr_value(hs, (bd > hs) ? (size_t)(bd - hs) : 0,
+                                      "location");
             }
             if (!loc) {
                 log_err("HTTPS request failed: HTTP %d%s", st,

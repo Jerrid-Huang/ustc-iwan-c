@@ -443,15 +443,16 @@ bool capture_default(char gw[16], char dev[16], char metric[16])
     size_t best = 0;
     bool prefer_en = false;
     for (size_t i = 0; i < n; i++) {
-        log_info("capture_default: default candidate %zu: via %s on %s",
-                 i + 1, cand_gw[i], cand_dev[i]);
+        /* %llu, never %zu: msvcrt printf (Windows) lacks %zu (json.c:55) */
+        log_info("capture_default: default candidate %llu: via %s on %s",
+                 (unsigned long long)(i + 1), cand_gw[i], cand_dev[i]);
         if (!prefer_en && strncmp(cand_dev[i], "en", 2) == 0) {
             prefer_en = true;
             best = i;
         }
     }
-    log_info("capture_default: %zu default route(s); choosing via %s on %s",
-             n, cand_gw[best], cand_dev[best]);
+    log_info("capture_default: %llu default route(s); choosing via %s on %s",
+             (unsigned long long)n, cand_gw[best], cand_dev[best]);
     copy_token(gw, 16, cand_gw[best]);
     copy_token(dev, 16, cand_dev[best]);
     return true;
