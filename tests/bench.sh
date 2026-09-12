@@ -35,11 +35,34 @@ fi
 # defaults that option to ON for EVERY non-Debug build type (Release
 # included). Benchmarks that request those switches would then silently
 # report empty [prof] / per-second output; refuse to run instead.
+#
+# R37 R5 WG-D (R4-L2): "non-empty" is NOT "diagnostics requested". An
+# explicit off-spelling (the user turning the switch OFF) must not trip
+# the abort below — that turned a legal benchmark into a hard failure
+# with a misleading "this build cannot emit the diagnostics" message.
+# The list must match the parsers:
+#   IWAN_DEBUG   -> env_bool("IWAN_DEBUG", false)   src/common/util.c:75,
+#                   called by debug_enabled() (util.c:69-79)
+#   IWAN_PROFILE -> env_bool("IWAN_PROFILE", false) src/common/profile.c:18
+#   env_bool() itself (util.c:51-66, R37 R5 R3-L17) treats "" (or unset)
+#   and the exact tokens 0/false/no/off as OFF, case-insensitively; every
+#   other value ("1", "0x", "offline", "nothing") stays ON. Both diag
+#   variables go through that one helper, so one predicate mirrors both.
+# IWAN_PUMP_PROF is deliberately NOT in that predicate: proxy.c:65,85 only
+# test getenv("IWAN_PUMP_PROF") != NULL, so ANY non-empty value — "0"
+# included — switches the pump profiler on and the loose non-empty test is
+# the accurate one. (Empty is kept as "unset" for all three.)
+diag_on() {   # true when the value requests diagnostics
+    case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+        "" | 0 | false | no | off) return 1 ;;
+        *) return 0 ;;
+    esac
+}
 DIAG_WANTED=0
 if [ "${2:-}" = "debug" ]; then
     DIAG_WANTED=1
 fi
-if [ -n "${IWAN_DEBUG:-}" ] || [ -n "${IWAN_PROFILE:-}" ] || \
+if diag_on "${IWAN_DEBUG:-}" || diag_on "${IWAN_PROFILE:-}" || \
    [ -n "${IWAN_PUMP_PROF:-}" ]; then
     DIAG_WANTED=1
 fi

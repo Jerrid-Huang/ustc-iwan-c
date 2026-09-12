@@ -92,6 +92,10 @@ static const char *usage_required(const char *sub)
     return "Usage: iwan-client <COMMAND>";
 }
 
+/* repeat-option note + environment matrix, printed at the end of every help
+ * text of this binary; the definition follows print_sub_help */
+static void print_help_footer(FILE *out);
+
 static void print_top_help(FILE *out)
 {
     fprintf(out,
@@ -109,6 +113,7 @@ static void print_top_help(FILE *out)
         "Options:\n"
         "  -h, --help     Print help\n"
         "  -V, --version  Print version\n");
+    print_help_footer(out);
 }
 
 static void print_help_help(void)
@@ -120,6 +125,71 @@ static void print_help_help(void)
         "\n"
         "Arguments:\n"
         "  [COMMAND]...  Print help for the subcommand(s)\n");
+    print_help_footer(stdout);
+}
+
+/* ---- shared help footer: repeat-option semantics + environment matrix ----
+ *
+ * R37 R5 (L24): "repeating an option ..." is deliberately the same opening
+ * sentence in all three binaries (iwan-server: the last value wins; the two
+ * clap-style parsers: exit 2 with 'cannot be used multiple times'), so the
+ * documented semantics can be compared side by side.
+ * R37 R5 (L20-1): the environment matrix lists ONLY the variables this
+ * binary really reads; [scope] says where each one applies. The same block
+ * is printed by every help text of this binary, and it mirrors README.md's
+ * matrix. */
+static void print_help_footer(FILE *out)
+{
+    fprintf(out,
+        "\n"
+        "Repeating an option is an error: 'cannot be used multiple times' (exit 2).\n"
+        "The list options --proxy-cidr, --proxy-ip, --proxy-domain and\n"
+        "--proxy-cidr6 (proxy only) are the exception: they accumulate across\n"
+        "repetitions.\n"
+        "\n"
+        "Environment (settings this binary reads; [scope] = where they apply):\n"
+        "      IWAN_DEBUG=1                      debug logging (default: off; ignored by\n"
+        "                                        IWAN_DEBUG_STRIP builds) [all]\n"
+        "      IWAN_PROFILE=1                    print stage throughput at exit (default:\n"
+        "                                        off; ignored by IWAN_DEBUG_STRIP builds) [all]\n"
+        "      IWAN_RX_STALE_MS=<ms>             re-authenticate after this long without\n"
+        "                                        downlink, 0 disables, 30000..86400000\n"
+        "                                        (default: 120000) [proxy, socks]\n"
+        "      IWAN_SEND_PACING_PPS=<n>          aggregate send pacing in packets/s,\n"
+        "                                        0 disables (default: 0) [proxy, socks]\n"
+        "      IWAN_RXDBG=1                      log every VPN datagram received\n"
+        "                                        (default: off) [socks]\n"
+        "      IWAN_FLOWDBG=1                    log SOCKS flow state changes and close\n"
+        "                                        reasons (default: off) [socks]\n"
+        "      IWAN_NS_CONNECT_TIMEOUT_MS=<ms>   userspace TCP connect timeout,\n"
+        "                                        1000..300000 (default: 30000) [socks]\n"
+        "      IWAN_SOCKS_ALLOW_LOOPBACK=1       let non-loopback peers reach loopback/\n"
+        "                                        link-local targets; only the exact value 1\n"
+        "                                        enables it (default: off) [socks]\n"
+        "      IWAN_AUTH_FAIL_MAX=<n>            failed authentications per source before\n"
+        "                                        lockout, 1..100 (default: 5) [socks]\n"
+        "      IWAN_AUTH_FAIL_WINDOW_MS=<ms>     lockout window, 100..86400000\n"
+        "                                        (default: 60000) [socks]\n"
+        "      IWAN_PUMP_PROF=1                  per-stage TUN pump profiler; any value\n"
+        "                                        (even empty) enables it, never parsed by\n"
+        "                                        IWAN_DEBUG_STRIP builds (default: off) [proxy]\n"
+        "      IWAN_PUMP_QUEUES=<n>              TUN reader-pool queues, 1..8 (default:\n"
+        "                                        number of CPUs, capped at 8; wintun is\n"
+        "                                        single-queue on Windows) [proxy]\n"
+        "      IWAN_RELAY_ALLOW_LOOPBACK=1       let non-loopback peers reach loopback/\n"
+        "                                        link-local targets through --listen; only\n"
+        "                                        the exact value 1 enables it (default: off)\n"
+        "                                        [proxy --listen]\n"
+        "      IWAN_WIN_THREAD_PIN=1             pin pump threads to CPU 1/2 (Windows\n"
+        "                                        only; default: off) [proxy]\n"
+        "      IWAN_ELEVATED_RELAUNCH            internal marker set by the program before\n"
+        "                                        a Windows UAC relaunch; do not set\n"
+        "      Flags: 0/false/no/off (case-insensitive) are off and any other non-empty\n"
+        "      value is on, except IWAN_RXDBG/IWAN_FLOWDBG, which are case-sensitive.\n"
+        "      Invalid numbers fall back to the default with a warning.\n"
+        "      Also read: SSL_CERT_FILE, SSL_CERT_DIR (non-Windows TUN mode; unset\n"
+        "      before helper binaries unless the path is root-owned and not\n"
+        "      group/other-writable).\n");
 }
 
 static void print_sub_help(const char *sub)
@@ -197,6 +267,7 @@ static void print_sub_help(const char *sub)
             "      --socks-ipv6         Assume the server relays IPv6: AAAA DNS + ATYP=4 (off by default)\n"
             "  -h, --help               Print help\n");
     }
+    print_help_footer(stdout);
 }
 
 /* ---- shared CLI glue (per-subcommand context) ---- */

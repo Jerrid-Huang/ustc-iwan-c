@@ -37,6 +37,69 @@ const char *oidc_usage(const Cli *c)
     return buf;
 }
 
+/* ---- shared help footer: repeat-option semantics + environment matrix ----
+ *
+ * R37 R5 (L24): "repeating an option ..." is deliberately the same opening
+ * sentence as in iwan-server and iwan-client, so the documented semantics of
+ * the three binaries can be compared side by side (both clap-style parsers
+ * exit 2 with 'cannot be used multiple times'; iwan-server's bare
+ * getopt_long takes the last value).
+ * R37 R5 (L20-1): the environment matrix lists ONLY the variables this
+ * binary really reads; [scope] says where each one applies. The same block
+ * is printed by -h and --help, and it mirrors README.md's matrix. */
+static void print_help_footer(void)
+{
+    printf(
+        "\n"
+        "Repeating an option is an error: 'cannot be used multiple times' (exit 2).\n"
+        "The list options --proxy-cidr, --proxy-ip, --proxy-domain and --proxy-cidr6\n"
+        "are the exception: they accumulate across repetitions.\n"
+        "\n"
+        "Environment (settings this binary reads; [scope] = where they apply):\n"
+        "      IWAN_DEBUG=1                      debug logging (default: off; ignored by\n"
+        "                                        IWAN_DEBUG_STRIP builds) [all]\n"
+        "      IWAN_RX_STALE_MS=<ms>             re-authenticate after this long without\n"
+        "                                        downlink, 0 disables, 30000..86400000\n"
+        "                                        (default: 120000) [TUN, socks]\n"
+        "      IWAN_SEND_PACING_PPS=<n>          aggregate send pacing in packets/s,\n"
+        "                                        0 disables (default: 0) [TUN, socks]\n"
+        "      IWAN_RXDBG=1                      log every VPN datagram received\n"
+        "                                        (default: off) [socks]\n"
+        "      IWAN_FLOWDBG=1                    log SOCKS flow state changes and close\n"
+        "                                        reasons (default: off) [socks]\n"
+        "      IWAN_NS_CONNECT_TIMEOUT_MS=<ms>   userspace TCP connect timeout,\n"
+        "                                        1000..300000 (default: 30000) [socks]\n"
+        "      IWAN_SOCKS_ALLOW_LOOPBACK=1       let non-loopback peers reach loopback/\n"
+        "                                        link-local targets; only the exact value 1\n"
+        "                                        enables it (default: off) [socks]\n"
+        "      IWAN_AUTH_FAIL_MAX=<n>            failed authentications per source before\n"
+        "                                        lockout, 1..100 (default: 5) [socks]\n"
+        "      IWAN_AUTH_FAIL_WINDOW_MS=<ms>     lockout window, 100..86400000\n"
+        "                                        (default: 60000) [socks]\n"
+        "      IWAN_PUMP_PROF=1                  per-stage TUN pump profiler; any value\n"
+        "                                        (even empty) enables it, never parsed by\n"
+        "                                        IWAN_DEBUG_STRIP builds (default: off) [TUN]\n"
+        "      IWAN_PUMP_QUEUES=<n>              TUN reader-pool queues, 1..8 (default:\n"
+        "                                        number of CPUs, capped at 8; wintun is\n"
+        "                                        single-queue on Windows) [TUN]\n"
+        "      IWAN_RELAY_ALLOW_LOOPBACK=1       let non-loopback peers reach loopback/\n"
+        "                                        link-local targets through --socks-listen;\n"
+        "                                        only the exact value 1 enables it\n"
+        "                                        (default: off) [TUN --socks-listen]\n"
+        "      IWAN_WIN_THREAD_PIN=1             pin pump threads to CPU 1/2 (Windows\n"
+        "                                        only; default: off) [TUN]\n"
+        "      IWAN_ELEVATED_RELAUNCH            internal marker set by the program before\n"
+        "                                        a Windows UAC relaunch; do not set\n"
+        "      Flags: 0/false/no/off (case-insensitive) are off and any other non-empty\n"
+        "      value is on, except IWAN_RXDBG/IWAN_FLOWDBG, which are case-sensitive.\n"
+        "      Invalid numbers fall back to the default with a warning.\n"
+        "      Also read: SSL_CERT_FILE, SSL_CERT_DIR (non-Windows: CA bundle for the\n"
+        "      HTTPS calls, dropped before helper exec unless root-owned and not\n"
+        "      group/other-writable), HOME, SUDO_USER, SUDO_UID, SUDO_GID,\n"
+        "      XDG_RUNTIME_DIR, TMPDIR (Linux);\n"
+        "      USERPROFILE, HOMEDRIVE, HOMEPATH, HOME, TEMP, TMP, USERNAME (Windows).\n");
+}
+
 static void print_help_short(void)
 {
     printf(
@@ -66,6 +129,7 @@ static void print_help_short(void)
         "      --socks-ipv6                   Assume the server relays IPv6: v6 DNS (AAAA) + ATYP=4 targets (off by default)\n"
         "  -h, --help                         Print help (see more with '--help')\n"
         "  -V, --version                      Print version\n");
+    print_help_footer();
 }
 
 static void print_help_long(void)
@@ -161,6 +225,7 @@ static void print_help_long(void)
         "\n"
         "  -V, --version\n"
         "          Print version\n");
+    print_help_footer();
 }
 
 static void on_help(bool long_help)
@@ -194,9 +259,7 @@ static const char *const short_aliases[][2] = {
 /* R37-FIX-A2: the guard implementation lives in oidc_config.c next to
  * normalize_path(); the CLI gate here and the oidc_save_config() backstop
  * MUST share it, otherwise a spelling this gate accepts could still be a
- * root write. (Declared locally because oidc.h was outside the fix's
- * file scope; moving it there later is a one-line change.) */
-bool oidc_config_dir_resolves_to_root(const char *dir);
+ * root write. The prototype lives in oidc.h (R3-L18). */
 
 /* R14-M-2: an empty or all-whitespace --config-dir joins with
  * "/servers.json" into "/servers.json" (and "--config-dir '//'" into

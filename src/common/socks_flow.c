@@ -1617,16 +1617,56 @@ static void handshake_request(Flow *f)
 
 void process_socks_handshake(Flow *f)
 {
-    if (f->state == ST_GREETING) {
-        if (f->http_mode) {
-            http_handshake(f);
+    /* R37-R5 (R3-L12): a client that coalesces the greeting and its
+     * RFC1929 auth frame into one write (curl -U) leaves the auth frame
+     * buffered while handshake_greeting() returns false right after
+     * queueing {5,2}. The old single-pass version then fell out and the
+     * buffered frame waited for the NEXT event-loop round to parse it;
+     * with no fd event and no lwIP timer pending that round is only
+     * reached at the 1000ms poll ceiling (socks.c POLL_CEIL_MS,
+     * socks.c:1354), measured 1001ms end to end. Advance every frame
+     * that is already buffered, in this round.
+     *
+     * Bounded: every `continue` below is preceded by a strict decrease
+     * of f->input.len (buf_consume of a frame the parser certified as
+     * complete), and the loop refuses to continue when nothing was
+     * consumed (`len >= before`), so it can never spin. At most three
+     * frames can belong to the handshake (greeting -> RFC1929 ->
+     * CONNECT), hence the pass cap; anything beyond CONNECT is tunnel
+     * payload that ST_CONNECTING/ST_RESOLVING spills into the netstack
+     * (see the state guard in service_local_inputs), not handshake
+     * input. */
+    for (int pass = 0; pass < 3; pass++) {
+        if (f->state != ST_GREETING && f->state != ST_REQUEST)
             return;
+        if (f->state == ST_GREETING) {
+            if (f->http_mode) {
+                http_handshake(f);
+                return;
+            }
+            size_t before = f->input.len;
+            if (handshake_greeting(f)) {
+                /* method 0 (or a verified RFC1929 frame) already moved
+                 * the flow to ST_REQUEST: parse CONNECT this round too
+                 * when it is buffered. With no buffered byte the old
+                 * code's handshake_request() call was a no-op
+                 * (pp_socks_request needs >= 4 bytes), so returning here
+                 * is behaviour-preserving. */
+                if (f->state == ST_REQUEST && f->input.len > 0)
+                    continue;
+                return;
+            }
+            if (f->input.len >= before)
+                return;      /* frame incomplete: wait for the next read */
+            /* a complete frame was consumed ({5,2} may have been queued
+             * for method 2, {1,0}/{1,1} for RFC1929, or nothing on the
+             * reject paths, which leave ST_CLOSING and exit at the top):
+             * parse whatever else came in the same write */
+            continue;
         }
-        if (!handshake_greeting(f))
-            return;
+        handshake_request(f);   /* ST_REQUEST */
+        return;
     }
-    if (f->state == ST_REQUEST)
-        handshake_request(f);
 }
 
 void handle_dns_results(void) {
@@ -1921,9 +1961,14 @@ void service_local_inputs(Flow *fs) {
                     break;       /* stack full: backpressure */
                 }
                 ssize_t r2 = port_readv(f->fd, iov, nv);
-                /* R37 R3-L5: EINTR is a retry, not a dead client — the
-                 * next event-loop round reads again (ns_close/ns_abort
-                 * here RST the client and discard f->output) */
+                /* R37 R3-L5 / R5-WG-B: EINTR is a retry, not a dead client.
+                 * It is caught by the EAGAIN arm of the chain below, not by
+                 * the hard-error arm: nothing was read and ns_send_commit was
+                 * never called, so this batch's reservation is simply dropped
+                 * and the next event-loop round reads again (rx_paused stays
+                 * false, so POLLIN is still registered). ns_close/ns_abort
+                 * here would RST the client and discard f->output. This guard
+                 * therefore only logs genuinely fatal errno values. */
                 if (r2 < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
                     errno != EINTR) {
                     log_debug("[flow %lu] readv fd=%d nv=%d err=%s "
@@ -1996,8 +2041,11 @@ void service_local_inputs(Flow *fs) {
                     ns_close(&g_ns, f->ns_idx);
                     set_flow_state(f, ST_CLOSING);
                     break;
-                } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    break;             /* drained for now */
+                } else if (errno == EAGAIN || errno == EWOULDBLOCK ||
+                           errno == EINTR) {
+                    break;             /* drained for now — EINTR retried
+                                        * next round: nothing was read and no
+                                        * reserved slot was committed */
                 } else {
                     /* hard read error (ECONNRESET when the local app
                      * RSTs, e.g. a cancelled browser tab): treat it as

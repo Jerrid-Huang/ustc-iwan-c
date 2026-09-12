@@ -275,6 +275,7 @@ static int bridge_output_parse(Netstack *ns, const struct pbuf *p,
                                int *has_payload)
 {
     uint8_t h[80];   /* 40B IPv6 hdr + 40B TCP (v6 SYN has thlen 28..40) */
+    const uint8_t *hb;   /* header bytes: h, or p->payload when contiguous */
     const uint8_t *t;
     uint16_t sport, dport;
     size_t ihl, thlen, tot;
@@ -285,17 +286,28 @@ static int bridge_output_parse(Netstack *ns, const struct pbuf *p,
      * unparseable and got misclassified as CTL, bypassing the per-conn
      * fair-share cap. Copy up to 80 and verify against what each family
      * actually needs. */
-    size_t got = pbuf_copy_partial(p, h, sizeof h, 0);
+    /* R3-A5 (L4): skip the redundant 80B copy when the header bytes are
+     * already contiguous in the first pbuf. pbuf_copy_partial() returns
+     * min(p->tot_len, sizeof h), so the fast path computes the identical
+     * `got` and reads only indices < got <= p->len: byte-for-byte
+     * equivalent. A chained pbuf (p->len < got) still takes the copy. */
+    size_t got = p->tot_len < sizeof h ? (size_t)p->tot_len : sizeof h;
+    if (p->len >= got) {
+        hb = (const uint8_t *)p->payload;
+    } else {
+        got = pbuf_copy_partial(p, h, sizeof h, 0);
+        hb = h;
+    }
     if (got < 20)
         return -1;   /* not even an IPv4 header */
 
-    if ((h[0] >> 4) == 6) {
+    if ((hb[0] >> 4) == 6) {
         /* IPv6: fixed 40-byte header, next header must be TCP (we never
          * generate extension headers); need 40 hdr + 20 TCP to read ports */
-        if (got < 60 || h[6] != 6)
+        if (got < 60 || hb[6] != 6)
             return -1;
-        tot = ((size_t)h[4] << 8) | h[5];   /* payload length */
-        t = h + 40;
+        tot = ((size_t)hb[4] << 8) | hb[5];   /* payload length */
+        t = hb + 40;
         thlen = (size_t)(t[12] >> 4) * 4;
         if (thlen < 20 || thlen > 40 || tot < thlen)
             return -1;
@@ -303,16 +315,16 @@ static int bridge_output_parse(Netstack *ns, const struct pbuf *p,
         sport = (uint16_t)((t[0] << 8) | t[1]);
         dport = (uint16_t)((t[2] << 8) | t[3]);
     } else {
-        ihl = (size_t)(h[0] & 0x0f) * 4;
+        ihl = (size_t)(hb[0] & 0x0f) * 4;
         if (ihl < 20 || ihl > 60)
             return -1;
         if (got < ihl + 20)
             return -1;   /* not enough for a full TCP header (ports/thlen) */
-        t = h + ihl;
+        t = hb + ihl;
         thlen = (size_t)(t[12] >> 4) * 4;
         if (thlen < 20 || ihl + thlen > sizeof h)
             return -1;
-        tot = ((size_t)h[2] << 8) | h[3];
+        tot = ((size_t)hb[2] << 8) | hb[3];
         if (tot < ihl + thlen)
             return -1;
         *has_payload = tot > ihl + thlen;

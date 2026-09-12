@@ -48,6 +48,41 @@ static inline bool debug_enabled(void) { return false; }
 #else
 bool debug_enabled(void);
 #endif
+
+/* R37 R5 (R3-L17 + M5 remainder): one shared spelling rule for the
+ * boolean feature env vars (IWAN_DEBUG, IWAN_PROFILE,
+ * IWAN_WIN_THREAD_PIN, IWAN_ELEVATED_RELAUNCH). Contract:
+ *   - unset, or the empty string        -> dflt
+ *   - case-insensitive {0,false,no,off} -> false
+ *   - any other non-empty value         -> true
+ * Both "loose" choices are load-bearing, do not tighten them:
+ *   - unknown values stay ON: operators use IWAN_DEBUG=yes and
+ *     IWAN_PROFILE=2, and a fail-closed positive list would silently
+ *     switch those off. This is also why the security opt-outs
+ *     (IWAN_ALLOW_INSECURE_USERS, IWAN_SOCKS_ALLOW_LOOPBACK,
+ *     IWAN_RELAY_ALLOW_LOOPBACK) must keep their own exact-token rule
+ *     instead of calling this helper;
+ *   - no whitespace trimming: " 0" has always been ON in
+ *     debug_enabled(), and trimming would silently stop a running debug
+ *     session. "0 " is likewise NOT an off spelling.
+ * Per-site delta vs the code this replaced (narrowing only, i.e. a
+ * value that used to be OFF never becomes ON, with one exception):
+ *   - debug_enabled(): off list {0,false,off} was case-sensitive and had
+ *     no "no" -> "no"/"No"/"FALSE"/"OFF" turn off (the R3-L17 fix);
+ *   - prof_init(): same list, was case-sensitive -> case variants turn
+ *     off; "no" was already handled there;
+ *   - IWAN_ELEVATED_RELAUNCH (port.c, oidc_util.c): was existence-only,
+ *     so ""/0/false/no/off were ON -> now off;
+ *   - the IWAN_WIN_THREAD_PIN sites (tun_win.c, proxy.c) used
+ *     `pin[0] != '0'`, so ""/false/no/off were ON -> now off, BUT
+ *     "0 "/"0x" were OFF (leading '0') and are now ON: trailing garbage
+ *     is not an off spelling. Documented exception; it affects the
+ *     experimental Windows affinity hint only.
+ * No internal cache: exactly one getenv() per call, so a caller that
+ * needs a cached or atomic answer keeps its own (debug_enabled() does).
+ * Do NOT re-express dbg_env() (see its looser documented contract
+ * above) or the exact-"1" security opt-outs with this helper. */
+bool env_bool(const char *name, bool dflt);
 /* reset PATH to a safe default and clear loader-injection vars; call in
  * the child before exec of helper binaries (root daemon hardening) */
 void exec_sanitize(void);

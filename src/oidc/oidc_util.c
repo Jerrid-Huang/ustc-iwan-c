@@ -26,7 +26,7 @@
 void oidc_pause_if_relaunched(void)
 {
 #ifdef _WIN32
-    if (getenv("IWAN_ELEVATED_RELAUNCH")) {
+    if (env_bool("IWAN_ELEVATED_RELAUNCH", false)) {
         fputs("\nPress any key to close this window...", stderr);
         fflush(stderr);
         _getch();

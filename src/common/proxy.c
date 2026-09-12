@@ -613,10 +613,10 @@ static void *udp2tun_thread(void *ud) {
 #else
     /* experimental pinning (IWAN_WIN_THREAD_PIN=1): downlink recv ->
      * CPU 2, ABOVE_NORMAL — pairs with the uplink reader on CPU 1 and
-     * stays off CPU 0 (virtio/wintun DPCs). */
+     * stays off CPU 0 (virtio/wintun DPCs). Off spellings (0/false/no/
+     * off, case-insensitive) disable it: env_bool, R37 R5. */
     {
-        const char *pin = getenv("IWAN_WIN_THREAD_PIN");
-        if (pin && pin[0] != '0') {
+        if (env_bool("IWAN_WIN_THREAD_PIN", false)) {
             SYSTEM_INFO si;
             GetSystemInfo(&si);
             if (si.dwNumberOfProcessors > 2)

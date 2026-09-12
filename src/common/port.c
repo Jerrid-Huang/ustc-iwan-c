@@ -39,7 +39,10 @@ static LONG WINAPI iwan_crash_filter(EXCEPTION_POINTERS *ep)
             (unsigned long)er->ExceptionCode, er->ExceptionAddress,
             modpath);
     fflush(stderr);
-    if (getenv("IWAN_ELEVATED_RELAUNCH")) {
+    /* R37 R5 (R3-L17): existence-only parsing made IWAN_ELEVATED_RELAUNCH=""
+     * or "0" mean "hold the window open"; the marker is set to "1" by
+     * port_elevate_self(), so honor the off spellings (env_bool). */
+    if (env_bool("IWAN_ELEVATED_RELAUNCH", false)) {
         fprintf(stderr, "Press any key to close this window...");
         fflush(stderr);
         _getch();

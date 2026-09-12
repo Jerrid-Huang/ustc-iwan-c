@@ -414,21 +414,60 @@ static int https_ctx_load_cas(SSL_CTX *ctx)
     if (ca && !ca[0])
         ca = NULL;
     /* R37 WG-E2 (R3-L15): SSL_CERT_FILE still wins when it loads, but a
-     * stale/unreadable value must no longer discard the system trust
-     * anchors — the candidate bundle paths are tried next, one by one,
-     * and only when every one of them failed too does this return -1
-     * (the caller then falls back to the two embedded roots). The log
-     * distinguishes "this file could not be read/loaded" from "no system
-     * CA bundle is usable" instead of blaming the system store for a bad
-     * environment variable. No verification is relaxed anywhere. */
+     * stale value must no longer discard the system trust anchors — the
+     * candidate bundle paths are tried next, one by one, and only when
+     * every one of them failed too does this return -1 (the caller then
+     * falls back to the two embedded roots).
+     *
+     * R37 R5 WG-C (R4-M1): "stale" is now decided explicitly instead of
+     * treating every SSL_CERT_FILE failure as stale. An explicit CA that
+     * EXISTS and is READABLE but that OpenSSL cannot use (junk bytes,
+     * empty file, a directory, corrupted PEM) means the operator's
+     * pinned trust set is unmet; silently swapping it for the system
+     * bundle turned a pinned store into the whole public WebPKI
+     * (measured: 2 -> 122 anchors). That case now fails closed. Only
+     * paths that cannot denote a readable file at all (ENOENT, ENOTDIR,
+     * ENAMETOOLONG, ELOOP — and any other errno we did not model, e.g.
+     * EACCES: default deny) fall back, which keeps the R3-L15 scenario
+     * (an inherited SSL_CERT_FILE=/nonexistent) working. No verification
+     * is relaxed anywhere. */
     if (ca) {
         char ebuf[256];
+        int aerr;
 
         if (SSL_CTX_load_verify_locations(ctx, ca, NULL) == 1)
             return 0;
         https_ssl_err(ebuf, sizeof ebuf);
         log_err("HTTPS: cannot load CA bundle '%s' (SSL_CERT_FILE): %s",
                 ca, ebuf);
+        /* Classify with access(), not with OpenSSL's errno: measured on
+         * a readable junk file OpenSSL leaves errno at 0, so errno from
+         * the call above cannot tell "unreadable path" from "readable
+         * but unusable bundle". */
+        errno = 0;
+        if (access(ca, R_OK) == 0) {
+            log_err("HTTPS: SSL_CERT_FILE '%s' is readable but not a "
+                    "usable CA bundle; refusing to fall back to the system "
+                    "trust store (fail-closed)", ca);
+            return -1;
+        }
+        aerr = errno;
+        switch (aerr) {
+        case ENOENT:
+        case ENOTDIR:
+        case ENAMETOOLONG:
+        case ELOOP:
+            break;      /* the path cannot denote a file: stale value */
+        default:
+            log_err("HTTPS: SSL_CERT_FILE '%s' is not readable (%s) and "
+                    "that is not a stale-path error; refusing to fall back "
+                    "to the system trust store (fail-closed)", ca,
+                    strerror(aerr));
+            return -1;
+        }
+        log_err("HTTPS: SSL_CERT_FILE '%s' cannot be used as a CA file "
+                "(%s); treating it as a stale value and trying the system "
+                "CA bundle candidates", ca, strerror(aerr));
     }
     for (size_t i = 0; i < sizeof cands / sizeof cands[0]; i++) {
         char ebuf[256];
@@ -1308,7 +1347,20 @@ static int https_tls_read(SSL *ssl, int fd, struct sbuf *resp,
  * body made body < hdr_start, so (size_t)(body - hdr_start) underflowed
  * (pointer-overflow UB in https_hdr_value's `hdr + len` and the whole
  * header block — Transfer-Encoding, Location — became invisible). With
- * one ruler hdr_start <= body holds for every input. */
+ * one ruler hdr_start <= body holds for every input.
+ *
+ * R37 R5 WG-D (R4-L1): with a terminator the two pointers are on the
+ * same ruler exactly as above (byte-identical behaviour). WITHOUT one
+ * the header block now runs to the END OF THE BUFFER instead of
+ * collapsing to zero length: the R3-L10 rewrite set both pointers to
+ * `d + len`, so hdr_len == 0 and every header line of an EOF-truncated
+ * response (Content-Length, Location, Transfer-Encoding) became
+ * invisible a second time — a redirect whose header block ends at EOF
+ * was no longer followed and an EOF-delimited body was handed out whole
+ * (status line included). hdr_start is therefore the first LF + 1 (the
+ * buffer start when it contains no LF at all, so the ruler still never
+ * crosses), which is what https_tls_read()'s "peer closed after a
+ * complete header block" path relies on. */
 static void https_hdr_body(const char *d, size_t len,
                            const char **hdr_start, const char **body)
 {
@@ -1321,8 +1373,10 @@ static void https_hdr_body(const char *d, size_t len,
         tlen = 2;
     }
     if (!term) {
-        /* no header terminator: neither a header block nor a body */
-        *hdr_start = d + len;
+        /* no header terminator: the header block runs to the buffer end
+         * (same semantics as before R3-L10) */
+        eol = memchr(d, '\n', len);
+        *hdr_start = eol ? eol + 1 : d;
         *body = d + len;
         return;
     }

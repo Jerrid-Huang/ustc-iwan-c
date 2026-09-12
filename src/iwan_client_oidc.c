@@ -22,14 +22,12 @@ static void usage_error(const Cli *usage, const char *msg)
     exit(2);
 }
 
-/* R37-FIX-A2: the root-write guard implementation lives in oidc_config.c
- * next to normalize_path(); this early gate and the oidc_save_config()
- * backstop must share it. Declared locally because oidc.h was outside
- * this fix's file scope. */
-bool oidc_config_dir_resolves_to_root(const char *dir);
-/* R37-FIX-A2b (R2-B2-1): same canonicalization the save backstop uses, so
- * the path opened by --list/--connect is the one --fetch wrote. */
-char *oidc_config_canon_path(const char *path);
+/* R37-FIX-A2 / A2b: the root-write guard implementation lives in
+ * oidc_config.c next to normalize_path(), and oidc_config_canon_path() is
+ * the same canonicalization the save backstop uses — so the path opened by
+ * --list/--connect is the one --fetch wrote. This early gate and the
+ * oidc_save_config() backstop must share both; the prototypes live in
+ * oidc.h (R3-L18). */
 
 int main(int argc, char **argv)
 {

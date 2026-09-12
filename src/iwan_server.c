@@ -112,8 +112,36 @@ static void usage(const char *prog, FILE *out)
     fprintf(out, "  -T, --no-tun           (testing) skip TUN device\n");
     fprintf(out, "      --user <NAME>      drop root privileges to this user after setup (default nobody)\n");
     fprintf(out, "  -h, --help             show this help\n");
-    fprintf(out, "  note: an option given twice takes its LAST value; unlike\n");
-    fprintf(out, "        iwan-client, no 'cannot be used multiple times' error\n");
+    fprintf(out, "  note: repeating an option is allowed: the LAST value wins\n");
+    fprintf(out, "        (no 'cannot be used multiple times' error, unlike iwan-client)\n");
+    /* R37 R5 (L20-1): environment matrix. Only the variables this binary
+     * really reads (getenv/env_bool sites reachable from main) are listed;
+     * the wording is kept in sync with README.md's matrix. */
+    fprintf(out, "  Environment (read once at startup):\n");
+    fprintf(out, "    IWAN_DEBUG=1        verbose debug logging (default: off; ignored\n");
+    fprintf(out, "                        by IWAN_DEBUG_STRIP builds)\n");
+    fprintf(out, "    IWAN_PROFILE=1      print stage throughput counters at exit\n");
+    fprintf(out, "                        (default: off; ignored by IWAN_DEBUG_STRIP\n");
+    fprintf(out, "                        builds)\n");
+    fprintf(out, "    IWAN_SRV_THREADS=N  uplink UDP receive threads, 1..16 (default: 4;\n");
+    fprintf(out, "                        a bad value warns and keeps 4)\n");
+    fprintf(out, "    IWAN_SRV_TUN_SINGLE=1  use one TUN queue instead of the multi-queue\n");
+    fprintf(out, "                        fan-out (A/B benchmark switch; default: off)\n");
+    fprintf(out, "    IWAN_ALLOW_INSECURE_USERS=1  accept a group/world-readable users\n");
+    fprintf(out, "                        file instead of refusing to start (default:\n");
+    fprintf(out, "                        off; only 1/true/yes/on enable it)\n");
+    fprintf(out, "    IWAN_RATE_OPEN_MAX=N  OPEN frames per source per second, 1..65535\n");
+    fprintf(out, "                        (default: 20)\n");
+    fprintf(out, "    IWAN_RATE_ECHO_MAX=N  PING and ECHO frames each per source per\n");
+    fprintf(out, "                        second, 1..65535 (default: 60)\n");
+    fprintf(out, "    IWAN_RATE_MISS_MAX=N  unknown-session DATA/CLOSE frames per source\n");
+    fprintf(out, "                        per second, 1..65535 (default: 2000)\n");
+    fprintf(out, "    Flags: 0/false/no/off (case-insensitive) are off, any other\n");
+    fprintf(out, "    non-empty value is on; IWAN_SRV_TUN_SINGLE is the exception, its\n");
+    fprintf(out, "    off spellings are case-sensitive. Invalid numbers fall back to the\n");
+    fprintf(out, "    default with a warning.\n");
+    fprintf(out, "    Also read: SSL_CERT_FILE, SSL_CERT_DIR (unset before running helper\n");
+    fprintf(out, "    binaries unless the path is root-owned and not group/other-writable)\n");
 }
 
 /* exit-code convention (matches iwan-client): usage errors exit 2 with
@@ -379,6 +407,7 @@ static void enable_ip_forward(void)
 static int run_cmd(char *const argv[])
 {
     pid_t pid = fork();
+    pid_t w;
     int st = 0;
 
     if (pid < 0)
@@ -388,8 +417,19 @@ static int run_cmd(char *const argv[])
         execvp(argv[0], argv);
         _exit(127);
     }
-    while (waitpid(pid, &st, 0) < 0 && errno == EINTR)
+    while ((w = waitpid(pid, &st, 0)) < 0 && errno == EINTR)
         ;
+    /* R37 R5 WG-D (R4-L4): a non-EINTR waitpid failure (ECHILD after a
+     * SIGCHLD handler with SA_NOCLDWAIT, EINVAL, ...) used to fall through
+     * with st still 0 => WIFEXITED(0) true and WEXITSTATUS(0) == 0 =>
+     * run_cmd reported success for a command whose exit status is unknown.
+     * iptables_ensure() then read that as "the -C rule already exists",
+     * skipped the -A and printed no warning: the server believed
+     * MASQUERADE was in place while NAT was silently broken. Same rule as
+     * util.c's ip_run() (R3-L7) and port.c's port_run_cmd: unknown status
+     * is failure. */
+    if (w < 0)
+        return -1;
     if (WIFEXITED(st))
         return WEXITSTATUS(st);
     return -1;

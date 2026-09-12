@@ -266,8 +266,13 @@ static atomic_ullong g_dl_pkts;   /* UDP datagrams sent (incl. control
                                    * counter is not a pure data metric) */
 static atomic_ullong g_dl_drops;  /* downlink inner-IPv4 gate drops (H1) */
 static atomic_ullong g_rate_drops; /* per-source rate-limit drops (silent) */
+/* L37: unknown-sid DATA/PT_DATA_ENC/CLOSE frames per source per window.
+ * Charged only AFTER a session-table miss (rate_allow_sid_miss), so it
+ * can never gate a frame that resolves to a live session. */
+#define RATE_MISS_MAX_DEFAULT 2000
 static unsigned g_rate_open_max = RATE_OPEN_MAX_DEFAULT;
 static unsigned g_rate_echo_max = RATE_ECHO_MAX_DEFAULT;
+static unsigned g_rate_miss_max = RATE_MISS_MAX_DEFAULT;
 static pthread_mutex_t g_log_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static uint64_t server_dl_pkts(void);
@@ -469,6 +474,12 @@ struct rate_bucket {
      * budget); uint32_t so env-configured limits above 255 stay
      * representable. */
     uint32_t open_cnt, ping_cnt, echo_cnt;
+    /* L37: unknown-sid DATA/PT_DATA_ENC/CLOSE frames only
+     * (IWAN_RATE_MISS_MAX). A SEPARATE counter on purpose: a random-sid
+     * flood must not spend the OPEN/PING/ECHO allowance of the address it
+     * shares with honest clients, and conversely. Charged strictly after
+     * a session-table miss — see rate_allow_sid_miss(). */
+    uint32_t miss_cnt;
     /* R1-D-1: the DATA/CLOSE token-mismatch budget is deliberately NOT a
      * field of this per-source bucket any more. Keyed by source IP it let
      * one host behind a NAT (or an ex-token device of the same account)
@@ -501,22 +512,58 @@ static int g_rate_shards_init;
 /* IWAN_RATE_* limits are read once at startup (server_rate_limits_init);
  * malformed or out-of-range values fall back to the defaults with a
  * logged warning. The 65535 ceiling keeps one source from claiming an
- * unbounded per-window allowance. */
+ * unbounded per-window allowance.
+ *
+ * R37 R5-WG-E (R4-L3): strict base-10 parse — the WHOLE string must be
+ * [0-9]+. strtoul() was permissive: " 1" and "+1" parsed to 1 and were
+ * applied SILENTLY, i.e. a typo tightened the default 20 by 20x with no
+ * diagnostic at all, while the SAME binary warns and falls back for the
+ * equally malformed IWAN_SRV_THREADS=" 1" (that one goes through
+ * util.c's parse_uint(), R3-L18's authoritative numeric parser). The
+ * accepted domain is deliberately identical to parse_uint()'s: leading
+ * zeros are LEGAL ("007" -> 7); rejected are empty (an explicitly set
+ * empty value warns, an unset variable does not), leading/trailing
+ * whitespace, a sign, any non-digit, out-of-range, and overflow (the
+ * per-digit check below cannot wrap around). util.h is not used for
+ * this — another agent owns that file this round — so the helper is
+ * file-local. */
+static bool rate_limit_parse(const char *s, unsigned *out)
+{
+    uint64_t v = 0;
+
+    if (!s || !*s)
+        return false;
+    for (const char *p = s; *p; p++) {
+        uint64_t d;
+        if (*p < '0' || *p > '9')
+            return false;
+        d = (uint64_t)(*p - '0');
+        /* reject BEFORE the multiply: a 20+ digit string must not wrap
+         * around and be admitted as a small in-range value (same
+         * pre-check shape as util.c parse_uint) */
+        if (v > (65535u - d) / 10u)
+            return false;
+        v = v * 10 + d;
+    }
+    if (v == 0) /* range is 1..65535: "0"/"00" is invalid, not a limit */
+        return false;
+    *out = (unsigned)v;
+    return true;
+}
+
 static unsigned rate_limit_env(const char *name, unsigned dflt)
 {
     const char *v = getenv(name);
-    char *end;
-    unsigned long n;
+    unsigned n;
 
-    if (!v || !*v)
+    /* unset: silently keep the default (the normal configuration) */
+    if (!v)
         return dflt;
-    errno = 0;
-    n = strtoul(v, &end, 10);
-    if (errno != 0 || end == v || *end != '\0' || n == 0 || n > 65535) {
+    if (!rate_limit_parse(v, &n)) {
         log_err("invalid %s='%s': using default %u", name, v, dflt);
         return dflt;
     }
-    return (unsigned)n;
+    return n;
 }
 
 void server_rate_limits_init(void)
@@ -532,6 +579,8 @@ void server_rate_limits_init(void)
                                      RATE_OPEN_MAX_DEFAULT);
     g_rate_echo_max = rate_limit_env("IWAN_RATE_ECHO_MAX",
                                      RATE_ECHO_MAX_DEFAULT);
+    g_rate_miss_max = rate_limit_env("IWAN_RATE_MISS_MAX",
+                                     RATE_MISS_MAX_DEFAULT);
 }
 
 /* source address -> owning shard. Top 4 hashed bits select the shard, so
@@ -587,7 +636,7 @@ static void rate_bucket_touch(struct rate_bucket *b, uint32_t ip, uint64_t now)
     if (b->ip != ip || now - b->win >= RATE_WINDOW_MS) {
         b->ip = ip;
         b->win = now;
-        b->open_cnt = b->ping_cnt = b->echo_cnt = 0;
+        b->open_cnt = b->ping_cnt = b->echo_cnt = b->miss_cnt = 0;
     }
 }
 
@@ -645,6 +694,27 @@ static bool rate_allow(const struct sockaddr_in *peer, uint8_t typ, uint64_t now
     rate_shard_unlock(ip);
     if (!ok)
         atomic_fetch_add(&g_rate_drops, 1);
+    return ok;
+}
+
+/* L37: charged ONLY for frames whose sid is absent from the session table
+ * (DATA/PT_DATA_ENC/CLOSE map misses), in their own per-source counter.
+ *
+ * Why this does not regress R1-D-1 (NAT collateral damage): both callers
+ * run it strictly AFTER find_session_unlocked() returned NULL, so a frame
+ * that resolves to a live session — from any source, carrying any token —
+ * never touches this bucket. A source that is over its unknown-sid budget
+ * still gets its own live sessions' data through and can still OPEN; a
+ * neighbour behind the same NAT pays nothing for someone else's spray.
+ *
+ * Locking: the caller MUST NOT hold ctx->sess_lock — lock order is always
+ * sess_lock (outer) -> rate-shard lock (inner), and both call sites
+ * release sess_lock before calling this. */
+static bool rate_allow_sid_miss(uint32_t ip, uint64_t now)
+{
+    struct rate_bucket *b = rate_bucket_enter(ip, now);
+    bool ok = ++b->miss_cnt <= g_rate_miss_max;
+    rate_shard_unlock(ip);
     return ok;
 }
 
@@ -784,7 +854,18 @@ static struct server_session *find_session_unlocked(struct server_ctx *ctx,
 {
     int slot = ctx->sid_map[sid];
 
-    if (slot >= 0 && slot < SERVER_MAX_SESSIONS &&
+    /* L37: sid_map[sid] < 0 means NO live session carries this sid, so the
+     * scan below could not match either — short-circuit it instead of
+     * walking all 256 slots (~80 KB) for every flooded unknown-sid frame.
+     * Invariant: every valid session's sid maps to its own slot. sid_map
+     * is written ONLY in handle_open and cleared ONLY in sess_wipe, both
+     * under the WRITE lock, and handle_open wipes any pre-existing session
+     * with the same sid BEFORE installing the new one, so two live
+     * sessions can never share a sid. The scanning fallback is kept for
+     * slot >= 0 (stale map entry). */
+    if (slot < 0)
+        return NULL;
+    if (slot < SERVER_MAX_SESSIONS &&
         ctx->sess[slot].valid && ctx->sess[slot].sid == sid)
         return &ctx->sess[slot];
     /* stale/absent map entry: the linear scan is authoritative. The map
@@ -806,7 +887,13 @@ static struct server_session *find_session_by_ip_unlocked(struct server_ctx *ctx
     uint16_t sid = (uint16_t)(((uint32_t)ip[2] << 8) | ip[3]);
     int slot = ctx->sid_map[sid];
 
-    if (slot >= 0 && slot < SERVER_MAX_SESSIONS &&
+    /* L37: same invariant as find_session_unlocked — sid is the low 16
+     * bits of the session's OWN assigned IP (handle_open), so a live
+     * session owning `ip` would have to be reachable through this map
+     * entry; slot < 0 therefore means no live session owns `ip`. */
+    if (slot < 0)
+        return NULL;
+    if (slot < SERVER_MAX_SESSIONS &&
         ctx->sess[slot].valid && ctx->sess[slot].sid == sid &&
         memcmp(ctx->sess[slot].ip, ip, 4) == 0)
         return &ctx->sess[slot];
@@ -1187,6 +1274,11 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                  * sids can no longer blacklist the sessions behind its
                  * NAT (the old code fed those frames to a per-IP counter). */
                 pthread_rwlock_unlock(&ctx->sess_lock);
+                /* L37: the miss itself is now charged to a dedicated
+                 * per-source counter (sess_lock released: shard lock
+                 * inside, never nested). Over budget => drop + count. */
+                if (!rate_allow_sid_miss((uint32_t)peer->sin_addr.s_addr, now))
+                    atomic_fetch_add(&g_rate_drops, 1);
                 return;
             }
             /* F4 (per session, R1-D-1; R37 R2 regression fix): the
@@ -1383,6 +1475,10 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
         if (!s) {
             /* R1-D-1: unknown sid — one table probe, no per-source state */
             pthread_rwlock_unlock(&ctx->sess_lock);
+            /* L37: dedicated per-source unknown-sid budget (see the DATA
+             * path / rate_allow_sid_miss note); sess_lock already released */
+            if (!rate_allow_sid_miss((uint32_t)peer->sin_addr.s_addr, now))
+                atomic_fetch_add(&g_rate_drops, 1);
             return;
         }
         /* F4/R1-D-1 + R37 R2: pre-check the token compare ONLY for the

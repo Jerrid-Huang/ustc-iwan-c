@@ -44,14 +44,35 @@ _Noreturn void oom_abort(void)
     abort();
 }
 
+/* R37 R5 (R3-L17): the shared boolean-env rule — full contract in
+ * util.h. Defined unconditionally (outside IWAN_DEBUG_STRIP): the
+ * Windows-only callers (tun_win.c, proxy.c, port.c, oidc_util.c) exist
+ * in stripped builds too. */
+bool env_bool(const char *name, bool dflt)
+{
+    const char *v = getenv(name);
+
+    if (v == NULL || *v == '\0')
+        return dflt;
+    /* exact match, case-insensitive: port_strncasecmp() compares up to
+     * the literal's NUL, so "0x"/"offline"/"nothing" are not off
+     * spellings (they stay ON, like every other unknown value) */
+    if (port_strncasecmp(v, "0", 2) == 0 ||
+        port_strncasecmp(v, "false", 6) == 0 ||
+        port_strncasecmp(v, "no", 3) == 0 ||
+        port_strncasecmp(v, "off", 4) == 0)
+        return false;
+    return true;
+}
+
 #ifndef IWAN_DEBUG_STRIP
 bool debug_enabled(void)
 {
     int c = atomic_load_explicit(&debug_cached, memory_order_relaxed);
     if (c < 0) {
-        const char *v = getenv("IWAN_DEBUG");
-        c = v && *v && strcmp(v, "0") != 0 &&
-            strcmp(v, "false") != 0 && strcmp(v, "off") != 0;
+        /* env_bool does the single getenv(); the atomic cache stays, so
+         * the per-recv-thread callers still read a cached int (R20) */
+        c = env_bool("IWAN_DEBUG", false);
         atomic_store_explicit(&debug_cached, c, memory_order_relaxed);
     }
     return c != 0;

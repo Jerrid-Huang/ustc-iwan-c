@@ -91,6 +91,15 @@ void oidc_fetch_config(Config *cf);
 void oidc_save_config(const char *path, const Config *cf);
 void oidc_load_config(const char *path, Config *cf);
 void oidc_config_free(Config *cf);
+/* R37-FIX-A2 / A2b (R3-L18): the ONE root-write guard and the ONE
+ * canonical spelling of the config path. Both live in oidc_config.c next
+ * to normalize_path() and are shared by the three call sites that MUST
+ * agree — the --config-dir CLI gate, iwan-client-oidc's early gate and
+ * the oidc_save_config() backstop. Declared here so the prototype cannot
+ * drift from the definition; the file-local normalization helper and its
+ * NormPath scratch type deliberately do NOT appear: neither is exported. */
+bool oidc_config_dir_resolves_to_root(const char *dir);
+char *oidc_config_canon_path(const char *path);
 
 /* oidc_flow.c */
 void oidc_login(char **kp_out, char **user_out);

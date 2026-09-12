@@ -30,6 +30,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #endif
 
@@ -77,6 +78,66 @@ static atomic_int g_rp_conn_n;
  * rp_add once the pair is reserved, decremented when the rp_conn is
  * closed and freed in rp_reap_maybe, or on every rp_add failure path). */
 static atomic_int g_rp_est_n;
+
+/* R37 R5 (R3-L22): effective cap on the ESTABLISHED set. The compile-time
+ * value (RP_MAX_ESTABLISHED) is only reachable when the process can hold
+ * the whole handshake set at the same time as the established set:
+ * RP_MAX_CONNS handshake threads, each holding an accepted fd plus —
+ * while rp_connect_target runs — a second one (2*RP_MAX_CONNS fds), plus a
+ * small working reserve. Under the common soft RLIMIT_NOFILE=1024 the old
+ * fixed cap was unreachable: EMFILE arrived first and the client saw a
+ * dropped handshake or a rep=5/502 instead of the intended "relay full"
+ * refusal. relay_proxy_start() lowers g_rp_max_est to what the current
+ * limit can actually hold and records the effective value; it is never
+ * raised above the reviewed compile-time cap. */
+#define RP_FD_RESERVE (2 * RP_MAX_CONNS + 64)
+static int g_rp_max_est = RP_MAX_ESTABLISHED;
+
+/* R37 R5 (R3-L21, R3-L22): the relay's refusal notices used to be one line
+ * per connection, so a full relay (or a dead data plane) could be driven
+ * into writing stderr at connection rate. Allow one line per second per
+ * site — the same shape as the listener poll/accept warnings below.
+ * now_ms() is monotonic 64-bit milliseconds, so the unsigned difference
+ * cannot wrap; the unlocked read/write is the pre-existing idiom here (two
+ * racers may each print once inside the same second — harmless, the bound
+ * is what matters). */
+static bool rp_note_due(uint64_t *last_ms)
+{
+    uint64_t now = now_ms();
+    if (now - *last_ms < 1000)
+        return false;
+    *last_ms = now;
+    return true;
+}
+
+static void rp_note_est_full(void)
+{
+    static uint64_t last_ms;
+    if (rp_note_due(&last_ms))
+        log_err("rp: relay connection limit %d reached, refusing connection",
+                g_rp_max_est);
+}
+
+static void rp_note_plane_down(void)
+{
+    static uint64_t last_ms;
+    if (rp_note_due(&last_ms))
+        log_err("rp: relay data plane is down (a direction thread "
+                "exited); refusing new connection");
+}
+
+/* Pre-flight for the reply paths: true when the established set is already
+ * full. The authoritative reservation still happens in rp_add(); checking
+ * here (before any success byte goes out) turns "always answer rep=0 and
+ * then close when full" into "answer rep=0 only if another thread takes the
+ * last free slot between this check and rp_add()" — a much smaller window
+ * of the same kind. Reading the atomic without the reservation is
+ * deliberate: no count has to be rolled back if the connection dies before
+ * rp_add(). */
+static bool rp_est_full(void)
+{
+    return atomic_load(&g_rp_est_n) >= g_rp_max_est;
+}
 
 /* ---- handshake watchdog (M6b) ----
  * RP_HANDSHAKE_TIMEOUT_MS remains the ceiling for a SINGLE poll, but
@@ -739,6 +800,24 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
                                    (const uint8_t *)&t.ip4, t.af == 6,
                                    t.ip6, guard);
         if (rc == 0) {
+            /* R37 R5 (R3-L21): rp_add() binds the established set, but it
+             * runs AFTER this reply. The old order answered rep=0
+             * ("succeeded") and closed the pair a moment later when the set
+             * was full, i.e. it lied to the client exactly when the relay
+             * was busy. Refuse instead: rep=0x01 (general SOCKS server
+             * failure) must be the client's first and only CONNECT reply,
+             * and the upstream fd is released here so the refusal leaks
+             * nothing. The upstream connect is already paid for because the
+             * check deliberately sits after rp_connect_target() (no count
+             * reservation to roll back); the residual window between this
+             * check and rp_add() is the pre-existing race, now narrowed to
+             * "only when another thread takes the last slot". */
+            if (rp_est_full()) {
+                rp_note_est_full();
+                port_close(up);
+                rp_socks_reply(fd, 1, hs);
+                return -1;
+            }
             rp_socks_reply(fd, 0, hs);
             if (n > frame_end &&
                 port_send(up, b + frame_end, n - frame_end, 0) !=
@@ -846,6 +925,18 @@ static int rp_handle_http(int fd, const uint8_t *first, size_t first_n,
                           t.ip6, guard) != 0) {
         static const char bad[] = "HTTP/1.1 502 Bad Gateway\r\n\r\n";
         (void)rp_send_full(hs, fd, bad, sizeof bad - 1);
+        return -1;
+    }
+    /* R37 R5 (R3-L21): the HTTP path had the same lie as SOCKS — it
+     * answered 200 Connection Established (or forwarded the request) and
+     * only then had rp_add() refuse the pair. Map "set full" to 503 before
+     * any success bytes go out. */
+    if (rp_est_full()) {
+        static const char busy[] = "HTTP/1.1 503 Service Unavailable\r\n"
+                                   "Content-Length: 0\r\n\r\n";
+        rp_note_est_full();
+        port_close(up);
+        (void)rp_send_full(hs, fd, busy, sizeof busy - 1);
         return -1;
     }
     if (is_connect) {
@@ -1006,9 +1097,14 @@ static void rp_add(int c, int u)
      * explicitly and refuse with a log line instead of silently
      * black-holing the peer. No idle timeout is added: SSH and other
      * long-lived idle sessions are legitimate. */
-    if (atomic_load(&g_rp_est_n) >= RP_MAX_ESTABLISHED) {
-        log_err("rp: relay connection limit %d reached, refusing connection",
-                RP_MAX_ESTABLISHED);
+    /* R37 R5 (R3-L21): rp_handle_socks/rp_handle_http already pre-checked
+     * this before their success reply, so reaching it now means another
+     * thread took the last free slot inside that window. The check must
+     * stay (this is the only place the set is actually reserved) and the
+     * notice is rate-limited through the same limiter as the pre-flight —
+     * the reply is already gone, so this path is log-only. */
+    if (atomic_load(&g_rp_est_n) >= g_rp_max_est) {
+        rp_note_est_full();
         port_close(c);
         port_close(u);
         return;
@@ -1072,9 +1168,10 @@ static void rp_add(int c, int u)
     }
     pthread_mutex_unlock(&g_rp_mu);
     if (!ok) {
+        /* R37 R5 (R4-L6): a dead data plane refuses every new connection,
+         * so this notice must not be one line per connection either. */
         if (dead)
-            log_err("rp: relay data plane is down (a direction thread "
-                    "exited); refusing new connection");
+            rp_note_plane_down();
         atomic_fetch_sub(&g_rp_est_n, 1);   /* R1-B-2: undo the reservation */
         port_close(c);
         port_close(u);
@@ -1887,6 +1984,30 @@ int relay_proxy_start(const char *listen_str, const char *auth_token,
         const char *v = getenv("IWAN_RELAY_ALLOW_LOOPBACK");
         g_rp_ssrf_off = v != NULL && strcmp(v, "1") == 0;
     }
+
+    /* R37 R5 (R3-L22): derive the effective established cap from the fd
+     * budget actually granted to this process, and record it. The reserve
+     * covers the concurrent handshake set plus a small working margin; only
+     * a LOWER value is taken (raising the cap above the reviewed
+     * compile-time maximum is a deliberate fd-pressure decision that
+     * belongs to the constant, not to the environment). Windows has no
+     * getrlimit; there the compile-time value stays in force. */
+#ifndef _WIN32
+    {
+        struct rlimit rl;
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0 &&
+            rl.rlim_cur != RLIM_INFINITY) {
+            long long room = ((long long)rl.rlim_cur - RP_FD_RESERVE) / 2;
+            if (room < 1)
+                room = 1;
+            if (room < g_rp_max_est)
+                g_rp_max_est = (int)room;
+        }
+    }
+#endif
+    log_info("relay proxy: established-connection cap=%d "
+             "(RLIMIT_NOFILE-derived, compile-time max=%d)",
+             g_rp_max_est, RP_MAX_ESTABLISHED);
 
     rp = calloc(1, sizeof *rp);
     if (!rp)

@@ -223,10 +223,30 @@ static bool wintun_load(void)
             return false;
         }
     }
+/* Store a runtime-resolved function address into a function-pointer
+ * member. The obvious `member = (fn)(void *)GetProcAddress(...)` is what
+ * -Wpedantic rejects twice over ("ISO C forbids conversion of function
+ * pointer to object pointer type" + "ISO C forbids assignment between
+ * function pointer and 'void *'"), and the cast is a strict-aliasing
+ * violation besides. GetProcAddress already returns FARPROC — a function
+ * pointer — so copying its bytes is how the address moves into a
+ * differently-typed function pointer with no cast at all (the idiom the
+ * Win32 docs use for GetProcAddress). It is a pure representation copy
+ * between function-pointer types of identical size — the _Static_assert
+ * below proves that per member at compile time — so a NULL result stays a
+ * NULL member (all-zero is the null function pointer on the Windows ABI,
+ * exactly as the previous cast relied on). */
+#define WINTUN_STORE_FN(dst, src)                                             \
+    do {                                                                      \
+        _Static_assert(sizeof(src) == sizeof(dst),                            \
+                       "wintun function pointer size mismatch");              \
+        memcpy(&(dst), &(src), sizeof(dst));                                  \
+    } while (0)
+
 #define WINTUN_LOAD_ONE(member, name)                                         \
     do {                                                                      \
-        iwan_wintun.member =                                                  \
-            (void *)GetProcAddress(iwan_wintun.dll, name);                    \
+        FARPROC fn_addr = GetProcAddress(iwan_wintun.dll, name);              \
+        WINTUN_STORE_FN(iwan_wintun.member, fn_addr);                         \
         if (iwan_wintun.member == NULL) {                                     \
             log_err("wintun.dll is missing %s — update wintun.dll from "      \
                     "wintun.net", name);                                      \
@@ -242,11 +262,14 @@ static bool wintun_load(void)
     WINTUN_LOAD_ONE(end_session, "WintunEndSession");
     WINTUN_LOAD_ONE(get_running_driver_version, "WintunGetRunningDriverVersion");
     /* 0.14+ exports WintunAllocateSendPacket; 0.13 and earlier do not
-     * (there WintunSendPacket takes the packet size as the 3rd arg) */
-    iwan_wintun.allocate_send_packet = (wintun_allocate_send_packet_fn)
-        (void *)GetProcAddress(iwan_wintun.dll, "WintunAllocateSendPacket");
-    iwan_wintun.send_packet = (wintun_send_packet_fn)
-        (void *)GetProcAddress(iwan_wintun.dll, "WintunSendPacket");
+     * (there WintunSendPacket takes the packet size as the 3rd arg). Both
+     * are optional — a NULL is a legitimate outcome, so they stay out of
+     * WINTUN_LOAD_ONE, which fails the whole load on a NULL. */
+    FARPROC p_alloc =
+        GetProcAddress(iwan_wintun.dll, "WintunAllocateSendPacket");
+    FARPROC p_send = GetProcAddress(iwan_wintun.dll, "WintunSendPacket");
+    WINTUN_STORE_FN(iwan_wintun.allocate_send_packet, p_alloc);
+    WINTUN_STORE_FN(iwan_wintun.send_packet, p_send);
     if (iwan_wintun.send_packet == NULL) {
         log_err("wintun.dll is missing WintunSendPacket — update "
                 "wintun.dll from wintun.net");
@@ -254,13 +277,15 @@ static bool wintun_load(void)
         iwan_wintun_loaded = -1;
         return false;
     }
-    if (iwan_wintun.allocate_send_packet == NULL)
-        iwan_wintun.send_packet_old = (wintun_send_packet_old_fn)
-            (void *)iwan_wintun.send_packet;
+    if (iwan_wintun.allocate_send_packet == NULL) {
+        /* wintun <= 0.13: the same address is the single BOOL send() form. */
+        WINTUN_STORE_FN(iwan_wintun.send_packet_old, iwan_wintun.send_packet);
+    }
     WINTUN_LOAD_ONE(receive_packet, "WintunReceivePacket");
     WINTUN_LOAD_ONE(release_receive_packet, "WintunReleaseReceivePacket");
     WINTUN_LOAD_ONE(get_read_wait_event, "WintunGetReadWaitEvent");
 #undef WINTUN_LOAD_ONE
+#undef WINTUN_STORE_FN
     iwan_wintun_loaded = 1;
     return true;
 }
@@ -649,10 +674,11 @@ static unsigned __stdcall tun_reader_main(void *ud)
 
     /* experimental pinning (IWAN_WIN_THREAD_PIN=1): uplink reader ->
      * CPU 1, ABOVE_NORMAL. Avoids vCPU migration (L1/L2 cold) and
-     * stays off CPU 0, where the virtio/wintun DPCs land. */
+     * stays off CPU 0, where the virtio/wintun DPCs land. Off spellings
+     * (0/false/no/off, case-insensitive) disable it: env_bool, R37 R5 —
+     * the old `pin[0] != '0'` read ""/"no"/"off" as ON. */
     {
-        const char *pin = getenv("IWAN_WIN_THREAD_PIN");
-        if (pin && pin[0] != '0') {
+        if (env_bool("IWAN_WIN_THREAD_PIN", false)) {
             SYSTEM_INFO si;
             GetSystemInfo(&si);
             if (si.dwNumberOfProcessors > 1)

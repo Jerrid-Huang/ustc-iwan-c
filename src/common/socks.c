@@ -160,6 +160,19 @@ void wait_events(int listener, int sockfd, int dns_evfd, int timeout_ms)
 }
 
 void accept_connections(int listener) {
+    /* R37 R5-WG-E: hard bound on CONSECUTIVE "aborted request" retries in
+     * one call (incremented in the ECONNABORTED/EPROTO branch below, reset
+     * by a successful accept). The kernel dequeues an aborted request, so a
+     * real storm is bounded by the backlog; this counter makes the bound
+     * EXPLICIT so that no pathological source of the error (one that keeps
+     * failing without ever removing a request — e.g. an injected fault) can
+     * hold the loop inside accept_connections() and spin. Measured with an
+     * injector that fails every accept4() unconditionally: 137.4M accepts
+     * and 93% of a core in 5s without this bound; with it the loop returns
+     * to wait_events() and is paced by the poll timeout instead. 64 is far
+     * above any real burst of aborted connections. */
+    enum { ABORT_DRAIN_MAX = 64 };
+    unsigned abort_drain = 0;
     for (;;) {
         /* L-5: with a large pended backlog the drain loop would accept
          * every pending client even after a stop signal; check the shared
@@ -178,27 +191,93 @@ void accept_connections(int listener) {
             /* R37 R3-M3: a signal-interrupted accept() is not a failure */
             if (errno == EINTR)
                 continue;
-            /* R37 R3-M3: every other accept() error (EMFILE/ENFILE/
-             * ENOBUFS/ENOMEM/ECONNABORTED/...) leaves the pending
-             * connection in the backlog, so the caller's
+            /* R37 R5-WG-E (R4-L5): an error that belongs to the NEW
+             * connection whose request the kernel has ALREADY discarded
+             * must not trigger the backoff. ECONNABORTED means the peer
+             * gave up before we accepted: the backlog is NOT under
+             * pressure and there is nothing left to back off from.
+             * Sleeping here taxed an innocent client that arrived inside
+             * the 50ms window (R4-E: p50 304us -> max 51282us) for a
+             * connection that no longer exists. Drain instead: the next
+             * accept() returns the next pending connection or EAGAIN
+             * (-> return), so the loop stays bounded by the backlog.
+             * EPROTO is kept here too: accept(2) reports it for the new
+             * socket's protocol error, and the request is dequeued in the
+             * same way. Deliberately NOT here (HEAD arbitration, R5):
+             * EPERM (firewall) and the ENETDOWN/ENETUNREACH/
+             * EHOSTUNREACH/ENOPROTOOPT/ETIMEDOUT family describe
+             * conditions that can PERSIST and are not proof that a request
+             * left the backlog; treating them as "just retry" is exactly
+             * the shape that spun at 98-102% CPU before R3-M3, so they
+             * stay in the paced (backoff) class below — 50ms there buys
+             * "never a hot spin".
+             * log_debug only (compiled OUT in Release): an aborted peer
+             * is a normal event, not a fault, and must not flood stderr. */
+            if (errno == ECONNABORTED || errno == EPROTO) {
+                log_debug("accept SOCKS5 client: %s (retrying)",
+                          strerror(errno));
+                if (++abort_drain > ABORT_DRAIN_MAX)
+                    return;   /* bounded: back to wait_events() to poll */
+                continue;
+            }
+            /* R37 R3-M3/R5-WG-E: the paced class. EMFILE/ENFILE
+             * (process/system fd table full) and ENOBUFS/ENOMEM (kernel
+             * memory pressure) are true resource exhaustion and leave the
+             * pending connection IN the backlog, so the caller's
              * poll -> accept -> log cycle would return immediately every
              * round: measured 98-102% CPU, 1.42M accepts/3s and 31.6 MiB
-             * of stderr in 3s while every local client timed out. Back
-             * off ONE bounded sleep and then return — the main loop must
-             * still run (under EMFILE it is the thing that releases fds)
-             * but at ~20 cycles/s instead of a hot spin. The log is
+             * of stderr in 3s while every local client timed out. EPERM/
+             * ENETDOWN/ENETUNREACH/EHOSTUNREACH/ENOPROTOOPT/ETIMEDOUT
+             * (the man page's "network errors for the new socket" family;
+             * EHOSTDOWN is omitted, mingw-w64's errno.h has no such name)
+             * are grouped here on purpose: they can persist for as long as
+             * the network/firewall condition does, so they get the same
+             * ONE bounded sleep. Back off and then return — the main loop
+             * must still run (under EMFILE it is the thing that releases
+             * fds) but at ~20 cycles/s instead of a hot spin. The log is
              * rate-limited to one line per second so a persistent error
-             * cannot flood stderr either. */
-            static uint64_t last_acc_backoff_ms;
-            uint64_t acc_now = now_ms();
-            if (acc_now - last_acc_backoff_ms >= 1000) {
-                last_acc_backoff_ms = acc_now;
-                log_err("accept SOCKS5 client: %s (backing off)",
-                        strerror(errno));
+             * cannot flood stderr. */
+            if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS ||
+                errno == ENOMEM || errno == EPERM || errno == ENETDOWN ||
+                errno == ENETUNREACH || errno == EHOSTUNREACH ||
+                errno == ENOPROTOOPT || errno == ETIMEDOUT) {
+                static uint64_t last_acc_backoff_ms;
+                uint64_t acc_now = now_ms();
+                if (acc_now - last_acc_backoff_ms >= 1000) {
+                    last_acc_backoff_ms = acc_now;
+                    log_err("accept SOCKS5 client: %s (backing off)",
+                            strerror(errno));
+                }
+                port_sleep_ms(50);
+                return;
+            }
+            /* Everything left is the listener fd itself being unusable
+             * (EBADF not open / EINVAL not listening or bad addrlen /
+             * ENOTSOCK not a socket / EOPNOTSUPP not SOCK_STREAM /
+             * EFAULT impossible with our stack addr) plus anything this
+             * list does not name. These are NOT transient, so they are
+             * never folded into the silent retry set above, and they are
+             * NEVER silently swallowed: one log_err per second (log_err,
+             * not log_debug, so the line survives Release) keeps the
+             * contract "EBADF stays fatal & visible" and hands the
+             * condition back to the caller every round. The single
+             * bounded sleep is kept ONLY because accept_connections runs
+             * unconditionally each round while wait_events()'s poll() on
+             * a closed fd reports POLLNVAL and returns IMMEDIATELY
+             * (measured) — returning without pacing would turn a dead
+             * listener into a 100% CPU spin, which is strictly worse than
+             * one visible line per second. */
+            static uint64_t last_acc_fatal_ms;
+            uint64_t fatal_now = now_ms();
+            if (fatal_now - last_acc_fatal_ms >= 1000) {
+                last_acc_fatal_ms = fatal_now;
+                log_err("accept SOCKS5 client: %s (listener fd unusable, "
+                        "not retrying)", strerror(errno));
             }
             port_sleep_ms(50);
             return;
         }
+        abort_drain = 0;   /* a real connection ended the aborted burst */
         /* Serve only loopback peers by default: an unauthenticated
          * remote peer would turn the host into an open proxy. Remote
          * peers are served only with an explicit --allow-remote bind

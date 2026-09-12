@@ -174,6 +174,84 @@ sudo ./iwan-server --port 6001 --tun iwan-srv \
 
 服务器启动时自动启用 IPv4 转发并配置 iptables MASQUERADE（需要 root，`--no-tun` 测试模式除外）。
 
+## 环境变量
+
+三个二进制的 `--help` 末尾各有一段 `Environment:` 清单，与本节是**同一份清单**（两处必须同步修改），只列**该二进制真正会读取**的变量。
+
+> **构建条件**：`IWAN_DEBUG`、`IWAN_PROFILE`、`IWAN_PUMP_PROF` 只在**未定义 `IWAN_DEBUG_STRIP`** 的构建里生效。CMake 对非 Debug 构建默认 `IWAN_DEBUG_STRIP=ON`（Release 又是默认构建类型），因此默认产物里这三个变量**完全不会被解析**；现场诊断请用 `-DCMAKE_BUILD_TYPE=Debug`（或显式 `-DIWAN_DEBUG_STRIP=OFF`）构建。`IWAN_RXDBG`/`IWAN_FLOWDBG` 不受该开关影响，Release 下仍可用。
+>
+> **布尔取值**：`0`/`false`/`no`/`off`（不分大小写）为关闭，其他非空值为开启。例外：`IWAN_RXDBG`/`IWAN_FLOWDBG` 的关闭拼写区分大小写；`IWAN_SRV_TUN_SINGLE` 的关闭拼写区分大小写；两个 `*_ALLOW_LOOPBACK` 安全开关只认精确的 `1`；`IWAN_ALLOW_INSECURE_USERS` 只认 `1`/`true`/`yes`/`on`。数值型变量非法时回退默认值并打印告警。
+
+### iwan-server（仅 Linux）
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `IWAN_DEBUG` | 关 | 详细调试日志（`IWAN_DEBUG_STRIP` 构建忽略） |
+| `IWAN_PROFILE` | 关 | 退出时打印分阶段吞吐计数（`IWAN_DEBUG_STRIP` 构建忽略） |
+| `IWAN_SRV_THREADS` | `4` | 上行 UDP 收包线程数，`1..16`；非法值告警后保持 4 |
+| `IWAN_SRV_TUN_SINGLE` | 关 | 只用一个 TUN 队列，替代多队列 fan-out（A/B 基准开关） |
+| `IWAN_ALLOW_INSECURE_USERS` | 关 | 允许组/其他可读的用户文件继续启动；仅 `1`/`true`/`yes`/`on` 放行 |
+| `IWAN_RATE_OPEN_MAX` | `20` | 每源每秒 OPEN 帧上限，`1..65535` |
+| `IWAN_RATE_ECHO_MAX` | `60` | 每源每秒 PING、ECHO 各自上限，`1..65535` |
+| `IWAN_RATE_MISS_MAX` | `2000` | 每源每秒未知会话 DATA/CLOSE 帧上限，`1..65535` |
+
+另读取：`SSL_CERT_FILE`、`SSL_CERT_DIR`（仅在 fork 出的辅助进程里，且非 root 属主或组/其他可写时会被清除）。
+
+### iwan-client
+
+| 变量 | 默认 | 适用模式 | 说明 |
+|------|------|----------|------|
+| `IWAN_DEBUG` | 关 | 全部 | 调试日志（`IWAN_DEBUG_STRIP` 构建忽略） |
+| `IWAN_PROFILE` | 关 | 全部 | 退出时打印分阶段吞吐（`IWAN_DEBUG_STRIP` 构建忽略） |
+| `IWAN_RX_STALE_MS` | `120000` | proxy / socks | 下行静默超过该毫秒数即重新认证；`0` 关闭；`30000..86400000` |
+| `IWAN_SEND_PACING_PPS` | `0` | proxy / socks | 聚合发送限速（包/秒），`0` 关闭 |
+| `IWAN_RXDBG` | 关 | socks | 打印每个收到的 VPN 数据报 |
+| `IWAN_FLOWDBG` | 关 | socks | 打印 SOCKS 流状态变化与关闭原因 |
+| `IWAN_NS_CONNECT_TIMEOUT_MS` | `30000` | socks | 用户态 TCP 连接超时，`1000..300000` |
+| `IWAN_SOCKS_ALLOW_LOOPBACK` | 关 | socks | SSRF 开关（只认精确 `1`）：允许非回环对端访问本机回环/链路本地目标 |
+| `IWAN_AUTH_FAIL_MAX` | `5` | socks | 每源认证失败达该次数即锁定，`1..100` |
+| `IWAN_AUTH_FAIL_WINDOW_MS` | `60000` | socks | 锁定统计窗口，`100..86400000` |
+| `IWAN_PUMP_PROF` | 关 | proxy | TUN 泵分阶段剖析；**设置任意值（含空串）即开启**；`IWAN_DEBUG_STRIP` 构建不解析 |
+| `IWAN_PUMP_QUEUES` | CPU 数（上限 `8`） | proxy | TUN 读队列数，`1..8`；非法值告警后回到默认；Windows 的 wintun 固定单队列 |
+| `IWAN_RELAY_ALLOW_LOOPBACK` | 关 | proxy `--listen` | 中继 SSRF 开关（只认精确 `1`） |
+| `IWAN_WIN_THREAD_PIN` | 关 | proxy（Windows） | 实验性：泵线程绑核/提优先级 |
+| `IWAN_ELEVATED_RELAUNCH` | — | Windows 内部 | 程序在 UAC 重启前自己设置，请勿手工设置 |
+
+另读取：`SSL_CERT_FILE`、`SSL_CERT_DIR`（非 Windows，TUN 模式；进入辅助进程前按属主/权限清除）。
+
+### iwan-client-oidc
+
+| 变量 | 默认 | 适用模式 | 说明 |
+|------|------|----------|------|
+| `IWAN_DEBUG` | 关 | 全部 | 调试日志（`IWAN_DEBUG_STRIP` 构建忽略） |
+| `IWAN_RX_STALE_MS` | `120000` | TUN / socks | 下行静默超过该毫秒数即重新认证；`0` 关闭；`30000..86400000` |
+| `IWAN_SEND_PACING_PPS` | `0` | TUN / socks | 聚合发送限速（包/秒），`0` 关闭 |
+| `IWAN_RXDBG` | 关 | socks | 打印每个收到的 VPN 数据报 |
+| `IWAN_FLOWDBG` | 关 | socks | 打印 SOCKS 流状态变化与关闭原因 |
+| `IWAN_NS_CONNECT_TIMEOUT_MS` | `30000` | socks | 用户态 TCP 连接超时，`1000..300000` |
+| `IWAN_SOCKS_ALLOW_LOOPBACK` | 关 | socks | SSRF 开关（只认精确 `1`） |
+| `IWAN_AUTH_FAIL_MAX` | `5` | socks | 每源认证失败达该次数即锁定，`1..100` |
+| `IWAN_AUTH_FAIL_WINDOW_MS` | `60000` | socks | 锁定统计窗口，`100..86400000` |
+| `IWAN_PUMP_PROF` | 关 | TUN | TUN 泵分阶段剖析；设置任意值即开启；`IWAN_DEBUG_STRIP` 构建不解析 |
+| `IWAN_PUMP_QUEUES` | CPU 数（上限 `8`） | TUN | TUN 读队列数，`1..8`；Windows 的 wintun 固定单队列 |
+| `IWAN_RELAY_ALLOW_LOOPBACK` | 关 | TUN `--socks-listen` | 中继 SSRF 开关（只认精确 `1`） |
+| `IWAN_WIN_THREAD_PIN` | 关 | TUN（Windows） | 实验性：泵线程绑核/提优先级 |
+| `IWAN_ELEVATED_RELAUNCH` | — | Windows 内部 | 程序在 UAC 重启前自己设置，请勿手工设置 |
+
+另读取：`SSL_CERT_FILE`、`SSL_CERT_DIR`（非 Windows：HTTPS 调用的 CA，辅助进程 exec 前按属主/权限清除）、`HOME`、`SUDO_USER`、`SUDO_UID`、`SUDO_GID`、`XDG_RUNTIME_DIR`、`TMPDIR`（Linux）；`USERPROFILE`、`HOMEDRIVE`、`HOMEPATH`、`HOME`、`TEMP`、`TMP`、`USERNAME`（Windows）。
+
+> 注意：`iwan-client-oidc` **不读** `IWAN_PROFILE`（其 `main` 不调用 `prof_init()`）。
+
+### 重复选项
+
+| 二进制 | 重复同一个选项 |
+|--------|----------------|
+| `iwan-server` | 允许，**取最后一次**的值（裸 `getopt_long`，无重复检测） |
+| `iwan-client` | 报错 `cannot be used multiple times`，退出码 2；仅 `proxy` 的列表选项 `--proxy-cidr`/`--proxy-ip`/`--proxy-domain`/`--proxy-cidr6` 可重复并累加 |
+| `iwan-client-oidc` | 同上（clap 语义）；列表选项 `--proxy-cidr`/`--proxy-ip`/`--proxy-domain`/`--proxy-cidr6` 可重复并累加 |
+
+`iwan-server` 的机制统一（移植 `cli.c` 的重复检测）仍未实现，当前只在文档层统一措辞。
+
 ## 从源码构建
 
 依赖：`cmake`（≥3.16）、C11 编译器、OpenSSL（Debian/Ubuntu：`libssl-dev`；macOS：`brew install openssl@3`）。
