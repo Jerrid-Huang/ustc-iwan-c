@@ -90,6 +90,19 @@ static atomic_int g_rp_est_n;
  * refusal. relay_proxy_start() lowers g_rp_max_est to what the current
  * limit can actually hold and records the effective value; it is never
  * raised above the reviewed compile-time cap. */
+/* R37 R6 (R6-M1): RP_FD_RESERVE is an UPPER BOUND on the reserve, NOT a
+ * fixed deduction. The R5 derivation subtracted the full worst-case
+ * reserve (2*RP_MAX_CONNS + 64 = 576 fds) from every limit, so any
+ * RLIMIT_NOFILE <= 578 collapsed the effective cap to 1 (measured
+ * cap=1/1/224/512 at ulimit -n 256/512/1024/4096): the first established
+ * connection filled the relay and every later CONNECT got rep=1 (SOCKS)
+ * or 503 (HTTP). macOS ships a default soft RLIMIT_NOFILE of 256 and
+ * hardened Linux images 512, so that was the COMMON case, not an edge
+ * case. relay_proxy_start() now scales the reserve with the granted
+ * limit (limit/4, never above RP_FD_RESERVE) and only ever lowers the
+ * cap; reserve + 2*room <= rlim_cur holds by construction, so the fd
+ * budget can still never be overspent while a small limit yields a
+ * usable cap. */
 #define RP_FD_RESERVE (2 * RP_MAX_CONNS + 64)
 static int g_rp_max_est = RP_MAX_ESTABLISHED;
 
@@ -98,21 +111,25 @@ static int g_rp_max_est = RP_MAX_ESTABLISHED;
  * into writing stderr at connection rate. Allow one line per second per
  * site — the same shape as the listener poll/accept warnings below.
  * now_ms() is monotonic 64-bit milliseconds, so the unsigned difference
- * cannot wrap; the unlocked read/write is the pre-existing idiom here (two
- * racers may each print once inside the same second — harmless, the bound
- * is what matters). */
-static bool rp_note_due(uint64_t *last_ms)
+ * cannot wrap.
+ * R37 R6 (R6-4): the latch is a _Atomic uint64_t with relaxed load/store
+ * — the same idiom as last_spawn_warn_ms below. The plain static it used
+ * to be was a real data race (TSan): rp_note_est_full/rp_note_plane_down
+ * are reached from every connection thread at once. Two racers may still
+ * each print once inside the same second, which is harmless — the bound
+ * is what matters. */
+static bool rp_note_due(_Atomic uint64_t *last_ms)
 {
     uint64_t now = now_ms();
-    if (now - *last_ms < 1000)
+    if (now - atomic_load_explicit(last_ms, memory_order_relaxed) < 1000)
         return false;
-    *last_ms = now;
+    atomic_store_explicit(last_ms, now, memory_order_relaxed);
     return true;
 }
 
 static void rp_note_est_full(void)
 {
-    static uint64_t last_ms;
+    static _Atomic uint64_t last_ms;
     if (rp_note_due(&last_ms))
         log_err("rp: relay connection limit %d reached, refusing connection",
                 g_rp_max_est);
@@ -120,7 +137,7 @@ static void rp_note_est_full(void)
 
 static void rp_note_plane_down(void)
 {
-    static uint64_t last_ms;
+    static _Atomic uint64_t last_ms;
     if (rp_note_due(&last_ms))
         log_err("rp: relay data plane is down (a direction thread "
                 "exited); refusing new connection");
@@ -819,12 +836,16 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
                 return -1;
             }
             rp_socks_reply(fd, 0, hs);
+            /* R37 R6 (K-5): rp_send_full, not a bare port_send. The
+             * upstream socket is blocking here, so the old check could
+             * not tell a SHORT write or an EINTR from a hard failure and
+             * failed the connection closed — silently losing the bytes
+             * already read out of the client socket. rp_send_full
+             * completes EINTR/short writes (bounded by the handshake
+             * budget) and still fails closed if the bytes cannot be
+             * delivered at all. */
             if (n > frame_end &&
-                port_send(up, b + frame_end, n - frame_end, 0) !=
-                    (ssize_t)(n - frame_end)) {
-                /* the upstream socket is blocking at this point, so a
-                 * short send is a hard failure, not EAGAIN: fail closed
-                 * rather than silently truncate the tunnel start */
+                rp_send_full(hs, up, b + frame_end, n - frame_end) != 0) {
                 port_close(up);
                 return -1;
             }
@@ -953,26 +974,29 @@ static int rp_handle_http(int fd, const uint8_t *first, size_t first_n,
         /* R4-08-F1: forward bytes already-read past the CONNECT header
          * (e.g. the first TLS bytes coalesced with the request) — they
          * are no longer in the client socket's kernel buffer and the
-         * relay loop would start from empty. */
+         * relay loop would start from empty. R37 R6 (K-5): rp_send_full,
+         * same reason as in rp_handle_socks — a short write or EINTR on
+         * this blocking upstream must not be read as a hard failure. */
         if (n > hdr_end &&
-            port_send(up, buf + hdr_end, n - hdr_end, 0) !=
-                (ssize_t)(n - hdr_end)) {
+            rp_send_full(hs, up, buf + hdr_end, n - hdr_end) != 0) {
             port_close(up);
             return -1;
         }
         return up;
     }
     /* absolute-URI forward: send the original request head verbatim
-     * (RFC 7230 servers accept absolute-form on a proxy connection) */
-    if (port_send(up, buf, hdr_end, 0) != (ssize_t)hdr_end) {
+     * (RFC 7230 servers accept absolute-form on a proxy connection).
+     * R37 R6 (K-5): rp_send_full — the head is sent in one piece and a
+     * short write/EINTR used to abort the forward. */
+    if (rp_send_full(hs, up, buf, hdr_end) != 0) {
         port_close(up);
         return -1;
     }
     /* R4-08-F1: also forward the request body bytes that were coalesced
-     * with the head into buf — same silent-drop hazard. */
+     * with the head into buf — same silent-drop hazard. R37 R6 (K-5):
+     * rp_send_full here too. */
     if (n > hdr_end &&
-        port_send(up, buf + hdr_end, n - hdr_end, 0) !=
-            (ssize_t)(n - hdr_end)) {
+        rp_send_full(hs, up, buf + hdr_end, n - hdr_end) != 0) {
         port_close(up);
         return -1;
     }
@@ -1790,6 +1814,22 @@ static void *rp_accept_main(void *ud)
     pthread_setname_np(pthread_self(), "rp-accept");
 #  endif
 #endif
+    /* R37 R6 (K-1; twin of R4-L5 in socks.c): hard bound on CONSECUTIVE
+     * "aborted request" retries inside this loop, reset by a successful
+     * accept. ECONNABORTED/EPROTO belong to the NEW connection whose
+     * request the kernel has ALREADY dequeued — the backlog is not under
+     * pressure, so pacing them taxed an innocent client that arrived
+     * inside the 50ms window (R6-K: 3 injected aborts => 149.6ms legal
+     * client latency, 6 => 299.0ms). The bound only exists so that a
+     * pathological source which keeps failing WITHOUT ever dequeuing
+     * (e.g. an injected fault) cannot hold the loop: past the bound the
+     * branch falls through to the same bounded 50ms pacing as the
+     * resource class. (socks.c returns to wait_events() there; here
+     * `continue` does reach poll(), but a non-empty backlog makes poll()
+     * return immediately, so the explicit sleep is what actually bounds
+     * it.) 64 is far above any real burst of aborted connections. */
+    enum { ABORT_DRAIN_MAX = 64 };
+    unsigned abort_drain = 0;
     while (!atomic_load(&rp->stop)) {
         struct pollfd pfd = { .fd = rp->listener, .events = POLLIN };
         int pr = port_poll(&pfd, 1, 1000);
@@ -1841,6 +1881,18 @@ static void *rp_accept_main(void *ud)
             }
             if (errno == EINTR)
                 continue;
+            /* R37 R6 (K-1): an error that belongs to the new connection
+             * whose request the kernel has already discarded must not
+             * trigger the backoff — drain the backlog instead. Past
+             * ABORT_DRAIN_MAX consecutive aborts the branch falls through
+             * to the paced path below (bounded: no hot spin). log_debug
+             * only: an aborted peer is a normal event, not a fault. */
+            if (errno == ECONNABORTED || errno == EPROTO) {
+                log_debug("rp: accept aborted request (errno=%d), draining",
+                          errno);
+                if (++abort_drain <= ABORT_DRAIN_MAX)
+                    continue;
+            }
             /* R37 R1-B-1: every other error accept(2) returns on Linux is
              * TRANSIENT — EMFILE/ENFILE (fd table full), ENOBUFS/ENOMEM
              * (kernel memory pressure), ECONNABORTED (peer RST before we
@@ -1861,6 +1913,7 @@ static void *rp_accept_main(void *ud)
             port_sleep_ms(50);   /* bounded: no hot spin under EMFILE */
             continue;
         }
+        abort_drain = 0;   /* a real connection ended the aborted burst */
 
         /* R37 R3-M1: hand the connection thread a NONBLOCKING fd. Linux
          * accept() returns a blocking socket, and the handshake's reads
@@ -1991,23 +2044,39 @@ int relay_proxy_start(const char *listen_str, const char *auth_token,
      * a LOWER value is taken (raising the cap above the reviewed
      * compile-time maximum is a deliberate fd-pressure decision that
      * belongs to the constant, not to the environment). Windows has no
-     * getrlimit; there the compile-time value stays in force. */
+     * getrlimit; there the compile-time value stays in force.
+     * R37 R6 (R6-M1): the reserve is scaled to the granted limit and
+     * clamped at the reviewed ceiling (RP_FD_RESERVE), so a small limit
+     * keeps a usable cap instead of collapsing to 1 (see the constant's
+     * comment). -1 in the log line means "not applicable" (Windows, or an
+     * infinite limit); both values are printed so an operator can tell a
+     * scaled reserve from the full one. */
+    long long rp_reserve = -1;
+    long long rp_rlim_cur = -1;
 #ifndef _WIN32
     {
         struct rlimit rl;
         if (getrlimit(RLIMIT_NOFILE, &rl) == 0 &&
             rl.rlim_cur != RLIM_INFINITY) {
-            long long room = ((long long)rl.rlim_cur - RP_FD_RESERVE) / 2;
+            long long lim = (long long)rl.rlim_cur;
+            long long reserve = lim / 4;
+            if (reserve > RP_FD_RESERVE)
+                reserve = RP_FD_RESERVE;
+            long long room = (lim - reserve) / 2;
             if (room < 1)
                 room = 1;
             if (room < g_rp_max_est)
                 g_rp_max_est = (int)room;
+            rp_reserve = reserve;
+            rp_rlim_cur = lim;
         }
     }
 #endif
     log_info("relay proxy: established-connection cap=%d "
-             "(RLIMIT_NOFILE-derived, compile-time max=%d)",
-             g_rp_max_est, RP_MAX_ESTABLISHED);
+             "(RLIMIT_NOFILE-derived: reserve=%d rlim_cur=%d, "
+             "compile-time max=%d)",
+             g_rp_max_est, (int)rp_reserve, (int)rp_rlim_cur,
+             RP_MAX_ESTABLISHED);
 
     rp = calloc(1, sizeof *rp);
     if (!rp)

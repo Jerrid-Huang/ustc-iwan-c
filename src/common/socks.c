@@ -212,10 +212,36 @@ void accept_connections(int listener) {
              * stay in the paced (backoff) class below — 50ms there buys
              * "never a hot spin".
              * log_debug only (compiled OUT in Release): an aborted peer
-             * is a normal event, not a fault, and must not flood stderr. */
+             * is a normal event, not a fault, and must not flood stderr.
+             *
+             * R37 R6-WG2 (R6-5): that last claim was false in Debug.
+             * ABORT_DRAIN_MAX bounds only CONSECUTIVE retries inside one
+             * call, while a listener with pending requests makes the
+             * caller's poll() return immediately every round — so with
+             * IWAN_DEBUG=1 and a fault that keeps accept4() failing (e.g.
+             * an injector) this logged without bound: measured 539.8k
+             * lines/s / 35.6 MiB/s at HEAD. Same 1-line/s idiom as the
+             * backoff below (its own counter, so a burst of aborted
+             * accepts can never silence a resource-exhaustion warning or
+             * vice versa); log_debug is KEPT — the diagnostic exists only
+             * in Debug, and Debug is precisely the scenario that needs it
+             * — it is the unbounded RATE, not the line, that was the bug.
+             * `_Atomic uint64_t` + relaxed: same rationale as
+             * relay_proxy.c:1931 (accept_connections runs on the single
+             * socks event-loop thread today; the atomic is race-free by
+             * construction and relaxed costs only a possible extra line
+             * after a lost update). */
             if (errno == ECONNABORTED || errno == EPROTO) {
-                log_debug("accept SOCKS5 client: %s (retrying)",
-                          strerror(errno));
+                static _Atomic uint64_t last_acc_abort_ms;
+                uint64_t ab_now = now_ms();
+                if (ab_now - atomic_load_explicit(&last_acc_abort_ms,
+                                                 memory_order_relaxed)
+                        >= 1000) {
+                    atomic_store_explicit(&last_acc_abort_ms, ab_now,
+                                          memory_order_relaxed);
+                    log_debug("accept SOCKS5 client: %s (retrying)",
+                              strerror(errno));
+                }
                 if (++abort_drain > ABORT_DRAIN_MAX)
                     return;   /* bounded: back to wait_events() to poll */
                 continue;
@@ -293,7 +319,25 @@ void accept_connections(int listener) {
                 htonl(0x7F000000u)) {
                 char cip[INET_ADDRSTRLEN] = "";
                 inet_ntop(AF_INET, &peer.sin_addr, cip, sizeof cip);
-                log_debug("SOCKS5: closing non-loopback peer %s", cip);
+                /* R37 R6-WG2 (K-2 Debug twin): reachable whenever the
+                 * listener is bound to a non-loopback address without
+                 * --allow-remote (the accept() succeeds and the peer is
+                 * refused here), i.e. one line per connection from any
+                 * remote scanner. Debug-only (compiled out in Release)
+                 * but Debug is the diagnostic scenario, so bound it to
+                 * one line per second with its own counter (this is not
+                 * the lockout condition below and must not share its
+                 * counter). `_Atomic` + relaxed: see the R6-5 limiter
+                 * above for the full rationale. */
+                static _Atomic uint64_t last_nonloop_ms;
+                uint64_t nl_now = now_ms();
+                if (nl_now - atomic_load_explicit(&last_nonloop_ms,
+                                                 memory_order_relaxed)
+                        >= 1000) {
+                    atomic_store_explicit(&last_nonloop_ms, nl_now,
+                                          memory_order_relaxed);
+                    log_debug("SOCKS5: closing non-loopback peer %s", cip);
+                }
                 port_close(cfd);
                 continue;
             }
@@ -301,7 +345,20 @@ void accept_connections(int listener) {
         if (auth_fail_blocked(peer.sin_addr.s_addr)) {
             char cip[INET_ADDRSTRLEN] = "";
             inet_ntop(AF_INET, &peer.sin_addr, cip, sizeof cip);
-            log_debug("SOCKS5: dropping %s (auth failure lockout)", cip);
+            /* R37 R6-WG2 (K-2 Debug twin): a local client that keeps
+             * reconnecting while locked out logs one line per attempt
+             * (lockout is per-IP and long-lived), so this needed the same
+             * 1-line/s bound as the non-loopback refusal above — own
+             * counter, neither signal may swallow the other. */
+            static _Atomic uint64_t last_lockout_drop_ms;
+            uint64_t ld_now = now_ms();
+            if (ld_now - atomic_load_explicit(&last_lockout_drop_ms,
+                                             memory_order_relaxed)
+                    >= 1000) {
+                atomic_store_explicit(&last_lockout_drop_ms, ld_now,
+                                      memory_order_relaxed);
+                log_debug("SOCKS5: dropping %s (auth failure lockout)", cip);
+            }
             port_close(cfd);
             continue;
         }
@@ -665,15 +722,59 @@ static int vpn_handle_data(SocksConfig *cfg, uint8_t *b, size_t n,
     size_t plen = n - 8;
     if (t == PT_DATA_ENC && !cfg->encryption) {
         /* symmetric gate (audit L14): plaintext session must not
-         * accept encrypted frames either */
-        log_err("VPN encrypted data on plaintext session, drop");
+         * accept encrypted frames either.
+         *
+         * R37 R6-WG2 (K-3): this is a per-PACKET hot path reached before
+         * the sid/token gate at :743, and the trigger is an ALREADY
+         * AUTHENTICATED server (or anything able to replay its outer
+         * header), so a downgrade/mismatch becomes a packet-rate stderr
+         * flood. Rate-limited to one line per second.
+         *
+         * Deliberately still log_err, NOT log_debug: this is a
+         * security-relevant downgrade signal and log_debug is compiled
+         * OUT in Release (util.h:46) — demoting it would REMOVE the
+         * signal from every shipped build, which is the opposite of the
+         * fix. The 1-line/s bound keeps Release visibility AND kills the
+         * flood. The two mismatches below get SEPARATE counters on
+         * purpose: "encrypted on a plaintext session" and "plaintext on
+         * an encrypted session" are different signals (a session can be
+         * re-authed with different encryption settings) and neither may
+         * silence the other; the worst case is still only 2 lines/s.
+         * Counter type: `_Atomic uint64_t` + relaxed load/store, the
+         * relay_proxy.c:1931 spelling — receive_vpn (and therefore this
+         * function) runs on the single socks event-loop thread today, but
+         * the atomic costs nothing measurable, is race-free by
+         * construction, and matches the project idiom for log limiters;
+         * relaxed suffices because a lost update only costs one extra
+         * line. */
+        static _Atomic uint64_t last_enc_on_plain_ms;
+        uint64_t eop_now = now_ms();
+        if (eop_now - atomic_load_explicit(&last_enc_on_plain_ms,
+                                           memory_order_relaxed) >= 1000) {
+            atomic_store_explicit(&last_enc_on_plain_ms, eop_now,
+                                  memory_order_relaxed);
+            log_err("VPN encrypted data on plaintext session, drop");
+        }
         return 0;
     }
     if (t == PT_DATA_ENC)
         xor_crypt(b + 8, plen, cfg->xor_key, 8);
     else if (cfg->encryption) {
-        /* encrypted session must not accept plaintext frames */
-        log_err("VPN plaintext data on encrypted session, drop");
+        /* encrypted session must not accept plaintext frames.
+         *
+         * R37 R6-WG2 (K-3): same shape as the case above (per-packet,
+         * pre-authentication-gate, already-authenticated trigger) and
+         * the same treatment: keep log_err for Release visibility,
+         * 1-line/s with its own counter (see above), still before the
+         * sid/token gate so nothing about the drop semantics changes. */
+        static _Atomic uint64_t last_plain_on_enc_ms;
+        uint64_t poe_now = now_ms();
+        if (poe_now - atomic_load_explicit(&last_plain_on_enc_ms,
+                                           memory_order_relaxed) >= 1000) {
+            atomic_store_explicit(&last_plain_on_enc_ms, poe_now,
+                                  memory_order_relaxed);
+            log_err("VPN plaintext data on encrypted session, drop");
+        }
         return 0;
     }
     if (debug_enabled() && t == PT_DATA_ENC) {

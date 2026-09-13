@@ -907,12 +907,25 @@ static void *udp2tun_thread(void *ud) {
                  *    frame is simply dropped and inner TCP recovers;
                  *    tearing the session down here made a healthy tunnel
                  *    reconnect on backpressure.
+                 *  - EINTR (R6-K-6): tun_write_retry re-enters the write
+                 *    after an EINTR and returns -1 with errno PRESERVED as
+                 *    EINTR when the 5ms budget expires while the write
+                 *    keeps being interrupted (tun.c:~376). That is the
+                 *    same "budget expired, frame dropped" outcome as
+                 *    EAGAIN above — a signal interrupting a syscall says
+                 *    nothing about the device, which was never reported
+                 *    broken — so it takes the same branch. The old code
+                 *    fell through to the fatal path and tore down a
+                 *    healthy session on a mere signal (SIGCHLD/SIGWINCH
+                 *    delivery under load), i.e. an unnecessary reconnect.
+                 *    Inner TCP recovers the dropped frame exactly as it
+                 *    does for EAGAIN.
                  * Anything else (ENODEV/EIO/EMSGSIZE/EINVAL) is fatal. */
                 if (g_user_stop)
                     break;   /* user stop: clean, caller returns 0 */
                 if (g_stop)
                     break;   /* stop already classified by its writer */
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
                     log_debug("tun write: transient %s, frame dropped",
                               strerror(errno));
                     continue;

@@ -496,6 +496,22 @@ struct rate_shard {
 
 static struct rate_shard g_rate_shards[RATE_SHARDS];
 
+/* R37 R6 (R3-L37): lock-free per-source "over the unknown-sid budget for
+ * the rest of this window" gate. One fixed, statically allocated slot per
+ * rate bucket, indexed by the SAME Knuth top-bit hash, so one hash maps an
+ * IP into both tables and the gate needs no lock, no allocation and no
+ * growth path. Read on every sid-miss ahead of the shard lock; written
+ * once per over-budget source per window. See rate_allow_sid_miss() for
+ * the full argument (why the fast path cannot change delivery, why a hash
+ * collision is harmless, why relaxed atomics are sufficient).
+ * over_until_ms == 0 means "no gate": now_ms() is a monotonic count from
+ * boot, so the `> now` test is false for a zeroed slot. */
+struct rate_gate {
+    _Atomic uint32_t ip;            /* network-order source address */
+    _Atomic uint64_t over_until_ms; /* budget refills at this monotonic ms */
+};
+static struct rate_gate g_rate_gate[RATE_BUCKETS];
+
 /* guards g_rate_shards: each shard has its own lock, taken for the
  * unauthenticated control types (rate_allow). The F4/R1-D-1 DATA/CLOSE
  * token-mismatch budget is NOT in this table any more: it is per
@@ -597,6 +613,15 @@ static inline unsigned rate_ip_shard(uint32_t ip)
 static inline void rate_shard_unlock(uint32_t ip)
 {
     pthread_mutex_unlock(&g_rate_shards[rate_ip_shard(ip)].mu);
+}
+
+/* source address -> its slot in the flat gate table. This is exactly
+ * rate_ip_shard(ip) * RATE_BUCKETS_PER_SHARD + the per-shard bucket index
+ * (top 10 hashed bits = 4 shard bits + 6 bucket bits), so the gate stays
+ * aligned with the bucket a source would use. */
+static inline unsigned rate_gate_slot(uint32_t ip)
+{
+    return (unsigned)((ip * RATE_HASH_MUL) >> RATE_HASH_SHIFT);
 }
 
 /* locate (or claim) the rate bucket for ip inside its shard; caller must
@@ -707,13 +732,71 @@ static bool rate_allow(const struct sockaddr_in *peer, uint8_t typ, uint64_t now
  * still gets its own live sessions' data through and can still OPEN; a
  * neighbour behind the same NAT pays nothing for someone else's spray.
  *
+ * R37 R6 (R3-L37): the budget is now a real per-source per-window COST
+ * cap, not just a counter. Before this change the return value only
+ * decided whether g_rate_drops was incremented: both call sites return
+ * unconditionally, so an unknown-sid frame was dropped either way and an
+ * over-budget source (IWAN_RATE_MISS_MAX=1) still paid a shard mutex,
+ * a bucket probe and a counter RMW for every single frame — measured
+ * identical cost for =1 and =65535 (R6-C/R6-H, re-measured here).
+ *
+ * The charge point cannot move in front of the session-table probe (that
+ * probe is what tells us the sid is unknown), so a pre-probe cap keyed on
+ * the source would drop live-session frames too — exactly the NAT
+ * collateral damage R1-D-1 forbids. What CAN be bounded is the cost
+ * AFTER the miss, which is what this gate does: once a source has spent
+ * its budget in the current window, g_rate_gate[hash] records it until
+ * the window ends and every further miss from that source is dropped
+ * after a single relaxed atomic load, with no shard lock and no bucket
+ * update.
+ *
+ * Safety (why this can never change delivery or hurt a live session):
+ *  - the return value gates NO delivery at either call site (both return
+ *    before it is even inspected); it only decides the g_rate_drops
+ *    increment, so every frame this function sees is dropped regardless;
+ *  - a live session's frames never reach this function (the session-table
+ *    probe succeeds first), so no legitimate, NAT-shared or rebound
+ *    client can be affected — including from the same source IP;
+ *  - the gate key is the same source-IP hash as the bucket. A collision
+ *    can at worst make the fast path fire for a source that is not over
+ *    budget, which only over-counts g_rate_drops for a frame that was
+ *    dropped anyway (never a delivery difference);
+ *  - all accesses are relaxed atomics on two dedicated fields, so there
+ *    is no data race with the shard-locked bucket update (TSan clean);
+ *  - `now`/over_until_ms are now_ms() (monotonic) and compared with >,
+ *    so the deadline never wraps.
  * Locking: the caller MUST NOT hold ctx->sess_lock — lock order is always
  * sess_lock (outer) -> rate-shard lock (inner), and both call sites
  * release sess_lock before calling this. */
 static bool rate_allow_sid_miss(uint32_t ip, uint64_t now)
 {
-    struct rate_bucket *b = rate_bucket_enter(ip, now);
-    bool ok = ++b->miss_cnt <= g_rate_miss_max;
+    struct rate_gate *g = &g_rate_gate[rate_gate_slot(ip)];
+    struct rate_bucket *b;
+    bool ok;
+
+    /* fast path (lock-free): this source already spent its unknown-sid
+     * budget earlier in the current window, so it is known to be over it
+     * for the rest of that window — drop without touching the shard */
+    if (atomic_load_explicit(&g->ip, memory_order_relaxed) == ip &&
+        atomic_load_explicit(&g->over_until_ms, memory_order_relaxed) > now)
+        return false;
+
+    b = rate_bucket_enter(ip, now);
+    ok = ++b->miss_cnt <= g_rate_miss_max;
+    if (!ok) {
+        /* publish the source as over-budget for the remainder of the
+         * window this frame was charged to (rate_bucket_touch() has just
+         * (re)started it, so b->win is that window's start and
+         * b->win + RATE_WINDOW_MS is exactly when the budget refills).
+         * The deadline is stored before the ip so that a concurrent
+         * reader that observes its own ip also observes a deadline that
+         * belongs to it; under relaxed ordering the worst case is a
+         * spurious false (one extra g_rate_drops count on a frame that is
+         * dropped either way) — never a missed drop. */
+        atomic_store_explicit(&g->over_until_ms, b->win + RATE_WINDOW_MS,
+                              memory_order_relaxed);
+        atomic_store_explicit(&g->ip, ip, memory_order_relaxed);
+    }
     rate_shard_unlock(ip);
     return ok;
 }
@@ -905,10 +988,31 @@ static struct server_session *find_session_by_ip_unlocked(struct server_ctx *ctx
 }
 
 /* invalidate a session and scrub its secrets; caller must hold
- * ctx->sess_lock (write mode) */
+ * ctx->sess_lock (write mode).
+ *
+ * R37 R6 (R6-I5): idempotent — wiping an already-invalidated slot is a
+ * NO-OP. The body reads s->sid and clears ctx->sid_map[sid], but never
+ * clears s->sid itself (callers log it after the wipe, and handle_open's
+ * re-OPEN path memsets the whole slot right after). A second wipe of the
+ * same slot would therefore clear sid_map[sid] a SECOND time — and by
+ * then that map entry may already have been re-pointed at a DIFFERENT,
+ * live session that recycled the same sid (sid is derived from the
+ * user's assigned IP, so a re-OPEN of the same user reuses it). With the
+ * short-circuit in find_session_unlocked() (`slot < 0 => NULL`) that
+ * stale -1 makes the new session unreachable by sid for its whole life:
+ * DATA/CLOSE/ECHO addressed to it are dropped as unknown-sid, and only
+ * last_active-based purging eventually clears the slot. All three
+ * current callers (handle_open's same-sid replace loop, the PT_CLOSE
+ * path, purge_expired) test `valid` first, so this guard preserves
+ * today's behaviour exactly; it moves the invariant into the function
+ * instead of relying on every future caller to re-check it. */
 static void sess_wipe(struct server_ctx *ctx, struct server_session *s)
 {
-    uint16_t sid = s->sid; /* still valid here: read before clearing */
+    uint16_t sid;
+
+    if (!s->valid)
+        return;
+    sid = s->sid; /* still valid here: read before clearing */
 
     s->valid = false;
     wipe(s->xor_key, sizeof s->xor_key);

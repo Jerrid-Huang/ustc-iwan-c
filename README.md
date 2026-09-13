@@ -178,9 +178,9 @@ sudo ./iwan-server --port 6001 --tun iwan-srv \
 
 三个二进制的 `--help` 末尾各有一段 `Environment:` 清单，与本节是**同一份清单**（两处必须同步修改），只列**该二进制真正会读取**的变量。
 
-> **构建条件**：`IWAN_DEBUG`、`IWAN_PROFILE`、`IWAN_PUMP_PROF` 只在**未定义 `IWAN_DEBUG_STRIP`** 的构建里生效。CMake 对非 Debug 构建默认 `IWAN_DEBUG_STRIP=ON`（Release 又是默认构建类型），因此默认产物里这三个变量**完全不会被解析**；现场诊断请用 `-DCMAKE_BUILD_TYPE=Debug`（或显式 `-DIWAN_DEBUG_STRIP=OFF`）构建。`IWAN_RXDBG`/`IWAN_FLOWDBG` 不受该开关影响，Release 下仍可用。
+> **构建条件**：`IWAN_DEBUG`、`IWAN_PROFILE`、`IWAN_PUMP_PROF` 只在**未定义 `IWAN_DEBUG_STRIP`** 的构建里生效。CMake 对非 Debug 构建默认 `IWAN_DEBUG_STRIP=ON`（Release 又是默认构建类型），因此默认产物里这三个变量**完全不会被解析**；现场诊断请用 `-DCMAKE_BUILD_TYPE=Debug`（或显式 `-DIWAN_DEBUG_STRIP=OFF`）构建。**多配置生成器例外**：`-DCMAKE_BUILD_TYPE` 只对单配置生成器（Unix Makefiles / Ninja）有效，Ninja Multi-Config 与 Visual Studio 会忽略它，其非 Debug 配置仍会带上 `-DIWAN_DEBUG_STRIP=1`；请显式加 `-DIWAN_DEBUG_STRIP=OFF`（或在配置阶段 `cmake -B <dir> -DIWAN_DEBUG_STRIP=OFF`）后再 `--config Debug` 构建。`IWAN_RXDBG`/`IWAN_FLOWDBG` 不受该开关影响，Release 下仍可用。
 >
-> **布尔取值**：`0`/`false`/`no`/`off`（不分大小写）为关闭，其他非空值为开启。例外：`IWAN_RXDBG`/`IWAN_FLOWDBG` 的关闭拼写区分大小写；`IWAN_SRV_TUN_SINGLE` 的关闭拼写区分大小写；两个 `*_ALLOW_LOOPBACK` 安全开关只认精确的 `1`；`IWAN_ALLOW_INSECURE_USERS` 只认 `1`/`true`/`yes`/`on`。数值型变量非法时回退默认值并打印告警。
+> **布尔取值**：`0`/`false`/`no`/`off`（不分大小写）为关闭，其他非空值为开启；未设置与显式空串都取默认值（下面各表中的"默认"列）。例外：`IWAN_RXDBG`/`IWAN_FLOWDBG` 只认**大小写敏感**的精确 `0`/`false`/`off` 为关闭——`no`/`NO`/`No` **不**关闭，`False`/`Off`/`0x`/`00`/`0 ` 一律算**开启**；`IWAN_SRV_TUN_SINGLE` 的关闭拼写区分大小写；`IWAN_PUMP_PROF` 只要**被设置**就是开启（空串、`0` 也算开启，只有完全不设置才是关）；`IWAN_WIN_THREAD_PIN` 的非精确关闭拼写（如 `0 `/`0x`/`00`）按总则算**开启**；两个 `*_ALLOW_LOOPBACK` 安全开关只认精确的 `1`；`IWAN_ALLOW_INSECURE_USERS` 只认 `1`/`true`/`yes`/`on`。数值型变量非法（含上界越界）时回退默认值并打印告警。
 
 ### iwan-server（仅 Linux）
 
@@ -193,9 +193,9 @@ sudo ./iwan-server --port 6001 --tun iwan-srv \
 | `IWAN_ALLOW_INSECURE_USERS` | 关 | 允许组/其他可读的用户文件继续启动；仅 `1`/`true`/`yes`/`on` 放行 |
 | `IWAN_RATE_OPEN_MAX` | `20` | 每源每秒 OPEN 帧上限，`1..65535` |
 | `IWAN_RATE_ECHO_MAX` | `60` | 每源每秒 PING、ECHO 各自上限，`1..65535` |
-| `IWAN_RATE_MISS_MAX` | `2000` | 每源每秒未知会话 DATA/CLOSE 帧上限，`1..65535` |
+| `IWAN_RATE_MISS_MAX` | `2000` | 每源每秒**计入慢路径**的未知会话 DATA/CLOSE 帧预算，`1..65535`；超预算后该源本秒内其余未知帧走无锁快路径丢弃（未知 sid 帧无论是否超预算都不投递） |
 
-另读取：`SSL_CERT_FILE`、`SSL_CERT_DIR`（仅在 fork 出的辅助进程里，且非 root 属主或组/其他可写时会被清除）。
+另读取：`SSL_CERT_FILE`（**唯一**由环境变量指定的 CA 文件来源）、`SSL_CERT_DIR`（**不会**被当作 CA 目录读取——`SSL_CTX_load_verify_locations()` 的第二实参 `CApath` 恒为空，全树也没有调用 `set_default_verify_paths()`；它只在 fork 出的辅助进程 `exec` 前按属主/权限决定保留或清除：非 root 属主、或组/其他可写时被清除）。
 
 ### iwan-client
 
@@ -204,7 +204,7 @@ sudo ./iwan-server --port 6001 --tun iwan-srv \
 | `IWAN_DEBUG` | 关 | 全部 | 调试日志（`IWAN_DEBUG_STRIP` 构建忽略） |
 | `IWAN_PROFILE` | 关 | 全部 | 退出时打印分阶段吞吐（`IWAN_DEBUG_STRIP` 构建忽略） |
 | `IWAN_RX_STALE_MS` | `120000` | proxy / socks | 下行静默超过该毫秒数即重新认证；`0` 关闭；`30000..86400000` |
-| `IWAN_SEND_PACING_PPS` | `0` | proxy / socks | 聚合发送限速（包/秒），`0` 关闭 |
+| `IWAN_SEND_PACING_PPS` | `0` | proxy / socks | 聚合发送限速（包/秒），`0` 关闭；有效范围 `1..10000000`，越界/非法告警后关闭 |
 | `IWAN_RXDBG` | 关 | socks | 打印每个收到的 VPN 数据报 |
 | `IWAN_FLOWDBG` | 关 | socks | 打印 SOCKS 流状态变化与关闭原因 |
 | `IWAN_NS_CONNECT_TIMEOUT_MS` | `30000` | socks | 用户态 TCP 连接超时，`1000..300000` |
@@ -217,7 +217,7 @@ sudo ./iwan-server --port 6001 --tun iwan-srv \
 | `IWAN_WIN_THREAD_PIN` | 关 | proxy（Windows） | 实验性：泵线程绑核/提优先级 |
 | `IWAN_ELEVATED_RELAUNCH` | — | Windows 内部 | 程序在 UAC 重启前自己设置，请勿手工设置 |
 
-另读取：`SSL_CERT_FILE`、`SSL_CERT_DIR`（非 Windows，TUN 模式；进入辅助进程前按属主/权限清除）。
+另读取：`SSL_CERT_FILE`（**唯一**由环境变量指定的 CA 文件来源；非 Windows，TUN 模式）、`SSL_CERT_DIR`（**不会**被当作 CA 目录读取；只在进入辅助进程 `exec` 前按属主/权限决定保留或清除）。
 
 ### iwan-client-oidc
 
@@ -225,7 +225,7 @@ sudo ./iwan-server --port 6001 --tun iwan-srv \
 |------|------|----------|------|
 | `IWAN_DEBUG` | 关 | 全部 | 调试日志（`IWAN_DEBUG_STRIP` 构建忽略） |
 | `IWAN_RX_STALE_MS` | `120000` | TUN / socks | 下行静默超过该毫秒数即重新认证；`0` 关闭；`30000..86400000` |
-| `IWAN_SEND_PACING_PPS` | `0` | TUN / socks | 聚合发送限速（包/秒），`0` 关闭 |
+| `IWAN_SEND_PACING_PPS` | `0` | TUN / socks | 聚合发送限速（包/秒），`0` 关闭；有效范围 `1..10000000`，越界/非法告警后关闭 |
 | `IWAN_RXDBG` | 关 | socks | 打印每个收到的 VPN 数据报 |
 | `IWAN_FLOWDBG` | 关 | socks | 打印 SOCKS 流状态变化与关闭原因 |
 | `IWAN_NS_CONNECT_TIMEOUT_MS` | `30000` | socks | 用户态 TCP 连接超时，`1000..300000` |
@@ -238,7 +238,7 @@ sudo ./iwan-server --port 6001 --tun iwan-srv \
 | `IWAN_WIN_THREAD_PIN` | 关 | TUN（Windows） | 实验性：泵线程绑核/提优先级 |
 | `IWAN_ELEVATED_RELAUNCH` | — | Windows 内部 | 程序在 UAC 重启前自己设置，请勿手工设置 |
 
-另读取：`SSL_CERT_FILE`、`SSL_CERT_DIR`（非 Windows：HTTPS 调用的 CA，辅助进程 exec 前按属主/权限清除）、`HOME`、`SUDO_USER`、`SUDO_UID`、`SUDO_GID`、`XDG_RUNTIME_DIR`、`TMPDIR`（Linux）；`USERPROFILE`、`HOMEDRIVE`、`HOMEPATH`、`HOME`、`TEMP`、`TMP`、`USERNAME`（Windows）。
+另读取：`SSL_CERT_FILE`（非 Windows：HTTPS 调用**唯一**由环境变量指定的 CA 文件来源）、`SSL_CERT_DIR`（**不会**被当作 CA 目录读取，辅助进程 `exec` 前只按属主/权限决定保留或清除）、`HOME`、`SUDO_USER`、`SUDO_UID`、`SUDO_GID`、`XDG_RUNTIME_DIR`、`TMPDIR`（Linux）；`USERPROFILE`、`HOMEDRIVE`、`HOMEPATH`、`HOME`、`TEMP`、`TMP`、`USERNAME`（Windows）。
 
 > 注意：`iwan-client-oidc` **不读** `IWAN_PROFILE`（其 `main` 不调用 `prof_init()`）。
 

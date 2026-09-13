@@ -73,11 +73,15 @@ bool debug_enabled(void);
  *     off; "no" was already handled there;
  *   - IWAN_ELEVATED_RELAUNCH (port.c, oidc_util.c): was existence-only,
  *     so ""/0/false/no/off were ON -> now off;
- *   - the IWAN_WIN_THREAD_PIN sites (tun_win.c, proxy.c) used
- *     `pin[0] != '0'`, so ""/false/no/off were ON -> now off, BUT
- *     "0 "/"0x" were OFF (leading '0') and are now ON: trailing garbage
- *     is not an off spelling. Documented exception; it affects the
- *     experimental Windows affinity hint only.
+ *   - the IWAN_WIN_THREAD_PIN sites (tun_win.c:681, proxy.c:619) used
+ *     `pin && pin[0] != '0'`: a ONE-BYTE test, so ""/false/no/off (and
+ *     their case variants) were ON -> now off, while the whole CLASS of
+ *     leading-'0' values that is not exactly the one-byte "0" — "0 ",
+ *     "00", "0x", "0abc", "0\n" ... i.e. every string whose first byte is
+ *     '0' except "0" itself — was OFF and is now ON. The predicate is
+ *     util.c:54-64 (exact, case-insensitive 0/false/no/off, no trimming),
+ *     so trailing garbage is not an off spelling. Documented exception; it
+ *     affects the experimental Windows affinity hint only.
  * No internal cache: exactly one getenv() per call, so a caller that
  * needs a cached or atomic answer keeps its own (debug_enabled() does).
  * Do NOT re-express dbg_env() (see its looser documented contract

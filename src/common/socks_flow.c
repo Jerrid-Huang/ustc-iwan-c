@@ -900,13 +900,51 @@ static void *dns_worker(void *arg) {
         pthread_mutex_unlock(&g_dns_wait_mu);
         goto done;
     }
-    if (port_send(g_sockfd, out, outlen, 0) < 0 && errno != EAGAIN &&
-        errno != EWOULDBLOCK) {
-        /* hard send error (ENETUNREACH, EPERM, ...): fail fast — a
-         * retry loop cannot succeed, and the flow would only see its
-         * rep=4 after the full 1.5s deadline */
+    /* R37 R6-WG2 (K-4): bounded EINTR retry. HEAD folded EINTR into the
+     * hard-error class below, so a single signal delivered to this thread
+     * while it sat in send() aborted the whole tunnel-DNS query: the slot
+     * was retired, rep=4 was pushed, and the local client saw "DNS
+     * failure" for a transient, retryable condition (R3-L5 family, 5th
+     * site). send() returning EINTR transferred NO data — g_sockfd is a
+     * UDP session socket (socks_internal.h:116), so a datagram send is
+     * all-or-nothing and a retry can neither duplicate nor half-emit a
+     * frame — which is what makes an in-place retry safe here. EINTR
+     * only is retried: EAGAIN/EWOULDBLOCK keep their existing meaning
+     * ("not sent now"; the for(;;) poll/resend loop below picks it up)
+     * and every other errno keeps the fail-fast path. After
+     * DNS_SEND_EINTR_MAX consecutive EINTRs EINTR is a hard error again,
+     * exactly as at HEAD — a permanently EINTR-ing send must not become
+     * an unbounded loop.
+     *
+     * Locking: the retry stays INSIDE the g_dns_wait_mu critical section
+     * that already wraps this first send. That is not a widening — HEAD
+     * already performs this I/O under the lock, and the lock is load
+     * bearing: dns_stop() takes the same lock before closing the socket,
+     * so a send can never race a close (see the comment above). Dropping
+     * the lock to retry would reintroduce exactly that race and would
+     * also have to re-validate dns_stale()/slot ownership between
+     * attempts. The added cost is bounded and small: at most 7 extra
+     * non-blocking send() attempts, each returning immediately on EINTR;
+     * dns_stale()/slot semantics are untouched because no unlock/lock
+     * pair and no new state are introduced. */
+    enum { DNS_SEND_EINTR_MAX = 8 };
+    ssize_t sres = -1;   /* port_send returns ssize_t (sent bytes / -1) */
+    int serr = 0;
+    for (int attempt = 0; attempt < DNS_SEND_EINTR_MAX; attempt++) {
+        sres = port_send(g_sockfd, out, outlen, 0);
+        if (sres >= 0)
+            break;
+        serr = errno;
+        if (serr != EINTR)
+            break;   /* EAGAIN/EWOULDBLOCK or a real error: as at HEAD */
+    }
+    if (sres < 0 && serr != EAGAIN && serr != EWOULDBLOCK) {
+        /* hard send error (ENETUNREACH, EPERM, ...) or EINTR that
+         * survived the bounded retry: fail fast — a retry loop cannot
+         * succeed, and the flow would only see its rep=4 after the full
+         * 1.5s deadline */
         pthread_mutex_unlock(&g_dns_wait_mu);
-        log_err("tunnel DNS send failed: %s", strerror(errno));
+        log_err("tunnel DNS send failed: %s", strerror(serr));
         goto fail;
     }
     pthread_mutex_unlock(&g_dns_wait_mu);
@@ -1107,9 +1145,41 @@ Flow *flow_alloc(struct sockaddr_in *peer) {
     }
     if (!f) {
         /* accept_connections closes the new socket silently on NULL; make
-         * the exhausted table visible instead of dropping in silence */
-        log_err("flow table full (%d active): dropping new SOCKS5 client",
-                g_flow_len);
+         * the exhausted table visible instead of dropping in silence.
+         *
+         * R37 R6-WG2 (K-2): that visibility had no rate bound — every
+         * accepted client while the table is full emits a line, so ONE
+         * persistent condition (a saturated proxy) produced unbounded
+         * stderr: measured at HEAD, 20 rejected connections -> 64 lines.
+         * Rate-limit to one line per second, reusing the 1-line/s idiom of
+         * the accept backoff (socks.c:244-250) and the relay spawn warning
+         * (relay_proxy.c:1931).
+         *
+         * Counter type: `_Atomic uint64_t` + relaxed load/store — the
+         * relay_proxy.c spelling, chosen over a plain static because the
+         * condition is a process-wide singleton (`g_flows`/`g_flow_len`)
+         * rather than per-flow state and this function is exported through
+         * socks_internal.h: today only the single socks event-loop thread
+         * reaches it (accept_connections is called once per round at
+         * socks.c:1379), but the file already owns a second thread (the
+         * detached tunnel-DNS worker) and a future caller must not have to
+         * re-audit this site. memory_order_relaxed is sufficient and
+         * deliberate: this is a best-effort diagnostic throttle, so a lost
+         * update costs at most one extra line and never correctness.
+         *
+         * Deliberately a SEPARATE counter from greet_reject()'s below: a
+         * saturated flow table and a client with no acceptable auth method
+         * are different conditions, and a shared counter would let either
+         * one silence the other's diagnosis for up to a second. */
+        static _Atomic uint64_t last_flow_full_ms;
+        uint64_t ff_now = now_ms();
+        if (ff_now - atomic_load_explicit(&last_flow_full_ms,
+                                         memory_order_relaxed) >= 1000) {
+            atomic_store_explicit(&last_flow_full_ms, ff_now,
+                                  memory_order_relaxed);
+            log_err("flow table full (%d active): dropping new SOCKS5 client",
+                    g_flow_len);
+        }
         return NULL;
     }
     memset(f, 0, sizeof *f);
@@ -1352,17 +1422,49 @@ static void greet_reject(Flow *f)
     if (g_socks_cfg && g_socks_cfg->auth_token) {
         /* auth is required: a client offering no acceptable method is
          * worth an error log (likely a misconfigured client or an
-         * unauthenticated probe against a token-protected proxy) */
-        inet_ntop(AF_INET, &(struct in_addr){ .s_addr = f->peer_ip },
-                  ipbuf, sizeof ipbuf);
-        log_err("[flow %lu] SOCKS5 client %s:%u offered no acceptable "
-                "method while auth is required",
-                (unsigned long)f->id, ipbuf, f->peer_port);
+         * unauthenticated probe against a token-protected proxy).
+         *
+         * R37 R6-WG2 (K-2): one greeting per connection means one line per
+         * connection, and this branch is the token-protected default an
+         * unauthenticated prober drives directly (send `\x05\x01\x02` with
+         * no 0x00/0x02 method and close) — measured at HEAD, 20 such
+         * connections -> 64 stderr lines. Rate-limited to one line per
+         * second with its own counter, independent of flow_alloc()'s
+         * (different condition, neither may swallow the other); the
+         * limiter also gates inet_ntop() so a rejected storm does no
+         * per-connection formatting work. See flow_alloc() for why the
+         * counter is `_Atomic` + relaxed. */
+        static _Atomic uint64_t last_greet_reject_ms;
+        uint64_t gr_now = now_ms();
+        if (gr_now - atomic_load_explicit(&last_greet_reject_ms,
+                                          memory_order_relaxed) >= 1000) {
+            atomic_store_explicit(&last_greet_reject_ms, gr_now,
+                                  memory_order_relaxed);
+            inet_ntop(AF_INET, &(struct in_addr){ .s_addr = f->peer_ip },
+                      ipbuf, sizeof ipbuf);
+            log_err("[flow %lu] SOCKS5 client %s:%u offered no acceptable "
+                    "method while auth is required",
+                    (unsigned long)f->id, ipbuf, f->peer_port);
+        }
     } else if (debug_enabled()) {
-        inet_ntop(AF_INET, &(struct in_addr){ .s_addr = f->peer_ip },
-                  ipbuf, sizeof ipbuf);
-        log_debug("[flow %lu] SOCKS5 client %s:%u offered no acceptable "
-                  "method", (unsigned long)f->id, ipbuf, f->peer_port);
+        /* R37 R6-WG2 (K-2): log_debug is compiled OUT in Release, but
+         * Debug is exactly the diagnostic scenario this round is about
+         * (same shape as R6-5 in socks.c), and this branch is the DEFAULT
+         * when no token is configured — a client looping on a bad greeting
+         * would flood it. Same 1-line/s treatment, own counter (it is not
+         * the "auth is required" condition, so it must not share that
+         * counter). */
+        static _Atomic uint64_t last_greet_reject_dbg_ms;
+        uint64_t grd_now = now_ms();
+        if (grd_now - atomic_load_explicit(&last_greet_reject_dbg_ms,
+                                           memory_order_relaxed) >= 1000) {
+            atomic_store_explicit(&last_greet_reject_dbg_ms, grd_now,
+                                  memory_order_relaxed);
+            inet_ntop(AF_INET, &(struct in_addr){ .s_addr = f->peer_ip },
+                      ipbuf, sizeof ipbuf);
+            log_debug("[flow %lu] SOCKS5 client %s:%u offered no acceptable "
+                      "method", (unsigned long)f->id, ipbuf, f->peer_port);
+        }
     }
     queue_flow_output(f, r, 2);
     set_flow_state(f, ST_CLOSING);

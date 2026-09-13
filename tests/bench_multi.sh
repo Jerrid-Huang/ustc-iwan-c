@@ -57,17 +57,28 @@ fi
 #   IWAN_DEBUG   -> env_bool("IWAN_DEBUG", false)   src/common/util.c:75,
 #                   called by debug_enabled() (util.c:69-79)
 #   IWAN_PROFILE -> env_bool("IWAN_PROFILE", false) src/common/profile.c:18
-#   env_bool() itself (util.c:51-66, R37 R5 R3-L17) treats "" (or unset)
-#   and the exact tokens 0/false/no/off as OFF, case-insensitively; every
-#   other value ("1", "0x", "offline", "nothing") stays ON. Both diag
-#   variables go through that one helper, so one predicate mirrors both.
-# IWAN_PUMP_PROF is deliberately NOT in that predicate: proxy.c:65,85 only
-# test getenv("IWAN_PUMP_PROF") != NULL, so ANY non-empty value — "0"
-# included — switches the pump profiler on and the loose non-empty test is
-# the accurate one. (Empty is kept as "unset" for all three.)
+#   env_bool() itself (src/common/util.c:51-65, R37 R5 R3-L17): unset or
+#   exactly "" takes the caller's default (false here); the exact tokens
+#   0/false/no/off, case-INSENSITIVELY, are OFF; EVERY other non-empty value
+#   ("1", "0x", "0 ", $'0\n', $'\n') is ON. Nothing is trimmed, so a value
+#   that merely contains/extends an off spelling ("offline", "no way") is
+#   NOT off. Both diag variables go through that one helper, so one
+#   predicate mirrors both.
+#
+# R37 R6 WG4 (R6-6): the predicate must not let the shell rewrite the
+# value. The previous form piped it through $(printf | tr), and a command
+# substitution strips TRAILING NEWLINES — "IWAN_DEBUG=$'0\n'" (the classic
+# `export IWAN_DEBUG=$(cat file)` / backtick case) arrived at the case
+# statement as "0" and was judged OFF, while env_bool() saw "0\n" and
+# stayed ON. The guard then let a stripped build through and the run
+# produced a silently EMPTY [prof] — exactly what this self-check exists to
+# prevent. A pure `case` on the raw value (off spellings written as
+# explicit case-insensitive globs) has neither the newline-eating
+# substitution nor the external `tr`, whose absence under a minimal PATH
+# made the old predicate fail OPEN for every value.
 diag_on() {   # true when the value requests diagnostics
-    case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
-        "" | 0 | false | no | off) return 1 ;;
+    case "$1" in
+        "" | 0 | [Ff][Aa][Ll][Ss][Ee] | [Nn][Oo] | [Oo][Ff][Ff]) return 1 ;;
         *) return 0 ;;
     esac
 }
@@ -75,8 +86,15 @@ DIAG_WANTED=0
 if [ "${3:-}" = "debug" ] || [ "${5:-}" = "prof" ] || [ "${6:-}" = "prof" ]; then
     DIAG_WANTED=1
 fi
+# IWAN_PUMP_PROF is deliberately NOT in that predicate: proxy.c:65 (the
+# one-shot gate in pump_prof_gate_init(), :61-70) and proxy.c:85 (the
+# printout gate) only test getenv("IWAN_PUMP_PROF") != NULL, so SET AT ALL
+# — "" and "0" included — switches the pump profiler on; only the unset
+# variable leaves it off. Hence the existence test `${IWAN_PUMP_PROF+x}`
+# (safe under `set -u`), NOT `${IWAN_PUMP_PROF:-}`, which folds the empty
+# string into "unset" and under-reports by exactly one cell.
 if diag_on "${IWAN_DEBUG:-}" || diag_on "${IWAN_PROFILE:-}" || \
-   [ -n "${IWAN_PUMP_PROF:-}" ]; then
+   [ -n "${IWAN_PUMP_PROF+x}" ]; then
     DIAG_WANTED=1
 fi
 diag_build_check() {

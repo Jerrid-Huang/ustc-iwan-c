@@ -156,11 +156,14 @@ static void print_help_footer(FILE *out)
         "                                        downlink, 0 disables, 30000..86400000\n"
         "                                        (default: 120000) [proxy, socks]\n"
         "      IWAN_SEND_PACING_PPS=<n>          aggregate send pacing in packets/s,\n"
-        "                                        0 disables (default: 0) [proxy, socks]\n"
+        "                                        0 disables; range 1..10000000\n"
+        "                                        (default: 0) [proxy, socks]\n"
         "      IWAN_RXDBG=1                      log every VPN datagram received\n"
-        "                                        (default: off) [socks]\n"
+        "                                        (default: off; only the case-sensitive\n"
+        "                                        exact 0/false/off switch it off) [socks]\n"
         "      IWAN_FLOWDBG=1                    log SOCKS flow state changes and close\n"
-        "                                        reasons (default: off) [socks]\n"
+        "                                        reasons (default: off; same case-sensitive\n"
+        "                                        0/false/off rule) [socks]\n"
         "      IWAN_NS_CONNECT_TIMEOUT_MS=<ms>   userspace TCP connect timeout,\n"
         "                                        1000..300000 (default: 30000) [socks]\n"
         "      IWAN_SOCKS_ALLOW_LOOPBACK=1       let non-loopback peers reach loopback/\n"
@@ -185,11 +188,15 @@ static void print_help_footer(FILE *out)
         "      IWAN_ELEVATED_RELAUNCH            internal marker set by the program before\n"
         "                                        a Windows UAC relaunch; do not set\n"
         "      Flags: 0/false/no/off (case-insensitive) are off and any other non-empty\n"
-        "      value is on, except IWAN_RXDBG/IWAN_FLOWDBG, which are case-sensitive.\n"
+        "      value is on, except: IWAN_RXDBG/IWAN_FLOWDBG take only the case-SENSITIVE\n"
+        "      exact 0/false/off as off (no/NO/False/Off/0x stay on); IWAN_PUMP_PROF is\n"
+        "      on whenever the variable is SET at all (empty string and 0 included).\n"
         "      Invalid numbers fall back to the default with a warning.\n"
-        "      Also read: SSL_CERT_FILE, SSL_CERT_DIR (non-Windows TUN mode; unset\n"
-        "      before helper binaries unless the path is root-owned and not\n"
-        "      group/other-writable).\n");
+        "      Also read: SSL_CERT_FILE (non-Windows TUN mode; the only CA file source\n"
+        "      chosen by an environment variable), SSL_CERT_DIR (never read as a CA\n"
+        "      directory; before helper exec it is only kept or dropped by\n"
+        "      owner/permission - a non-root-owned or group/other-writable path is\n"
+        "      unset).\n");
 }
 
 static void print_sub_help(const char *sub)

@@ -134,14 +134,18 @@ static void usage(const char *prog, FILE *out)
     fprintf(out, "                        (default: 20)\n");
     fprintf(out, "    IWAN_RATE_ECHO_MAX=N  PING and ECHO frames each per source per\n");
     fprintf(out, "                        second, 1..65535 (default: 60)\n");
-    fprintf(out, "    IWAN_RATE_MISS_MAX=N  unknown-session DATA/CLOSE frames per source\n");
-    fprintf(out, "                        per second, 1..65535 (default: 2000)\n");
+    fprintf(out, "    IWAN_RATE_MISS_MAX=N  per-source per-second budget for\n");
+    fprintf(out, "                        unknown-session DATA/CLOSE frames; over-budget\n");
+    fprintf(out, "                        frames are dropped on a lock-free fast path\n");
+    fprintf(out, "                        (default: 2000, 1..65535)\n");
     fprintf(out, "    Flags: 0/false/no/off (case-insensitive) are off, any other\n");
     fprintf(out, "    non-empty value is on; IWAN_SRV_TUN_SINGLE is the exception, its\n");
     fprintf(out, "    off spellings are case-sensitive. Invalid numbers fall back to the\n");
     fprintf(out, "    default with a warning.\n");
-    fprintf(out, "    Also read: SSL_CERT_FILE, SSL_CERT_DIR (unset before running helper\n");
-    fprintf(out, "    binaries unless the path is root-owned and not group/other-writable)\n");
+    fprintf(out, "    Also read: SSL_CERT_FILE (the only CA file source chosen by an\n");
+    fprintf(out, "    environment variable), SSL_CERT_DIR (never read as a CA directory;\n");
+    fprintf(out, "    before helper exec it is only kept or dropped by owner/permission -\n");
+    fprintf(out, "    a non-root-owned or group/other-writable path is unset)\n");
 }
 
 /* exit-code convention (matches iwan-client): usage errors exit 2 with
