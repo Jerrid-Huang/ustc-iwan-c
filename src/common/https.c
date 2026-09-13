@@ -336,7 +336,10 @@ static int https_set_io_timeo(int fd, int opt, uint64_t ms)
 
     if (ms > HTTPS_POLL_MS)
         ms = HTTPS_POLL_MS;
-    tv.tv_sec = (time_t)(ms / 1000);
+    /* mingw's timeval.tv_sec is a 32-bit long while time_t is 64-bit:
+     * an explicit cast keeps -Wconversion quiet; the value is bounded by
+     * HTTPS_POLL_MS a few lines above. */
+    tv.tv_sec = (long)(ms / 1000);
     tv.tv_usec = (long)((ms % 1000) * 1000);
     return port_setsockopt(fd, SOL_SOCKET, opt, &tv, sizeof tv);
 }
@@ -723,7 +726,7 @@ static void he_lane_start(he_lane *ln, char *diag, size_t diagsz)
             (void)port_setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nd,
                                   sizeof nd);
         }
-        if (port_connect(fd, ai->ai_addr, ai->ai_addrlen) != 0 &&
+        if (port_connect(fd, ai->ai_addr, (socklen_t)ai->ai_addrlen) != 0 &&
             errno != EINPROGRESS && errno != EAGAIN &&
             errno != EWOULDBLOCK && errno != EINTR) {
             /* nonblocking connect: WSAEWOULDBLOCK -> EAGAIN on Windows,
@@ -843,13 +846,13 @@ static int https_connect_tcp(const char *host, uint16_t port,
         /* v6 first in the poll set: it wins ties (preferred family) */
         if (l6.waiting && l6.fd >= 0) {
             l6_idx = (int)npfd;
-            pfd[npfd].fd = l6.fd;
+            pfd[npfd].fd = PORT_FD_ARG(l6.fd);
             pfd[npfd].events = POLLOUT;
             npfd++;
         }
         if (l4.waiting && l4.fd >= 0) {
             l4_idx = (int)npfd;
-            pfd[npfd].fd = l4.fd;
+            pfd[npfd].fd = PORT_FD_ARG(l4.fd);
             pfd[npfd].events = POLLOUT;
             npfd++;
         }

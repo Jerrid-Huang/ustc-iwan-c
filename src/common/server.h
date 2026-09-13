@@ -138,6 +138,12 @@ uint64_t server_send_drops(void);
 
 /* IWAN_DEBUG=1: print per-step uplink timing averages once per second. */
 void server_up_stats_print(void);
+/* R37 R7 (R3-L37): report g_rate_drops growth once per second, in EVERY
+ * build — Release (IWAN_DEBUG_STRIP=ON) compiles the debug tier out, so
+ * without this the per-source rate-limit drop counter is unobservable in
+ * a shipped binary. Silent while the counter does not move; at most one
+ * stderr line per second. Call from the 1 Hz housekeeping tick. */
+void server_rate_drops_maybe_print(void);
 /* record the number of uplink recv threads (stats are per-thread) */
 void server_up_stats_set_threads(int n);
 

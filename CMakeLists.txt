@@ -82,48 +82,41 @@ option(IWAN_STRICT       "Strict warning gate for project sources (src/, tests/)
 set(IWAN_STRICT_FLAGS
   -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion -Werror)
 # ---------------------------------------------------------------------------
-# Windows/LLP64 platform tier (R37 R6-WG5, closes R3-L13).
+# Windows/LLP64 platform tier (R37 R6-WG5, closed by R37 R7).
 #
-# On Windows the same seven flags produce 25 diagnostics in 7 files, all of
-# them LLP64-only (mingw `long` is 32-bit; winsock `SOCKET` is uint64):
-# 20x -Wsign-conversion + 5x -Wconversion, 0x -Wpedantic. Distribution on
-# e189476 (38 src/ TUs, reproduced from compile_commands.json):
-#   relay_proxy.c 9 (sign 7/conv 2)  socks.c 5 (sign 5)
-#   https.c 4 (conv 2/sign 2)        port.c 4 (sign 4)
-#   auth.c 1, proxy.c 1, udp_send.c 1
-# Causes, by class (each one is a no-op conversion on LP64, which is why the
-# Linux gcc+clang strict legs are clean and can never see them):
-#   * `int fd` -> `struct pollfd.fd`: winsock2.h:1192 declares it `SOCKET`
-#     (uint64) vs glibc's `int`;
-#   * `ai_addrlen` -> `socklen_t`: mingw ws2tcpip.h:170 `size_t ai_addrlen`
-#     vs glibc where ai_addrlen IS socklen_t;
-#   * `size_t` -> project `nfds_t` (port.h:68 `unsigned int` on Windows) vs
-#     glibc `nfds_t` == `unsigned long` == size_t on LP64;
-#   * `(time_t)` -> `struct timeval.tv_sec`: mingw time_t is 64-bit while
-#     tv_sec is `long` (32-bit); on LP64 they are the same type;
-#   * port.c's `long unsigned -> long int` value changes need a 32-bit long.
-# `-Wno-error=conversion`/`-Wno-error=sign-conversion` is NOT a usable
-# alternative here: it still prints all 25 lines, and CI's win-cross leg
-# fails on any `warning:` in the build log, so the flags must actually be
-# dropped from the Windows tier.
+# HISTORY: the seven strict flags used to produce 25 diagnostics in 7 files on
+# Windows, all of them LLP64-only (mingw `long` is 32-bit; winsock `SOCKET` is
+# uint64): 20x -Wsign-conversion + 5x -Wconversion, 0x -Wpedantic. R6-WG5
+# therefore defaulted Windows to a reduced "platform tier" (no
+# -Wconversion/-Wsign-conversion) so the win-cross gate was green.
 #
-# So IWAN_STRICT=ON on Windows defaults to the platform tier below (the
-# documented invariant minus the two type-conversion flags); the full set
-# stays one switch away via IWAN_STRICT_WIN_LLP64=ON, which is how the
-# "LLP64 type-tightening" batch (see the note under the option) reproduces
-# and then retires the 25 items. Only the flag LIST differs per platform —
-# the scope is untouched: the gate is still applied per target, so
+# R37 R7 fixed all 25 at the source, so the two type-conversion flags are back
+# in the DEFAULT Windows tier and Windows now gets exactly the same documented
+# invariant as Linux:
+#   * `int fd` -> `struct pollfd.fd` / winsock SOCKET arguments: routed through
+#     the new PORT_FD_ARG() helper in port.h (the one place that knows the
+#     platform's spelling);
+#   * `ai_addrlen` -> `socklen_t` and `size_t` -> `nfds_t`: explicit casts at
+#     the three/four call sites;
+#   * `(time_t)` -> `struct timeval.tv_sec`: explicit (long) cast (value is
+#     bounded by HTTPS_POLL_MS);
+#   * port.c's `long unsigned -> long int` value changes: (long)FIONBIO at the
+#     two ioctlsocket sites (the wrapped bit pattern is what winsock
+#     documents), and _snwprintf's count is passed as the size_t it already is.
+# Verified: mingw + IWAN_STRICT=ON + IWAN_WERROR=ON builds the whole tree with
+# rc=0 and 0 diagnostics (see .cc_tmp/r37/fixes/HEAD-R7-SUMMARY.md §2).
+#
+# IWAN_STRICT_WIN_LLP64 is kept ONLY as a documented escape hatch for a
+# downstream that needs the old reduced tier; it now defaults ON and CI needs
+# no flag at all (adding -DIWAN_STRICT=ON to the win-cross leg is enough — do
+# NOT add IWAN_STRICT_WIN_LLP64=ON, it is the default). Delete the option and
+# the tier once no downstream sets it to OFF.
+# Scope is untouched either way: the gate is applied per target, so
 # third_party/lwip still gets only the global -Wall -Wextra.
 set(IWAN_STRICT_FLAGS_WIN
   -Wall -Wextra -Wpedantic -Wshadow -Werror)
-# Windows-only opt-in: restore the full documented invariant on Windows
-# (i.e. add -Wconversion -Wsign-conversion back). OFF so the win-cross
-# gate is green today; flip the default to ON once the 25 LLP64 items in
-# the 7 files above are fixed — at that point delete this option and the
-# tier entirely. Ignored on non-Windows builds, which always use
-# IWAN_STRICT_FLAGS.
 option(IWAN_STRICT_WIN_LLP64
-  "Windows: also enforce -Wconversion/-Wsign-conversion (full LLP64 strict tier)" OFF)
+  "Windows: also enforce -Wconversion/-Wsign-conversion (full strict tier; ON by default since R37 R7)" ON)
 # Opt-in extras (IWAN_STRICT=ON + IWAN_STRICT_EXTRA=ON): const-correctness /
 # float-equality style diagnostics that the existing code deliberately does
 # not follow (`char *argv[] = {"literal", ...}` is used throughout), so they

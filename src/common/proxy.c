@@ -722,7 +722,8 @@ static void *udp2tun_thread(void *ud) {
             int to = ka_ms > now_msv ? (int)(ka_ms - now_msv) : 1;
             if (to > PUMP_POLL_CEIL_MS)
                 to = PUMP_POLL_CEIL_MS;
-            struct pollfd pfd = { .fd = ctx->sockfd, .events = POLLIN };
+            struct pollfd pfd = { .fd = PORT_FD_ARG(ctx->sockfd),
+                                  .events = POLLIN };
             uint64_t pw0 = now_us();
             int pr = port_poll(&pfd, 1, to);
             pump_prof_add(&ctx->prof[PP_POLLWAIT], now_us() - pw0);

@@ -129,7 +129,7 @@ int udp_send_stall_wait(int fd, uint64_t retry_t0, unsigned budget_ms)
     uint64_t el = now_ms() - retry_t0;
     if (el >= budget_ms)
         return 0;
-    struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+    struct pollfd pfd = { .fd = PORT_FD_ARG(fd), .events = POLLOUT };
     port_poll(&pfd, 1, (int)(budget_ms - el));
     return 1;
 }

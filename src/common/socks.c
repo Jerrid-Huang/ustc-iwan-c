@@ -100,14 +100,14 @@ void wait_events(int listener, int sockfd, int dns_evfd, int timeout_ms)
 {
     struct pollfd fds[3 + MAX_FLOWS];
     int n = 0;
-    fds[n].fd = listener;
+    fds[n].fd = PORT_FD_ARG(listener);
     fds[n].events = POLLIN;
     n++;
-    fds[n].fd = sockfd;
+    fds[n].fd = PORT_FD_ARG(sockfd);
     fds[n].events = POLLIN;
     n++;
     if (dns_evfd >= 0) {
-        fds[n].fd = dns_evfd;
+        fds[n].fd = PORT_FD_ARG(dns_evfd);
         fds[n].events = POLLIN;
         n++;
     }
@@ -123,7 +123,7 @@ void wait_events(int listener, int sockfd, int dns_evfd, int timeout_ms)
          * computation. */
         if (f->fd < 0)
             continue;
-        fds[n].fd = f->fd;
+        fds[n].fd = PORT_FD_ARG(f->fd);
         /* rx_paused (netstack ring full): do NOT register POLLIN — the
          * socket stays readable, so polling it would return instantly
          * and busy-spin the loop; the next netstack tick (<=100ms)
@@ -439,7 +439,7 @@ static int socks_send_stall_wait(int sockfd, uint64_t retry_t0,
         *last_diag = nowd;
         log_err(diag_fmt, strerror(errno), npk, sent);
     }
-    struct pollfd pfd = { .fd = sockfd, .events = POLLOUT };
+    struct pollfd pfd = { .fd = PORT_FD_ARG(sockfd), .events = POLLOUT };
     (void)port_poll(&pfd, 1, 1);
     if (now_ms() - retry_t0 >= SOCKS_SEND_RETRY_MS)
         return 0;

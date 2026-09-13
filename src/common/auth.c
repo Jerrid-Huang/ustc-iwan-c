@@ -355,7 +355,7 @@ int udp_connect(const char *host, uint16_t port, int timeout_ms)
         log_debug("SO_RCVBUF: %s", strerror(errno));
     if (port_setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufsz, sizeof bufsz) < 0)
         log_debug("SO_SNDBUF: %s", strerror(errno));
-    if (port_connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
+    if (port_connect(fd, res->ai_addr, (socklen_t)res->ai_addrlen) < 0) {
         port_close(fd);
         freeaddrinfo(res);
         return -1;

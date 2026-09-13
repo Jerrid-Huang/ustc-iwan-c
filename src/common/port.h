@@ -142,6 +142,27 @@ struct mmsghdr {
 
 #endif
 
+/* ------------------- platform-typed fd argument -------------------- */
+/* Socket handles cross the platform boundary in two spellings: the port
+ * layer keeps fds as `int` everywhere, but winsock declares `SOCKET`
+ * arguments and `WSAPOLLFD.fd` as SOCKET (unsigned, 64-bit on LLP64)
+ * while POSIX uses int. Passing/assigning a plain int fd to those is an
+ * implicit int -> unsigned conversion, which the Windows strict tier
+ * rejects (-Wsign-conversion). PORT_FD_ARG is the single place that knows
+ * the platform's spelling, so shared call sites stay cast-free:
+ *
+ *     pfd.fd = PORT_FD_ARG(fd);
+ *     (void)send(PORT_FD_ARG(sock), buf, len, 0);
+ *
+ * The argument must be a valid, non-negative handle. The Windows arm goes
+ * through `unsigned` first so that neither step is int -> 64-bit-unsigned
+ * (which is what -Wsign-conversion flags). */
+#ifdef _WIN32
+#  define PORT_FD_ARG(fdv) ((SOCKET)(unsigned)(fdv))
+#else
+#  define PORT_FD_ARG(fdv) (fdv)
+#endif
+
 /* ------------------------- lifecycle ------------------------------- */
 
 /* WSAStartup once (Windows only; no-op elsewhere). Call at the top of

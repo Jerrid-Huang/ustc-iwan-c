@@ -143,17 +143,36 @@ static void rp_note_plane_down(void)
                 "exited); refusing new connection");
 }
 
-/* Pre-flight for the reply paths: true when the established set is already
- * full. The authoritative reservation still happens in rp_add(); checking
- * here (before any success byte goes out) turns "always answer rep=0 and
- * then close when full" into "answer rep=0 only if another thread takes the
- * last free slot between this check and rp_add()" — a much smaller window
- * of the same kind. Reading the atomic without the reservation is
- * deliberate: no count has to be rolled back if the connection dies before
- * rp_add(). */
-static bool rp_est_full(void)
+/* R37 R7 (R3-L21): take a slot in the established-connection set BEFORE any
+ * success byte goes out, so a client that is told rep=0/200 really has a
+ * slot. The R5 read-only pre-check (rp_est_full()) narrowed the window but
+ * left it open: N threads could all read n < cap, only one could then win
+ * the slot in rp_add(), and the losers had already answered "success" —
+ * measured as "answered rep=0, then the pair is closed" (R6-A/R6-I).
+ *
+ * Returns true when a slot was taken; the caller MUST then either hand the
+ * reservation to rp_add() (success) or release it (every failure path).
+ * The release is centralised: rp_handle_socks()/rp_handle_http() only set
+ * hs->reserved and rp_conn_main()'s `out:` label rolls it back, so a new
+ * `return -1` inside a handler cannot forget it (5 scattered rollback
+ * points were the R6 draft's main risk: one missed release = a permanent
+ * count leak = every later connection refused). */
+static bool rp_est_reserve(void)
 {
-    return atomic_load(&g_rp_est_n) >= g_rp_max_est;
+    int n = atomic_load(&g_rp_est_n);
+
+    while (n < g_rp_max_est) {
+        if (atomic_compare_exchange_weak(&g_rp_est_n, &n, n + 1))
+            return true;
+        /* n was refreshed with the current value by the failed CAS */
+    }
+    return false;
+}
+
+/* Release a reservation that rp_add() did not consume. */
+static void rp_est_release(void)
+{
+    atomic_fetch_sub(&g_rp_est_n, 1);
 }
 
 /* ---- handshake watchdog (M6b) ----
@@ -171,12 +190,22 @@ static bool rp_est_full(void)
 struct rp_hs {
     uint64_t deadline;      /* absolute now_ms() deadline */
     size_t   in;            /* cumulative handshake bytes read */
+    /* R37 R7 (R3-L21): set once rp_est_reserve() has taken a slot in
+     * g_rp_est_n for THIS connection. rp_conn_main's `out:` label is the
+     * single choke point that rolls it back when the handshake fails
+     * after the slot was taken but before rp_add() consumed it; the
+     * success path passes it to rp_add(), which owns the count from then
+     * on. Exactly one of the two must happen, or the counter leaks (and a
+     * leaked count permanently refuses connections once it reaches the
+     * cap). */
+    bool     reserved;
 };
 
 static void rp_hs_init(struct rp_hs *hs)
 {
     hs->deadline = now_ms() + RP_HS_TOTAL_MS;
     hs->in = 0;
+    hs->reserved = false;
 }
 
 /* Poll within the handshake budget for the requested events: the poll
@@ -196,7 +225,7 @@ static int rp_hs_poll_ev(const struct rp_hs *hs, int fd, short events)
         return 0;
     if (left > RP_HANDSHAKE_TIMEOUT_MS)
         left = RP_HANDSHAKE_TIMEOUT_MS;
-    pfd.fd = fd;
+    pfd.fd = PORT_FD_ARG(fd);
     pfd.events = events;
     pfd.revents = 0;
     for (;;) {
@@ -417,7 +446,7 @@ static int rp_connect_literal(int af, const void *addr, uint16_t port,
          * outright). */
         /* rp_poll_retry: EINTR keeps waiting within the timeout instead
          * of aborting the connect (M1) */
-        struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+        struct pollfd pfd = { .fd = PORT_FD_ARG(fd), .events = POLLOUT };
         if (rp_poll_retry(&pfd, RP_CONNECT_TIMEOUT_MS) <= 0) {
             port_close(fd);
             return -1;
@@ -554,14 +583,14 @@ static int rp_connect_target(int *fd_out, const char *host, uint16_t port,
             port_close(fd);
             continue;
         }
-        if (port_connect(fd, ai->ai_addr, ai->ai_addrlen) == 0)
+        if (port_connect(fd, ai->ai_addr, (socklen_t)ai->ai_addrlen) == 0)
             last = fd;
         else if (errno == EINPROGRESS || errno == EINTR) {
             /* R37 R3-L3: see rp_connect_literal — EINTR does not abort a
              * nonblocking connect */
             /* rp_poll_retry: EINTR keeps this candidate waiting within
              * the timeout instead of skipping it (M1) */
-            struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+            struct pollfd pfd = { .fd = PORT_FD_ARG(fd), .events = POLLOUT };
             if (rp_poll_retry(&pfd, RP_CONNECT_TIMEOUT_MS) > 0) {
                 int soerr = 0;
                 socklen_t sl = sizeof soerr;
@@ -817,24 +846,32 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
                                    (const uint8_t *)&t.ip4, t.af == 6,
                                    t.ip6, guard);
         if (rc == 0) {
-            /* R37 R5 (R3-L21): rp_add() binds the established set, but it
-             * runs AFTER this reply. The old order answered rep=0
+            /* R37 R5 (R3-L21) / R37 R7: rp_add() binds the established set,
+             * but it runs AFTER this reply. The old order answered rep=0
              * ("succeeded") and closed the pair a moment later when the set
              * was full, i.e. it lied to the client exactly when the relay
              * was busy. Refuse instead: rep=0x01 (general SOCKS server
              * failure) must be the client's first and only CONNECT reply,
              * and the upstream fd is released here so the refusal leaks
              * nothing. The upstream connect is already paid for because the
-             * check deliberately sits after rp_connect_target() (no count
-             * reservation to roll back); the residual window between this
-             * check and rp_add() is the pre-existing race, now narrowed to
-             * "only when another thread takes the last slot". */
-            if (rp_est_full()) {
+             * check deliberately sits after rp_connect_target().
+             *
+             * R37 R7: the check is now a real CAS reservation taken before
+             * the reply, so there is no residual "another thread took the
+             * last slot after I checked" window left — the losers of the
+             * race are refused here, with rep=1, instead of being told
+             * rep=0 and then disconnected. */
+            if (!rp_est_reserve()) {
                 rp_note_est_full();
                 port_close(up);
                 rp_socks_reply(fd, 1, hs);
                 return -1;
             }
+            /* R37 R7 (R3-L21): the slot is ours; rp_conn_main's `out:`
+             * label releases it on any later failure, rp_add() consumes it
+             * on success. Reply rep=0 only now that the slot is held, so
+             * "success" can no longer be taken back. */
+            hs->reserved = true;
             rp_socks_reply(fd, 0, hs);
             /* R37 R6 (K-5): rp_send_full, not a bare port_send. The
              * upstream socket is blocking here, so the old check could
@@ -952,7 +989,7 @@ static int rp_handle_http(int fd, const uint8_t *first, size_t first_n,
      * answered 200 Connection Established (or forwarded the request) and
      * only then had rp_add() refuse the pair. Map "set full" to 503 before
      * any success bytes go out. */
-    if (rp_est_full()) {
+    if (!rp_est_reserve()) {
         static const char busy[] = "HTTP/1.1 503 Service Unavailable\r\n"
                                    "Content-Length: 0\r\n\r\n";
         rp_note_est_full();
@@ -960,6 +997,10 @@ static int rp_handle_http(int fd, const uint8_t *first, size_t first_n,
         (void)rp_send_full(hs, fd, busy, sizeof busy - 1);
         return -1;
     }
+    /* R37 R7 (R3-L21): same as the SOCKS path — the slot is held before
+     * the 200/forward bytes go out; every failure below is rolled back by
+     * rp_conn_main's `out:` label, success is consumed by rp_add(). */
+    hs->reserved = true;
     if (is_connect) {
         static const char ok[] =
             "HTTP/1.1 200 Connection Established\r\n\r\n";
@@ -1108,8 +1149,16 @@ static bool rp_arr_add(struct rp_conn ***arr, size_t *n, size_t *cap,
 }
 
 /* hand the connected pair to the global relay; on failure both sockets
- * are closed here and the caller must not touch them again */
-static void rp_add(int c, int u)
+ * are closed here and the caller must not touch them again.
+ *
+ * R37 R7 (R3-L21): `reserved` says the caller already took a slot with
+ * rp_est_reserve() before it answered success. From here on the count is
+ * rp_add's to own: the pre-existing atomic_fetch_sub(&g_rp_est_n, 1) on
+ * every failure path below is exactly the rollback of that reservation, so
+ * no extra release is needed. The !reserved branch keeps the historical
+ * check-and-take for any future caller that has not reserved (there is
+ * none today; it is kept so the function cannot silently over-admit). */
+static void rp_add(int c, int u, bool reserved)
 {
     struct rp_conn *cn;
 
@@ -1121,19 +1170,20 @@ static void rp_add(int c, int u)
      * explicitly and refuse with a log line instead of silently
      * black-holing the peer. No idle timeout is added: SSH and other
      * long-lived idle sessions are legitimate. */
-    /* R37 R5 (R3-L21): rp_handle_socks/rp_handle_http already pre-checked
-     * this before their success reply, so reaching it now means another
-     * thread took the last free slot inside that window. The check must
-     * stay (this is the only place the set is actually reserved) and the
-     * notice is rate-limited through the same limiter as the pre-flight —
-     * the reply is already gone, so this path is log-only. */
-    if (atomic_load(&g_rp_est_n) >= g_rp_max_est) {
-        rp_note_est_full();
-        port_close(c);
-        port_close(u);
-        return;
+    /* R37 R5 (R3-L21) / R37 R7: both handlers now reserve the slot BEFORE
+     * their success reply, so this branch is unreachable for the current
+     * callers (they pass reserved=true and the count they took is exactly
+     * the one rp_add owns). It is kept for a caller that has not reserved:
+     * it must still refuse rather than over-admit. */
+    if (!reserved) {
+        if (atomic_load(&g_rp_est_n) >= g_rp_max_est) {
+            rp_note_est_full();
+            port_close(c);
+            port_close(u);
+            return;
+        }
+        atomic_fetch_add(&g_rp_est_n, 1);
     }
-    atomic_fetch_add(&g_rp_est_n, 1);
 
     cn = calloc(1, sizeof *cn);
     if (!cn) {
@@ -1435,14 +1485,14 @@ static void *rp_dir_main(void *ud)
                 slot_from[i] = slot_to[i] = -1;
                 if (!e->from_eof &&
                     e->plen + (size_t)RP_BUF <= RP_PEND_LIMIT) {
-                    pf[k].fd = e->from;
+                    pf[k].fd = PORT_FD_ARG(e->from);
                     pf[k].events = POLLIN;
                     pf[k].revents = 0;
                     slot_from[i] = (int)k;
                     k++;
                 }
                 if (e->plen > 0) {
-                    pf[k].fd = e->to;
+                    pf[k].fd = PORT_FD_ARG(e->to);
                     pf[k].events = POLLOUT;
                     pf[k].revents = 0;
                     slot_to[i] = (int)k;
@@ -1453,7 +1503,7 @@ static void *rp_dir_main(void *ud)
             pf_dirty = false;
             built_gen = cur_gen;
         }
-        int pr = port_poll(pf, pf_n, RP_POLL_MS);
+        int pr = port_poll(pf, (nfds_t)pf_n, RP_POLL_MS);
 #ifndef IWAN_DEBUG_STRIP
         if (atomic_load_explicit(&g_prof_on, memory_order_relaxed)) {
             atomic_fetch_add(&g_prof_rp_iters, 1);
@@ -1767,8 +1817,9 @@ static void *rp_conn_main(void *ud)
 
     /* handshake done here, then hand the pair to the two GLOBAL
      * direction threads. rp_add owns (or closed) both sockets from
-     * now on. */
-    rp_add(fd, up);
+     * now on. R37 R7 (R3-L21): hs.reserved carries the slot taken before
+     * the success reply; rp_add consumes it. */
+    rp_add(fd, up, hs.reserved);
     /* M6a: success exit — this thread stops tracking the connection
      * (the global relay owns it now) */
     atomic_fetch_sub(&g_rp_conn_n, 1);
@@ -1776,6 +1827,14 @@ static void *rp_conn_main(void *ud)
     return NULL;
 
 out:
+    /* R37 R7 (R3-L21): THE single rollback point for a pre-reply slot
+     * reservation. Every failure path inside rp_handle_socks()/
+     * rp_handle_http() returns -1, which lands here, so no handler can
+     * leak the count by forgetting a release (that leak would permanently
+     * refuse every later connection once it reached the cap). rp_add()
+     * owns the count on the success path, so this must NOT run then. */
+    if (hs.reserved)
+        rp_est_release();
     /* M6a: failure exit — every path through here decrements exactly
      * once (the accept thread's increment is consumed below) */
     if (up >= 0)
@@ -1831,7 +1890,8 @@ static void *rp_accept_main(void *ud)
     enum { ABORT_DRAIN_MAX = 64 };
     unsigned abort_drain = 0;
     while (!atomic_load(&rp->stop)) {
-        struct pollfd pfd = { .fd = rp->listener, .events = POLLIN };
+        struct pollfd pfd = { .fd = PORT_FD_ARG(rp->listener),
+                              .events = POLLIN };
         int pr = port_poll(&pfd, 1, 1000);
         if (pr < 0) {
             if (errno == EINTR)
@@ -1942,7 +2002,8 @@ static void *rp_accept_main(void *ud)
         rp_fail_key fk;
         memset(&pss, 0, sizeof pss);
         bool have_key =
-            getpeername(fd, (struct sockaddr *)&pss, &pslen) == 0 &&
+            getpeername(PORT_FD_ARG(fd), (struct sockaddr *)&pss,
+                        &pslen) == 0 &&
             rp_fail_key_of(&pss, &fk);
         if (have_key && rp_fail_blocked(&fk)) {
             log_debug("rp: dropping peer (auth failure lockout)");

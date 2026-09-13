@@ -47,22 +47,60 @@ _Noreturn void oom_abort(void)
 /* R37 R5 (R3-L17): the shared boolean-env rule — full contract in
  * util.h. Defined unconditionally (outside IWAN_DEBUG_STRIP): the
  * Windows-only callers (tun_win.c, proxy.c, port.c, oidc_util.c) exist
- * in stripped builds too. */
+ * in stripped builds too.
+ * R37 R7 WG-E (R6-I4): the predicate is now env_bool_value(), shared with
+ * dbg_env()/the security opt-outs, so the four spellings exist exactly
+ * once in the tree. */
+bool env_bool_value(env_bool_kind kind, const char *v, bool dflt)
+{
+    switch (kind) {
+    case ENV_BOOL_LOOSE:
+        if (v == NULL || *v == '\0')
+            return dflt;
+        /* exact match, case-insensitive: port_strncasecmp() compares up to
+         * the literal's NUL, so "0x"/"offline"/"nothing" are not off
+         * spellings (they stay ON, like every other unknown value) */
+        return !(port_strncasecmp(v, "0", 2) == 0 ||
+                 port_strncasecmp(v, "false", 6) == 0 ||
+                 port_strncasecmp(v, "no", 3) == 0 ||
+                 port_strncasecmp(v, "off", 4) == 0);
+    case ENV_BOOL_CS:
+        /* dbg_env()'s documented exception, kept value-for-value: the off
+         * list {0,false,off} is case-SENSITIVE and has no "no", so
+         * no/NO/False/Off/0x/00/"0 " all stay ON. Unset AND set-but-empty
+         * are OFF (dflt): the pre-R7 inline chain tested `v && *v` before
+         * the strcmp list, so an empty value must not reach it. The R7
+         * refactor initially dropped that test and turned IWAN_RXDBG= (set
+         * but empty) ON — caught by the 116-cell equivalence matrix in
+         * .cc_tmp/r37/r7/envmatrix.c. */
+        if (v == NULL || *v == '\0')
+            return dflt;
+        return !(strcmp(v, "0") == 0 || strcmp(v, "false") == 0 ||
+                 strcmp(v, "off") == 0);
+    case ENV_BOOL_PRESENT:
+        /* IWAN_PUMP_PROF: set at all == ON, empty string included */
+        return v != NULL ? true : dflt;
+    case ENV_BOOL_EXACT1:
+        return v != NULL && strcmp(v, "1") == 0;
+    case ENV_BOOL_POSITIVE:
+        return v != NULL && (port_strncasecmp(v, "1", 2) == 0 ||
+                             port_strncasecmp(v, "true", 5) == 0 ||
+                             port_strncasecmp(v, "yes", 4) == 0 ||
+                             port_strncasecmp(v, "on", 3) == 0);
+    case ENV_KIND_NUM:
+        break;   /* not a boolean; callers use env_u64()/env_ms_range() */
+    }
+    return dflt;
+}
+
+bool env_bool_ex(const char *name, env_bool_kind kind, bool dflt)
+{
+    return env_bool_value(kind, getenv(name), dflt);
+}
+
 bool env_bool(const char *name, bool dflt)
 {
-    const char *v = getenv(name);
-
-    if (v == NULL || *v == '\0')
-        return dflt;
-    /* exact match, case-insensitive: port_strncasecmp() compares up to
-     * the literal's NUL, so "0x"/"offline"/"nothing" are not off
-     * spellings (they stay ON, like every other unknown value) */
-    if (port_strncasecmp(v, "0", 2) == 0 ||
-        port_strncasecmp(v, "false", 6) == 0 ||
-        port_strncasecmp(v, "no", 3) == 0 ||
-        port_strncasecmp(v, "off", 4) == 0)
-        return false;
-    return true;
+    return env_bool_ex(name, ENV_BOOL_LOOSE, dflt);
 }
 
 #ifndef IWAN_DEBUG_STRIP
@@ -445,9 +483,11 @@ bool dbg_env(const char *name)
         if (strcmp(names[i], name) == 0)
             return vals[i] != 0;
     {
-        const char *v = getenv(name);
-        int val = v && *v && strcmp(v, "0") != 0 &&
-                  strcmp(v, "false") != 0 && strcmp(v, "off") != 0;
+        /* R37 R7 WG-E: the predicate is env_bool_value(ENV_BOOL_CS, ...) —
+         * one implementation, value-for-value identical to the old inline
+         * strcmp chain (0/false/off exact and case-sensitive, no "no",
+         * empty value OFF, unset OFF). */
+        int val = env_bool_value(ENV_BOOL_CS, getenv(name), false);
         if (n < 3) {
             names[n] = name;
             vals[n] = val;
@@ -457,7 +497,7 @@ bool dbg_env(const char *name)
     }
 }
 
-/* Strict decimal parse for the numeric env vars (R37 R3 / L18): the WHOLE
+/* Strict decimal scan for the numeric env vars (R37 R3 / L18): the WHOLE
  * string must be a canonical decimal integer. strtoll() (used here before)
  * silently accepted leading whitespace (" 1") and an explicit '+' ("+1"),
  * while parse_uint() — the parser behind IWAN_SRV_THREADS and the CLI
@@ -468,8 +508,12 @@ bool dbg_env(const char *name)
  * the caller logs the value and keeps its default. A leading '-' is kept
  * for API generality (env_ms_range takes signed bounds); the min/max check
  * in the caller still rejects negatives for every current variable.
+ * R37 R7 WG-E (R6-I4): this is now THE scanner — env_scan_i64() is the
+ * signed form and env_scan_u64() (below, the body parse_uint() used to
+ * carry) the unsigned one; env_ms_range(), env_u64(), parse_uint() and
+ * str_to_u16() all delegate here, so the accepted domain is one function.
  * Returns 0 and stores the value on success, -1 otherwise. */
-static int parse_ll_strict(const char *s, long long *out)
+int env_scan_i64(const char *s, long long *out)
 {
     if (!s || !*s)
         return -1;
@@ -519,7 +563,7 @@ long long env_ms_range(const char *name, long long defval, long long min,
 
     if (!v || !v[0])
         return defval;
-    if (parse_ll_strict(v, &n) != 0) {
+    if (env_scan_i64(v, &n) != 0) {
         log_err("%s: invalid value '%s' (%s); using default",
                 name, v, range_desc);
         return defval;
@@ -532,6 +576,34 @@ long long env_ms_range(const char *name, long long defval, long long min,
         return defval;
     }
     return n;
+}
+
+/* R37 R7 WG-E: unsigned sibling of env_ms_range — same contract, same
+ * warning text, and the same env_scan_u64() domain as parse_uint(). Used
+ * by the userspace-stack connect timeout, whose hand-written
+ * strtoul()+end-pointer block (lwip_bridge.c, R2-G1 §N3) was the last
+ * numeric env parser in the tree that accepted " 1000"/"+1000". */
+uint64_t env_u64(const char *name, uint64_t defval, uint64_t min,
+                 uint64_t max, int allow_zero, const char *range_desc)
+{
+    const char *v = getenv(name);
+    uint64_t n;
+
+    if (!v || !v[0])
+        return defval;
+    if (env_scan_u64(v, max, &n) != PARSE_UINT_OK) {
+        log_err("%s: invalid value '%s' (%s); using default",
+                name, v, range_desc);
+        return defval;
+    }
+    if (n == 0 && allow_zero)
+        return 0;
+    if (n < min) {
+        log_err("%s: invalid value '%s' (%s); using default",
+                name, v, range_desc);
+        return defval;
+    }
+    return n;   /* n <= max: env_scan_u64()'s ceiling */
 }
 
 /* ---------- string list ---------- */
@@ -751,7 +823,10 @@ void pace_take(pace_bucket *b, int npk)
     }
 }
 
-int parse_uint(const char *s, uint64_t max, uint64_t *out)
+/* The unsigned strict-decimal scanner (R37 R7 WG-E): this body used to BE
+ * parse_uint(); it is now shared, so parse_uint(), env_u64() and
+ * str_to_u16() cannot drift apart. */
+int env_scan_u64(const char *s, uint64_t max, uint64_t *out)
 {
     if (!s || !*s)
         return PARSE_UINT_BAD;
@@ -772,6 +847,11 @@ int parse_uint(const char *s, uint64_t max, uint64_t *out)
     }
     *out = v;
     return PARSE_UINT_OK;
+}
+
+int parse_uint(const char *s, uint64_t max, uint64_t *out)
+{
+    return env_scan_u64(s, max, out);
 }
 
 int str_to_u16(const char *s, uint16_t *out)

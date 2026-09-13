@@ -985,6 +985,12 @@ static void *recv_thread_main(void *v)
                 purge_expired(a->ctx, now);
                 if (debug_enabled())
                     server_up_stats_print();
+                /* R37 R7 (R3-L37): the ratedrop counter must stay visible
+                 * in Release, where IWAN_DEBUG_STRIP=ON makes the call
+                 * above unreachable (and would suppress it even in Debug
+                 * while no DATA is delivered). Unconditional, but silent
+                 * unless the counter moved; see server.c. */
+                server_rate_drops_maybe_print();
                 uint64_t drops = server_send_drops();
                 if (drops != last_drops) {
                     fprintf(stderr, "udp send dropped %llu packets\n",

@@ -444,8 +444,11 @@ static const wchar_t *win_system32_appname(char *const argv[], int start,
         return NULL;
     if (appbufsz < 8)
         return NULL;
-    _snwprintf(appbuf, (int)appbufsz, L"%s\\%s.exe", sysdir, wname);
-    appbuf[appbufsz - 1] = L'\0';
+    /* _snwprintf's count parameter is size_t; the historical (int) cast was
+     * an int -> size_t sign conversion on LLP64. appbufsz is already
+     * size_t and bounded by MAX_PATH at every call site. */
+    _snwprintf(appbuf, appbufsz, L"%s\\%s.exe", sysdir, wname);
+    appbuf[(size_t)appbufsz - 1] = L'\0';
     return appbuf;
 }
 #endif /* _WIN32 */
@@ -1123,7 +1126,11 @@ int port_close(int fd)
 int port_set_nonblock(int fd, bool nb)
 {
     u_long mode = nb ? 1 : 0;
-    if (ioctlsocket((SOCKET)fd, FIONBIO, &mode) == SOCKET_ERROR) {
+    /* FIONBIO is 0x8004667e: an unsigned constant that does not fit a
+     * signed 32-bit long, so converting it to ioctlsocket's `long cmd`
+     * implicitly is a -Wsign-conversion error (the wrapped bit pattern is
+     * exactly what winsock documents). Cast explicitly. */
+    if (ioctlsocket((SOCKET)fd, (long)FIONBIO, &mode) == SOCKET_ERROR) {
         set_sock_errno(fd);
         return -1;
     }
@@ -1137,7 +1144,7 @@ int port_set_nonblock(int fd, bool nb)
 static int ensure_nonblock(int fd)
 {
     u_long mode = 1;
-    if (ioctlsocket((SOCKET)fd, FIONBIO, &mode) == SOCKET_ERROR) {
+    if (ioctlsocket((SOCKET)fd, (long)FIONBIO, &mode) == SOCKET_ERROR) {
         set_sock_errno(fd);
         return -1;
     }
@@ -1914,7 +1921,7 @@ int port_evfd_wake(int fd)
     (void)fd;   /* the wake side is the static peer socket */
     if (g_evfd_peer == EVFD_INVALID)
         return -1;
-    if (send((int)g_evfd_peer, &c, 1, 0) != 1) {
+    if (send(PORT_FD_ARG(g_evfd_peer), &c, 1, 0) != 1) {
 #ifdef _WIN32
         /* winsock reports the error in WSAGetLastError, not errno */
         set_sock_errno(fd);

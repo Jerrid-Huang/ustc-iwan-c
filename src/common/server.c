@@ -356,11 +356,17 @@ static uint64_t now_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+/* R37 R7 (R3-L37): last g_rate_drops total the operator has already been
+ * told about, by either printer (the Debug stats line or the always-on
+ * line below). Both run on the primary recv thread, so no atomic is
+ * needed; server_up_stats_print() refreshes it so the always-on line does
+ * not repeat a number the stats line just printed. */
+static uint64_t g_rate_drops_reported;
+
 void server_up_stats_print(void)
 {
     uint64_t now;
     struct up_stats sum;
-
     memset(&sum, 0, sizeof sum);
     for (int t = 0; t < g_up_nthreads; t++) {
         sum.n += atomic_load_explicit(&g_up[t].n, memory_order_relaxed);
@@ -390,6 +396,11 @@ void server_up_stats_print(void)
             (unsigned long long)server_dl_pkts(),
             (unsigned long long)atomic_load(&g_dl_drops),
             (unsigned long long)atomic_load(&g_rate_drops));
+    /* R37 R7 (R3-L37): this line already reported the ratedrop total, so
+     * mark it as reported — server_rate_drops_maybe_print() then stays
+     * quiet instead of repeating the same number on its own line. */
+    g_rate_drops_reported =
+        (uint64_t)atomic_load_explicit(&g_rate_drops, memory_order_relaxed);
     for (int t = 0; t < g_up_nthreads; t++) {
         atomic_store_explicit(&g_up[t].n, 0, memory_order_relaxed);
         atomic_store_explicit(&g_up[t].parse, 0, memory_order_relaxed);
@@ -401,6 +412,47 @@ void server_up_stats_print(void)
     }
     /* dl counter is cumulative (per-second delta is printed by the
      * caller's diff of consecutive lines); do not reset here */
+}
+
+/* R37 R7 (R3-L37): report per-source rate-limit drops in EVERY build.
+ *
+ * Why this exists: g_rate_drops is otherwise observable only through the
+ * "uplink: ... ratedrop=" stats line, which lives in the debug tier —
+ * Release builds default to IWAN_DEBUG_STRIP=ON, where debug_enabled() is
+ * a compile-time false and server_up_stats_print() is never called at
+ * all. Even in Debug that line is suppressed while no DATA was delivered
+ * (server_up_stats_print() returns early on `sum.n == 0`), so a pure
+ * unknown-sid flood was invisible. This function has no debug guard and
+ * no dependency on the uplink stats window.
+ *
+ * Contract (kept deliberately small so it stays cheap and quiet):
+ *  - prints only when the counter moved since the last reported value, so
+ *    an idle server writes nothing;
+ *  - at most one line per second (RATE_DROPS_PRINT_MS), so a flood cannot
+ *    turn this into a log amplifier; the printed delta is then the growth
+ *    accumulated since the previous line;
+ *  - stderr, same stream as the Debug stats line;
+ *  - caller: the primary recv thread's 1 Hz housekeeping tick
+ *    (src/iwan_server.c), right after the debug-gated stats print. */
+#define RATE_DROPS_PRINT_MS 1000
+
+void server_rate_drops_maybe_print(void)
+{
+    static uint64_t last_ms;
+    uint64_t total =
+        (uint64_t)atomic_load_explicit(&g_rate_drops, memory_order_relaxed);
+    uint64_t now;
+
+    if (total == g_rate_drops_reported)
+        return; /* nothing new since the last line */
+    now = now_ms();
+    if (last_ms != 0 && now - last_ms < RATE_DROPS_PRINT_MS)
+        return; /* rate-limited: the next line carries the accumulated delta */
+    last_ms = now;
+    fprintf(stderr, "rate: ratedrop=%llu (+%llu)\n",
+            (unsigned long long)total,
+            (unsigned long long)(total - g_rate_drops_reported));
+    g_rate_drops_reported = total;
 }
 
 /* best-effort scrub of secrets, immune to optimizer elision */

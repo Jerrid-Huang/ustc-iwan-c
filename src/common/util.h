@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>   /* FILE for env_doc_emit (R37 R7 WG-E) */
 
 /* R37-F3 (R3-M5): format checking for our own printf-like wrappers.
  * Without this attribute the compiler did not check any of the 250+
@@ -87,6 +88,113 @@ bool debug_enabled(void);
  * Do NOT re-express dbg_env() (see its looser documented contract
  * above) or the exact-"1" security opt-outs with this helper. */
 bool env_bool(const char *name, bool dflt);
+
+/* ---------------- R37 R7 WG-E: one env parser, one env doc table ----------
+ *
+ * R6-I4 root cause: the boolean/numeric env rules were re-expressed at 13
+ * boolean and 8 numeric call sites, and the documented matrix existed in
+ * four copies (three --help footers + README.md) that drifted twice inside
+ * one release. This block is the single source for BOTH:
+ *   - parsing: env_bool_value()/env_bool_ex() are the only boolean
+ *     predicates, env_scan_u64()/env_scan_i64() the only decimal scanners
+ *     (parse_uint, env_ms_range, env_u64 all delegate to them), and
+ *     env_doc_entry.kind names the rule every documented variable uses, so
+ *     a call site can no longer invent a sixth spelling;
+ *   - documentation: g_env_docs[] carries name/synopsis/default/range/
+ *     scope/description for every documented variable, and env_doc_emit()
+ *     renders a binary's `Environment:` help block out of it. README.md's
+ *     matrix is compared against this table mechanically (R7-WG-E checker).
+ *
+ * The five boolean rules in use across the tree. Naming one of these is
+ * mandatory: a new `strcmp(v, "0") != 0` is a bug. */
+typedef enum {
+    ENV_BOOL_LOOSE = 0,  /* env_bool(): the empty/unset value takes dflt;
+                            exact 0/false/no/off are OFF, case-INSENSITIVE;
+                            every other non-empty value is ON */
+    ENV_BOOL_CS,         /* dbg_env()/IWAN_SRV_TUN_SINGLE: the same four
+                            tokens, case-SENSITIVE and no "no"/"No"
+                            (documented exception, kept verbatim) */
+    ENV_BOOL_PRESENT,    /* IWAN_PUMP_PROF: SET AT ALL is ON ("" included);
+                            only "unset" is the default */
+    ENV_BOOL_EXACT1,     /* the *_ALLOW_LOOPBACK SSRF opt-outs: only the
+                            exact string "1" is ON */
+    ENV_BOOL_POSITIVE,   /* IWAN_ALLOW_INSECURE_USERS: 1/true/yes/on,
+                            case-insensitive */
+    ENV_KIND_NUM,        /* not a boolean: strict decimal, see env_u64() */
+} env_bool_kind;
+
+/* pure predicate: v == NULL means "unset". No getenv(), no cache, so the
+ * matrix checker can drive every value verbatim. */
+bool env_bool_value(env_bool_kind kind, const char *v, bool dflt);
+/* one getenv() + env_bool_value(). env_bool() is
+ * env_bool_ex(name, ENV_BOOL_LOOSE, dflt). */
+bool env_bool_ex(const char *name, env_bool_kind kind, bool dflt);
+
+/* The one strict decimal scanner. The WHOLE string must be [0-9]+ (the
+ * signed variant additionally accepts one leading '-'); leading/trailing
+ * whitespace, '+', trailing garbage, empty and overflow are all rejected,
+ * and leading zeros are legal ("007" -> 7). Return codes are parse_uint's
+ * three-state contract: env_scan_u64 returns PARSE_UINT_OK/BAD/RANGE,
+ * env_scan_i64 returns 0/-1. parse_uint() itself is this function. */
+int env_scan_u64(const char *s, uint64_t max, uint64_t *out);
+int env_scan_i64(const char *s, long long *out);
+
+/* env_ms_range's unsigned sibling: unset/empty -> defval silently; a value
+ * that env_scan_u64 rejects or that falls outside [min,max] -> warning +
+ * defval. allow_zero lets an explicit 0 (the documented "disabled"
+ * sentinel) pass through unvalidated. */
+uint64_t env_u64(const char *name, uint64_t defval, uint64_t min, uint64_t max,
+                 int allow_zero, const char *range_desc);
+
+/* ---------------- the documented env matrix (single source) ------------- */
+
+typedef enum {
+    ENV_DOC_SERVER = 1u << 0,
+    ENV_DOC_CLIENT = 1u << 1,
+    ENV_DOC_OIDC   = 1u << 2,
+} env_doc_bin;
+
+typedef struct {
+    const char      *name;    /* "IWAN_RX_STALE_MS" */
+    env_bool_kind    kind;    /* ENV_KIND_NUM for the numeric variables */
+    const char      *syn;     /* left column: "IWAN_RX_STALE_MS=<ms>" */
+    const char      *dflt;    /* displayed default, NULL = none */
+    long long        min, max;/* numeric domain (bools: 0,0) */
+    int              allow_zero; /* numeric: explicit 0 = "disabled" */
+    unsigned         bins;    /* ENV_DOC_* bitmask of the footers listing it */
+    const char      *scope_cli;  /* [scope] word for iwan-client, NULL=none */
+    const char      *scope_oidc; /* [scope] word for iwan-client-oidc */
+    /* Pre-wrapped description bodies, verbatim per binary ('@' marks a
+     * continuation indent, expanded to the layout's continuation string).
+     * NULL when that binary's footer does not list the variable. */
+    const char      *desc_srv, *desc_cli, *desc_oidc;
+    /* Canonical wording for the "Flags: ... except: ..." sentence; NULL
+     * for entries that follow the general rule. The sentence is assembled
+     * from these clauses, so a new exception cannot be documented in its
+     * own row but forgotten in the general rule (R6-I3 (1)). */
+    const char      *rule;
+} env_doc_entry;
+
+extern const env_doc_entry g_env_docs[];
+extern const size_t g_env_docs_n;
+
+const env_doc_entry *env_doc_find(const char *name);
+
+typedef struct {
+    env_doc_bin bin;
+    const char *indent;     /* "      " (iwan-client) / "    " (iwan-server) */
+    const char *cont;       /* continuation indent, strlen == description col */
+    int         rule_width; /* wrap width of the generated "Flags:" sentence */
+} env_doc_layout;
+
+/* Print one binary's whole variable list (the header line is the caller's:
+ * iwan-server prints "Environment (read once at startup):"). */
+void env_doc_emit(FILE *out, const env_doc_layout *lay);
+/* The generated "Flags: ..." paragraph for `bin` (static buffer). */
+const char *env_doc_bool_rule(env_doc_bin bin);
+/* The per-binary "Also read: SSL_CERT_* ..." paragraph, verbatim. */
+const char *env_doc_also_read(env_doc_bin bin);
+
 /* reset PATH to a safe default and clear loader-injection vars; call in
  * the child before exec of helper binaries (root daemon hardening) */
 void exec_sanitize(void);
