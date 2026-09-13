@@ -558,20 +558,16 @@ bool ns_init(Netstack *ns, uint32_t inner_ip, uint32_t gw, uint16_t mtu)
     ns->ip = inner_ip;
     ns->mtu = mtu;
 
-    ns->connect_timeout_ms = NS_CONNECT_TIMEOUT;
-    {
-        const char *v = getenv("IWAN_NS_CONNECT_TIMEOUT_MS");
-        char *end;
-        unsigned long n;
-        if (v && v[0]) {
-            n = strtoul(v, &end, 10);
-            if (end != v && *end == '\0' && n >= 1000 && n <= 300000)
-                ns->connect_timeout_ms = (uint32_t)n;
-            else
-                log_err("IWAN_NS_CONNECT_TIMEOUT_MS: invalid value '%s' "
-                        "(1000..300000); using default", v);
-        }
-    }
+    /* Single-source numeric parse (R38-A1-1): the hand-written
+     * strtoul()+end-pointer block that used to live here accepted
+     * " 1000"/"+1000"/"\t1000", which env_scan_u64() — and therefore every
+     * other numeric setting in the tree — rejects as invalid (warning +
+     * default). allow_zero is deliberately 0: the documented floor is
+     * 1000 ms, and letting an explicit "0" through would install a 0 ms
+     * connect timeout, i.e. every inner TCP connect fails instantly. */
+    ns->connect_timeout_ms =
+        (uint32_t)env_u64("IWAN_NS_CONNECT_TIMEOUT_MS", NS_CONNECT_TIMEOUT,
+                          1000, 300000, 0, "1000..300000");
 
     lwip_init();
 

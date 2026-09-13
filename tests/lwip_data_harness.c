@@ -28,6 +28,15 @@
 #define SERVER_PORT 12345
 #define CLIENT_PORT 40000
 #define PATTERN_LEN (44 * 1460)   /* 44 full-MSS segments = 22 reorder pairs */
+/* P2-18: upper bound for IWAN_TEST_BENCH_BYTES. The in-process echo is
+ * single-event-loop bound and the deadline already scales with the size
+ * (g_total/50000 ms below), so anything past 4 GiB is a typo rather than a
+ * fixture run; it is rejected instead of being handed to malloc(). The cap
+ * is clamped to SIZE_MAX so the (size_t)n narrowing below stays exact on
+ * 32-bit builds (mingw i686) too. */
+#define MAX_BENCH_BYTES                                              \
+    (((uint64_t)4u << 30) < (uint64_t)SIZE_MAX ? ((uint64_t)4u << 30) \
+                                               : (uint64_t)SIZE_MAX)
 
 /* IPv6 fake peer (IWAN_TEST_IPV6=1): the client's inner v6 is derived
  * from CLIENT_IP (fd00::/96 + v4, see protocol.h); the peer is a
@@ -287,12 +296,24 @@ int main(void)
     g_ipv6 = getenv("IWAN_TEST_IPV6") != NULL;
     g_total = PATTERN_LEN;
     {
+        /* P2-18: strict whole-string parse with an explicit upper bound
+         * (env_scan_u64, util.h) instead of strtoull(), which accepted
+         * " 64240"/"+64240"/trailing garbage and turned an overflowing
+         * value into an unbounded malloc(). Unset and set-but-empty still
+         * take the default silently. */
         const char *b = getenv("IWAN_TEST_BENCH_BYTES");
+        uint64_t n = 0;
         if (b && b[0]) {
-            unsigned long long n = strtoull(b, NULL, 10);
-            if (n >= PATTERN_LEN) {
+            if (env_scan_u64(b, MAX_BENCH_BYTES, &n) == PARSE_UINT_OK &&
+                n >= (uint64_t)PATTERN_LEN) {
                 g_total = (size_t)n;
                 g_bench = 1;
+            } else {
+                fprintf(stderr,
+                        "warning: invalid IWAN_TEST_BENCH_BYTES '%s' "
+                        "(%llu..%llu); ignoring\n",
+                        b, (unsigned long long)PATTERN_LEN,
+                        (unsigned long long)MAX_BENCH_BYTES);
             }
         }
     }

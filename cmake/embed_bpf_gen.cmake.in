@@ -1,0 +1,42 @@
+# embed_bpf_gen.cmake.in — template for the BPF object -> C array embedding step.
+#
+# CMakeLists.txt runs configure_file() on this template, so @IN@ / @OUT@ become
+# literal paths inside the generated script, and the build recipe invokes that
+# script with NO path arguments at all:
+#
+#     cmake -P <build>/embed_bpf_gen.cmake
+#
+# Why the indirection: a path containing a space cannot be carried as a build
+# recipe argument on every generator. Handing `-DIN="<path>"` to
+# add_custom_command puts the quotes *inside* the value (file(READ) then looks
+# for a name that literally starts with a quote); adding VERBATIM escapes them a
+# second time. Positional arguments (`-- <in> <out>`) work under Ninja but NOT
+# under Unix Makefiles, which escapes the space as `\ ` and leaves the
+# backslash in the value Make passes on. Baking the paths into the script at
+# configure time sidesteps generator-specific escaping entirely, so a tree whose
+# source directory, build directory, or both contain spaces builds.
+#
+# The variable names IN/OUT are kept so the standalone form still works:
+#     cmake -DIN=<obj> -DOUT=<cfile> -P embed_bpf.cmake
+#
+# Emits the same file shape the Makefile produced with od|awk:
+#   const unsigned char steer_bpf_o[] = { 0x..,0x.., ... };
+#   const unsigned int steer_bpf_o_len = sizeof(steer_bpf_o);
+# tun.c (bpf_prog_load_steer) parses the embedded ELF section table at
+# runtime, so the object bytes must be preserved verbatim.
+
+set(IN "@IN@")
+set(OUT "@OUT@")
+
+if(NOT EXISTS "${IN}")
+  message(FATAL_ERROR "embed_bpf: input object not found: ${IN}")
+endif()
+
+file(READ "${IN}" _hex HEX)                 # continuous lowercase hex
+string(REGEX REPLACE "(..)" "0x\\1," _bytes "${_hex}")
+string(REGEX REPLACE "((0x[0-9a-f]{2},){16})" "\\1\n" _lines "${_bytes}")
+
+file(WRITE "${OUT}"
+"/* generated from steer_bpf.o; do not edit */\n"
+"const unsigned char steer_bpf_o[] = {\n${_lines}};\n"
+"const unsigned int steer_bpf_o_len = sizeof(steer_bpf_o);\n")

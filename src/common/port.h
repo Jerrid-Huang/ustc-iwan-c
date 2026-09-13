@@ -38,7 +38,18 @@
 
    /* ---- POSIX shims absent from mingw-w64 headers ---- */
 
-   /* ssize_t: defined by corecrt.h on this toolchain; guard anyway */
+   /* ssize_t: defined by corecrt.h on this toolchain; guard anyway.
+    *
+    * NOTE for the ILP32 (i686) mingw build: intptr_t is 32-bit there, so this
+    * ssize_t is `int` (32-bit) and an `unsigned int` source does not widen on
+    * assignment — it is a sign-changing narrowing. Every `ssize_t n =
+    * <msg_len>` from a struct mmsghdr below therefore needs an explicit
+    * (ssize_t) cast; that cast is a harmless no-op where ssize_t is already
+    * 64-bit (LLP64) and keeps the site clean on both architectures. x86_64 is
+    * LLP64 (intptr_t is 64-bit), so it never warned, which is how the i686
+    * sites stayed hidden until the R38 i686 gate ran: since R37 R7 the
+    * Windows strict tier applies the full flag set, -Wconversion and
+    * -Wsign-conversion included, on every architecture. */
 #  ifndef _SSIZE_T_DEFINED
 #    define _SSIZE_T_DEFINED
 typedef intptr_t ssize_t;
@@ -161,6 +172,39 @@ struct mmsghdr {
 #  define PORT_FD_ARG(fdv) ((SOCKET)(unsigned)(fdv))
 #else
 #  define PORT_FD_ARG(fdv) (fdv)
+#endif
+
+/* ---------------- platform-typed msg_iovlen argument --------------- */
+/* struct msghdr::msg_iovlen crosses the same boundary as the fd above, but
+ * with the opposite spelling problem: POSIX declares it `size_t`, while the
+ * WSABUF-backed shim in the Windows branch above declares it `int` — and so
+ * does Darwin, which deviates from POSIX here (XNU's struct msghdr has
+ * `int msg_iovlen`, the same 32-bit field as its msghdr_x extension). A
+ * plain cast to either spelling is wrong elsewhere under the strict tier:
+ * int -> size_t is a sign change on LP64 POSIX, and on ILP32 mingw size_t
+ * is `unsigned int`, so size_t -> int is one there too (on LLP64 it is
+ * instead a 64 -> 32 narrowing). PORT_MSG_IOVLEN is the single place that
+ * knows the platform's spelling, so shared call sites stay cast-free:
+ *
+ *     mh.msg_iovlen = PORT_MSG_IOVLEN(npk);
+ *
+ * The argument is an iovec/message count, bounded by the caller's array.
+ * The _Static_asserts are the self-check: if a future edit (or a new libc)
+ * changes a field's width, that platform fails HERE instead of shipping a
+ * silently wrong cast that only some other toolchain's -Wsign-conversion
+ * would have caught. */
+#if defined(_WIN32)
+#  define PORT_MSG_IOVLEN(n) ((int)(n))
+_Static_assert(sizeof(((struct msghdr *)0)->msg_iovlen) == sizeof(int),
+               "Windows shim msg_iovlen must be int");
+#elif defined(__APPLE__)
+#  define PORT_MSG_IOVLEN(n) ((int)(n))
+_Static_assert(sizeof(((struct msghdr *)0)->msg_iovlen) == sizeof(int),
+               "Darwin msghdr.msg_iovlen is int, not size_t");
+#else
+#  define PORT_MSG_IOVLEN(n) ((size_t)(n))
+_Static_assert(sizeof(((struct msghdr *)0)->msg_iovlen) == sizeof(size_t),
+               "POSIX msghdr.msg_iovlen must be size_t");
 #endif
 
 /* ------------------------- lifecycle ------------------------------- */
@@ -438,7 +482,25 @@ static inline int port_evfd_create(void)
 static inline int port_evfd_wake(int fd)
 {
     uint64_t one = 1;
-    return write(fd, &one, sizeof one) == (ssize_t)sizeof one ? 0 : -1;
+    /* R38 P2-5: EINTR means the write was interrupted BEFORE the eventfd
+     * counter was incremented — the 8-byte eventfd write is all-or-nothing
+     * (no partial write is possible) and with EFD_NONBLOCK it never sleeps,
+     * so a failure that is not EAGAIN left no wake behind. The tree
+     * installs every sigaction with sa_flags = 0 (no SA_RESTART), so an
+     * ordinary signal can land here; reporting it as a plain failure would
+     * drop the wakeup and park the event loop until the next event or poll
+     * timeout even though a DNS result is waiting. Retry instead. The
+     * attempt bound only keeps a pathological signal storm from spinning
+     * this inline forever; the caller logs any non-zero return, and EAGAIN
+     * (counter already non-zero = a wake is pending, the reader is/will be
+     * awake) still propagates unchanged. */
+    for (int i = 0; i < 8; i++) {
+        if (write(fd, &one, sizeof one) == (ssize_t)sizeof one)
+            return 0;
+        if (errno != EINTR)
+            return -1;   /* EAGAIN/EWOULDBLOCK included: wake already pending */
+    }
+    return -1;   /* errno == EINTR from the last attempt */
 }
 static inline int port_evfd_drain(int fd)
 {

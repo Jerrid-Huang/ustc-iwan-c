@@ -71,6 +71,50 @@ uint64_t port_now_ms(void)
 #endif
 }
 
+#ifdef _WIN32
+/* ---- one-shot lazy calibration, shared by both Windows clock backends --- */
+/* port_now_us() is the process-wide clock and its first call is concurrent
+ * (every server recv worker runs `now_ms()` as its first statement), while
+ * calibration is expensive (9 x Sleep(5) ~= 45 ms on the RDTSC path). Both
+ * backends therefore publish their factor through this state machine
+ * instead of a pair of plain lazy statics (R38 P2-2, WG-C3 C3-1):
+ *
+ *   - exactly one caller runs the calibration (CAS COLD -> BUSY); the
+ *     others wait for READY, so the payload is never written concurrently
+ *     and cannot be read half-written;
+ *   - the payload is a plain variable stored BEFORE the release store that
+ *     publishes it, and the fast path reads it only after an acquire load
+ *     that observed READY (or after this thread itself published it). A
+ *     reader can therefore never see `READY` together with a zero/partial
+ *     factor: that combination was `x / 0.0 -> (uint64_t)inf` (UB) whose
+ *     result the per-thread monotonic clamp below would then latch forever;
+ *   - a failed/absurd calibration is folded into a finite positive factor
+ *     before the release, so nothing bad can be published in the first
+ *     place. */
+enum { CAL_COLD = 0, CAL_BUSY = 1, CAL_READY = 2 };
+
+/* True for the single caller that must compute the payload, false once it
+ * has been published. The wait is bounded by the calibration itself (which
+ * cannot fail) and happens at most once per process, never in steady state
+ * — the fast path is just the caller's acquire load, no lock, no call. */
+static bool cal_claim(_Atomic int *state)
+{
+    int expect = CAL_COLD;
+    if (atomic_compare_exchange_strong_explicit(state, &expect, CAL_BUSY,
+                                                memory_order_acq_rel,
+                                                memory_order_acquire))
+        return true;
+    while (atomic_load_explicit(state, memory_order_acquire) != CAL_READY)
+        Sleep(1);
+    return false;
+}
+
+static void cal_publish(_Atomic int *state)
+{
+    atomic_store_explicit(state, CAL_READY, memory_order_release);
+}
+#endif
+
 /* Windows µs clock: RDTSC, calibrated once against QPC.
  *
  * Why not QPC?  In virtual machines QPC's backing clock is chosen
@@ -92,59 +136,93 @@ uint64_t port_now_ms(void)
  * client warns the user on VM migration anyway. */
 uint64_t port_now_us(void)
 {
-#if defined(_WIN32) && (defined(_M_IX86) || defined(_M_X64))
+    /* R38 P2-1: `_M_IX86`/`_M_X64` are NOT compiler built-ins. MSVC
+     * predefines them, but mingw-w64 only defines them from the Windows
+     * SDK headers it pulls in (measured: `x86_64-w64-mingw32-gcc -dM -E -`
+     * on an empty TU shows only `__x86_64__`; add <windows.h> and it also
+     * shows `_M_X64 100` / `_M_IX86 600`). This test therefore works today
+     * only because port.h includes <windows.h> before this line. A TU that
+     * reaches port_now_us without those headers, or a toolchain that never
+     * defines them, would silently fall through to the QPC branch below —
+     * a clock up to ~300x slower per call (3.8us vs 13ns, see above) with
+     * no diagnostic. The compiler-predefined `__i386__`/`__x86_64__` are
+     * always available, so OR them in; on every current target this is a
+     * no-op (both mingw architectures already took this branch — verified
+     * by preprocessing this file for i686 and x86_64). */
+#if defined(_WIN32) && \
+    (defined(_M_IX86) || defined(_M_X64) || \
+     defined(__i386__) || defined(__x86_64__))
     /* x86/x64 only: __rdtsc is an x86 instruction (aarch64 Windows has
      * no TSC). The invariant TSC reads in ~13ns here vs QPC's 3.8us on
      * some vCPUs of the tiny11 guest, so it is worth the calibration. */
-    static double tsc_per_us;   /* TSC ticks per microsecond */
-    static int have;
-    if (!have) {
-        static LARGE_INTEGER freq;
-        double rates[9];
-        int n = 0;
-        QueryPerformanceFrequency(&freq);
-        /* several 5ms windows: one preempted/glitched sample must not
-         * poison the factor, so take the median rate */
-        for (int i = 0; i < 9; i++) {
-            LARGE_INTEGER a, b;
-            uint64_t t0 = __rdtsc();
-            QueryPerformanceCounter(&a);
-            Sleep(5);
-            uint64_t t1 = __rdtsc();
-            QueryPerformanceCounter(&b);
-            double dt_us = (double)(b.QuadPart - a.QuadPart) * 1e6 /
-                           (double)freq.QuadPart;
-            if (dt_us > 0.0)
-                rates[n++] = (double)(t1 - t0) / dt_us;
-        }
-        if (n == 0)
-            tsc_per_us = 1.0;   /* cannot happen */
-        else {
-            /* insertion sort; take the middle */
-            for (int i = 1; i < n; i++) {
-                double v = rates[i];
-                int j = i - 1;
-                while (j >= 0 && rates[j] > v) {
-                    rates[j + 1] = rates[j];
-                    j--;
-                }
-                rates[j + 1] = v;
+    static double tsc_per_us;   /* TSC ticks per microsecond (payload) */
+    static _Atomic int tsc_state;
+    if (atomic_load_explicit(&tsc_state, memory_order_acquire) != CAL_READY) {
+        if (cal_claim(&tsc_state)) {
+            LARGE_INTEGER freq;
+            double rates[9];
+            double f;
+            int n = 0;
+            QueryPerformanceFrequency(&freq);
+            /* several 5ms windows: one preempted/glitched sample must not
+             * poison the factor, so take the median rate */
+            for (int i = 0; i < 9; i++) {
+                LARGE_INTEGER a, b;
+                uint64_t t0 = __rdtsc();
+                QueryPerformanceCounter(&a);
+                Sleep(5);
+                uint64_t t1 = __rdtsc();
+                QueryPerformanceCounter(&b);
+                double dt_us = (double)(b.QuadPart - a.QuadPart) * 1e6 /
+                               (double)freq.QuadPart;
+                if (dt_us > 0.0)
+                    rates[n++] = (double)(t1 - t0) / dt_us;
             }
-            tsc_per_us = rates[n / 2];
+            if (n == 0)
+                f = 1.0;   /* cannot happen */
+            else {
+                /* insertion sort; take the middle */
+                for (int i = 1; i < n; i++) {
+                    double v = rates[i];
+                    int j = i - 1;
+                    while (j >= 0 && rates[j] > v) {
+                        rates[j + 1] = rates[j];
+                        j--;
+                    }
+                    rates[j + 1] = v;
+                }
+                f = rates[n / 2];
+            }
+            /* Never publish a zero/NaN factor: the steady state divides by
+             * it, and the clamp below would latch the garbage forever. */
+            if (!(f > 0.0))
+                f = 1.0;
+            tsc_per_us = f;   /* payload first ... */
+            cal_publish(&tsc_state);
         }
-        have = 1;
     }
     uint64_t now = (uint64_t)((double)__rdtsc() / tsc_per_us);
 #elif defined(_WIN32)
     /* ARM64 Windows: no TSC instruction — use QPC (monotonic, high
-     * resolution; its per-call cost is fine on native ARM hardware). */
-    static LARGE_INTEGER qpc_freq;
-    static int qpc_have;
-    if (!qpc_have) {
-        LARGE_INTEGER f;
-        QueryPerformanceFrequency(&f);
-        qpc_freq = f;
-        qpc_have = 1;
+     * resolution; its per-call cost is fine on native ARM hardware).
+     * NOTE: this branch is ARM64-only in practice; the x86/x64 mingw and
+     * MSVC builds take the RDTSC branch above (R38 P2-2 scope note: the
+     * calibration race fixed here was reachable on both, but the only
+     * platform this branch runs on — Windows-on-ARM — is not exercised by
+     * the R38 gates, so this part is static hardening only). */
+    static LARGE_INTEGER qpc_freq;   /* QPC ticks per second (payload) */
+    static _Atomic int qpc_state;
+    if (atomic_load_explicit(&qpc_state, memory_order_acquire) != CAL_READY) {
+        if (cal_claim(&qpc_state)) {
+            LARGE_INTEGER f;
+            QueryPerformanceFrequency(&f);
+            /* Documented non-zero and constant for the process lifetime;
+             * clamp anyway so a broken HAL cannot publish a 0 divisor. */
+            if (f.QuadPart <= 0)
+                f.QuadPart = 1;
+            qpc_freq = f;   /* payload first ... */
+            cal_publish(&qpc_state);
+        }
     }
     LARGE_INTEGER c;
     QueryPerformanceCounter(&c);
@@ -1921,7 +1999,17 @@ int port_evfd_wake(int fd)
     (void)fd;   /* the wake side is the static peer socket */
     if (g_evfd_peer == EVFD_INVALID)
         return -1;
-    if (send(PORT_FD_ARG(g_evfd_peer), &c, 1, 0) != 1) {
+    /* R38 P2-5: same rule as the POSIX eventfd inline in port.h. EINTR
+     * means send() was interrupted before the datagram was queued, so the
+     * wake would be lost if it were reported as a failure — retry it
+     * (bounded so a signal storm cannot spin here). EAGAIN is the opposite
+     * case and keeps its old "success" meaning below: a full peer/loop
+     * buffer means a wake is already pending, so the reader is (or is about
+     * to be) awake. sa_flags = 0 everywhere, so no SA_RESTART protects
+     * this call. */
+    for (int i = 0; i < 8; i++) {
+        if (send(PORT_FD_ARG(g_evfd_peer), &c, 1, 0) == 1)
+            return 0;
 #ifdef _WIN32
         /* winsock reports the error in WSAGetLastError, not errno */
         set_sock_errno(fd);
@@ -1931,9 +2019,10 @@ int port_evfd_wake(int fd)
          * success rather than failing a DNS worker. */
         if (errno == EAGAIN || errno == EWOULDBLOCK)
             return 0;
-        return -1;
+        if (errno != EINTR)
+            return -1;
     }
-    return 0;
+    return -1;   /* errno == EINTR from the last attempt */
 }
 
 int port_evfd_drain(int fd)

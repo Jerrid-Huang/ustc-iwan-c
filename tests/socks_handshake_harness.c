@@ -102,7 +102,11 @@ int main(int argc, char **argv)
 
     struct sockaddr_in bound;
     socklen_t blen = sizeof bound;
-    if (getsockname(listener, (struct sockaddr *)&bound, &blen) < 0) {
+    /* PORT_FD_ARG: getsockname() is a raw winsock call taking SOCKET, so the
+     * int fd needs the same explicit widening the production call sites use
+     * (without it, mingw -Wsign-conversion breaks -DIWAN_STRICT builds with
+     * -DBUILD_TESTING=ON). */
+    if (getsockname(PORT_FD_ARG(listener), (struct sockaddr *)&bound, &blen) < 0) {
         fprintf(stderr, "harness: getsockname: %s\n", strerror(errno));
         port_close(listener);
         free(g_flows);

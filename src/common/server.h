@@ -136,13 +136,23 @@ uint64_t server_send_drops(void);
 /* Cumulative UDP datagrams sent to clients (includes control frames
  * such as OPEN_ACK/PING_RSP, not only tunnel data). */
 
-/* IWAN_DEBUG=1: print per-step uplink timing averages once per second. */
+/* IWAN_DEBUG=1: print per-step uplink timing averages once per second.
+ * R38 P2-14: PRIMARY RECV THREAD ONLY. It writes the file-static
+ * g_rate_drops_reported latch (server.c) that server_rate_drops_maybe_print()
+ * also reads/writes; that latch is deliberately a plain uint64_t, not an
+ * atomic, so the mutual exclusion is the single-thread invariant kept at
+ * the call site (src/iwan_server.c, the tid==0 housekeeping tick), not the
+ * type. Do not call from a secondary recv thread, a TUN reader, or main. */
 void server_up_stats_print(void);
 /* R37 R7 (R3-L37): report g_rate_drops growth once per second, in EVERY
  * build — Release (IWAN_DEBUG_STRIP=ON) compiles the debug tier out, so
  * without this the per-source rate-limit drop counter is unobservable in
  * a shipped binary. Silent while the counter does not move; at most one
- * stderr line per second. Call from the 1 Hz housekeeping tick. */
+ * stderr line per second. Call from the 1 Hz housekeeping tick.
+ * R38 P2-14: PRIMARY RECV THREAD ONLY — same non-atomic latches as
+ * server_up_stats_print() above (g_rate_drops_reported plus the function's
+ * own static last_ms), same tid==0 call-site invariant in src/iwan_server.c.
+ * Calling it concurrently would be a C11 data race on both latches. */
 void server_rate_drops_maybe_print(void);
 /* record the number of uplink recv threads (stats are per-thread) */
 void server_up_stats_set_threads(int n);

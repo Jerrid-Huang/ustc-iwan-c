@@ -176,7 +176,12 @@ sudo ./iwan-server --port 6001 --tun iwan-srv \
 
 ## 环境变量
 
-三个二进制的 `--help` 末尾各有一段 `Environment:` 清单，与本节是**同一份清单**（两处必须同步修改），只列**该二进制真正会读取**的变量。
+三个二进制的 `--help` 末尾各有一段 `Environment:` 清单，与本节下面的三张表是**同一份清单**，共 **4 份文件 / 6 个块**，改动其中一块必须同步其余五块：
+
+- `src/iwan_client.c`、`src/iwan_server.c`、`src/oidc/oidc_cli.c` 各一处 help footer（即 `--help` 末尾的 `Environment:` 段）；
+- 本节的三张表：`### iwan-server（仅 Linux）`、`### iwan-client`、`### iwan-client-oidc`。
+
+定位方式：`grep -rn "Environment" src/` 找三个 footer（该命令还会命中 `src/common/port.c` 的 `SetEnvironmentVariableW` 等无关行），本节三张表见下方三个 `###` 标题。每块只列**该二进制真正会读取**的变量。
 
 > **构建条件**：`IWAN_DEBUG`、`IWAN_PROFILE`、`IWAN_PUMP_PROF` 只在**未定义 `IWAN_DEBUG_STRIP`** 的构建里生效。CMake 对非 Debug 构建默认 `IWAN_DEBUG_STRIP=ON`（Release 又是默认构建类型），因此默认产物里这三个变量**完全不会被解析**；现场诊断请用 `-DCMAKE_BUILD_TYPE=Debug`（或显式 `-DIWAN_DEBUG_STRIP=OFF`）构建。**多配置生成器例外**：`-DCMAKE_BUILD_TYPE` 只对单配置生成器（Unix Makefiles / Ninja）有效，Ninja Multi-Config 与 Visual Studio 会忽略它，其非 Debug 配置仍会带上 `-DIWAN_DEBUG_STRIP=1`；请显式加 `-DIWAN_DEBUG_STRIP=OFF`（或在配置阶段 `cmake -B <dir> -DIWAN_DEBUG_STRIP=OFF`）后再 `--config Debug` 构建。`IWAN_RXDBG`/`IWAN_FLOWDBG` 不受该开关影响，Release 下仍可用。
 >
@@ -196,6 +201,8 @@ sudo ./iwan-server --port 6001 --tun iwan-srv \
 | `IWAN_RATE_MISS_MAX` | `2000` | 每源每秒**计入慢路径**的未知会话 DATA/CLOSE 帧预算，`1..65535`；超预算后该源本秒内其余未知帧走无锁快路径丢弃（未知 sid 帧无论是否超预算都不投递） |
 
 另读取：`SSL_CERT_FILE`（**唯一**由环境变量指定的 CA 文件来源）、`SSL_CERT_DIR`（**不会**被当作 CA 目录读取——`SSL_CTX_load_verify_locations()` 的第二实参 `CApath` 恒为空，全树也没有调用 `set_default_verify_paths()`；它只在 fork 出的辅助进程 `exec` 前按属主/权限决定保留或清除：非 root 属主、或组/其他可写时被清除）。
+
+`IWAN_RATE_MISS_MAX` 触发的限流丢弃在 stderr 上可观测：只要丢弃计数有增长，服务端就输出一行 `rate: ratedrop=<total> (+<delta>)`（`total` 为累计丢弃数，`delta` 为**自上次报告总数以来的新增量**；Debug 下 `uplink: ... ratedrop=` 统计行报过的数字不会在 `+delta` 里重复计入），**每秒最多一行**；计数不动则一行都不打印。该行**不受 `IWAN_DEBUG_STRIP` 影响，Release 产物同样打印**。
 
 ### iwan-client
 

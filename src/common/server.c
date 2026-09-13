@@ -315,7 +315,9 @@ struct up_stats {
     _Atomic uint64_t xor;     /* in-place decryption */
     _Atomic uint64_t write;   /* tun_write syscall */
     _Atomic uint64_t drop;    /* tun_write EAGAIN/failure drops */
-    _Atomic uint64_t h1;      /* inner-IPv4 gate drops (malformed/spoofed) */
+    _Atomic uint64_t h1;      /* uplink inner-header gate drops: malformed
+                              * frame, source != session, or (R38 P1-4)
+                              * host-local destination */
 };
 
 /* per-recv-thread stats (the multi-threaded uplink sums them on print) */
@@ -328,13 +330,20 @@ static bool srv_tun_single(void)
     /* R20: called from every recv thread's handle_udp — atomic cache.
      * R37 R2: a boolean env must treat "0"/"false"/"no"/"off"/"" as OFF;
      * existence-only parsing made IWAN_SRV_TUN_SINGLE=0 mean ON, the
-     * opposite of what an operator writing "=0" intends. */
+     * opposite of what an operator writing "=0" intends.
+     * R38 P1-3: the sixth spelling that chain implemented now has a name —
+     * env_bool_value(ENV_BOOL_CS_NO, ...) (util.h): LOOSE's off tokens,
+     * case-SENSITIVE, "no" included, unset/empty -> dflt. Value-for-value
+     * equivalence with the removed inline chain was proven over 15 cells
+     * (NULL, "", 0/false/no/off, NO/No/OFF/False, 1/yes/0x/00/"0 ") before
+     * the swap — see .cc_tmp/r38/fixes/notes-srv-h1.md; dflt is false to
+     * match the old `e && *e` short-circuit. The cached-atomic protocol
+     * and relaxed orderings are unchanged. */
     static _Atomic int v = -1;
     int c = atomic_load_explicit(&v, memory_order_relaxed);
     if (c < 0) {
-        const char *e = getenv("IWAN_SRV_TUN_SINGLE");
-        c = e && *e && strcmp(e, "0") != 0 && strcmp(e, "false") != 0 &&
-            strcmp(e, "no") != 0 && strcmp(e, "off") != 0;
+        c = env_bool_value(ENV_BOOL_CS_NO,
+                           getenv("IWAN_SRV_TUN_SINGLE"), false);
         atomic_store_explicit(&v, c, memory_order_relaxed);
     }
     return c != 0;
@@ -358,9 +367,11 @@ static uint64_t now_ns(void)
 
 /* R37 R7 (R3-L37): last g_rate_drops total the operator has already been
  * told about, by either printer (the Debug stats line or the always-on
- * line below). Both run on the primary recv thread, so no atomic is
- * needed; server_up_stats_print() refreshes it so the always-on line does
- * not repeat a number the stats line just printed. */
+ * line below). Both run on the primary recv thread — R38 P2-14: that
+ * invariant is a hard API contract now written into server.h; the caller
+ * in src/iwan_server.c gates both on tid==0 — so no atomic is needed;
+ * server_up_stats_print() refreshes it so the always-on line does not
+ * repeat a number the stats line just printed. */
 static uint64_t g_rate_drops_reported;
 
 void server_up_stats_print(void)
@@ -430,10 +441,19 @@ void server_up_stats_print(void)
  *    an idle server writes nothing;
  *  - at most one line per second (RATE_DROPS_PRINT_MS), so a flood cannot
  *    turn this into a log amplifier; the printed delta is then the growth
- *    accumulated since the previous line;
+ *    accumulated since the last line that reported the TOTAL — which is
+ *    either a previous `rate:` line or, in Debug with IWAN_DEBUG=1, the
+ *    `uplink: ... ratedrop=` stats line, since server_up_stats_print()
+ *    refreshes the same g_rate_drops_reported latch (R38 P2-15: so
+ *    `+delta` is always unreported growth and never re-counts a total the
+ *    stats line already showed — it is NOT necessarily the delta since the
+ *    previous `rate:` line specifically);
  *  - stderr, same stream as the Debug stats line;
  *  - caller: the primary recv thread's 1 Hz housekeeping tick
- *    (src/iwan_server.c), right after the debug-gated stats print. */
+ *    (src/iwan_server.c), right after the debug-gated stats print.
+ *    Primary recv thread ONLY — it shares the plain, non-atomic
+ *    g_rate_drops_reported and file-static last_ms latches with
+ *    server_up_stats_print(); see the R38 P2-14 contract in server.h. */
 #define RATE_DROPS_PRINT_MS 1000
 
 void server_rate_drops_maybe_print(void)
@@ -1381,6 +1401,92 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
     }
 }
 
+/* R38 P1-4: uplink inner-header DESTINATION rejection set.
+ *
+ * Before this, the uplink H1 gate checked only the inner SOURCE (== the
+ * session's assigned address / derived ULA). The downlink gate
+ * (tun_prep_downlink) validates the destination, and the two SSRF gates
+ * (relay_proxy.c M7 rp_target_blocked, socks_flow.c socks_target_blocked)
+ * refuse host-local targets — so the tunnel was asymmetric: an
+ * authenticated client could hand the server an inner packet addressed to
+ * the server's own loopback / link-local range and let the kernel stack
+ * deliver it locally; the TUN write is the only thing in between. Local
+ * rejection set only: no wire byte, frame layout, or existing H1
+ * criterion (source, port, checksum-free sanity) changes.
+ *
+ * IPv4 (d is ip4_u32(inner dst), the same BE-value order as s_ip):
+ *   127.0.0.0/8     loopback
+ *   0.0.0.0/8       "this host on this network": Linux send()/connect()
+ *                   routes it to loopback, so it is an alternate spelling
+ *                   of 127.0.0.1 (same rationale as relay_proxy.c M7)
+ *   169.254.0.0/16  link-local
+ * IPv6:
+ *   ::1/128         loopback
+ *   fe80::/10       link-local
+ * The v4-mapped spellings (::ffff:127.0.0.1, ...) are outside this
+ * mandated set; whether an inner v4-mapped destination is routable
+ * locally at all still needs root-hardware re-verification (lwIP/kernel
+ * side, see .cc_tmp/r38/fixes/notes-srv-h1.md).
+ *
+ * No legitimate client traffic can carry these destinations: the client's
+ * own kernel/lwIP stack routes 127/8, 0/8, 169.254/16 and ::1/fe80::/10
+ * locally and never hands them to the TUN/netstack uplink, so nothing
+ * that used to reach the server's TUN legitimately is refused here. */
+static bool up_inner_dst_blocked4(uint32_t d)
+{
+    return (d & 0xFF000000u) == 0x7F000000u ||   /* 127.0.0.0/8 */
+           (d & 0xFF000000u) == 0x00000000u ||   /* 0.0.0.0/8 */
+           (d & 0xFFFF0000u) == 0xA9FE0000u;     /* 169.254.0.0/16 */
+}
+
+static bool up_inner_dst_blocked6(const uint8_t d[16])
+{
+    static const uint8_t lo[16] = { 0, 0, 0, 0, 0, 0, 0, 0,
+                                    0, 0, 0, 0, 0, 0, 0, 1 };
+    if (memcmp(d, lo, sizeof lo) == 0)
+        return true;                              /* ::1 */
+    return d[0] == 0xfe && (d[1] & 0xc0) == 0x80; /* fe80::/10 */
+}
+
+/* R38 P2-6: rate limiter for the H1 drop log_debug sites below.
+ *
+ * Those sites are per-packet and reachable by any authenticated client
+ * that can put a forged source/spoofed destination in an inner header, so
+ * an IWAN_DEBUG server could be driven into writing stderr at packet
+ * rate. Same shape as socks.c K-3 / relay_proxy.c rp_note_due: one line
+ * per second, and the next line carries the number of drops that were
+ * suppressed in the meantime, so the true volume stays observable
+ * instead of being silently clamped. Counters are _Atomic because
+ * handle_udp runs on several SO_REUSEPORT recv threads at once; relaxed
+ * load/store/exchange is enough (a lost update costs one extra line at
+ * worst). Frames that fail the gate are ALWAYS counted in g_up[tid].h1 —
+ * only the stderr line is decimated. */
+#define H1_DROP_LOG_MS 1000
+static _Atomic uint64_t g_h1_log_last_ms;
+static _Atomic uint64_t g_h1_log_suppressed;
+
+static bool h1_drop_log_due(void)
+{
+    uint64_t now = now_ms();
+    uint64_t last =
+        atomic_load_explicit(&g_h1_log_last_ms, memory_order_relaxed);
+    if (last != 0 && now - last < H1_DROP_LOG_MS) {
+        atomic_fetch_add_explicit(&g_h1_log_suppressed, 1,
+                                  memory_order_relaxed);
+        return false;
+    }
+    {
+        uint64_t supp = atomic_exchange_explicit(&g_h1_log_suppressed, 0,
+                                                 memory_order_relaxed);
+        atomic_store_explicit(&g_h1_log_last_ms, now, memory_order_relaxed);
+        if (supp != 0)
+            log_debug("uplink drop: %llu further H1 rejects suppressed "
+                      "(debug log capped at 1 line/s)",
+                      (unsigned long long)supp);
+    }
+    return true;
+}
+
 void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nusers,
                 const uint8_t *raw, size_t len,
                 const struct sockaddr_in *peer, int sockfd, unsigned tid)
@@ -1506,13 +1612,16 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
             if (debug_enabled())
                 tx1 = now_ns();
             /* H1: the decrypted payload must be a sane IPv4 packet whose
-             * source is the session's assigned address, or a sane IPv6
-             * packet whose source is the session's derived ULA
-             * (fd00::/96 + assigned IPv4, see protocol.h). Anything else
-             * is a malformed or spoofed frame — drop it before it reaches
-             * the TUN (counted; logged only under IWAN_DEBUG). The inner
-             * header sits at raw+IWAN_HDR_LEN, behind the outer
-             * header. */
+             * source is the session's assigned address and whose
+             * destination is not host-local, or a sane IPv6 packet whose
+             * source is the session's derived ULA (fd00::/96 + assigned
+             * IPv4, see protocol.h) and whose destination is not
+             * host-local (R38 P1-4: see up_inner_dst_blocked4/6). Anything
+             * else is a malformed, spoofed, or springboard frame — drop
+             * it before it reaches the TUN (always counted in
+             * g_up[tid].h1; the diagnosis goes to the IWAN_DEBUG log,
+             * capped at 1 line/s by h1_drop_log_due()). The inner header
+             * sits at raw+IWAN_HDR_LEN, behind the outer header. */
             if (len <= IWAN_HDR_LEN) {
                 atomic_fetch_add_explicit(&g_up[tid].h1, 1, memory_order_relaxed);
                 break;
@@ -1524,9 +1633,10 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                     uint8_t s6[16], d6[16], want6[16];
                     ip6_derive_ula(s_ip, want6);
                     if (ip6_pkt_ok(in, inlen, s6, d6) != 0 ||
-                        memcmp(s6, want6, 16) != 0) {
+                        memcmp(s6, want6, 16) != 0 ||
+                        up_inner_dst_blocked6(d6)) {
                         atomic_fetch_add_explicit(&g_up[tid].h1, 1, memory_order_relaxed);
-                        if (debug_enabled()) {
+                        if (debug_enabled() && h1_drop_log_due()) {
                             /* short frames can fail the sanity check
                              * before in[4..6] exist — never read past the
                              * datagram end (stale slot bytes), just log a
@@ -1546,9 +1656,10 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                     }
                 } else {
                     if (ipv4_pkt_ok(in, inlen, &saddr, &daddr) != 0 ||
-                        saddr != s_ip) {
+                        saddr != s_ip ||
+                        up_inner_dst_blocked4(daddr)) {
                         atomic_fetch_add_explicit(&g_up[tid].h1, 1, memory_order_relaxed);
-                        if (debug_enabled()) {
+                        if (debug_enabled() && h1_drop_log_due()) {
                             /* short frames can fail the sanity check
                              * before the inner header bytes exist — never
                              * read past the datagram end (stale slot

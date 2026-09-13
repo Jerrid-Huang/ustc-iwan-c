@@ -31,6 +31,10 @@
 #include "socks_internal.h"
 #include "util.h"
 
+/* P0-3: msg_iovlen's spelling differs per platform (POSIX `size_t`, Windows
+ * shim `int`); PORT_MSG_IOVLEN() in port.h is the single source of that
+ * knowledge, so this call site stays cast-free (see R38 P0-3). */
+
 Netstack g_ns;
 
 /* FIND-R2-5: ns_flow_unref (bridge extension, declared in lwip_bridge.h —
@@ -172,7 +176,11 @@ void accept_connections(int listener) {
      * to wait_events() and is paced by the poll timeout instead. 64 is far
      * above any real burst of aborted connections. */
     enum { ABORT_DRAIN_MAX = 64 };
+    /* R38 P2-7: same explicit bound for the signal-interrupted (EINTR)
+     * retry class R3-M3 introduced; rationale in the EINTR branch below. */
+    enum { EINTR_DRAIN_MAX = 64 };
     unsigned abort_drain = 0;
+    unsigned eintr_drain = 0;
     for (;;) {
         /* L-5: with a large pended backlog the drain loop would accept
          * every pending client even after a stop signal; check the shared
@@ -188,9 +196,40 @@ void accept_connections(int listener) {
              * valid on Windows */
             if (errno == EAGAIN || errno == EWOULDBLOCK)
                 return;
-            /* R37 R3-M3: a signal-interrupted accept() is not a failure */
-            if (errno == EINTR)
+            /* R37 R3-M3: a signal-interrupted accept() is not a failure.
+             * R38 P2-7: it retried immediately, with no bound and no
+             * pacing — the same hot-spin shape R5-WG-E fixed for the
+             * aborted-request class. A signal does NOT dequeue a pending
+             * request, so a pathological source that keeps interrupting
+             * accept() would hold this loop inside accept_connections()
+             * (the caller cannot pace a loop that never returns) and, with
+             * a pending backlog, make every round burn unbounded syscalls.
+             * Bound the CONSECUTIVE retries with its own counter — a burst
+             * of interruptions must not silence the abort/fatal limiters
+             * and vice versa — and hand control back to wait_events();
+             * EINTR only means "no connection was accepted", never "the
+             * listener is broken", so exceeding the bound is a plain
+             * return: the listener stays open, no backoff sleep and no
+             * log_err. (A genuine stop signal sets g_stop in the handler,
+             * so the caller's loop exits at its next check; the bound is
+             * for the injected-fault / signal-storm case.) The debug line
+             * is rate-limited to one per second with its own counter, same
+             * idiom as the aborted branch above. */
+            if (errno == EINTR) {
+                static _Atomic uint64_t last_acc_eintr_ms;
+                uint64_t ei_now = now_ms();
+                if (ei_now - atomic_load_explicit(&last_acc_eintr_ms,
+                                                  memory_order_relaxed)
+                        >= 1000) {
+                    atomic_store_explicit(&last_acc_eintr_ms, ei_now,
+                                          memory_order_relaxed);
+                    log_debug("accept SOCKS5 client: %s (retrying)",
+                              strerror(errno));
+                }
+                if (++eintr_drain > EINTR_DRAIN_MAX)
+                    return;   /* bounded: back to wait_events() to poll */
                 continue;
+            }
             /* R37 R5-WG-E (R4-L5): an error that belongs to the NEW
              * connection whose request the kernel has ALREADY discarded
              * must not trigger the backoff. ECONNABORTED means the peer
@@ -304,6 +343,7 @@ void accept_connections(int listener) {
             return;
         }
         abort_drain = 0;   /* a real connection ended the aborted burst */
+        eintr_drain = 0;   /* ... and the interrupted-accept burst (P2-7) */
         /* Serve only loopback peers by default: an unauthenticated
          * remote peer would turn the host into an open proxy. Remote
          * peers are served only with an explicit --allow-remote bind
@@ -499,7 +539,10 @@ static int socks_send_batch2(int sockfd, SocksConfig *cfg,
             struct msghdr mh;
             memset(&mh, 0, sizeof mh);
             mh.msg_iov = iovs;
-            mh.msg_iovlen = (size_t)npk;
+            /* npk is a batch count bounded by SOCKS_MAX_PK (NS_TX_MAX),
+             * far below INT_MAX, so PORT_MSG_IOVLEN's platform cast only
+             * spells the value, it never changes it. */
+            mh.msg_iovlen = PORT_MSG_IOVLEN(npk);
             while (!g_stop) {
                 ssize_t r = port_sendmsg(sockfd, &mh, 0);
                 if (r == (ssize_t)total)
@@ -960,7 +1003,7 @@ int receive_vpn(int sockfd, SocksConfig *cfg) {
                     return 0;   /* drained (copy mode has no pool ownership) */
                 budget -= v;
                 for (int i = 0; i < v; i++) {
-                    ssize_t n = copy_msgs[i].msg_len;
+                    ssize_t n = (ssize_t)copy_msgs[i].msg_len;
                     if (n < 8 || (copy_msgs[i].msg_hdr.msg_flags & MSG_TRUNC))
                         continue;   /* no pool slot to release in copy mode */
                     int r = vpn_handle_datagram(sockfd, cfg, copy_buf[i],
@@ -1015,7 +1058,7 @@ int receive_vpn(int sockfd, SocksConfig *cfg) {
         }
         budget -= v;
         for (int i = 0; i < v; i++) {
-            ssize_t n = rx_msgs[i].msg_len;
+            ssize_t n = (ssize_t)rx_msgs[i].msg_len;
             if (n < 8 || (rx_msgs[i].msg_hdr.msg_flags & MSG_TRUNC)) {
                 ns_rx_buf_release(rx_bufs[i]);
                 continue;
@@ -1195,6 +1238,31 @@ static void socks_reauth_swap(int *sockfd, int nfd, SocksConfig *cfg)
      * EMSGSIZE + throughput loss (and the M11 re-probe never sees it). */
     cfg->gso_ok = 0;   /* socks.h semantics: 0 = untried */
     cfg->gso_mss = 0;
+    /* R38-C3-2: run_socks sets the INITIAL session fd non-blocking exactly
+     * once (run_socks, "set nonblock on session socket"), but the fd a
+     * re-auth hands back comes straight from authenticate_ex -> udp_connect,
+     * which leaves it BLOCKING with SO_SNDTIMEO/SO_RCVTIMEO = 3 s. Installing
+     * that fd here would silently defeat the whole drain design: a congested
+     * uplink makes sendmmsg() sleep in the kernel for the full 3 s instead of
+     * returning EAGAIN, stalling this single event loop (accept, every flow,
+     * keepalive, DNS results) and, via the DNS worker's send under
+     * g_dns_wait_mu, blocking the receive path too. Same fix as proxy.c's
+     * run_pump applies to every session socket.
+     *
+     * Rollback (same ownership rule as the nfd < 0 early return above): the
+     * new fd is closed HERE, *sockfd/g_sockfd keep the OLD — still
+     * non-blocking — socket, and nothing in cfg points at the closed fd, so
+     * run_socks teardown still closes exactly one fd and the callers' `nfd`
+     * bookkeeping (which tests socks_reauth_tunnel's return, not this swap)
+     * stays valid. cfg->gso_ok/gso_mss above are merely back to "untried"
+     * for the old socket and the next batch re-probes it. The next attempt
+     * is failure-driven (stale watchdog / keepalive-fail / CLOSE path), not
+     * the reauth_at schedule: a SUCCESSFUL tunnel clears reauth_at to 0. */
+    if (port_set_nonblock(nfd, true) != 0) {
+        log_err("SOCKS5: set nonblock on re-auth socket: %s", strerror(errno));
+        port_close(nfd);
+        return;
+    }
     port_close(*sockfd);
     *sockfd = nfd;
     g_sockfd = nfd;

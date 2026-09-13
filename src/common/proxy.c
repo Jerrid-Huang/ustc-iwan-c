@@ -602,6 +602,54 @@ static void pump_reader_exit(void)
     g_tx.n = 0;
 }
 
+/* R38 (R8-P2-4): the two "wrong encryption state" gates below fire once per
+ * received datagram and err_printf() is NOT compiled out by
+ * IWAN_DEBUG_STRIP (see util.h: it has no #ifdef), so a peer that keeps
+ * sending frames with the wrong enc bit — a re-authed peer with different
+ * encryption settings, or a stale/spoofed sender that already passed the
+ * sid/token gate — turns this client's stderr into an unbounded stream in
+ * Release builds too. Each signal gets its own 1-line/s limiter, the same
+ * shape and rationale as the K-3 limiter in socks.c (vpn_handle_datagram):
+ * "plaintext on an encrypted session" and "encrypted on a plaintext
+ * session" are different signals and neither may silence the other.
+ *
+ * Observability stays lossless: every datagram inside the window is counted,
+ * and the next printed line carries the accumulated count as
+ * "(+N suppressed)", so an operator can still tell one stray frame from a
+ * flood. The counter is only exchanged to 0 when a line is actually
+ * printed. `_Atomic` + relaxed load/store is the project idiom for log
+ * limiters (relay_proxy.c rp_note_due, socks.c K-3): this thread is the only
+ * writer today, but a lost update would cost one extra line at most. */
+#define UDP2TUN_DROP_WARN_MS 1000u
+
+static _Atomic uint64_t g_drop_plain_on_enc_ms;
+static _Atomic uint32_t g_drop_plain_on_enc_n;
+static _Atomic uint64_t g_drop_enc_on_plain_ms;
+static _Atomic uint32_t g_drop_enc_on_plain_n;
+
+static void udp2tun_drop_warn(_Atomic uint64_t *last_ms,
+                              _Atomic uint32_t *suppressed,
+                              const char *what)
+{
+    uint64_t now = now_ms();
+
+    if (now - atomic_load_explicit(last_ms, memory_order_relaxed) <
+        UDP2TUN_DROP_WARN_MS) {
+        atomic_fetch_add_explicit(suppressed, 1u, memory_order_relaxed);
+        return;
+    }
+    uint32_t n = atomic_exchange_explicit(suppressed, 0u,
+                                          memory_order_relaxed);
+    atomic_store_explicit(last_ms, now, memory_order_relaxed);
+    /* The base text is unchanged; a suppression suffix is only appended when
+     * something was actually suppressed (so a steady 1/s stream stays
+     * byte-identical to the pre-R38 line). */
+    if (n != 0)
+        err_printf("%s (+%u suppressed)\n", what, (unsigned)n);
+    else
+        err_printf("%s\n", what);
+}
+
 static void *udp2tun_thread(void *ud) {
     pump_ctx_t *ctx = ud;
 #ifndef _WIN32
@@ -756,7 +804,11 @@ static void *udp2tun_thread(void *ud) {
 #endif
         uint64_t dl0 = now_us();
         for (i = 0; i < v; i++) {
-            ssize_t n = msgs[i].msg_len;
+            /* (ssize_t): msg_len is unsigned int in the Windows shim and
+             * ssize_t is only 32-bit on ILP32, so mingw -Wsign-conversion
+             * flags the implicit narrowing; the value is bounded by the
+             * receive slot (<= 64 KiB) so the conversion is lossless. */
+            ssize_t n = (ssize_t)msgs[i].msg_len;
             uint8_t *m = batch + (size_t)i * slot;
             if (n < 8 || (msgs[i].msg_hdr.msg_flags & MSG_TRUNC))
                 continue;
@@ -818,13 +870,19 @@ static void *udp2tun_thread(void *ud) {
             if (t != PT_DATA && t != PT_DATA_ENC)
                 continue;
             if (t == PT_DATA && ctx->enc) {
-                err_printf("[UDP->TUN] plaintext data on encrypted session, drop\n");
+                udp2tun_drop_warn(&g_drop_plain_on_enc_ms,
+                                  &g_drop_plain_on_enc_n,
+                                  "[UDP->TUN] plaintext data on encrypted "
+                                  "session, drop");
                 continue;
             }
             if (t == PT_DATA_ENC && !ctx->enc) {
                 /* symmetric gate (audit L14): keep the session's
                  * encryption state a two-way check */
-                err_printf("[UDP->TUN] encrypted data on plaintext session, drop\n");
+                udp2tun_drop_warn(&g_drop_enc_on_plain_ms,
+                                  &g_drop_enc_on_plain_n,
+                                  "[UDP->TUN] encrypted data on plaintext "
+                                  "session, drop");
                 continue;
             }
             if (t == PT_DATA_ENC)

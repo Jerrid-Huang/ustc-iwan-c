@@ -141,10 +141,22 @@ static void peer_feed(const uint8_t *pkt, size_t n)
 int main(void)
 {
     g_nconns = 8;
-    if (getenv("IWAN_TEST_CONNS")) {
-        int v = atoi(getenv("IWAN_TEST_CONNS"));
-        if (v >= 1 && v <= MAX_CONNS)
-            g_nconns = v;
+    {
+        /* P2-18: strict whole-string parse with an explicit upper bound
+         * (env_scan_u64, util.h) instead of atoi(), which silently accepted
+         * "4x"/overflow and ignored every malformed value without a word.
+         * Unset and set-but-empty still take the default silently. */
+        const char *v = getenv("IWAN_TEST_CONNS");
+        uint64_t n = 0;
+        if (v && env_scan_u64(v, (uint64_t)MAX_CONNS, &n) == PARSE_UINT_OK &&
+            n >= 1 && n <= (uint64_t)MAX_CONNS) {
+            g_nconns = (int)n;
+        } else if (v && v[0]) {
+            fprintf(stderr,
+                    "warning: invalid IWAN_TEST_CONNS '%s' (1..%d); "
+                    "using default %d\n",
+                    v, MAX_CONNS, g_nconns);
+        }
     }
 
     ns_init(&g_ns, CLIENT_IP, SERVER_IP, 1500);

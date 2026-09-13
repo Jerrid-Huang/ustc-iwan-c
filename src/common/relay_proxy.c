@@ -169,7 +169,20 @@ static bool rp_est_reserve(void)
     return false;
 }
 
-/* Release a reservation that rp_add() did not consume. */
+/* Release a reservation that rp_add() did not consume.
+ *
+ * R38 (R8-P2-3): the caller's `reserved` token is one-shot — rp_add()
+ * consumes it when it takes ownership and rp_conn_main()'s `out:` clears it
+ * before releasing — so this decrement runs at most once per reservation.
+ *
+ * Deliberately NOT clamped at zero: a clamp would keep the counter from
+ * going negative, but it cannot restore the cap (a success-path extra
+ * release under-counts by one per connection, so the counter sits at 0
+ * while the live set keeps growing) and it would blind the regression
+ * sentinels that detect exactly that. Keep MINEST>=0, MAXEST<=cap and
+ * REP0<=cap (WG-A3 F2 measured a double release admitting 116 concurrent
+ * connections at cap=96 while the POST probe stayed green; REP0>cap is the
+ * only client-visible signature of that class of bug). */
 static void rp_est_release(void)
 {
     atomic_fetch_sub(&g_rp_est_n, 1);
@@ -1157,10 +1170,20 @@ static bool rp_arr_add(struct rp_conn ***arr, size_t *n, size_t *cap,
  * every failure path below is exactly the rollback of that reservation, so
  * no extra release is needed. The !reserved branch keeps the historical
  * check-and-take for any future caller that has not reserved (there is
- * none today; it is kept so the function cannot silently over-admit). */
-static void rp_add(int c, int u, bool reserved)
+ * none today; it is kept so the function cannot silently over-admit).
+ *
+ * R38 (R8-P2-3): the reservation is a ONE-SHOT TOKEN and rp_add() consumes
+ * it at entry (clears the caller's flag), exactly like the ownership
+ * transfer it already documents. Without that, a future extra release
+ * written against the same flag ("the caller still thinks it owns the
+ * slot") decremented the counter once per connection and silently removed
+ * the established-set cap — see rp_est_release() below. */
+static void rp_add(int c, int u, bool *reserved)
 {
     struct rp_conn *cn;
+    bool have_slot = *reserved;
+
+    *reserved = false;   /* rp_add owns (or rolls back) the slot from here */
 
     /* R37 R1-B-2: RP_MAX_CONNS caps concurrent HANDSHAKE threads only —
      * an established-but-idle relayed connection was never bounded (600
@@ -1172,10 +1195,10 @@ static void rp_add(int c, int u, bool reserved)
      * long-lived idle sessions are legitimate. */
     /* R37 R5 (R3-L21) / R37 R7: both handlers now reserve the slot BEFORE
      * their success reply, so this branch is unreachable for the current
-     * callers (they pass reserved=true and the count they took is exactly
+     * callers (they pass have_slot=true and the count they took is exactly
      * the one rp_add owns). It is kept for a caller that has not reserved:
      * it must still refuse rather than over-admit. */
-    if (!reserved) {
+    if (!have_slot) {
         if (atomic_load(&g_rp_est_n) >= g_rp_max_est) {
             rp_note_est_full();
             port_close(c);
@@ -1818,8 +1841,9 @@ static void *rp_conn_main(void *ud)
     /* handshake done here, then hand the pair to the two GLOBAL
      * direction threads. rp_add owns (or closed) both sockets from
      * now on. R37 R7 (R3-L21): hs.reserved carries the slot taken before
-     * the success reply; rp_add consumes it. */
-    rp_add(fd, up, hs.reserved);
+     * the success reply; rp_add consumes the token (it clears the flag), so
+     * this connection can never release that slot a second time (R38 P2-3). */
+    rp_add(fd, up, &hs.reserved);
     /* M6a: success exit — this thread stops tracking the connection
      * (the global relay owns it now) */
     atomic_fetch_sub(&g_rp_conn_n, 1);
@@ -1832,9 +1856,14 @@ out:
      * rp_handle_http() returns -1, which lands here, so no handler can
      * leak the count by forgetting a release (that leak would permanently
      * refuse every later connection once it reached the cap). rp_add()
-     * owns the count on the success path, so this must NOT run then. */
-    if (hs.reserved)
+     * owns the count on the success path, so this must NOT run then.
+     * R38 (R8-P2-3): clear the one-shot token BEFORE releasing, so no
+     * second trip through this label (or any future duplicate release
+     * guarded by the same flag) can decrement g_rp_est_n twice. */
+    if (hs.reserved) {
+        hs.reserved = false;
         rp_est_release();
+    }
     /* M6a: failure exit — every path through here decrements exactly
      * once (the accept thread's increment is consumed below) */
     if (up >= 0)

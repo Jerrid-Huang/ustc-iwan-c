@@ -82,48 +82,89 @@ option(IWAN_STRICT       "Strict warning gate for project sources (src/, tests/)
 set(IWAN_STRICT_FLAGS
   -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion -Werror)
 # ---------------------------------------------------------------------------
-# Windows/LLP64 platform tier (R37 R6-WG5, closed by R37 R7).
+# Windows/LLP64 history (opened by R37 R6-WG5, closed at the source by R37 R7,
+# scaffolding deleted in R38).
 #
 # HISTORY: the seven strict flags used to produce 25 diagnostics in 7 files on
 # Windows, all of them LLP64-only (mingw `long` is 32-bit; winsock `SOCKET` is
 # uint64): 20x -Wsign-conversion + 5x -Wconversion, 0x -Wpedantic. R6-WG5
-# therefore defaulted Windows to a reduced "platform tier" (no
-# -Wconversion/-Wsign-conversion) so the win-cross gate was green.
-#
-# R37 R7 fixed all 25 at the source, so the two type-conversion flags are back
-# in the DEFAULT Windows tier and Windows now gets exactly the same documented
-# invariant as Linux:
+# therefore introduced a reduced Windows "platform tier" (no
+# -Wconversion/-Wsign-conversion) so the win-cross gate was green. R37 R7
+# fixed all 25 at the source:
 #   * `int fd` -> `struct pollfd.fd` / winsock SOCKET arguments: routed through
-#     the new PORT_FD_ARG() helper in port.h (the one place that knows the
-#     platform's spelling);
+#     PORT_FD_ARG() in port.h (the one place that knows the platform spelling);
 #   * `ai_addrlen` -> `socklen_t` and `size_t` -> `nfds_t`: explicit casts at
-#     the three/four call sites;
+#     the call sites;
 #   * `(time_t)` -> `struct timeval.tv_sec`: explicit (long) cast (value is
 #     bounded by HTTPS_POLL_MS);
 #   * port.c's `long unsigned -> long int` value changes: (long)FIONBIO at the
 #     two ioctlsocket sites (the wrapped bit pattern is what winsock
 #     documents), and _snwprintf's count is passed as the size_t it already is.
-# Verified: mingw + IWAN_STRICT=ON + IWAN_WERROR=ON builds the whole tree with
-# rc=0 and 0 diagnostics (see .cc_tmp/r37/fixes/HEAD-R7-SUMMARY.md §2).
+# R38 deleted the leftover tier scaffolding: IWAN_STRICT_FLAGS_WIN and the
+# IWAN_STRICT_WIN_LLP64 option (ON by default since R37 R7, i.e. a no-op in
+# every tree and CI leg). Windows now selects IWAN_STRICT_FLAGS exactly like
+# every other platform, so there is one list, not two. A downstream still
+# passing -DIWAN_STRICT_WIN_LLP64=... gets CMake's harmless
+# "Manually-specified variables were not used by the project" warning; the
+# effective flags are the full set (the old default). Downstreams that relied
+# on =OFF for the reduced tier must fix the diagnostic at the source instead —
+# the tier no longer exists to hide it.
 #
-# IWAN_STRICT_WIN_LLP64 is kept ONLY as a documented escape hatch for a
-# downstream that needs the old reduced tier; it now defaults ON and CI needs
-# no flag at all (adding -DIWAN_STRICT=ON to the win-cross leg is enough — do
-# NOT add IWAN_STRICT_WIN_LLP64=ON, it is the default). Delete the option and
-# the tier once no downstream sets it to OFF.
-# Scope is untouched either way: the gate is applied per target, so
-# third_party/lwip still gets only the global -Wall -Wextra.
-set(IWAN_STRICT_FLAGS_WIN
-  -Wall -Wextra -Wpedantic -Wshadow -Werror)
-option(IWAN_STRICT_WIN_LLP64
-  "Windows: also enforce -Wconversion/-Wsign-conversion (full strict tier; ON by default since R37 R7)" ON)
-# Opt-in extras (IWAN_STRICT=ON + IWAN_STRICT_EXTRA=ON): const-correctness /
-# float-equality style diagnostics that the existing code deliberately does
-# not follow (`char *argv[] = {"literal", ...}` is used throughout), so they
-# stay out of the default gate instead of being silently suppressed.
-option(IWAN_STRICT_EXTRA "Add -Wwrite-strings/-Wfloat-equal/... to IWAN_STRICT" OFF)
+# Coverage of the strict gate, stated exactly (R38 P0-5; the old comment here
+# claimed "the whole tree" on the strength of a production-only run, and told
+# readers to just add -DIWAN_STRICT=ON to the win-cross leg, which would have
+# failed on i686 and on any leg with -DBUILD_TESTING=ON):
+#   * production tree = iwan_core, iwan_oidc, iwan-client, iwan-client-oidc,
+#     iwan-server. rc=0 / 0 diagnostics on Linux gcc and clang (Release) and
+#     on mingw-w64 x86_64. Verified in R38 with
+#     `-DIWAN_STRICT=ON -DIWAN_WERROR=ON` (see .cc_tmp/r38/fixes/).
+#   * `-DBUILD_TESTING=ON` adds tests/socks_handshake_harness.c,
+#     tests/lwip_data_harness.c and tests/lwip_fairness_harness.c to the SAME
+#     per-target gate (the target list at the end of this file). "Whole tree"
+#     therefore means "production tree + those harnesses", and it needed the
+#     R38 P0-4 fix (SOCKET conversion in socks_handshake_harness.c) before it
+#     held on mingw x86_64.
+#   * mingw-w64 i686 (ILP32) additionally needed the R38 P0-3 explicit
+#     narrowings: ssize_t is `int` there, so `unsigned msg_len` assignments are
+#     sign changes that LLP64 x86_64 never sees. R37 verified x86_64 only.
+#   * CI does NOT enable IWAN_STRICT on the win-cross / win-arm64 legs today
+#     (they pass -DIWAN_WERROR=ON only), so "add -DIWAN_STRICT=ON to CI" is a
+#     coverage change, not a no-op: it must land together with the P0-3/P0-4
+#     source fixes, on every matrix entry it touches.
+# Scope is unchanged: the gate is applied per target, so third_party/lwip
+# still gets only the global -Wall -Wextra.
+#
+# Opt-in extras (IWAN_STRICT=ON + IWAN_STRICT_EXTRA=ON). These are ADVISORY:
+# const-correctness / float-equality style diagnostics the code deliberately
+# does not follow (`char *argv[] = {"literal", ...}` throughout; the 4
+# -Wfloat-equal sites are exact-value comparisons with written justifications)
+# stay out of the default gate rather than being silently suppressed. With
+# IWAN_WERROR=ON an un-demoted extras diagnostic is fatal, and the documented
+# "opt-in" switch became "turn this on and the build dies" (R38 P0-2, gcc
+# Release: 144 diagnostics — 140 discarded-qualifiers from -Wwrite-strings,
+# 4 -Wfloat-equal; clang 155, adding 12 -Wcast-align). Each extras flag is
+# therefore demoted by name, AFTER the -Werror in IWAN_STRICT_FLAGS; a bare
+# -Wno-error would also demote the base gate, which is exactly what must not
+# happen. The diagnostics are still printed — warnings, not silence.
+option(IWAN_STRICT_EXTRA "Add -Wwrite-strings/-Wfloat-equal/... to IWAN_STRICT (advisory, never fatal)" OFF)
 set(IWAN_STRICT_EXTRA_FLAGS
   -Wfloat-equal -Wcast-align -Wpointer-arith -Wwrite-strings -fno-common)
+set(IWAN_STRICT_EXTRA_NOWERROR_FLAGS
+  -Wno-error=float-equal -Wno-error=cast-align -Wno-error=pointer-arith)
+# -Wwrite-strings is a spelling both front ends accept, but the diagnostic it
+# enables is named differently, and an unknown -Wno-error=<name> target is
+# itself an error once -Werror is in effect (clang: -Wunknown-warning-option),
+# so the demotion must use the name the compiler prints:
+#   gcc   : ... discards 'const' qualifier from pointer target type [-Wdiscarded-qualifiers]
+#   clang : ... discards qualifiers [-Wincompatible-pointer-types-discards-qualifiers]
+# (Verified in R38 that gcc's -Wno-error=write-strings does NOT demote
+# -Wdiscarded-qualifiers — the per-diagnostic spelling above is required.)
+if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+  list(APPEND IWAN_STRICT_EXTRA_NOWERROR_FLAGS -Wno-error=discarded-qualifiers)
+elseif(CMAKE_C_COMPILER_ID MATCHES "Clang")
+  list(APPEND IWAN_STRICT_EXTRA_NOWERROR_FLAGS
+       -Wno-error=incompatible-pointer-types-discards-qualifiers)
+endif()
 set(IWAN_OPENSSL_DIR "" CACHE PATH "OpenSSL sysroot (include/ + lib/ or lib64/)")
 # ---------------------------------------------------------------------------
 # Global flags — the old Makefile's CFLAGS/LDFLAGS, split per platform.
@@ -433,14 +474,23 @@ function(iwan_enable_bpf)
             "${CMAKE_CURRENT_SOURCE_DIR}/src/common/steer_bpf.c"
             -o "${IWAN_STEER_DIR}/steer_bpf.o"
     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/common/steer_bpf.c"
-    COMMENT "Compiling tun steering eBPF program (clang -target bpf)")
+    COMMENT "Compiling tun steering eBPF program (clang -target bpf)" VERBATIM)
+  # Bake the two paths into a private script at configure time and invoke that
+  # script with NO arguments: a path containing a space cannot be carried as a
+  # build-recipe argument portably (-D"..." puts the quotes in the value,
+  # VERBATIM escapes them again, and Makefiles turn a positional path's space
+  # into a literal backslash). configure_file() substitutes them as string
+  # literals instead, so source dir / build dir / both may contain spaces.
+  set(IN  "${IWAN_STEER_DIR}/steer_bpf.o")
+  set(OUT "${IWAN_STEER_DIR}/steer_bpf_data.c")
+  configure_file("${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_bpf_gen.cmake.in"
+                 "${CMAKE_CURRENT_BINARY_DIR}/embed_bpf_gen.cmake" @ONLY)
   add_custom_command(
     OUTPUT "${IWAN_STEER_DIR}/steer_bpf_data.c"
-    COMMAND "${CMAKE_COMMAND}" -DIN="${IWAN_STEER_DIR}/steer_bpf.o"
-            -DOUT="${IWAN_STEER_DIR}/steer_bpf_data.c"
-            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_bpf.cmake"
+    COMMAND "${CMAKE_COMMAND}" -P
+            "${CMAKE_CURRENT_BINARY_DIR}/embed_bpf_gen.cmake"
     DEPENDS "${IWAN_STEER_DIR}/steer_bpf.o"
-            "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_bpf.cmake"
+            "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_bpf_gen.cmake.in"
     COMMENT "Embedding BPF payload (steer_bpf_data.c)")
   target_sources(iwan_core PRIVATE "${IWAN_STEER_DIR}/steer_bpf_data.c")
 endfunction()
@@ -520,18 +570,17 @@ endif()
 # built only with -DBUILD_TESTING=ON). lwip is deliberately absent: it is
 # vendored code and keeps the global -Wall -Wextra only.
 #
-# The flag LIST is platform-tiered (see the IWAN_STRICT_FLAGS_WIN block near
-# the options): non-Windows always uses the full IWAN_STRICT_FLAGS, Windows
-# uses the platform tier unless IWAN_STRICT_WIN_LLP64=ON asks for the full
-# set. The target SCOPE is identical on both — lwip never enters this loop.
+# One flag list for every platform (R38 P2-12/P2-16): non-Windows and Windows
+# both use IWAN_STRICT_FLAGS, and the extras (when enabled) are appended after
+# the -Werror it ends with, followed by their per-diagnostic -Wno-error=
+# demotions. The target SCOPE never changes — lwip never enters this loop.
 if(IWAN_STRICT)
-  if(WIN32 AND NOT IWAN_STRICT_WIN_LLP64)
-    set(_iwan_strict_flags ${IWAN_STRICT_FLAGS_WIN})
-  else()
-    set(_iwan_strict_flags ${IWAN_STRICT_FLAGS})
-  endif()
+  set(_iwan_strict_flags ${IWAN_STRICT_FLAGS})
   if(IWAN_STRICT_EXTRA)
     list(APPEND _iwan_strict_flags ${IWAN_STRICT_EXTRA_FLAGS})
+    # Must stay after IWAN_STRICT_FLAGS (which ends in -Werror) and after the
+    # extras that produce these diagnostics; see the options block above.
+    list(APPEND _iwan_strict_flags ${IWAN_STRICT_EXTRA_NOWERROR_FLAGS})
   endif()
   foreach(_tgt iwan_core iwan_oidc iwan-client iwan-client-oidc iwan-server
                socks_handshake_harness lwip_data_harness lwip_fairness_harness)
@@ -555,3 +604,28 @@ else()
     COMMAND tests/integration.sh
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 endif()
+
+# ---------------------------------------------------------------------------
+# Packaging / install: this project deliberately has NO install() rule (R38
+# P2-13). The delivery path is the CI release job, which assembles the
+# archives itself from the build tree; the binaries land in
+# CMAKE_RUNTIME_OUTPUT_DIRECTORY (<repo>/bin by default), which is the path
+# tests and CI rely on.
+#
+# Know what `cmake --install <build-dir> --prefix <dir>` does here: CMake
+# accepts it and returns 0 WITHOUT copying a single file, because
+# cmake_install.cmake has no file(INSTALL) rules to run. That silent success
+# is a fail-open trap — scripts that "install" and then package or ship the
+# prefix get an empty directory and no error. (`ninja install` / `make
+# install` do fail with "unknown target", but that is not the invocation
+# people reach for.) Until a real install() rule exists, copy the binaries
+# from bin/ explicitly, and treat a zero-exit `cmake --install` as "nothing
+# was installed", not as success.
+#
+# If a downstream does want `cmake --install` to work, adding install(TARGETS
+# ...) alone is not enough: iwan_core links against ${IWAN_OPENSSL_DIR}/lib /
+# lib64 as a non-implicit directory, so the build tree binaries carry a build
+# RPATH pointing there (CMake adds it automatically). The install rule must
+# also set CMAKE_INSTALL_RPATH / INSTALL_RPATH_USE_LINK_PATH so the staged
+# binaries do not keep a build-tree path — otherwise they only run on the
+# machine that built them.

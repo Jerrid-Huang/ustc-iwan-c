@@ -87,6 +87,16 @@ bool env_bool_value(env_bool_kind kind, const char *v, bool dflt)
                              port_strncasecmp(v, "true", 5) == 0 ||
                              port_strncasecmp(v, "yes", 4) == 0 ||
                              port_strncasecmp(v, "on", 3) == 0);
+    case ENV_BOOL_CS_NO:
+        /* IWAN_SRV_TUN_SINGLE's rule, kept value-for-value with the inline
+         * chain at its (single) read site: the LOOSE off list, but
+         * case-sensitive. Unset and set-but-empty are OFF (dflt), matching
+         * the `e && *e` guard there. Provided so the rule is named and
+         * testable rather than spelled out at the call site. */
+        if (v == NULL || *v == '\0')
+            return dflt;
+        return !(strcmp(v, "0") == 0 || strcmp(v, "false") == 0 ||
+                 strcmp(v, "no") == 0 || strcmp(v, "off") == 0);
     case ENV_KIND_NUM:
         break;   /* not a boolean; callers use env_u64()/env_ms_range() */
     }
@@ -579,10 +589,16 @@ long long env_ms_range(const char *name, long long defval, long long min,
 }
 
 /* R37 R7 WG-E: unsigned sibling of env_ms_range — same contract, same
- * warning text, and the same env_scan_u64() domain as parse_uint(). Used
- * by the userspace-stack connect timeout, whose hand-written
- * strtoul()+end-pointer block (lwip_bridge.c, R2-G1 §N3) was the last
- * numeric env parser in the tree that accepted " 1000"/"+1000". */
+ * warning text, and the same env_scan_u64() domain as parse_uint().
+ * R38 (P1-2): this function is now really called — lwip_bridge.c:569
+ * (ns_init(), IWAN_NS_CONNECT_TIMEOUT_MS, min 1000/max 300000, allow_zero
+ * deliberately 0) is its call site, and the hand-written strtoul()
+ * +end-pointer block that used to sit there (R2-G1 §N3) is gone. That
+ * block accepted " 1000"/"+1000"/"\t1000"; this one rejects them with the
+ * warning above and returns defval, because env_scan_u64() (util.h) is the
+ * env layer's only strict decimal scanner — the remaining local strtol
+ * parsers (proxy.c queue counts, server.c rate_limit_parse()) have their
+ * own narrower jobs and are not env-layer scanners. */
 uint64_t env_u64(const char *name, uint64_t defval, uint64_t min,
                  uint64_t max, int allow_zero, const char *range_desc)
 {

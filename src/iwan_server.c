@@ -142,6 +142,11 @@ static void usage(const char *prog, FILE *out)
     fprintf(out, "    non-empty value is on; IWAN_SRV_TUN_SINGLE is the exception, its\n");
     fprintf(out, "    off spellings are case-sensitive. Invalid numbers fall back to the\n");
     fprintf(out, "    default with a warning.\n");
+    fprintf(out, "    Runtime: when the IWAN_RATE_* limits drop a frame, this server\n");
+    fprintf(out, "    prints 'rate: ratedrop=<total> (+<delta>)' on stderr, at most\n");
+    fprintf(out, "    once per second (nothing while the counter does not move). That\n");
+    fprintf(out, "    line is printed in every build, including Release with\n");
+    fprintf(out, "    IWAN_DEBUG_STRIP=ON.\n");
     fprintf(out, "    Also read: SSL_CERT_FILE (the only CA file source chosen by an\n");
     fprintf(out, "    environment variable), SSL_CERT_DIR (never read as a CA directory;\n");
     fprintf(out, "    before helper exec it is only kept or dropped by owner/permission -\n");
