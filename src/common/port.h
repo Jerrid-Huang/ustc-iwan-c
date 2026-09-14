@@ -176,24 +176,37 @@ struct mmsghdr {
 
 /* ---------------- platform-typed msg_iovlen argument --------------- */
 /* struct msghdr::msg_iovlen crosses the same boundary as the fd above, but
- * with the opposite spelling problem: POSIX declares it `size_t`, while the
- * WSABUF-backed shim in the Windows branch above declares it `int` — and so
- * does Darwin, which deviates from POSIX here (XNU's struct msghdr has
- * `int msg_iovlen`, the same 32-bit field as its msghdr_x extension). A
- * plain cast to either spelling is wrong elsewhere under the strict tier:
- * int -> size_t is a sign change on LP64 POSIX, and on ILP32 mingw size_t
- * is `unsigned int`, so size_t -> int is one there too (on LLP64 it is
- * instead a 64 -> 32 narrowing). PORT_MSG_IOVLEN is the single place that
- * knows the platform's spelling, so shared call sites stay cast-free:
+ * with the opposite spelling problem. "POSIX" does NOT actually pin the
+ * field to size_t — the real widths are:
+ *   - glibc (every arch):        size_t;
+ *   - musl (every arch, incl. i386 and x86_64): int;
+ *   - Darwin/XNU:                int (struct msghdr has `int msg_iovlen`,
+ *     the same 32-bit field as its msghdr_x extension);
+ *   - the WSABUF-backed shim in the Windows branch above: int.
+ * A plain cast to either spelling is wrong on the other libc under the
+ * strict tier: int -> size_t is a sign change on LP64 POSIX, and on ILP32
+ * mingw size_t is `unsigned int`, so size_t -> int is one there too (on
+ * LLP64 it is instead a 64 -> 32 narrowing). PORT_MSG_IOVLEN is the single
+ * place that knows the platform's spelling, so shared call sites stay
+ * cast-free:
  *
  *     mh.msg_iovlen = PORT_MSG_IOVLEN(npk);
  *
  * The argument is an iovec/message count, bounded by the caller's array.
- * The _Static_asserts are the self-check: if a future edit (or a new libc)
- * changes a field's width, that platform fails HERE instead of shipping a
- * silently wrong cast that only some other toolchain's -Wsign-conversion
- * would have caught. */
-#if defined(_WIN32)
+ * The primary arm asks the FIELD for its own declared type via __typeof__
+ * (the argument is converted to exactly that type), so it carries no width
+ * assumption at all and cannot be broken by a libc that spells the field
+ * `int` instead of `size_t`. The explicit arms after it exist only for
+ * compilers without __typeof__ (e.g. MSVC); each keeps a _Static_assert
+ * self-check, so if a future edit (or a new libc) changes a field's width,
+ * that platform fails HERE instead of shipping a silently wrong cast that
+ * only some other toolchain's -Wsign-conversion would have caught. The
+ * final #else refuses to guess rather than defaulting to the old (wrong on
+ * musl) `size_t`. */
+#if defined(__GNUC__) || defined(__clang__)
+#  define PORT_MSG_IOVLEN(n) \
+       ((__typeof__(((struct msghdr *)0)->msg_iovlen))(n))
+#elif defined(_WIN32)
 #  define PORT_MSG_IOVLEN(n) ((int)(n))
 _Static_assert(sizeof(((struct msghdr *)0)->msg_iovlen) == sizeof(int),
                "Windows shim msg_iovlen must be int");
@@ -201,10 +214,16 @@ _Static_assert(sizeof(((struct msghdr *)0)->msg_iovlen) == sizeof(int),
 #  define PORT_MSG_IOVLEN(n) ((int)(n))
 _Static_assert(sizeof(((struct msghdr *)0)->msg_iovlen) == sizeof(int),
                "Darwin msghdr.msg_iovlen is int, not size_t");
-#else
+#elif defined(__linux__) && !defined(__GLIBC__)
+#  define PORT_MSG_IOVLEN(n) ((int)(n))
+_Static_assert(sizeof(((struct msghdr *)0)->msg_iovlen) == sizeof(int),
+               "musl msghdr.msg_iovlen is int, not size_t");
+#elif defined(__GLIBC__)
 #  define PORT_MSG_IOVLEN(n) ((size_t)(n))
 _Static_assert(sizeof(((struct msghdr *)0)->msg_iovlen) == sizeof(size_t),
-               "POSIX msghdr.msg_iovlen must be size_t");
+               "glibc msghdr.msg_iovlen is size_t");
+#else
+#  error "PORT_MSG_IOVLEN: unknown compiler/libc; refusing to guess msg_iovlen's type"
 #endif
 
 /* ------------------------- lifecycle ------------------------------- */

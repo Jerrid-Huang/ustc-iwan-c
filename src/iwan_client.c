@@ -1120,11 +1120,6 @@ int main(int argc, char **argv)
 #endif
     port_socket_init();   /* WSAStartup on Windows; no-op on Linux */
     util_ignore_sigpipe();
-    /* R38 OOM-hang: force libcrypto's lazy init here rather than inside the
-     * first EVP_Digest(), where an internal allocation failure hangs the
-     * process forever in futex() with no diagnostic at all. */
-    if (crypto_init() != 0)
-        oom_abort();
     prof_init();          /* IWAN_PROFILE=1: stage throughput prints */
     if (argc < 2) {
         /* clap arg_required_else_help: help on stderr, exit 2 */
@@ -1166,6 +1161,30 @@ int main(int argc, char **argv)
         fprintf(stderr, "error: unexpected argument '%s' found", sub);
         err_usage_exit(usage_full(NULL));
     }
+
+    /* R39: reject an unknown subcommand BEFORE touching libcrypto. The final
+     * `else` of the dispatch below is the historical place for this error, but
+     * it sits after crypto_init(), so a plain usage error would depend on
+     * libcrypto's allocation succeeding (visible OOM fatal instead of the rc=2
+     * usage error); on e07fe75 this path allocated nothing at all. The
+     * dispatch's own else is kept as an unreachable safety net. */
+    if (strcmp(sub, "ping") != 0 && strcmp(sub, "auth") != 0 &&
+        strcmp(sub, "proxy") != 0 && strcmp(sub, "socks") != 0) {
+        fprintf(stderr, "error: unrecognized subcommand '%s'", sub);
+        err_usage_exit(usage_full(NULL));
+    }
+
+    /* R38/R39 OOM-hang: install libcrypto's never-NULL allocator and force
+     * libcrypto initialisation *here*, not at the top of main. Everything
+     * above this point is pure CLI (--help/-V/help/argument errors) and must
+     * stay libcrypto-free: on e07fe75 those paths did zero libcrypto work,
+     * and 9fef151's top-of-main pre-warm made them initialise libcrypto and
+     * hang forever in futex() when an internal allocation failed (no
+     * diagnostic at all). No OpenSSL call is reachable before this line:
+     * every md5()/sha256()/session_key()/... call site lives inside the
+     * cmd_* functions dispatched below. */
+    if (crypto_init() != 0)
+        oom_abort();
 
     int rc = 0;
     if (strcmp(sub, "ping") == 0)

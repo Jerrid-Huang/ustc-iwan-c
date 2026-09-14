@@ -12,34 +12,94 @@
 /* 64-bit word usable on uint8_t storage without strict-aliasing UB */
 typedef uint64_t u64_may_alias __attribute__((may_alias));
 
-/* R38 OOM-hang: pre-warm libcrypto on the MAIN thread, at process start.
+/* R39 OOM-hang: libcrypto's own allocator must NEVER be allowed to see a
+ * failed allocation, so the project's visible OOM fatal is installed as the
+ * allocation callback before the library can initialise itself.
  *
- * Every digest here goes through EVP_Digest(), and libcrypto initialises
- * itself LAZILY inside that first call (OPENSSL_init_crypto ->
- * CRYPTO_THREAD_run_once -> CRYPTO_THREAD_lock_new -> CRYPTO_zalloc). If that
- * internal allocation returns NULL the once/lock state is left inconsistent
- * and the process blocks FOREVER in futex(FUTEX_WAIT) with no output and no
- * CPU use — no syscall, no abort, not even the digest() error path below can
- * run, because EVP_Digest() never returns. Reproduced under an allocation
- * fault injector (single NULL is enough; see .cc_tmp/r38/fixes/notes-judge-oom.md
- * §A6), and observed earlier in the R37 scan, so it is a libcrypto property
- * rather than a defect of our call sites.
+ * Why 9fef151 was an ineffective fix: that commit moved OPENSSL_init_crypto()
+ * into a startup helper and claimed "a failure there is reported and turned
+ * into the project's visible fatal". The claim is FALSE. Initialisation goes
+ * OPENSSL_init_crypto -> CRYPTO_THREAD_run_once -> pthread_once ->
+ * CRYPTO_THREAD_lock_new -> CRYPTO_zalloc; when that malloc returns NULL the
+ * ONCE control block is left run==done (the callback is marked finished even
+ * though it never completed), so OPENSSL_init_crypto() NEVER RETURNS — the
+ * thread blocks forever in futex(FUTEX_WAIT) — and the
+ * `if (crypto_init() != 0) oom_abort();` line after it is never reached. An
+ * injected single NULL malloc therefore produced a silent permanent hang, not
+ * a diagnostic; it also made pure-CLI paths (--help, no args, bad
+ * subcommand) initialise libcrypto at all — they did ZERO libcrypto work on
+ * e07fe75 and survived any single malloc failure there. Measured on OpenSSL
+ * 3.5.5: `FI_FAIL=malloc:1` / `#2` -> rc=124 (timeout) for --help before this
+ * change (see .cc_tmp/r39fix/logs/crypto/before.txt).
  *
- * Warming the library up BEFORE any request handling does not remove
- * libcrypto's own error handling, but it moves the initialisation into our
- * controlled startup path: a failure there is reported and turned into the
- * project's visible "allocation failed" fatal instead of an undiagnosable
- * hang, and every later digest runs with the library already initialised.
+ * The actual mechanism that removes the hang: libcrypto routes its internal
+ * allocations through the functions installed here. Ours never return NULL
+ * (a genuine OOM takes oom_abort() instead), so the once/lock state machine
+ * can no longer observe an allocation failure and can never be left
+ * inconsistent — there is nothing left to hang on. CRYPTO_set_mem_functions()
+ * must be the FIRST libcrypto call in the process: it returns 0 once the
+ * library has been initialised by any other call, and it is the only hook
+ * that covers every internal allocation. Returning 0 is fatal here (never
+ * silently continue): it means the never-NULL property is not installed
+ * while later libcrypto use could still initialise the library.
+ *
+ * Zero-size requests are deliberately grown to one byte in both wrappers:
+ * malloc(0)/realloc(p, 0) may legally return NULL (C11 7.22.3), and a NULL
+ * there would be misread as OOM by this code or by libcrypto. For realloc
+ * the alternative (free + return NULL) is worse than growing: a libcrypto
+ * caller that treats NULL as failure may free the old pointer afterwards,
+ * i.e. double-free, whereas a valid 1-byte block has entirely normal
+ * ownership. Neither case was observed on 3.5.5, but both are defended.
+ *
  * Returns 0 on success, -1 if libcrypto could not initialise. */
+static void *oomsafe_malloc(size_t n, const char *file, int line)
+{
+    void *p;
+    (void)file;   /* libcrypto's __FILE__/__LINE__ annotations: unused */
+    (void)line;
+    if (n == 0)
+        n = 1;   /* never hand a zero-size request to malloc() */
+    p = malloc(n);
+    if (!p)
+        oom_abort();
+    return p;
+}
+
+static void *oomsafe_realloc(void *q, size_t n, const char *file, int line)
+{
+    void *p;
+    (void)file;
+    (void)line;
+    if (n == 0)
+        n = 1;   /* realloc(q, 0) may free q and return NULL: grow instead */
+    p = realloc(q, n);
+    if (!p)
+        oom_abort();
+    return p;
+}
+
+static void oomsafe_free(void *p, const char *file, int line)
+{
+    (void)file;
+    (void)line;
+    free(p);   /* free(NULL) is a no-op (C11 7.22.3.3) */
+}
+
 int crypto_init(void)
 {
-    /* OPENSSL_INIT_LOAD_CRYPTO_STRINGS is implied by the default options;
-     * the explicit call is what forces initialisation now. */
+    /* MUST be first: fails (returns 0) if anything else initialised
+     * libcrypto already, and that must not be papered over. */
+    if (CRYPTO_set_mem_functions(oomsafe_malloc, oomsafe_realloc,
+                                 oomsafe_free) == 0)
+        oom_abort();
+    /* Now that allocation cannot fail, force the initialisation onto this
+     * controlled startup path: OPENSSL_INIT_LOAD_CRYPTO_STRINGS is implied
+     * by the default options; the explicit call is what runs it now. The
+     * EVP_md5()/EVP_sha256() NULL check 9fef151 added here is dropped: on
+     * this library both are branchless "return <static table address>"
+     * stubs (objdump: lea 0x...(%rip),%rax; ret) and can never be NULL, so
+     * the check was unreachable code. */
     if (OPENSSL_init_crypto(OPENSSL_INIT_LOAD_CRYPTO_STRINGS, NULL) != 1)
-        return -1;
-    /* Also force the digest table used by md5()/sha256() to be looked up
-     * once, so the first real hash cannot be the thing that initialises. */
-    if (EVP_md5() == NULL || EVP_sha256() == NULL)
         return -1;
     return 0;
 }

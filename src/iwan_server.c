@@ -1099,15 +1099,9 @@ int main(int argc, char **argv)
 
     parse_opts(argc, argv, &o);
 
-    /* R38 OOM-hang: pre-warm libcrypto before any request handling (and
-     * before the root section below, which is the earliest point that would
-     * otherwise hash). libcrypto initialises itself lazily inside the first
-     * EVP_Digest(); if that internal allocation fails the process hangs
-     * forever in futex() with no output. Warming up here keeps the failure on
-     * a controlled path where it becomes the visible OOM fatal. */
-    if (crypto_init() != 0)
-        oom_abort();
-
+    /* The argument checks below are pure string/path validation and must stay
+     * libcrypto-free: on e07fe75 an invalid --subnet/--tun/--server-ip/--dns
+     * exited rc=1 without touching libcrypto at all. */
     if (!o.no_tun && !tun_name_valid(o.tun)) {
         fprintf(stderr, "error: invalid tun device name '%s'\n", o.tun);
         return 1;
@@ -1125,6 +1119,21 @@ int main(int argc, char **argv)
         fprintf(stderr, "error: invalid subnet '%s' (want IP/MASK, mask 8-30)\n", o.subnet);
         return 1;
     }
+
+    /* R39 OOM-hang: install libcrypto's never-NULL allocator (and force init)
+     * here — immediately before the root/hash work below, which is the
+     * earliest point that reaches libcrypto. 9fef151's pre-warm did NOT fix
+     * the hang: OPENSSL_init_crypto -> CRYPTO_THREAD_run_once -> pthread_once
+     * -> CRYPTO_THREAD_lock_new -> CRYPTO_zalloc returns NULL, the once state
+     * is left finished-but-incomplete, and OPENSSL_init_crypto() never
+     * returns, so the oom_abort() after it was unreachable. The allocator
+     * installed here never returns NULL (a real OOM becomes the project's
+     * visible fatal), so libcrypto can no longer observe a failed allocation
+     * and there is nothing left to hang on. MUST be the first libcrypto call
+     * in the process; CRYPTO_set_mem_functions() returns 0 otherwise and that
+     * is fatal here rather than silently continuing unprotected. */
+    if (crypto_init() != 0)
+        oom_abort();
 
     nusers = load_users(o.users, users, SERVER_MAX_USERS);
     if (nusers < 0) {

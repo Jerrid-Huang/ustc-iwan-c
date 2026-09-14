@@ -41,11 +41,6 @@ int main(int argc, char **argv)
      * recovery for every first socket (wine: wsa 10093), and Chinese
      * output was mangled (console codepage never set to UTF-8). */
     port_socket_init();
-    /* R38 OOM-hang: same pre-warm as iwan-client — libcrypto's lazy init must
-     * not be the thing that first allocates (failure there = silent futex
-     * hang, see crypto_init's comment). */
-    if (crypto_init() != 0)
-        oom_abort();
     Opts o;
     memset(&o, 0, sizeof o);
     o.config_dir = "~/.config/iwan";
@@ -157,6 +152,20 @@ int main(int argc, char **argv)
         free(path);
         path = cpath;
     }
+
+    /* R39: install the never-NULL libcrypto allocator (and force init) only
+     * now, immediately before the first action that can reach libcrypto:
+     * oidc_fetch_config() hashes the PKCE verifier / OPENSSL_cleanse()s
+     * secrets, and oidc_load_config() verifies JWTs through EVP_DigestVerify.
+     * This used to run at the top of main, so pure-CLI paths (--help,
+     * argument/usage errors) initialised libcrypto and could hang forever in
+     * futex() on one failed internal allocation (9fef151). Everything above
+     * this line is CLI parsing + pure string/path validation: oidc_cli.c,
+     * oidc_util.c, common/config.c and the pre-fetch part of oidc_config.c
+     * contain no libcrypto call (the only OPENSSL_* symbol in oidc_config.c
+     * is inside oidc_fetch_config, below this point). */
+    if (crypto_init() != 0)
+        oom_abort();
 
     Config cf;
     memset(&cf, 0, sizeof cf);

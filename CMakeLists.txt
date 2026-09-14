@@ -491,7 +491,7 @@ function(iwan_enable_bpf)
             "${CMAKE_CURRENT_BINARY_DIR}/embed_bpf_gen.cmake"
     DEPENDS "${IWAN_STEER_DIR}/steer_bpf.o"
             "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_bpf_gen.cmake.in"
-    COMMENT "Embedding BPF payload (steer_bpf_data.c)")
+    COMMENT "Embedding BPF payload (steer_bpf_data.c)" VERBATIM)
   target_sources(iwan_core PRIVATE "${IWAN_STEER_DIR}/steer_bpf_data.c")
 endfunction()
 

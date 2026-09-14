@@ -5,15 +5,22 @@
 #include <stdint.h>
 #include "common.h"
 
-/* Pre-warm libcrypto on the calling (main) thread, at process start.
+/* Install the never-NULL libcrypto allocator (CRYPTO_set_mem_functions) and
+ * then force libcrypto initialisation on the calling thread.
  *
- * libcrypto initialises itself lazily inside the first EVP_Digest(); if that
- * internal allocation fails, the library's once/lock state is left broken and
- * the process blocks forever in futex() with no output at all. Calling this
- * early keeps the initialisation on a controlled path where the failure is
- * reported (and turned into the project's visible OOM fatal) instead of an
- * undiagnosable hang. Returns 0 on success, -1 if libcrypto could not be
- * initialised; callers are expected to treat -1 as fatal (oom_abort()). */
+ * This MUST be the first libcrypto call in the process: the setter only
+ * works before the library initialises itself (it returns 0 afterwards, and
+ * that is treated as fatal). Without it, one failed internal allocation
+ * leaves libcrypto's pthread_once state finished-but-incomplete, so
+ * initialisation never returns and the process blocks forever in futex()
+ * with no output — exactly the R38 symptom. 9fef151's pre-warm did NOT fix
+ * that: the hang happens *inside* the pre-warm, so the oom_abort() after it
+ * is never reached. With the wrapper installed libcrypto cannot observe an
+ * allocation failure at all, and a genuine OOM turns into the project's
+ * visible allocation fatal. Returns 0 on success, -1 if libcrypto could not
+ * be initialised; callers are expected to treat -1 as fatal (oom_abort()).
+ * Call it only on paths that really use libcrypto: pure-CLI paths (--help,
+ * version, argument errors) must stay libcrypto-free. */
 int crypto_init(void);
 
 void md5(const void *data, size_t len, uint8_t out[16]);
