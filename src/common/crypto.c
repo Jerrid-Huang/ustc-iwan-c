@@ -12,6 +12,38 @@
 /* 64-bit word usable on uint8_t storage without strict-aliasing UB */
 typedef uint64_t u64_may_alias __attribute__((may_alias));
 
+/* R38 OOM-hang: pre-warm libcrypto on the MAIN thread, at process start.
+ *
+ * Every digest here goes through EVP_Digest(), and libcrypto initialises
+ * itself LAZILY inside that first call (OPENSSL_init_crypto ->
+ * CRYPTO_THREAD_run_once -> CRYPTO_THREAD_lock_new -> CRYPTO_zalloc). If that
+ * internal allocation returns NULL the once/lock state is left inconsistent
+ * and the process blocks FOREVER in futex(FUTEX_WAIT) with no output and no
+ * CPU use — no syscall, no abort, not even the digest() error path below can
+ * run, because EVP_Digest() never returns. Reproduced under an allocation
+ * fault injector (single NULL is enough; see .cc_tmp/r38/fixes/notes-judge-oom.md
+ * §A6), and observed earlier in the R37 scan, so it is a libcrypto property
+ * rather than a defect of our call sites.
+ *
+ * Warming the library up BEFORE any request handling does not remove
+ * libcrypto's own error handling, but it moves the initialisation into our
+ * controlled startup path: a failure there is reported and turned into the
+ * project's visible "allocation failed" fatal instead of an undiagnosable
+ * hang, and every later digest runs with the library already initialised.
+ * Returns 0 on success, -1 if libcrypto could not initialise. */
+int crypto_init(void)
+{
+    /* OPENSSL_INIT_LOAD_CRYPTO_STRINGS is implied by the default options;
+     * the explicit call is what forces initialisation now. */
+    if (OPENSSL_init_crypto(OPENSSL_INIT_LOAD_CRYPTO_STRINGS, NULL) != 1)
+        return -1;
+    /* Also force the digest table used by md5()/sha256() to be looked up
+     * once, so the first real hash cannot be the thing that initialises. */
+    if (EVP_md5() == NULL || EVP_sha256() == NULL)
+        return -1;
+    return 0;
+}
+
 /* shared EVP one-shot digest with fatal-on-failure semantics (all hashing
  * here is fail-closed: a failed digest would silently corrupt auth, so
  * aborting is correct). `name` only feeds the error message. Callers

@@ -1120,6 +1120,11 @@ int main(int argc, char **argv)
 #endif
     port_socket_init();   /* WSAStartup on Windows; no-op on Linux */
     util_ignore_sigpipe();
+    /* R38 OOM-hang: force libcrypto's lazy init here rather than inside the
+     * first EVP_Digest(), where an internal allocation failure hangs the
+     * process forever in futex() with no diagnostic at all. */
+    if (crypto_init() != 0)
+        oom_abort();
     prof_init();          /* IWAN_PROFILE=1: stage throughput prints */
     if (argc < 2) {
         /* clap arg_required_else_help: help on stderr, exit 2 */

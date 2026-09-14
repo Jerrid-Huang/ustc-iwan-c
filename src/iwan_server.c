@@ -22,6 +22,7 @@
 #include <unistd.h>
 
 #include "common.h"
+#include "crypto.h"
 #include "profile.h"
 #include "protocol.h"
 
@@ -1097,6 +1098,15 @@ int main(int argc, char **argv)
     strcpy(o.user, "nobody");
 
     parse_opts(argc, argv, &o);
+
+    /* R38 OOM-hang: pre-warm libcrypto before any request handling (and
+     * before the root section below, which is the earliest point that would
+     * otherwise hash). libcrypto initialises itself lazily inside the first
+     * EVP_Digest(); if that internal allocation fails the process hangs
+     * forever in futex() with no output. Warming up here keeps the failure on
+     * a controlled path where it becomes the visible OOM fatal. */
+    if (crypto_init() != 0)
+        oom_abort();
 
     if (!o.no_tun && !tun_name_valid(o.tun)) {
         fprintf(stderr, "error: invalid tun device name '%s'\n", o.tun);

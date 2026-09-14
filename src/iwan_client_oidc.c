@@ -10,6 +10,7 @@
 #endif
 
 #include "common.h"
+#include "crypto.h"
 #include "oidc.h"
 #include "util.h"
 
@@ -40,6 +41,11 @@ int main(int argc, char **argv)
      * recovery for every first socket (wine: wsa 10093), and Chinese
      * output was mangled (console codepage never set to UTF-8). */
     port_socket_init();
+    /* R38 OOM-hang: same pre-warm as iwan-client — libcrypto's lazy init must
+     * not be the thing that first allocates (failure there = silent futex
+     * hang, see crypto_init's comment). */
+    if (crypto_init() != 0)
+        oom_abort();
     Opts o;
     memset(&o, 0, sizeof o);
     o.config_dir = "~/.config/iwan";

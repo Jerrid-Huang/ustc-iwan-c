@@ -5,6 +5,17 @@
 #include <stdint.h>
 #include "common.h"
 
+/* Pre-warm libcrypto on the calling (main) thread, at process start.
+ *
+ * libcrypto initialises itself lazily inside the first EVP_Digest(); if that
+ * internal allocation fails, the library's once/lock state is left broken and
+ * the process blocks forever in futex() with no output at all. Calling this
+ * early keeps the initialisation on a controlled path where the failure is
+ * reported (and turned into the project's visible OOM fatal) instead of an
+ * undiagnosable hang. Returns 0 on success, -1 if libcrypto could not be
+ * initialised; callers are expected to treat -1 as fatal (oom_abort()). */
+int crypto_init(void);
+
 void md5(const void *data, size_t len, uint8_t out[16]);
 void sha256(const void *data, size_t len, uint8_t out[32]);
 void hmac_sha256(const uint8_t *key, size_t klen,
