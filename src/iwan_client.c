@@ -605,6 +605,35 @@ static void fmt_duration(char *out, size_t sz, uint64_t ns)
                  suf);
 }
 
+/* R10 (F1-8): install libcrypto's never-NULL allocator as LATE as possible.
+ *
+ * R39 put the single crypto_init() call in main() before the subcommand
+ * dispatch, which made every usage error of an *already recognised*
+ * subcommand ("iwan-client ping" without --server) initialise libcrypto:
+ * under an injected allocation failure that turned a plain rc=2 usage error
+ * into an "out of memory" abort, and with the allocator wrapper removed it
+ * hung in futex() (e07fe75 did zero libcrypto work on those paths). The
+ * contract in crypto.h is explicit: --help, --version and argument errors
+ * must stay libcrypto-free.
+ *
+ * Every cmd_* below therefore calls this immediately after its last
+ * argument/usage check and strictly BEFORE its first libcrypto call:
+ *   cmd_ping  -> ctrl_hdr()      -> protocol.c pkt_sig()  -> md5()
+ *   cmd_auth  -> authenticate()  -> cli_common.c authenticate_ex()
+ *                                 -> protocol.c build_open() -> md5()
+ *   cmd_proxy -> wintun_ensure() -> wintun_pin.c sha256()  (_WIN32 only)
+ *                authenticate()  (Linux: the first one on this path)
+ *   cmd_socks -> authenticate()
+ * Installing it later than the first libcrypto call would reintroduce the
+ * R39 hang (CRYPTO_set_mem_functions() only has an effect while libcrypto
+ * is still uninitialised), so the position is load-bearing: keep it after
+ * the validation, never after the crypto. */
+static void crypto_init_or_die(void)
+{
+    if (crypto_init() != 0)
+        oom_abort();
+}
+
 static int cmd_ping(int argc, char **argv, int start)
 {
     CmdOpts o;
@@ -621,6 +650,8 @@ static int cmd_ping(int argc, char **argv, int start)
     char eb[64];
     if (!check_server_ip(o.server, eb, sizeof eb))
         die_invalid_address("invalid server address");
+    /* last usage check passed; next stop is ctrl_hdr() -> md5() */
+    crypto_init_or_die();
 
     int fd = udp_connect(o.server, o.port, PING_TIMEOUT_MS);
     if (fd < 0) {
@@ -688,6 +719,9 @@ static int cmd_auth(int argc, char **argv, int start)
     char eb[64];
     if (!check_server_ip(o.server, eb, sizeof eb))
         die_invalid_address("invalid server address");
+
+    /* last usage check passed; next stop is authenticate() -> md5() */
+    crypto_init_or_die();
 
     AuthResult res;
     int fd = authenticate(&o, DO_AUTH_AUTH, &res);
@@ -797,6 +831,13 @@ static int cmd_proxy(int argc, char **argv, int start)
         cleanse_str(o.ct_pass);
         return 1;
     }
+
+    /* All argument/usage checks of this subcommand are done (parse_cmd
+     * validators, --server/--pass requirements, --socks-token checks and
+     * tun_name_valid above). Everything from here on is real work, and the
+     * first libcrypto call on this path is wintun_ensure() -> sha256()
+     * (_WIN32) or authenticate() -> md5() (Linux). */
+    crypto_init_or_die();
 
     /* No pre-delete here: the TUN devices we create are non-persistent
      * (open_tun never sets TUNSETPERSIST), so the kernel removes them
@@ -982,6 +1023,8 @@ static int cmd_socks(int argc, char **argv, int start)
     if (o.allow_remote && (!o.socks_token || !*o.socks_token) &&
         !o.socks_no_token)
         err_remote_token("socks");
+    /* last usage check passed; next stop is authenticate() -> md5() */
+    crypto_init_or_die();
 
     /* keep the plaintext pass until the session ends: reconnects need
      * it to re-derive the session key (server re-OPEN keeps the IP) */
@@ -1174,17 +1217,17 @@ int main(int argc, char **argv)
         err_usage_exit(usage_full(NULL));
     }
 
-    /* R38/R39 OOM-hang: install libcrypto's never-NULL allocator and force
-     * libcrypto initialisation *here*, not at the top of main. Everything
-     * above this point is pure CLI (--help/-V/help/argument errors) and must
-     * stay libcrypto-free: on e07fe75 those paths did zero libcrypto work,
-     * and 9fef151's top-of-main pre-warm made them initialise libcrypto and
-     * hang forever in futex() when an internal allocation failed (no
-     * diagnostic at all). No OpenSSL call is reachable before this line:
-     * every md5()/sha256()/session_key()/... call site lives inside the
-     * cmd_* functions dispatched below. */
-    if (crypto_init() != 0)
-        oom_abort();
+    /* R10 (F1-8): libcrypto is NO LONGER initialised here. R39 put the
+     * crypto_init() call at this point, i.e. before the dispatch, which
+     * covers the unrecognised-subcommand error above but not the usage
+     * errors *inside* an already recognised subcommand: "iwan-client ping"
+     * without --server initialised libcrypto and then exited rc=2, so one
+     * failed internal allocation reported "out of memory" instead (and the
+     * un-wrapped negative control hung). Each cmd_* now calls
+     * crypto_init_or_die() itself, immediately after its last argument
+     * check and immediately before its first libcrypto call; the checks
+     * above (argc, --help/-V/help, dash-argument, unknown subcommand) stay
+     * libcrypto-free exactly as on e07fe75. */
 
     int rc = 0;
     if (strcmp(sub, "ping") == 0)

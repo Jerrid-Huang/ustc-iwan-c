@@ -1121,19 +1121,27 @@ int main(int argc, char **argv)
     }
 
     /* R39 OOM-hang: install libcrypto's never-NULL allocator (and force init)
-     * here — immediately before the root/hash work below, which is the
-     * earliest point that reaches libcrypto. 9fef151's pre-warm did NOT fix
-     * the hang: OPENSSL_init_crypto -> CRYPTO_THREAD_run_once -> pthread_once
-     * -> CRYPTO_THREAD_lock_new -> CRYPTO_zalloc returns NULL, the once state
-     * is left finished-but-incomplete, and OPENSSL_init_crypto() never
-     * returns, so the oom_abort() after it was unreachable. The allocator
-     * installed here never returns NULL (a real OOM becomes the project's
-     * visible fatal), so libcrypto can no longer observe a failed allocation
-     * and there is nothing left to hang on. MUST be the first libcrypto call
-     * in the process; CRYPTO_set_mem_functions() returns 0 otherwise and that
-     * is fatal here rather than silently continuing unprotected. */
-    if (crypto_init() != 0)
-        oom_abort();
+     * before the first libcrypto call, never after it. 9fef151's pre-warm did
+     * NOT fix the hang: OPENSSL_init_crypto -> CRYPTO_THREAD_run_once ->
+     * pthread_once -> CRYPTO_THREAD_lock_new -> CRYPTO_zalloc returns NULL,
+     * the once state is left finished-but-incomplete, and
+     * OPENSSL_init_crypto() never returns, so the oom_abort() after it was
+     * unreachable. The allocator installed here never returns NULL (a real
+     * OOM becomes the project's visible fatal), so libcrypto can no longer
+     * observe a failed allocation and there is nothing left to hang on.
+     * CRYPTO_set_mem_functions() returns 0 if libcrypto is already
+     * initialised, and that is fatal here rather than silently unprotected.
+     *
+     * R10 (F1-8): the call itself now sits further down, after the LAST
+     * argument check (see the --dns block below). R39 had it here, which
+     * left the --server-ip/--subnet and --dns consistency checks *after*
+     * libcrypto was initialised: those are plain argument errors and on
+     * e07fe75 they exited rc=1 without touching libcrypto. Nothing between
+     * this comment and the call below reaches libcrypto: load_users() is
+     * stdio-only, stat/getenv/strcasecmp are libc, server_ctx_init() only
+     * takes a rwlock and memsets. The first libcrypto call on this path is
+     * in the session/auth handling (server.c: CRYPTO_memcmp/md5), i.e.
+     * inside the server loop started at the bottom of main(). */
 
     nusers = load_users(o.users, users, SERVER_MAX_USERS);
     if (nusers < 0) {
@@ -1229,6 +1237,15 @@ int main(int argc, char **argv)
                             "allow it\n",
                     o.dns, subnet_net);
     }
+
+    /* R10 (F1-8): every argument check is behind us now — an invalid
+     * --subnet/--tun/--server-ip/--dns or an unreadable/over-permissive
+     * users file returns above without libcrypto, as on e07fe75. The next
+     * statement that reaches libcrypto is the session/auth handling inside
+     * the server loop below (server.c CRYPTO_memcmp/md5); the TUN/NAT/UDP
+     * setup in between is syscalls only. */
+    if (crypto_init() != 0)
+        oom_abort();
 
     if (o.no_tun) {
         printf("no-tun mode: TCP echo mirror (bench harness)\n");

@@ -228,15 +228,42 @@ static int https_te_is_chunked(const char *val)
     return ok && codings == 1;
 }
 
+/* R10: true when the n bytes at s contain a byte that must never reach the
+   wire verbatim inside a request line or a header field. CR and LF are the
+   classic request-splitting/header-injection vector (RFC 7230 3.2.4: a
+   request target and a field value carry no bare CR or LF); the rest of the
+   C0 range and DEL are rejected by the same rule because no request target,
+   hostname or header value produced by this program contains them, and one
+   uniform rule is easier to keep true than a blacklist. TAB is deliberately
+   included: RFC 7230 tolerates it only as optional whitespace around a field
+   value, the request target allows no TAB at all, and every caller here
+   passes base64url tokens / hostnames / paths, none of which need it.
+   The data comes from remote input: the Authorization value is built from
+   the token endpoint's access_token, and path/host come from jwks_uri and
+   from redirect Location headers, where a JSON "\u000d"/"\u000a" escape
+   decodes to a real CR/LF (json.c:98). */
+static bool http_ctrl_in(const char *s, size_t n)
+{
+    if (!s)
+        return false;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x20 || c == 0x7f)
+            return true;
+    }
+    return false;
+}
+
 /* Split an absolute https:// URL into malloc'd host and path. Returns 1 on
    success; 0 when the URL is not an absolute https URL (other schemes,
-   userinfo, or an explicit port are rejected). The authority ends at the
+   userinfo, an explicit port, or a control character anywhere in the
+   authority or the request target are rejected). The authority ends at the
    first '/', '?' or '#': a query must never leak into the Host header. */
 int https_url_split(const char *url, char **host_out, char **path_out)
 {
     static const char scheme[] = "https://";
-    const char *auth, *slash, *cut;
-    size_t alen;
+    const char *auth, *slash, *cut, *frag;
+    size_t alen, plen;
 
     /* strncasecmp reads exactly 8 bytes but stops at the NUL of a
      * shorter string, unlike the old per-char loop which read url[0..7]
@@ -271,16 +298,31 @@ int https_url_split(const char *url, char **host_out, char **path_out)
         return 0;
     if (memchr(auth, ':', alen))
         return 0;   /* explicit port: unsupported */
+    /* R10 (CRLF injection): reject CR/LF and the rest of the C0 range plus
+     * DEL before any allocation, so a rejected URL leaves *host_out and
+     * *path_out untouched (every caller frees them on failure). This is
+     * remote input: jwks_uri out of the discovery document and the Location
+     * header of a redirect. https_req_build() re-checks both fields, but a
+     * URL that could split the request must be refused here, at the parse
+     * site, while there is still a diagnostic that names the URL. */
+    if (http_ctrl_in(auth, alen))
+        return 0;
+    if (slash) {
+        /* strip the fragment from the request path ('#' and beyond);
+         * the query ('?') is part of the path */
+        frag = strchr(slash, '#');
+        plen = frag ? (size_t)(frag - slash) : strlen(slash);
+        if (http_ctrl_in(slash, plen))
+            return 0;
+    } else {
+        plen = 0;
+    }
     *host_out = malloc(alen + 1);
     if (!*host_out)
         oom_abort();
     memcpy(*host_out, auth, alen);
     (*host_out)[alen] = '\0';
     if (slash) {
-        /* strip the fragment from the request path ('#' and beyond);
-         * the query ('?') is part of the path */
-        const char *frag = strchr(slash, '#');
-        size_t plen = frag ? (size_t)(frag - slash) : strlen(slash);
         char *p = malloc(plen + 1);
         if (!p)
             oom_abort();
@@ -299,13 +341,44 @@ static char *empty_str(void)
 }
 
 /* Assemble the request (request line, headers, body) into *req.
- * is_get: GET with no Content-Length and no body; else POST. */
-static void https_req_build(struct sbuf *req, const char *host,
-                            const char *path, const char *body,
-                            const char *const *headers, bool is_get)
+ * is_get: GET with no Content-Length and no body; else POST.
+ *
+ * Returns 1 when the request was built, 0 when it was REFUSED: path, host
+ * and every header are checked for control characters first, and nothing is
+ * appended when one of them fails (fail closed — the caller must not send
+ * the request). The values are not logged: an offending header can be the
+ * "Authorization: Bearer <token>" line.
+ *
+ * R10 (CRLF injection): the three inputs are remote-controlled — the path
+ * comes from jwks_uri / a redirect Location, the Authorization header from
+ * the token endpoint's access_token — and appending them verbatim let a
+ * "\r\n" inside one of them start a new header on the wire (audit probe:
+ * "X-Injected-Header: pwned"). The body is NOT checked: it is written after
+ * the blank line, where CR/LF is ordinary JSON content. */
+static int https_req_build(struct sbuf *req, const char *host,
+                           const char *path, const char *body,
+                           const char *const *headers, bool is_get)
 {
     char cl[64];
 
+    if (http_ctrl_in(path, strlen(path))) {
+        log_err("HTTPS request refused: control character in the request "
+                "path");
+        return 0;
+    }
+    if (http_ctrl_in(host, strlen(host))) {
+        log_err("HTTPS request refused: control character in the host name");
+        return 0;
+    }
+    if (headers) {
+        for (int i = 0; headers[i]; i++) {
+            if (http_ctrl_in(headers[i], strlen(headers[i]))) {
+                log_err("HTTPS request refused: control character in a "
+                        "request header");
+                return 0;
+            }
+        }
+    }
     if (!body)
         body = "";
     snprintf(cl, sizeof cl, "Content-Length: %llu",
@@ -330,6 +403,7 @@ static void https_req_build(struct sbuf *req, const char *host,
     sbuf_app(req, "\r\n", 2);
     if (!is_get)
         sbuf_app(req, body, strlen(body));
+    return 1;
 }
 
 /* Fetch the first OpenSSL error from the queue as a single-line string
@@ -1694,7 +1768,16 @@ static bool https_roundtrip(const char *host, const char *path,
             break;
         }
 
-        https_req_build(&req, cur_host, cur_path, body, cur_headers, is_get);
+        /* R10: a refused build (control character in path/host/header —
+         * the token endpoint or a redirect handed us CR/LF) must never
+         * reach the transport. req is still empty here, but free it
+         * anyway so the ownership rule is the same on every exit. */
+        if (!https_req_build(&req, cur_host, cur_path, body, cur_headers,
+                             is_get)) {
+            free(req.d);
+            failed = 1;
+            break;
+        }
         if (!https_transport(cur_host, &req, &resp, deadline)) {
             failed = 1;
             break;

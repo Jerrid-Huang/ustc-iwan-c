@@ -404,12 +404,50 @@ static void check_csrf_state(const char *cb_state, const char *saved,
                  "state (OIDC Core 3.1.2.1 CSRF check failed)");
 }
 
-/* pull the access_token out of the token response; dies when absent */
+/* R10 (CRLF injection): the access_token is pasted verbatim into
+ * "Authorization: Bearer %s" (see oidc_ctrl_post) and sent to the controller
+ * host, so its character set is a security boundary, not cosmetics: a CR/LF
+ * inside it would start a new header on the wire (the audit probe injected
+ * "X-Injected-Header: pwned" that way). RFC 6750 2.1 defines the token as
+ *     b64token = 1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"="
+ * i.e. at least one base64url/base64 character, optionally padded with '='.
+ * Anything else is refused. Deliberately hand-rolled instead of isalnum():
+ * that is locale- and sign-dependent for bytes >= 0x80. */
+static bool oidc_b64token_ok(const char *s)
+{
+    size_t i = 0;
+
+    if (!s || !s[0])
+        return false;
+    for (; s[i]; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '=')
+            break;   /* padding starts: nothing but '=' may follow */
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' ||
+              c == '~' || c == '+' || c == '/'))
+            return false;
+    }
+    if (i == 0)
+        return false;   /* "*=" alone: RFC 6750 requires 1*(...) first */
+    for (; s[i]; i++)
+        if (s[i] != '=')
+            return false;
+    return true;
+}
+
+/* pull the access_token out of the token response; dies when absent or when
+ * it is not an RFC 6750 b64token (the value goes into a request header, so a
+ * malformed one must fail closed rather than be forwarded) */
 static char *take_access_token(Json *tok)
 {
     const char *at = json_get_str(tok, "access_token");
     if (!at)
         oidc_die("no access_token");
+    /* the offending value is NOT echoed: it is a bearer credential */
+    if (!oidc_b64token_ok(at))
+        oidc_die("access_token is not a valid RFC 6750 b64token "
+                 "(refusing to build an Authorization header from it)");
     return xstrdup(at);
 }
 
