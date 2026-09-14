@@ -200,6 +200,17 @@ static void parse_opts(int argc, char **argv, struct opts *o)
             snprintf(o->server_ip, sizeof o->server_ip, "%s", optarg);
             break;
         case 'S':
+            /* R38-C4-2, same family as the -s/-d/-t/-u guards: the longest
+             * legal subnet is "255.255.255.255/30" (18 chars), so anything
+             * that does not fit 'o->subnet' is invalid input that snprintf
+             * would silently TRUNCATE — and the truncated form could then be
+             * ACCEPTED by parse_subnet() when the cut landed on a valid
+             * prefix. The guard turns "silently accepted garbage" into a
+             * usage error, matching every sibling option above. */
+            if (strlen(optarg) >= sizeof o->subnet)
+                usage_error(argv[0],
+                            "error: subnet too long: '%s' (max %zu)",
+                            optarg, sizeof o->subnet - 1);
             snprintf(o->subnet, sizeof o->subnet, "%s", optarg);
             break;
         case 'd':

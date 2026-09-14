@@ -39,6 +39,29 @@
  * workarounds for riscv64/i686 musl cross builds; those attributes now
  * live on the shared implementation in util.c. */
 
+/* R38-C4-4: remaining milliseconds until `deadline` from ONE clock read.
+ *
+ * The deadline checks used to read the clock twice — once for the
+ * `now_ms() >= deadline_ms` test and again for the `deadline_ms - now_ms()`
+ * subtraction. The clock can cross the deadline in between, and because both
+ * values are uint64_t the subtraction then UNDERFLOWS to ~1.8e19, which is
+ * armed as SO_RCVTIMEO/SO_SNDTIMEO (and, at the poll site, truncated to a
+ * negative int). Measured effect: a single connect blocking ~25 s instead of
+ * the configured timeout, i.e. far past HTTPS_TIMEOUT_MS. One read removes
+ * the window by construction.
+ *
+ * Returns 0 once the deadline has passed, and callers MUST keep their
+ * `now >= deadline` test before arming a timeout: 0 means "already expired",
+ * not "wait forever", and passing 0 to setsockopt would do the latter on
+ * some platforms. */
+static uint64_t https_remain_ms(uint64_t deadline, uint64_t *now_out)
+{
+    uint64_t now = now_ms();
+    if (now_out != NULL)
+        *now_out = now;
+    return now < deadline ? deadline - now : 0;
+}
+
 static long hex_parse_sz(const char *s, size_t n)
 {
     long v = 0;
@@ -859,7 +882,8 @@ static int https_connect_tcp(const char *host, uint16_t port,
         if (npfd == 0)
             break;   /* both lanes between attempts or exhausted */
         {
-            uint64_t remain = deadline_ms - now_ms();
+            /* one clock read (R38-C4-4): see https_remain_ms */
+            uint64_t remain = https_remain_ms(deadline_ms, NULL);
             int to = remain > HTTPS_POLL_MS ? (int)HTTPS_POLL_MS
                                             : (int)remain;
 
@@ -1032,11 +1056,14 @@ static int https_tls_connect(SSL *ssl, int fd, uint64_t deadline_ms,
         if (verify_err)
             *verify_err = X509_V_OK;
 
-        if (now_ms() >= deadline_ms) {
-            snprintf(diag, diagsz, "TLS handshake timed out");
-            return -1;
+        {
+            uint64_t now;
+            remain = https_remain_ms(deadline_ms, &now);
+            if (now >= deadline_ms) {
+                snprintf(diag, diagsz, "TLS handshake timed out");
+                return -1;
+            }
         }
-        remain = deadline_ms - now_ms();
         if (https_set_io_timeo(fd, SO_RCVTIMEO, remain) != 0 ||
             https_set_io_timeo(fd, SO_SNDTIMEO, remain) != 0) {
             snprintf(diag, diagsz, "cannot arm socket timeout: %s",
@@ -1109,11 +1136,14 @@ static int https_tls_write(SSL *ssl, int fd, const char *req,
         uint64_t remain;
         int w;
 
-        if (now_ms() >= deadline_ms) {
-            snprintf(diag, diagsz, "timed out sending request");
-            return -1;
+        {
+            uint64_t now;
+            remain = https_remain_ms(deadline_ms, &now);
+            if (now >= deadline_ms) {
+                snprintf(diag, diagsz, "timed out sending request");
+                return -1;
+            }
         }
-        remain = deadline_ms - now_ms();
         if (https_set_io_timeo(fd, SO_SNDTIMEO, remain) != 0) {
             snprintf(diag, diagsz, "cannot arm send timeout: %s",
                      strerror(errno));
@@ -1230,11 +1260,14 @@ static int https_tls_read(SSL *ssl, int fd, struct sbuf *resp,
                      (unsigned)(HTTPS_MAX_RESP >> 20));
             return -1;
         }
-        if (now_ms() >= deadline_ms) {
-            snprintf(diag, diagsz, "timed out waiting for response");
-            return -1;
+        {
+            uint64_t now;
+            remain = https_remain_ms(deadline_ms, &now);
+            if (now >= deadline_ms) {
+                snprintf(diag, diagsz, "timed out waiting for response");
+                return -1;
+            }
         }
-        remain = deadline_ms - now_ms();
         if (https_set_io_timeo(fd, SO_RCVTIMEO, remain) != 0) {
             snprintf(diag, diagsz, "cannot arm receive timeout: %s",
                      strerror(errno));
