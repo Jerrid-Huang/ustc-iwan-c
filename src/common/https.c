@@ -243,7 +243,20 @@ static int https_te_is_chunked(const char *val)
  * framing on top of them, so cutting at CL truncates the chunk stream
  * and the downstream chunk_decode hard-fails ("chunked body truncated",
  * observed e.g. for CL:0 which returned at the "declared empty body"
- * check with an empty, non-chunked "body"). */
+ * check with an empty, non-chunked "body").
+ *
+ * R14 (R13-A4-1): obs-fold continuation lines — "Transfer-Encoding:\r\n
+ * chunked" (RFC 7230 §3.2.4 old-style folding) — are folded into the
+ * value exactly as the parse side already does (https_hdr_value folds
+ * them, https_te_is_chunked then accepts "chunked").  Before this the
+ * first line carried an empty value, so the helper answered "not
+ * chunked" while the parser saw "chunked": framing (CL-count early
+ * exit) and parsing (chunked, truncated) disagreed and a real chunked
+ * body was cut at the bogus CL.  http_ctrl_in() does not gate this
+ * path — it guards only OUTGOING request components (auth/path/host/
+ * request headers) — and obs-fold in a locally-consumed response is
+ * legitimate old syntax, so there is no CRLF conflict: this is purely
+ * folding, the value itself never reaches the wire. */
 static bool https_te_header_chunked(const char *hdrs, size_t hlen)
 {
     static const char te[] = "Transfer-Encoding:";
@@ -255,31 +268,81 @@ static bool https_te_header_chunked(const char *hdrs, size_t hlen)
             eol++;
         if (eol - i >= sizeof te - 1 &&
             port_strncasecmp(hdrs + i, te, sizeof te - 1) == 0) {
-            const char *p = hdrs + i + sizeof te - 1;
-            size_t vlen = eol - (i + sizeof te - 1);
+            struct sbuf v = {0};
+            const char *p;
+            size_t vlen;
+            size_t j = eol;
+            bool yes = false;
+
+            sbuf_app(&v, hdrs + i + sizeof te - 1,
+                     eol - (i + sizeof te - 1));
+            /* obs-fold continuation lines (RFC 7230 §3.2.4): a line that
+             * starts with SP/TAB continues the previous field.  Fold each
+             * trimmed fragment after one space, exactly as https_hdr_value
+             * does, so framing and parsing agree.  Like that parser, an
+             * empty line (end of the header block) or a normal field line
+             * terminates the fold. */
+            if (j < hlen && hdrs[j] == '\r')
+                j++;             /* consume exactly the TE line CRLF... */
+            if (j < hlen && hdrs[j] == '\n')
+                j++;             /* ...so a following blank line survives */
             for (;;) {
-                size_t n;
+                size_t leol;
+                if (j >= hlen)
+                    break;
+                leol = j;
+                while (leol < hlen && hdrs[leol] != '\r' &&
+                       hdrs[leol] != '\n')
+                    leol++;
+                if (leol == j || (hdrs[j] != ' ' && hdrs[j] != '\t'))
+                    break;   /* blank line or a new field line: stop */
+                p = hdrs + j;
+                vlen = leol - j;
                 while (vlen && (*p == ' ' || *p == '\t')) {
                     p++;
                     vlen--;
                 }
-                n = 0;
-                while (n < vlen && p[n] != ',' && p[n] != ';' &&
-                       p[n] != ' ' && p[n] != '\t')
-                    n++;
-                if (n == 7 && port_strncasecmp(p, "chunked", 7) == 0)
-                    return true;
-                /* skip past this coding (and its ;parameters) */
-                while (vlen && *p != ',') {
-                    p++;
+                if (vlen) {
+                    sbuf_app(&v, " ", 1);
+                    sbuf_app(&v, p, vlen);
+                }
+                j = leol;
+                if (j < hlen && hdrs[j] == '\r')
+                    j++;
+                if (j < hlen && hdrs[j] == '\n')
+                    j++;
+            }
+            /* token scan over the (folded) value — unchanged semantics */
+            p = v.d;
+            vlen = v.len;
+            if (p) {
+                for (;;) {
+                    size_t n;
+                    while (vlen && (*p == ' ' || *p == '\t')) {
+                        p++;
+                        vlen--;
+                    }
+                    n = 0;
+                    while (n < vlen && p[n] != ',' && p[n] != ';' &&
+                           p[n] != ' ' && p[n] != '\t')
+                        n++;
+                    if (n == 7 && port_strncasecmp(p, "chunked", 7) == 0) {
+                        yes = true;
+                        break;
+                    }
+                    /* skip past this coding (and its ;parameters) */
+                    while (vlen && *p != ',') {
+                        p++;
+                        vlen--;
+                    }
+                    if (!vlen)
+                        break;
+                    p++;            /* consume ',' */
                     vlen--;
                 }
-                if (!vlen)
-                    break;
-                p++;            /* consume ',' */
-                vlen--;
             }
-            return false;
+            free(v.d);
+            return yes;
         }
         i = eol;
         while (i < hlen && (hdrs[i] == '\r' || hdrs[i] == '\n'))
