@@ -658,6 +658,9 @@ static int https_ctx_load_cas(SSL_CTX *ctx)
         char ebuf[256];
         int aerr;
 
+        /* R14 (R13-B1-L2): clear the residual queue first so a failed
+         * load is attributed to THIS call, not a stale SSL error. */
+        ERR_clear_error();
         if (SSL_CTX_load_verify_locations(ctx, ca, NULL) == 1)
             return 0;
         https_ssl_err(ebuf, sizeof ebuf);
@@ -697,6 +700,7 @@ static int https_ctx_load_cas(SSL_CTX *ctx)
 
         if (access(cands[i], R_OK) != 0)
             continue;   /* not installed here: try the next candidate */
+        ERR_clear_error();   /* R14 (R13-B1-L2): same residual-queue rule */
         if (SSL_CTX_load_verify_locations(ctx, cands[i], NULL) == 1) {
             if (ca)
                 log_info("HTTPS: falling back to system CA bundle '%s'",
@@ -1794,6 +1798,7 @@ static bool https_transport(const char *host, struct sbuf *req,
     SSL *ssl = NULL;
     int fd = -1;
     bool ok = false;
+    bool connected = false;   /* R14 (R13-B1-L3): handshake completed */
 
     if (debug_enabled())
         log_debug("https_transport: %s start (deadline %llu ms)",
@@ -1836,6 +1841,10 @@ static bool https_transport(const char *host, struct sbuf *req,
         if (debug_enabled())
             log_debug("https_transport: %s connected fd=%d", host, fd);
 
+        /* R14 (R13-B1-L2): clear the residual queue so a failure here is
+         * attributed to THIS SSL_new (or https_ssl_new's SSL_set_*), not
+         * to a stale error left by an earlier operation in the process. */
+        ERR_clear_error();
         ssl = https_ssl_new(ctx, fd, host);
         if (!ssl) {
             https_ssl_err(diag, sizeof diag);
@@ -1864,6 +1873,7 @@ static bool https_transport(const char *host, struct sbuf *req,
                 }
                 goto out;
             }
+            connected = true;
         }
         if (https_tls_write(ssl, fd, req->d, req->len, deadline_ms, diag,
                             sizeof diag) != 0)
@@ -1882,8 +1892,22 @@ out:
     if (req->d && req->len)
         OPENSSL_cleanse(req->d, req->len);
     free(req->d);
-    if (ssl)
+    if (ssl) {
+        /* R14 (R13-B1-L3): send close_notify so a connection that got as
+         * far as a completed handshake ends with a clean FIN instead of
+         * an RST (a server logging close_notify warnings no longer
+         * sees one per request).  Only the first SSL_shutdown phase runs
+         * — it writes close_notify; awaiting the peer's echo could stall,
+         * so the socket timeouts are capped to 1 s for this write and
+         * the result is discarded (close() still flushes the record). */
+        if (connected) {
+            https_set_io_timeo(fd, SO_SNDTIMEO, 1000);
+            https_set_io_timeo(fd, SO_RCVTIMEO, 1000);
+            ERR_clear_error();
+            (void)SSL_shutdown(ssl);
+        }
         SSL_free(ssl);
+    }
     /* ctx is process-cached (https_ctx_get): never freed here */
     if (fd >= 0)
         port_close(fd);
