@@ -146,6 +146,10 @@ WORK=$(mktemp -d)
 exec > >(tee "$OUT") 2>&1
 
 SERVER_PID=""; CLI_PIDS=""; BENCH_PIDS=""; BENCH_SRV_PID=""; INPUT_RULE_SRV=0
+# R18-2: any bench_client that dies mid-window (or the whole data plane
+# going dark) must abort the run like bench.sh — not print a fake
+# "0 Mbit/s TOTAL" with exit 0.
+BENCH_RC=0
 
 cleanup() {
     set +e
@@ -359,7 +363,15 @@ for C in $CLIENTS_LIST; do
         done
         echo "proxy threads during window: $thr"
     fi
-    wait $BENCH_PIDS 2>/dev/null || true
+    # R18-2: `wait ... || true` swallowed every bench_client failure, so a
+    # data plane that was dead for the whole window still printed
+    # "TOTAL: 0 Mbit/s aggregate" + "BENCH MULTI DONE" and exited 0.
+    # wait returns the last client's status; record it and let the AGG
+    # check below turn a failure into exit 1 (same contract as bench.sh,
+    # where bench_client's non-zero exit propagates via set -e).
+    if ! wait $BENCH_PIDS 2>/dev/null; then
+        BENCH_RC=1
+    fi
     cpu1=$(srv_ticks)
     st1=$(awk '/^cpu / {print $2 + $3 + $4 + $5 + $6 + $7 + $8 + $9 + $10 + $11}' /proc/stat)
     id1=$(awk '/^cpu / {print $5}' /proc/stat)
@@ -398,22 +410,43 @@ for C in $CLIENTS_LIST; do
     fi
     if [ "$PROXY_MODE" = 1 ]; then
         v=$(grep '^AGG' "$WORK/bench.out" | sed -n \
-            's/.*= \([0-9][0-9]*\) Mbit\/s aggregate.*/\1/p')
-        [ -n "$v" ] || v=0
+            's/.*= \([0-9][0-9]*\) Mbit\/s aggregate.*/\1/p' || true)
+        # R18-2: a missing/zero aggregate used to be silently coerced to 0
+        # ("proxy conns=4: 0 Mbit/s aggregate") and the run still passed.
+        # A dead data plane must fail the script instead.
+        if [ -z "$v" ] || [ "$v" -eq 0 ] || [ "$BENCH_RC" != 0 ]; then
+            echo "error: no/zero aggregate throughput in proxy bench (data plane failed)" >&2
+            exit 1
+        fi
         echo "proxy conns=$C: $v Mbit/s aggregate"
     else
         total=0
+        missing=0
         for i in $(seq 1 "$C"); do
             # "AGG up: 1879.8 MB in 5.00s = 3007 Mbit/s aggregate"
             v=$(grep '^AGG' "$WORK/bench$i.out" | sed -n \
-                's/.*= \([0-9][0-9]*\) Mbit\/s aggregate.*/\1/p')
-            [ -n "$v" ] || v=0
-            echo "client $i: $v Mbit/s"
-            total=$((total + v))
+                's/.*= \([0-9][0-9]*\) Mbit\/s aggregate.*/\1/p' || true)
+            if [ -n "$v" ]; then
+                echo "client $i: $v Mbit/s"
+                total=$((total + v))
+            else
+                missing=1
+                echo "client $i: no aggregate line (data plane failed)" >&2
+            fi
         done
+        # R18-2: `[ -n "$v" ] || v=0` used to paper over an absent AGG
+        # line with a fake 0, and nothing checked the clients' exit
+        # status — a completely dead bench still reported
+        # "TOTAL: 0 Mbit/s aggregate" + "BENCH MULTI DONE", exit 0.
+        # Now a missing aggregate, a zero total, or any client failure
+        # aborts with exit 1 (bench.sh contract).
+        if [ "$missing" = 1 ] || [ "$total" -eq 0 ] || [ "$BENCH_RC" != 0 ]; then
+            echo "error: aggregate throughput 0/missing (bench clients failed); aborted like bench.sh" >&2
+            exit 1
+        fi
         echo "TOTAL ($C clients): $total Mbit/s aggregate"
         # client-side send stalls (UDP sndbuf full) visible in cli logs
-        ne=$(grep -l "EAGAIN" "$WORK"/cli*.log 2>/dev/null | wc -l)
+        ne=$(grep -l "EAGAIN" "$WORK"/cli*.log 2>/dev/null | wc -l || true)
         [ "$ne" -gt 0 ] && echo "WARN: $ne client(s) hit UDP send EAGAIN"
     fi
 
