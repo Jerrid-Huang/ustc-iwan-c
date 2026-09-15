@@ -99,24 +99,38 @@ static void ps_squote(char *out, size_t cap, const char *src)
     out[o] = 0;
 }
 
-/* run a command and capture its stdout (line-oriented use only) */
-static char *ps_capture(const char *ps_expr){
+/* run a command and capture its stdout (line-oriented use only).
+ *
+ * R18-1: the result must participate in the caller's failure decision.
+ * *ps_rc (optional) receives 0 on success and 1 on ANY failure — a
+ * non-zero PowerShell exit status (every command below runs under
+ * $ErrorActionPreference='Stop' and ends with `; exit $LASTEXITCODE`,
+ * so a cmdlet error really turns into a non-zero process exit), a
+ * spawn failure, or an out-of-memory condition.  On success the
+ * returned buffer is malloc'd (possibly empty) and is now the CALLER's
+ * to free; on failure NULL is returned.  stderr is folded into the
+ * captured stream (2>&1) so an error report is visible to the caller. */
+static char *ps_capture(const char *ps_expr, int *ps_rc){
     /* +64 covers the wrapper below, so any expression built into a
      * PS_CMD_MAX buffer fits; a longer one is reported, not truncated. */
     char cmd[PS_CMD_MAX + 64];
     int n = snprintf(cmd, sizeof cmd,
-                     "powershell -NoProfile -Command \"%s\"", ps_expr);
+                     "powershell -NoProfile -Command \"%s\" 2>&1", ps_expr);
     if (n < 0 || (size_t)n >= sizeof cmd) {
         log_err("internal error: PowerShell command line too long (%d bytes)", n);
+        if (ps_rc) *ps_rc = 1;
         return NULL;
     }
     FILE *p = _popen(cmd, "r");
-    if (!p)
+    if (!p) {
+        if (ps_rc) *ps_rc = 1;
         return NULL;
+    }
     size_t cap = 4096, len = 0;
     char *buf = malloc(cap);
     if (!buf) {
         _pclose(p);
+        if (ps_rc) *ps_rc = 1;
         return NULL;
     }
     buf[0] = '\0';   /* FIND-W-2: a child with no stdout leaves the malloc'd
@@ -136,7 +150,11 @@ static char *ps_capture(const char *ps_expr){
         memcpy(buf + len, line, ll + 1);
         len += ll;
     }
-    _pclose(p);
+    /* _pclose returns the command interpreter's exit status (-1 when it
+     * cannot be reaped: treat that as a failure as well). */
+    int rc = _pclose(p);
+    if (ps_rc)
+        *ps_rc = (rc == 0) ? 0 : 1;
     return buf;
 }
 
@@ -233,30 +251,74 @@ int wintun_ensure(void)
     }
 
     char cmd[PS_CMD_MAX];
+    int rc = 1;
     char zipq[PS_PATH_MAX], tmpq[PS_PATH_MAX];
     ps_squote(zipq, sizeof zipq, zip);
     ps_squote(tmpq, sizeof tmpq, tmpdir);
     /* FIND-W-1: the two %s slots were reversed — the URL wants the
      * VERSION (wintun-%s.zip), -OutFile wants the local zip path. As
-     * written, every download produced a 404 URL + a file named "0.14.1" */
+     * written, every download produced a 404 URL + a file named "0.14.1".
+     * R18-1: the old command opened with a parenthesized expression and
+     * appended the named parameter outside it — "(Invoke-WebRequest …)
+     * -OutFile '…'" — which is a PARSE error in PowerShell (after a
+     * closed `)` only an operator, `.`/`::` member access, `[ ]`
+     * indexing, `( )` invocation or a pipe/redirection may follow; a
+     * named parameter token cannot.  Verified against PowerShell:
+     * "Unexpected token '-OutFile' in expression or statement.").
+     * Command-first form is legal, and
+     * $ErrorActionPreference='Stop' makes a cmdlet failure a TERMINATING
+     * error so the process (whose status _pclose() returns) exits
+     * non-zero instead of PowerShell silently exiting 0. */
     n = snprintf(cmd, sizeof cmd,
-                 "(Invoke-WebRequest -UseBasicParsing '" WINTUN_ZIP_FMT "')"
-                 " -OutFile '%s'", ver, zipq);
+                 "$ErrorActionPreference='Stop'; Invoke-WebRequest"
+                 " -UseBasicParsing '" WINTUN_ZIP_FMT "' -OutFile '%s';"
+                 " exit $LASTEXITCODE", ver, zipq);
     if (n < 0 || (size_t)n >= sizeof cmd) {
         log_err("internal error: PowerShell download command too long");
         return -1;
     }
     log_info("downloading wintun-%s.zip ...", ver);
-    ps_capture(cmd);
+    char *dlout = ps_capture(cmd, &rc);
+    /* R18-1: the caller's decision must use ps_capture()'s result — the
+     * old code discarded it, so a parse-error'd / failed download raced
+     * on to Expand-Archive and then mis-reported "zip does not contain
+     * bin\amd64\wintun.dll".  Check the exit status AND the produced zip
+     * (the file check is the ground truth the download exists to serve). */
+    if (rc != 0) {
+        log_err("PowerShell failed to download %s (pinned wintun build); "
+                "auto-install aborted (%s)", zip, manual);
+        if (dlout && dlout[0])
+            log_err("PowerShell output: %s", dlout);
+        free(dlout);
+        return -1;
+    }
+    free(dlout);
+    if (!file_exists(zip)) {
+        log_err("download did not produce %s; auto-install aborted (%s)",
+                zip, manual);
+        return -1;
+    }
 
     n = snprintf(cmd, sizeof cmd,
-                 "Expand-Archive -Path '%s' -DestinationPath '%s' -Force",
-                 zipq, tmpq);
+                 "$ErrorActionPreference='Stop'; Expand-Archive"
+                 " -Path '%s' -DestinationPath '%s' -Force;"
+                 " exit $LASTEXITCODE", zipq, tmpq);
     if (n < 0 || (size_t)n >= sizeof cmd) {
         log_err("internal error: PowerShell expand command too long");
         return -1;
     }
-    ps_capture(cmd);
+    char *exout = ps_capture(cmd, &rc);
+    if (rc != 0) {
+        log_err("PowerShell failed to extract %s; auto-install aborted "
+                "(%s)", zip, manual);
+        if (exout && exout[0])
+            log_err("PowerShell output: %s", exout);
+        free(exout);
+        DeleteFileA(zip);          /* best-effort temp cleanup */
+        RemoveDirectoryA(tmpdir);
+        return -1;
+    }
+    free(exout);
 
     char src[PS_PATH_DERIVED_MAX];
     /* Expand-Archive preserves the zip's top-level wintun/ folder */
@@ -284,6 +346,11 @@ int wintun_ensure(void)
     if (!MoveFileA(src, dll)) {
         log_err("cannot move %s -> %s (error %lu)", src, dll,
                 (unsigned long)GetLastError());
+        /* R18-1/T3: this failure branch used to leak the downloaded zip
+         * and the extracted DLL in tmpdir — mirror the pin-mismatch
+         * branch above and clean them up best-effort. */
+        DeleteFileA(src);
+        DeleteFileA(zip);
         return -1;
     }
 
