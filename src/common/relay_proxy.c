@@ -188,6 +188,12 @@ static void rp_est_release(void)
     atomic_fetch_sub(&g_rp_est_n, 1);
 }
 
+/* R12-T2 (R41-3-1): data-plane liveness gate for the SUCCESS reply.
+ * Defined below (needs the g_rp_gen/g_rp_dir_dead_gen globals); declared
+ * here so rp_handle_socks()/rp_handle_http() can refuse BEFORE rep=0/200
+ * goes out. */
+static bool rp_plane_dead(void);
+
 /* ---- handshake watchdog (M6b) ----
  * RP_HANDSHAKE_TIMEOUT_MS remains the ceiling for a SINGLE poll, but
  * a slow sender could previously renew that window forever and pin a
@@ -885,6 +891,18 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
              * on success. Reply rep=0 only now that the slot is held, so
              * "success" can no longer be taken back. */
             hs->reserved = true;
+            /* R12-T2 (R41-3-1): the reservation gates the cap-full
+             * cause only; a DEAD data plane is the second way rp_add()
+             * refuses after the reply. Refuse with rep=1 before any
+             * rep=0 goes out — answering "established" and then closing
+             * is the lie the review measured. `out:` rolls the
+             * reservation back (hs->reserved is already set). */
+            if (rp_plane_dead()) {
+                rp_note_plane_down();
+                rp_socks_reply(fd, 1, hs);
+                port_close(up);
+                return -1;
+            }
             rp_socks_reply(fd, 0, hs);
             /* R37 R6 (K-5): rp_send_full, not a bare port_send. The
              * upstream socket is blocking here, so the old check could
@@ -1014,6 +1032,18 @@ static int rp_handle_http(int fd, const uint8_t *first, size_t first_n,
      * the 200/forward bytes go out; every failure below is rolled back by
      * rp_conn_main's `out:` label, success is consumed by rp_add(). */
     hs->reserved = true;
+    /* R12-T2 (R41-3-1): dead-plane gate, same as the SOCKS path — refuse
+     * 503 BEFORE any success (200 / forwarded request) bytes go out,
+     * since rp_add() would refuse immediately after them otherwise.
+     * `out:` rolls the reservation back. */
+    if (rp_plane_dead()) {
+        static const char busy[] = "HTTP/1.1 503 Service Unavailable\r\n"
+                                   "Content-Length: 0\r\n\r\n";
+        rp_note_plane_down();
+        port_close(up);
+        (void)rp_send_full(hs, fd, busy, sizeof busy - 1);
+        return -1;
+    }
     if (is_connect) {
         static const char ok[] =
             "HTTP/1.1 200 Connection Established\r\n\r\n";
@@ -1145,6 +1175,33 @@ atomic_uint_fast64_t g_prof_rp_up_recv, g_prof_rp_up_send;
 atomic_uint_fast64_t g_prof_rp_dn_recv, g_prof_rp_dn_send;
 atomic_uint_fast64_t g_prof_rp_pend;   /* bytes appended to pend */
 atomic_uint_fast64_t g_prof_rp_iters, g_prof_rp_poll0;   /* TEMP loop */
+
+/* R12-T2 (R41-3-1): has the current relay instance's data plane already
+ * died? A direction thread writes g_rp_dir_dead_gen under g_rp_mu in its
+ * cleanup:; rp_add() checks it while registering, but by then the success
+ * reply (rep=0 / 200) went out — answering "established" right before
+ * closing is the lie the review measured (LIE_COUNT(rep0_then_EOF) 6/6).
+ * The existing reservation gates only the cap-full cause; this gate
+ * closes the dead-plane cause at the SAME point (before the success
+ * reply): the caller sends an honest failure reply instead.
+ *
+ * The read takes g_rp_mu — the marker's guard lock — so a reply-side
+ * check that does not see the marker ran before the exit published it,
+ * and the pair is then registered before the cleanup retires everything
+ * (the "no window" invariant rp_add relies on). A stale marker from a
+ * previous relay instance carries a different generation (g_rp_gen is
+ * bumped before each instance's threads start), so it cannot poison a
+ * restarted relay — the same test rp_add() applies. */
+static bool rp_plane_dead(void)
+{
+    bool dead;
+    pthread_mutex_lock(&g_rp_mu);
+    unsigned gen = atomic_load(&g_rp_gen);
+    dead = (g_rp_dir_dead_gen[0] == gen ||
+            g_rp_dir_dead_gen[1] == gen);
+    pthread_mutex_unlock(&g_rp_mu);
+    return dead;
+}
 
 static bool rp_arr_add(struct rp_conn ***arr, size_t *n, size_t *cap,
                         struct rp_conn *cn)
