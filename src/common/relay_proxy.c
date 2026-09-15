@@ -316,6 +316,52 @@ static int rp_send_full(const struct rp_hs *hs, int fd, const void *buf,
     return 0;
 }
 
+/* R23 (T2): payload-forwarding variant of rp_send_full, used ONLY at the
+ * four call sites that forward USER PAYLOAD BYTES ALREADY READ OUT OF
+ * the client socket (SOCKS CONNECT post-frame tail, HTTP CONNECT
+ * post-header tail, HTTP absolute-URI head, HTTP request body). For
+ * those bytes a failed send is unrecoverable data loss — the same
+ * non-drop argument R21 (dbd5ccb) applied to the relay data plane — so
+ * the transient send-pressure errors ENOBUFS/ENOMEM are retried (1 ms
+ * backoff, then a POLLOUT wait drawn from the same handshake budget)
+ * instead of failing the send: `done` is untouched (w<0 wrote nothing),
+ * so no byte is dropped, duplicated or reordered. The HANDshake/CONTROL
+ * call sites deliberately keep rp_send_full: their messages are small
+ * generated setup replies (SOCKS rep/ver-select, HTTP 1xx/2xx/5xx) that
+ * fit the one-shot setup window and that a client can retry with a fresh
+ * connection, so a transient failure is allowed to fail the connect. */
+static int rp_send_full_payload(const struct rp_hs *hs, int fd,
+                                const void *buf, size_t len)
+{
+    const uint8_t *p = (const uint8_t *)buf;
+    size_t done = 0;
+    while (done < len) {
+        ssize_t w = port_send(fd, p + done, len - done, 0);
+        if (w > 0) {
+            done += (size_t)w;
+            continue;
+        }
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK ||
+                      errno == EINTR)) {
+            if (rp_hs_poll_ev(hs, fd, POLLOUT) <= 0)
+                return -1;
+            continue;
+        }
+        if (w < 0 && (errno == ENOBUFS || errno == ENOMEM)) {
+            /* transient kernel send-buffer / memory pressure: the socket
+             * can stay POLLOUT-ready while the kernel keeps refusing, so
+             * back off 1 ms (same as R21 rp_flush) before the bounded
+             * POLLOUT wait */
+            port_sleep_ms(1);
+            if (rp_hs_poll_ev(hs, fd, POLLOUT) <= 0)
+                return -1;
+            continue;
+        }
+        return -1;              /* hard error */
+    }
+    return 0;
+}
+
 /* recv with the handshake input cap: behaves like port_recv, but a
  * read that pushes the cumulative handshake input past RP_HS_INPUT_MAX
  * fails with EMSGSIZE. Callers treat any non-EAGAIN error as fatal,
@@ -913,7 +959,13 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
              * budget) and still fails closed if the bytes cannot be
              * delivered at all. */
             if (n > frame_end &&
-                rp_send_full(hs, up, b + frame_end, n - frame_end) != 0) {
+                /* R23 (T2): user payload already read out of the client
+                 * socket (post-frame tail) — transient ENOBUFS/ENOMEM
+                 * must not drop it (rp_send_full_payload); the SOCKS
+                 * handshake replies above stay on rp_send_full (control,
+                 * client-retryable) */
+                rp_send_full_payload(hs, up, b + frame_end,
+                                     n - frame_end) != 0) {
                 port_close(up);
                 return -1;
             }
@@ -1062,7 +1114,12 @@ static int rp_handle_http(int fd, const uint8_t *first, size_t first_n,
          * same reason as in rp_handle_socks — a short write or EINTR on
          * this blocking upstream must not be read as a hard failure. */
         if (n > hdr_end &&
-            rp_send_full(hs, up, buf + hdr_end, n - hdr_end) != 0) {
+            /* R23 (T2): user payload already read out of the client
+             * socket (first TLS bytes coalesced with the CONNECT
+             * header) — transient ENOBUFS/ENOMEM must not drop it;
+             * the 200 reply above stays on rp_send_full (control) */
+            rp_send_full_payload(hs, up, buf + hdr_end,
+                                 n - hdr_end) != 0) {
             port_close(up);
             return -1;
         }
@@ -1071,16 +1128,19 @@ static int rp_handle_http(int fd, const uint8_t *first, size_t first_n,
     /* absolute-URI forward: send the original request head verbatim
      * (RFC 7230 servers accept absolute-form on a proxy connection).
      * R37 R6 (K-5): rp_send_full — the head is sent in one piece and a
-     * short write/EINTR used to abort the forward. */
-    if (rp_send_full(hs, up, buf, hdr_end) != 0) {
+     * short write/EINTR used to abort the forward. R23 (T2): the head
+     * is the CLIENT'S OWN REQUEST BYTES (user payload, not a generated
+     * control message), so the payload variant retries transient
+     * ENOBUFS/ENOMEM instead of dropping them. */
+    if (rp_send_full_payload(hs, up, buf, hdr_end) != 0) {
         port_close(up);
         return -1;
     }
     /* R4-08-F1: also forward the request body bytes that were coalesced
      * with the head into buf — same silent-drop hazard. R37 R6 (K-5):
-     * rp_send_full here too. */
+     * rp_send_full here too; R23 (T2): payload variant (see above). */
     if (n > hdr_end &&
-        rp_send_full(hs, up, buf + hdr_end, n - hdr_end) != 0) {
+        rp_send_full_payload(hs, up, buf + hdr_end, n - hdr_end) != 0) {
         port_close(up);
         return -1;
     }
