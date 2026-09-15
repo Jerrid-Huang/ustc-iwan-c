@@ -989,7 +989,7 @@ static void *recv_thread_main(void *v)
             }
             if (now - last_purge >= 1000) {
 #ifndef IWAN_DEBUG_STRIP
-                {
+                if (atomic_load_explicit(&g_prof_on, memory_order_relaxed)) {
                     static struct prof_state ps_recv, ps_tunw, ps_tunr,
                         ps_dl;
                     if (prof_print("srv recv", &ps_recv, g_prof_srv_recv)) {
