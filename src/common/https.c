@@ -1274,6 +1274,18 @@ static int https_tls_connect(SSL *ssl, int fd, uint64_t deadline_ms,
         {
             int e = SSL_get_error(ssl, r);
 
+            if (e == SSL_ERROR_ZERO_RETURN) {
+                /* R14 (R13-B1-L1): the peer half-closed the TCP connection
+                 * during the handshake (accepted then FIN) — OpenSSL 3.x
+                 * reports the raw FIN here as ZERO_RETURN with r<0, errno==0
+                 * and an empty queue (verified by probe); a close_notify
+                 * mid-handshake lands here too.  Without this branch the
+                 * failure fell through to https_ssl_err which printed
+                 * strerror(errno) == "Success". */
+                snprintf(diag, diagsz,
+                         "peer closed the connection during TLS handshake");
+                return -1;
+            }
             if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE)
                 /* socket-timeout semantics hold only on a BLOCKING fd;
                  * https_connect_tcp restored it to blocking (C-1), so a
@@ -1282,6 +1294,22 @@ static int https_tls_connect(SSL *ssl, int fd, uint64_t deadline_ms,
                  * return instantly and spin one core until the deadline. */
                 continue;
             if (e == SSL_ERROR_SYSCALL) {
+                /* R14 (R13-B1-L1): the peer sent FIN/close_notify before
+                 * the handshake finished (accepted then closed).  OpenSSL
+                 * documents r==0 as the "unexpected EOF" return, but the
+                 * handshake path in practice surfaces r<0 with errno==0 and
+                 * an empty error queue (verified on OpenSSL 3.x) — either
+                 * way there is NO OS error to report, so name the real
+                 * cause instead of letting https_ssl_err print
+                 * strerror(errno) == "Success".  The read side has had the
+                 * r==0 rule since 21a4a50; this mirrors it plus the
+                 * observed r<0/errno==0 shape. */
+                if (r == 0 || (r < 0 && errno == 0 &&
+                               ERR_peek_error() == 0)) {
+                    snprintf(diag, diagsz,
+                             "peer closed the connection during TLS handshake");
+                    return -1;
+                }
                 if (errno == EINTR)
                     continue;
                 if (errno == EAGAIN || errno == EWOULDBLOCK ||
@@ -1357,11 +1385,34 @@ static int https_tls_write(SSL *ssl, int fd, const char *req,
         {
             int e = SSL_get_error(ssl, w);
 
+            if (e == SSL_ERROR_ZERO_RETURN) {
+                /* R14 (R13-B1-L1): the peer closed the connection (FIN /
+                 * close_notify) before the request was fully written;
+                 * OpenSSL reports it as ZERO_RETURN with no errno/queue.
+                 * Same fix as the handshake side: name the real cause
+                 * instead of https_ssl_err's strerror(errno) == "Success". */
+                snprintf(diag, diagsz,
+                         "peer closed the connection while sending request");
+                return -1;
+            }
             if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE)
                 /* fd is blocking (restored by C-1); WANT_* means the send
                  * timeout fired — re-check the deadline next iteration */
                 continue;
             if (e == SSL_ERROR_SYSCALL) {
+                /* R14 (R13-B1-L1): the peer closed (FIN/close_notify)
+                 * while the request was still going out.  Mirror of the
+                 * handshake/read r==0 rules: r==0 is the documented
+                 * "peer went away" return, and a partially-written request
+                 * to a just-closed peer can also surface r<0 with
+                 * errno==0 and an empty queue; both must not fall through
+                 * to strerror(errno) == "Success". */
+                if (w == 0 || (w < 0 && errno == 0 &&
+                               ERR_peek_error() == 0)) {
+                    snprintf(diag, diagsz,
+                             "peer closed the connection while sending request");
+                    return -1;
+                }
                 if (errno == EINTR)
                     continue;
                 if (errno == EAGAIN || errno == EWOULDBLOCK ||
