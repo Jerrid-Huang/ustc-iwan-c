@@ -1093,8 +1093,9 @@ static int rp_handle_http(int fd, const uint8_t *first, size_t first_n,
  * Each direction owns an array of entries and one poll() event loop:
  *   - nonblocking recv with a write-through fast path: when no backlog
  *     exists the chunk is sent immediately (zero pend, zero extra
- *     poll round-trip); only a partial/EAGAIN send leaves a remainder
- *     in the pending buffer, and once anything is pending the loop
+ *     poll round-trip); only a partial / transient send (EAGAIN or
+ *     R20-11: ENOBUFS/ENOMEM) leaves a remainder in the pending buffer,
+ *     and once anything is pending the loop
  *     stops reading that pass so the kernel socket buffer stays the
  *     backpressure point (pend is bounded by RP_PEND_LIMIT)
  *   - POLLOUT is registered while pending data exists; POLLIN is
@@ -1427,7 +1428,9 @@ static bool rp_pend(struct rp_ent *e, const uint8_t *p, size_t n)
 }
 
 /* flush the pending buffer; on a hard send error the remaining data is
- * dropped and the entry is half-closed */
+ * dropped and the entry is half-closed. EAGAIN/EWOULDBLOCK/EINTR (and,
+ * per R20-11, the transient ENOBUFS/ENOMEM the UDP pump also retries)
+ * leave plen intact for the next POLLOUT instead. */
 static void rp_flush(struct rp_ent *e, bool up_dir)
 {
     (void)up_dir;   /* only consumed by the prof counters (stripped) */
@@ -1444,9 +1447,21 @@ static void rp_flush(struct rp_ent *e, bool up_dir)
             memmove(e->pend, e->pend + w, e->plen);
             continue;
         }
-        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK ||
-                      errno == EINTR))
+        if (w < 0 &&
+            (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
             return;             /* retry on the next POLLOUT */
+        if (w < 0 && (errno == ENOBUFS || errno == ENOMEM)) {
+            /* R20-11: send-buffer / memory pressure is transient and the
+             * relay must not drop TCP bytes over it (the UDP pump treats
+             * ENOBUFS exactly like EAGAIN — budgeted stall, never a
+             * fatal). Unlike EAGAIN the socket can stay POLLOUT-ready
+             * while the kernel keeps refusing, which would hot-spin this
+             * poll loop — back off explicitly, then retry on the next
+             * POLLOUT. plen is untouched (a send that returned -1 wrote
+             * nothing), so no byte is dropped, duplicated or reordered. */
+            port_sleep_ms(1);
+            return;
+        }
         e->plen = 0;            /* hard error: drop, half-close */
         e->from_eof = true;
         return;
@@ -1678,7 +1693,14 @@ static void *rp_dir_main(void *ud)
                                 if (w < 0 &&
                                     (errno == EAGAIN ||
                                      errno == EWOULDBLOCK ||
-                                     errno == EINTR))
+                                     errno == EINTR ||
+                                     /* R20-11: transient send-buffer /
+                                      * memory pressure — same non-drop
+                                      * classification as rp_flush below
+                                      * (remainder goes to pend and waits
+                                      * on POLLOUT, byte-identical) */
+                                     errno == ENOBUFS ||
+                                     errno == ENOMEM))
                                     break;
                                 e->plen = 0;   /* hard send error */
                                 e->from_eof = true;
