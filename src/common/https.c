@@ -2119,8 +2119,13 @@ static bool https_roundtrip(const char *host, const char *path,
             {
                 char *new_host = NULL, *new_path = NULL;
                 if (!https_url_split(loc, &new_host, &new_path)) {
+                    /* R15 (B3-2): loc is remote-controlled; same log
+                     * hygiene as the Transfer-Encoding line — bounded
+                     * printable-only copy on stderr. */
+                    char san[HTTPS_LOG_SAN_MAX];
+                    https_log_san(loc, san, sizeof san);
                     log_err("HTTPS redirect to unsupported URL '%s' "
-                            "(HTTP %d)", loc, st);
+                            "(HTTP %d)", san, st);
                     free(loc);
                     status = st;
                     free(resp.d);
