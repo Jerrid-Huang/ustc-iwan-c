@@ -486,54 +486,85 @@ void server_rate_drops_maybe_print(void)
  * to stdout raw and let an unauthenticated OPEN forge terminal output.
  * The C1 range is also the UTF-8 continuation-byte range, so a
  * byte-wise escape would corrupt every multi-byte character that
- * contains one (the U+20AC sign is E2 82 AC). Decode instead: a structurally
- * valid UTF-8 sequence is copied verbatim; a bare C1 byte, and the
- * two-byte UTF-8 encoding of a C1 code point (C2 80..C2 9F), are
- * neutralised. Bytes >= 0xA0 that are not a valid lead byte are left
- * alone, exactly as before. */
-static size_t utf8_seq_len(unsigned char c)
+ * contains one (the U+20AC sign is E2 82 AC). Decode instead: a valid,
+ * SHORTEST-form UTF-8 sequence is copied verbatim; a bare C1 byte, and
+ * the two-byte UTF-8 encoding of a C1 code point (C2 80..C2 9F, the
+ * whole group neutralised), become '?'.  R17 (R16-6): overlong
+ * encodings (E0 80 9B = a 3-byte stand-in for C1 U+009B), UTF-16
+ * surrogate halves and code points past U+10FFFF are NOT valid UTF-8 and
+ * are rejected with the same criteria as https.c's https_utf8_seq.
+ * Everything that is not part of a valid sequence becomes '?', so no
+ * lead byte can leak.  Input is a NUL-terminated C string (usernames),
+ * so — unlike https.c's length-carrying sanitizer — an embedded NUL
+ * still ends the visible value. */
+static size_t utf8_seq_len(const char *in, size_t avail)
 {
+    unsigned char c = (unsigned char)in[0];
+    size_t len;
+    unsigned char lo = 0x80, hi = 0xBF;   /* allowed range of byte 1 */
+
     if (c >= 0xC2 && c <= 0xDF)
-        return 2;
-    if (c >= 0xE0 && c <= 0xEF)
-        return 3;
-    if (c >= 0xF0 && c <= 0xF4)
-        return 4;
-    return 0;   /* ASCII, continuation byte, overlong lead, 0xF5..0xFF */
+        len = 2;
+    else if (c >= 0xE0 && c <= 0xEF) {
+        len = 3;
+        if (c == 0xE0)      lo = 0xA0;    /* E0 xx: byte1 >= A0, no overlong */
+        else if (c == 0xED) hi = 0x9F;    /* ED xx: byte1 <= 9F, no surrogate */
+    } else if (c >= 0xF0 && c <= 0xF4) {
+        len = 4;
+        if (c == 0xF0)      lo = 0x90;    /* F0 xx: byte1 >= 90, >= U+10000 */
+        else if (c == 0xF4) hi = 0x8F;    /* F4 xx: byte1 <= 8F, <= U+10FFFF */
+    } else
+        return 0;
+
+    if (avail < 2 || ((unsigned char)in[1] & 0xC0) != 0x80)
+        return 0;                          /* no room / not a continuation */
+    if ((unsigned char)in[1] < lo || (unsigned char)in[1] > hi)
+        return 0;                          /* overlong, surrogate or too big */
+    if (len >= 3 && (avail < 3 || ((unsigned char)in[2] & 0xC0) != 0x80))
+        return 0;
+    if (len >= 4 && (avail < 4 || ((unsigned char)in[3] & 0xC0) != 0x80))
+        return 0;
+    return len;
 }
 
 static void log_escape(const char *in, char out[], size_t outsz)
 {
-    size_t i = 0;
+    size_t i = 0, n = 0;
+    size_t inlen = strlen(in);
+
     if (outsz == 0)
         return;
-    while (*in && i + 1 < outsz) {
-        unsigned char c = (unsigned char)*in;
-        size_t seq = utf8_seq_len(c);
+    while (n < inlen && i + 1 < outsz) {
+        unsigned char c = (unsigned char)in[n];
+        size_t seq = utf8_seq_len(in + n, inlen - n);
+
         if (seq >= 2) {
-            size_t k;
-            for (k = 1; k < seq; k++) {
-                if (((unsigned char)in[k] & 0xC0) != 0x80)
-                    break;
+            if (i + seq + 1 > outsz)
+                break;              /* no room for the whole char */
+            /* C2 80..C2 9F is U+0080..U+009F: a C1 control in its only
+             * legal two-byte form, not text — neutralise the WHOLE group
+             * with one '?' instead of leaking the 0xC2 lead byte (R17,
+             * R16-4) */
+            if (seq == 2 && c == 0xC2 &&
+                (unsigned char)in[n + 1] >= 0x80 &&
+                (unsigned char)in[n + 1] <= 0x9F) {
+                out[i++] = '?';
+                n += seq;
+                continue;
             }
-            if (k == seq) {
-                if (i + seq + 1 > outsz)
-                    break;              /* no room for the whole char */
-                /* C2 80..C2 9F is U+0080..U+009F: a C1 control, not text */
-                if (seq != 2 || c != 0xC2 ||
-                    (unsigned char)in[1] < 0x80 ||
-                    (unsigned char)in[1] > 0x9F) {
-                    memcpy(out + i, in, seq);
-                    i += seq;
-                    in += seq;
-                    continue;
-                }
-            }
+            memcpy(out + i, in + n, seq);
+            i += seq;
+            n += seq;
+            continue;
         }
-        if (c < 0x20 || c == 0x7f || (c >= 0x80 && c <= 0x9f))
+        /* not part of a valid multi-byte sequence: every control, DEL and
+         * each byte that failed the sequence checks above becomes '?'
+         * (this replaces the old ">= A0 lone bytes left alone" allowance;
+         * a log sink has no business keeping them) */
+        if (c < 0x20 || c >= 0x7f)
             c = '?';
         out[i++] = (char)c;
-        in++;
+        n++;
     }
     out[i] = '\0';
 }

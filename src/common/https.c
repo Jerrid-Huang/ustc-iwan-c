@@ -38,33 +38,63 @@
  * header value (Transfer-Encoding, Location) for a stderr log line.  The
  * raw bytes must never reach log_err: CR/LF would forge spurious lines
  * and C0/C1/DEL would let a hostile server inject terminal escape
- * sequences.  Same policy as server.c's log_escape (R3-L20): valid UTF-8
- * sequences are copied verbatim so multi-byte text is not mangled, C1
- * bytes that escape a valid sequence plus every control byte become '?',
- * and the copy is capped at HTTPS_LOG_SAN_MAX bytes with a "..." marker
- * so an absurd value cannot flood the log.  Kept local to https.c (rather
- * than sharing server.c's static log_escape) to keep this hygiene fix a
- * single-file change. */
+ * sequences.  Same policy as server.c's log_escape (R3-L20): valid,
+ * SHORTEST-FORM UTF-8 sequences are copied verbatim so multi-byte text
+ * is not mangled (R17/R16-1: overlong encodings such as E0 80 9B — a
+ * 3-byte stand-in for the C1 control U+009B — are NOT valid UTF-8 and
+ * are rejected, so a permissive terminal cannot unfold them back into
+ * 8-bit CSI/OSC); every other byte (controls, DEL, bare/mis-encoded
+ * C1/lead bytes, embedded NUL — R17/R16-4/5) becomes '?', and the copy
+ * is capped at HTTPS_LOG_SAN_MAX bytes with a "..." marker so an absurd
+ * value cannot flood the log.  Kept local to https.c (rather than
+ * sharing server.c's static log_escape, whose C-string-only interface
+ * cannot see embedded NULs) to keep this hygiene fix a single-file
+ * change; the UTF-8 criteria are byte-for-byte the same in both. */
 #define HTTPS_LOG_SAN_MAX   64
 #define HTTPS_LOG_SAN_VAL   (HTTPS_LOG_SAN_MAX - 3)   /* room for "..." */
 
-/* length of a complete UTF-8 sequence led by lead byte c, else 0 (ASCII,
- * continuation byte, overlong/0xF5..0xFF lead — the byte-wise path then
- * handles it) */
-static size_t https_utf8_seq(unsigned char c)
+/* length of a complete, well-formed, SHORTEST-form UTF-8 sequence led by
+ * in[0], else 0.  "Shortest-form" is the point: UTF-8 admits redundant
+ * encodings (E0 80 9B is a 3-byte stand-in for the C1 control U+009B)
+ * and a permissive decoder would unfold them back into control bytes, so
+ * overlong forms, UTF-16 surrogate halves (ED A0..BF) and code points
+ * above U+10FFFF (F4 90..BF, F5..FF) are all rejected — the caller then
+ * treats the leading byte as non-printable.  avail bounds every read so
+ * a truncated sequence never reaches past the caller's buffer. */
+static size_t https_utf8_seq(const char *in, size_t avail)
 {
+    unsigned char c = (unsigned char)in[0];
+    size_t len;
+    unsigned char lo = 0x80, hi = 0xBF;   /* allowed range of byte 1 */
+
     if (c >= 0xC2 && c <= 0xDF)
-        return 2;
-    if (c >= 0xE0 && c <= 0xEF)
-        return 3;
-    if (c >= 0xF0 && c <= 0xF4)
-        return 4;
-    return 0;
+        len = 2;
+    else if (c >= 0xE0 && c <= 0xEF) {
+        len = 3;
+        if (c == 0xE0)      lo = 0xA0;    /* E0 xx: byte1 >= A0, no overlong */
+        else if (c == 0xED) hi = 0x9F;    /* ED xx: byte1 <= 9F, no surrogate */
+    } else if (c >= 0xF0 && c <= 0xF4) {
+        len = 4;
+        if (c == 0xF0)      lo = 0x90;    /* F0 xx: byte1 >= 90, >= U+10000 */
+        else if (c == 0xF4) hi = 0x8F;    /* F4 xx: byte1 <= 8F, <= U+10FFFF */
+    } else
+        return 0;
+
+    if (avail < 2 || ((unsigned char)in[1] & 0xC0) != 0x80)
+        return 0;                          /* no room / not a continuation */
+    if ((unsigned char)in[1] < lo || (unsigned char)in[1] > hi)
+        return 0;                          /* overlong, surrogate or too big */
+    if (len >= 3 && (avail < 3 || ((unsigned char)in[2] & 0xC0) != 0x80))
+        return 0;
+    if (len >= 4 && (avail < 4 || ((unsigned char)in[3] & 0xC0) != 0x80))
+        return 0;
+    return len;
 }
 
-static void https_log_san(const char *in, char out[], size_t outsz)
+static void https_log_san(const char *in, size_t inlen, char out[],
+                          size_t outsz)
 {
-    size_t budget, i = 0;
+    size_t budget, i = 0, n = 0;
 
     if (outsz == 0)
         return;
@@ -72,36 +102,40 @@ static void https_log_san(const char *in, char out[], size_t outsz)
      * NUL always fit after it, so a truncation never has to cut a
      * multi-byte character in half */
     budget = (outsz > 4) ? outsz - 4 : 0;
-    while (*in && i < budget) {
-        unsigned char c = (unsigned char)*in;
-        size_t seq = https_utf8_seq(c);
+    while (n < inlen && i < budget) {
+        unsigned char c = (unsigned char)in[n];
+        size_t seq = https_utf8_seq(in + n, inlen - n);
 
         if (seq >= 2) {
-            size_t k;
-            for (k = 1; k < seq; k++) {
-                if (((unsigned char)in[k] & 0xC0) != 0x80)
-                    break;
+            if (i + seq > budget)
+                break;      /* whole char does not fit the budget */
+            /* C2 80..C2 9F is U+0080..U+009F: a C1 control in its only
+             * legal two-byte form, not text — neutralise the WHOLE group
+             * with one '?' instead of leaking the 0xC2 lead byte (R17,
+             * R16-4) */
+            if (seq == 2 && c == 0xC2 &&
+                (unsigned char)in[n + 1] >= 0x80 &&
+                (unsigned char)in[n + 1] <= 0x9F) {
+                out[i++] = '?';
+                n += seq;
+                continue;
             }
-            if (k == seq) {
-                if (i + seq > budget)
-                    break;      /* whole char does not fit the budget */
-                /* C2 80..C2 9F is U+0080..U+009F: a C1 control, not text */
-                if (seq != 2 || c != 0xC2 ||
-                    (unsigned char)in[1] < 0x80 ||
-                    (unsigned char)in[1] > 0x9F) {
-                    memcpy(out + i, in, seq);
-                    i += seq;
-                    in += seq;
-                    continue;
-                }
-            }
+            memcpy(out + i, in + n, seq);
+            i += seq;
+            n += seq;
+            continue;
         }
-        if (c < 0x20 || c == 0x7f || (c >= 0x80 && c <= 0x9f))
+        /* not part of a valid multi-byte sequence: NUL, every control and
+         * DEL, and each byte that failed the sequence checks above, are
+         * non-printable for a terminal — '?' (R17, R16-1).  This also
+         * covers the historical lone high bytes (the old copy left
+         * >= A0 alone), which a log sink has no business keeping. */
+        if (c == 0 || c < 0x20 || c >= 0x7f)
             c = '?';
         out[i++] = (char)c;
-        in++;
+        n++;
     }
-    if (*in && outsz >= 4) {
+    if (n < inlen && outsz >= 4) {
         memcpy(out + i, "...", 3);
         i += 3;
     }
@@ -203,7 +237,8 @@ static int chunk_decode(const char *in, size_t in_len, struct sbuf *out,
  * [hdr, hdr + len); returns a malloc'd trimmed value, or NULL when absent.
  * Multiple occurrences are joined with ", " (RFC 7230 §3.2.2) and obs-fold
  * continuation lines are folded into the value with a single space. */
-static char *https_hdr_value(const char *hdr, size_t len, const char *name)
+static char *https_hdr_value(const char *hdr, size_t len, const char *name,
+                             size_t *vlen_out)
 {
     size_t nl = strlen(name);
     struct sbuf val = {0};
@@ -265,6 +300,11 @@ static char *https_hdr_value(const char *hdr, size_t len, const char *name)
     while (val.len > 0 &&
            (val.d[val.len - 1] == ' ' || val.d[val.len - 1] == '\t'))
         val.d[--val.len] = '\0';
+    /* the wire may have embedded NUL bytes inside the value; the caller
+     * gets the true byte length so the log sanitizer can replace them
+     * instead of silently truncating (R17, R16-5) */
+    if (vlen_out)
+        *vlen_out = val.len;
     return val.d;
 }
 
@@ -1799,6 +1839,7 @@ static int https_resp_parse(struct sbuf *resp, int *status, char **body_out)
     size_t hdr_len;
     int chunked = 0;
     char *out, *te;
+    size_t te_len = 0;
 
     /* M3-3: the caller seeds *body_out with empty_str() before the
      * redirect loop; every return path below overwrites it, so free the
@@ -1819,7 +1860,7 @@ static int https_resp_parse(struct sbuf *resp, int *status, char **body_out)
      * but a negative difference must never reach https_hdr_value again
      * (that subtraction is what wrapped the pointer and hid the headers) */
     hdr_len = (body > hdr_start) ? (size_t)(body - hdr_start) : 0;
-    te = https_hdr_value(hdr_start, hdr_len, "transfer-encoding");
+    te = https_hdr_value(hdr_start, hdr_len, "transfer-encoding", &te_len);
     if (te) {
         if (!https_te_is_chunked(te)) {
             /* R15 (B3-1): te is remote-controlled — a hostile server may
@@ -1827,7 +1868,7 @@ static int https_resp_parse(struct sbuf *resp, int *status, char **body_out)
              * injection).  Log a bounded, printable-only copy instead of
              * the raw value; the reject/parse path below is unchanged. */
             char san[HTTPS_LOG_SAN_MAX];
-            https_log_san(te, san, sizeof san);
+            https_log_san(te, te_len, san, sizeof san);
             log_err("unsupported Transfer-Encoding: %s", san);
             free(te);
             free(resp->d);
@@ -2093,6 +2134,7 @@ static bool https_roundtrip(const char *host, const char *path,
             int follow = st == 301 || st == 302 || st == 303 ||
                          st == 307 || st == 308;
             char *loc = NULL;
+            size_t loc_len = 0;
 
             /* sensitive non-GET (token endpoint POST) must never follow
              * a redirect: 307/308 preserve the body, leaking the
@@ -2110,7 +2152,7 @@ static bool https_roundtrip(const char *host, const char *path,
                 const char *hs, *bd;
                 https_hdr_body(resp.d, resp.len, &hs, &bd);
                 loc = https_hdr_value(hs, (bd > hs) ? (size_t)(bd - hs) : 0,
-                                      "location");
+                                      "location", &loc_len);
             }
             if (!loc) {
                 log_err("HTTPS request failed: HTTP %d%s", st,
@@ -2128,7 +2170,7 @@ static bool https_roundtrip(const char *host, const char *path,
                      * hygiene as the Transfer-Encoding line — bounded
                      * printable-only copy on stderr. */
                     char san[HTTPS_LOG_SAN_MAX];
-                    https_log_san(loc, san, sizeof san);
+                    https_log_san(loc, loc_len, san, sizeof san);
                     log_err("HTTPS redirect to unsupported URL '%s' "
                             "(HTTP %d)", san, st);
                     free(loc);
