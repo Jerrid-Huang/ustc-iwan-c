@@ -145,7 +145,7 @@ WORK=$(mktemp -d)
 # goes to bench-multi.out AND the console from here on
 exec > >(tee "$OUT") 2>&1
 
-SERVER_PID=""; CLI_PIDS=""; BENCH_PIDS=""; BENCH_SRV_PID=""; INPUT_RULE_SRV=0
+SERVER_PID=""; CLI_PIDS=""; BENCH_PIDS=""; BENCH_SRV_PID=""; INPUT_RULE_SRV=0; INPUT_RULE_VETH=0
 # R18-2: any bench_client that dies mid-window (or the whole data plane
 # going dark) must abort the run like bench.sh — not print a fake
 # "0 Mbit/s TOTAL" with exit 0.
@@ -159,6 +159,9 @@ cleanup() {
     [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
     if [ "$INPUT_RULE_SRV" = 1 ]; then
         iptables -D INPUT -i "$TUN_NAME" -j ACCEPT 2>/dev/null
+    fi
+    if [ "$INPUT_RULE_VETH" = 1 ]; then
+        iptables -D INPUT -i veth0 -j ACCEPT 2>/dev/null
     fi
     ip link del "$TUN_NAME" 2>/dev/null
     ip netns del "$TUN_NS" 2>/dev/null
@@ -256,7 +259,8 @@ if [ "$PROXY_MODE" = 1 ]; then
     ip netns exec "$TUN_NS" ip link set veth1 up
     ip netns exec "$TUN_NS" ip link set lo up
     ip netns exec "$TUN_NS" ip route add default via "$VETH_IP"
-    iptables -I INPUT -i veth0 -j ACCEPT 2>/dev/null || true
+    iptables -I INPUT -i veth0 -j ACCEPT 2>/dev/null && \
+        INPUT_RULE_VETH=1 || true
     ip netns exec "$TUN_NS" ./bin/iwan-client proxy \
         --server "$VETH_IP" --port "$PORT" --user u1 --pass s3cret \
         --tun "$CLI_TUN" --listen "127.0.0.1:$PROXY_PORT" \
