@@ -186,10 +186,24 @@ static void delete_tree(const char *path)
                              fd.cFileName);
             if (m < 0 || (size_t)m >= sizeof sub)
                 continue;   /* cannot address this entry; skip it */
-            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-                delete_tree(sub);
-            DeleteFileA(sub);   /* a file; for a dir the recursion above
-                                 * already emptied it (harmless miss) */
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                /* R22-A1-1: never recurse into a reparse point
+                 * (junction/symlink) — that would FOLLOW the link and
+                 * delete the TARGET's contents, or recurse forever on a
+                 * self-referencing link (stack overflow). Remove the
+                 * link itself without following: RemoveDirectoryA
+                 * removes a junction (and a dir symlink), DeleteFileA
+                 * also removes a dir symlink — both best-effort, the
+                 * miss of one is covered by the other. */
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+                    RemoveDirectoryA(sub);
+                    DeleteFileA(sub);
+                } else {
+                    delete_tree(sub);   /* real dir: contents + itself */
+                }
+            } else {
+                DeleteFileA(sub);       /* a real file */
+            }
         } while (FindNextFileA(h, &fd));
         FindClose(h);
     }
