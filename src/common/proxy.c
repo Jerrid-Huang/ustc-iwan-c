@@ -39,7 +39,7 @@ struct pump_tx_buf;   /* Windows send-thread batch-buffer pool (defined below) *
  * single-thread pump variant shares them) */
 atomic_uint_fast64_t g_prof_send_dgrams;    /* datagrams inside PP_SEND */
 atomic_uint_fast64_t g_prof_send_syscalls;  /* port_sendmmsg/port_sendmsg */
-atomic_uint_fast64_t g_prof_send_eagain;    /* EAGAIN/ENOBUFS/EPERM hits */
+atomic_uint_fast64_t g_prof_send_eagain;    /* EAGAIN/ENOBUFS/ENOMEM/EPERM hits */
 atomic_uint_fast64_t g_prof_recv_dgrams;    /* sum of v over recvmmsg calls */
 atomic_uint_fast64_t g_prof_recv_empty;     /* EAGAIN (no data) iterations */
 atomic_uint_fast64_t g_prof_recv_badtok;    /* datagrams with bad sid/token */

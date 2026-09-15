@@ -36,10 +36,10 @@ void udp_gso_clear(int fd, int *ok, size_t *gso_mss);
 int udp_gso_prepare(int fd, size_t mss, int *ok, size_t *gso_mss,
                     size_t *pending_mss, unsigned *streak);
 
-/* One bounded EAGAIN/ENOBUFS/EPERM wait: poll POLLOUT for the remaining
- * retry budget (retry_t0 = drain start, budget_ms = total budget).
- * Returns 1 to retry, 0 when the budget is exhausted (caller yields to
- * its receive path). */
+/* One bounded EAGAIN/ENOBUFS/ENOMEM/EPERM wait: poll POLLOUT for the
+ * remaining retry budget (retry_t0 = drain start, budget_ms = total
+ * budget). Returns 1 to retry, 0 when the budget is exhausted (caller
+ * yields to its receive path). */
 int udp_send_stall_wait(int fd, uint64_t retry_t0, unsigned budget_ms);
 
 #endif /* IWAN_UDP_SEND_H */
