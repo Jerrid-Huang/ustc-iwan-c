@@ -1469,9 +1469,14 @@ static bool up_inner_dst_in_tunnel(const struct server_ctx *ctx, uint32_t d)
  * host-local reject set even when the destination is an IPv4-embedded
  * IPv6 spelling — v4-mapped (::ffff:a.b.c.d), NAT64 well-known prefix
  * (64:ff9b::a.b.c.d), v4-compatible (::a.b.c.d) and 6to4 (2002:a.b.c.d::).
- * Before this, all four spellings of 127.0.0.1 sailed through on a legal
- * ULA source while the plain IPv4 spelling was dropped, leaving the same
- * loopback alias one packet type away.
+ * R14 (R13-A3-1): the SIIT/IPv4-translated family ::ffff:0:0:0/96
+ * (::ffff:0:a.b.c.d, RFC 6052 §3.1 / RFC 2765) gets the same treatment —
+ * its embedded v4 lives in bytes 12-15 under the 96-bit prefix {0*8,
+ * ff,ff,0,0}, so it used to sail through every branch above while lwIP's
+ * ip6_addr_isipv4mappedipv6 also left it alone (the only v4-embedded
+ * spelling both layers pass). Before the fix, the five spellings of
+ * 127.0.0.1 from R41-2-3 — four blocked, this one let through — reached
+ * the same loopback alias one packet type away.
  *
  * The embedded IPv4 gets the SAME T1 exemption (up_inner_dst_in_tunnel)
  * the plain IPv4 branch applies: a tunnel whose -s/-S was deliberately
@@ -1490,6 +1495,9 @@ static bool up_inner_dst_blocked6(const struct server_ctx *ctx,
     static const uint8_t v4mapped[12] = { 0,0,0,0,0,0,0,0,0,0,0xff,0xff };
     static const uint8_t nat64[12] = { 0x00,0x64,0xff,0x9b, 0,0,0,0,0,0,0,0 };
     static const uint8_t compat[12] = { 0,0,0,0,0,0,0,0,0,0,0,0 };
+    /* ::ffff:0:0:0/96 — SIIT / IPv4-translated (RFC 6052 §3.1 / RFC 2765):
+     * prefix bytes 0..11 = {0*8, ff, ff, 0, 0}, embedded v4 at 12..15. */
+    static const uint8_t siit[12] = { 0,0,0,0,0,0,0,0,0xff,0xff,0,0 };
     uint32_t emb = 0;
     int shift = -1;          /* byte offset of the embedded IPv4, -1 = none */
     int i;
@@ -1508,6 +1516,8 @@ static bool up_inner_dst_blocked6(const struct server_ctx *ctx,
     else if (memcmp(d, nat64, sizeof nat64) == 0)   /* 64:ff9b::/96 */
         shift = 12;
     else if (memcmp(d, compat, sizeof compat) == 0) /* ::a.b.c.d */
+        shift = 12;
+    else if (memcmp(d, siit, sizeof siit) == 0)      /* ::ffff:0:a.b.c.d */
         shift = 12;
     else if (d[0] == 0x20 && d[1] == 0x02)          /* 2002::/16 6to4 */
         shift = 2;
