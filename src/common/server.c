@@ -1423,10 +1423,11 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
  * IPv6:
  *   ::1/128         loopback
  *   fe80::/10       link-local
- * The v4-mapped spellings (::ffff:127.0.0.1, ...) are outside this
- * mandated set; whether an inner v4-mapped destination is routable
- * locally at all still needs root-hardware re-verification (lwIP/kernel
- * side, see .cc_tmp/r38/fixes/notes-srv-h1.md).
+ *   R12-T3 (R41-2-3): and the IPv4 reject set applied to its IPv4-embedded
+ *   spellings (::ffff:a.b.c.d v4-mapped, 64:ff9b::/96 NAT64, ::a.b.c.d
+ *   v4-compatible, 2002::/16 6to4) — see up_inner_dst_blocked6. Real-lwIP/
+ *   kernel-side routability of the embedded spellings still needs root
+ *   hardware re-verification (see .cc_tmp/r38/fixes/notes-srv-h1.md).
  *
  * No legitimate client traffic can carry these destinations: the client's
  * own kernel/lwIP stack routes 127/8, 0/8, 169.254/16 and ::1/fe80::/10
@@ -1464,13 +1465,60 @@ static bool up_inner_dst_in_tunnel(const struct server_ctx *ctx, uint32_t d)
     return (d & ctx->subnet_mask) == ctx->subnet_base;
 }
 
-static bool up_inner_dst_blocked6(const uint8_t d[16])
+/* R12 T3 (R41-2-3): the IPv6 branch of the H1 gate must apply the IPv4
+ * host-local reject set even when the destination is an IPv4-embedded
+ * IPv6 spelling — v4-mapped (::ffff:a.b.c.d), NAT64 well-known prefix
+ * (64:ff9b::a.b.c.d), v4-compatible (::a.b.c.d) and 6to4 (2002:a.b.c.d::).
+ * Before this, all four spellings of 127.0.0.1 sailed through on a legal
+ * ULA source while the plain IPv4 spelling was dropped, leaving the same
+ * loopback alias one packet type away.
+ *
+ * The embedded IPv4 gets the SAME T1 exemption (up_inner_dst_in_tunnel)
+ * the plain IPv4 branch applies: a tunnel whose -s/-S was deliberately
+ * configured inside 127/8, 0/8 or 169.254/16 must not lose the
+ * embedded-v6 spelling of its own gateway/pool traffic, or the T1 fix
+ * would be asymmetric (allowed as plain IPv4, dropped as ::ffff:...).
+ * Non-embedded destinations are untouched: ::1/fe80::/10 stay blocked
+ * and any sane ULA/global v6 (fd00::<assigned>, 2001:db8::1,
+ * 64:ff9b::808:808 = 8.8.8.8) passes. Real routability of the embedded
+ * spellings on lwIP/kernel still needs root-hardware re-verification. */
+static bool up_inner_dst_blocked6(const struct server_ctx *ctx,
+                                  const uint8_t d[16])
 {
     static const uint8_t lo[16] = { 0, 0, 0, 0, 0, 0, 0, 0,
                                     0, 0, 0, 0, 0, 0, 0, 1 };
+    static const uint8_t v4mapped[12] = { 0,0,0,0,0,0,0,0,0,0,0xff,0xff };
+    static const uint8_t nat64[12] = { 0x00,0x64,0xff,0x9b, 0,0,0,0,0,0,0,0 };
+    static const uint8_t compat[12] = { 0,0,0,0,0,0,0,0,0,0,0,0 };
+    uint32_t emb = 0;
+    int shift = -1;          /* byte offset of the embedded IPv4, -1 = none */
+    int i;
+
     if (memcmp(d, lo, sizeof lo) == 0)
         return true;                              /* ::1 */
-    return d[0] == 0xfe && (d[1] & 0xc0) == 0x80; /* fe80::/10 */
+    if (d[0] == 0xfe && (d[1] & 0xc0) == 0x80)    /* fe80::/10 */
+        return true;
+
+    /* v4-embedded spellings: locate the IPv4 bytes, then run the exact
+     * IPv4 reject set on them, with the T1 tunnel exemption (::1 is
+     * already caught above; ::a.b.c.d with v4=0.0.0.1 also matches
+     * 0/8 here, which is consistent). */
+    if (memcmp(d, v4mapped, sizeof v4mapped) == 0)  /* ::ffff:a.b.c.d */
+        shift = 12;
+    else if (memcmp(d, nat64, sizeof nat64) == 0)   /* 64:ff9b::/96 */
+        shift = 12;
+    else if (memcmp(d, compat, sizeof compat) == 0) /* ::a.b.c.d */
+        shift = 12;
+    else if (d[0] == 0x20 && d[1] == 0x02)          /* 2002::/16 6to4 */
+        shift = 2;
+    if (shift >= 0) {
+        for (i = 0, emb = 0; i < 4; i++)
+            emb = (emb << 8) | d[shift + i];
+        if (up_inner_dst_blocked4(emb) &&
+            !up_inner_dst_in_tunnel(ctx, emb))
+            return true;
+    }
+    return false;
 }
 
 /* R38 P2-6: rate limiter for the H1 drop log_debug sites below.
@@ -1659,7 +1707,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                     ip6_derive_ula(s_ip, want6);
                     if (ip6_pkt_ok(in, inlen, s6, d6) != 0 ||
                         memcmp(s6, want6, 16) != 0 ||
-                        up_inner_dst_blocked6(d6)) {
+                        up_inner_dst_blocked6(ctx, d6)) {
                         atomic_fetch_add_explicit(&g_up[tid].h1, 1, memory_order_relaxed);
                         if (debug_enabled() && h1_drop_log_due()) {
                             /* short frames can fail the sanity check
