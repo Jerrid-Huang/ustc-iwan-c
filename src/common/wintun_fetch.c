@@ -158,6 +158,53 @@ static char *ps_capture(const char *ps_expr, int *ps_rc){
     return buf;
 }
 
+/* Recursively remove a directory tree (files as well as subdirectories).
+ * R20-1/T1: RemoveDirectoryA only removes an EMPTY directory, so a
+ * partially-extracted tmpdir (Expand-Archive failing mid-flight) was
+ * never cleaned up by the old `RemoveDirectoryA(tmpdir)` call — "fail
+ * then clean" was structurally ineffective. Walk the tree with
+ * FindFirstFile/FindNextFile instead and remove everything; each step is
+ * best-effort (a failure may leave a residual entry, but the routine
+ * degrades per entry, never abandoning the whole tree). */
+static void delete_tree(const char *path)
+{
+    char pat[PS_PATH_DERIVED_MAX];
+    int n = snprintf(pat, sizeof pat, "%s\\*", path);
+    if (n < 0 || (size_t)n >= sizeof pat) {
+        log_err("internal error: cleanup glob too long; leaving %s", path);
+        return;
+    }
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (strcmp(fd.cFileName, ".") == 0 ||
+                strcmp(fd.cFileName, "..") == 0)
+                continue;
+            char sub[PS_PATH_DERIVED_MAX];
+            int m = snprintf(sub, sizeof sub, "%s\\%s", path,
+                             fd.cFileName);
+            if (m < 0 || (size_t)m >= sizeof sub)
+                continue;   /* cannot address this entry; skip it */
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                delete_tree(sub);
+            DeleteFileA(sub);   /* a file; for a dir the recursion above
+                                 * already emptied it (harmless miss) */
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    RemoveDirectoryA(path);
+}
+
+/* Best-effort removal of the download zip plus the extraction tree.
+ * Shared by the success path and the unified failure exit below, so the
+ * two can never diverge on what "cleaned up" means. */
+static void fetch_cleanup(const char *zip, const char *tmpdir)
+{
+    DeleteFileA(zip);
+    delete_tree(tmpdir);
+}
+
 static int arch_tag(char *out, size_t cap)
 {
     int n;
@@ -290,13 +337,14 @@ int wintun_ensure(void)
         if (dlout && dlout[0])
             log_err("PowerShell output: %s", dlout);
         free(dlout);
-        return -1;
+        goto fail;   /* unified cleanup: nothing extracted yet, but the
+                      * (partial) zip goes away with the rest */
     }
     free(dlout);
     if (!file_exists(zip)) {
         log_err("download did not produce %s; auto-install aborted (%s)",
                 zip, manual);
-        return -1;
+        goto fail;
     }
 
     n = snprintf(cmd, sizeof cmd,
@@ -305,7 +353,7 @@ int wintun_ensure(void)
                  " exit $LASTEXITCODE", zipq, tmpq);
     if (n < 0 || (size_t)n >= sizeof cmd) {
         log_err("internal error: PowerShell expand command too long");
-        return -1;
+        goto fail;
     }
     char *exout = ps_capture(cmd, &rc);
     if (rc != 0) {
@@ -314,9 +362,12 @@ int wintun_ensure(void)
         if (exout && exout[0])
             log_err("PowerShell output: %s", exout);
         free(exout);
-        DeleteFileA(zip);          /* best-effort temp cleanup */
-        RemoveDirectoryA(tmpdir);
-        return -1;
+        /* T1/R20-1: the Expand failure branch used to return after a
+         * bare RemoveDirectoryA(tmpdir) — a NO-OP while tmpdir holds the
+         * files Expand already wrote - so partial extraction residue was
+         * left in the exe directory. Route through the single cleanup
+         * exit below, which recursively removes the whole tree. */
+        goto fail;
     }
     free(exout);
 
@@ -326,12 +377,12 @@ int wintun_ensure(void)
                  arch);
     if (n < 0 || (size_t)n >= sizeof src) {
         log_err("internal error: extracted DLL path too long");
-        return -1;
+        goto fail;
     }
     if (!file_exists(src)) {
         log_err("wintun-%s.zip does not contain bin\\%s\\wintun.dll",
                 ver, arch);
-        return -1;
+        goto fail;
     }
     /* the fetched artifact must match the pinned official build before
      * it lands next to the exe — the download is over TLS but a pinned
@@ -339,54 +390,34 @@ int wintun_ensure(void)
     if (!wintun_pin_ok_a(src)) {
         log_err("downloaded wintun.dll does not match the pinned build; "
                 "deleting it");
-        DeleteFileA(src);
-        DeleteFileA(zip);
-        return -1;
+        goto fail;   /* unified cleanup removes src + zip + tmpdir tree */
     }
     if (!MoveFileA(src, dll)) {
         log_err("cannot move %s -> %s (error %lu)", src, dll,
                 (unsigned long)GetLastError());
-        /* R18-1/T3: this failure branch used to leak the downloaded zip
-         * and the extracted DLL in tmpdir — mirror the pin-mismatch
-         * branch above and clean them up best-effort. */
-        DeleteFileA(src);
-        DeleteFileA(zip);
-        return -1;
+        /* R18-1/T3 + T1/R20-1: this failure branch used to leak the
+         * zip/DLL/late-extraction files in tmpdir — the unified failure
+         * exit below now owns all of them. */
+        goto fail;
     }
 
-    /* best-effort cleanup of the temp artifacts */
-    DeleteFileA(zip);
-    {
-        /* Build the longest cleanup path once — tmpdir\wintun\bin\<arch> —
-         * and derive the shorter ones by trimming it. The old code issued
-         * four snprintf calls (two of them byte-identical) into a MAX_PATH
-         * buffer, which is where -Wformat-truncation fired. On truncation we
-         * skip the removals rather than silently deleting a shorter prefix
-         * of the intended path; the DLL itself is already installed. */
-        char bin[PS_PATH_DERIVED_MAX];
-        n = snprintf(bin, sizeof bin, "%s\\wintun\\bin\\%s", tmpdir, arch);
-        if (n < 0 || (size_t)n >= sizeof bin) {
-            log_err("internal error: cleanup path too long; leaving %s",
-                    tmpdir);
-        } else {
-            char *tail = strrchr(bin, '\\');   /* points at "\<arch>" */
-            DeleteFileA(bin);          /* fails while dirs exist; ignore */
-            RemoveDirectoryA(bin);
-            if (tail) {
-                *tail = '\0';
-                RemoveDirectoryA(bin);         /* tmpdir\wintun\bin */
-                tail = strrchr(bin, '\\');
-                if (tail) {
-                    *tail = '\0';
-                    RemoveDirectoryA(bin);     /* tmpdir\wintun */
-                }
-            }
-            RemoveDirectoryA(tmpdir);
-        }
-    }
+    /* success path: remove the temp artifacts through the SAME routine
+     * as the failure exit, so the two can never diverge (T1/R20-1) */
+    fetch_cleanup(zip, tmpdir);
 
     printf("wintun.dll installed: %s\n", dll);
     return 0;
+
+fail:
+    /* T1/R20-1: single exit for every failure after the download phase
+     * (i.e. once zip/tmpdir can exist on disk). One place owns "remove
+     * the zip + recursively remove the tmpdir tree", so a failed
+     * Expand-Archive (partial files already written), a missing arch
+     * folder, a pin mismatch or a failed MoveFileA can no longer leave
+     * residue in the exe directory. Best-effort by design — cleanup
+     * never changes the failure return. */
+    fetch_cleanup(zip, tmpdir);
+    return -1;
 }
 
 #else /* !_WIN32: keep TU non-empty for pedantic builds */
