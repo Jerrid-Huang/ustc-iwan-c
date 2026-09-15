@@ -34,6 +34,80 @@
  * is hex; anything above INT_MAX is rejected as absurd) */
 #define HTTPS_CHUNK_SZ_CAP  0x7FFFFFFFL
 
+/* R15 (B3-1/B3-2): bounded, printable-only copy of a remote-controlled
+ * header value (Transfer-Encoding, Location) for a stderr log line.  The
+ * raw bytes must never reach log_err: CR/LF would forge spurious lines
+ * and C0/C1/DEL would let a hostile server inject terminal escape
+ * sequences.  Same policy as server.c's log_escape (R3-L20): valid UTF-8
+ * sequences are copied verbatim so multi-byte text is not mangled, C1
+ * bytes that escape a valid sequence plus every control byte become '?',
+ * and the copy is capped at HTTPS_LOG_SAN_MAX bytes with a "..." marker
+ * so an absurd value cannot flood the log.  Kept local to https.c (rather
+ * than sharing server.c's static log_escape) to keep this hygiene fix a
+ * single-file change. */
+#define HTTPS_LOG_SAN_MAX   64
+#define HTTPS_LOG_SAN_VAL   (HTTPS_LOG_SAN_MAX - 3)   /* room for "..." */
+
+/* length of a complete UTF-8 sequence led by lead byte c, else 0 (ASCII,
+ * continuation byte, overlong/0xF5..0xFF lead — the byte-wise path then
+ * handles it) */
+static size_t https_utf8_seq(unsigned char c)
+{
+    if (c >= 0xC2 && c <= 0xDF)
+        return 2;
+    if (c >= 0xE0 && c <= 0xEF)
+        return 3;
+    if (c >= 0xF0 && c <= 0xF4)
+        return 4;
+    return 0;
+}
+
+static void https_log_san(const char *in, char out[], size_t outsz)
+{
+    size_t budget, i = 0;
+
+    if (outsz == 0)
+        return;
+    /* hold the VALUE in the first outsz-4 bytes; the "..." marker and the
+     * NUL always fit after it, so a truncation never has to cut a
+     * multi-byte character in half */
+    budget = (outsz > 4) ? outsz - 4 : 0;
+    while (*in && i < budget) {
+        unsigned char c = (unsigned char)*in;
+        size_t seq = https_utf8_seq(c);
+
+        if (seq >= 2) {
+            size_t k;
+            for (k = 1; k < seq; k++) {
+                if (((unsigned char)in[k] & 0xC0) != 0x80)
+                    break;
+            }
+            if (k == seq) {
+                if (i + seq > budget)
+                    break;      /* whole char does not fit the budget */
+                /* C2 80..C2 9F is U+0080..U+009F: a C1 control, not text */
+                if (seq != 2 || c != 0xC2 ||
+                    (unsigned char)in[1] < 0x80 ||
+                    (unsigned char)in[1] > 0x9F) {
+                    memcpy(out + i, in, seq);
+                    i += seq;
+                    in += seq;
+                    continue;
+                }
+            }
+        }
+        if (c < 0x20 || c == 0x7f || (c >= 0x80 && c <= 0x9f))
+            c = '?';
+        out[i++] = (char)c;
+        in++;
+    }
+    if (*in && outsz >= 4) {
+        memcpy(out + i, "...", 3);
+        i += 3;
+    }
+    out[i] = '\0';
+}
+
 /* sbuf/sbuf_app come from util.h (single shared definition). The local
  * copy that used to live here carried the gcc noinline/-Wrestrict
  * workarounds for riscv64/i686 musl cross builds; those attributes now
@@ -1743,7 +1817,13 @@ static int https_resp_parse(struct sbuf *resp, int *status, char **body_out)
     te = https_hdr_value(hdr_start, hdr_len, "transfer-encoding");
     if (te) {
         if (!https_te_is_chunked(te)) {
-            log_err("unsupported Transfer-Encoding: %s", te);
+            /* R15 (B3-1): te is remote-controlled — a hostile server may
+             * embed CR/LF (line forgery) or C0/C1 escapes (terminal
+             * injection).  Log a bounded, printable-only copy instead of
+             * the raw value; the reject/parse path below is unchanged. */
+            char san[HTTPS_LOG_SAN_MAX];
+            https_log_san(te, san, sizeof san);
+            log_err("unsupported Transfer-Encoding: %s", san);
             free(te);
             free(resp->d);
             *body_out = empty_str();
