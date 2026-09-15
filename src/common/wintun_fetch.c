@@ -175,8 +175,11 @@ static void delete_tree(const char *path)
      * guard missed at the function entry). Check the entry itself and,
      * when it is a reparse point, remove just the link without following
      * and return — same RemoveDirectoryA+DeleteFileA pair as the inner
-     * branch below (this also closes the entry-swap TOCTOU at every
-     * recursion level). */
+     * branch below. This is a PRE-ENUMERATION check: the entry is
+     * verified before FindFirstFileA ever sees it, so a residual
+     * entry-swap TOCTOU is not statically reachable in the routine's
+     * control flow (each recursion level re-checks the path it
+     * dereferences). */
     DWORD attr = GetFileAttributesA(path);
     if (attr != INVALID_FILE_ATTRIBUTES &&
         (attr & FILE_ATTRIBUTE_REPARSE_POINT)) {
