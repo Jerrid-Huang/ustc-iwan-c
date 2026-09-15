@@ -94,7 +94,14 @@ void pump_win_single_pkt(void *ud, uint8_t *pkt, size_t len, bool last)
         if (errno == EINTR)
             continue;
         if (errno == EAGAIN || errno == EWOULDBLOCK ||
-            errno == ENOBUFS || errno == EPERM) {
+            errno == ENOBUFS || errno == EPERM ||
+            /* R23 (R22-B1-2): ENOMEM — socket-buffer/memory pressure is
+             * transient, same class as ENOBUFS (on Windows wsa_errno
+             * even maps WSAENOBUFS to ENOBUFS); the old code marked the
+             * session lost on ENOMEM while the Linux pump only yielded.
+             * Unified across the pump family: budget-bounded stall,
+             * never a session kill. */
+            errno == ENOMEM) {
             atomic_fetch_add(&g_prof_send_eagain, 1);
             if (!udp_send_stall_wait(ctx->sockfd, retry_t0,
                                      PUMP_SEND_RETRY_MS))

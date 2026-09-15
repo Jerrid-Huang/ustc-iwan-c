@@ -550,7 +550,13 @@ static int socks_send_batch2(int sockfd, SocksConfig *cfg,
                 if (r < 0 &&
                     (errno == EAGAIN || errno == EWOULDBLOCK ||
                      errno == ENOBUFS || errno == EINTR ||
-                     errno == EPERM)) {
+                     errno == EPERM ||
+                     /* R23 (R22-B1-2): ENOMEM (socket-buffer/memory
+                      * pressure) is transient, same class as ENOBUFS —
+                      * it must not permanently disable GSO (the old
+                      * hard-error branch did) nor kill the session;
+                      * unified across the pump family */
+                     errno == ENOMEM)) {
                     /* EPERM: netfilter OUTPUT DROP returns EPERM for
                      * the dropped datagram (firewall rule, not a dead
                      * tunnel) — transient per-packet, retry like
@@ -615,7 +621,12 @@ per_msg:
             if (errno == EINTR)
                 continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK ||
-                errno == ENOBUFS || errno == EPERM) {
+                errno == ENOBUFS || errno == EPERM ||
+                /* R23 (R22-B1-2): ENOMEM (socket-buffer/memory pressure)
+                 * is transient, same class as ENOBUFS — the old code
+                 * marked the session lost on it here while the GSO path
+                 * merely disabled GSO; unified across the pump family */
+                errno == ENOMEM) {
                 /* EPERM: netfilter OUTPUT DROP returns EPERM for the
                  * dropped datagram — transient per-packet, retry like
                  * EAGAIN (send buffer full: poll up to 1ms for

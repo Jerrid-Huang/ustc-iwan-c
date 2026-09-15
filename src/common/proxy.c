@@ -283,7 +283,13 @@ static int send_batch(pump_ctx_t *ctx, struct mmsghdr *msgs, unsigned n)
         if (errno == EINTR)
             continue;
         if (errno == EAGAIN || errno == EWOULDBLOCK ||
-            errno == ENOBUFS || errno == EPERM) {
+            errno == ENOBUFS || errno == EPERM ||
+            /* R23 (R22-B1-2): ENOMEM (socket-buffer/memory pressure) is
+             * the same transient class — send_batch must not kill the
+             * session over it. Unified with send_gso / pump_win_single /
+             * socks.c (all now retry ENOMEM); UDP datagrams are droppable,
+             * a re-auth storm on ENOMEM is not. */
+            errno == ENOMEM) {
             /* EPERM: netfilter OUTPUT DROP returns EPERM for the
              * dropped datagram — transient per-packet, retry like
              * EAGAIN. The wait lives in pump_send_retry: poll at most
@@ -401,7 +407,12 @@ static int send_gso(pump_ctx_t *ctx, struct iovec *iov, unsigned n,
         if (errno == EINTR)
             continue;
         if (errno == EAGAIN || errno == EWOULDBLOCK ||
-            errno == ENOBUFS || errno == EPERM) {
+            errno == ENOBUFS || errno == EPERM ||
+            /* R23 (R22-B1-2): ENOMEM is transient here too — with the
+             * old classification send_batch killed the session on
+             * ENOMEM while send_gso merely disabled GSO (contradiction);
+             * unified: both retry within the budget. */
+            errno == ENOMEM) {
             /* EPERM: netfilter OUTPUT DROP returns EPERM for the
              * dropped datagram — transient per-packet, retry like
              * EAGAIN (same budget-bounded wait as send_batch: poll at
