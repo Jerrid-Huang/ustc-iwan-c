@@ -2276,10 +2276,16 @@ void service_local_outputs(void) {
                  * progress — resets the no-progress watchdog */
                 f->last_progress_ms = now_ms();
             } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK ||
-                                 errno == EINTR)) {
+                                 errno == EINTR || errno == ENOBUFS ||
+                                 errno == ENOMEM)) {
                 /* R37 R3-L5: EINTR keeps the queued output for the next
                  * round; the old code fell into the hard-error branch and
-                 * buf_clear()ed replies the client never got */
+                 * buf_clear()ed replies the client never got. R23
+                 * (R22-B1-1): ENOBUFS/ENOMEM are the same transient
+                 * send-pressure class the relay and UDP pump already
+                 * retry — the local client's buffer stays intact and the
+                 * next POLLOUT drains it, instead of dropping bytes and
+                 * closing the flow. */
                 break;
             } else {
                 f->local_eof = true;
@@ -2343,7 +2349,13 @@ void service_local_outputs(void) {
                      * no-progress watchdog */
                     f->last_progress_ms = now_ms();
                 } else if (n < 0 && errno != EAGAIN &&
-                           errno != EWOULDBLOCK && errno != EINTR) {
+                           errno != EWOULDBLOCK && errno != EINTR &&
+                           /* R23 (R22-B1-1): ENOBUFS/ENOMEM are transient
+                            * send pressure (local socket buffer/memory), the
+                            * same class the relay and UDP pump retry — keep
+                            * the rxq tail and wait for the next POLLOUT
+                            * rather than aborting the flow and dropping it */
+                           errno != ENOBUFS && errno != ENOMEM) {
                     f->local_eof = true;
                     ns_abort(&g_ns, f->ns_idx);
                     f->rxq_waiting = false; /* dead client: no POLLOUT wake */
