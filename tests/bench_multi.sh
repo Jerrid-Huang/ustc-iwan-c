@@ -370,12 +370,17 @@ for C in $CLIENTS_LIST; do
     # R18-2: `wait ... || true` swallowed every bench_client failure, so a
     # data plane that was dead for the whole window still printed
     # "TOTAL: 0 Mbit/s aggregate" + "BENCH MULTI DONE" and exited 0.
-    # wait returns the last client's status; record it and let the AGG
-    # check below turn a failure into exit 1 (same contract as bench.sh,
-    # where bench_client's non-zero exit propagates via set -e).
-    if ! wait $BENCH_PIDS 2>/dev/null; then
-        BENCH_RC=1
-    fi
+    # R31-A3-2: `wait $BENCH_PIDS` reports only the LAST pid's status, so
+    # a non-last client failing (1106a63: bench_client exits 1 on a
+    # 0-byte connection) was swallowed and the round went spuriously
+    # green. Collect each pid individually: ANY failure sets BENCH_RC,
+    # and the AGG/TOTAL check below turns it into exit 1 (same contract
+    # as bench.sh, where bench_client's non-zero exit propagates via
+    # set -e).
+    BENCH_RC=0
+    for pid in $BENCH_PIDS; do
+        wait "$pid" 2>/dev/null || BENCH_RC=1
+    done
     cpu1=$(srv_ticks)
     st1=$(awk '/^cpu / {print $2 + $3 + $4 + $5 + $6 + $7 + $8 + $9 + $10 + $11}' /proc/stat)
     id1=$(awk '/^cpu / {print $5}' /proc/stat)
