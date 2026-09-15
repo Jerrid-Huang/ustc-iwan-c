@@ -1557,8 +1557,10 @@ static void *rp_dir_main(void *ud)
      * g_rp_dir_dead_gen when publishing our own death) */
     unsigned my_gen = atomic_load(&g_rp_gen);
     uint8_t buf[RP_BUF];
+#ifndef IWAN_DEBUG_STRIP
     static _Thread_local struct prof_state pst;
     const char *tag = up_dir ? "rp up recv" : "rp dn recv";
+#endif
 
     while (!atomic_load(&g_rp_stop)) {
         pthread_mutex_lock(&g_rp_mu);
@@ -1685,7 +1687,9 @@ static void *rp_dir_main(void *ud)
                     up_dir ? "up" : "down", strerror(errno));
             break;              /* poll failed: stop relaying */
         }
-        if (prof_print(tag, &pst,
+#ifndef IWAN_DEBUG_STRIP
+        if (atomic_load_explicit(&g_prof_on, memory_order_relaxed) &&
+            prof_print(tag, &pst,
                        up_dir ? g_prof_rp_up_recv : g_prof_rp_dn_recv)) {
             static _Thread_local struct prof_state pst2, pst3;
             prof_print(up_dir ? "rp up send" : "rp dn send", &pst2,
@@ -1700,6 +1704,7 @@ static void *rp_dir_main(void *ud)
                     (unsigned long long)n, (unsigned long long)pf_n,
                     (int)pf_dirty);
         }
+#endif
 
         for (size_t i = 0; i < n; i++) {
             struct rp_conn *cn = snap[i];

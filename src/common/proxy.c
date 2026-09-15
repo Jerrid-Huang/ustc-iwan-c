@@ -807,7 +807,7 @@ static void *udp2tun_thread(void *ud) {
             break;
         }
 #ifndef IWAN_DEBUG_STRIP
-        {
+        if (atomic_load_explicit(&g_prof_on, memory_order_relaxed)) {
             static struct prof_state pst_rx, pst_tx;
             if (prof_print("cli rx", &pst_rx, g_prof_pump_rx))
                 prof_print("cli tx", &pst_tx, g_prof_pump_tx);
