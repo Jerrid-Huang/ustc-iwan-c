@@ -1396,7 +1396,7 @@ static int https_tls_connect(SSL *ssl, int fd, uint64_t deadline_ms,
                 /* R14 (R13-B1-L1): the peer half-closed the TCP connection
                  * during the handshake (accepted then FIN).  MEASURED on
                  * OpenSSL 3.5.5: the early close lands HERE as ZERO_RETURN
-                 * (r<0, errno stale/non-zero, empty error queue) — the
+                 * (r<0, errno==0, empty error queue) — the
                  * SYSCALL/errno==0 branch below is a defensive fallback,
                  * not reached on that version.  A close_notify
                  * mid-handshake lands here too.  Without this branch the
@@ -1508,11 +1508,15 @@ static int https_tls_write(SSL *ssl, int fd, const char *req,
 
             if (e == SSL_ERROR_ZERO_RETURN) {
                 /* R14 (R13-B1-L1): the peer closed the connection (FIN /
-                 * close_notify) before the request was fully written;
-                 * MEASURED on OpenSSL 3.5.5 as ZERO_RETURN, the same
-                 * early-close shape as the handshake side.  Name the real
-                 * cause instead of https_ssl_err's strerror(errno) ==
-                 * "Success". */
+                 * close_notify) before the request was fully written.
+                 * R17 (R16-3): DEFENSIVE FALLBACK on the WRITE side —
+                 * never observed on OpenSSL 3.5.5, where the early close
+                 * surfaces as SSL_ERROR_SYSCALL (e=5) with
+                 * errno=ECONNRESET/EPIPE below, or the write simply
+                 * completes.  The ZERO_RETURN measurement is handshake-
+                 * side only and does not transfer here.  Still name the
+                 * real cause instead of https_ssl_err's
+                 * strerror(errno) == "Success". */
                 snprintf(diag, diagsz,
                          "peer closed the connection while sending request");
                 return -1;
@@ -1522,13 +1526,16 @@ static int https_tls_write(SSL *ssl, int fd, const char *req,
                  * timeout fired — re-check the deadline next iteration */
                 continue;
             if (e == SSL_ERROR_SYSCALL) {
-                /* R14 (R13-B1-L1): DEFENSIVE FALLBACK for a peer that
-                 * closed (FIN/close_notify) while the request was still
-                 * going out.  Mirror of the handshake/read r==0 rules: r==0
-                 * is the documented "peer went away" return, and the r<0
-                 * errno==0 empty-queue shape is belt-and-braces — NOT
-                 * observed on OpenSSL 3.5.5, which reports the early close
-                 * as ZERO_RETURN; both must not fall through to
+                /* R14 (R13-B1-L1): a peer that closed (FIN/close_notify)
+                 * while the request was still going out.  Mirror of the
+                 * handshake/read r==0 rules: r==0 is the documented "peer
+                 * went away" return, and the r<0 errno==0 empty-queue
+                 * shape is belt-and-braces.  R17 (R16-3): MEASURED on
+                 * OpenSSL 3.5.5 — on the write side the early close is
+                 * what lands HERE as SYSCALL with errno=ECONNRESET/EPIPE
+                 * when the peer RSTs (or the write completes first);
+                 * ZERO_RETURN was never observed on the write side.
+                 * Either way neither shape must fall through to
                  * strerror(errno) == "Success". */
                 if (w == 0 || (w < 0 && errno == 0 &&
                                ERR_peek_error() == 0)) {
