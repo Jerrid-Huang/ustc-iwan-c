@@ -21,7 +21,7 @@ void lockout_note(lockout_rec *tbl, int n, const void *key, size_t klen,
         pthread_mutex_lock(mu);
     if (success) {
         for (int i = 0; i < n; i++) {
-            if (tbl[i].first_fail_ms != 0 &&
+            if (tbl[i].in_use &&
                 memcmp(tbl[i].key, key, klen) == 0) {
                 memset(&tbl[i], 0, sizeof tbl[i]);
                 break;
@@ -33,14 +33,14 @@ void lockout_note(lockout_rec *tbl, int n, const void *key, size_t klen,
     }
     for (int i = 0; i < n; i++) {
         lockout_rec *r = &tbl[i];
-        if (r->first_fail_ms != 0 && memcmp(r->key, key, klen) == 0) {
+        if (r->in_use && memcmp(r->key, key, klen) == 0) {
             e = r;
             break;
         }
         /* empty slot wins; otherwise keep the oldest first_fail_ms among
          * entries that are NOT currently blocked (L-1: never evict a live
          * ban while a non-blocked victim exists) */
-        if (r->first_fail_ms == 0 ||
+        if (!r->in_use ||
             (r->blocked_until_ms <= now &&
              (oldest == NULL || r->first_fail_ms < oldest->first_fail_ms)))
             oldest = r;
@@ -63,7 +63,7 @@ void lockout_note(lockout_rec *tbl, int n, const void *key, size_t klen,
      * counting window but while blocked_until_ms is still in force must
      * NOT clear the ban — only the counting window restarts and the entry
      * stays blocked until blocked_until_ms expires naturally. */
-    if (e->first_fail_ms == 0 ||
+    if (!e->in_use ||
         memcmp(e->key, key, klen) != 0 ||
         now - e->first_fail_ms >= window_ms) {
         /* M-1: same key, previous burst aged out, ban still active — keep
@@ -71,7 +71,7 @@ void lockout_note(lockout_rec *tbl, int n, const void *key, size_t klen,
          * limited to same-key window age-outs: when the key differs this
          * is a table eviction and the new key must still take over the
          * slot. */
-        if (e->first_fail_ms != 0 &&
+        if (e->in_use &&
             memcmp(e->key, key, klen) == 0 &&
             e->blocked_until_ms != 0 && e->blocked_until_ms > now) {
             e->fail = 1;
@@ -84,6 +84,7 @@ void lockout_note(lockout_rec *tbl, int n, const void *key, size_t klen,
         memcpy(e->key, key, klen);
         e->fail = 1;
         e->first_fail_ms = now;
+        e->in_use = true;
         /* R1-D-c-1: the fresh-entry path returns early, so it must apply
          * the threshold itself — max_fails == 1 has to ban on this very
          * first failure (a 2nd try would otherwise always be allowed). */

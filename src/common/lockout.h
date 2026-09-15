@@ -29,6 +29,13 @@ typedef struct {
     int      fail;
     uint64_t first_fail_ms;
     uint64_t blocked_until_ms;  /* 0 = not blocked */
+    /* R17 (R16-7): an independent occupancy bit.  first_fail_ms==0 used
+     * to double as the empty-slot marker, which made a first failure at
+     * now_ms()==0 invisible to the counter/success search and left a
+     * ghost record behind; the bit is set on every entry creation and
+     * cleared by memset on clear/evict.  blocked_until_ms==0 keeps its
+     * own "not blocked" meaning. */
+    bool     in_use;
 } lockout_rec;
 
 void lockout_note(lockout_rec *tbl, int n, const void *key, size_t klen,
