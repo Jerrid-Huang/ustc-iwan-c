@@ -142,15 +142,55 @@ fi
 echo "== start echo server on the tunnel gateway =="
 python3 tests/echo_server.py --bind "$SRV_IP" --port "$ECHO_PORT" &
 ECHO_PID=$!
-sleep 0.5
+# R30-B1-F2: wait for the listener (a fixed sleep raced a slow startup
+# and the first echo connection got ECONNREFUSED; kill -0 catches an
+# early exit, ss catches the not-yet-bound case). Same ss poll + kill -0
+# shape as bench.sh:212-231 / bench_multi.sh:296-307.
+for _ in $(seq 1 40); do
+    if ! kill -0 "$ECHO_PID" 2>/dev/null; then
+        echo "error: echo server exited" >&2
+        exit 1
+    fi
+    if ss -tln 2>/dev/null | grep -q ":$ECHO_PORT "; then
+        break
+    fi
+    sleep 0.25
+done
+kill -0 "$ECHO_PID" 2>/dev/null || {
+    echo "error: echo server exited" >&2
+    exit 1
+}
+if ! ss -tln 2>/dev/null | grep -q ":$ECHO_PORT "; then
+    echo "error: echo server (port $ECHO_PORT) not listening after 10s" >&2
+    ss -tln 2>/dev/null | head -20 >&2
+    exit 1
+fi
 
 echo "== mode 1: socks client, 4 TCP echo connections =="
 ./bin/iwan-client socks --server 127.0.0.1 --port "$PORT" \
     --user test --pass s3cret --listen "127.0.0.1:$SOCKS_PORT" &
 SOCKS_PID=$!
-sleep 1.5
-if ! kill -0 "$SOCKS_PID" 2>/dev/null; then
+# R30-B1-F5: wait for the LISTENER, not a fixed sleep — on a slow host
+# the client could still be mid-OPEN when echo_client started and all
+# 4 conns got ECONNREFUSED (a fake failure; the old comment only covered
+# "port busy"). Same ss poll + kill -0 double check as bench.sh:212-231.
+for _ in $(seq 1 40); do
+    if ! kill -0 "$SOCKS_PID" 2>/dev/null; then
+        echo "error: socks client exited (listener port $SOCKS_PORT busy?)" >&2
+        exit 1
+    fi
+    if ss -tln 2>/dev/null | grep -q ":$SOCKS_PORT "; then
+        break
+    fi
+    sleep 0.25
+done
+kill -0 "$SOCKS_PID" 2>/dev/null || {
     echo "error: socks client exited (listener port $SOCKS_PORT busy?)" >&2
+    exit 1
+}
+if ! ss -tln 2>/dev/null | grep -q ":$SOCKS_PORT "; then
+    echo "error: socks listener (port $SOCKS_PORT) not up after 10s" >&2
+    ss -tln 2>/dev/null | head -20 >&2
     exit 1
 fi
 python3 tests/echo_client.py --target "$SRV_IP:$ECHO_PORT" \
@@ -180,6 +220,7 @@ socks_dns_check http://www.ustc.edu.cn/
 echo "socks domain via tunnel DNS: PASS"
 kill "$SOCKS_PID" 2>/dev/null
 wait "$SOCKS_PID" 2>/dev/null || true
+SOCKS_PID=""   # don't let cleanup() kill a reused / stale PID (site 2 does the same before its own restart)
 # restart the server without a tunnel DNS and the socks client against
 # it: the client must fall back to local resolution
 kill "$SERVER_PID" 2>/dev/null
@@ -200,9 +241,24 @@ ip addr show iwan-srv-it 2>/dev/null | grep -q "$SRV_IP" || {
 ./bin/iwan-client socks --server 127.0.0.1 --port "$PORT" \
     --user test --pass s3cret --listen "127.0.0.1:$SOCKS_PORT" &
 SOCKS_PID=$!
-sleep 1.5
-if ! kill -0 "$SOCKS_PID" 2>/dev/null; then
+# R30-B1-F5 (second instance): same listener readiness poll as above
+for _ in $(seq 1 40); do
+    if ! kill -0 "$SOCKS_PID" 2>/dev/null; then
+        echo "error: socks client exited (second instance)" >&2
+        exit 1
+    fi
+    if ss -tln 2>/dev/null | grep -q ":$SOCKS_PORT "; then
+        break
+    fi
+    sleep 0.25
+done
+kill -0 "$SOCKS_PID" 2>/dev/null || {
     echo "error: socks client exited (second instance)" >&2
+    exit 1
+}
+if ! ss -tln 2>/dev/null | grep -q ":$SOCKS_PORT "; then
+    echo "error: socks listener (port $SOCKS_PORT) not up after 10s (second instance)" >&2
+    ss -tln 2>/dev/null | head -20 >&2
     exit 1
 fi
 socks_dns_check http://www.ustc.edu.cn/
