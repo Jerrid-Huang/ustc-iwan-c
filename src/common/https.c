@@ -51,7 +51,6 @@
  * cannot see embedded NULs) to keep this hygiene fix a single-file
  * change; the UTF-8 criteria are byte-for-byte the same in both. */
 #define HTTPS_LOG_SAN_MAX   64
-#define HTTPS_LOG_SAN_VAL   (HTTPS_LOG_SAN_MAX - 3)   /* room for "..." */
 
 /* length of a complete, well-formed, SHORTEST-form UTF-8 sequence led by
  * in[0], else 0.  "Shortest-form" is the point: UTF-8 admits redundant
