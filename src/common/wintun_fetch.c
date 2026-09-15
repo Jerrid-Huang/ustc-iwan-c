@@ -168,6 +168,22 @@ static char *ps_capture(const char *ps_expr, int *ps_rc){
  * degrades per entry, never abandoning the whole tree). */
 static void delete_tree(const char *path)
 {
+    /* R25 (R24-A1-1): the ROOT entry `path` itself may be a pre-planted
+     * junction/symlink (<exe_dir>\wintun-tmp) — FindFirstFileA(path\*)
+     * FOLLOWS the link transparently and would enumerate and recursively
+     * delete the TARGET's contents (the exact hole 910dd02's inner-item
+     * guard missed at the function entry). Check the entry itself and,
+     * when it is a reparse point, remove just the link without following
+     * and return — same RemoveDirectoryA+DeleteFileA pair as the inner
+     * branch below (this also closes the entry-swap TOCTOU at every
+     * recursion level). */
+    DWORD attr = GetFileAttributesA(path);
+    if (attr != INVALID_FILE_ATTRIBUTES &&
+        (attr & FILE_ATTRIBUTE_REPARSE_POINT)) {
+        RemoveDirectoryA(path);
+        DeleteFileA(path);
+        return;
+    }
     char pat[PS_PATH_DERIVED_MAX];
     int n = snprintf(pat, sizeof pat, "%s\\*", path);
     if (n < 0 || (size_t)n >= sizeof pat) {
