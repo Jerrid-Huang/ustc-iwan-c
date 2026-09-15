@@ -2285,7 +2285,15 @@ void service_local_outputs(void) {
                  * send-pressure class the relay and UDP pump already
                  * retry — the local client's buffer stays intact and the
                  * next POLLOUT drains it, instead of dropping bytes and
-                 * closing the flow. */
+                 * closing the flow.
+                 * R25 (R24-A3-1): with ENOBUFS/ENOMEM the socket can stay
+                 * POLLOUT-armed/ready while the kernel keeps refusing the
+                 * write — without a backoff the event loop re-enters this
+                 * arm every round (hot spin on one core; the no-progress
+                 * watchdog excludes ESTABLISHED flows). Back off 1 ms for
+                 * that pair, same as relay rp_send_full_payload. */
+                if (errno == ENOBUFS || errno == ENOMEM)
+                    port_sleep_ms(1);
                 break;
             } else {
                 f->local_eof = true;
@@ -2362,6 +2370,12 @@ void service_local_outputs(void) {
                     set_flow_state(f, ST_CLOSING);
                     continue;
                 } else {
+                    /* R25 (R24-A3-1): same 1 ms backoff as the main drain
+                     * — ENOBUFS/ENOMEM with POLLOUT ready would otherwise
+                     * re-enter every round and hot-spin one core (relay
+                     * rp_send_full_payload precedent) */
+                    if (n < 0 && (errno == ENOBUFS || errno == ENOMEM))
+                        port_sleep_ms(1);
                     f->rxq_waiting = true;
                 }
             } else {
