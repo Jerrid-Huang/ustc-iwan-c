@@ -465,7 +465,7 @@ void accept_connections(int listener) {
  * them in place, both illegal while a zerocopy notification is
  * outstanding. This GSO+sendmmsg shape is the local optimum. */
 
-/* One transient EAGAIN/ENOBUFS/EPERM drain stall (EINTR is handled by
+/* One transient EAGAIN/ENOBUFS/ENOMEM/EPERM drain stall (EINTR is handled by
  * the caller before this runs): emit a throttled diagnostic — one per
  * second per drain path, each call site keeps its own last_diag static,
  * so a GSO stall and a sendmmsg stall within the same second are both
@@ -1689,6 +1689,16 @@ int run_socks(int sockfd, SocksConfig *cfg) {
     sigaction(SIGTERM, &old_term, NULL);
     sigaction(SIGPIPE, &old_pipe, NULL);
 #endif
+    /* R25 (R24-B1-1): run_socks replaces run_pump in the same process,
+     * so the shared g_prof_send_eagain counter (incremented by
+     * sock_drain_tx above) would never be read — run_pump's [pump-prof]
+     * tail reader does not run here. Read it ourselves under the same
+     * IWAN_PUMP_PROF gate so SOCKS uplink send pressure stays observable
+     * at teardown (whole-run counter, printed once like pump_prof_print). */
+    pump_prof_gate_init();
+    if (pump_prof_on())
+        fprintf(stderr, "[pump-prof] socks send-ctr eagain=%llu\n",
+                (unsigned long long)atomic_load(&g_prof_send_eagain));
     log_info("SOCKS5 stopped");
     return cfg->session_lost ? 1 : 0;
 }
