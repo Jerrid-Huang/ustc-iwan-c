@@ -1182,6 +1182,18 @@ int main(int argc, char **argv)
     ctx.ip_end = (subnet_base | ~(0xFFFFFFFFu << (32 - o.mask))) - 1; /* pre-broadcast */
     ctx.next_ip = ctx.ip_base;
     ctx.tun_fd = -1;
+    /* R12 T1: make the H1 gate subnet-aware (see server.h/server.c).  An
+     * uplink inner packet to the gateway (-s) or to any address inside
+     * --subnet is THIS tunnel's own address space, not a springboard into
+     * the server host, so it must not be refused by the host-local
+     * reject set.  Without this, `-s 169.254.0.1 -S 169.254.0.0/16` (or
+     * any operator-chosen tunnel range overlapping that set) silently
+     * dropped every packet addressed to the gateway.  Zero-init above
+     * leaves subnet_set=false for any other constructor: strict legacy
+     * behavior. */
+    ctx.subnet_base = subnet_base;                 /* BE u32 (parse_subnet) */
+    ctx.subnet_mask = 0xFFFFFFFFu << (32 - o.mask);
+    ctx.subnet_set = true;
 
     {
         uint32_t sipu = ip4_u32(sip);

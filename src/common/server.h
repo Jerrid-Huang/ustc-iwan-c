@@ -78,6 +78,24 @@ struct server_ctx {
     uint32_t next_ip;        /* BE u32; next client IP to hand out */
     uint32_t ip_base;        /* BE u32; first usable host address */
     uint32_t ip_end;         /* BE u32; last usable host address (pre-broadcast) */
+    /* R12 T1: the tunnel's OWN address space as configured by the
+     * operator (`-S/--subnet` network+mask, `-s/--server-ip` above).
+     * The uplink H1 gate rejects host-local destinations (server.c
+     * up_inner_dst_blocked4) so an authenticated client cannot use the
+     * server as a springboard to the server host's own loopback /
+     * link-local addresses (R38 P1-4).  That reject set is a property of
+     * the HOST, not of the tunnel, and it unconditionally contains
+     * ranges an operator may legitimately have chosen for the tunnel
+     * itself: with `-s 169.254.0.1 -S 169.254.0.0/16` every uplink
+     * packet addressed to the gateway was silently dropped as
+     * "host-local".  The gate therefore exempts the gateway and anything
+     * inside `--subnet` — those are addresses this server hands out and
+     * routes, not springboards.  subnet_set == false (the
+     * zero-initialized default) means "no subnet known" and keeps the
+     * pre-R12 strict behavior (full reject set). */
+    uint32_t subnet_base;    /* BE u32; --subnet network address */
+    uint32_t subnet_mask;    /* BE u32; --subnet netmask (length 8..30) */
+    bool subnet_set;         /* false => full reject set (strict) */
     int tun_fd;              /* -1 when running in --no-tun mode */
     void *qpool;             /* struct tun_pool *, owned by main() */
 };

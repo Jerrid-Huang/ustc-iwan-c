@@ -1439,6 +1439,31 @@ static bool up_inner_dst_blocked4(uint32_t d)
            (d & 0xFFFF0000u) == 0xA9FE0000u;     /* 169.254.0.0/16 */
 }
 
+/* R12 T1: is d (BE u32) an address that belongs to THIS tunnel's own
+ * configured address space — the --server-ip gateway or anywhere inside
+ * --subnet?  Those are addresses the server itself hands out and routes;
+ * an uplink packet to them is ordinary tunnel traffic (gateway ping/DNS,
+ * client-to-client within the pool), not a springboard into the server
+ * host, so the H1 host-local reject set must not fire for them.
+ *
+ * Without this exemption, an operator whose tunnel legitimately sits in
+ * a range of the reject set — e.g. `-s 169.254.0.1 -S 169.254.0.0/16`
+ * (link-local /16 as the tunnel subnet) — lost EVERY uplink packet
+ * addressed to the gateway or to another pool address: the frame dies in
+ * the gate (only the g_up[tid].h1 counter and, under IWAN_DEBUG, one log
+ * line/s), the kernel never sees it.
+ *
+ * subnet_set == false (the zero-initialized default; any caller that
+ * never configured a subnet) keeps the strict pre-R12 behavior. */
+static bool up_inner_dst_in_tunnel(const struct server_ctx *ctx, uint32_t d)
+{
+    if (!ctx->subnet_set)
+        return false;
+    if (d == ip4_u32(ctx->server_ip))
+        return true;                              /* the gateway itself */
+    return (d & ctx->subnet_mask) == ctx->subnet_base;
+}
+
 static bool up_inner_dst_blocked6(const uint8_t d[16])
 {
     static const uint8_t lo[16] = { 0, 0, 0, 0, 0, 0, 0, 0,
@@ -1657,7 +1682,8 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                 } else {
                     if (ipv4_pkt_ok(in, inlen, &saddr, &daddr) != 0 ||
                         saddr != s_ip ||
-                        up_inner_dst_blocked4(daddr)) {
+                        (up_inner_dst_blocked4(daddr) &&
+                         !up_inner_dst_in_tunnel(ctx, daddr))) {
                         atomic_fetch_add_explicit(&g_up[tid].h1, 1, memory_order_relaxed);
                         if (debug_enabled() && h1_drop_log_due()) {
                             /* short frames can fail the sanity check
