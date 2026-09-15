@@ -26,17 +26,30 @@ import time
 CHUNK = 1 << 16
 
 
+def recv_exact(s, n):
+    """R30 F6/F7: recv() may return fewer bytes than asked for; loop until
+    n bytes or EOF (a bare recv(2)/recv(10) splits under load and made the
+    SOCKS5 handshake flaky)."""
+    buf = b""
+    while len(buf) < n:
+        chunk = s.recv(n - len(buf))
+        if not chunk:
+            raise RuntimeError(f"EOF after {len(buf)}/{n} bytes")
+        buf += chunk
+    return buf
+
+
 def socks5_connect(proxy, target_host, target_port):
     ph, pp = proxy
     s = socket.create_connection((ph, pp), timeout=10)
     s.sendall(b"\x05\x01\x00")
-    if s.recv(2) != b"\x05\x00":
+    if recv_exact(s, 2) != b"\x05\x00":
         s.close()
         raise RuntimeError("SOCKS5 no-auth not accepted")
     s.sendall(b"\x05\x01\x00\x01" + socket.inet_aton(target_host) +
               struct.pack(">H", target_port))
-    rep = s.recv(10)
-    if len(rep) < 10 or rep[:4] != b"\x05\x00\x00\x01":
+    rep = recv_exact(s, 10)
+    if rep[:4] != b"\x05\x00\x00\x01":
         s.close()
         raise RuntimeError(f"SOCKS5 connect failed: {rep.hex()}")
     return s

@@ -26,13 +26,15 @@ def socks5_connect(proxy, target_host, target_port):
     ph, pp = proxy
     s = socket.create_connection((ph, pp), timeout=10)
     s.sendall(b"\x05\x01\x00")
-    if s.recv(2) != SOCKS5_OK:
+    # R30 F6/F7: full reads — recv() may split the greeting/reply and a
+    # bare recv(2)/recv(10) then broke the handshake under load
+    if recv_exact(s, 2) != SOCKS5_OK:
         s.close()
         raise RuntimeError("SOCKS5 no-auth not accepted")
     ip = socket.inet_aton(target_host)
     s.sendall(b"\x05\x01\x00\x01" + ip + struct.pack(">H", target_port))
-    rep = s.recv(10)
-    if len(rep) < 10 or rep[:4] != SOCKS5_CONNECT_OK:
+    rep = recv_exact(s, 10)
+    if rep[:4] != SOCKS5_CONNECT_OK:
         s.close()
         raise RuntimeError(f"SOCKS5 connect failed: {rep.hex()}")
     return s
