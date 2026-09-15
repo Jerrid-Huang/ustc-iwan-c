@@ -30,6 +30,13 @@
 #include "socks.h"
 #include "socks_internal.h"
 #include "util.h"
+#include "proxy_internal.h"   /* R25 (R24-B1-1): g_prof_send_eagain — the
+                               * socks drain shares the pump family's
+                               * EAGAIN/ENOBUFS/ENOMEM hit counter, so
+                               * SOCKS uplink send pressure stays
+                               * observable in the profiler (was silently
+                               * uncounted while the "keep in sync" note
+                               * in proxy.c promised parity) */
 
 /* P0-3: msg_iovlen's spelling differs per platform (POSIX `size_t`, Windows
  * shim `int`); PORT_MSG_IOVLEN() in port.h is the single source of that
@@ -565,6 +572,10 @@ static int socks_send_batch2(int sockfd, SocksConfig *cfg,
                         /* throttled diagnostic: identify which error
                          * wedges the drain under burst load */
                         static uint64_t last_diag;
+                        /* R25 (R24-B1-1): count the hit on the shared
+                         * pump-family counter (same arm as proxy.c
+                         * send_batch / send_gso) */
+                        atomic_fetch_add(&g_prof_send_eagain, 1);
                         if (!socks_send_stall_wait(sockfd, retry_t0,
                                                    &last_diag,
                                                    "SOCKS GSO EAGAIN: %s (npk=%d)",
@@ -642,6 +653,11 @@ per_msg:
                  * and let the main loop cycle (see the function
                  * comment). */
                 static uint64_t last_diag;
+                /* R25 (R24-B1-1): count on the shared pump-family counter
+                 * (EINTR is handled above, so this arm is exactly the
+                 * EAGAIN/ENOBUFS/ENOMEM/EPERM transient class proxy.c
+                 * counts — SOCKS uplink pressure is now observable) */
+                atomic_fetch_add(&g_prof_send_eagain, 1);
                 if (!socks_send_stall_wait(sockfd, retry_t0, &last_diag,
                                            "SOCKS sendmmsg EAGAIN: %s (npk=%d sent=%u)",
                                            npk, sent))
