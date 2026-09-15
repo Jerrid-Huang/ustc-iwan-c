@@ -124,9 +124,18 @@ def main():
         t.join()
     wall = time.monotonic() - t0
     total = sum(results)
+    # R30-B1-1: align with the docstring — exit 0 only when EVERY conn moved
+    # at least one byte. A sum > 0 silently swallowed partial failures (some
+    # conns dead behind a live aggregate), so any 0-byte conn now exits 1
+    # with a diagnostic listing the failed conns.
+    failed = [i for i, n in enumerate(results) if n == 0]
+    if failed:
+        print("error: %d of %d conns moved 0 bytes: %s" %
+              (len(failed), args.conns,
+               ", ".join("conn %d" % i for i in failed)), flush=True)
     print(f"AGG {args.direction}: {total / 1e6:.1f} MB in {wall:.2f}s = "
           f"{total * 8 / wall / 1e6:.0f} Mbit/s aggregate", flush=True)
-    raise SystemExit(0 if total > 0 else 1)
+    raise SystemExit(0 if not failed else 1)
 
 
 if __name__ == "__main__":
