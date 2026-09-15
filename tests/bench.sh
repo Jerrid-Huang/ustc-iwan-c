@@ -181,10 +181,43 @@ if ! iptables -C INPUT -i iwan-srv-it -j ACCEPT 2>/dev/null; then
 fi
 
 echo "== start bench server (sink + source) =="
+# a leftover bench server from an aborted run would hold the ports forever;
+# the new instance then dies on bind and a READY-looking poll would watch
+# the stale sockets — the benchmark would silently hit the old instance
+# (R30-B1-F2). Same upfront pkill as bench_multi.sh:176.
+pkill -f 'bench_server.py' 2>/dev/null || true
+sleep 0.3
 stdbuf -oL -eL python3 tests/bench_server.py --bind "$SRV_IP" \
     --sink-port "$SINK_PORT" --source-port "$SOURCE_PORT" &
 BENCH_PID=$!
-sleep 0.5
+# R30-B1-F2: wait for BOTH listeners before the first bench connection.
+# A fixed sleep raced a slow startup and — worse — with a stale instance
+# already holding the ports the new server dies on bind while the stale
+# one keeps listening, so the bench silently hit the OLD instance; ss
+# alone cannot tell (the port IS listening). kill -0 catches the dead
+# new instance, ss catches the slow-bind case. Same ss-poll shape as
+# bench_multi.sh:296-307 / bench.sh socks poll below.
+for _ in $(seq 1 40); do
+    if ! kill -0 "$BENCH_PID" 2>/dev/null; then
+        echo "error: bench server exited" >&2
+        exit 1
+    fi
+    if ss -tln 2>/dev/null | grep -q ":$SINK_PORT " && \
+       ss -tln 2>/dev/null | grep -q ":$SOURCE_PORT "; then
+        break
+    fi
+    sleep 0.25
+done
+kill -0 "$BENCH_PID" 2>/dev/null || {
+    echo "error: bench server exited" >&2
+    exit 1
+}
+if ! ss -tln 2>/dev/null | grep -q ":$SINK_PORT " || \
+   ! ss -tln 2>/dev/null | grep -q ":$SOURCE_PORT "; then
+    echo "error: bench server (ports $SINK_PORT/$SOURCE_PORT) not listening after 10s" >&2
+    ss -tln 2>/dev/null | head -20 >&2
+    exit 1
+fi
 
 bench() {   # $1=label  $2=socks-arg(empty=direct)  $3=netns-exec(empty=host)
     local dir
