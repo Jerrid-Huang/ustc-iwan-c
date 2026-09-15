@@ -228,6 +228,66 @@ static int https_te_is_chunked(const char *val)
     return ok && codings == 1;
 }
 
+/* R12 T4 (R41-1A2-1): scan a complete header block (NUL-free, len bytes)
+ * for a Transfer-Encoding field whose coding list contains the "chunked"
+ * token — case-insensitive, comma-separated, tolerant of the optional
+ * OWS / parameters the parser below allows. This answers the FRAMING
+ * question only ("is the body chunked?"); the strict single-coding
+ * validation happens later in https_resp_parse, unchanged.
+ *
+ * RFC 7230 §3.3.3: when a message carries both Transfer-Encoding and
+ * Content-Length, Transfer-Encoding overrides it (a sender that emits
+ * both is buggy, but a receiver must still frame by chunked). The raw
+ * read must then run to EOF/close_notify instead of stopping at the CL
+ * count — CL counts DECODED payload bytes, the wire holds the chunk
+ * framing on top of them, so cutting at CL truncates the chunk stream
+ * and the downstream chunk_decode hard-fails ("chunked body truncated",
+ * observed e.g. for CL:0 which returned at the "declared empty body"
+ * check with an empty, non-chunked "body"). */
+static bool https_te_header_chunked(const char *hdrs, size_t hlen)
+{
+    static const char te[] = "Transfer-Encoding:";
+    size_t i = 0;
+
+    while (i < hlen) {
+        size_t eol = i;
+        while (eol < hlen && hdrs[eol] != '\r' && hdrs[eol] != '\n')
+            eol++;
+        if (eol - i >= sizeof te - 1 &&
+            port_strncasecmp(hdrs + i, te, sizeof te - 1) == 0) {
+            const char *p = hdrs + i + sizeof te - 1;
+            size_t vlen = eol - (i + sizeof te - 1);
+            for (;;) {
+                size_t n;
+                while (vlen && (*p == ' ' || *p == '\t')) {
+                    p++;
+                    vlen--;
+                }
+                n = 0;
+                while (n < vlen && p[n] != ',' && p[n] != ';' &&
+                       p[n] != ' ' && p[n] != '\t')
+                    n++;
+                if (n == 7 && port_strncasecmp(p, "chunked", 7) == 0)
+                    return true;
+                /* skip past this coding (and its ;parameters) */
+                while (vlen && *p != ',') {
+                    p++;
+                    vlen--;
+                }
+                if (!vlen)
+                    break;
+                p++;            /* consume ',' */
+                vlen--;
+            }
+            return false;
+        }
+        i = eol;
+        while (i < hlen && (hdrs[i] == '\r' || hdrs[i] == '\n'))
+            i++;
+    }
+    return false;
+}
+
 /* R10: true when the n bytes at s contain a byte that must never reach the
    wire verbatim inside a request line or a header field. CR and LF are the
    classic request-splitting/header-injection vector (RFC 7230 3.2.4: a
@@ -1311,6 +1371,7 @@ static int https_tls_read(SSL *ssl, int fd, struct sbuf *resp,
 {
     char buf[HTTPS_READ_CHUNK];
     long long content_len = -1;   /* -1: unknown (EOF-delimited) */
+    bool chunked = false;         /* TE: chunked wins over CL (R12 T4) */
     size_t body_start = 0;
     /* R1-B1-1: the header scan below used to restart at byte 0 after every
      * 4 KiB read, so a peer that pushes the terminator late (or never)
@@ -1385,10 +1446,26 @@ static int https_tls_read(SSL *ssl, int fd, struct sbuf *resp,
                      * CRLF (preferred) while content_len is unknown; that
                      * is the only case that re-parses */
                     body_start = crlf_hit ? crlf_pos + 4 : lf_pos + 2;
-                    content_len =
-                        https_content_length(resp->d, body_start);
-                    if (content_len == 0)
-                        return 0;   /* declared empty body */
+                    if (!chunked) {
+                        /* R12 T4 (R41-1A2-1): decide the framing ONCE, at
+                         * the first settled header block. TE: chunked
+                         * overrides any Content-Length (RFC 7230 §3.3.3):
+                         * keep content_len == -1 so the raw read runs to
+                         * EOF/close_notify and the FULL chunk stream is
+                         * captured — CL counts decoded payload bytes, not
+                         * the chunk-framed wire octets, so stopping at CL
+                         * would truncate the stream and chunk_decode()
+                         * below would hard-fail. Only the non-chunked
+                         * path parses Content-Length (behavior unchanged). */
+                        chunked = https_te_header_chunked(resp->d,
+                                                          body_start);
+                        if (!chunked) {
+                            content_len =
+                                https_content_length(resp->d, body_start);
+                            if (content_len == 0)
+                                return 0;   /* declared empty body */
+                        }
+                    }
                 }
             }
             if (content_len > 0 &&
