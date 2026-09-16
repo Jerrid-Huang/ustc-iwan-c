@@ -174,6 +174,8 @@ sudo ./iwan-server --port 6001 --tun iwan-srv \
 
 服务器启动时自动启用 IPv4 转发并配置 iptables MASQUERADE（需要 root，`--no-tun` 测试模式除外）。
 
+> **运行时韧性（R43-C1-L1）**：服务端每秒探测一次 TUN 设备索引（`if_nametoindex`，与客户端 proxy 哨兵同机制）。若 TUN 设备在运行中被外部删除（`ip link del $TUN`、netns 拆除、驱动卸载），服务端会输出 `tun device <name> vanished (deleted externally); tunnel dead — restart to recover` 并以**非零码退出**，交由 systemd/restart 策略恢复，而不是继续在静默死亡的隧道上运行。正常关停（SIGINT/SIGTERM/SIGHUP）不探测、不误报，退出码不受影响。
+
 ## 环境变量
 
 三个二进制的 `--help` 末尾各有一段 `Environment:` 清单，与本节下面的三张表是**同一份清单**，共 **4 份文件 / 6 个块**，改动其中一块必须同步其余五块：

@@ -862,6 +862,10 @@ struct recv_thr_arg {
     unsigned tid;
     _Atomic int *poll_err;   /* M3-6: shared fatal-poll flag (all
                               * threads OR into it; main aggregates) */
+    const char *tun_name;    /* the TUN device name this server created
+                              * (o.tun): alive-probe target for the tid==0
+                              * housekeeping. Always a valid string, even
+                              * in --no-tun mode (never probed there). */
 };
 
 static void *recv_thread_main(void *v)
@@ -872,7 +876,8 @@ static void *recv_thread_main(void *v)
     struct sockaddr_in peers[UDP_RXBATCH];
     struct iovec iov[UDP_RXBATCH];
     uint8_t *buf;
-    uint64_t last_purge = now_ms(), last_qctl = now_ms(), last_drops = 0;
+    uint64_t last_purge = now_ms(), last_qctl = now_ms(), last_probe = now_ms(),
+             last_drops = 0;
 
     buf = malloc((size_t)UDP_RXBATCH * 65536);
     if (!buf) {
@@ -986,6 +991,31 @@ static void *recv_thread_main(void *v)
             if (a->ctx->qpool && now - last_qctl >= TUN_POOL_TICK_MS) {
                 tun_pool_tick(a->ctx->qpool);
                 last_qctl = now;
+            }
+            /* R43-C1-L1: TUN device deleted externally (ip link del,
+             * netns teardown, driver unload): each pool reader exits on
+             * POLLHUP leaving the pool's nq/stop accounting untouched,
+             * so uplink writes keep targeting the dead queue fd and the
+             * tunnel goes silently dark while UDP keepalives still look
+             * alive. Probe the interface index once per second (mirrors
+             * the client sentinel, proxy.c cmd_proxy): zero means the
+             * device is gone — say so out loud and fail fast (exit 1
+             * via poll_err) instead of serving a dead tunnel until a
+             * manual restart. Gated on !g_stop so a normal shutdown
+             * (which stops the readers through the same poll path) never
+             * probes, reports, or mis-exits. */
+            if (now - last_probe >= 1000) {
+                last_probe = now;
+                if (!atomic_load_explicit(&g_stop, memory_order_relaxed) &&
+                    a->ctx->qpool && if_nametoindex(a->tun_name) == 0) {
+                    log_err("tun device %s vanished (deleted externally); "
+                            "tunnel dead — restart to recover",
+                            a->tun_name);
+                    atomic_store_explicit(&g_stop, true,
+                                          memory_order_relaxed);
+                    atomic_store_explicit(a->poll_err, 1,
+                                          memory_order_relaxed);
+                }
             }
             if (now - last_purge >= 1000) {
 #ifndef IWAN_DEBUG_STRIP
@@ -1525,7 +1555,7 @@ int main(int argc, char **argv)
         args[i + 1] = (struct recv_thr_arg){ &ctx, users, nusers,
                                              udp_fds[i + 1],
                                              (unsigned)(i + 1),
-                                             &poll_err };
+                                             &poll_err, o.tun };
         /* R37 L3 convention (see relay_proxy.c): pthread_create returns
          * the error number and does NOT set errno — on musl a failure
          * left a stale "Success" in the log. Report strerror(rc). */
@@ -1545,7 +1575,7 @@ int main(int argc, char **argv)
         ncreated++;
     }
     args[0] = (struct recv_thr_arg){ &ctx, users, nusers, udp_fds[0], 0,
-                                     &poll_err };
+                                     &poll_err, o.tun };
     recv_thread_main(&args[0]);   /* primary loop, inline */
 
     /* join ONLY the threads that were created: pthread_create failure
