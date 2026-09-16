@@ -727,12 +727,23 @@ static bool rp_read_full(int fd, uint8_t *buf, size_t want,
     return true;
 }
 
-static void rp_socks_reply(int fd, uint8_t rep, const struct rp_hs *hs)
+static void rp_socks_reply(int fd, uint8_t rep, const struct rp_hs *hs,
+                           bool v6)
 {
-    uint8_t r[10] = {5, rep, 0, 1, 0, 0, 0, 0, 0, 0};
+    /* R45-L1: RFC 1928 requires BND.ATYP to match the target family —
+     * answering a CONNECT ATYP=4 (IPv6) upstream with the fixed IPv4
+     * frame made strict clients (JDK style) reject even a successful
+     * tunnel. A v6 success now returns the 22-byte frame {5, rep, 0, 4,
+     * 16x ::, 0, 0}: the proxy is not bound to a concrete source
+     * address, so BND.ADDR/port are zero by convention, exactly like
+     * the lwIP SOCKS mode's socks_reply6 (socks_flow.c). Error replies
+     * (rep != 0) stay on the 10-byte v4 frame — RFC 1928 allows a zero
+     * BND.ADDR there and v4 keeps maximum compatibility. */
+    uint8_t r[22] = {5, rep, 0, v6 ? 4 : 1};
+    size_t n = v6 ? sizeof r : 10;
     /* M3: rp_send_full completes short writes (Windows nonblocking
-     * handshake replies) and verifies the full 10 bytes went out */
-    if (rp_send_full(hs, fd, r, sizeof r) != 0)
+     * handshake replies) and verifies the full frame went out */
+    if (rp_send_full(hs, fd, r, n) != 0)
         err_printf("rp_socks_reply send failed rep=%u errno=%d\n", rep,
                    errno);
 }
@@ -901,7 +912,9 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
         }
     }
     if (rep != 0) {
-        rp_socks_reply(fd, rep, hs);
+        /* parser-level error (bad cmd/atyp): v4 reply keeps maximum
+         * compatibility; RFC 1928 permits a zero BND.ADDR here */
+        rp_socks_reply(fd, rep, hs, false);
         return -1;
     }
     /* R4-08-F1: bytes that arrived past the CONNECT frame were already
@@ -942,7 +955,7 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
             if (!rp_est_reserve()) {
                 rp_note_est_full();
                 port_close(up);
-                rp_socks_reply(fd, 1, hs);
+                rp_socks_reply(fd, 1, hs, false);
                 return -1;
             }
             /* R37 R7 (R3-L21): the slot is ours; rp_conn_main's `out:`
@@ -958,11 +971,16 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
              * reservation back (hs->reserved is already set). */
             if (rp_plane_dead()) {
                 rp_note_plane_down();
-                rp_socks_reply(fd, 1, hs);
+                rp_socks_reply(fd, 1, hs, false);
                 port_close(up);
                 return -1;
             }
-            rp_socks_reply(fd, 0, hs);
+            /* R45-L1: a success reply echoes the REQUEST's target
+             * family (t.af, 4 or 6; a domain target resolves either so
+             * the literal family the client asked for governs, matching
+             * the lwIP side's target_af) — ATYP=6 gets the 22-byte v6
+             * frame, everything else the 10-byte v4 one. */
+            rp_socks_reply(fd, 0, hs, t.af == 6);
             /* R37 R6 (K-5): rp_send_full, not a bare port_send. The
              * upstream socket is blocking here, so the old check could
              * not tell a SHORT write or an EINTR from a hard failure and
@@ -986,7 +1004,7 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
         }
         /* M7: a gate refusal is "not allowed" (rep 2), everything
          * else stays a general failure */
-        rp_socks_reply(fd, rc == -2 ? 2 : 5, hs);
+        rp_socks_reply(fd, rc == -2 ? 2 : 5, hs, false);
         return -1;
     }
 }
