@@ -755,6 +755,7 @@ static int rp_connect_target(int *fd_out, int *up_af, const char *host,
      * LAST candidate's cause (deterministic, mirrors the existing
      * last-fd model); per-candidate causes are mapped below */
     uint8_t cand_rep = 5;
+    bool real_fail = false;   /* R47-FIXA-L1: a REAL (non-gate) failure */
     for (ai = res; ai != NULL; ai = ai->ai_next) {
         int fd;
         if (ai->ai_family == AF_INET) {
@@ -774,6 +775,13 @@ static int rp_connect_target(int *fd_out, int *up_af, const char *host,
                 continue;
             }
         }
+        /* R47-FIXA-L1: this candidate passed the gate, so any failure
+         * below is a REAL target failure. A mixed result set — some
+         * candidates gate-refused, others really failing (split-horizon
+         * DNS: one private/loopback record + one public-refusing record)
+         * — must report the real cause like socks_flow, NOT the
+         * all-gate-refused rep=2. */
+        real_fail = true;
         fd = port_socket(ai->ai_family, SOCK_STREAM, 0);
         if (fd < 0) {
             cand_rep = 5;
@@ -830,8 +838,14 @@ static int rp_connect_target(int *fd_out, int *up_af, const char *host,
         port_close(fd);
     }
     freeaddrinfo(res);
-    if (last < 0)
-        return blocked ? -2 : -1;
+    if (last < 0) {
+        /* R47-FIXA-L1: -2 (SSRF gate refusal, rep=2) ONLY when every
+         * candidate was refused by the gate. If any candidate really
+         * tried to connect and failed, report the real cause (fail_rep
+         * set below) — the all-gate-refused latch previously masked a
+         * mixed result set as rep=2. */
+        return (blocked && !real_fail) ? -2 : -1;
+    }
     if (up_af)
         *up_af = last_af;
     *fd_out = last;
