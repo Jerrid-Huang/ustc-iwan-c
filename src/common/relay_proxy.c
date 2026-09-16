@@ -1173,6 +1173,23 @@ static int rp_handle_http(int fd, const uint8_t *first, size_t first_n,
             n += (size_t)r;
             continue;
         }
+        if (r == 0 && sizeof buf - 1 - n == 0) {
+            /* R47-H1-03: the header outgrew the 8 KiB cap without a
+             * \r\n\r\n terminator — an overlong head (large cookie /
+             * delegation) or LF-only line endings. Reply 431 instead of
+             * hanging up silently. The lwIP twin accepts up to 64 KiB
+             * (HANDSHAKE_INPUT_MAX); the relay deliberately keeps the
+             * conservative 8 KiB stack buf — a 64 KiB buf across
+             * RP_MAX_CONNS handshake threads would cost ~16 MiB of
+             * thread stacks, and the handshake already caps cumulative
+             * input at RP_HS_INPUT_MAX — so the cap stays at 8 KiB and
+             * the refusal is now visible and protocol-correct. */
+            static const char toobig[] =
+                "HTTP/1.1 431 Request Header Fields Too Large\r\n"
+                "Content-Length: 0\r\n\r\n";
+            (void)rp_send_full(hs, fd, toobig, sizeof toobig - 1);
+            return -1;
+        }
         if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK ||
                       errno == EINTR)) {
             if (rp_hs_poll(hs, fd) <= 0) {
@@ -1188,9 +1205,8 @@ static int rp_handle_http(int fd, const uint8_t *first, size_t first_n,
     }
     if (hdr_end == (size_t)-1) {
         /* unreachable fence — every not-found exit above already replied
-         * (502 for the timeout) or is a hard read error where the peer
-         * is gone; the too-large refusal (431, R47-H1-03) is emitted at
-         * the buffer-full point in the read loop */
+         * (431 for the cap, 502 for the timeout) or is a hard read error
+         * where the peer is gone */
         return -1;
     }
 
