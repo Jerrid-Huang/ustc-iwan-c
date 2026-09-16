@@ -460,7 +460,10 @@ for C in $CLIENTS_LIST; do
     fi
 
     if [ "$PROXY_MODE" != 1 ]; then
-        [ -n "$CLI_PIDS" ] && kill $CLI_PIDS 2>/dev/null
+        # R32-A2-2: clients often already exited (e.g. crash/done) before
+        # this per-iteration reap — kill then returns 1 (ESRCH) and set -e
+        # would abort the loop mid-run; the cleanup is best-effort.
+        [ -n "$CLI_PIDS" ] && kill $CLI_PIDS 2>/dev/null || true
         CLI_PIDS=""
     fi
     sleep 1
