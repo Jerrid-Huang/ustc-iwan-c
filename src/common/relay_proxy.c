@@ -489,15 +489,38 @@ static bool rp_fail_blocked(const rp_fail_key *key)
  * poll for writability within RP_CONNECT_TIMEOUT_MS, check SO_ERROR,
  * then restore blocking before the fd is handed to the relay (which
  * expects blocking sockets). */
+
+/* R46-L6: map a connect-failure errno to the RFC 1928 reply code the
+ * relay sends: unreachable/timeout -> 4 (host unreachable), everything
+ * else (ECONNREFUSED, ...) -> 5 (connection refused / general failure).
+ * The categories mirror the lwIP SOCKS mode (socks_flow.c: NS_TERM_
+ * TIMEOUT -> rep 4, an overall connect timeout -> rep 4, RST/other ->
+ * rep 5). */
+static uint8_t rp_conn_err_rep(int err)
+{
+    switch (err) {
+    case EHOSTUNREACH:
+    case ENETUNREACH:
+    case ETIMEDOUT:
+    case ECONNABORTED:
+        return 4;
+    default:
+        return 5;
+    }
+}
+
 static int rp_connect_literal(int af, const void *addr, uint16_t port,
-                              int *fd_out)
+                              int *fd_out, uint8_t *fail_rep)
 {
     struct sockaddr_storage ss;
     socklen_t salen;
     int fd = port_socket(af, SOCK_STREAM, 0);
 
-    if (fd < 0)
+    if (fd < 0) {
+        if (fail_rep)
+            *fail_rep = 5;
         return -1;
+    }
     memset(&ss, 0, sizeof ss);
     if (af == AF_INET) {
         struct sockaddr_in *sa = (struct sockaddr_in *)&ss;
@@ -514,6 +537,8 @@ static int rp_connect_literal(int af, const void *addr, uint16_t port,
     }
     if (port_set_nonblock(fd, true) != 0) {
         port_close(fd);
+        if (fail_rep)
+            *fail_rep = 5;
         return -1;
     }
     if (port_connect(fd, (struct sockaddr *)&ss, salen) == 0) {
@@ -529,18 +554,28 @@ static int rp_connect_literal(int af, const void *addr, uint16_t port,
          * of aborting the connect (M1) */
         struct pollfd pfd = { .fd = PORT_FD_ARG(fd), .events = POLLOUT };
         if (rp_poll_retry(&pfd, RP_CONNECT_TIMEOUT_MS) <= 0) {
+            /* R46-L6: connect TIMED OUT — RFC 1928 host unreachable (4) */
             port_close(fd);
+            if (fail_rep)
+                *fail_rep = 4;
             return -1;
         }
         int soerr = 0;
         socklen_t sl = sizeof soerr;
         if (port_getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr,
                             &sl) != 0 || soerr != 0) {
+            /* R46-L6: async connect failed — map the SO_ERROR like an
+             * immediate errno (soerr==0 with a failed getsockopt reads
+             * as a general failure) */
             port_close(fd);
+            if (fail_rep)
+                *fail_rep = soerr == 0 ? 5 : rp_conn_err_rep((int)soerr);
             return -1;
         }
     } else {
         port_close(fd);
+        if (fail_rep)
+            *fail_rep = rp_conn_err_rep(errno);
         return -1;
     }
     /* restore blocking for the relay threads; if the mode cannot be
@@ -548,6 +583,8 @@ static int rp_connect_literal(int af, const void *addr, uint16_t port,
      * would alias EAGAIN as a hard relay error (C-F4) */
     if (port_set_nonblock(fd, false) != 0) {
         port_close(fd);
+        if (fail_rep)
+            *fail_rep = 5;
         return -1;
     }
     *fd_out = fd;
@@ -612,11 +649,15 @@ static bool rp_target_blocked(bool guard, int af, const uint8_t *p)
  * family the SOCKS reply's BND.ATYP must match (R46-L5: for a domain
  * target the RESOLVED address's family, not the request's ATYP; literal
  * targets always report their own family). Returns -2 when every
- * candidate was refused by the SSRF gate, -1 on any other failure. */
+ * candidate was refused by the SSRF gate, -1 on any other failure; on
+ * ANY failure, *fail_rep (when non-NULL) holds the RFC 1928 reply code
+ * the SOCKS caller must send — 4 for DNS failure / connect timeout /
+ * host unreachable, 5 for refused / general (R46-L6). */
 static int rp_connect_target(int *fd_out, int *up_af, const char *host,
                              uint16_t port, bool have_ip4,
                              const uint8_t ip4[4], bool have_ip6,
-                             const uint8_t ip6[16], bool guard)
+                             const uint8_t ip6[16], bool guard,
+                             uint8_t *fail_rep)
 {
     struct addrinfo hints, *res = NULL, *ai;
     char port_s[8];
@@ -635,20 +676,29 @@ static int rp_connect_target(int *fd_out, int *up_af, const char *host,
             return -2;
         if (up_af)
             *up_af = AF_INET;
-        return rp_connect_literal(AF_INET, ip4, port, fd_out);
+        return rp_connect_literal(AF_INET, ip4, port, fd_out, fail_rep);
     }
     if (have_ip6) {
         if (rp_target_blocked(guard, 6, ip6))
             return -2;
         if (up_af)
             *up_af = AF_INET6;
-        return rp_connect_literal(AF_INET6, ip6, port, fd_out);
+        return rp_connect_literal(AF_INET6, ip6, port, fd_out, fail_rep);
     }
     /* domain: resolve, then try every address (v4 and v6). The gate
      * must judge each RESOLVED address — checking only the hostname
      * would let DNS rebinding slip through. */
-    if (getaddrinfo(host, port_s, &hints, &res) != 0)
+    if (getaddrinfo(host, port_s, &hints, &res) != 0) {
+        /* R46-L6: resolution failure (NXDOMAIN, resolver timeout, ...)
+         * is "host unreachable" per the lwIP SOCKS-mode semantics */
+        if (fail_rep)
+            *fail_rep = 4;
         return -1;
+    }
+    /* R46-L6: if every candidate fails, the error reply reports the
+     * LAST candidate's cause (deterministic, mirrors the existing
+     * last-fd model); per-candidate causes are mapped below */
+    uint8_t cand_rep = 5;
     for (ai = res; ai != NULL; ai = ai->ai_next) {
         int fd;
         if (ai->ai_family == AF_INET) {
@@ -669,10 +719,13 @@ static int rp_connect_target(int *fd_out, int *up_af, const char *host,
             }
         }
         fd = port_socket(ai->ai_family, SOCK_STREAM, 0);
-        if (fd < 0)
+        if (fd < 0) {
+            cand_rep = 5;
             continue;
+        }
         if (port_set_nonblock(fd, true) != 0) {
             port_close(fd);
+            cand_rep = 5;
             continue;
         }
         if (port_connect(fd, ai->ai_addr, (socklen_t)ai->ai_addrlen) == 0) {
@@ -691,8 +744,17 @@ static int rp_connect_target(int *fd_out, int *up_af, const char *host,
                                     &sl) == 0 && soerr == 0) {
                     last = fd;
                     last_af = ai->ai_family;
+                } else {
+                    /* async connect failed: soerr already holds the
+                     * SO_ERROR read above (0 when the read failed) */
+                    cand_rep = soerr == 0 ? 5
+                                          : rp_conn_err_rep((int)soerr);
                 }
+            } else {
+                cand_rep = 4;   /* connect timed out */
             }
+        } else {
+            cand_rep = rp_conn_err_rep(errno);
         }
         if (last >= 0) {
             /* restore blocking for the relay threads; a failed restore
@@ -702,10 +764,13 @@ static int rp_connect_target(int *fd_out, int *up_af, const char *host,
             if (port_set_nonblock(fd, false) != 0) {
                 port_close(fd);
                 last = -1;
+                cand_rep = 5;   /* restore failure is a general failure */
                 continue;       /* try the next candidate */
             }
             break;
         }
+        if (fail_rep)
+            *fail_rep = cand_rep;
         port_close(fd);
     }
     freeaddrinfo(res);
@@ -970,9 +1035,10 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
             frame_end = 5 + (size_t)b[4] + 2;
         int up = -1;
         int up_af = 0;   /* actual upstream socket family (R46-L5) */
+        uint8_t fail_rep = 5;   /* R46-L6: rep for the SOCKS error reply */
         int rc = rp_connect_target(&up, &up_af, t.host, t.port, t.af == 4,
                                    (const uint8_t *)&t.ip4, t.af == 6,
-                                   t.ip6, guard);
+                                   t.ip6, guard, &fail_rep);
         if (rc == 0) {
             /* R37 R5 (R3-L21) / R37 R7: rp_add() binds the established set,
              * but it runs AFTER this reply. The old order answered rep=0
@@ -1046,9 +1112,12 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
             }
             return up;           /* caller relays on fd <-> up */
         }
-        /* M7: a gate refusal is "not allowed" (rep 2), everything
-         * else stays a general failure */
-        rp_socks_reply(fd, rc == -2 ? 2 : 5, hs, false);
+        /* M7: a gate refusal is "not allowed" (rep 2), everything else
+         * is classified by cause (R46-L6): rp_connect_target mapped the
+         * failure — DNS failure / connect timeout / host unreachable ->
+         * rep 4 (host unreachable, RFC 1928), ECONNREFUSED / general ->
+         * rep 5 — mirroring the lwIP SOCKS mode's reply codes. */
+        rp_socks_reply(fd, rc == -2 ? 2 : fail_rep, hs, false);
         return -1;
     }
 }
@@ -1138,7 +1207,7 @@ static int rp_handle_http(int fd, const uint8_t *first, size_t first_n,
      * same target-connection path */
     if (rp_connect_target(&up, NULL, t.host, t.port, t.af == 4,
                           (const uint8_t *)&t.ip4, t.af == 6,
-                          t.ip6, guard) != 0) {
+                          t.ip6, guard, NULL) != 0) {
         static const char bad[] = "HTTP/1.1 502 Bad Gateway\r\n\r\n";
         (void)rp_send_full(hs, fd, bad, sizeof bad - 1);
         return -1;
