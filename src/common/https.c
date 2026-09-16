@@ -1959,8 +1959,12 @@ static bool https_transport(const char *host, struct sbuf *req,
                          "with bundled fallback CAs");
                 continue;
             }
-            free(req->d);
-            return false;
+            /* R34-B4-2: fall through to out: so the request buffer
+             * (Bearer + token POST body) is OPENSSL_cleanse'd before
+             * release, symmetric with every other exit of this
+             * function. fd=-1/ssl=NULL here, so out:'s SSL/fd cleanup
+             * is a no-op. */
+            goto out;
         }
 
         fd = https_connect_tcp(host, 443, deadline_ms, diag, sizeof diag);
