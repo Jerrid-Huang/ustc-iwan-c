@@ -58,6 +58,50 @@
  * refused with a log line rather than silently black-holed. */
 #define RP_MAX_ESTABLISHED      (RP_MAX_CONNS * 2)
 
+/* R47-H1-02: bound the number of concurrent BLOCKING getaddrinfo()
+ * calls. Resolution is the only handshake step outside the
+ * RP_HS_TOTAL_MS budget — a slow / unresponsive resolver used to pin
+ * up to RP_MAX_CONNS handshake threads for the resolver's whole
+ * timeout, blocking every new connection relay-wide. A small cap keeps
+ * the saturated case bounded: further connections wait at most
+ * RP_DNS_GATE_WAIT_MS for a slot, then fail as a DNS failure (SOCKS
+ * rep=4 / HTTP 502) instead of occupying another thread behind the
+ * same resolver. The cap is deliberately small (16): healthy lookups
+ * finish in milliseconds, the bounded wait absorbs transient bursts,
+ * and only a genuinely wedged resolver saturates it. (Chosen over a
+ * per-call timeout — a blocking getaddrinfo cannot be interrupted
+ * portably, and a threaded async resolver is unjustified complexity
+ * for this L.) */
+#define RP_DNS_MAX_INFLIGHT 16
+#define RP_DNS_GATE_WAIT_MS 250u
+
+static _Atomic unsigned g_rp_dns_inflight;
+
+/* Reserve a resolver slot within RP_DNS_GATE_WAIT_MS; returns false
+ * when the cap stays saturated (caller must fail the resolution). */
+static bool rp_dns_acquire(void)
+{
+    uint64_t deadline = now_ms() + RP_DNS_GATE_WAIT_MS;
+    for (;;) {
+        unsigned n = atomic_load_explicit(&g_rp_dns_inflight,
+                                          memory_order_relaxed);
+        if (n < RP_DNS_MAX_INFLIGHT &&
+            atomic_compare_exchange_weak_explicit(
+                &g_rp_dns_inflight, &n, n + 1,
+                memory_order_relaxed, memory_order_relaxed))
+            return true;
+        if (now_ms() >= deadline)
+            return false;
+        port_sleep_ms(2);
+    }
+}
+
+static void rp_dns_release(void)
+{
+    atomic_fetch_sub_explicit(&g_rp_dns_inflight, 1,
+                              memory_order_relaxed);
+}
+
 struct RelayProxy {
     _Atomic int  listener;   /* -1 = stopped; written by stop/accept threads (R20 atomic) */
     atomic_bool  stop;
@@ -688,7 +732,19 @@ static int rp_connect_target(int *fd_out, int *up_af, const char *host,
     /* domain: resolve, then try every address (v4 and v6). The gate
      * must judge each RESOLVED address — checking only the hostname
      * would let DNS rebinding slip through. */
-    if (getaddrinfo(host, port_s, &hints, &res) != 0) {
+    if (!rp_dns_acquire()) {
+        /* R47-H1-02: the resolver concurrency cap is saturated (a slow
+         * DNS server pins the in-flight lookups for its full timeout).
+         * Fail this connection as a DNS failure — rep=4 in SOCKS mode,
+         * 502 in HTTP mode — instead of queueing yet another handshake
+         * thread behind the same resolver. */
+        if (fail_rep)
+            *fail_rep = 4;
+        return -1;
+    }
+    int gai = getaddrinfo(host, port_s, &hints, &res);
+    rp_dns_release();
+    if (gai != 0) {
         /* R46-L6: resolution failure (NXDOMAIN, resolver timeout, ...)
          * is "host unreachable" per the lwIP SOCKS-mode semantics */
         if (fail_rep)
