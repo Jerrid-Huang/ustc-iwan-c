@@ -571,13 +571,44 @@ done:
 #endif /* __linux__ */
 
 #ifdef _WIN32
+/* R45-L2: is an IPv6 next hop the unspecified address (::)? Windows
+ * represents an on-link v6 route's (missing) gateway this way, exactly
+ * like an on-link v4 route's 0.0.0.0. The address bytes are read
+ * through the raw memory of the SOCKADDR_IN6 member so no SDK-specific
+ * in6_addr sub-member names are needed (works on both the Windows SDK
+ * and mingw-w64 IN6_ADDR layouts). */
+static bool ip6_nexthop_unspec(const SOCKADDR_INET *nh)
+{
+    static const uint8_t zero[16] = {0};
+    if (nh->si_family != AF_INET6)
+        return false;
+    const uint8_t *a = (const uint8_t *)&nh->Ipv6.sin6_addr;
+    return memcmp(a, zero, sizeof zero) == 0;
+}
+
 /* Sweep stale routes still bound to OUR adapter (audit M2): a crash,
  * force-kill or power loss leaves the metric-0 default route and the
  * server /32 pin alive until the next reboot, because the wintun
  * adapter intentionally persists and the stack never reclaims them —
  * the machine would keep routing its default into a dead tunnel.
  * Runs at every setup, BEFORE new routes are added; the on-link
- * connected route the stack manages for the interface address is kept. */
+ * connected route the stack manages for the interface address is kept.
+ *
+ * R45-L2: the v4-only sweep also stranded the IPv6 side — the policy
+ * routes route_setup6 installs (`netsh interface ipv6 add route ...`,
+ * all on-link with nexthop ::) and, after a crash of a run that brought
+ * the derived ULA up, their stale entries stay on the persistent wintun
+ * adapter: on the next config a leftover ::/0 via tun black-holes IPv6.
+ * Mirror the v4 arm on the AF_INET6 table with the same keep shape
+ * (on-link connected + prefix threshold). The threshold is /64, not
+ * /24: the two routes the stack always manages for the interface — the
+ * link-local connected fe80::/64 and the derived-ULA connected
+ * fd00::/96 — are both >= /64, so they are never touched, while the
+ * ::/0 black hole and every shorter stale proxy prefix are swept. A
+ * leftover proxy route with prefix >= /64 is kept on purpose (on-link
+ * v6 routes carry no nexthop that would tell it apart from a stack
+ * route; keeping it is the conservative direction and it is re-added
+ * idempotently by the next route_setup6 anyway). */
 static void sweep_stale_routes(const char *tun)
 {
     wchar_t wname[128];
@@ -604,6 +635,25 @@ static void sweep_stale_routes(const char *tun)
             removed++;
     }
     FreeMibTable(tbl);
+    /* R45-L2: sweep the AF_INET6 table with the same shape (best-
+     * effort: a failure to fetch/scan the v6 table must not un-sweep
+     * the v4 removals already counted above) */
+    if (GetIpForwardTable2(AF_INET6, &tbl) == NO_ERROR) {
+        for (ULONG i = 0; i < tbl->NumEntries; i++) {
+            MIB_IPFORWARD_ROW2 *r = &tbl->Table[i];
+            if (r->InterfaceLuid.Value != luid.Value)
+                continue;
+            /* keep the stack-managed on-link connected v6 routes
+             * (nexthop ::, prefix >= /64): see the comment above the
+             * function — fe80::/64 and the derived-ULA fd00::/96 */
+            if (ip6_nexthop_unspec(&r->NextHop) &&
+                r->DestinationPrefix.PrefixLength >= 64)
+                continue;
+            if (DeleteIpForwardEntry2(r) == NO_ERROR)
+                removed++;
+        }
+        FreeMibTable(tbl);
+    }
     if (removed)
         log_info("route_setup: swept %lu stale route(s) from %s",
                  removed, tun);
