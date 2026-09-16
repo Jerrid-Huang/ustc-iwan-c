@@ -18,12 +18,17 @@
 #define MAX_FLOWS       256
 
 /* ---- tunnel DNS (socks_flow.c) ---- */
-#define DNS_RESULT_Q_LEN 256    /* DNS result ring size (dns_push/dns_drain).
-                                 * 256 not 64: the event loop drains 16 per
-                                 * round, so 64 could drop-oldest under a
+#define DNS_RESULT_Q_LEN 512    /* DNS result ring size (dns_push/dns_drain).
+                                 * 512 = 2*MAX_FLOWS: spawn_dns (R33 N1) has
+                                 * no spawn-side cap and the IPv6 mode
+                                 * spawns TWO workers per flow (AAAA + A),
+                                 * so up to 512 detached workers can each
+                                 * be pushing one terminal result — a
+                                 * smaller ring would drop-oldest under a
                                  * burst of slow lookups and strand a flow
                                  * for its full 30s timeout (SUMMARY-2 M10);
-                                 * ~48B per entry, 12KB total */
+                                 * 512 slots every in-flight worker's push.
+                                 * ~48B per entry, ~24KB total */
 #define DNS_DRAIN_MAX    16     /* results handled per event-loop round */
 #define DNS_WAIT_MAX     16     /* concurrent pending queries */
 #define DNS_POLL_MS      250u   /* worker retry/poll interval */
