@@ -1124,6 +1124,19 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
 
 /* ---- HTTP ---- */
 
+/* R47-H1-01: answer a malformed / unsupported HTTP request with the
+ * same 502 the lwIP twin sends (socks_flow.c http-mode error path) —
+ * an HTTP client expects a status line for every request, so closing
+ * with zero response bytes was a silent hang/retry-loop. The response
+ * is a static string; no user-controlled byte is ever echoed, so there
+ * is no header-injection surface. rp_send_full verifies the whole line
+ * went out; every caller closes immediately after. */
+static void rp_http_bad(struct rp_hs *hs, int fd)
+{
+    static const char bad[] = "HTTP/1.1 502 Bad Gateway\r\n\r\n";
+    (void)rp_send_full(hs, fd, bad, sizeof bad - 1);
+}
+
 /* returns the connected upstream fd, or -1 */
 static int rp_handle_http(int fd, const uint8_t *first, size_t first_n,
                           struct rp_hs *hs, bool guard)
@@ -1162,29 +1175,45 @@ static int rp_handle_http(int fd, const uint8_t *first, size_t first_n,
         }
         if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK ||
                       errno == EINTR)) {
-            if (rp_hs_poll(hs, fd) <= 0)
+            if (rp_hs_poll(hs, fd) <= 0) {
+                /* R47-H1-01: mirror socks_flow's http_mode 502 on a
+                 * handshake timeout — an HTTP client expects a status
+                 * line for every request, even one that stalled. */
+                rp_http_bad(hs, fd);
                 return -1;
+            }
             continue;
         }
         return -1;
     }
-    if (hdr_end == (size_t)-1)
+    if (hdr_end == (size_t)-1) {
+        /* unreachable fence — every not-found exit above already replied
+         * (502 for the timeout) or is a hard read error where the peer
+         * is gone; the too-large refusal (431, R47-H1-03) is emitted at
+         * the buffer-full point in the read loop */
         return -1;
+    }
 
     /* method token */
     size_t mn = 0;
     while (mn < hdr_end && buf[mn] != ' ')
         mn++;
-    if (mn == 0 || mn >= hdr_end)
+    if (mn == 0 || mn >= hdr_end) {
+        /* R47-H1-01: no method token — malformed request line. */
+        rp_http_bad(hs, fd);
         return -1;
+    }
     bool is_connect = (mn == 7 && memcmp(buf, "CONNECT", 7) == 0);
 
     /* target starts after the first space (skip repeats) */
     size_t ts = mn + 1;
     while (ts < hdr_end && buf[ts] == ' ')
         ts++;
-    if (ts >= hdr_end)
+    if (ts >= hdr_end) {
+        /* R47-H1-01: request line with no target. */
+        rp_http_bad(hs, fd);
         return -1;
+    }
     const char *tgt = (const char *)buf + ts;
     size_t tlen = 0;
     for (size_t i = ts; i < hdr_end; i++) {
@@ -1193,14 +1222,22 @@ static int rp_handle_http(int fd, const uint8_t *first, size_t first_n,
             break;
         }
     }
-    if (tlen == 0)
+    if (tlen == 0) {
+        /* R47-H1-01: empty target. */
+        rp_http_bad(hs, fd);
         return -1;
+    }
 
     /* target parsing (CONNECT authority / absolute URI with scheme
      * stripped) is shared with SOCKS mode via proto_parse.c */
     pp_target t;
-    if (pp_http_target(tgt, tlen, is_connect, &t) != 0)
+    if (pp_http_target(tgt, tlen, is_connect, &t) != 0) {
+        /* R47-H1-01: malformed authority / origin-form / unsupported
+         * scheme. Served with 502 like the lwIP twin instead of a
+         * silent close. */
+        rp_http_bad(hs, fd);
         return -1;
+    }
 
     int up = -1;
     /* the gate also covers absolute-URI forwards: same SSRF surface,
