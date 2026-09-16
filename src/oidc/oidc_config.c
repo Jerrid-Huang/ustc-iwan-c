@@ -538,7 +538,14 @@ void oidc_fetch_config(Config *cf)
                 free(plain);
             }
             oidc_esc_put(&b, pw ? pw : (pw_raw ? pw_raw : ""));
-            free(pw);
+            /* R32-B2-L2: on Linux the wrap copy IS the plaintext bytes
+             * (xstrdup of `plain`/pw_raw) — scrub before release like
+             * the `plain` intermediate above; on sealed platforms pw is
+             * a non-secret marker/hex and the wipe is a no-op. */
+            if (pw) {
+                OPENSSL_cleanse(pw, strlen(pw));
+                free(pw);
+            }
         }
         buf_put_str(&b, "\"\n    }");
         if (i + 1 < n)
