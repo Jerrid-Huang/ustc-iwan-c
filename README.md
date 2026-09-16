@@ -39,7 +39,7 @@ Usage: iwan-client-oidc [OPTIONS] --fetch | --list | --connect | --all
 | `--config-dir <DIR>` | 配置目录（默认 `~/.config/iwan`；Windows：`%USERPROFILE%\.config\iwan`） |
 | `--tun <TUN>` | TUN 设备名（默认 `iwan0`） |
 | `--socks` | 改用纯 SOCKS5 模式（免 root，无需 TUN 设备） |
-| `--socks-listen <ADDR:PORT>` | SOCKS 模式：代理监听地址（默认 `127.0.0.1:1080`）；**TUN 模式：同样默认启用**的附加 SOCKS5+HTTP 代理监听地址（默认 `127.0.0.1:1080`，与 `--help` 一致）。该端口若已被占用，TUN 连接会以 `cannot start the SOCKS5+HTTP proxy` 失败退出（不静默降级） |
+| `--socks-listen <ADDR:PORT>` | SOCKS 模式：代理监听地址（默认 `127.0.0.1:1080`）；**TUN 模式：同样默认启用**的附加 SOCKS5+HTTP 代理监听地址（默认 `127.0.0.1:1080`，与 `--help` 一致）。该端口若已被占用，TUN 连接**不会失败**：侧车代理以一条错误日志跳过（继续无本地代理运行，隧道不受影响） |
 | `--socks-mtu <MTU>` | SOCKS 模式下内层 TCP 的 MSS/MTU（默认 `1380`） |
 | `--socks-token <TOKEN>` | SOCKS5 RFC1929 密码认证（与 `--socks-no-token` 互斥） |
 | `--socks-no-token` | 显式允许无密码代理（配合 `--allow-remote`） |
