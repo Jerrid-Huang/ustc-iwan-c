@@ -196,6 +196,11 @@ bool route_iface_up(const char *tun, const char *tun_ip, uint16_t mtu)
 /* take the tunnel interface down and flush its addresses (no routes).
  * Shared by route_teardown's tail and the no-route-hijack pump path. */
 #ifdef _WIN32
+/* forward decl: sweep_stale_routes is defined below (R46-L1) — this
+ * function now also sweeps, so the no-route-hijack pump path reaches
+ * the crash-leftover cleanup even though route_setup never ran */
+static void sweep_stale_routes(const char *tun);
+
 void route_iface_down(const char *tun)
 {
     char namea[32];
@@ -203,6 +208,17 @@ void route_iface_down(const char *tun)
     char *d1[] = { "netsh", "interface", "ipv4", "delete", "address",
                    namea, NULL };
     port_run_cmd(d1);   /* best-effort: no address left, or iface gone */
+    /* R46-L1: this function is the teardown of the no-route-hijack pump
+     * path (proxy.c teardown_routes calls route_iface_down when no
+     * routes were hijacked), where route_setup — the sweep's only other
+     * reachable site — never runs. A crashed route-hijack run's metric-0
+     * default / stale proxy routes (netsh persistent) would otherwise
+     * keep black-holing default traffic into the dead tunnel across an
+     * unbounded number of pure-TUN runs. Sweep here too; it is
+     * idempotent and, on the route_setup/route_teardown callers of this
+     * function, only removes leftovers the explicit deletes missed
+     * (nothing that is being kept is newly added after this point). */
+    sweep_stale_routes(tun);
 }
 #elif defined(__APPLE__)
 void route_iface_down(const char *tun)
@@ -655,7 +671,7 @@ static void sweep_stale_routes(const char *tun)
         FreeMibTable(tbl);
     }
     if (removed)
-        log_info("route_setup: swept %lu stale route(s) from %s",
+        log_info("route sweep: removed %lu stale route(s) from %s",
                  removed, tun);
 }
 
