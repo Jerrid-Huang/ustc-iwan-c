@@ -12,9 +12,11 @@
 /* R37-FIX-C1 (L35): is this stored value a reference to the platform's
  * sealed store, or a plaintext password? The rule differs per platform and
  * must be no looser than what oidc_wrap_password() actually writes:
- *   - Windows writes "WDP1:" + hex payload, so the marker is
- *     self-delimiting and a prefix test is exact enough (the payload is
- *     validated by pw_hex_decode_wdp());
+ *   - Windows writes "WDP1:" + hex payload, so a value is a reference
+ *     only when the marker is followed by a valid non-empty even-length
+ *     hex payload (R32-B2-L1: a prefix test misread plaintext passwords
+ *     that merely START with "WDP1:" as sealed and they could never be
+ *     unwrapped back to plaintext — fail-closed);
  *   - macOS writes EXACTLY the 4-byte "WKC1" with no payload. Matching it
  *     with strncmp(...,4) made every plaintext password that merely STARTS
  *     with "WKC1" look like a Keychain reference: unwrap then read a stale
@@ -28,7 +30,26 @@
 static bool pw_is_sealed(const char *stored)
 {
 #if defined(_WIN32)
-    return strncmp(stored, "WDP1:", 5) == 0;
+    /* R32-B2-L1: Windows writes "WDP1:" + hex_encode() of the DPAPI
+     * blob (non-empty, even-length, all-hex — the blob is variable,
+     * ~76 + padded-payload bytes, NOT a fixed 16). Requiring that whole
+     * SHAPE instead of just the marker makes a plaintext password that
+     * merely STARTS with "WDP1:" no longer look sealed: the old prefix
+     * test sent such passwords down the DPAPI-unseal path, which failed,
+     * so the user could never log in (fail-closed). Values that match the
+     * shape fall through to pw_hex_decode_wdp() exactly as before, so
+     * every value oidc_wrap_password() ever wrote keeps working. */
+    {
+        size_t n = strlen(stored), i;
+        if (n <= 5 || strncmp(stored, "WDP1:", 5) != 0)
+            return false;             /* no marker: plaintext */
+        if (((n - 5) & 1u) != 0)
+            return false;             /* odd tail length: never written */
+        for (i = 5; i < n; i++)
+            if (hex_nibble(stored[i]) < 0)
+                return false;         /* non-hex tail: plaintext */
+        return true;
+    }
 #elif defined(__APPLE__)
     return strcmp(stored, "WKC1") == 0;
 #else
