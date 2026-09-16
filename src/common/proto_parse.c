@@ -87,6 +87,13 @@ int pp_http_target(const char *s, size_t n, bool is_connect,
         } else if (n >= 8 && port_strncasecmp(s, "https://", 8) == 0) {
             s += 8;
             n -= 8;
+            /* R47-H1-04: an https:// absolute-URI must default to port
+             * 443, not the 80 hardcoded above — the scheme was stripped
+             * but never remembered. An explicit :port later in the
+             * authority overrides this default (both parse paths write
+             * `port`). http:// keeps 80; CONNECT is unaffected
+             * (is_connect already defaults to 443). */
+            port = 443;
         }
         if (n == 0)
             return -1;
