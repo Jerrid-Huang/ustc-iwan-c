@@ -18,17 +18,23 @@
 #define MAX_FLOWS       256
 
 /* ---- tunnel DNS (socks_flow.c) ---- */
-#define DNS_RESULT_Q_LEN 512    /* DNS result ring size (dns_push/dns_drain).
-                                 * 512 = 2*MAX_FLOWS: spawn_dns (R33 N1) has
-                                 * no spawn-side cap and the IPv6 mode
-                                 * spawns TWO workers per flow (AAAA + A),
-                                 * so up to 512 detached workers can each
-                                 * be pushing one terminal result — a
-                                 * smaller ring would drop-oldest under a
-                                 * burst of slow lookups and strand a flow
-                                 * for its full 30s timeout (SUMMARY-2 M10);
-                                 * 512 slots every in-flight worker's push.
-                                 * ~48B per entry, ~24KB total */
+#define DNS_RESULT_Q_LEN 513    /* DNS result ring size (dns_push/dns_drain).
+                                 * The ring treats tl==hd as empty, so a
+                                 * size-L ring holds L-1 entries; 513 gives
+                                 * 512 usable slots = 2*MAX_FLOWS = the
+                                 * worst-case number of in-flight terminal
+                                 * pushes (spawn_dns (R33 N1) has no
+                                 * spawn-side cap and IPv6 mode spawns TWO
+                                 * workers per flow (AAAA + A), so up to 512
+                                 * detached workers can each be pushing one
+                                 * terminal result — a ring of 512 would
+                                 * drop-oldest on the 512th push and strand
+                                 * a flow for its full 30s timeout
+                                 * (SUMMARY-2 M10); R34-B3-1: LEN-1 = 512
+                                 * guarantees every in-flight worker's push
+                                 * has a slot.
+                                 * 36B per entry (measured sizeof
+                                 * DnsResult), 513*36 = 18468B ~ 18KiB */
 #define DNS_DRAIN_MAX    16     /* results handled per event-loop round */
 #define DNS_WAIT_MAX     16     /* concurrent pending queries */
 #define DNS_POLL_MS      250u   /* worker retry/poll interval */
