@@ -2062,7 +2062,14 @@ out:
 /* Return a NULL-terminated copy of `headers` with any Authorization
    entry dropped: a redirect to a different host must not carry the
    caller's Bearer token. Results go into store[] (needs >= n+1 slots;
-   callers pass a small fixed array). Returns NULL on overflow. */
+   callers pass a small fixed array). Returns NULL on overflow.
+   R32-B1-1: only Authorization needs dropping. The app's X-Auth-*
+   set (X-Auth-AppId/Timestamp/Nonce/Sign from oidc_ctrl_post) carries
+   no credential material: AppId is a public constant, and X-Auth-Sign
+   is an integrity HMAC over the canonical request keyed by a public
+   binary constant (by design "互操作约定，不提供身份保证" — no
+   identity guarantee), bound to this request's path/body/ts/nonce, so
+   a redirect target gains no secret from it. Deliberate no-op. */
 static const char *const *https_drop_auth(const char *const *headers,
                                           const char **store, size_t store_sz)
 {
