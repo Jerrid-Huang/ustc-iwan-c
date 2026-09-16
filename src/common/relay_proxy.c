@@ -90,27 +90,32 @@ static atomic_int g_rp_est_n;
  * refusal. relay_proxy_start() lowers g_rp_max_est to what the current
  * limit can actually hold and records the effective value; it is never
  * raised above the reviewed compile-time cap. */
-/* R37 R6 (R6-M1): RP_FD_RESERVE is an UPPER BOUND on the reserve, NOT a
- * fixed deduction. The R5 derivation subtracted the full worst-case
- * reserve (2*RP_MAX_CONNS + 64 = 576 fds) from every limit, so any
- * RLIMIT_NOFILE <= 578 collapsed the effective cap to 1 (measured
- * cap=1/1/224/512 at ulimit -n 256/512/1024/4096): the first established
- * connection filled the relay and every later CONNECT got rep=1 (SOCKS)
- * or 503 (HTTP). macOS ships a default soft RLIMIT_NOFILE of 256 and
- * hardened Linux images 512, so that was the COMMON case, not an edge
- * case. relay_proxy_start() now scales the reserve with the granted
- * limit (limit/4, floored at the worst-case handshake set — R33-B2-L2:
- * 2*RP_MAX_CONNS fds — and capped above at RP_FD_RESERVE) and only
- * ever lowers the cap. For rlim_cur >= 2*RP_MAX_CONNS the floor makes
- * the "never overspend" bound exact: established (<= 2*room =
- * lim - reserve) plus a full instantaneous handshake set (<= reserve)
- * can never exceed the limit, so no transient EMFILE arises from fd
- * pressure. Below 2*RP_MAX_CONNS the limit itself cannot hold a full
- * handshake set; the cap collapses toward 1 and the process is
- * physically fd-bound (a same-instant burst can still EMFILE, but is
- * momentary and self-healing). That is deliberate — the floor is what
- * keeps the comment true; a small limit yields a usable cap only as
- * far as the implicit handshake bound allows. */
+/* R37 R6 (R6-M1) / R34-A2-1: RP_FD_RESERVE is an UPPER BOUND on the
+ * reserve, NOT a fixed deduction. The R5 derivation subtracted the full
+ * worst-case reserve (2*RP_MAX_CONNS + 64 = 576 fds) from every limit,
+ * so any RLIMIT_NOFILE <= 578 collapsed the effective cap to 1
+ * (measured cap=1/1/224/512 at ulimit -n 256/512/1024/4096): the first
+ * established connection filled the relay and every later CONNECT got
+ * rep=1 (SOCKS) or 503 (HTTP). macOS ships a default soft
+ * RLIMIT_NOFILE of 256 and hardened Linux images 512, so that was the
+ * COMMON case, not an edge case. relay_proxy_start() now scales the
+ * reserve with the granted limit: limit/4, clamped at the ceiling
+ * RP_FD_RESERVE, with a floor of min(lim/2, 2*RP_MAX_CONNS) —
+ * R34-A2-1 — so the floor itself always fits the limit and a small
+ * limit keeps a usable cap (lim=256 -> cap 64, lim=512 -> cap 128,
+ * instead of the R33-B2-L2 collapse to 1). For
+ * lim >= 2*RP_MAX_CONNS the reserve covers the whole instantaneous
+ * handshake set and the "never overspend" bound is exact: established
+ * (<= 2*room = lim - reserve) plus a full instantaneous handshake set
+ * (<= reserve) can never exceed the limit, so no transient EMFILE
+ * arises from fd pressure. For lim < 2*RP_MAX_CONNS the limit cannot
+ * hold a full handshake set at all; the reserve takes
+ * min(lim/2, 2*RP_MAX_CONNS), established + reserve <= lim stays exact
+ * (2*room = lim - reserve), so the established set is never trimmed —
+ * but a same-instant full handshake burst can still EMFILE. That
+ * window is physically unavoidable below 2*RP_MAX_CONNS and self-heals
+ * (the burst is momentary; the next poll/accept round has fds again);
+ * the cap stays usable, which is the R6-M1 intent. */
 #define RP_FD_RESERVE (2 * RP_MAX_CONNS + 64)
 static int g_rp_max_est = RP_MAX_ESTABLISHED;
 
@@ -2298,21 +2303,26 @@ int relay_proxy_start(const char *listen_str, const char *auth_token,
      * compile-time maximum is a deliberate fd-pressure decision that
      * belongs to the constant, not to the environment). Windows has no
      * getrlimit; there the compile-time value stays in force.
-     * R37 R6 (R6-M1): the reserve is scaled to the granted limit
-     * (limit/4), floored at the worst-case INSTANTANEOUS handshake set
-     * (R33-B2-L2: 2*RP_MAX_CONNS fds — RP_MAX_CONNS handshake threads,
-     * accepted fd + connect-target fd each) and clamped at the reviewed
-     * ceiling (RP_FD_RESERVE), so a small limit still keeps a usable cap
-     * (see the constant's comment) while the "never overspend" bound
-     * stays exact for lim >= 2*RP_MAX_CONNS: established set (2*room)
-     * + a same-instant full handshake burst (<= reserve) can never
-     * exceed the limit, so no transient EMFILE refusal from fd pressure.
-     * Below 2*RP_MAX_CONNS the cap collapses toward 1 (the limit cannot
-     * hold a full handshake set; any residual same-instant EMFILE is
-     * momentary and self-healing). -1 in the log line means "not
-     * applicable" (Windows, or an infinite limit); both values are
-     * printed so an operator can tell a scaled reserve from the full
-     * one. */
+     * R37 R6 (R6-M1) / R34-A2-1: the reserve is scaled to the granted
+     * limit (limit/4), floored at min(lim/2, 2*RP_MAX_CONNS) — NOT an
+     * unconditional 2*RP_MAX_CONNS: the floor must itself fit the
+     * granted limit, or a small lim (macOS 256 / hardened Linux 512)
+     * collapses the cap to 1. With the min-floor, for lim >=
+     * 2*RP_MAX_CONNS the reserve covers the whole INSTANTANEOUS
+     * handshake set (R33-B2-L2: 2*RP_MAX_CONNS fds — RP_MAX_CONNS
+     * handshake threads, accepted fd + connect-target fd each) and the
+     * "never overspend" bound is exact: established set (<= 2*room =
+     * lim - reserve) + a same-instant full handshake burst (<= reserve)
+     * can never exceed the limit, so no transient EMFILE from fd
+     * pressure. For lim < 2*RP_MAX_CONNS the limit cannot hold a full
+     * handshake set: the reserve takes min(lim/2, 2*RP_MAX_CONNS),
+     * established + reserve <= lim stays exact (2*room = lim - reserve),
+     * so a same-instant full burst can still EMFILE — physically
+     * unavoidable below 2*RP_MAX_CONNS, momentary and self-healing —
+     * while the cap stays usable (the R6-M1 intent). -1 in the log
+     * line means "not applicable" (Windows, or an infinite limit); both
+     * values are printed so an operator can tell a scaled reserve from
+     * the full one. */
     long long rp_reserve = -1;
     long long rp_rlim_cur = -1;
 #ifndef _WIN32
@@ -2324,23 +2334,28 @@ int relay_proxy_start(const char *listen_str, const char *auth_token,
             long long reserve = lim / 4;
             if (reserve > RP_FD_RESERVE)
                 reserve = RP_FD_RESERVE;
-            /* R33-B2-L2: floor the reserve at the worst-case INSTANTANEOUS
-             * handshake fd set — RP_MAX_CONNS handshake threads (M6a cap),
-             * each holding an accepted fd plus a connect-target fd while
-             * rp_connect_target runs = 2*RP_MAX_CONNS fds. With
-             * reserve < that, an established set at cap (2*room fds) plus a
-             * same-instant full handshake burst overspends the limit by
-             * (2*RP_MAX_CONNS - reserve) fds: the accept loop hits a
-             * transient EMFILE and refuses new connections. It self-heals
-             * (the burst is momentary; the next poll/accept round has fds
-             * again), but the bound is now honest: for lim >= 2*RP_MAX_CONNS,
-             * established(<=2*room=lim-reserve) + handshake(<=reserve) can
-             * never exceed lim. For lim < 2*RP_MAX_CONNS the limit itself
-             * cannot hold a full handshake set: room collapses toward 1 and
-             * the process is physically fd-bound (the momentary-EMFILE
-             * window cannot be engineered away below that point, only
-             * shrunk to the waiters' single handshake thread.). */
-            if (reserve < (long long)(2 * RP_MAX_CONNS))
+            /* R34-A2-1: the reserve floor is min(lim/2, 2*RP_MAX_CONNS),
+             * not an unconditional 2*RP_MAX_CONNS — the floor must fit
+             * the granted limit or it collapses the cap (R33-B2-L2 gave
+             * cap=1 for any lim <= 515, the macOS 256 / hardened-Linux
+             * 512 COMMON cases). For lim >= 2*RP_MAX_CONNS the reserve
+             * >= 2*RP_MAX_CONNS covers the whole INSTANTANEOUS handshake
+             * fd set (RP_MAX_CONNS handshake threads (M6a cap), each
+             * holding an accepted fd plus a connect-target fd while
+             * rp_connect_target runs = 2*RP_MAX_CONNS fds): established
+             * (<= 2*room = lim - reserve) + handshake (<= reserve) can
+             * never exceed lim, so no transient EMFILE from fd pressure.
+             * For lim < 2*RP_MAX_CONNS the reserve takes lim/2 (which
+             * fits the limit; 2*room = lim - reserve stays exact, so the
+             * established set is never trimmed and the cap stays usable),
+             * but it cannot hold a full handshake set: a same-instant
+             * full burst can still EMFILE. That window is physically
+             * unavoidable below 2*RP_MAX_CONNS and self-heals (the burst
+             * is momentary; the next poll/accept round has fds again). */
+            if (reserve < (long long)(lim / 2) &&
+                (long long)(lim / 2) < (long long)(2 * RP_MAX_CONNS))
+                reserve = (long long)(lim / 2);
+            else if (reserve < (long long)(2 * RP_MAX_CONNS))
                 reserve = (long long)(2 * RP_MAX_CONNS);
             long long room = (lim - reserve) / 2;
             if (room < 1)
