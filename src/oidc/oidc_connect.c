@@ -336,14 +336,22 @@ void oidc_connect_server(const Opts *o, const Config *cf)
         set_nonblock(tun_fd);
         if (debug_enabled())
             oidc_eprintf("  tun %s fd=%d\n", o->tun, tun_fd);
-        /* optional SOCKS5+HTTP proxy sharing the TUN routes */
+        /* optional SOCKS5+HTTP proxy sharing the TUN routes.
+         * R38-L02: a failed listener start (most commonly 127.0.0.1:1080
+         * already in use) must NOT kill the whole tunnel — the side-car
+         * is a convenience on top of the TUN, so degrade to "no local
+         * proxy" and keep going. rp is left NULL (relay_proxy_start sets
+         * *out = NULL before returning -1 on every failure arm) and
+         * relay_proxy_stop(NULL) at teardown is a no-op. The OIDC SOCKS
+         * MODE (--socks) never reaches this branch — it is guarded by
+         * !o->socks above — and keeps the proxy as the tunnel itself. */
         if (o->socks_listen &&
             relay_proxy_start(o->socks_listen, o->socks_token,
                               o->socks_no_token, o->allow_remote,
-                              &rp) != 0) {
-            port_close(tun_fd);   /* R24-f3 F5: own fd before die (mirrors cmd_proxy) */
-            oidc_die("cannot start the SOCKS5+HTTP proxy");
-        }
+                              &rp) != 0)
+            log_err("cannot start the SOCKS5+HTTP side-car proxy on %s; "
+                    "continuing without it (tunnel unaffected)",
+                    o->socks_listen);
     }
 
     slist_t routes;
