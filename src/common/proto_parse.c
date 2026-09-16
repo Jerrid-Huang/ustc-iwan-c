@@ -40,7 +40,9 @@ int pp_http_probe(const uint8_t *d, size_t n)
      * needs to catch proper prefixes: 'P' methods are PUT(3)/POST(4)/
      * PATCH(5) and 'T' is TRACE(5), so a fragmented PATCH/TRACE at
      * n=3,4 and POST at n=3 must wait rather than fall through. */
-    if (d[0] == 'C' || d[0] == 'O' || d[0] == 'D' ||
+    if ((d[0] == 'C' && n < 7) ||   /* CONNECT(7) is the only 'C' method */
+        (d[0] == 'O' && n < 7) ||   /* OPTIONS(7) is the only 'O' method */
+        (d[0] == 'D' && n < 6) ||   /* DELETE(6) is the only 'D' method */
         (d[0] == 'G' && n < 3) ||
         (d[0] == 'H' && n < 4) ||
         ((d[0] == 'P' || d[0] == 'T') && n < 5))
