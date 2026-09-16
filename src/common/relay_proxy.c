@@ -606,14 +606,21 @@ static bool rp_target_blocked(bool guard, int af, const uint8_t *p)
     return false;
 }
 
-static int rp_connect_target(int *fd_out, const char *host, uint16_t port,
-                             bool have_ip4, const uint8_t ip4[4],
-                             bool have_ip6, const uint8_t ip6[16],
-                             bool guard)
+/* Resolve (when needed) and connect to the target. Returns 0 with the
+ * connected fd in *fd_out; on success also reports the ACTUAL upstream
+ * socket family in *up_af (AF_INET/AF_INET6) when up_af != NULL — the
+ * family the SOCKS reply's BND.ATYP must match (R46-L5: for a domain
+ * target the RESOLVED address's family, not the request's ATYP; literal
+ * targets always report their own family). Returns -2 when every
+ * candidate was refused by the SSRF gate, -1 on any other failure. */
+static int rp_connect_target(int *fd_out, int *up_af, const char *host,
+                             uint16_t port, bool have_ip4,
+                             const uint8_t ip4[4], bool have_ip6,
+                             const uint8_t ip6[16], bool guard)
 {
     struct addrinfo hints, *res = NULL, *ai;
     char port_s[8];
-    int last = -1;
+    int last = -1, last_af = 0;
     bool blocked = false;   /* a candidate was refused by the gate */
 
     memset(&hints, 0, sizeof hints);
@@ -626,11 +633,15 @@ static int rp_connect_target(int *fd_out, const char *host, uint16_t port,
          * sees the literal bytes before any connect attempt. */
         if (rp_target_blocked(guard, 4, ip4))
             return -2;
+        if (up_af)
+            *up_af = AF_INET;
         return rp_connect_literal(AF_INET, ip4, port, fd_out);
     }
     if (have_ip6) {
         if (rp_target_blocked(guard, 6, ip6))
             return -2;
+        if (up_af)
+            *up_af = AF_INET6;
         return rp_connect_literal(AF_INET6, ip6, port, fd_out);
     }
     /* domain: resolve, then try every address (v4 and v6). The gate
@@ -664,9 +675,10 @@ static int rp_connect_target(int *fd_out, const char *host, uint16_t port,
             port_close(fd);
             continue;
         }
-        if (port_connect(fd, ai->ai_addr, (socklen_t)ai->ai_addrlen) == 0)
+        if (port_connect(fd, ai->ai_addr, (socklen_t)ai->ai_addrlen) == 0) {
             last = fd;
-        else if (errno == EINPROGRESS || errno == EINTR) {
+            last_af = ai->ai_family;
+        } else if (errno == EINPROGRESS || errno == EINTR) {
             /* R37 R3-L3: see rp_connect_literal — EINTR does not abort a
              * nonblocking connect */
             /* rp_poll_retry: EINTR keeps this candidate waiting within
@@ -676,8 +688,10 @@ static int rp_connect_target(int *fd_out, const char *host, uint16_t port,
                 int soerr = 0;
                 socklen_t sl = sizeof soerr;
                 if (port_getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr,
-                                    &sl) == 0 && soerr == 0)
+                                    &sl) == 0 && soerr == 0) {
                     last = fd;
+                    last_af = ai->ai_family;
+                }
             }
         }
         if (last >= 0) {
@@ -697,6 +711,8 @@ static int rp_connect_target(int *fd_out, const char *host, uint16_t port,
     freeaddrinfo(res);
     if (last < 0)
         return blocked ? -2 : -1;
+    if (up_af)
+        *up_af = last_af;
     *fd_out = last;
     return 0;
 }
@@ -953,7 +969,8 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
         else
             frame_end = 5 + (size_t)b[4] + 2;
         int up = -1;
-        int rc = rp_connect_target(&up, t.host, t.port, t.af == 4,
+        int up_af = 0;   /* actual upstream socket family (R46-L5) */
+        int rc = rp_connect_target(&up, &up_af, t.host, t.port, t.af == 4,
                                    (const uint8_t *)&t.ip4, t.af == 6,
                                    t.ip6, guard);
         if (rc == 0) {
@@ -995,12 +1012,19 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
                 port_close(up);
                 return -1;
             }
-            /* R45-L1: a success reply echoes the REQUEST's target
-             * family (t.af, 4 or 6; a domain target resolves either so
-             * the literal family the client asked for governs, matching
-             * the lwIP side's target_af) — ATYP=6 gets the 22-byte v6
-             * frame, everything else the 10-byte v4 one. */
-            rp_socks_reply(fd, 0, hs, t.af == 6);
+            /* R45-L1 / R46-L5: a success reply's BND.ATYP must match the
+             * family of the ACTUAL upstream socket — the literal family
+             * for an ATYP=1/4 request (a literal v6 target gets the
+             * 22-byte v6 frame, exactly as before R46-L5), and the
+             * RESOLVED family for a domain (ATYP=3) request: a domain
+             * that connected via IPv6 gets the 22-byte v6 frame even
+             * though the request carried no family. This is the same
+             * dispatch as the lwIP SOCKS mode, where a domain is keyed
+             * on the DNS result's family (socks_flow.c target_af) — the
+             * earlier comment claimed "the literal family the client
+             * asked for governs, matching the lwIP side", which a domain
+             * request (t.af == 0) made false. */
+            rp_socks_reply(fd, 0, hs, up_af == AF_INET6);
             /* R37 R6 (K-5): rp_send_full, not a bare port_send. The
              * upstream socket is blocking here, so the old check could
              * not tell a SHORT write or an EINTR from a hard failure and
@@ -1112,7 +1136,7 @@ static int rp_handle_http(int fd, const uint8_t *first, size_t first_n,
     int up = -1;
     /* the gate also covers absolute-URI forwards: same SSRF surface,
      * same target-connection path */
-    if (rp_connect_target(&up, t.host, t.port, t.af == 4,
+    if (rp_connect_target(&up, NULL, t.host, t.port, t.af == 4,
                           (const uint8_t *)&t.ip4, t.af == 6,
                           t.ip6, guard) != 0) {
         static const char bad[] = "HTTP/1.1 502 Bad Gateway\r\n\r\n";
