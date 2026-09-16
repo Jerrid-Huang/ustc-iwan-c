@@ -1575,24 +1575,49 @@ int run_socks(int sockfd, SocksConfig *cfg) {
         accept_connections(listener);
         if (receive_vpn(sockfd, cfg) < 0) {
             /* server CLOSE / hard recv error: re-auth in place when a
-             * callback exists, else legacy exit for the caller loop */
-            int nfd = socks_reauth_tunnel(cfg);
-            socks_reauth_swap(&sockfd, nfd, cfg);
-            if (nfd >= 0)
-                continue;
-            if (!cfg->reauth) {
-                cfg->session_lost = true;
-                g_stop = 1;
-                break;
+             * callback exists, else legacy exit for the caller loop.
+             * A-6: fold this trigger into the same reauth_at backoff as
+             * the A-2 stale watchdog / :1533 retry / A-3 keepalive-fail
+             * gates — a repeated hard recv error while a previous
+             * re-auth is still backing off (a failed auth set reauth_at
+             * = now+10s) must NOT fire another full re-auth every loop
+             * round. Under a sustained hard error the old code re-auth'd
+             * per round: an OIDC blast (Keychain unwrap + GCM + full
+             * session sync each round; a locked Keychain makes the
+             * failure permanent, so this spun tight and wedged the
+             * proxy). legacy (!cfg->reauth) keeps reauth_at == 0
+             * (socks_reauth_tunnel bails at its top and never sets it),
+             * so its immediate reauth->fail->session_lost+stop is
+             * unchanged here. */
+            if (cfg->reauth_at == 0 || now_ms() >= cfg->reauth_at) {
+                int nfd = socks_reauth_tunnel(cfg);
+                socks_reauth_swap(&sockfd, nfd, cfg);
+                if (nfd >= 0)
+                    continue;
+                if (!cfg->reauth) {
+                    cfg->session_lost = true;
+                    g_stop = 1;
+                    break;
+                }
+                /* A-5: hard recv error (receive_vpn set session_lost on
+                 * its abnormal path) and the re-auth FAILED (callback
+                 * exists): without clearing it the next round's
+                 * session_lost branch would immediately re-auth once
+                 * more before the reauth_at backoff takes effect. Clear
+                 * it so the retry runs on the reauth_at schedule
+                 * (mirrors the session_lost branch above, :1062-1063). */
+                cfg->session_lost = false;
+            } else {
+                /* A-6: still inside the reauth_at backoff window — do
+                 * NOT re-auth now. Clear session_lost (same A-5 reason:
+                 * without it the next round's session_lost branch would
+                 * fire a re-auth ahead of the schedule) and fall through
+                 * to the rest of the loop; the :1533 retry gate fires
+                 * the single re-auth when reauth_at expires, so
+                 * consecutive re-auth attempts stay >=
+                 * SOCKS_KEEPALIVE_MS apart. */
+                cfg->session_lost = false;
             }
-            /* A-5: hard recv error (receive_vpn set session_lost on its
-             * abnormal path) and the re-auth FAILED (callback exists):
-             * without clearing it the next round's session_lost branch
-             * would immediately re-auth once more before the reauth_at
-             * backoff takes effect. Clear it so the retry runs on the
-             * reauth_at schedule (mirrors the session_lost branch
-             * above, :1062-1063). */
-            cfg->session_lost = false;
         }
         service_local_inputs(g_flows);
         handle_dns_results();
