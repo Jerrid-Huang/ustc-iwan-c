@@ -1395,8 +1395,25 @@ void route_setup6(const char *tun, const slist_t *routes6)
     snprintf(ifa, sizeof ifa, "interface=%s", tun);
     for (size_t i = 0; i < routes6->n; i++) {
         const char *c = routes6->v[i];
-        char *a[] = { "netsh", "interface", "ipv6", "add", "route",
-                      (char *)c, ifa, NULL };
+        /* R46-L3: mirror the v4 side (route_setup gives the default
+         * route an explicit metric=0, outranking every physical default;
+         * proxy-cidr prefixes stay metric-less — the v4 proxy-cidr arm
+         * has no metric either, so the two sides stay fully symmetric).
+         * Without it a same-prefix ::/0 on the tunnel competes by
+         * EFFECTIVE metric, and a physical NIC with a lower v6
+         * interface metric wins — the tunnel ::/0 silently loses. */
+        int na = 0;
+        char *a[10];
+        a[na++] = "netsh";
+        a[na++] = "interface";
+        a[na++] = "ipv6";
+        a[na++] = "add";
+        a[na++] = "route";
+        a[na++] = (char *)c;
+        a[na++] = ifa;
+        if (strcmp(c, "::/0") == 0)
+            a[na++] = "metric=0";
+        a[na] = NULL;
         if (netsh_run(a, "route_setup6: add route"))
             continue;
         log_err("route_setup6: add %s failed", c);
