@@ -26,6 +26,8 @@ extern char **environ;     /* macOS unistd.h does not declare it */
 #include "proxy.h"
 #include "relay_proxy.h"
 #include "socks.h"
+#include "socks_internal.h"   /* R36-L01: on_sig for the loop-level stop
+                               * handler (see the reconnect loop below) */
 #include "tun.h"
 #include "util.h"
 
@@ -361,6 +363,29 @@ void oidc_connect_server(const Opts *o, const Config *cf)
         .srv_user = srv_user, .encrypted_pw = encrypted_pw, .cf = cf,
     };
     bool reconnecting = false;
+#ifndef _WIN32
+    /* R36-L01: hold the stop handler across the WHOLE reconnect loop in
+     * SOCKS mode. run_socks installs on_sig when it enters and restores
+     * the PREVIOUS disposition when it leaves; without a loop-level
+     * install that previous disposition in the reconnect wait window
+     * after run_socks_mode returned was the DEFAULT, so a Ctrl-C there
+     * took the default action (abrupt rc=130 in the foreground, or
+     * swallowed by an inherited SIG_IGN in the background) and the
+     * g_user_stop check below could never fire. Holding on_sig for the
+     * loop makes run_socks's save/restore preserve it, the wait-window
+     * Ctrl-C lands in g_user_stop, and the loop breaks cleanly. The TUN
+     * path (run_pump) already keeps its own handler for the process
+     * lifetime (proxy.c install_signals) and is unchanged; we only cover
+     * the shared wait window once. Restored after the loop so nothing
+     * persists. Windows: run_socks uses the process-lifetime
+     * port_set_stop_handler there, so the window was never unprotected —
+     * nothing to add. */
+    struct sigaction sa_stop, old_stop_int, old_stop_term;
+    memset(&sa_stop, 0, sizeof sa_stop);
+    sa_stop.sa_handler = on_sig;
+    sigaction(SIGINT, &sa_stop, &old_stop_int);
+    sigaction(SIGTERM, &sa_stop, &old_stop_term);
+#endif
     for (;;) {
         char *password = stored_password(encrypted_pw, cf->domain,
                                          srv_user);
@@ -473,6 +498,13 @@ void oidc_connect_server(const Opts *o, const Config *cf)
             break;   /* Ctrl-C during the reconnect wait */
     }
 
+#ifndef _WIN32
+    /* R36-L01: loop-level handler no longer needed; restore the
+     * dispositions that were active when the loop was entered (the TUN
+     * path's own handler, if any, is left exactly as run_pump set it). */
+    sigaction(SIGINT, &old_stop_int, NULL);
+    sigaction(SIGTERM, &old_stop_term, NULL);
+#endif
     relay_proxy_stop(rp);
     if (tun_fd >= 0)
         tun_close(tun_fd);

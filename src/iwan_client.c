@@ -29,6 +29,8 @@
 #include "proxy.h"
 #include "relay_proxy.h"
 #include "socks.h"
+#include "socks_internal.h"   /* R36-L01: on_sig for the loop-level stop
+                               * handler (see cmd_socks) */
 #include "tun.h"
 #include "util.h"
 
@@ -1036,6 +1038,30 @@ static int cmd_socks(int argc, char **argv, int start)
      * run_socks never succeeded once). */
     bool ran_session = false;
     bool saw_startup_fail = false;
+#ifndef _WIN32
+    /* R36-L01: hold the stop handler across the WHOLE reconnect loop,
+     * not just inside run_socks. run_socks installs on_sig when it
+     * enters and restores the PREVIOUS disposition when it leaves; with
+     * no loop-level install, that "previous disposition" during the
+     * between-attempt wait window was the DEFAULT, so a Ctrl-C in the
+     * port_sleep_ms(1000) window took the default action — abrupt rc=130
+     * death in the foreground, or a silently swallowed signal (a
+     * background job inherits SIG_IGN) that left the startup-fail retry
+     * loop running forever — and the g_user_stop check right after the
+     * sleep could never fire. With the loop-level handler, run_socks's
+     * save/restore now preserves on_sig, the wait-window Ctrl-C lands in
+     * g_user_stop, and the loop breaks cleanly when the sleep returns.
+     * Restored after the loop so nothing persists for a later run_socks
+     * call (the early `return 1` paths below exit the process right
+     * away, so their handler state is unobservable). Windows: run_socks
+     * uses the process-lifetime port_set_stop_handler there, so the wait
+     * window was never unprotected on Windows — nothing to add. */
+    struct sigaction sa_stop, old_stop_int, old_stop_term;
+    memset(&sa_stop, 0, sizeof sa_stop);
+    sa_stop.sa_handler = on_sig;
+    sigaction(SIGINT, &sa_stop, &old_stop_int);
+    sigaction(SIGTERM, &sa_stop, &old_stop_term);
+#endif
     for (;;) {
         AuthResult res;
         int sockfd = authenticate(&o, DO_AUTH_PUMP, &res);
@@ -1145,6 +1171,12 @@ static int cmd_socks(int argc, char **argv, int start)
         if (g_user_stop)
             break;   /* Ctrl-C during the reconnect wait */
     }
+#ifndef _WIN32
+    /* R36-L01: loop-level handler no longer needed; restore the
+     * dispositions that were active when cmd_socks was entered. */
+    sigaction(SIGINT, &old_stop_int, NULL);
+    sigaction(SIGTERM, &old_stop_term, NULL);
+#endif
     cleanse_str(o.pass);
     cleanse_str(o.ct_pass);
     /* M-3: if every single attempt died at startup and no session ever
