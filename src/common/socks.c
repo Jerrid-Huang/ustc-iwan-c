@@ -1237,6 +1237,16 @@ static int socks_reauth_tunnel(SocksConfig *cfg)
              * (socks_reauth_swap bails on nfd<0 without installing it), so
              * close it here or it leaks one socket per failed re-auth. */
             port_close(newfd);
+            /* R38-L01: the other failure arms set reauth_at (the auth
+             * failure arm at :1174, = now+10s), so the :1533 retry gate
+             * picks the tunnel back up. This ns_init failure LEFT
+             * reauth_at alone: the re-auth callback had already SUCCEEDED
+             * and cleared it to 0 (the success arm at :1181), so the stale
+             * watchdog / retry / keepalive-fail gates all saw "no backoff
+             * needed" and never re-fired — a failed stack rebuild silently
+             * left the tunnel dead for up to SOCKS_RX_STALE_MS (120s).
+             * Same schedule as :1174: retry in SOCKS_KEEPALIVE_MS. */
+            cfg->reauth_at = now_ms() + SOCKS_KEEPALIVE_MS;
             log_err("SOCKS: stack rebuild failed");
             return -1;
         }
