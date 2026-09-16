@@ -1119,6 +1119,21 @@ int main(int argc, char **argv)
         fprintf(stderr, "error: invalid subnet '%s' (want IP/MASK, mask 8-30)\n", o.subnet);
         return 1;
     }
+    /* R38-L03: parse_subnet accepts /8../30, but the session id is the
+     * low 16 bits of the assigned IP, so a pool wider than /16 (more
+     * than 65536 addresses) can never map to distinct sids. Fail fast
+     * HERE instead of accepting the config, printing "server ready", and
+     * only rejecting the first OPEN at runtime (server.c:1345: "server
+     * subnet wider than /16 ... session id space exhausted"). /16 is the
+     * real floor: exactly 65536 usable sid values, which the runtime
+     * check accepts. */
+    if (o.mask < 16) {
+        fprintf(stderr,
+                "error: subnet mask /%d too wide: session id space "
+                "exhausted (sid is the low 16 bits of the assigned IP); "
+                "use a /16 or narrower subnet\n", o.mask);
+        return 1;
+    }
 
     /* R39 OOM-hang: install libcrypto's never-NULL allocator (and force init)
      * before the first libcrypto call, never after it. 9fef151's pre-warm did
