@@ -911,7 +911,7 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
         for (;;) {
             int pr = pp_socks_auth_frame(b, n, user, sizeof user,
                                          &pass, &plen);
-            if (pr > 0) {
+            if (pr == 1) {
                 /* M6c: a well-formed frame with the wrong token is
                  * a counted auth failure */
                 /* R37 R1-B-7: must not shadow the greeting's `ok[2]`
