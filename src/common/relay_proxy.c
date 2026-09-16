@@ -1810,6 +1810,17 @@ static void *rp_dir_main(void *ud)
                         e->from_eof = true;
                     } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
                         /* drained */
+                    } else if (errno == ENOBUFS || errno == ENOMEM) {
+                        /* R33-B2-L1: transient recv memory / socket-buffer
+                         * pressure — same non-drop classification as the
+                         * send side (R20-11/R22-A2-1), so a transient read
+                         * error must NOT half-close the whole connection.
+                         * Like the send side the fd can stay POLLIN-ready
+                         * while the kernel keeps refusing, which would
+                         * hot-spin this poll loop — back off explicitly
+                         * (same port_sleep_ms(1) shape as rp_flush below),
+                         * then read resumes on the next readable round. */
+                        port_sleep_ms(1);
                     } else if (errno == EINTR) {
                         continue;
                     } else {
