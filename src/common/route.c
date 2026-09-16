@@ -51,6 +51,86 @@ static bool is_default_v4(const char *c)
     return strcmp(c, "default") == 0 || strcmp(c, "0.0.0.0/0") == 0;
 }
 
+#ifdef _WIN32
+/* R46-L2: reconcile the wintun adapter's derived-ULA address surface.
+ * A crashed run (whose teardown never ran) leaves ITS ULA — derived
+ * from that run's inner IPv4 — on the persistent adapter, and
+ * route_teardown6 only ever deletes the CURRENT run's ULA: once the
+ * inner IPv4 changes, the old ULA address (plus its on-link /96 route)
+ * survives forever. Enumerate the adapter's v6 unicast addresses and
+ * delete every fd00::/96-shaped address that is not `cur`. Only the
+ * deterministic derived-ULA shape (byte0 = 0xfd, bytes 1..11 zero;
+ * protocol.c ip6_derive_ula) is ever touched, so the stack-managed
+ * link-local address and any user-added global address are left alone.
+ * When a stale ULA was deleted and the current one is not yet present,
+ * the shared fd00::/96 on-link route is also dropped; the caller
+ * (tun_iface_up6) re-adds the current ULA/96 right after, restoring
+ * pool reachability either way. Best-effort: failures are logged only. */
+static void reconcile_stale_ula(const char *tun, const char *tun_ip)
+{
+    uint8_t v4[4], cur[16];
+    if (!s2ip4(tun_ip, v4))
+        return;
+    ip6_derive_ula(ip4_u32(v4), cur);
+    wchar_t wname[128];
+    if (MultiByteToWideChar(CP_UTF8, 0, tun, -1, wname, 128) <= 0)
+        return;
+    NET_LUID luid;
+    if (ConvertInterfaceAliasToLuid(wname, &luid) != NO_ERROR)
+        return;
+    PMIB_UNICASTIPADDRESS_TABLE tbl;
+    if (GetUnicastIpAddressTable(AF_INET6, &tbl) != NO_ERROR)
+        return;
+    char ifa[32], ds[INET6_ADDRSTRLEN];
+    snprintf(ifa, sizeof ifa, "interface=%s", tun);
+    bool cur_present = false, deleted_any = false;
+    for (ULONG i = 0; i < tbl->NumEntries; i++) {
+        MIB_UNICASTIPADDRESS_ROW *r = &tbl->Table[i];
+        if (r->InterfaceLuid.Value != luid.Value ||
+            r->Address.si_family != AF_INET6)
+            continue;
+        const uint8_t *a = (const uint8_t *)&r->Address.Ipv6.sin6_addr;
+        /* our derived-ULA shape only: fd00::/96 + the inner IPv4 */
+        if (a[0] != 0xfd)
+            continue;
+        if (!(a[1] == 0 && a[2] == 0 && a[3] == 0 && a[4] == 0 &&
+              a[5] == 0 && a[6] == 0 && a[7] == 0 && a[8] == 0 &&
+              a[9] == 0 && a[10] == 0 && a[11] == 0))
+            continue;
+        if (memcmp(a, cur, 16) == 0) {
+            cur_present = true;
+            continue;
+        }
+        if (inet_ntop(AF_INET6, a, ds, sizeof ds) == NULL)
+            continue;
+        {
+            char *d[] = { "netsh", "interface", "ipv6", "delete",
+                          "address", ifa, ds, NULL };
+            if (port_run_cmd(d) == 0)
+                deleted_any = true;
+            else
+                log_debug("route: delete stale ULA %s on %s: not present",
+                          ds, tun);
+        }
+    }
+    FreeMibTable(tbl);
+    if (deleted_any) {
+        log_info("route: dropped stale derived-ULA residue on %s", tun);
+        if (!cur_present) {
+            /* no derived ULA remains on the adapter: the fd00::/96
+             * on-link route (created by the stale address's add) is a
+             * bare leftover; drop it — the current add below
+             * re-creates it */
+            char *d[] = { "netsh", "interface", "ipv6", "delete",
+                          "route", "fd00::/96", ifa, NULL };
+            if (port_run_cmd(d) != 0)
+                log_debug("route: delete stale fd00::/96 on %s: "
+                          "not present", tun);
+        }
+    }
+}
+#endif /* _WIN32 */
+
 /* best-effort: give the tunnel interface its IPv6 side (the derived
  * ULA/96). The /96 makes the whole client pool on-link, so the kernel
  * routes v6 return traffic into the tunnel without extra routes. */
@@ -60,6 +140,11 @@ static void tun_iface_up6(const char *tun, const char *tun_ip)
     char ula[64], ula96[72], ifa[32];
     if (!tun_ula_str(tun_ip, ula))
         return;
+    /* R46-L2: before adding the current ULA, drop stale derived ULAs a
+     * crashed run / an inner-IPv4 change left on this adapter — the add
+     * below is an append (netsh has no replace) and would otherwise
+     * accumulate every historical ULA on the persistent wintun adapter */
+    reconcile_stale_ula(tun, tun_ip);
     /* netsh would default a bare address to no /96 prefix, breaking the
      * client-pool on-link semantics; pass the explicit /96 like Linux.
      * ula96[72] is provably enough: ula holds at most 63 chars + "/96".
