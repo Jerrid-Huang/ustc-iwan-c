@@ -1526,10 +1526,14 @@ int main(int argc, char **argv)
                                              udp_fds[i + 1],
                                              (unsigned)(i + 1),
                                              &poll_err };
-        if (pthread_create(&workers[i], NULL, recv_thread_main,
-                           &args[i + 1]) != 0) {
+        /* R37 L3 convention (see relay_proxy.c): pthread_create returns
+         * the error number and does NOT set errno — on musl a failure
+         * left a stale "Success" in the log. Report strerror(rc). */
+        int prc = pthread_create(&workers[i], NULL, recv_thread_main,
+                                 &args[i + 1]);
+        if (prc != 0) {
             log_err("cannot start uplink recv thread %d: %s", i + 1,
-                    strerror(errno));
+                    strerror(prc));
             atomic_store_explicit(&g_stop, true, memory_order_relaxed);
             /* R25-f2 F2-A: without this the process would exit 0 after
              * "server ready" with zero (or too few) recv threads — a
