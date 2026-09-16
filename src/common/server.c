@@ -1324,6 +1324,38 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
         return;
     }
 
+    /* R47-H2-L1: a re-OPEN of an account that ALREADY has a live session
+     * instantly rotates the token and rebinds the peer — anyone holding
+     * the account password could silently blackhole the active client
+     * from any other address. Guard the takeover instead:
+     *   - same source IP  -> allowed (legitimate reconnect: a
+     *     crash/restart keeps its source address even when the ephemeral
+     *     port changes); single-session-per-account semantics unchanged.
+     *   - different IP and the old session is still ACTIVE (last
+     *     heartbeat < IDLE_TIMEOUT_MS ago) -> reject the new OPEN with
+     *     the existing PT_OPEN_REJECT frame; the active client's session
+     *     stays untouched. The takeover only completes once the old
+     *     session naturally idles out (purge_expired reaps it) — the
+     *     sanctioned "require the old session to time out first" path.
+     *   - different IP but the old session already idle-expired -> allow
+     *     (the old peer is gone; purge_expired would wipe it anyway).
+     * No wire-format change: only the PT_OPEN_REJECT control frame (with
+     * a descriptive reason) is reused. */
+    if (ctx->sess[slot].valid &&
+        ctx->sess[slot].peer.sin_addr.s_addr != peer->sin_addr.s_addr &&
+        now_ms() - atomic_load(&ctx->sess[slot].last_active_ms) <=
+            IDLE_TIMEOUT_MS) {
+        uint16_t osid = ctx->sess[slot].sid;
+        uint64_t idle = now_ms() -
+                        atomic_load(&ctx->sess[slot].last_active_ms);
+        pthread_rwlock_unlock(&ctx->sess_lock);
+        srv_log("OPEN rejected sid=0x%04x: account '%s' has an active "
+                "session from a different address (idle %llu ms)",
+                osid, a.user, (unsigned long long)idle);
+        open_reject(sockfd, peer, a.user, "session active elsewhere");
+        return;
+    }
+
     /* hand out an address whose sid is not in use by any live session.
      * sid = low 16 bits of the IP, so sid uniqueness implies IP
      * uniqueness: a live session whose sid collided would be silently
