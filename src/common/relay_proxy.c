@@ -394,15 +394,18 @@ static ssize_t rp_hs_recv(struct rp_hs *hs, int fd, void *buf, size_t len)
 
 /* ---- RFC1929 brute-force lockout (M6c/L6) ----
  * Same semantics as the SOCKS-mode table in socks_flow.c: only
- * WELL-FORMED RFC1929 frames that fail the token check count
- * (protocol violations are not auth attempts, so a probe flood cannot
- * lock a legitimate user out); RP_FAIL_MAX failures inside
- * RP_FAIL_WINDOW_MS lock the source out for another window; a
- * successful auth clears the source; locked sources are dropped at
- * accept() time. Two differences: the table holds 64 entries (L6:
- * the SOCKS table's 16 was too small for a shared-NAT world), and it
- * is mutex-guarded — unlike the single-threaded SOCKS event loop,
- * every relay proxy connection runs on its own thread.
+ * WELL-FORMED RFC1929 frames whose credentials fail count toward the
+ * budget — wrong-token frames AND (R37 R1-B-5) well-shaped frames with
+ * an oversized username are auth attempts; genuinely malformed frames
+ * (VER!=1, zero-length ulen/plen) are protocol violations, not auth
+ * attempts, so a probe flood cannot lock a legitimate user out
+ * (R46-L4). RP_FAIL_MAX failures inside RP_FAIL_WINDOW_MS lock the
+ * source out for another window; a successful auth clears the source;
+ * locked sources are dropped at accept() time. Two differences: the
+ * table holds 64 entries (L6: the SOCKS table's 16 was too small for a
+ * shared-NAT world), and it is mutex-guarded — unlike the
+ * single-threaded SOCKS event loop, every relay proxy connection runs
+ * on its own thread.
  *
  * Key: the peer IPv4 as-is; an IPv6 peer is merged to its /64 prefix
  * so one subnet cannot fill the table with 2^64 /128 aliases. The
@@ -849,19 +852,36 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
                 }
                 break;
             }
-            if (pr == 0) {
-                /* R37 R1-B-5: pp_socks_auth_frame() returns 0 both for a
-                 * genuinely malformed frame AND for a WELL-FORMED RFC1929
-                 * frame whose username exceeds our 64-byte buffer
-                 * (RFC1929 ULEN is 1 byte, so up to 255 is legal). The
-                 * old code closed the connection with no reply, so e.g.
-                 * `curl -U <64+-char-user>:<token>` looked like a protocol
-                 * error instead of an auth failure. Answer {1,1} and count
-                 * it toward the peer's brute-force budget. */
+            if (pr == 2) {
+                /* R37 R1-B-5: pp_socks_auth_frame() returns 2 for a
+                 * WELL-FORMED RFC1929 frame whose username exceeds our
+                 * 64-byte buffer (RFC1929 ULEN is 1 byte, so up to 255
+                 * is legal). That is a real brute-force auth attempt (a
+                 * credential guess with an oversized user field), so the
+                 * deliberate lockout count from R37 R1-B-5 is KEPT.
+                 * R46-L4: this is the ONLY pr!=1 case that counts — see
+                 * the pr==0 branch below. */
                 uint8_t rr[2] = {1, 1};
                 rp_fail_note(fk, false);
                 (void)rp_send_full(hs, fd, rr, sizeof rr);
-                return -1;      /* complete but unparseable/oversized */
+                return -1;      /* complete but oversized username */
+            }
+            if (pr == 0) {
+                /* R46-L4: a genuinely malformed frame (VER!=1, ulen=0,
+                 * plen=0) is a protocol violation, NOT an auth attempt.
+                 * Answer {1,1} and close, but do NOT count it toward the
+                 * peer's lockout budget — the M6c contract and the
+                 * socks_flow equivalent (socks_flow.c auth_reject) only
+                 * count well-formed wrong credentials, and tests/
+                 * socks_handshake.py marks ulen=0/plen=0/VER!=1 as
+                 * "not a lockout-counted failure". Before R46-L4 the
+                 * relay counted every failure class here, so a probe
+                 * flood of malformed frames could lock a legit user out
+                 * on the relay while the same flood did nothing on the
+                 * SOCKS side. */
+                uint8_t rr[2] = {1, 1};
+                (void)rp_send_full(hs, fd, rr, sizeof rr);
+                return -1;      /* complete but malformed */
             }
             if (n >= sizeof b)
                 return -1;

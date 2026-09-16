@@ -53,10 +53,17 @@ bool pp_socks_auth_ok(const uint8_t *pass, size_t plen, const char *token);
 int pp_socks_greeting(const uint8_t *d, size_t n, bool have_token,
                       uint8_t *method);
 
-/* RFC1929 auth frame [1, ulen, user..., plen, pass...]: returns 1 when
- * complete and valid (user NUL-terminated, pass/plen filled); 0 when
- * complete but malformed (bad version, zero-length field) — caller
- * rejects; -1 when incomplete (caller waits for more bytes). */
+/* RFC1929 auth frame [1, ulen, user..., plen, pass...]. Returns:
+ *   1  complete and valid — user is NUL-terminated and pass/plen point
+ *      into the frame (caller validates with pp_socks_auth_ok);
+ *   2  complete and well-shaped, but the username does not fit the
+ *      caller's `usz` buffer (RFC1929 ulen is 1 byte, so up to 255 is
+ *      legal) — still an auth attempt, distinct from a malformed frame
+ *      so a lockout policy can count it (relay does; socks_flow treats
+ *      it as a reject, preserving its contract);
+ *   0  complete but malformed (bad version, zero-length ulen/plen) —
+ *      caller rejects without treating it as an auth attempt;
+ *  -1  incomplete (caller waits for more bytes). */
 int pp_socks_auth_frame(const uint8_t *d, size_t n, char *user,
                         size_t usz, const uint8_t **pass, size_t *plen);
 

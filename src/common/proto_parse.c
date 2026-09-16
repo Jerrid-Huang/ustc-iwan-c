@@ -261,7 +261,13 @@ int pp_socks_auth_frame(const uint8_t *d, size_t n, char *user,
     if (n < 2 + ulen + 1 + d[2 + ulen])
         return -1;
     if (ulen >= usz)
-        return 0;
+        /* R46-L4: distinct from the malformed-frame verdict below (return
+         * 0). This frame is complete and well-shaped — RFC1929 ulen is a
+         * single byte, so up to 255 is legal — but the username does not
+         * fit the caller's `usz` buffer. Callers may treat it as an auth
+         * attempt (relay counts it toward the brute-force lockout, R37
+         * R1-B-5) rather than a protocol violation. */
+        return 2;
     memcpy(user, d + 2, ulen);
     user[ulen] = 0;
     *pass = d + 2 + ulen + 1;

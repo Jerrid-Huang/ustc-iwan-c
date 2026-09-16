@@ -1637,7 +1637,13 @@ static bool handshake_greeting(Flow *f)
                                  sizeof user, &pass, &plen);
     if (pr < 0)
         return false;              /* frame incomplete: wait */
-    if (pr == 0) {
+    if (pr == 0 || pr == 2) {
+        /* R46-L4: the parser now reports an oversized-username frame
+         * (well-shaped, but ulen >= 64) as 2, distinct from "malformed"
+         * (0). For THIS path both are rejects that never count toward
+         * the source's lockout (M6c: only well-formed wrong passes
+         * count), so they share the auth_reject — behavior is unchanged
+         * from before the split. */
         inet_ntop(AF_INET, &(struct in_addr){ .s_addr = f->peer_ip },
                   ipbuf, sizeof ipbuf);
         log_debug("[flow %lu] RFC1929 auth frame malformed "
