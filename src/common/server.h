@@ -48,6 +48,16 @@ struct server_session {
      * (RATE_TOKEN_MISMATCH_*). */
     uint32_t tok_mis_cnt, tok_mis_bound;
     uint64_t tok_mis_win;   /* window start (monotonic ms); 0 = none yet */
+    /* R47-H2-M1: congestion-reactive per-session uplink throttle. Set to
+     * now + g_up_throttle_ms (server.c) when THIS session's own TUN write
+     * just failed on a full device queue; while in the future, the DATA
+     * path drops the session's frames immediately (counted) so a flooding
+     * client yields the shared TUN queue to other sessions. Only ever set
+     * by the queue-full drop path, so uncongested sessions see 0 and no
+     * normal throughput is capped. Atomic + relaxed like last_active_ms;
+     * updated only under ctx->sess_lock (write for sess_wipe's memset,
+     * read for the drop-path store) — see server.c. */
+    atomic_uint_fast64_t throttle_until_ms;
     char user[SERVER_USER_MAX + 1]; /* owning account; one slot per user */
 };
 

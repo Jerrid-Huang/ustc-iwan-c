@@ -270,9 +270,21 @@ static atomic_ullong g_rate_drops; /* per-source rate-limit drops (silent) */
  * Charged only AFTER a session-table miss (rate_allow_sid_miss), so it
  * can never gate a frame that resolves to a live session. */
 #define RATE_MISS_MAX_DEFAULT 2000
+/* R47-H2-M1: default per-session uplink fairness throttle window (ms),
+ * applied only after THIS session's TUN write hit a full device queue.
+ * 2 ms: one window per queue-full drop lets the flooder's OWN next
+ * frames be dropped before they reach the queue, draining it for other
+ * sessions; the flooder still retries every ~2 ms, so it keeps its
+ * fair share while never monopolizing the shared device. */
+#define SRV_THROTTLE_DEFAULT_MS 2u
 static unsigned g_rate_open_max = RATE_OPEN_MAX_DEFAULT;
 static unsigned g_rate_echo_max = RATE_ECHO_MAX_DEFAULT;
 static unsigned g_rate_miss_max = RATE_MISS_MAX_DEFAULT;
+/* R47-H2-M1: per-session uplink fairness throttle window (ms) applied on
+ * a queue-full TUN drop (IWAN_SRV_THROTTLE_MS, default SRV_THROTTLE_DEFAULT_MS;
+ * rate_limit_env rejects 0 -> range is 1..65535). See server.h
+ * throttle_until_ms. */
+static unsigned g_up_throttle_ms = SRV_THROTTLE_DEFAULT_MS;
 static pthread_mutex_t g_log_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static uint64_t server_dl_pkts(void);
@@ -700,6 +712,8 @@ void server_rate_limits_init(void)
                                      RATE_ECHO_MAX_DEFAULT);
     g_rate_miss_max = rate_limit_env("IWAN_RATE_MISS_MAX",
                                      RATE_MISS_MAX_DEFAULT);
+    g_up_throttle_ms = rate_limit_env("IWAN_SRV_THROTTLE_MS",
+                                      SRV_THROTTLE_DEFAULT_MS);
 }
 
 /* source address -> owning shard. Top 4 hashed bits select the shard, so
@@ -1708,6 +1722,25 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                 tok_charge_upgrade(ctx, sid, tok, peer, now);
                 return; /* wrong token: drop */
             }
+            /* R47-H2-M1: congestion-reactive per-session uplink fairness.
+             * throttle_until_ms is set only when THIS session's own TUN
+             * write just hit a full device queue (the drop path below);
+             * while active, its DATA frames are dropped here — before the
+             * inner-packet checks and the (up-to-1 ms) queue-full poll —
+             * so a flooding client yields the shared TUN queue to other
+             * sessions and cannot monopolize its recv thread with poll
+             * churn. Drops are covered by the client's retransmits, the
+             * same contract as the queue-full drop. Uncongested sessions
+             * never set it (stays 0), so no normal throughput is capped. */
+            if (ctx->tun_fd >= 0 &&
+                now < atomic_load_explicit(&s->throttle_until_ms,
+                                           memory_order_relaxed)) {
+                pthread_rwlock_unlock(&ctx->sess_lock);
+                atomic_fetch_add_explicit(&g_up[tid].drop, 1,
+                                          memory_order_relaxed);
+                atomic_fetch_add(&g_rate_drops, 1);
+                return;
+            }
             /* source binding: only the session's peer may drive the
              * session; first valid-token packet from a new source rebinds
              * it (NAT or port rebinding tolerance). Rebinds are rare, so
@@ -1861,6 +1894,26 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                      * AIMD keeps the write fan-out (never shrinks). */
                     tun_pool_note_stall(ctx->qpool);
                     atomic_fetch_add_explicit(&g_up[tid].drop, 1, memory_order_relaxed);
+                    /* R47-H2-M1: stamp this session's fairness throttle
+                     * (re-lock — the DATA path released the read lock
+                     * before the TUN write; this path is rare: it runs
+                     * only per queue-full drop). Its own next frames are
+                     * dropped at the gate above for g_up_throttle_ms,
+                     * letting other sessions write while the device
+                     * drains. The token is re-verified so a wiped/replaced
+                     * session (new token) is not throttled. */
+                    pthread_rwlock_rdlock(&ctx->sess_lock);
+                    {
+                        struct server_session *s2 =
+                            find_session_unlocked(ctx, sid);
+                        if (s2 && CRYPTO_memcmp(&s2->token, &tok,
+                                                sizeof tok) == 0)
+                            atomic_store_explicit(
+                                &s2->throttle_until_ms,
+                                now + g_up_throttle_ms,
+                                memory_order_relaxed);
+                    }
+                    pthread_rwlock_unlock(&ctx->sess_lock);
                 }
             } else {
                 /* --no-tun test mode: echo the packet back (zero-latency
