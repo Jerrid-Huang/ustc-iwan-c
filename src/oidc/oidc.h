@@ -110,9 +110,13 @@ char *oidc_build_dev_body(const char *type, const char *device_id,
 
 /* oidc_jwt.c */
 /* verify an id_token JWT (signature against the issuer's JWKS plus
- * aud/iss/exp); returns 0 when valid, non-zero otherwise (reason on
- * stderr). Fail-closed on network/parse errors. */
-int oidc_jwt_verify(const char *jwt, const char *aud, const char *iss);
+ * aud/iss/exp claim validation and, when expected_nonce is non-NULL,
+ * the OIDC nonce echo — OIDC Core 3.1.3.7); returns 0 when valid,
+ * non-zero otherwise (reason on stderr). Fail-closed on network/parse
+ * errors. expected_nonce = the nonce sent in the authorization request
+ * (NULL skips the nonce check). */
+int oidc_jwt_verify(const char *jwt, const char *aud, const char *iss,
+                    const char *expected_nonce);
 /* extract one base64url segment of a JWT (0=header, 1=payload, 2=sig),
  * decoded to a NUL-terminated string; NULL on malformed input or
  * allocation failure */

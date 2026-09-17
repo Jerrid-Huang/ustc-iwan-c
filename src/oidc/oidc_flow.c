@@ -42,8 +42,10 @@ char *oidc_build_dev_body(const char *type, const char *device_id,
 
 /* Where the OAuth state is persisted between issuing the authorize URL
  * and validating the pasted redirect URL: a per-user temp file, 0600.
- * (oidc_login has no config-dir handle -- the CLI resolves it in main --
- * so a standard per-user temp location is used.) */
+ * R49-L3: the OIDC nonce is persisted on the second line of the same
+ * file, so it survives to the id_token check with the same lifecycle as
+ * the state. (oidc_login has no config-dir handle -- the CLI resolves it
+ * in main -- so a standard per-user temp location is used.) */
 #ifndef _WIN32
 /* R37-WG-E1 (L21): XDG_RUNTIME_DIR/TMPDIR are inherited environment, not a
  * contract: a relative value ("." or "relative/dir") used to drop the state
@@ -119,7 +121,8 @@ static char *state_file_path(void)
     return p;
 }
 
-static void save_state_file(const char *path, const char *state)
+static void save_state_file(const char *path, const char *state,
+                            const char *nonce)
 {
     /* O_EXCL|O_NOFOLLOW: never follow a pre-planted symlink, never
      * overwrite someone else's file. The randomized name makes a
@@ -127,10 +130,10 @@ static void save_state_file(const char *path, const char *state)
      * Windows: O_NOFOLLOW has no equivalent, but the file is created
      * fresh with O_CREAT|O_EXCL (fails if ANYTHING exists at the random
      * path), so there is no pre-existing link to follow. */
-#ifdef _WIN32
-    int fd = _open(path, _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY, 0600);
-#else
+#ifndef _WIN32
     int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+#else
+    int fd = _open(path, _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY, 0600);
 #endif
     if (fd < 0)
         oidc_die("cannot create OAuth state file %s: %s", path,
@@ -146,7 +149,11 @@ static void save_state_file(const char *path, const char *state)
 #endif
         oidc_die("cannot create OAuth state file %s", path);
     }
+    /* two lines: state, then nonce (R49-L3) — both are written in one
+     * fputs run, so a partially-written file (crash mid-write) cannot
+     * look like a complete previous state */
     if (fputs(state, f) == EOF || fputc('\n', f) == EOF ||
+        fputs(nonce, f) == EOF || fputc('\n', f) == EOF ||
         fflush(f) != 0 || fclose(f) != 0) {
 #ifdef _WIN32
         _unlink(path);
@@ -157,9 +164,12 @@ static void save_state_file(const char *path, const char *state)
     }
 }
 
-/* read the persisted state back; 0 on success, -1 on any failure */
-static int load_state_file(const char *path, char *out, size_t outsz)
+/* read the two persisted lines back (state, then nonce); 0 on success,
+ * -1 on any failure (including a file without a nonce line) */
+static int load_state_file(const char *path, char *state_out, size_t state_sz,
+                           char *nonce_out, size_t nonce_sz)
 {
+    char buf[160];   /* 32-char state + '\n' + 32-char nonce + '\n' */
 #ifdef _WIN32
     /* O_NOFOLLOW has no Windows equivalent; the path is our own freshly
      * created random-suffixed file, read back immediately (see the
@@ -169,7 +179,7 @@ static int load_state_file(const char *path, char *out, size_t outsz)
         return -1;
     int n;
     do {
-        n = _read(fd, out, (unsigned int)(outsz - 1));
+        n = _read(fd, buf, (unsigned int)(sizeof buf - 1));
     } while (n < 0 && errno == EINTR);   /* R37-WG-E1 (R3-L4) */
     if (_close(fd) != 0)
         log_err("cannot close OAuth state file %s: %s (state kept)",
@@ -184,7 +194,7 @@ static int load_state_file(const char *path, char *out, size_t outsz)
      * match the saved state (CSRF check failed)" — an ordinary IO hiccup
      * presented as an attack, forcing a fresh login. Retry EINTR. */
     do {
-        n = read(fd, out, outsz - 1);
+        n = read(fd, buf, sizeof buf - 1);
     } while (n < 0 && errno == EINTR);
     /* R3-L4: a failing close() does not invalidate the bytes just read;
      * warn only, the read result below decides. (close() on a read-only
@@ -195,9 +205,24 @@ static int load_state_file(const char *path, char *out, size_t outsz)
 #endif
     if (n <= 0)
         return -1;
-    out[n] = '\0';
-    if (out[n - 1] == '\n')   /* tolerate our own trailing newline */
-        out[n - 1] = '\0';
+    buf[n] = '\0';
+    char *nl = strchr(buf, '\n');
+    if (!nl)
+        return -1;                 /* not even one line: not our format */
+    *nl = '\0';                    /* line 1: state */
+    char *nonce = nl + 1;          /* line 2: nonce (R49-L3) */
+    size_t nn = strlen(nonce);
+    if (nn > 0 && nonce[nn - 1] == '\n')   /* tolerate trailing newline */
+        nonce[nn - 1] = '\0';
+    /* R49-L3: our writer always emits a nonce line; a file without one is
+     * stale (pre-nonce format), refuse it so the CSRF check forces a
+     * fresh login instead of silently skipping the nonce check. */
+    if (nonce[0] == '\0')
+        return -1;
+    /* never truncate a CSRF/binding value: a too-small buffer is failure */
+    if (snprintf(state_out, state_sz, "%s", buf) >= (int)state_sz ||
+        snprintf(nonce_out, nonce_sz, "%s", nonce) >= (int)nonce_sz)
+        return -1;
     return 0;
 }
 
@@ -231,8 +256,27 @@ static char *make_state(void)
     return state;
 }
 
-/* authorize URL carrying the PKCE challenge and CSRF state; malloc'd */
-static char *build_auth_url(const char *code_challenge, const char *state)
+/* R49-L3: 16 CSPRNG bytes rendered as 32 upper-hex characters, malloc'd.
+ * The OIDC `nonce` (OIDC Core 3.1.3.7; RFC 8252 6.3 for native apps)
+ * binds the id_token to THIS authorization session: it is sent in the
+ * authorize request and must be echoed verbatim in the id_token, which
+ * validate_claims enforces (fail closed). Same generation mechanism as
+ * the X-Auth-Nonce random in oidc_ctrl_post below. */
+static char *make_nonce(void)
+{
+    uint8_t nb[16];
+    oidc_rand_bytes(nb, sizeof nb);
+    char *nonce = malloc(33);
+    if (!nonce)
+        oidc_die("out of memory");   /* fail closed: no nonce, no login */
+    oidc_hex_upper(nb, sizeof nb, nonce);
+    return nonce;
+}
+
+/* authorize URL carrying the PKCE challenge, CSRF state and the OIDC
+ * nonce (R49-L3); malloc'd */
+static char *build_auth_url(const char *code_challenge, const char *state,
+                            const char *nonce)
 {
     buf_t url;
     buf_init(&url);
@@ -248,6 +292,12 @@ static char *build_auth_url(const char *code_challenge, const char *state)
     buf_put_str(&url, "&code_challenge_method=S256");
     buf_put_str(&url, "&state=");
     oidc_urlenc(state, &url);
+    /* R49-L3: OIDC Core 3.1.3.7 mandates a nonce for requests that need
+     * the id_token bound to the client session (RFC 8252 6.3 for native
+     * apps). The same value is later checked against the id_token's
+     * nonce claim (validate_claims, fail closed). */
+    buf_put_str(&url, "&nonce=");
+    oidc_urlenc(nonce, &url);
     oidc_buf_cstr(&url);
     return (char *)url.data;
 }
@@ -371,16 +421,18 @@ static Json *exchange_code(const char *code, const char *code_verifier)
 
 /* the id_token is the client's proof of authentication: verify its
  * signature against the issuer's JWKS and its aud/iss/exp claims
- * before trusting any of its contents (fail-closed). Returns the
+ * (plus the OIDC nonce, R49-L3) before trusting any of its contents
+ * (fail-closed). expected_nonce is the value sent in the authorize
+ * request; the id_token must echo it or verification fails. Returns the
  * verified id_token string (points into tok), so oidc_login does not
  * fetch it a second time for username extraction. */
-static const char *verify_id_token(Json *tok)
+static const char *verify_id_token(Json *tok, const char *expected_nonce)
 {
     const char *id_token = json_get_str(tok, "id_token");
     if (!id_token)
         oidc_die("login response missing id_token");
     if (oidc_jwt_verify(id_token, OIDC_CLIENT_ID,
-                        "https://" OIDC_AUTH_HOST) != 0)
+                        "https://" OIDC_AUTH_HOST, expected_nonce) != 0)
         oidc_die("id_token verification failed");
     return id_token;
 }
@@ -463,13 +515,18 @@ void oidc_login(char **kp_out, char **user_out)
     char *code_verifier, *code_challenge;
     make_pkce(&code_verifier, &code_challenge);
     char *state = make_state();
+    /* R49-L3: a fresh per-session nonce, persisted beside the state and
+     * checked against the id_token's nonce claim after the exchange
+     * (token/session binding); fail closed on absence/mismatch. */
+    char *nonce = make_nonce();
 
-    /* persist the state before issuing the request: the authorization
-     * response must echo it back or the flow is rejected below */
+    /* persist the state (and nonce) before issuing the request: the
+     * authorization response must echo state back or the flow is
+     * rejected below; the id_token must echo the nonce back. */
     char *state_path = state_file_path();
-    save_state_file(state_path, state);
+    save_state_file(state_path, state, nonce);
 
-    char *url = build_auth_url(code_challenge, state);
+    char *url = build_auth_url(code_challenge, state, nonce);
     oidc_eprintf("  Open in browser:\n  %s\n\n", url);
     free(url);
     free(code_challenge);
@@ -479,7 +536,9 @@ void oidc_login(char **kp_out, char **user_out)
      * remove it now, before the interactive input, so no random-named
      * 0600 file is left behind on any error path below. */
     char saved[64];
-    int have_state = load_state_file(state_path, saved, sizeof saved) == 0;
+    char saved_nonce[64];
+    int have_state = load_state_file(state_path, saved, sizeof saved,
+                                     saved_nonce, sizeof saved_nonce) == 0;
 #ifdef _WIN32
     _unlink(state_path);
 #else
@@ -506,7 +565,16 @@ void oidc_login(char **kp_out, char **user_out)
     free(code_verifier);
 
     char *kp = take_access_token(tok);
-    const char *id_token = verify_id_token(tok);
+    /* R49-L3: the id_token must echo the nonce we issued (validate_claims
+     * rejects a missing/mismatched nonce, fail closed). `have_state` is
+     * always true here — check_csrf_state above dies unless the persisted
+     * record was actually loaded — the conditional is API robustness. */
+    const char *id_token = verify_id_token(tok,
+                                           have_state ? saved_nonce : NULL);
+    /* the nonce has served its session-binding purpose: scrub it like the
+     * other session material before release */
+    OPENSSL_cleanse(nonce, strlen(nonce));
+    free(nonce);
     /* L2 (bughunt): scrub the refresh_token/access_token heap strings
      * before json_free drops them — they outlive their use by a long
      * shot (offline_access scope), so swap-forget is out. */

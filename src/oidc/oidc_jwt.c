@@ -260,8 +260,13 @@ fail:
     return NULL;
 }
 
-/* exp/aud/iss claim validation (RFC 7519 / OIDC Core); 0 on success */
-static int validate_claims(Json *pay_j, const char *aud, const char *iss)
+/* exp/aud/iss claim validation (RFC 7519 / OIDC Core); 0 on success.
+ * expected_nonce (NULL = no nonce check): the OIDC `nonce` sent in the
+ * authorization request — OIDC Core 3.1.3.7 requires the id_token to
+ * echo it back, which binds the token to the client session (RFC 8252
+ * 6.3 for native apps). Absent or mismatched -> reject (fail closed). */
+static int validate_claims(Json *pay_j, const char *aud, const char *iss,
+                           const char *expected_nonce)
 {
     time_t now = time(NULL);
     Json *exp = json_get(pay_j, "exp");
@@ -331,6 +336,24 @@ static int validate_claims(Json *pay_j, const char *aud, const char *iss)
             oidc_eprintf("oidc_jwt_verify: id_token iss \"%s\" != \"%s\"\n",
                          tiss_s, iss);
             free(tiss_s);
+            return -1;
+        }
+    }
+    /* R49-L3: OIDC Core 3.1.3.7 — when the authorization request carried
+     * a nonce (this client always does), the id_token MUST echo it back;
+     * a missing or mismatched nonce means the token was minted for a
+     * different client session (token/session binding). Fail closed.
+     * Local, fixed-length strings; constant-time compare like the other
+     * sensitive comparisons here (ct_eq returns non-zero on a MATCH). The
+     * claim value is issuer-controlled text, but only the diagnostic
+     * copy is filtered — the verdict uses the raw bytes. */
+    if (expected_nonce) {
+        const char *tnonce = json_get_str(pay_j, "nonce");
+        if (!tnonce || strlen(tnonce) != strlen(expected_nonce) ||
+            ct_eq(tnonce, expected_nonce, strlen(expected_nonce)) == 0) {
+            oidc_eprintf("oidc_jwt_verify: id_token nonce does not match "
+                         "the nonce sent in the authorization request "
+                         "(OIDC Core 3.1.3.7)\n");
             return -1;
         }
     }
@@ -458,7 +481,8 @@ out:
     return rc;
 }
 
-int oidc_jwt_verify(const char *jwt, const char *aud, const char *iss)
+int oidc_jwt_verify(const char *jwt, const char *aud, const char *iss,
+                    const char *expected_nonce)
 {
     const char *sig;
     Json *hdr_j = NULL;
@@ -469,7 +493,7 @@ int oidc_jwt_verify(const char *jwt, const char *aud, const char *iss)
 
     if (!pay_j)
         return -1;
-    if (validate_claims(pay_j, aud, iss) != 0)
+    if (validate_claims(pay_j, aud, iss, expected_nonce) != 0)
         goto out;
     jwks = fetch_jwks(iss);
     if (!jwks)
