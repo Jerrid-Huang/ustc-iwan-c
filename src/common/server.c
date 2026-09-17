@@ -699,12 +699,34 @@ static struct rate_shard g_rate_shards[RATE_SHARDS];
  * collision's inherent cost), which the old publish-unconditionally shape
  * turned into a degenerate per-frame thrash.
  * over_until_ms == 0 means "no gate": now_ms() is a monotonic count from
- * boot, so the `> now` test is false for a zeroed slot. */
+ * boot, so the `> now` test is false for a zeroed slot.
+ *
+ * R50-A1: the gate tables are 4-WAY SET-ASSOCIATIVE. A single-way slot
+ * could "park" only ONE source per window, so under R50-A1's eviction
+ * churn (a shard with more live sources than buckets) sources that shared
+ * a slot endlessly lost the claim (rate_gate_claim) and stayed on the
+ * shard-locked slow path / write-lock path the whole window. With
+ * RATE_GATE_WAYS ways per slot, up to four sources that hash to the same
+ * set are gated (fast-path) at once, so a whole shard (up to
+ * 4 * RATE_BUCKETS_PER_SHARD = 256 live sources) can be carried on the
+ * lock-free fast path while its buckets churn: exactly the per-source
+ * budget population whose counters the churn keeps resetting. Beyond that
+ * (a fifth+ source per set) the claim backs off and the source keeps the
+ * slow path for its window — the documented bounded-multiplier residual,
+ * same shape as R49-I2, now with a real per-window cap per source (see
+ * rate_evict_publish). R49-L1's no-thrash property is preserved per way:
+ * a way validly held by another source is never overwritten, so two
+ * over-budget sources in one set do not evict each other — they settle
+ * into different ways and each keeps its fast path. */
 struct rate_gate {
     _Atomic uint32_t ip;            /* network-order source address */
     _Atomic uint64_t over_until_ms; /* budget refills at this monotonic ms */
 };
-static struct rate_gate g_rate_gate[RATE_BUCKETS];
+#define RATE_GATE_WAYS 4
+struct rate_gate_set {
+    struct rate_gate way[RATE_GATE_WAYS];
+};
+static struct rate_gate_set g_rate_gate[RATE_BUCKETS];
 /* R47-H2-M2: second, independent lock-free over-budget gate table for the
  * per-source bound-class wrong-token budget (rate_allow_tokbad). Separate
  * from g_rate_gate on purpose: the sid-miss gate and the tokbad gate
@@ -713,7 +735,7 @@ static struct rate_gate g_rate_gate[RATE_BUCKETS];
  * lock-cost, never delivery, but the accounting cross-talk is needless).
  * Same slot function, same static sizing, same relaxed-atomic discipline
  * as g_rate_gate (R49-L1: exclusive claim, rate_gate_claim). */
-static struct rate_gate g_tokbad_gate[RATE_BUCKETS];
+static struct rate_gate_set g_tokbad_gate[RATE_BUCKETS];
 /* R48-F1(2/3): third, independent lock-free over-budget gate table for the
  * per-source known-sid wrong-token CLOSE budget (rate_allow_close).
  * Separate from both g_rate_gate and g_tokbad_gate on purpose: each gate
@@ -722,7 +744,19 @@ static struct rate_gate g_tokbad_gate[RATE_BUCKETS];
  * counting / lock-cost, never delivery, but the accounting cross-talk is
  * needless). Same slot function, same static sizing, same relaxed-atomic
  * discipline (R49-L1: exclusive claim, rate_gate_claim). */
-static struct rate_gate g_close_gate[RATE_BUCKETS];
+static struct rate_gate_set g_close_gate[RATE_BUCKETS];
+/* R50-A1: fourth gate table, for the OPEN/PING/ECHO face (rate_allow).
+ * The three gates above bound the COST of frames that are dropped
+ * regardless (unknown-sid, wrong-token DATA/CLOSE). OPEN/PING/ECHO are the
+ * only class whose rate check is also a DELIVERY gate (an in-budget OPEN
+ * IS processed), so this table is consulted only by rate_allow and is
+ * armed ONLY by rate_evict_publish — i.e. only when the source's bucket
+ * was evicted mid-window by the very churn that broke its CPU cap, never
+ * by an over-budget slow-path self-publish (see rate_evict_publish). It
+ * restores the OPEN/PING/ECHO CPU cap that eviction churn nullifies, at
+ * the documented price of treating an evicted source as over-budget for
+ * the remainder of its window. Same shape/discipline as the other three. */
+static struct rate_gate_set g_ctrl_gate[RATE_BUCKETS];
 
 /* guards g_rate_shards: each shard has its own lock, taken for the
  * unauthenticated control types (rate_allow). The F4/R1-D-1 DATA/CLOSE
@@ -842,44 +876,73 @@ static inline unsigned rate_gate_slot(uint32_t ip)
     return (unsigned)((ip * RATE_HASH_MUL) >> RATE_HASH_SHIFT);
 }
 
-/* R49-L1: claim `g` for `ip` until `until` (a deadline in now_ms()),
- * UNLESS the slot is currently validly claimed by a different source, in
- * which case back off and leave the holder's claim untouched. Called only
- * by over-budget publishers, from inside the shard-locked slow path.
+/* R49-L1 (+ R50-A1): claim `gs` (a RATE_GATE_WAYS-way set) for `ip` until
+ * `until` (a deadline in now_ms()), writing the FIRST way that is either
+ * this source's own, stale, or never used — UNLESS every way is currently
+ * validly claimed by a different source, in which case back off and leave
+ * the holders' claims untouched. Called only by over-budget publishers,
+ * from inside the shard-locked slow path.
  *
- * Why the guard: before this helper every over-budget source published
- * its claim unconditionally (deadline first, ip second). Two over-budget
- * sources that hash to the SAME slot therefore spent the whole window
- * overwriting each other: A's frame saw B's claim, missed the lock-free
- * fast path, went through the shard lock + bucket probe + counter RMW and
- * re-published A; B's next frame saw A's claim and did the same — so BOTH
- * sources took the slow path on EVERY frame for the whole window, the
- * opposite of the "a collision costs at most one extra count" claim. With
- * the exclusive rule the first source to publish keeps the slot and stays
- * on the fast path; the colliding source backs off and keeps the shard-
- * locked slow path (the collision's inherent, unavoidable cost) instead
- * of actively evicting the holder. Delivery never changes either way:
- * this is a cost gate, and a missed fast path only means one more shard-
- * locked drop decision on a frame that is dropped regardless.
+ * Why the guard (R49-L1): before this helper every over-budget source
+ * published its claim unconditionally (deadline first, ip second). Two
+ * over-budget sources that hash to the SAME slot therefore spent the whole
+ * window overwriting each other: A's frame saw B's claim, missed the
+ * lock-free fast path, went through the shard lock + bucket probe +
+ * counter RMW and re-published A; B's next frame saw A's claim and did the
+ * same — so BOTH sources took the slow path on EVERY frame for the whole
+ * window, the opposite of the "a collision costs at most one extra count"
+ * claim. With the exclusive rule the first source to publish keeps its way
+ * and stays on the fast path; the colliding source takes the next free way
+ * (R50-A1) or, when all RATE_GATE_WAYS ways are validly held by other
+ * sources, backs off and keeps the shard-locked slow path (the collision's
+ * inherent, unavoidable cost) instead of actively evicting the holder.
+ * Delivery never changes either way: this is a cost gate, and a missed
+ * fast path only means one more shard-locked drop decision on a frame that
+ * is dropped regardless.
  *
  * Store ordering is unchanged from the callers' old publish sequence:
  * over_until_ms is stored before ip, so a reader that observes its own ip
- * can only have observed a deadline stored before it. All accesses stay
- * relaxed; the only cost of the check-then-act race (two sources reading
- * the slot as free at once and both publishing) is exactly the old
- * spurious-count worst case, after which the loser backs off on its next
- * over-budget publish — the slot still settles to a single holder. */
-static inline void rate_gate_claim(struct rate_gate *g, uint32_t ip,
+ * in a way can only have observed a deadline stored before it. All
+ * accesses stay relaxed; the only cost of the check-then-act race (two
+ * sources reading a way as free at once and both publishing) is exactly
+ * the old spurious-count worst case, after which the loser settles into
+ * another free way or backs off on its next over-budget publish — the set
+ * still settles to stable holders. */
+static inline void rate_gate_claim(struct rate_gate_set *gs, uint32_t ip,
                                    uint64_t until, uint64_t now)
 {
-    uint32_t cur_ip =
-        atomic_load_explicit(&g->ip, memory_order_relaxed);
-    uint64_t cur_until =
-        atomic_load_explicit(&g->over_until_ms, memory_order_relaxed);
-    if (cur_ip != 0 && cur_ip != ip && cur_until > now)
-        return; /* validly claimed by another source: back off */
-    atomic_store_explicit(&g->over_until_ms, until, memory_order_relaxed);
-    atomic_store_explicit(&g->ip, ip, memory_order_relaxed);
+    for (unsigned w = 0; w < RATE_GATE_WAYS; w++) {
+        struct rate_gate *g = &gs->way[w];
+        uint32_t cur_ip =
+            atomic_load_explicit(&g->ip, memory_order_relaxed);
+        uint64_t cur_until =
+            atomic_load_explicit(&g->over_until_ms, memory_order_relaxed);
+        if (cur_ip != 0 && cur_ip != ip && cur_until > now)
+            continue; /* this way is validly claimed by another source */
+        atomic_store_explicit(&g->over_until_ms, until, memory_order_relaxed);
+        atomic_store_explicit(&g->ip, ip, memory_order_relaxed);
+        return;
+    }
+    /* all RATE_GATE_WAYS ways validly claimed by other sources this
+     * window: back off — the source keeps the (shard-locked, bounded)
+     * slow path until a way frees at the next window roll. */
+}
+
+/* R50-A1: is `ip` currently gated by any way of `gs`? Lock-free fast-path
+ * reader; same relaxed discipline and store-ordering argument as
+ * rate_gate_claim (a way's deadline is stored before its ip, so seeing our
+ * own ip guarantees the deadline in that way predates it and therefore
+ * belongs to us). */
+static inline bool rate_gate_check(const struct rate_gate_set *gs,
+                                   uint32_t ip, uint64_t now)
+{
+    for (unsigned w = 0; w < RATE_GATE_WAYS; w++) {
+        const struct rate_gate *g = &gs->way[w];
+        if (atomic_load_explicit(&g->ip, memory_order_relaxed) == ip &&
+            atomic_load_explicit(&g->over_until_ms, memory_order_relaxed) > now)
+            return true;
+    }
+    return false;
 }
 
 /* locate (or claim) the rate bucket for ip inside its shard; caller must
@@ -912,11 +975,68 @@ static struct rate_bucket *rate_bucket_find(struct rate_shard *sh,
     return &sh->buckets[(h + evict) % RATE_BUCKETS_PER_SHARD];
 }
 
+/* R50-A1: a bucket being stolen from its holder mid-window means the
+ * holder's budget state dies with the counters about to be zeroed for the
+ * new occupant. If the holder had actually consumed anything this window
+ * (a live window AND any non-zero count), its per-window cost has not yet
+ * been capped — under churn its counter was reset before it could reach
+ * `max`, so `++cnt <= max` would otherwise stay true forever and the
+ * source would keep the shard-locked slow path / sess_lock WRITE path on
+ * every frame (the R50-A1 nullification). Carrying the budget instead of
+ * losing it: publish the holder's over-budget gates with its window's
+ * deadline BEFORE the counters are reset. From its next frame on the
+ * source hits the lock-free fast path (rate_gate_check), i.e. it is
+ * treated exactly like a source that exceeded its budget — which never
+ * changes delivery (all three gated classes drop such frames anyway) and
+ * counts one g_rate_drops per dropped frame, precisely like a slow-path
+ * over-budget drop. The OPEN/PING/ECHO face gets its own gate
+ * (g_ctrl_gate) armed here too — see its declaration for why that is the
+ * only place that gate is ever armed.
+ *
+ * Boundedness: per window, each source spends at most `max` frames on the
+ * slow path / write-lock path, then stays on the fast path until the
+ * window it was evicted in rolls. Under bucket churn the eviction of a
+ * live-counted bucket is what closes the source's window early, and a
+ * source can be re-churned within AT MOST one further slow-path frame per
+ * eviction; repeated evictions (a must under sustained oversubscription)
+ * therefore re-arm it at its original window deadline — the eviction
+ * deadline is fixed (it never shrinks), so total per-window cost is bounded
+ * by `max` + (# evictions it survives, each costing one extra in-budget
+ * frame) per source, and the aggregate over a shard is bounded by the gate
+ * sets' capacity (4 * RATE_BUCKETS_PER_SHARD sources keep the fast path;
+ * sources beyond that keep the shard-locked slow path for the window —
+ * the bounded-multiplier residual, same shape as R49-I2 but now with a
+ * real per-window cap per source instead of an unbounded one). Caller must
+ * hold the shard lock (runs inside rate_bucket_touch). */
+static void rate_evict_publish(struct rate_bucket *b, uint64_t now)
+{
+    uint64_t until;
+    uint32_t ip = b->ip;
+    unsigned slot;
+
+    if (ip == 0 || now - b->win >= RATE_WINDOW_MS)
+        return; /* never-claimed slot, or the window already elapsed (a
+                 * fresh window is a legit budget refill, not an eviction) */
+    if (b->open_cnt == 0 && b->ping_cnt == 0 && b->echo_cnt == 0 &&
+        b->miss_cnt == 0 && b->tokbad_cnt == 0 && b->close_cnt == 0)
+        return; /* claimed this window but spent nothing: nothing to carry */
+    /* the holder is being evicted with live spending: gate it for the
+     * remainder of ITS window, across all four faces (the three cost
+     * gates plus the ctrl gate the evicted holder may next hit) */
+    until = b->win + RATE_WINDOW_MS;
+    slot = rate_gate_slot(ip);
+    rate_gate_claim(&g_rate_gate[slot], ip, until, now);
+    rate_gate_claim(&g_tokbad_gate[slot], ip, until, now);
+    rate_gate_claim(&g_close_gate[slot], ip, until, now);
+    rate_gate_claim(&g_ctrl_gate[slot], ip, until, now);
+}
+
 /* (re)start the source's window when the bucket is stale or was just
  * evicted from another source; caller must hold the shard lock. */
 static void rate_bucket_touch(struct rate_bucket *b, uint32_t ip, uint64_t now)
 {
     if (b->ip != ip || now - b->win >= RATE_WINDOW_MS) {
+        rate_evict_publish(b, now);
         b->ip = ip;
         b->win = now;
         b->open_cnt = b->ping_cnt = b->echo_cnt = b->miss_cnt = 0;
@@ -962,6 +1082,21 @@ static bool rate_allow(const struct sockaddr_in *peer, uint8_t typ, uint64_t now
         break;
     default:
         return true; /* authenticated or negligible-cost paths */
+    }
+    /* R50-A1: a source whose bucket was evicted mid-window
+     * (rate_evict_publish) is treated as over-budget on the OPEN/PING/ECHO
+     * face until that window ends. This is the only way to restore this
+     * face's CPU cap under churn (its slow path IS the delivery gate, so
+     * it has no pre-existing over-budget fast path of its own): a source
+     * that keeps losing its bucket would otherwise keep a fresh budget
+     * each frame and derive/parse forever. It fires ONLY when the source's
+     * own live-counted bucket was evicted under table pressure — i.e.
+     * never for a well-behaved source whose budget survives, and with a
+     * hard deadline at its evicted window's end. The frame is counted in
+     * g_rate_drops exactly once, like every other rate-limited drop. */
+    if (rate_gate_check(&g_ctrl_gate[rate_gate_slot(ip)], ip, now)) {
+        atomic_fetch_add(&g_rate_drops, 1);
+        return false;
     }
     /* the sharded rate tables are shared by the multi-threaded uplink
      * recv threads; the per-shard mutex is taken on the unauthenticated
@@ -1036,19 +1171,20 @@ static bool rate_allow(const struct sockaddr_in *peer, uint8_t typ, uint64_t now
  * release sess_lock before calling this. */
 static bool rate_allow_sid_miss(uint32_t ip, uint64_t now)
 {
-    struct rate_gate *g = &g_rate_gate[rate_gate_slot(ip)];
+    struct rate_gate_set *g = &g_rate_gate[rate_gate_slot(ip)];
     struct rate_bucket *b;
     bool ok;
 
     /* fast path (lock-free): this source already spent its unknown-sid
      * budget earlier in the current window, so it is known to be over it
      * for the rest of that window — drop without touching the shard.
-     * R49-L1: the published claim is exclusive (rate_gate_claim backs off
-     * on a slot validly held by another source), so a hash collision can
-     * only keep the LATER source on the slow path below — it can never
-     * evict this source from the fast path mid-window. */
-    if (atomic_load_explicit(&g->ip, memory_order_relaxed) == ip &&
-        atomic_load_explicit(&g->over_until_ms, memory_order_relaxed) > now)
+     * R49-L1: the published claim is exclusive per way (rate_gate_claim
+     * backs off on a way validly held by another source), so a hash
+     * collision can only keep the LATER source on the slow path below —
+     * it can never evict this source from the fast path mid-window.
+     * R50-A1: rate_evict_publish arms this same gate when the source's
+     * bucket was evicted with live spending, closing the churn hole. */
+    if (rate_gate_check(g, ip, now))
         return false;
 
     b = rate_bucket_enter(ip, now);
@@ -1116,16 +1252,20 @@ static bool rate_allow_sid_miss(uint32_t ip, uint64_t now)
 static bool rate_allow_tokbad(const struct sockaddr_in *peer, uint64_t now)
 {
     uint32_t ip = (uint32_t)peer->sin_addr.s_addr;
-    struct rate_gate *g = &g_tokbad_gate[rate_gate_slot(ip)];
+    struct rate_gate_set *g = &g_tokbad_gate[rate_gate_slot(ip)];
     struct rate_bucket *b;
     bool ok;
 
     /* fast path (lock-free): this source already spent its bound-class
      * wrong-token budget earlier in the current window; drop the frame
-     * on a single relaxed load pair, exactly like rate_allow_sid_miss.
-     * R49-L1: exclusive claim (rate_gate_claim), same as sid_miss. */
-    if (atomic_load_explicit(&g->ip, memory_order_relaxed) == ip &&
-        atomic_load_explicit(&g->over_until_ms, memory_order_relaxed) > now)
+     * on a relaxed load scan, exactly like rate_allow_sid_miss.
+     * R49-L1: exclusive claim per way (rate_gate_claim), same as sid_miss.
+     * R50-A1: rate_evict_publish arms this gate for a source whose bucket
+     * was evicted mid-window (the tokbad write-lock cap is the R50-A1
+     * headline: without it the source's counter reset each eviction and
+     * every frame re-entered tok_charge_upgrade — one global sess_lock
+     * WRITE lock). */
+    if (rate_gate_check(g, ip, now))
         return false;
 
     b = rate_bucket_enter(ip, now);
@@ -1192,16 +1332,17 @@ static bool rate_allow_tokbad(const struct sockaddr_in *peer, uint64_t now)
 static bool rate_allow_close(const struct sockaddr_in *peer, uint64_t now)
 {
     uint32_t ip = (uint32_t)peer->sin_addr.s_addr;
-    struct rate_gate *g = &g_close_gate[rate_gate_slot(ip)];
+    struct rate_gate_set *g = &g_close_gate[rate_gate_slot(ip)];
     struct rate_bucket *b;
     bool ok;
 
     /* fast path (lock-free): this source already spent its known-sid
      * wrong-token CLOSE budget earlier in the current window; drop the
-     * frame on a single relaxed load pair, exactly like rate_allow_tokbad.
-     * R49-L1: exclusive claim (rate_gate_claim), same as the family. */
-    if (atomic_load_explicit(&g->ip, memory_order_relaxed) == ip &&
-        atomic_load_explicit(&g->over_until_ms, memory_order_relaxed) > now)
+     * frame on a relaxed load scan, exactly like rate_allow_tokbad.
+     * R49-L1: exclusive claim per way (rate_gate_claim), same as the
+     * family. R50-A1: rate_evict_publish arms this gate too when the
+     * source's bucket was evicted mid-window with live spending. */
+    if (rate_gate_check(g, ip, now))
         return false;
 
     b = rate_bucket_enter(ip, now);
