@@ -1151,6 +1151,10 @@ int main(int argc, char **argv)
     _Atomic int poll_err = 0;   /* M3-6: fatal poll flag aggregated from
                                  * all recv threads (exit != 0 for mgrs) */
     bool drop_child = false; /* A1: this process is the forked, de-privileged server */
+    /* R52-D2: the stop signals are blocked before the first root side
+     * effect and each role re-opens them after its own graceful-stop
+     * machinery is installed (see the sigprocmask below parse_opts). */
+    sigset_t stop_mask, stop_orig;
 
     util_ignore_sigpipe();     /* EPIPE on a dead socket, not a SIGPIPE kill */
     prof_init();               /* IWAN_PROFILE=1: stage throughput prints */
@@ -1186,6 +1190,36 @@ int main(int argc, char **argv)
     strcpy(o.user, "nobody");
 
     parse_opts(argc, argv, &o);
+
+    /* R52-D2: the stop signals must never reach their default disposition
+     * while this process carries system state only the graceful-exit path
+     * can undo (ip_forward, the MASQUERADE/FORWARD rules, the fork). Until
+     * R52 their handlers were installed only AFTER that root configuration
+     * (parent: the forwarding handlers below; server: on_signal after the
+     * fork), so a SIGINT/SIGTERM/SIGHUP/SIGQUIT in the ms-wide window took
+     * default action, terminated the process, and left MASQUERADE +
+     * FORWARD + ip_forward=1 stranded — the server's half of the client's
+     * "install signals before any route setup" contract was asymmetric.
+     * Block all four here, before the first such side effect; each role
+     * re-opens them only once its own graceful-stop machinery is in place
+     * (the parent after parent_fwd_signal + g_child_pid, the server after
+     * on_signal). A signal arriving meanwhile is held pending — not lost,
+     * not default-killed — and delivered at the re-open, where it becomes
+     * an orderly stop with the full cleanup. sigprocmask affects no other
+     * system call; the exec'd helper processes (iptables/ip) inherit the
+     * mask across fork+exec, so they cannot be half-killed either. stop_orig
+     * is restored, never assumed empty, preserving a launcher that already
+     * had some of these blocked. */
+    sigemptyset(&stop_mask);
+    sigaddset(&stop_mask, SIGINT);
+    sigaddset(&stop_mask, SIGTERM);
+    sigaddset(&stop_mask, SIGHUP);
+    sigaddset(&stop_mask, SIGQUIT);
+    if (sigprocmask(SIG_BLOCK, &stop_mask, &stop_orig) != 0) {
+        fprintf(stderr, "error: cannot block stop signals: %s\n",
+                strerror(errno));
+        return 1;
+    }
 
     /* The argument checks below are pure string/path validation and must stay
      * libcrypto-free: on e07fe75 an invalid --subnet/--tun/--server-ip/--dns
@@ -1438,32 +1472,33 @@ int main(int argc, char **argv)
              * cleanup — ignoring them (as before) let kill <parent-pid>
              * or an SSH hangup strand the NAT state forever.
              *
-             * The forwarded signals stay BLOCKED while the handlers and
-             * g_child_pid are installed: a signal arriving in that
-             * window must not be lost (handlers not yet up) or swallowed
-             * without forwarding (g_child_pid still -1). Anything that
-             * arrives meanwhile is delivered once the mask is restored,
-             * with everything in place. */
-            sigset_t mask, oldmask;
-            sigemptyset(&mask);
-            sigaddset(&mask, SIGINT);
-            sigaddset(&mask, SIGTERM);
-            sigaddset(&mask, SIGHUP);
-            sigaddset(&mask, SIGQUIT);
-            sigprocmask(SIG_BLOCK, &mask, &oldmask);
+             * R52-D2: those signals have been BLOCKED since before the
+             * NAT setup (see main, above the root configuration) and stay
+             * blocked here while the forwarding handlers and g_child_pid
+             * are installed: a signal arriving in this window must not be
+             * lost (handlers not yet up) or swallowed without forwarding
+             * (g_child_pid still -1) — it is held pending and delivered
+             * once stop_orig is restored below, with everything in
+             * place. */
             if (install_sig(SIGINT, parent_fwd_signal, 0) != 0 ||
                 install_sig(SIGTERM, parent_fwd_signal, 0) != 0 ||
                 install_sig(SIGHUP, parent_fwd_signal, 0) != 0 ||
                 install_sig(SIGQUIT, parent_fwd_signal, 0) != 0) {
                 fprintf(stderr, "error: cannot install forwarding "
                         "handlers: %s\n", strerror(errno));
-                sigprocmask(SIG_SETMASK, &oldmask, NULL);
                 /* R24-f3 F3: the server child is already forked; without
                  * this it would keep running as an orphan while we just
-                 * stripped the NAT rules it depends on. Kill + reap it. */
+                 * stripped the NAT rules it depends on. Kill + reap it.
+                 * R52-D2: keep the stop signals BLOCKED across this
+                 * teardown and restore the original mask only AFTER the
+                 * cleanup — a pending window signal delivered mid-cleanup
+                 * (some of the four failed to install, so their
+                 * disposition may still be default) must not kill the
+                 * parent before it has undone the NAT changes. */
                 kill(pid, SIGKILL);
                 (void)waitpid(pid, NULL, 0);
                 server_cleanup_nat();
+                sigprocmask(SIG_SETMASK, &stop_orig, NULL);
                 return 1;
             }
             g_child_pid = pid;
@@ -1471,7 +1506,7 @@ int main(int argc, char **argv)
              * parent reaps the child with waitpid below, and forwarding
              * it to the child would be meaningless (the child is the
              * one that exited). */
-            sigprocmask(SIG_SETMASK, &oldmask, NULL);
+            sigprocmask(SIG_SETMASK, &stop_orig, NULL);
             for (;;) {
                 /* R37 WG1a: `st` must not shadow the `struct stat st` of
                  * the parent branch under -Wshadow -Werror */
@@ -1519,6 +1554,16 @@ int main(int argc, char **argv)
         log_err("cannot install signal handlers: %s", strerror(errno));
         return 1;
     }
+    /* R52-D2: the stop signals were held BLOCKED from the moment before
+     * the first root side effect (enable_ip_forward/setup_nat) so no
+     * default-disposition window could leave MASQUERADE/FORWARD/ip_forward
+     * stranded; both the forked child and every non-root deployment
+     * inherit that mask. Re-open here, after on_signal guards this
+     * process's graceful shutdown — a signal that arrived during startup
+     * is delivered now and becomes an orderly stop: the server exits
+     * through the normal path and the root parent's waitpid reaps it and
+     * undoes the NAT changes. */
+    sigprocmask(SIG_SETMASK, &stop_orig, NULL);
 
     if (!o.no_tun) {
         static struct srv_pool_ud pu; /* readers reference this for life */
