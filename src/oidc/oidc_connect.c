@@ -49,12 +49,18 @@ struct oidc_reauth_ctx {
  * nonce + 16-byte tag)? This mirrors exactly the structural gate inside
  * decrypt_password (gcm.c:94-96), which refuses anything decoding to
  * fewer than GCM_NONCE_LEN + GCM_TAG_LEN bytes before it even attempts
- * GCM. A blob that fails this shape test cannot be legacy ciphertext, so
- * a decrypt failure on it is the NORMAL modern plaintext path — not a
- * corruption signal. (The irreducible residual: a plaintext password
- * that independently happens to decode to >= 28 bytes of base64url is
+ * GCM. A blob that fails this shape test cannot be legacy ciphertext
+ * UNLESS it was corrupted in a way that destroyed its decodability;
+ * such a corrupted legacy blob is indistinguishable by shape from a
+ * plaintext password and would fall back as plaintext with no
+ * corruption alert — the irreducible residual of the markerless format
+ * (frozen: the format carries no marker that could separate "corrupted
+ * ciphertext" from a "legit short plaintext", so this ambiguity is
+ * information-theoretically unavoidable and is deliberately not chased).
+ * The other irreducible residual: a plaintext password that
+ * independently happens to decode to >= 28 bytes of base64url is
  * indistinguishable from ciphertext by shape; it also logged under the
- * old unconditional rule, so nothing regresses.)
+ * old unconditional rule, so nothing regresses.
  * FROZEN BOUNDARY: decrypt_password, oidc_wrap_password and every write
  * format are untouched; this only classifies the DIAGNOSTIC TRIGGER in
  * stored_password(). */
@@ -116,9 +122,14 @@ static char *stored_password(const char *stored, const char *domain,
                 "the stored blob as a legacy plaintext password — this may "
                 "indicate corruption/tampering or a secret change");
     else
-        log_debug("stored password is not legacy-ciphertext shaped "
-                  "(undecodable as base64url or shorter than the GCM "
-                  "nonce+tag overhead); using it as a plaintext password");
+        log_debug("stored password fell back as a plaintext password: it "
+                  "is not legacy-ciphertext shaped (undecodable as "
+                  "base64url or shorter than the GCM nonce+tag overhead). "
+                  "Note the ambiguity: if this value was SUPPOSED to be "
+                  "legacy ciphertext, it has been damaged past "
+                  "recognizability and will be used as plaintext — the "
+                  "markerless format (frozen) cannot tell that apart from "
+                  "a genuine short plaintext");
     return blob;   /* plaintext format: the blob is the password */
 }
 
