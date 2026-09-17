@@ -1432,12 +1432,36 @@ void route_setup6(const char *tun, const slist_t *routes6)
         log_err("route_setup6: add %s failed", c);
     }
 #else
+    /* R49-L2: `replace`, not `add`, mirroring the v4 arm's metric-less
+     * `route replace ... dev <tun>` (see the R1-C-C-1 note in route_setup,
+     * route.c ~line 1096). `add` was broken in two ways on any dual-stack
+     * host that already has a physical IPv6 default: the kernel applies
+     * IP6_RT_PRIO_USER (1024) to a v6 netlink route whose RTA_PRIORITY is
+     * absent (inet6_rtm_newroute), so (a) a `add ::/0` collided with an
+     * RA default at the same 1024 and rtnetlink answered EEXIST — the
+     * tunnel ::/0 was never installed, and (b) even when the metrics
+     * differed, the 1024 tunnel default lost to any lower-metric physical
+     * default. The metric below is therefore written EXPLICITLY as
+     * `metric 0`: on IPv6 an absent metric is 1024, NOT the priority-0 an
+     * absent metric means on IPv4, so the v4 tradeoff (a priority-0
+     * tunnel default that outranks every physical default while the
+     * physical default stays in the table and self-heals when the TUN
+     * unregisters) is only reproducible on v6 by naming metric 0. The
+     * v4/v6 replace tradeoffs are otherwise shared: replace is idempotent
+     * (a leftover from an old run — at any metric — is superseded in its
+     * slot if identical or re-created), and neither side ever removes the
+     * physical default because independent metrics keep both entries in
+     * the table; the only shared edge is a pre-existing physical route AT
+     * priority 0, which replace takes over exactly as the v4 arm does.
+     * route_teardown6's `-6 route del <c> dev <tun>` already deletes the
+     * priority-0 dev-<tun> entry and leaves any other default alone. */
     for (size_t i = 0; i < routes6->n; i++) {
         const char *c = routes6->v[i];
-        char *a[] = { "-6", "route", "add", (char *)c,
-                      "dev", (char *)tun, NULL };
+        char *a[] = { "-6", "route", "replace", (char *)c,
+                      "dev", (char *)tun, "metric", "0", NULL };
         if (!ip_run(a))
-            log_err("route_setup6: ip -6 route add %s dev %s failed", c, tun);
+            log_err("route_setup6: ip -6 route replace %s dev %s failed",
+                    c, tun);
     }
 #endif
 }
