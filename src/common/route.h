@@ -18,10 +18,15 @@ bool capture_default(char gw[16], char dev[16], char metric[16]);
  * on failure, rolls back everything applied so far (restoring the
  * pre-VPN default route) and returns false — the caller must not
  * start the pump on failure. metric is the pre-VPN default's metric
- * ("" when none) and is carried into the teardown restore. */
+ * ("" when none) and is carried into the teardown restore. routes6 is
+ * the already-expanded IPv6 proxy list (see route_setup6); the Windows
+ * crash-leftover sweep uses it to keep ONLY the currently configured
+ * v6 prefixes (plus fe80::/64 and the derived ULA/96) instead of
+ * preserving every on-link >= /64 route (R49-L5). */
 bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
                  const char *srv, const char *ogw, const char *odev,
-                 const char *metric, const slist_t *routes_with_default);
+                 const char *metric, const slist_t *routes_with_default,
+                 const slist_t *routes6);
 void route_teardown(const char *tun, const char *srv, const char *ogw,
                     const char *odev, const char *metric,
                     const slist_t *routes);

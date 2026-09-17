@@ -1379,7 +1379,7 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
         log_debug("default route: via %s dev %s%s%s", ogw, odev,
                   ogw_metric[0] ? " metric " : "", ogw_metric);
         if (!route_setup(tun_name, auth_tun_ip, auth_mtu, server, ogw, odev,
-                         ogw_metric, &routes)) {
+                         ogw_metric, &routes, &routes6)) {
             /* route_setup already rolled back and logged; a half-configured
              * tunnel must not start pumping */
             slist_free(&routes);

@@ -284,7 +284,8 @@ bool route_iface_up(const char *tun, const char *tun_ip, uint16_t mtu)
 /* forward decl: sweep_stale_routes is defined below (R46-L1) — this
  * function now also sweeps, so the no-route-hijack pump path reaches
  * the crash-leftover cleanup even though route_setup never ran */
-static void sweep_stale_routes(const char *tun);
+static void sweep_stale_routes(const char *tun, const char *tun_ip,
+                               const slist_t *routes6);
 
 void route_iface_down(const char *tun)
 {
@@ -302,8 +303,12 @@ void route_iface_down(const char *tun)
      * unbounded number of pure-TUN runs. Sweep here too; it is
      * idempotent and, on the route_setup/route_teardown callers of this
      * function, only removes leftovers the explicit deletes missed
-     * (nothing that is being kept is newly added after this point). */
-    sweep_stale_routes(tun);
+     * (nothing that is being kept is newly added after this point).
+     * R49-L5: passes no tun_ip/routes6, so the v6 sweep keeps only
+     * fe80::/64 — on this path route_teardown6 already deleted the
+     * current config and the derived ULA/96 immediately before, so any
+     * other on-link route left here is residue by definition. */
+    sweep_stale_routes(tun, NULL, NULL);
 }
 #elif defined(__APPLE__)
 void route_iface_down(const char *tun)
@@ -687,6 +692,54 @@ static bool ip6_nexthop_unspec(const SOCKADDR_INET *nh)
     return memcmp(a, zero, sizeof zero) == 0;
 }
 
+/* R49-L5: exact IPv6 prefix match. Both sides are masked to the shorter
+ * of their prefix lengths and compared with the LENGTHS THEMSELVES also
+ * required equal, so fe80::/64 never matches fe80::/128 (or a host bit
+ * set inside the network, e.g. an unmasked "fe80::1/64" spelling). A
+ * masked byte comparison (not a string "contains") normalizes every
+ * spelling of the same network. */
+static bool ip6_prefix_eq(const uint8_t a[16], int plen_a,
+                          const uint8_t b[16], int plen_b)
+{
+    if (plen_a != plen_b)
+        return false;
+    int full = plen_a / 8;
+    if (memcmp(a, b, (size_t)full) != 0)
+        return false;
+    if (plen_a % 8) {
+        uint8_t mask = (uint8_t)(0xFFu << (8 - (plen_a % 8)));
+        if (((uint8_t)(a[full] ^ b[full]) & mask) != 0)
+            return false;
+    }
+    return true;
+}
+
+/* R49-L5: one whitelist entry for the v6 sweep keep set. Kept routes are
+ * exactly {fe80::/64} ∪ {the current derived ULA/96} ∪ {every prefix in
+ * the current routes6 config}; anything else on-link (the user's removed
+ * or crash-leftover >= /64 proxy prefixes) is swept like the v4 side
+ * always did. The whitelist is bounded below (64): a config longer than
+ * that is unrealistic, and an entry dropped off the tail is only deleted
+ * and cleanly re-added by the following route_setup6 — never lost. */
+struct kept6 {
+    uint8_t addr[16];
+    int plen;
+};
+#define KEPT6_MAX 64
+
+/* is MIB prefix (raw IN6_ADDR bytes, prefix length in plen) in the keep
+ * set? Only meaningful for on-link routes — the caller gates on nexthop
+ * :: first, so a nexthop-bearing route is never preserved. */
+static bool sweep6_keep(const uint8_t *addr, UCHAR plen,
+                        const struct kept6 *keep, size_t nkeep)
+{
+    for (size_t k = 0; k < nkeep; k++) {
+        if (ip6_prefix_eq(addr, (int)plen, keep[k].addr, keep[k].plen))
+            return true;
+    }
+    return false;
+}
+
 /* Sweep stale routes still bound to OUR adapter (audit M2): a crash,
  * force-kill or power loss leaves the metric-0 default route and the
  * server /32 pin alive until the next reboot, because the wintun
@@ -700,17 +753,21 @@ static bool ip6_nexthop_unspec(const SOCKADDR_INET *nh)
  * all on-link with nexthop ::) and, after a crash of a run that brought
  * the derived ULA up, their stale entries stay on the persistent wintun
  * adapter: on the next config a leftover ::/0 via tun black-holes IPv6.
- * Mirror the v4 arm on the AF_INET6 table with the same keep shape
- * (on-link connected + prefix threshold). The threshold is /64, not
- * /24: the two routes the stack always manages for the interface — the
- * link-local connected fe80::/64 and the derived-ULA connected
- * fd00::/96 — are both >= /64, so they are never touched, while the
- * ::/0 black hole and every shorter stale proxy prefix are swept. A
- * leftover proxy route with prefix >= /64 is kept on purpose (on-link
- * v6 routes carry no nexthop that would tell it apart from a stack
- * route; keeping it is the conservative direction and it is re-added
- * idempotently by the next route_setup6 anyway). */
-static void sweep_stale_routes(const char *tun)
+ * The v6 arm mirrors the v4 shape but with a PRECISE keep set: an
+ * on-link route is preserved only when it is exactly fe80::/64 (the
+ * interface link-local), the current derived ULA fd00::/96 (derived from
+ * tun_ip, so a changed inner IPv4 is swept here and reconcile_stale_ula
+ * handles the address side), or one of the currently configured routes6
+ * prefixes. R49-L5 tightened this: the old "every on-link >= /64" keep
+ * could not tell a stack route from a user proxy-cidr6 prefix (both are
+ * on-link with no nexthop), so a >= /64 v6 proxy prefix the user REMOVED
+ * from config — or a crash left behind — was never swept and the tool
+ * could not remove it. tun_ip/routes6 are optional (NULL): the pump-path
+ * teardown (route_iface_down) has neither at hand, and there the current
+ * config and ULA were just deleted by route_teardown6, so keeping only
+ * fe80::/64 is exactly right. */
+static void sweep_stale_routes(const char *tun, const char *tun_ip,
+                               const slist_t *routes6)
 {
     wchar_t wname[128];
     if (MultiByteToWideChar(CP_UTF8, 0, tun, -1, wname, 128) <= 0)
@@ -738,17 +795,78 @@ static void sweep_stale_routes(const char *tun)
     FreeMibTable(tbl);
     /* R45-L2: sweep the AF_INET6 table with the same shape (best-
      * effort: a failure to fetch/scan the v6 table must not un-sweep
-     * the v4 removals already counted above) */
+     * the v4 removals already counted above). R49-L5: keep-set is the
+     * exact whitelist below — fe80::/64 (interface link-local), the
+     * current derived ULA/96 and the configured routes6 prefixes — not
+     * "every on-link >= /64" (which permanently preserved user >= /64
+     * proxy prefixes removed from config). The ULA and config sets are
+     * dropped when their inputs are absent: the pump-path teardown
+     * passes NULL for both because route_teardown6 already deleted the
+     * current config and ULA just before, so only fe80::/64 must not be
+     * touched. */
+    struct kept6 keep[KEPT6_MAX];
+    size_t nkeep = 0;
+    {
+        static const uint8_t fe80[16] = { 0xfe, 0x80 };
+        memcpy(keep[nkeep].addr, fe80, sizeof fe80);
+        keep[nkeep].plen = 64;
+        nkeep++;
+    }
+    if (tun_ip != NULL) {
+        uint8_t v4[4], ula[16];
+        if (s2ip4(tun_ip, v4)) {
+            ip6_derive_ula(ip4_u32(v4), ula);
+            memcpy(keep[nkeep].addr, ula, sizeof ula);
+            keep[nkeep].plen = 96;
+            nkeep++;
+        }
+    }
+    if (routes6 != NULL) {
+        for (size_t i = 0; i < routes6->n && nkeep < KEPT6_MAX; i++) {
+            const char *c = routes6->v[i];
+            const char *slash = strchr(c, '/');
+            char addr[64];
+            size_t an;
+            if (slash == NULL) {
+                /* defensive: expand_route_targets6 never emits a bare
+                 * v6 entry; a malformed one has no installed route to
+                 * protect so it is simply not whitelisted */
+                continue;
+            }
+            an = (size_t)(slash - c);
+            if (an == 0 || an >= sizeof addr)
+                continue;
+            memcpy(addr, c, an);
+            addr[an] = '\0';
+            struct in6_addr a6;
+            if (inet_pton(AF_INET6, addr, &a6) != 1)
+                continue;
+            int plen = atoi(slash + 1);
+            if (plen < 0 || plen > 128)
+                continue;
+            memcpy(keep[nkeep].addr, &a6, sizeof a6);
+            keep[nkeep].plen = plen;
+            nkeep++;
+        }
+    }
     if (GetIpForwardTable2(AF_INET6, &tbl) == NO_ERROR) {
         for (ULONG i = 0; i < tbl->NumEntries; i++) {
             MIB_IPFORWARD_ROW2 *r = &tbl->Table[i];
             if (r->InterfaceLuid.Value != luid.Value)
                 continue;
-            /* keep the stack-managed on-link connected v6 routes
-             * (nexthop ::, prefix >= /64): see the comment above the
-             * function — fe80::/64 and the derived-ULA fd00::/96 */
+            /* keep only the exact whitelist above (all three entries
+             * are on-link routes with nexthop :: like every v6 policy
+             * route we install, so the on-link gate cannot mis-hit);
+             * every other route on this adapter — including a >= /64
+             * prefix no longer in config, or the black-hole ::/0 — is
+             * residue and is deleted. The prefix compare is exact
+             * (masked bytes + length), never a string contains, so
+             * fe80::/64 cannot be confused with any other prefix. */
             if (ip6_nexthop_unspec(&r->NextHop) &&
-                r->DestinationPrefix.PrefixLength >= 64)
+                sweep6_keep(
+                    (const uint8_t *)&r->DestinationPrefix.Prefix.Ipv6.
+                        sin6_addr,
+                    r->DestinationPrefix.PrefixLength, keep, nkeep))
                 continue;
             if (DeleteIpForwardEntry2(r) == NO_ERROR)
                 removed++;
@@ -762,12 +880,17 @@ static void sweep_stale_routes(const char *tun)
 
 bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
                  const char *srv, const char *ogw, const char *odev,
-                 const char *metric, const slist_t *routes_with_default)
+                 const char *metric, const slist_t *routes_with_default,
+                 const slist_t *routes6)
 {
     char tun_if[32], nh[40];
     struct in_addr s4;
 
-    sweep_stale_routes(tun);   /* audit M2: crash leftover cleanup */
+    /* audit M2: crash leftover cleanup. R49-L5: the sweep is fed the
+     * current config so the v6 keep-set includes the configured prefixes
+     * and the current derived ULA/96 — the ONLY things it must preserve;
+     * removed/crashed >= /64 v6 proxy prefixes are swept here. */
+    sweep_stale_routes(tun, tun_ip, routes6);
 
     (void)metric;   /* Windows keeps the physical default in the table;
                      * teardown deletes only our own route, so there is
@@ -906,8 +1029,10 @@ static bool mac_pin_exists(const char *srv, const char *ogw)
 
 bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
                  const char *srv, const char *ogw, const char *odev,
-                 const char *metric, const slist_t *routes_with_default) {
+                 const char *metric, const slist_t *routes_with_default,
+                 const slist_t *routes6) {
     (void)metric;
+    (void)routes6;   /* IPv6 policy routes are handled by route_setup6 */
     const char *ifn = tun_ifname(tun);
     struct in_addr s4;
     bool srv_v4 = inet_pton(AF_INET, srv, &s4) == 1;
@@ -1026,9 +1151,11 @@ static bool canon_v4_cidr(const char *c, char out[24]) {
 
 bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
                  const char *srv, const char *ogw, const char *odev,
-                 const char *metric, const slist_t *routes_with_default) {
+                 const char *metric, const slist_t *routes_with_default,
+                 const slist_t *routes6) {
     char srv32[64];
     struct in_addr s4;
+    (void)routes6;   /* IPv6 policy routes are handled by route_setup6 */
     bool srv_v4 = inet_pton(AF_INET, srv, &s4) == 1;
     /* loopback servers (e.g. --server 127.0.0.1 when client and server
      * share a host) are local: no /32 pin is needed, and the kernel
@@ -1401,7 +1528,19 @@ void route_setup6(const char *tun, const slist_t *routes6)
          * has no metric either, so the two sides stay fully symmetric).
          * Without it a same-prefix ::/0 on the tunnel competes by
          * EFFECTIVE metric, and a physical NIC with a lower v6
-         * interface metric wins — the tunnel ::/0 silently loses. */
+         * interface metric wins — the tunnel ::/0 silently loses.
+         * R49-L5: netsh `add route` is an append, so a same-prefix
+         * route left by an older config/crash (or by THIS run, when a
+         * configured prefix is re-added on a reconnect) would either
+         * be duplicated or shadow the new one; mirror the v4 default
+         * arm and the Apple arm — pre-delete idempotently before the
+         * add. "Not present" is the common case, so its failure is
+         * debug-level only (port_run_cmd style, like the v4 arm's
+         * `delete route` pre-step). */
+        char *d[] = { "netsh", "interface", "ipv6", "delete", "route",
+                      (char *)c, ifa, NULL };
+        if (port_run_cmd(d) != 0)
+            log_debug("route_setup6: pre-delete %s: not present", c);
         int na = 0;
         char *a[10];
         a[na++] = "netsh";
