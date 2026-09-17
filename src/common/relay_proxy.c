@@ -1272,6 +1272,115 @@ static void rp_http_bad(struct rp_hs *hs, int fd)
     (void)rp_send_full(hs, fd, bad, sizeof bad - 1);
 }
 
+/* R52-B1: HTTP forward is SINGLE-REQUEST semantics. The absolute-URI
+ * forward pins one client connection to the upstream chosen at handshake
+ * time and the two direction threads then relay it as a transparent
+ * duplex pipe that NEVER parses the byte stream again — so a second
+ * request on the same connection cannot be re-dispatched to a different
+ * origin, and RFC 7230 §6.3.6 (a proxy MUST NOT forward a request whose
+ * authority differs from the connection it would reuse) is violated
+ * silently for exactly that (itself non-compliant) client. Honest
+ * assessment: under this transparent-pipe architecture the defect is NOT
+ * fixable in the data path without per-request HTTP boundary parsing
+ * (which would break transparency and add parse cost to the hot loop),
+ * so the fix here is to stop PROMISING keep-alive, at zero data-path
+ * cost:
+ *
+ *   - the forwarded request's head is rewritten so it carries exactly
+ *     one `Connection: close` (RFC 7230 §6.1/§6.6 `close` option). A
+ *     compliant upstream then answers with Connection: close and closes
+ *     its side; the relay passes that EOF through (SHUT_WR + close), so
+ *     the client connection ends after ONE response and a compliant
+ *     client never gets a chance to reuse it across origins.
+ *   - the client is then expected to pool requests per origin (RFC 7230
+ *     §6.3.6) and gets a fresh connection per request.
+ *   - RESIDUAL (documented, not concealable): a client that ignores the
+ *     close hint and sends a second request on the still-open pipe (or
+ *     pipelines it before upstream's close) is still forwarded to the
+ *     FIRST upstream — the blind pipe cannot tell. The residual is also
+ *     inherent to any non-compliant upstream that keeps the connection
+ *     open despite Connection: close. Neither is detectable post-
+ *     handshake in this architecture; they are exactly RFC 7230 §6.3.6's
+ *     reason for requiring per-origin pooling.
+ *
+ * The CONNECT tunnel is exempt: after the 200 the connection is opaque
+ * (TLS/arbitrary bytes), there is no HTTP request/response stream to
+ * re-dispatch and no response to annotate — nothing this rewrite could
+ * add.
+ *
+ * Implementation: head[0..hlen) is the request-line + header block ending
+ * in \r\n\r\n. The rewrite drops every existing `Connection` header line
+ * (skipped) and inserts one `Connection: close\r\n` as the last header,
+ * so the forwarded head carries exactly one, canonical, non-ambiguous
+ * close option. Header names are matched case-insensitively per RFC 7230
+ * §3.2. Returns the rewritten length, or 0 on buffer overrun (caller
+ * falls back to forwarding the original head verbatim — same guarantee
+ * as forever: the relay never misroutes MORE than today). */
+static size_t rp_http_force_close(uint8_t *out, size_t outcap,
+                                  const uint8_t *head, size_t hlen)
+{
+    static const char cc[] = "Connection: close\r\n";
+    const size_t cclen = sizeof cc - 1;
+    size_t o = 0;
+#define RP_HTTP_W(b, bl) do {                                            \
+        size_t _bl = (bl);                                               \
+        if (o + _bl > outcap)                                            \
+            return 0;                                                    \
+        memcpy(out + o, (b), _bl);                                       \
+        o += _bl;                                                        \
+    } while (0)
+
+    size_t i = 0;
+    while (i < hlen) {
+        size_t e = i;
+        while (e < hlen && head[e] != '\r' && head[e] != '\n')
+            e++;
+        size_t llen = e - i;
+        if (llen > 0) {
+            bool is_conn = false;
+            /* field name = up to ':' (request line has none; a ':' inside
+             * e.g. the request-URI can never equal "Connection") */
+            size_t j = 0;
+            while (j < llen && head[i + j] != ':')
+                j++;
+            if (j < llen && j == 10) {   /* strlen("connection") */
+                static const char want[] = "connection";
+                is_conn = true;
+                for (size_t k = 0; k < j; k++) {
+                    char a = (char)head[i + k];
+                    if (a >= 'A' && a <= 'Z')
+                        a = (char)(a - 'A' + 'a');
+                    if (a != want[k]) {
+                        is_conn = false;
+                        break;
+                    }
+                }
+            }
+            if (!is_conn) {
+                RP_HTTP_W(head + i, llen);
+                RP_HTTP_W("\r\n", 2);
+            }
+            /* Connection header line: skipped; emitted once at the end */
+        } else {
+            /* blank line = the start of the final \r\n\r\n: close this
+             * blank line and append the single Connection: close header
+             * before the terminator (21 bytes replace the 4-byte
+             * \r\n\r\n) */
+            RP_HTTP_W(cc, cclen);
+            RP_HTTP_W("\r\n", 2);
+            break;
+        }
+        /* advance past this line's terminator (\r\n, lone \r or lone \n) */
+        if (e < hlen && head[e] == '\r')
+            e++;
+        if (e < hlen && head[e] == '\n')
+            e++;
+        i = e;
+    }
+    return o;
+#undef RP_HTTP_W
+}
+
 /* returns the connected upstream fd, or -1 */
 static int rp_handle_http(int fd, const uint8_t *first, size_t first_n,
                           struct rp_hs *hs, bool guard)
@@ -1457,14 +1566,27 @@ static int rp_handle_http(int fd, const uint8_t *first, size_t first_n,
         }
         return up;
     }
-    /* absolute-URI forward: send the original request head verbatim
-     * (RFC 7230 servers accept absolute-form on a proxy connection).
+    /* absolute-URI forward: send the request head (RFC 7230 servers
+     * accept absolute-form on a proxy connection). R52-B1: the head is
+     * REWRITTEN to carry exactly one `Connection: close` (rp_http_force_
+     * close) so a compliant upstream closes after this one response and
+     * the client connection ends after a single request — the relay
+     * stops promising keep-alive it cannot honor (see the R52-B1
+     * comment on rp_http_force_close). Head-only, at handshake time,
+     * zero data-path parsing; on a rewrite overrun (practically
+     * unreachable — the 8 KiB head cap leaves 32 bytes of margin) the
+     * original head is forwarded verbatim, same guarantee as before.
      * R37 R6 (K-5): rp_send_full — the head is sent in one piece and a
      * short write/EINTR used to abort the forward. R23 (T2): the head
      * is the CLIENT'S OWN REQUEST BYTES (user payload, not a generated
      * control message), so the payload variant retries transient
      * ENOBUFS/ENOMEM instead of dropping them. */
-    if (rp_send_full_payload(hs, up, buf, hdr_end) != 0) {
+    uint8_t conn_head[sizeof buf + 32];
+    size_t hlen2 = rp_http_force_close(conn_head, sizeof conn_head,
+                                       buf, hdr_end);
+    const uint8_t *hbuf = hlen2 > 0 ? conn_head : buf;
+    size_t hsend = hlen2 > 0 ? hlen2 : hdr_end;
+    if (rp_send_full_payload(hs, up, hbuf, hsend) != 0) {
         port_close(up);
         return -1;
     }

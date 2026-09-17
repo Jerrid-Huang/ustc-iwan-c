@@ -111,6 +111,8 @@ Usage: iwan-client proxy [OPTIONS] --server <SERVER>
 
 > `--listen` 代理的连接走本机内核栈，**与 TUN 路由规则一致**（默认路由全走隧道；`--proxy-cidr` 模式下仅 CIDR 内目标走隧道）。同一端口同时接受 SOCKS5 与 HTTP 握手（设置 `--socks-token` 后 HTTP 代理关闭）。
 
+> **HTTP 代理为单请求语义**：绝对 URI 转发（GET/HEAD/POST … http://…）把一条客户端连接固定到首个请求选定的上游，随后的字节流以透明双工管道直通、不再解析——第二条指向不同 origin 的请求**无法被重新分派**（RFC 7230 §6.3.6 禁止代理跨 authority 复用连接转发）。因此转发时会将原请求里的 `Connection` 头改写为 `Connection: close`：合规上游会以 `Connection: close` 应答并关闭连接，该代理连接在**一次请求/响应后即结束**，合规客户端（浏览器、主流 HTTP 库按 origin 池化）不受影响。**残余（如实声明）**：忽略 `Connection: close` 并坚持在同一连接上复用/管线化的客户端，其第二条请求仍会被送到首个上游（数据面不解析无法感知）；此类客户端必须按 origin 池化连接。`CONNECT` 隧道不受影响（建立后为透明字节流，无逐请求语义）。
+
 > 安全提示：多用户共机时不设 `--socks-token` 意味着本机任何账号都可使用这个无密码代理；`--socks-token` 经命令行传入，本机其他用户可在进程列表中看到明文口令 —— 敏感环境建议改用仅回环监听（默认）并自行评估。
 
 ```bash
