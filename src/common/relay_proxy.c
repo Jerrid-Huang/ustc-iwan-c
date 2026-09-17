@@ -2078,6 +2078,11 @@ static void *rp_dir_main(void *ud)
                 port_close(wh[1]);
         }
     }
+#else
+    /* Windows: no pipe wakeup (WSAPoll on a pipe is not usable) — the
+     * RP_POLL_MS pickup bound is the only path, exactly as before R52-B2.
+     * `my_wake` is referenced only in the POSIX sections below. */
+    (void)my_wake;
 #endif
 
     while (!atomic_load(&g_rp_stop)) {
@@ -2178,19 +2183,20 @@ static void *rp_dir_main(void *ud)
             }
             /* R52-B2: this thread's wake pipe read end always in the
              * pollset (last slot) so an rp_add kick wakes a parked loop
-             * and it can rebuild with the new connection immediately. */
+             * and it can rebuild with the new connection immediately.
+             * POSIX-only: Windows keeps the plain RP_POLL_MS bound. */
+#ifndef _WIN32
             if (my_wake >= 0) {
                 pf[k].fd = my_wake;
                 pf[k].events = POLLIN;
                 pf[k].revents = 0;
                 k++;
             }
+#endif
             pf_n = k;
             pf_dirty = false;
             built_gen = cur_gen;
         }
-        /* the wake pipe occupies the LAST pollfd slot whenever present */
-        int wake_slot = (my_wake >= 0 && pf_n > 0) ? (int)pf_n - 1 : -1;
         int pr = port_poll(pf, (nfds_t)pf_n, RP_POLL_MS);
 #ifndef IWAN_DEBUG_STRIP
         if (atomic_load_explicit(&g_prof_on, memory_order_relaxed)) {
@@ -2241,14 +2247,21 @@ static void *rp_dir_main(void *ud)
          * cannot stay readable and hot-spin) and force a pollset rebuild:
          * a connection registered after this iteration's snapshot needs
          * to enter the pollset on the NEXT pass instead of after the
-         * RP_POLL_MS backstop. */
-        if (wake_slot >= 0 &&
-            (pf[wake_slot].revents & (POLLIN | POLLERR | POLLHUP))) {
-            uint8_t tmp[32];
-            while (read(my_wake, tmp, sizeof tmp) > 0)
-                ;
-            pf_dirty = true;
+         * RP_POLL_MS backstop. POSIX-only (no pipe on Windows). */
+#ifndef _WIN32
+        {
+            int wake_slot = (my_wake >= 0 && pf_n > 0)
+                                ? (int)pf_n - 1
+                                : -1;
+            if (wake_slot >= 0 &&
+                (pf[wake_slot].revents & (POLLIN | POLLERR | POLLHUP))) {
+                uint8_t tmp[32];
+                while (read(my_wake, tmp, sizeof tmp) > 0)
+                    ;
+                pf_dirty = true;
+            }
         }
+#endif
 
         for (size_t i = 0; i < n; i++) {
             struct rp_conn *cn = snap[i];
