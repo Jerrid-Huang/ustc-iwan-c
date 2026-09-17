@@ -2087,13 +2087,39 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
     case PT_CLOSE:
         if (!verify_sig(raw, len))
             return;
-        pthread_rwlock_wrlock(&ctx->sess_lock);
+        /* R48-F1(1/3, R48-CLOSE-1): probe the sid under the READ lock,
+         * exactly like the DATA path. The unknown-sid CLOSE branch is the
+         * cheapest forged attack shape — random 16-bit sids, no live
+         * session needed, sig = MD5(hdr8+"mw") forgeable by anyone — and
+         * it used to take one global sess_lock WRITE lock per frame with
+         * no per-source budget (rate_allow's CLOSE ="default:return true"
+         * and R37-R6's sid_miss budget only caps the accounting AFTER the
+         * unlock). Probing under the shared read lock kills that per-frame
+         * write-lock spray for the whole unknown-sid class; delivery is
+         * unchanged (unknown-sid frames are dropped either way). */
+        pthread_rwlock_rdlock(&ctx->sess_lock);
         s = find_session_unlocked(ctx, sid);
         if (!s) {
             /* R1-D-1: unknown sid — one table probe, no per-source state */
             pthread_rwlock_unlock(&ctx->sess_lock);
             /* L37: dedicated per-source unknown-sid budget (see the DATA
              * path / rate_allow_sid_miss note); sess_lock already released */
+            if (!rate_allow_sid_miss((uint32_t)peer->sin_addr.s_addr, now))
+                atomic_fetch_add(&g_rate_drops, 1);
+            return;
+        }
+        /* known sid: the probe ran under the READ lock; the token/peer
+         * checks and any wipe need the WRITE lock, so upgrade and RE-FIND
+         * (TOCTOU-safe: the session may have been wiped or replaced by a
+         * re-OPEN between the two lock acquisitions — the DATA rebind
+         * path re-finds under the upgrade for the same reason). The
+         * unknown-sid flood is already over, so this upgrade is per
+         * known-sid frame only, not per forged frame. */
+        pthread_rwlock_unlock(&ctx->sess_lock);
+        pthread_rwlock_wrlock(&ctx->sess_lock);
+        s = find_session_unlocked(ctx, sid);
+        if (!s) {
+            pthread_rwlock_unlock(&ctx->sess_lock);
             if (!rate_allow_sid_miss((uint32_t)peer->sin_addr.s_addr, now))
                 atomic_fetch_add(&g_rate_drops, 1);
             return;
