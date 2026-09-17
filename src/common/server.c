@@ -1705,6 +1705,18 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
 
     memset(&a, 0, sizeof a);
     a.mtu = IWAN_DEFAULT_MTU;
+    /* R50-B7: FAIL-CLOSED enc default. memset left a.enc == 0, so an OPEN
+     * that omitted T_ENCRYPT created a plaintext (enc=0) session whose
+     * ACK advertised enc=0 — the opposite default of the reference client,
+     * which treats a missing T_ENCRYPT in the ACK as enc=1 (auth.c R23-F2)
+     * and always sends T_ENCRYPT on its own OPEN anyway (auth.c:68). The
+     * two defaults were asymmetric and server-side fail-open: any future
+     * client that omits the TLV would silently get an unencrypted tunnel.
+     * An EXPLICIT T_ENCRYPT — including 0 — is still honoured verbatim by
+     * open_tlv's clamp below, so plaintext remains an explicit client
+     * choice, exactly as before. Wire and parse semantics for the always-
+     * present case are byte-for-byte unchanged. */
+    a.enc = 1;
     if (parse_tlvs(raw + IWAN_CTRL_LEN, len - IWAN_CTRL_LEN, open_tlv,
                    &a) != 0) {
         open_reject(sockfd, peer, a.user, "malformed TLVs");
