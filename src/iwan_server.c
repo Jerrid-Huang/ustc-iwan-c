@@ -27,6 +27,18 @@
 #include "protocol.h"
 
 #define UDP_RXBATCH 64 /* recvmmsg drain batch size */
+/* R48-L2: cap on consecutive FULL batches inside one drain. The drain
+ * loop keeps pulling while every batch comes back full, so a sustained
+ * flood can monopolize the thread and tid==0 never reaches the
+ * housekeeping block below the poll (TUN pool tick, dead-TUN probe,
+ * session purge — all ~1s contracts). Returning to poll after at most
+ * this many full batches (512*64 = 32768 datagrams worst case) makes
+ * the outer loop — and thereby every 1s housekeeping check — run at
+ * least that often; poll's own 100ms timeout keeps the cadence well
+ * under the 1s contract even with zero data. No delivery change: a
+ * drained-but-still-hot socket simply re-polls immediately (POLLIN
+ * stays asserted, so the very next iteration resumes draining). */
+#define UDP_DRAIN_MAXBATCH 512
 #include "server.h"
 #include "tun.h"
 #include "util.h"
@@ -934,6 +946,7 @@ static void *recv_thread_main(void *v)
              * be the loop's throughput ceiling — a full poll burst is
              * consumed in one syscall round */
             int last_v = 1;
+            int full_iters = 0; /* consecutive FULL batches this drain */
             for (;;) {
                 /* R37 WG1a: `v` would shadow recv_thread_main's parameter
                  * `void *v` under -Wshadow -Werror (no semantic change) */
@@ -953,6 +966,12 @@ static void *recv_thread_main(void *v)
                     last_v = nready;
                     if (nready < UDP_RXBATCH)
                         break; /* partial batch: drained */
+                    /* full batch: R48-L2 — bound consecutive full
+                     * batches so this thread always returns to poll (and
+                     * tid==0 reaches its 1s housekeeping) even under an
+                     * unbounded flood */
+                    if (++full_iters >= UDP_DRAIN_MAXBATCH)
+                        break;
                     continue;
                 }
                 if (nready < 0 && errno == EINTR)
