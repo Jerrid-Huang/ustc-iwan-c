@@ -745,18 +745,15 @@ static struct rate_gate_set g_tokbad_gate[RATE_BUCKETS];
  * needless). Same slot function, same static sizing, same relaxed-atomic
  * discipline (R49-L1: exclusive claim, rate_gate_claim). */
 static struct rate_gate_set g_close_gate[RATE_BUCKETS];
-/* R50-A1: fourth gate table, for the OPEN/PING/ECHO face (rate_allow).
- * The three gates above bound the COST of frames that are dropped
- * regardless (unknown-sid, wrong-token DATA/CLOSE). OPEN/PING/ECHO are the
- * only class whose rate check is also a DELIVERY gate (an in-budget OPEN
- * IS processed), so this table is consulted only by rate_allow and is
- * armed ONLY by rate_evict_publish — i.e. only when the source's bucket
- * was evicted mid-window by the very churn that broke its CPU cap, never
- * by an over-budget slow-path self-publish (see rate_evict_publish). It
- * restores the OPEN/PING/ECHO CPU cap that eviction churn nullifies, at
- * the documented price of treating an evicted source as over-budget for
- * the remainder of its window. Same shape/discipline as the other three. */
-static struct rate_gate_set g_ctrl_gate[RATE_BUCKETS];
+/* No ctrl (OPEN/PING/ECHO) gate table, R51-H1: rate_allow() is the ONLY
+ * rate path whose verdict doubles as a DELIVERY gate (an in-budget OPEN
+ * is processed), and the only cheap way to arm such a gate is from an
+ * eviction event — which any attacker can fabricate with a small pool of
+ * colliding source IPs (the bucket hash is public), turning "the source
+ * was evicted" into a targeted delivery veto (R50-A1 armed exactly this
+ * g_ctrl_gate from rate_evict_publish; R51-H1 removed the table). The
+ * delivery face is therefore bounded by the per-source bucket accounting
+ * alone (see rate_allow). */
 
 /* guards g_rate_shards: each shard has its own lock, taken for the
  * unauthenticated control types (rate_allow). The F4/R1-D-1 DATA/CLOSE
@@ -989,9 +986,12 @@ static struct rate_bucket *rate_bucket_find(struct rate_shard *sh,
  * treated exactly like a source that exceeded its budget — which never
  * changes delivery (all three gated classes drop such frames anyway) and
  * counts one g_rate_drops per dropped frame, precisely like a slow-path
- * over-budget drop. The OPEN/PING/ECHO face gets its own gate
- * (g_ctrl_gate) armed here too — see its declaration for why that is the
- * only place that gate is ever armed.
+ * over-budget drop. The OPEN/PING/ECHO face is deliberately NOT armed
+ * here (R51-H1): it is the one class whose rate verdict doubles as a
+ * delivery gate, and eviction events are attacker-fabricable (a handful
+ * of colliding source IPs suffices — the hash is public), so a delivery
+ * gate armed from eviction becomes a targeted delivery veto. See
+ * rate_allow() for the full argument and the CPU-cap consequence.
  *
  * Boundedness: per window, each source spends at most `max` frames on the
  * slow path / write-lock path, then stays on the fast path until the
@@ -1003,10 +1003,11 @@ static struct rate_bucket *rate_bucket_find(struct rate_shard *sh,
  * deadline is fixed (it never shrinks), so total per-window cost is bounded
  * by `max` + (# evictions it survives, each costing one extra in-budget
  * frame) per source, and the aggregate over a shard is bounded by the gate
- * sets' capacity (4 * RATE_BUCKETS_PER_SHARD sources keep the fast path;
- * sources beyond that keep the shard-locked slow path for the window —
- * the bounded-multiplier residual, same shape as R49-I2 but now with a
- * real per-window cap per source instead of an unbounded one). Caller must
+ * sets' capacity (RATE_GATE_WAYS * RATE_BUCKETS_PER_SHARD sources keep the
+ * fast path; sources beyond that keep the shard-locked slow path for the
+ * window — the bounded-multiplier residual, same shape as R49-I2 but now
+ * with a real per-window cap per source instead of an unbounded one;
+ * see rate_gate for the honest R51-H2 boundary). Caller must
  * hold the shard lock (runs inside rate_bucket_touch). */
 static void rate_evict_publish(struct rate_bucket *b, uint64_t now)
 {
@@ -1021,14 +1022,15 @@ static void rate_evict_publish(struct rate_bucket *b, uint64_t now)
         b->miss_cnt == 0 && b->tokbad_cnt == 0 && b->close_cnt == 0)
         return; /* claimed this window but spent nothing: nothing to carry */
     /* the holder is being evicted with live spending: gate it for the
-     * remainder of ITS window, across all four faces (the three cost
-     * gates plus the ctrl gate the evicted holder may next hit) */
+     * remainder of ITS window on the three COST gates only. The ctrl
+     * (OPEN/PING/ECHO) face is never armed from an eviction — R51-H1
+     * (a delivery veto must not be triggerable by an attacker-made
+     * eviction; see rate_allow). */
     until = b->win + RATE_WINDOW_MS;
     slot = rate_gate_slot(ip);
     rate_gate_claim(&g_rate_gate[slot], ip, until, now);
     rate_gate_claim(&g_tokbad_gate[slot], ip, until, now);
     rate_gate_claim(&g_close_gate[slot], ip, until, now);
-    rate_gate_claim(&g_ctrl_gate[slot], ip, until, now);
 }
 
 /* (re)start the source's window when the bucket is stale or was just
@@ -1083,21 +1085,29 @@ static bool rate_allow(const struct sockaddr_in *peer, uint8_t typ, uint64_t now
     default:
         return true; /* authenticated or negligible-cost paths */
     }
-    /* R50-A1: a source whose bucket was evicted mid-window
-     * (rate_evict_publish) is treated as over-budget on the OPEN/PING/ECHO
-     * face until that window ends. This is the only way to restore this
-     * face's CPU cap under churn (its slow path IS the delivery gate, so
-     * it has no pre-existing over-budget fast path of its own): a source
-     * that keeps losing its bucket would otherwise keep a fresh budget
-     * each frame and derive/parse forever. It fires ONLY when the source's
-     * own live-counted bucket was evicted under table pressure — i.e.
-     * never for a well-behaved source whose budget survives, and with a
-     * hard deadline at its evicted window's end. The frame is counted in
-     * g_rate_drops exactly once, like every other rate-limited drop. */
-    if (rate_gate_check(&g_ctrl_gate[rate_gate_slot(ip)], ip, now)) {
-        atomic_fetch_add(&g_rate_drops, 1);
-        return false;
-    }
+    /* R51-H1: deliberately NO lock-free over-budget fast path on this
+     * face. OPEN/PING/ECHO are the only rate class whose check doubles as
+     * a DELIVERY gate (an in-budget OPEN is processed), and the only cheap
+     * way to arm such a gate was from an eviction event (R50-A1's
+     * g_ctrl_gate, armed by rate_evict_publish) — but an eviction carries
+     * NO evidence that its target is genuinely over the OPEN/PING/ECHO
+     * budget: the attacker who keeps a handful of colliding source IPs
+     * (the bucket hash is public, ~16k candidates per hash set) can
+     * fabricate an eviction per window at ~8 frames/s and use the gate to
+     * SILENTLY veto the victim's OPEN/PING/ECHO for the rest of its window,
+     * repeatably — a cheap targeted delivery blackout. So the delivery
+     * face is never vetoed by eviction: an in-budget OPEN/PING/ECHO is
+     * always processed, and the per-source budget below stays exact per
+     * window (verified by the R50-fix e1e2/e9 class, unchanged here).
+     *
+     * Honest CPU-cap consequence of dropping the ctrl gate: under
+     * SUSTAINED eviction churn a possibly-over-budget source keeps a
+     * fresh budget whenever its bucket is stolen, so a flood that also
+     * churns is processed on the shard-locked slow path. That is exactly
+     * the pre-R50-A1 (R49) shape, and this face's CPU is then bounded only
+     * by sustained attacker bandwidth (every such eviction/stolen-bucket
+     * frame must be SENT by an attacker already flooding at rate) — the
+     * cheap 8-frames-per-window sniper of the gated shape is gone. */
     /* the sharded rate tables are shared by the multi-threaded uplink
      * recv threads; the per-shard mutex is taken on the unauthenticated
      * control types above (the F4/R1-D-1 DATA/CLOSE budget is no longer
