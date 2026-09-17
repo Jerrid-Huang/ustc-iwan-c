@@ -229,7 +229,17 @@ static int echo_mirror(struct server_ctx *ctx, uint8_t *p, size_t len,
  * and that is the class every NAT neighbour / stale-token device lands
  * in. RATE_TOKEN_MISMATCH_BOUND_MAX is kept as the saturation point of
  * the observability counter (a bound-address mismatch storm is the
- * signature of source spoofing) and to document the class split. */
+ * signature of source spoofing) and to document the class split.
+ *
+ * R47-H2-M2 closes the remaining cost hole without reopening the
+ * blackhole: the bound class still gets NO pre-compare gate (a spoofer
+ * cannot force the victim's correct-token frames to be dropped), but a
+ * per-SOURCE budget applied strictly AFTER a failed compare
+ * (rate_allow_tokbad / RATE_TOKBAD_MAX_DEFAULT) caps how many such
+ * frames may take the session table's global write lock, switching
+ * over-budget sources to a lock-free drop. Since it fires only after the
+ * compare and only on frames that are dropped either way, it changes no
+ * delivery — see rate_allow_tokbad(). */
 #define RATE_TOKEN_MISMATCH_MAX 4        /* non-peer sources, per session */
 #define RATE_TOKEN_MISMATCH_BOUND_MAX 64 /* bound-peer address, per session */
 /* Rate-table hashing: Knuth's multiplicative hash. The constant is
@@ -270,6 +280,21 @@ static atomic_ullong g_rate_drops; /* per-source rate-limit drops (silent) */
  * Charged only AFTER a session-table miss (rate_allow_sid_miss), so it
  * can never gate a frame that resolves to a live session. */
 #define RATE_MISS_MAX_DEFAULT 2000
+/* R47-H2-M2: per-source pre-budget for BOUND-class wrong-token DATA
+ * frames (rate_allow_tokbad, same family as rate_allow_sid_miss: shared
+ * per-source shard buckets + a lock-free over-budget gate). Default
+ * 4096 per source-IP per RATE_WINDOW_MS (1 s) — roughly three orders of
+ * magnitude above the legitimate boundary: an honest client with a stale
+ * token sends a handful of wrong-token frames and re-OPENs, so 4096/s
+ * can never misjudge it, while a focused attacker is capped at 4096
+ * global-write-lock acquisitions per second (sub-µs each) before its
+ * frames switch to the lock-free drop fast path. This budget is a COST
+ * cap on write-lock acquisitions, never a delivery gate: it fires only
+ * AFTER a token compare failed, so a correct-token frame can never touch
+ * it, and a wrong-token frame is dropped either way — see
+ * rate_allow_tokbad() and the RATE_TOKEN_MISMATCH bound-class note.
+ * Env IWAN_RATE_TOKBAD_MAX (rate_limit_env: 1..65535). */
+#define RATE_TOKBAD_MAX_DEFAULT 4096
 /* R47-H2-M1: default per-session uplink fairness throttle window (ms),
  * applied only after THIS session's TUN write hit a full device queue.
  * 2 ms: one window per queue-full drop lets the flooder's OWN next
@@ -280,6 +305,10 @@ static atomic_ullong g_rate_drops; /* per-source rate-limit drops (silent) */
 static unsigned g_rate_open_max = RATE_OPEN_MAX_DEFAULT;
 static unsigned g_rate_echo_max = RATE_ECHO_MAX_DEFAULT;
 static unsigned g_rate_miss_max = RATE_MISS_MAX_DEFAULT;
+/* R47-H2-M2: per-source bound-class wrong-token DATA budget
+ * (IWAN_RATE_TOKBAD_MAX, default RATE_TOKBAD_MAX_DEFAULT); see the
+ * RATE_TOKBAD_MAX_DEFAULT block above. */
+static unsigned g_rate_tokbad_max = RATE_TOKBAD_MAX_DEFAULT;
 /* R47-H2-M1: per-session uplink fairness throttle window (ms) applied on
  * a queue-full TUN drop (IWAN_SRV_THROTTLE_MS, default SRV_THROTTLE_DEFAULT_MS;
  * rate_limit_env rejects 0 -> range is 1..65535). See server.h
@@ -595,6 +624,17 @@ struct rate_bucket {
      * shares with honest clients, and conversely. Charged strictly after
      * a session-table miss — see rate_allow_sid_miss(). */
     uint32_t miss_cnt;
+    /* R47-H2-M2: BOUND-class wrong-token DATA frames from this source
+     * (IWAN_RATE_TOKBAD_MAX). A SEPARATE counter on purpose, like
+     * miss_cnt: the worst-case flood (a spoofer forging a live session's
+     * peer ip:port) must not spend the OPEN/PING/ECHO or unknown-sid
+     * allowance of the (real) address it claims. Charged only by
+     * rate_allow_tokbad(), i.e. strictly after a token compare failed —
+     * never by a frame that carries the correct token. Unlike the
+     * (session, source-class) tok_mis_* counters this one CAN live in the
+     * per-source bucket because it is a COST cap, not a delivery gate
+     * (see rate_allow_tokbad). */
+    uint32_t tokbad_cnt;
     /* R1-D-1: the DATA/CLOSE token-mismatch budget is deliberately NOT a
      * field of this per-source bucket any more. Keyed by source IP it let
      * one host behind a NAT (or an ex-token device of the same account)
@@ -626,6 +666,15 @@ struct rate_gate {
     _Atomic uint64_t over_until_ms; /* budget refills at this monotonic ms */
 };
 static struct rate_gate g_rate_gate[RATE_BUCKETS];
+/* R47-H2-M2: second, independent lock-free over-budget gate table for the
+ * per-source bound-class wrong-token budget (rate_allow_tokbad). Separate
+ * from g_rate_gate on purpose: the sid-miss gate and the tokbad gate
+ * bound different costs of different frames, and sharing a slot would let
+ * one budget's storm flip the other's over-budget flag (only counting /
+ * lock-cost, never delivery, but the accounting cross-talk is needless).
+ * Same slot function, same static sizing, same relaxed-atomic discipline
+ * as g_rate_gate. */
+static struct rate_gate g_tokbad_gate[RATE_BUCKETS];
 
 /* guards g_rate_shards: each shard has its own lock, taken for the
  * unauthenticated control types (rate_allow). The F4/R1-D-1 DATA/CLOSE
@@ -712,6 +761,8 @@ void server_rate_limits_init(void)
                                      RATE_ECHO_MAX_DEFAULT);
     g_rate_miss_max = rate_limit_env("IWAN_RATE_MISS_MAX",
                                      RATE_MISS_MAX_DEFAULT);
+    g_rate_tokbad_max = rate_limit_env("IWAN_RATE_TOKBAD_MAX",
+                                       RATE_TOKBAD_MAX_DEFAULT);
     g_up_throttle_ms = rate_limit_env("IWAN_SRV_THROTTLE_MS",
                                       SRV_THROTTLE_DEFAULT_MS);
 }
@@ -779,6 +830,7 @@ static void rate_bucket_touch(struct rate_bucket *b, uint32_t ip, uint64_t now)
         b->ip = ip;
         b->win = now;
         b->open_cnt = b->ping_cnt = b->echo_cnt = b->miss_cnt = 0;
+        b->tokbad_cnt = 0;
     }
 }
 
@@ -910,6 +962,79 @@ static bool rate_allow_sid_miss(uint32_t ip, uint64_t now)
          * belongs to it; under relaxed ordering the worst case is a
          * spurious false (one extra g_rate_drops count on a frame that is
          * dropped either way) — never a missed drop. */
+        atomic_store_explicit(&g->over_until_ms, b->win + RATE_WINDOW_MS,
+                              memory_order_relaxed);
+        atomic_store_explicit(&g->ip, ip, memory_order_relaxed);
+    }
+    rate_shard_unlock(ip);
+    return ok;
+}
+
+/* ---- R47-H2-M2: per-source budget for BOUND-class wrong-token DATA ----
+ *
+ * R37-R2's token-mismatch budget gates only the NON-peer class at the
+ * pre-compare step (tok_budget_over): a source that is not the session's
+ * peer spends tok_mis_cnt, and once that is spent its next wrong-token
+ * frame is dropped before the token compare. The BOUND class — a frame
+ * whose source equals the session's current peer ip:port VERBATIM — is
+ * deliberately not pre-gated, because a spoofer can present it to spend a
+ * pre-compare budget on the victim's behalf. The consequence (R37 R2,
+ * acknowledged at the time): a spoofer who forges the victim's address
+ * could test wrong tokens against a live sid at line rate, and every
+ * such frame went through tok_charge_upgrade() taking the session table's
+ * GLOBAL write lock per frame, convoying every recv thread that holds the
+ * read lock and the downlink.
+ *
+ * rate_allow_tokbad() is that missing bound-class throttle. Three
+ * properties make it safe where a per-session pre-compare budget is not:
+ *
+ *  1. It is keyed per SOURCE-IP and charges the source's own rate_bucket
+ *     (the source the server observes is the one making the claim — the
+ *     forged victim address — so an attacker flooding one victim spends
+ *     that address's budget, not a shared session counter the victim's
+ *     own frames draw on).
+ *  2. It runs strictly AFTER the token compare has failed, so a frame
+ *     carrying the correct token NEVER touches this budget — the real
+ *     client's DATA is byte-for-byte unaffected, which is exactly the
+ *     property a pre-compare bound gate would break (R37 R2).
+ *  3. Its false result only skips a charge that is pure observability
+ *     (tok_mis_bound saturates at RATE_TOKEN_MISMATCH_BOUND_MAX and never
+ *     gates) and the write lock that accompanies it. Every frame the
+ *     caller subjects to it is a wrong-token frame that is dropped either
+ *     way, so this is a COST cap on write-lock acquisitions, not a
+ *     delivery gate — the R1-D-1 "one NAT neighbour must not spend a
+ *     budget that gates the neighbours' sessions" argument does not apply
+ *     (a NAT neighbour's tokbad spending cannot change what any other
+ *     frame delivers).
+ *
+ * Rate/lock shape (same family as rate_allow_sid_miss): charge the shard
+ * bucket under the shard mutex; once over g_rate_tokbad_max in the
+ * current window publish the source in the lock-free g_tokbad_gate slot,
+ * after which every further over-budget frame from that source costs one
+ * relaxed atomic load and a drop — no shard lock, no bucket update.
+ * Caller must NOT hold ctx->sess_lock (lock order: sess_lock outer ->
+ * shard lock inner; the DATA call site has already released sess_lock). */
+static bool rate_allow_tokbad(const struct sockaddr_in *peer, uint64_t now)
+{
+    uint32_t ip = (uint32_t)peer->sin_addr.s_addr;
+    struct rate_gate *g = &g_tokbad_gate[rate_gate_slot(ip)];
+    struct rate_bucket *b;
+    bool ok;
+
+    /* fast path (lock-free): this source already spent its bound-class
+     * wrong-token budget earlier in the current window; drop the frame
+     * on a single relaxed load pair, exactly like rate_allow_sid_miss */
+    if (atomic_load_explicit(&g->ip, memory_order_relaxed) == ip &&
+        atomic_load_explicit(&g->over_until_ms, memory_order_relaxed) > now)
+        return false;
+
+    b = rate_bucket_enter(ip, now);
+    ok = ++b->tokbad_cnt <= g_rate_tokbad_max;
+    if (!ok) {
+        /* publish before the ip so a reader that sees its own ip also
+         * sees a deadline that belongs to it (same ordering argument as
+         * rate_allow_sid_miss: worst case is a spurious count on a frame
+         * that is dropped either way) */
         atomic_store_explicit(&g->over_until_ms, b->win + RATE_WINDOW_MS,
                               memory_order_relaxed);
         atomic_store_explicit(&g->ip, ip, memory_order_relaxed);
@@ -1719,6 +1844,31 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
             }
             if (CRYPTO_memcmp(&s->token, &tok, sizeof tok) != 0) {
                 pthread_rwlock_unlock(&ctx->sess_lock);
+                /* R47-H2-M2: bound-class (source == this session's peer
+                 * verbatim) wrong-token DATA frames used to reach
+                 * tok_charge_upgrade() — one global sess_lock WRITE lock
+                 * per frame — on EVERY frame: R37-R2's 4/s pre-compare
+                 * budget (tok_budget_over above) gates only the NON-peer
+                 * class, and the bound class is deliberately never
+                 * pre-compare-gated. An unauthenticated attacker who
+                 * forges the victim's ip:port (a live sid from the
+                 * plaintext 8-byte header, ~16-33 s blind scan) could
+                 * therefore convoy the whole rwlock: every recv thread
+                 * holding the read lock and the downlink stalled behind
+                 * his frames. Pre-budget the bound class per SOURCE
+                 * (rate_allow_tokbad — same rate_bucket/rate_gate family
+                 * as rate_allow_sid_miss), strictly AFTER the token
+                 * compare failed: over budget the frame is dropped here
+                 * with no write lock and no observability charge
+                 * (tok_mis_bound saturates at RATE_TOKEN_MISMATCH_BOUND_MAX
+                 * anyway and never gates). Correct-token frames never
+                 * reach this; R37-R2's non-peer pre-compare budget is
+                 * untouched; the default 4096/window is ~3 orders above
+                 * any legitimate stale-token retry rate. */
+                if (peer_is_peer && !rate_allow_tokbad(peer, now)) {
+                    atomic_fetch_add(&g_rate_drops, 1);
+                    return; /* bound-class wrong-token storm: drop */
+                }
                 tok_charge_upgrade(ctx, sid, tok, peer, now);
                 return; /* wrong token: drop */
             }
