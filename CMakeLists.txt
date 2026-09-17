@@ -557,6 +557,15 @@ if(BUILD_TESTING)
   # per-conn tx-queue fair-share gate, NS_TX_CONN_CAP).
   add_executable(lwip_fairness_harness tests/lwip_fairness_harness.c)
   target_link_libraries(lwip_fairness_harness PRIVATE iwan_core)
+  # R47-FIXA-I1: relay RFC1929 auth-loop regression harness. Drives the REAL
+  # relay (relay_proxy_start -> rp_conn_main -> rp_handle_socks) as a SOCKS5
+  # client and asserts the pr==2 / pr==0 / counted-lockout contract — the
+  # auth loop the socks_handshake harness (socks_flow/lwIP) never reaches,
+  # which is why the pre-fix pr>0 crasher was invisible to CI. Runner:
+  # tests/relay_socks_harness.py (fresh process per case: relay's lockout
+  # table is file-static).
+  add_executable(relay_socks_harness tests/relay_socks_harness.c)
+  target_link_libraries(relay_socks_harness PRIVATE iwan_core)
 endif()
 
 if(UNIX AND NOT APPLE)
@@ -583,7 +592,8 @@ if(IWAN_STRICT)
     list(APPEND _iwan_strict_flags ${IWAN_STRICT_EXTRA_NOWERROR_FLAGS})
   endif()
   foreach(_tgt iwan_core iwan_oidc iwan-client iwan-client-oidc iwan-server
-               socks_handshake_harness lwip_data_harness lwip_fairness_harness)
+               socks_handshake_harness lwip_data_harness lwip_fairness_harness
+               relay_socks_harness)
     if(TARGET ${_tgt})
       target_compile_options(${_tgt} PRIVATE ${_iwan_strict_flags})
     endif()

@@ -1,0 +1,389 @@
+/*
+ * Relay RFC1929 authentication-loop test harness (root-free, no TUN).
+ *
+ * Regression harness for R47-FIXA-I1 (the F0 / R47-FIXA-H1 fix at
+ * relay_proxy.c rp_handle_socks: `pr > 0` -> `pr == 1`).
+ *
+ * The existing socks_handshake harness drives socks_flow.c (the lwIP
+ * SOCKS-mode netstack) and NEVER reaches the relay's own authentication
+ * loop, which is exactly why the pr==2 crasher was invisible to CI. This
+ * harness drives the REAL relay: it starts a real relay_proxy_start()
+ * instance on 127.0.0.1 (production code: accept thread -> rp_conn_main
+ * -> rp_handle_socks, the RFC1929 loop of relay_proxy.c) and then acts
+ * as a real SOCKS5 client against it, speaking the wire protocol
+ * byte-for-byte.
+ *
+ * The pr==2 case: a COMPLETE RFC1929 frame whose username length is 64
+ * (0x40) fills the relay's 64-byte `user` buffer exactly. The parser
+ * (pp_socks_auth_frame, proto_parse.c) returns 2 for ulen >= usz — the
+ * frame is well-formed, so it is an auth attempt (R37 R1-B-5: counted in
+ * the peer lockout), NOT a protocol violation. Before F0/3e7c12b the
+ * relay's `if (pr > 0)` treated pr==2 as a valid frame and evaluated
+ * pp_socks_auth_ok() with UNINITIALIZED pass/plen (the pr==2 branch does
+ * not write them): with a token -> wild-pointer read (SEGV / ASan
+ * report); without a token -> `2 + user_len + 1 + garbage_plen` memmove
+ * underflow (ASan OOB / crash). On the fixed code, pr==2 lands in its
+ * own counted branch: reply {1,1}, no uninitialized use, peer failure
+ * counter +1.
+ *
+ * Cases (relay_proxy.c in the current tree; each case must run as a
+ * fresh PROCESS so the file-static peer lockout table starts clean —
+ * tests/relay_socks_harness.py handles that):
+ *
+ *   tokpr2    token mode: 5 x pr==2 -> each answers {5,2} then {1,1}
+ *             (counted), then the 6th connection from the same peer
+ *             (127.0.0.1) is dropped at accept() with NO reply —
+ *             proving pr==2 counts toward the lockout, plus the {1,1}
+ *             wire contract and (under ASan/UBSan, 434ef80) the crash.
+ *   notokpr2  no-token (courtesy) mode: a pr==2 frame answers {1,1}
+ *             and is still counted (no crash).
+ *   pr0       token mode: 10 x malformed frame (ulen=0, R46-L4) each
+ *             answers {1,1}, then an 11th connection is STILL served
+ *             (not blocked) — malformed frames must NOT count.
+ *
+ * Exit code 0 only when every step of the case passed.
+ *
+ * This binary exists ONLY for tests; it must never be shipped.
+ */
+
+#include <signal.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "common.h"       /* port.h: winsock2.h + windows.h first */
+#include "relay_proxy.h"
+
+#if defined(_WIN32)
+#include <winsock2.h>
+#else
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
+
+static int g_fails;
+
+static void note_ok(const char *fmt, ...)
+{
+    va_list ap;
+    (void)fmt;
+    va_start(ap, fmt);
+    vprintf(fmt, ap);
+    printf("\n");
+    va_end(ap);
+}
+
+static void note_fail(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    fprintf(stderr, "FAIL: ");
+    vfprintf(stderr, fmt, ap);
+    fprintf(stderr, "\n");
+    va_end(ap);
+    g_fails++;
+}
+
+/* ---- tiny SOCKS5 test client (loopback, blocking + recv timeout) ---- */
+
+static int cli_connect(uint16_t port)
+{
+    int fd = (int)port_socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        note_fail("socket: %s", strerror(errno));
+        return -1;
+    }
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port = htons(port);
+    if (port_connect(fd, (const struct sockaddr *)&a, sizeof a) != 0) {
+        note_fail("connect: %s", strerror(errno));
+        port_close(fd);
+        return -1;
+    }
+    /* the whole case must answer within a few seconds; a blocked peer
+     * (lockout drop) answers with EOF/RST, never with {5,2} */
+    struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+    port_setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    return fd;
+}
+
+static int cli_send_all(int fd, const uint8_t *p, size_t n)
+{
+    size_t done = 0;
+    while (done < n) {
+        ssize_t w = (ssize_t)port_send(fd, p + done, n - done, 0);
+        if (w > 0) {
+            done += (size_t)w;
+            continue;
+        }
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            continue;
+        return -1;
+    }
+    return 0;
+}
+
+/* 1 = got exactly want bytes; 0 = EOF/error before want (peer closed,
+ * e.g. the lockout drop); -1 = error */
+static int cli_recv_exact(int fd, uint8_t *b, size_t want)
+{
+    size_t got = 0;
+    while (got < want) {
+        ssize_t r = (ssize_t)port_recv(fd, b + got, want - got, 0);
+        if (r > 0) {
+            got += (size_t)r;
+            continue;
+        }
+        if (r == 0)
+            return 0;
+        if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            return 0;   /* timeout: treat as "no reply" for blocked drop */
+        return -1;
+    }
+    return 1;
+}
+
+/* ---- wire frames ---- */
+
+/* GREETING: offer RFC1929 username/password only (the relay's token
+ * mode picks method 2 from this; courtesy mode also takes it). */
+static size_t frame_greeting(uint8_t *b)
+{
+    b[0] = 5; b[1] = 1; b[2] = 0x02; return 3;
+}
+
+/* RFC1929 frame with a 64-byte (0x40) username: the parser returns 2
+ * (complete frame, username does not fit the 64-byte user buffer). */
+static size_t frame_pr2(uint8_t *b)
+{
+    b[0] = 1; b[1] = 64;
+    memset(b + 2, 'U', 64);
+    b[66] = 2; b[67] = 'x'; b[68] = 'y';
+    return 69;
+}
+
+/* RFC1929 frame with ulen=0: malformed (R46-L4), parser returns 0. */
+static size_t frame_pr0(uint8_t *b)
+{
+    b[0] = 1; b[1] = 0; return 2;
+}
+
+/* RFC1929 frame with a small username + wrong password (pr==1) is not
+ * used by the current cases (pr==2 and pr==0 cover the regressions); the
+ * shared attempt()/reply machinery above would serve it unchanged. */
+
+/* One full handshake attempt over a fresh connection: greeting then
+ * `frm`/`flen`. Every served attempt answers {5,2} (method selection)
+ * first and then the 2-byte auth reply. `want_reply` is the expected
+ * auth reply, or NULL when the peer is expected to be lockout-dropped
+ * (no {5,2}, no reply at all). Returns 0 on expected behaviour, -1
+ * otherwise. */
+static int attempt(uint16_t port, const uint8_t *frm, size_t flen,
+                   const uint8_t *want_reply, const char *what)
+{
+    int fd = cli_connect(port);
+    if (fd < 0)
+        return -1;
+    uint8_t g[8];
+    size_t gl = frame_greeting(g);
+    if (cli_send_all(fd, g, gl) != 0 ||
+        cli_send_all(fd, frm, flen) != 0) {
+        note_fail("%s: send failed", what);
+        port_close(fd);
+        return -1;
+    }
+    uint8_t r[8];
+    int bad = 0;
+    if (want_reply) {
+        static const uint8_t sel[2] = {5, 2};
+        /* method selection first, then the auth verdict */
+        int rv = cli_recv_exact(fd, r, 2);
+        if (rv == 1 && r[0] == sel[0] && r[1] == sel[1]) {
+            rv = cli_recv_exact(fd, r, 2);
+            if (rv == 1 && r[0] == want_reply[0] && r[1] == want_reply[1]) {
+                note_ok("PASS %s: reply {%d,%d}",
+                        what, want_reply[0], want_reply[1]);
+            } else {
+                note_fail("%s: expected {%d,%d} auth reply, got rv=%d "
+                          "r={%d,%d}",
+                          what, want_reply[0], want_reply[1], rv, r[0], r[1]);
+                bad = 1;
+            }
+        } else {
+            note_fail("%s: expected {5,2} method selection, got rv=%d "
+                      "r={%d,%d}", what, rv, r[0], r[1]);
+            bad = 1;
+        }
+    } else {
+        /* blocked peer: dropped at accept() (port_close on the accepted
+         * fd) -> the client sees EOF (0), ECONNRESET (-1) or a recv
+         * timeout (0) — never the {5,2}+{1,1} replies. Only a full
+         * 2-byte reply proves the peer was served. */
+        int rv = cli_recv_exact(fd, r, 2);
+        if (rv != 1) {
+            note_ok("PASS %s: dropped (no reply, recv=%d%s)", what,
+                    rv, rv == -1 ? " ECONNRESET" : "");
+        } else {
+            note_fail("%s: peer answered (r={%d,%d}) but should be blocked",
+                      what, r[0], r[1]);
+            bad = 1;
+        }
+    }
+    port_close(fd);
+    return bad;
+}
+
+/* ---- relay instance management ---- */
+
+static uint16_t pick_port(void)
+{
+    int fd = (int)port_socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port = 0;
+    if (port_bind(fd, (const struct sockaddr *)&a, sizeof a) != 0) {
+        fprintf(stderr, "harness: probe bind failed\n");
+        exit(2);
+    }
+    socklen_t al = sizeof a;
+    if (getsockname(PORT_FD_ARG(fd), (struct sockaddr *)&a, &al) != 0) {
+        fprintf(stderr, "harness: probe getsockname failed\n");
+        exit(2);
+    }
+    port_close(fd);
+    return (uint16_t)ntohs(a.sin_port);
+}
+
+static struct RelayProxy *relay_start(const char *token, uint16_t port)
+{
+    char listen[64];
+    snprintf(listen, sizeof listen, "127.0.0.1:%u", (unsigned)port);
+    struct RelayProxy *rp = NULL;
+    if (relay_proxy_start(listen, token, false, false, &rp) != 0 || !rp) {
+        fprintf(stderr, "harness: relay_proxy_start(%s) failed\n", listen);
+        return NULL;
+    }
+    return rp;
+}
+
+/* ---- cases (each in a fresh process: static lockout table is clean) ---- */
+
+static int case_tokpr2(const char *token, uint16_t port)
+{
+    struct RelayProxy *rp = relay_start(token, port);
+    if (!rp)
+        return 1;
+    uint8_t f[128];
+    size_t fl = frame_pr2(f);
+    static const uint8_t fail11[2] = {1, 1};
+    int bad = 0;
+    for (int i = 1; i <= 5; i++) {
+        char what[64];
+        snprintf(what, sizeof what, "tokpr2 failure #%d (pr==2 counted)", i);
+        if (attempt(port, f, fl, fail11, what) != 0)
+            bad = 1;
+    }
+    /* 6th connection from the same peer must be lockout-dropped */
+    if (attempt(port, f, fl, NULL, "tokpr2 6th attempt (lockout drop)") != 0)
+        bad = 1;
+    relay_proxy_stop(rp);
+    printf("RESULT tokpr2: %s\n", bad ? "FAIL" : "PASS");
+    return bad;
+}
+
+static int case_notokpr2(uint16_t port)
+{
+    struct RelayProxy *rp = relay_start(NULL, port);   /* courtesy mode */
+    if (!rp)
+        return 1;
+    uint8_t f[128];
+    size_t fl = frame_pr2(f);
+    static const uint8_t fail11[2] = {1, 1};
+    int bad = 0;
+    if (attempt(port, f, fl, fail11, "notok pr==2 (courtesy, counted)") != 0)
+        bad = 1;
+    relay_proxy_stop(rp);
+    printf("RESULT notokpr2: %s\n", bad ? "FAIL" : "PASS");
+    return bad;
+}
+
+static int case_pr0(const char *token, uint16_t port)
+{
+    struct RelayProxy *rp = relay_start(token, port);
+    if (!rp)
+        return 1;
+    uint8_t f[128];
+    size_t fl = frame_pr0(f);
+    static const uint8_t fail11[2] = {1, 1};
+    int bad = 0;
+    for (int i = 1; i <= 10; i++) {
+        char what[64];
+        snprintf(what, sizeof what, "pr0 malformed #%d (not counted)", i);
+        if (attempt(port, f, fl, fail11, what) != 0)
+            bad = 1;
+    }
+    /* 10 malformed frames must NOT trip the lockout: an 11th connection
+     * with a mismatched-token frame is still served a {1,1} reply. */
+    if (attempt(port, f, fl, fail11,
+                "pr0 11th attempt (peer NOT blocked)") != 0)
+        bad = 1;
+    relay_proxy_stop(rp);
+    printf("RESULT pr0: %s\n", bad ? "FAIL" : "PASS");
+    return bad;
+}
+
+int main(int argc, char **argv)
+{
+    const char *token = NULL;
+    const char *casename = NULL;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--token") == 0 && i + 1 < argc) {
+            token = argv[++i];
+        } else if (strcmp(argv[i], "--case") == 0 && i + 1 < argc) {
+            casename = argv[++i];
+        } else {
+            fprintf(stderr, "usage: %s --case tokpr2|notokpr2|pr0 "
+                    "[--token STR]\n", argv[0]);
+            return 2;
+        }
+    }
+    if (!casename) {
+        fprintf(stderr, "harness: --case required\n");
+        return 2;
+    }
+    if (strcmp(casename, "notokpr2") != 0 && !token) {
+        fprintf(stderr, "harness: --token required for --case %s\n",
+                casename);
+        return 2;
+    }
+
+    port_socket_init();   /* WSAStartup on Windows; no-op on Linux */
+    /* a lockout drop closes the connection mid-handshake: a send() on
+     * the RST-ed socket must not kill the harness with SIGPIPE */
+    signal(SIGPIPE, SIG_IGN);
+
+    uint16_t port = pick_port();
+    printf("LISTEN 127.0.0.1:%u\n", (unsigned)port);
+    fflush(stdout);
+
+    int rc = 0;
+    if (strcmp(casename, "tokpr2") == 0)
+        rc = case_tokpr2(token, port);
+    else if (strcmp(casename, "notokpr2") == 0)
+        rc = case_notokpr2(port);
+    else if (strcmp(casename, "pr0") == 0)
+        rc = case_pr0(token, port);
+    else {
+        fprintf(stderr, "harness: unknown case '%s'\n", casename);
+        return 2;
+    }
+    return rc == 0 ? 0 : 1;
+}
