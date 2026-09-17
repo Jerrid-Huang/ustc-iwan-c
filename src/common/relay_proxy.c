@@ -30,8 +30,11 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>   /* TCP_NODELAY (R52-B2); winsock2 via port.h on
+                            * Windows, like socks.c */
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <unistd.h>        /* pipe/read/write: R52-B2 per-direction wake */
 #endif
 
 #include "addr.h"
@@ -672,6 +675,16 @@ static int rp_connect_literal(int af, const void *addr, uint16_t port,
             *fail_rep = 5;
         return -1;
     }
+    /* R52-B2: disable Nagle on the upstream fd (CONNECT and absolute-URI
+     * forward targets both arrive here); see the accepted-fd note. */
+    {
+        int nodelay = 1;
+        if (port_setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay,
+                            sizeof nodelay) != 0) {
+            log_debug("rp: TCP_NODELAY on upstream fd: %s",
+                      strerror(errno));
+        }
+    }
     *fd_out = fd;
     return 0;
 }
@@ -871,6 +884,17 @@ static int rp_connect_target(int *fd_out, int *up_af, const char *host,
                 last = -1;
                 cand_rep = 5;   /* restore failure is a general failure */
                 continue;       /* try the next candidate */
+            }
+            /* R52-B2: disable Nagle on this upstream fd (the domain
+             * candidate counterpart of the rp_connect_literal set).
+             * Optimization, not correctness: a failure is debug-only. */
+            {
+                int nodelay = 1;
+                if (port_setsockopt(fd, IPPROTO_TCP, TCP_NODELAY,
+                                    &nodelay, sizeof nodelay) != 0) {
+                    log_debug("rp: TCP_NODELAY on upstream fd: %s",
+                              strerror(errno));
+                }
             }
             break;
         }
@@ -1587,6 +1611,40 @@ static bool rp_arr_add(struct rp_conn ***arr, size_t *n, size_t *cap,
     return true;
 }
 
+/* R52-B2: per-direction wakeup pipes. A direction thread whose pollset
+ * does not yet contain a freshly-registered connection is parked in
+ * port_poll() for up to RP_POLL_MS (100 ms) before it rebuilds its
+ * pollset — the FIRST payload after a handshake therefore paid up to a
+ * full poll timeout (~20-100ms, measured ~76ms) of registration-pickup
+ * latency on every new connection (interactive SSH/API write). Each
+ * direction thread owns a pipe; rp_add writes one byte to both pipes so
+ * the parked threads wake, drain and rebuild within microseconds. The
+ * pipe is only a PROMPT: correctness never depends on it, because the
+ * poll timeout stays as the backstop — a lost/missed/misfired kick is at
+ * worst today's status-quo latency. POSIX-only (pipe is not pollable via
+ * the Windows WSAPoll path); on _WIN32 the direction threads keep the
+ * plain RP_POLL_MS bound. */
+#ifndef _WIN32
+static _Atomic int g_rp_wake_w[2] = { -1, -1 };   /* pipe write ends, by dir */
+
+static void rp_kick_dirs(void)
+{
+    uint8_t b = 1;
+    for (int i = 0; i < 2; i++) {
+        int wf = atomic_load(&g_rp_wake_w[i]);
+        if (wf >= 0) {
+            ssize_t wr = write(wf, &b, 1);
+            (void)wr;   /* EAGAIN (full pipe) means a kick is already
+                         * pending; EBADF/closed is caught by nobody
+                         * polling it (backstop timeout covers it) */
+        }
+    }
+}
+#else  /* _WIN32: no pollable pipe wake; direction threads use the
+        * plain RP_POLL_MS pickup bound (status quo). */
+static void rp_kick_dirs(void) {}
+#endif
+
 /* hand the connected pair to the global relay; on failure both sockets
  * are closed here and the caller must not touch them again.
  *
@@ -1701,6 +1759,11 @@ static void rp_add(int c, int u, bool *reserved)
         free(cn);
         return;
     }
+    /* R52-B2: the just-registered conn is not yet in either direction
+     * thread's pollset; both may be parked in poll() for up to RP_POLL_MS.
+     * Kick them so the FIRST payload is picked up in microseconds instead
+     * of after the poll timeout (the timeout remains the backstop). */
+    rp_kick_dirs();
 }
 
 /* free a retired conn once no loop iteration may still dereference
@@ -1869,6 +1932,31 @@ static void *rp_dir_main(void *ud)
     static _Thread_local struct prof_state pst;
     const char *tag = up_dir ? "rp up recv" : "rp dn recv";
 #endif
+    /* R52-B2: per-direction wake pipe (POSIX; see the block above
+     * rp_add). This thread creates its own pipe, publishes the write end
+     * for rp_kick_dirs() and keeps the read end for its pollset. The
+     * pipe lives for the relay lifetime (never closed, like rp itself —
+     * one relay per process, bounded); a fresh pipe on a relay restart
+     * simply replaces the slot. On creation failure only the prompt is
+     * lost: the RP_POLL_MS backstop keeps today's behavior. */
+    int my_wake = -1;
+#ifndef _WIN32
+    int my_dir = up_dir ? 1 : 0;
+    {
+        int wh[2] = { -1, -1 };
+        if (pipe(wh) == 0 &&
+            port_set_nonblock(wh[0], true) == 0 &&
+            port_set_nonblock(wh[1], true) == 0) {
+            my_wake = wh[0];
+            atomic_store(&g_rp_wake_w[my_dir], wh[1]);
+        } else {
+            if (wh[0] >= 0)
+                port_close(wh[0]);
+            if (wh[1] >= 0)
+                port_close(wh[1]);
+        }
+    }
+#endif
 
     while (!atomic_load(&g_rp_stop)) {
         pthread_mutex_lock(&g_rp_mu);
@@ -1914,12 +2002,14 @@ static void *rp_dir_main(void *ud)
             atomic_load_explicit(&g_rp_arr_gen, memory_order_relaxed);
         pthread_mutex_unlock(&g_rp_mu);
 
-        if (n * 2 > pfcap) {
-            struct pollfd *n2 = realloc(pf, (n * 2) * sizeof *n2);
+        /* +1: the R52-B2 per-direction wake fd always gets one pollfd
+         * slot of its own (see the wake append in the rebuild below) */
+        if (n * 2 + 1 > pfcap) {
+            struct pollfd *n2 = realloc(pf, (n * 2 + 1) * sizeof *n2);
             if (!n2)
                 goto cleanup;   /* L3 + R3: retire/unref handled there */
             pf = n2;
-            pfcap = n * 2;
+            pfcap = n * 2 + 1;
         }
         if (n > slotcap) {
             int *ns = realloc(slot_from, n * sizeof *ns);
@@ -1964,10 +2054,21 @@ static void *rp_dir_main(void *ud)
                     k++;
                 }
             }
+            /* R52-B2: this thread's wake pipe read end always in the
+             * pollset (last slot) so an rp_add kick wakes a parked loop
+             * and it can rebuild with the new connection immediately. */
+            if (my_wake >= 0) {
+                pf[k].fd = my_wake;
+                pf[k].events = POLLIN;
+                pf[k].revents = 0;
+                k++;
+            }
             pf_n = k;
             pf_dirty = false;
             built_gen = cur_gen;
         }
+        /* the wake pipe occupies the LAST pollfd slot whenever present */
+        int wake_slot = (my_wake >= 0 && pf_n > 0) ? (int)pf_n - 1 : -1;
         int pr = port_poll(pf, (nfds_t)pf_n, RP_POLL_MS);
 #ifndef IWAN_DEBUG_STRIP
         if (atomic_load_explicit(&g_prof_on, memory_order_relaxed)) {
@@ -2013,6 +2114,19 @@ static void *rp_dir_main(void *ud)
                     (int)pf_dirty);
         }
 #endif
+
+        /* R52-B2: an rp_add kick woke this loop. Drain the pipe (so it
+         * cannot stay readable and hot-spin) and force a pollset rebuild:
+         * a connection registered after this iteration's snapshot needs
+         * to enter the pollset on the NEXT pass instead of after the
+         * RP_POLL_MS backstop. */
+        if (wake_slot >= 0 &&
+            (pf[wake_slot].revents & (POLLIN | POLLERR | POLLHUP))) {
+            uint8_t tmp[32];
+            while (read(my_wake, tmp, sizeof tmp) > 0)
+                ;
+            pf_dirty = true;
+        }
 
         for (size_t i = 0; i < n; i++) {
             struct rp_conn *cn = snap[i];
@@ -2493,6 +2607,20 @@ static void *rp_accept_main(void *ud)
                     "dropped");
             port_close(fd);
             continue;
+        }
+        /* R52-B2: disable Nagle on the accepted client fd, same as the
+         * lwIP SOCKS listener (socks.c accept loop). Without TCP_NODELAY
+         * the relay's two TCP legs interact with the peer's delayed ACK
+         * and interactive small writes (SSH/API) spike to 20-100ms one-way
+         * RTT. This is an optimization, not correctness: a failure is
+         * logged at debug level and the connection proceeds anyway. */
+        {
+            int nodelay = 1;
+            if (port_setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay,
+                                sizeof nodelay) != 0) {
+                log_debug("rp: TCP_NODELAY on accepted fd: %s",
+                          strerror(errno));
+            }
         }
 
         /* M6c/L6: drop sources locked out for RFC1929 brute force
