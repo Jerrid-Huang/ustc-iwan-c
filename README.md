@@ -201,6 +201,9 @@ sudo ./iwan-server --port 6001 --tun iwan-srv \
 | `IWAN_RATE_OPEN_MAX` | `20` | 每源每秒 OPEN 帧上限，`1..65535` |
 | `IWAN_RATE_ECHO_MAX` | `60` | 每源每秒 PING、ECHO 各自上限，`1..65535` |
 | `IWAN_RATE_MISS_MAX` | `2000` | 每源每秒**计入慢路径**的未知会话 DATA/CLOSE 帧预算，`1..65535`；超预算后该源本秒内其余未知帧走无锁快路径丢弃（未知 sid 帧无论是否超预算都不投递） |
+| `IWAN_RATE_TOKBAD_MAX` | `4096` | 每源每秒**已知会话错 token** 的 DATA 帧预算（bound 类：源与某会话 peer 的 ip:port 逐字节相同），`1..65535`；超预算后该源本秒内其余错 token 帧走无锁快路径丢弃——错 token 帧无论是否超预算都不投递，正确 token 的 DATA 永不触达该预算（预算只省每帧的会话写锁，不 gate 投递） |
+| `IWAN_RATE_CLOSE_MAX` | `4096` | 每源每秒**已知会话错 token** 的 CLOSE 帧预算（bound 类），`1..65535`；超预算后该源本秒内其余错 token CLOSE 走无锁快路径丢弃——错 token CLOSE 无论是否超预算都被丢弃，正确 token 的同源 wipe 永不触达该预算（预算只省每帧的会话写锁，不 gate 投递） |
+| `IWAN_SRV_THROTTLE_MS` | `2` | 每会话上行节流窗（ms）：该会话自身 TUN 写碰满设备队列后生效，`1..65535`（`0` 非法；一窗一帧地让洪泛者后续帧在到队列前就被丢，把共享设备让给其他会话） |
 
 另读取：`SSL_CERT_FILE`（**唯一**由环境变量指定的 CA 文件来源）、`SSL_CERT_DIR`（**不会**被当作 CA 目录读取——`SSL_CTX_load_verify_locations()` 的第二实参 `CApath` 恒为空，全树也没有调用 `set_default_verify_paths()`；它只在 fork 出的辅助进程 `exec` 前按属主/权限决定保留或清除：非 root 属主、或组/其他可写时被清除）。
 
