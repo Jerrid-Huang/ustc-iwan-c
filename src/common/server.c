@@ -2066,7 +2066,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                                                 sizeof tok) == 0)
                             atomic_store_explicit(
                                 &s2->throttle_until_ms,
-                                now + g_up_throttle_ms,
+                                now_ms() + g_up_throttle_ms,
                                 memory_order_relaxed);
                     }
                     pthread_rwlock_unlock(&ctx->sess_lock);
