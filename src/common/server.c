@@ -295,6 +295,23 @@ static atomic_ullong g_rate_drops; /* per-source rate-limit drops (silent) */
  * rate_allow_tokbad() and the RATE_TOKEN_MISMATCH bound-class note.
  * Env IWAN_RATE_TOKBAD_MAX (rate_limit_env: 1..65535). */
 #define RATE_TOKBAD_MAX_DEFAULT 4096
+/* R48-F1(2/3): per-source pre-budget for known-sid wrong-token CLOSE
+ * frames (rate_allow_close, same family as rate_allow_sid_miss /
+ * rate_allow_tokbad: shared per-source shard buckets + a lock-free
+ * over-budget gate). F1-1 (3c68d8c) removed the unknown-sid CLOSE write
+ * lock but left one write lock per KNOWN-sid CLOSE frame until the token
+ * compare; a spoofer who knows a live sid (held in the plaintext 8-byte
+ * header, ~16-33 s blind scan) and forges the victim peer's ip:port
+ * byte-for-byte makes every such frame fail only AT the compare — after
+ * one global sess_lock WRITE lock — so the bound class still convoyed
+ * the rwlock at line rate (R48-CLOSE-1's residual, which the DATA-side
+ * R47-H2-M2 budget never covered). Same default 4096 per source-IP per
+ * RATE_WINDOW_MS (1 s), same cost-cap-not-delivery-gate argument: it
+ * fires only AFTER a CLOSE token compare failed, so the real peer's
+ * correct-token CLOSE wipe is never even charged, and it bounds
+ * write-lock acquisitions, not delivery — see rate_allow_close().
+ * Env IWAN_RATE_CLOSE_MAX (rate_limit_env: 1..65535). */
+#define RATE_CLOSE_MAX_DEFAULT 4096
 /* R47-H2-M1: default per-session uplink fairness throttle window (ms),
  * applied only after THIS session's TUN write hit a full device queue.
  * 2 ms: one window per queue-full drop lets the flooder's OWN next
@@ -309,6 +326,10 @@ static unsigned g_rate_miss_max = RATE_MISS_MAX_DEFAULT;
  * (IWAN_RATE_TOKBAD_MAX, default RATE_TOKBAD_MAX_DEFAULT); see the
  * RATE_TOKBAD_MAX_DEFAULT block above. */
 static unsigned g_rate_tokbad_max = RATE_TOKBAD_MAX_DEFAULT;
+/* R48-F1(2/3): per-source known-sid wrong-token CLOSE budget
+ * (IWAN_RATE_CLOSE_MAX, default RATE_CLOSE_MAX_DEFAULT); see the
+ * RATE_CLOSE_MAX_DEFAULT block above. */
+static unsigned g_rate_close_max = RATE_CLOSE_MAX_DEFAULT;
 /* R47-H2-M1: per-session uplink fairness throttle window (ms) applied on
  * a queue-full TUN drop (IWAN_SRV_THROTTLE_MS, default SRV_THROTTLE_DEFAULT_MS;
  * rate_limit_env rejects 0 -> range is 1..65535). See server.h
@@ -635,6 +656,17 @@ struct rate_bucket {
      * per-source bucket because it is a COST cap, not a delivery gate
      * (see rate_allow_tokbad). */
     uint32_t tokbad_cnt;
+    /* R48-F1(2/3): known-sid wrong-token CLOSE frames from this source
+     * (IWAN_RATE_CLOSE_MAX). A SEPARATE counter on purpose, like
+     * miss_cnt/tokbad_cnt: a bound-class CLOSE storm (a spoofer forging a
+     * live session's peer ip:port) must not spend the tokbad allowance the
+     * same source needs for its live DATA, nor the OPEN/PING/ECHO or
+     * unknown-sid allowances. Charged only by rate_allow_close(), i.e.
+     * strictly after a CLOSE token compare failed. Same
+     * cost-cap-not-delivery-gate argument as tokbad_cnt: this CAN live in
+     * the per-source bucket because it bounds write-lock cost, never
+     * delivery (see rate_allow_close). */
+    uint32_t close_cnt;
     /* R1-D-1: the DATA/CLOSE token-mismatch budget is deliberately NOT a
      * field of this per-source bucket any more. Keyed by source IP it let
      * one host behind a NAT (or an ex-token device of the same account)
@@ -675,6 +707,15 @@ static struct rate_gate g_rate_gate[RATE_BUCKETS];
  * Same slot function, same static sizing, same relaxed-atomic discipline
  * as g_rate_gate. */
 static struct rate_gate g_tokbad_gate[RATE_BUCKETS];
+/* R48-F1(2/3): third, independent lock-free over-budget gate table for the
+ * per-source known-sid wrong-token CLOSE budget (rate_allow_close).
+ * Separate from both g_rate_gate and g_tokbad_gate on purpose: each gate
+ * bounds a different cost of a different frame class, and sharing a slot
+ * would let one class's storm flip another's over-budget flag (only
+ * counting / lock-cost, never delivery, but the accounting cross-talk is
+ * needless). Same slot function, same static sizing, same relaxed-atomic
+ * discipline. */
+static struct rate_gate g_close_gate[RATE_BUCKETS];
 
 /* guards g_rate_shards: each shard has its own lock, taken for the
  * unauthenticated control types (rate_allow). The F4/R1-D-1 DATA/CLOSE
@@ -763,6 +804,8 @@ void server_rate_limits_init(void)
                                      RATE_MISS_MAX_DEFAULT);
     g_rate_tokbad_max = rate_limit_env("IWAN_RATE_TOKBAD_MAX",
                                        RATE_TOKBAD_MAX_DEFAULT);
+    g_rate_close_max = rate_limit_env("IWAN_RATE_CLOSE_MAX",
+                                      RATE_CLOSE_MAX_DEFAULT);
     g_up_throttle_ms = rate_limit_env("IWAN_SRV_THROTTLE_MS",
                                       SRV_THROTTLE_DEFAULT_MS);
 }
@@ -831,6 +874,7 @@ static void rate_bucket_touch(struct rate_bucket *b, uint32_t ip, uint64_t now)
         b->win = now;
         b->open_cnt = b->ping_cnt = b->echo_cnt = b->miss_cnt = 0;
         b->tokbad_cnt = 0;
+        b->close_cnt = 0;
     }
 }
 
@@ -1034,6 +1078,82 @@ static bool rate_allow_tokbad(const struct sockaddr_in *peer, uint64_t now)
         /* publish before the ip so a reader that sees its own ip also
          * sees a deadline that belongs to it (same ordering argument as
          * rate_allow_sid_miss: worst case is a spurious count on a frame
+         * that is dropped either way) */
+        atomic_store_explicit(&g->over_until_ms, b->win + RATE_WINDOW_MS,
+                              memory_order_relaxed);
+        atomic_store_explicit(&g->ip, ip, memory_order_relaxed);
+    }
+    rate_shard_unlock(ip);
+    return ok;
+}
+
+/* ---- R48-F1(2/3): per-source budget for known-sid wrong-token CLOSE ----
+ *
+ * F1-1 (3c68d8c) moved the unknown-sid CLOSE probe under the READ lock,
+ * killing the per-frame global write lock for the random-sid spray. The
+ * KNOWN-sid wrong-token CLOSE keeps one write lock per frame in its wake:
+ * the CLOSE branch ran its token compare under the write lock (it must
+ * wipe under it), and R37-R2's non-peer pre-compare budget
+ * (tok_budget_over, 4/s/session) never gates the class that claims the
+ * session's peer address verbatim — the bound class. A spoofer who knows
+ * a live sid (the plaintext 8-byte header, ~16-33 s blind scan) and
+ * forges the victim peer's ip:port byte-for-byte can therefore still take
+ * one global sess_lock WRITE lock (plus the observable tok_mis_bound
+ * charge) per frame at line rate: R48-CLOSE-1's residual, exactly the
+ * shape R47-H2-M2 capped on the DATA side (rate_allow_tokbad) but which
+ * it never covered for CLOSE.
+ *
+ * rate_allow_close() is that missing CLOSE-side budget, a verbatim mirror
+ * of rate_allow_tokbad (same family as rate_allow_sid_miss). The same
+ * three properties make it safe:
+ *
+ *  1. It is keyed per SOURCE-IP and charges the source's own rate_bucket
+ *     (the source the server observes is the forged victim address, so an
+ *     attacker flooding one victim spends only that address's budget).
+ *  2. It runs strictly AFTER a CLOSE token compare has failed, so a frame
+ *     carrying the correct token — the real peer's live wipe — NEVER
+ *     touches this budget; the wipe path stays byte-for-byte unchanged
+ *     (which is exactly why a pre-compare bound gate would be unsafe).
+ *  3. Its false result only skips a charge that is pure observability
+ *     (tok_mis_bound saturates at RATE_TOKEN_MISMATCH_BOUND_MAX and never
+ *     gates) and the write lock that accompanies it. Every frame the
+ *     caller subjects to it is a wrong-token CLOSE, which is dropped
+ *     either way (CLOSE never rebinds, so a wrong token can never wipe).
+ *     It is therefore a COST cap on write-lock acquisitions, not a
+ *     delivery gate — the R1-D-1 "one NAT neighbour must not spend a
+ *     budget that gates the neighbours' sessions" argument does not apply
+ *     here either (a NAT neighbour's close spending cannot change what
+ *     any other frame delivers).
+ *
+ * Rate/lock shape (same family as rate_allow_sid_miss / rate_allow_tokbad):
+ * charge the shard bucket under the shard mutex; once over
+ * g_rate_close_max in the current window publish the source in the
+ * lock-free g_close_gate slot, after which every further over-budget
+ * wrong-token CLOSE from that source costs one relaxed atomic load pair
+ * and a drop — no shard lock, no bucket update, no sess_lock write.
+ * Caller must NOT hold ctx->sess_lock (lock order: sess_lock outer ->
+ * shard lock inner); the CLOSE call site releases the lock before calling
+ * (see the PT_CLOSE branch). */
+static bool rate_allow_close(const struct sockaddr_in *peer, uint64_t now)
+{
+    uint32_t ip = (uint32_t)peer->sin_addr.s_addr;
+    struct rate_gate *g = &g_close_gate[rate_gate_slot(ip)];
+    struct rate_bucket *b;
+    bool ok;
+
+    /* fast path (lock-free): this source already spent its known-sid
+     * wrong-token CLOSE budget earlier in the current window; drop the
+     * frame on a single relaxed load pair, exactly like rate_allow_tokbad */
+    if (atomic_load_explicit(&g->ip, memory_order_relaxed) == ip &&
+        atomic_load_explicit(&g->over_until_ms, memory_order_relaxed) > now)
+        return false;
+
+    b = rate_bucket_enter(ip, now);
+    ok = ++b->close_cnt <= g_rate_close_max;
+    if (!ok) {
+        /* publish before the ip so a reader that sees its own ip also
+         * sees a deadline that belongs to it (same ordering argument as
+         * rate_allow_tokbad: worst case is a spurious count on a frame
          * that is dropped either way) */
         atomic_store_explicit(&g->over_until_ms, b->win + RATE_WINDOW_MS,
                               memory_order_relaxed);
@@ -2114,50 +2234,96 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                 atomic_fetch_add(&g_rate_drops, 1);
             return;
         }
-        /* known sid: the probe ran under the READ lock; the token/peer
-         * checks and any wipe need the WRITE lock, so upgrade and RE-FIND
-         * (TOCTOU-safe: the session may have been wiped or replaced by a
-         * re-OPEN between the two lock acquisitions — the DATA rebind
-         * path re-finds under the upgrade for the same reason). The
-         * unknown-sid flood is already over, so this upgrade is per
-         * known-sid frame only, not per forged frame. */
-        pthread_rwlock_unlock(&ctx->sess_lock);
-        pthread_rwlock_wrlock(&ctx->sess_lock);
-        s = find_session_unlocked(ctx, sid);
-        if (!s) {
-            pthread_rwlock_unlock(&ctx->sess_lock);
-            if (!rate_allow_sid_miss((uint32_t)peer->sin_addr.s_addr, now))
-                atomic_fetch_add(&g_rate_drops, 1);
-            return;
-        }
+        /* known sid: R48-F1(2/3) runs the token and peer checks under the
+         * READ lock — both are pure (tok_budget_over is documented as
+         * read-lock safe; token/peer fields are written only under the
+         * WRITE lock, so a read-lock holder sees a consistent snapshot) —
+         * exactly like the DATA path. A wrong-token CLOSE therefore never
+         * takes the write lock at all; only the correct-token WIPE
+         * upgrades (TOCTOU-safe re-find below). */
+        cls_bound = memcmp(&s->peer, peer, sizeof *peer) == 0;
         /* F4/R1-D-1 + R37 R2: pre-check the token compare ONLY for the
          * non-peer class (see the DATA path / tok_budget_over note); a
          * bound-class CLOSE is always compared, so a spoofer cannot get
          * the real peer's CLOSE dropped. */
-        cls_bound = memcmp(&s->peer, peer, sizeof *peer) == 0;
         if (!cls_bound && tok_budget_over(s, now)) {
             pthread_rwlock_unlock(&ctx->sess_lock);
             atomic_fetch_add(&g_rate_drops, 1);
             return;
         }
-        if (CRYPTO_memcmp(&s->token, &tok, sizeof tok) == 0) {
-            /* CLOSE is terminal: never rebind to a new source, or a
-             * token-holding attacker could kill the session from any
-             * address */
-            if (s->peer.sin_addr.s_addr != peer->sin_addr.s_addr ||
-                s->peer.sin_port != peer->sin_port) {
-                pthread_rwlock_unlock(&ctx->sess_lock);
-                return;
+        if (CRYPTO_memcmp(&s->token, &tok, sizeof tok) != 0) {
+            /* R48-F1(2/3): a wrong-token CLOSE against a live sid is a
+             * guess, and when its source forges the session's peer
+             * verbatim it is the BOUND class, which R37-R2 never
+             * pre-gates — under F1-1 every such frame still took one
+             * global sess_lock WRITE lock (plus the tok_mis_bound
+             * observability charge) at line rate. Pre-budget it per
+             * SOURCE strictly AFTER the failed compare (rate_allow_close,
+             * same family as rate_allow_tokbad): over budget the frame is
+             * dropped here with no write lock and no observability charge
+             * (tok_mis_bound saturates at RATE_TOKEN_MISMATCH_BOUND_MAX
+             * anyway and never gates). Correct-token frames never reach
+             * this (the default 4096/window is ~3 orders above any
+             * legitimate stale-token retry rate); R37-R2's non-peer
+             * pre-compare budget is untouched. The write lock is not held
+             * here at all, and the lock order is sess_lock outer -> shard
+             * lock inner, so rate_allow_close runs with sess_lock
+             * released. */
+            pthread_rwlock_unlock(&ctx->sess_lock);
+            if (!rate_allow_close(peer, now)) {
+                atomic_fetch_add(&g_rate_drops, 1);
+                return; /* wrong-token CLOSE storm from this source: drop */
             }
-            peer_to_string(peer, peerstr);
-            srv_log("[%s] session 0x%04x (ip %u.%u.%u.%u) closed",
-                    peerstr, s->sid, s->ip[0], s->ip[1], s->ip[2], s->ip[3]);
-            sess_wipe(ctx, s);
-        } else {
-            /* a bad-token CLOSE is a guess: charge this session's budget,
-             * not a per-source blacklist */
-            tok_budget_charge(s, cls_bound, now);
+            /* within budget: re-lock and charge the session's mismatch
+             * budget only if the frame is STILL a mismatch for it,
+             * exactly like the DATA path's tok_charge_upgrade — a racing
+             * re-OPEN (new token, same sid) must not be charged for a
+             * guess aimed at the previous token */
+            pthread_rwlock_wrlock(&ctx->sess_lock);
+            s = find_session_unlocked(ctx, sid);
+            if (s && CRYPTO_memcmp(&s->token, &tok, sizeof tok) != 0)
+                tok_budget_charge(s, memcmp(&s->peer, peer,
+                                            sizeof *peer) == 0, now);
+            pthread_rwlock_unlock(&ctx->sess_lock);
+            break;
         }
+        /* correct token: CLOSE is terminal — the wipe needs the write
+         * lock, so upgrade and RE-FIND (TOCTOU-safe: the session may have
+         * been wiped or replaced by a re-OPEN between the read-lock probe
+         * and the upgrade; the DATA rebind path re-finds under the
+         * upgrade for the same reason). This upgrade is per correct-token
+         * frame only. */
+        pthread_rwlock_unlock(&ctx->sess_lock);
+        pthread_rwlock_wrlock(&ctx->sess_lock);
+        s = find_session_unlocked(ctx, sid);
+        if (!s) {
+            /* session wiped/replaced between probe and upgrade: this
+             * CLOSE no longer names a live session, so drop it without
+             * charging (mis-attributing the unknown-sid budget would be
+             * wrong: the sid WAS known at probe time) */
+            pthread_rwlock_unlock(&ctx->sess_lock);
+            return;
+        }
+        /* the token may have rotated between the two lock acquisitions:
+         * the frame is a wrong-token CLOSE for the CURRENT session now */
+        if (CRYPTO_memcmp(&s->token, &tok, sizeof tok) != 0) {
+            tok_budget_charge(s, memcmp(&s->peer, peer, sizeof *peer) == 0,
+                              now);
+            pthread_rwlock_unlock(&ctx->sess_lock);
+            return;
+        }
+        /* CLOSE is terminal: never rebind to a new source, or a
+         * token-holding attacker could kill the session from any
+         * address */
+        if (s->peer.sin_addr.s_addr != peer->sin_addr.s_addr ||
+            s->peer.sin_port != peer->sin_port) {
+            pthread_rwlock_unlock(&ctx->sess_lock);
+            return;
+        }
+        peer_to_string(peer, peerstr);
+        srv_log("[%s] session 0x%04x (ip %u.%u.%u.%u) closed",
+                peerstr, s->sid, s->ip[0], s->ip[1], s->ip[2], s->ip[3]);
+        sess_wipe(ctx, s);
         pthread_rwlock_unlock(&ctx->sess_lock);
         break;
 
