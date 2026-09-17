@@ -1479,7 +1479,13 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
      *   - different IP but the old session already idle-expired -> allow
      *     (the old peer is gone; purge_expired would wipe it anyway).
      * No wire-format change: only the PT_OPEN_REJECT control frame (with
-     * a descriptive reason) is reused. */
+     * a descriptive reason) is reused.
+     * Accepted residual (L level, R48-L4): an attacker behind the SAME
+     * NAT / same public IP as the client still passes the source-IP
+     * check and can bump the active client off (token rotation + rebind)
+     * — the guard only closes the cross-address takeover, not the
+     * same-IP one, which is indistinguishable from a legitimate
+     * reconnect without channel-bound auth. */
     if (ctx->sess[slot].valid &&
         ctx->sess[slot].peer.sin_addr.s_addr != peer->sin_addr.s_addr &&
         now_ms() - atomic_load(&ctx->sess[slot].last_active_ms) <=
