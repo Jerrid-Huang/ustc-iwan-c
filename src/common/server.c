@@ -701,28 +701,43 @@ static struct rate_shard g_rate_shards[RATE_SHARDS];
  * over_until_ms == 0 means "no gate": now_ms() is a monotonic count from
  * boot, so the `> now` test is false for a zeroed slot.
  *
- * R50-A1: the gate tables are 4-WAY SET-ASSOCIATIVE. A single-way slot
- * could "park" only ONE source per window, so under R50-A1's eviction
- * churn (a shard with more live sources than buckets) sources that shared
- * a slot endlessly lost the claim (rate_gate_claim) and stayed on the
- * shard-locked slow path / write-lock path the whole window. With
- * RATE_GATE_WAYS ways per slot, up to four sources that hash to the same
- * set are gated (fast-path) at once, so a whole shard (up to
- * 4 * RATE_BUCKETS_PER_SHARD = 256 live sources) can be carried on the
- * lock-free fast path while its buckets churn: exactly the per-source
- * budget population whose counters the churn keeps resetting. Beyond that
- * (a fifth+ source per set) the claim backs off and the source keeps the
- * slow path for its window — the documented bounded-multiplier residual,
- * same shape as R49-I2, now with a real per-window cap per source (see
- * rate_evict_publish). R49-L1's no-thrash property is preserved per way:
- * a way validly held by another source is never overwritten, so two
- * over-budget sources in one set do not evict each other — they settle
- * into different ways and each keeps its fast path. */
+ * R50-A1 (+R51-H2): the gate tables are RATE_GATE_WAYS-WAY SET-ASSOCIATIVE.
+ * A single-way slot could "park" only ONE source per window, so under
+ * eviction churn (a shard with more live sources than buckets) sources
+ * that shared a slot endlessly lost the claim (rate_gate_claim) and
+ * stayed on the shard-locked slow path / write-lock path the whole
+ * window. With RATE_GATE_WAYS ways per slot, up to RATE_GATE_WAYS sources
+ * that hash to the same set are gated (fast-path) at once, so a whole
+ * shard (up to RATE_GATE_WAYS * RATE_BUCKETS_PER_SHARD live sources) can
+ * be carried on the lock-free fast path while its buckets churn: exactly
+ * the per-source budget population whose counters the churn keeps
+ * resetting. R51-H2: at 4 ways the 5th+ source per set had EVERY claim
+ * backed off while churn kept zeroing its counters, so its per-source
+ * budget died for the whole window with NO cap (measured: 640/1280
+ * same-shard sources collapsed to exactly 4*64*M drops, and >=20
+ * colliding tokbad sessions reopened part of the R48-M1 write-lock
+ * convoy); the ways were raised to 16 so that <=16 sources per set
+ * (<=16*64 = 1024 live sources per shard) are all carried on the fast
+ * path — the R51-H2 acceptance boundary. Beyond that (a 17th+ source per
+ * set) the claim backs off and the source keeps the slow path for its
+ * window: the documented bounded-multiplier residual, same shape as
+ * R49-I2, now with a real per-window cap per source (see
+ * rate_evict_publish). Residual is HONEST and recorded, not claimed
+ * bounded: a finite way table cannot bound an unbounded number of
+ * colliding pseudo-sources; it only moves the boundary to 16/set
+ * (1024/shard), 4x the R50-A1 boundary, and any acceptance beyond it is
+ * explicitly a recorded residual. R49-L1's no-thrash property is
+ * preserved per way: a way validly held by another source is never
+ * overwritten, so two over-budget sources in one set do not evict each
+ * other — they settle into different ways and each keeps its fast path.
+ * Memory: each gate set is RATE_GATE_WAYS * 16 B, four tables of
+ * RATE_BUCKETS sets => 4 * 1024 * 16 * 16 B = 1 MiB BSS (the four-table
+ * total was 256 KiB at 4 ways; +768 KiB for this fix). */
 struct rate_gate {
     _Atomic uint32_t ip;            /* network-order source address */
     _Atomic uint64_t over_until_ms; /* budget refills at this monotonic ms */
 };
-#define RATE_GATE_WAYS 4
+#define RATE_GATE_WAYS 16
 struct rate_gate_set {
     struct rate_gate way[RATE_GATE_WAYS];
 };
