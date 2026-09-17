@@ -436,6 +436,47 @@ static ssize_t rp_hs_recv(struct rp_hs *hs, int fd, void *buf, size_t len)
     return r;
 }
 
+/* R50-C1: empty a peer's unread receive bytes before a refusal close.
+ * Linux close() with unread data in the receive queue sends RST
+ * instead of FIN, and the RST discards the freshly-sent refusal reply
+ * from the peer's buffer — dynamically proven in R50 (probe431.py:
+ * every >8 KiB flood header got "HTTP/1.1 431" then ECONNRESET, since
+ * a 431 can only fire when the peer sent more than could be read, i.e.
+ * >= 1 byte unread at close; probe502rst.py: 502 + 16/64 KiB pipelined
+ * junk -> 28B 502 then RST). Draining to EAGAIN leaves the queue
+ * empty, so the close sends FIN and the peer can read the reply to a
+ * clean EOF.
+ *
+ * Why drain and not shutdown(fd, SHUT_WR): SHUT_WR half-closes only
+ * the WRITE side — the unread receive data that triggers the kernel's
+ * RST-on-close is still queued, so the subsequent close() would RST
+ * anyway. Draining is the only option that yields FIN, and it lets
+ * the peer finish reading the reply before the FIN completes.
+ *
+ * Bounded: at most RP_HS_INPUT_MAX bytes are consumed (the same
+ * absolute budget the handshake already draws from — the parser would
+ * never have processed more input than this), in a nonblocking recv
+ * loop with no poll and no sleep: a peer that keeps refilling the
+ * buffer just burns the byte budget and the loop ends in microseconds,
+ * so no new time risk is introduced and no refusal thread is pinned
+ * anywhere near the 30 s handshake deadline. */
+static void rp_drain_in(int fd)
+{
+    uint8_t t[2048];
+    size_t left = RP_HS_INPUT_MAX;
+    while (left > 0) {
+        size_t want = left < sizeof t ? left : sizeof t;
+        ssize_t r = port_recv(fd, t, want, 0);
+        if (r > 0) {
+            left -= (size_t)r;
+            continue;
+        }
+        /* EAGAIN/EWOULDBLOCK (queue empty), EINTR, EOF or a hard error:
+         * nothing left to drain, so the close below sends FIN. */
+        return;
+    }
+}
+
 /* ---- RFC1929 brute-force lockout (M6c/L6) ----
  * Same semantics as the SOCKS-mode table in socks_flow.c: only
  * WELL-FORMED RFC1929 frames whose credentials fail count toward the
@@ -2290,6 +2331,14 @@ out:
      * once (the accept thread's increment is consumed below) */
     if (up >= 0)
         port_close(up);
+    /* R50-C1: every refusal-reply path (HTTP 431/502/503, SOCKS
+     * rep!=0) returns -1 and lands here after the reply was flushed;
+     * a peer that pipelined more bytes than the handshake consumed
+     * left the kernel receive queue non-empty, which would make this
+     * close() RST the connection and discard the reply from the peer's
+     * buffer. Drain the queue first so the close ends the connection
+     * with FIN and the peer reads the reply to clean EOF. */
+    rp_drain_in(fd);
     port_close(fd);
     atomic_fetch_sub(&g_rp_conn_n, 1);
     free(ca);
