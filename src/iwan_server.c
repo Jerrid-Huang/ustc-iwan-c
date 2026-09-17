@@ -723,6 +723,31 @@ static void srv_tun_pkt(void *ud, uint8_t *pkt, size_t len, bool last)
         srv_dl_flush(b, fd);
 }
 
+/* R52-D1: clear a queue's downlink batch when its reader thread exits.
+ * The pool owner REUSES a slot after a shrink (tun_pool_del ->
+ * tun_pool_add_fd: the new reader thread takes the same qid), so frames
+ * retained by srv_dl_flush's EAGAIN backpressure (b->n > 0, addressed to
+ * the OLD peer at the front of the batch) would otherwise survive into the
+ * next queue owner and be sent late/out-of-order to the dead session.
+ * Registered through tun_pool_set_exit_cb: tun.c runs it on the exiting
+ * reader thread itself, strictly AFTER the final flush signal (tun.c gives
+ * the retained frames one last best-effort send — if that still hits
+ * EAGAIN they drop under the documented "unsent data recovers by TCP RTO"
+ * contract), and tun_pool_del / tun_pool_destroy pthread_join that thread
+ * before the slot is ever handed to a new reader — so this reset races
+ * nothing (the batch's only writer is gone, no in-flight flush). Only
+ * b->n needs resetting: the next srv_tun_pkt stages from index 0 and
+ * re-points iovs/msgs/peers as it goes, so the stale hdrs/pl/peers cells
+ * are overwritten before any flush can read them. */
+static struct srv_pool_ud *g_srv_pool_ud;
+static void srv_dl_reader_exit(void)
+{
+    int qid = tun_reader_qid();
+
+    if (g_srv_pool_ud && qid >= 0 && qid < TUN_POOL_MAX)
+        g_srv_pool_ud->b[qid].n = 0;
+}
+
 /* open and configure the tun. Exits on failure. */
 static int setup_tun(const char *name, const char *server_ip, int mask)
 {
@@ -1500,6 +1525,7 @@ int main(int argc, char **argv)
         /* maxq/initq were computed once in the root section above (H-3)
          * so the same geometry drives both the queue pre-open and this
          * pool. */
+        g_srv_pool_ud = &pu; /* R52-D1: reader-exit batch reset (below) */
         pu.ctx = &ctx;
         pu.udp_fds = udp_fds;
         pu.nfds = nfds;
@@ -1520,6 +1546,13 @@ int main(int argc, char **argv)
                 server_cleanup_nat(); /* parent (root) undoes NAT */
             return 1;
         }
+        /* R52-D1: the per-queue downlink batch is tied to a queue SLOT,
+         * not to a session; register the reader-exit reset before any
+         * tick can grow/shrink the pool. Queue 0's reader (already
+         * started inside tun_pool_create_pre) also exits through this
+         * callback; a batch is only ever touched by its own reader
+         * thread (see srv_dl_reader_exit). */
+        tun_pool_set_exit_cb(ctx.qpool, srv_dl_reader_exit);
         /* M1: report the REAL queue count (tun_pool_queues) instead of the
          * requested initq — eager multi-queue fill (tun_pool_add ->
          * open /dev/net/tun per queue) still degrades when /dev/net/tun
