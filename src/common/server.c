@@ -1049,9 +1049,33 @@ static void rate_evict_publish(struct rate_bucket *b, uint64_t now)
 }
 
 /* (re)start the source's window when the bucket is stale or was just
- * evicted from another source; caller must hold the shard lock. */
-static void rate_bucket_touch(struct rate_bucket *b, uint32_t ip, uint64_t now)
+ * evicted from another source; caller must hold the shard lock.
+ * R51-A1: the window arithmetic samples now_ms() HERE, under the shard
+ * lock, instead of trusting the caller's `now` (sampled once per frame
+ * BEFORE any lock — server.c handle_udp line ~2132 — so it can be ≥1 ms
+ * stale by the time this lock is taken). Waiting for this shard can span
+ * another recv thread's write of b->win with a newer clock tick; the
+ * unsigned subtraction `now - b->win` then underflows to ~2^64 and a
+ * LIVE window is treated as elapsed: rate_evict_publish early-returns
+ * (its gates for the evicted holder are not armed for that eviction) and
+ * the counters/win are zeroed/rewound, granting a fresh mid-window
+ * budget (measured: 64-socket single-IP PING flood, 16 recv threads,
+ * maxbin 118 > the strict 60/window). Under the lock no writer can move
+ * b->win forward while this thread runs, and now_ms() is monotonic, so
+ * the sampled clock is always >= the last writer's sample that produced
+ * b->win — the subtraction cannot underflow. Mirrors purge_expired's
+ * under-lock re-read and R48-L1 (dd89178). The caller's `now` is still
+ * used for the lock-free gate checks and the post-lock claims' validity
+ * test; a stale sample there only errs toward "another way's deadline
+ * still valid" (a claim backs off / a gate stays armed slightly longer —
+ * never an early budget refill, and for the three cost gates a missed
+ * fast path is just one extra shard-locked drop decision on a frame
+ * dropped regardless). This re-read changes ONLY the window
+ * adjudication, not gate-deadline semantics and not delivery/accounting. */
+static void rate_bucket_touch(struct rate_bucket *b, uint32_t ip)
 {
+    uint64_t now = now_ms();
+
     if (b->ip != ip || now - b->win >= RATE_WINDOW_MS) {
         rate_evict_publish(b, now);
         b->ip = ip;
@@ -1068,12 +1092,12 @@ static void rate_bucket_touch(struct rate_bucket *b, uint32_t ip, uint64_t now)
  * and then calls rate_shard_unlock(ip) (the counter read-modify-write must
  * stay inside the critical section). Small enough that the compiler
  * inlines it on the per-packet path. */
-static struct rate_bucket *rate_bucket_enter(uint32_t ip, uint64_t now)
+static struct rate_bucket *rate_bucket_enter(uint32_t ip)
 {
     struct rate_shard *sh = &g_rate_shards[rate_ip_shard(ip)];
     pthread_mutex_lock(&sh->mu);
     struct rate_bucket *b = rate_bucket_find(sh, ip);
-    rate_bucket_touch(b, ip, now);
+    rate_bucket_touch(b, ip);
     return b;
 }
 
@@ -1081,7 +1105,7 @@ static struct rate_bucket *rate_bucket_enter(uint32_t ip, uint64_t now)
  * sources are silently dropped (no reject, no log; each drop is counted
  * in g_rate_drops for the per-second stats line) so a single host
  * cannot saturate the single-threaded loop with cheap forged packets. */
-static bool rate_allow(const struct sockaddr_in *peer, uint8_t typ, uint64_t now)
+static bool rate_allow(const struct sockaddr_in *peer, uint8_t typ)
 {
     uint32_t ip = (uint32_t)peer->sin_addr.s_addr;
     struct rate_bucket *b;
@@ -1127,7 +1151,7 @@ static bool rate_allow(const struct sockaddr_in *peer, uint8_t typ, uint64_t now
      * recv threads; the per-shard mutex is taken on the unauthenticated
      * control types above (the F4/R1-D-1 DATA/CLOSE budget is no longer
      * here — it is per session, under ctx->sess_lock) */
-    b = rate_bucket_enter(ip, now);
+    b = rate_bucket_enter(ip);
     /* independent per-type counters: a PING flood cannot eat the ECHO
      * budget (or vice versa); OPEN keeps its own, tighter limit */
     cnt = (typ == PT_OPEN) ? &b->open_cnt :
@@ -1212,7 +1236,7 @@ static bool rate_allow_sid_miss(uint32_t ip, uint64_t now)
     if (rate_gate_check(g, ip, now))
         return false;
 
-    b = rate_bucket_enter(ip, now);
+    b = rate_bucket_enter(ip);
     ok = ++b->miss_cnt <= g_rate_miss_max;
     if (!ok) {
         /* publish the source as over-budget for the remainder of the
@@ -1293,7 +1317,7 @@ static bool rate_allow_tokbad(const struct sockaddr_in *peer, uint64_t now)
     if (rate_gate_check(g, ip, now))
         return false;
 
-    b = rate_bucket_enter(ip, now);
+    b = rate_bucket_enter(ip);
     ok = ++b->tokbad_cnt <= g_rate_tokbad_max;
     if (!ok) {
         /* R49-L1: rate_gate_claim keeps the publish-before-ip ordering so
@@ -1370,7 +1394,7 @@ static bool rate_allow_close(const struct sockaddr_in *peer, uint64_t now)
     if (rate_gate_check(g, ip, now))
         return false;
 
-    b = rate_bucket_enter(ip, now);
+    b = rate_bucket_enter(ip);
     ok = ++b->close_cnt <= g_rate_close_max;
     if (!ok) {
         /* R49-L1: rate_gate_claim keeps the publish-before-ip ordering so
@@ -2157,7 +2181,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
         uint64_t now = now_ms(); /* one clock read shared by the rate checks */
         if (debug_enabled())
             ta = now_ns();
-        if (!rate_allow(peer, typ, now))
+        if (!rate_allow(peer, typ))
             return; /* unauthenticated flood from this source: silent drop */
 
         switch (typ) {
