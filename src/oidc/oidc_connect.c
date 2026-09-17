@@ -44,6 +44,30 @@ struct oidc_reauth_ctx {
     const Config *cf;
 };
 
+/* R49-L4: does `blob` have the SHAPE of a legacy GCM ciphertext — i.e.
+ * is it base64url-decodable to at least the fixed GCM overhead (12-byte
+ * nonce + 16-byte tag)? This mirrors exactly the structural gate inside
+ * decrypt_password (gcm.c:94-96), which refuses anything decoding to
+ * fewer than GCM_NONCE_LEN + GCM_TAG_LEN bytes before it even attempts
+ * GCM. A blob that fails this shape test cannot be legacy ciphertext, so
+ * a decrypt failure on it is the NORMAL modern plaintext path — not a
+ * corruption signal. (The irreducible residual: a plaintext password
+ * that independently happens to decode to >= 28 bytes of base64url is
+ * indistinguishable from ciphertext by shape; it also logged under the
+ * old unconditional rule, so nothing regresses.)
+ * FROZEN BOUNDARY: decrypt_password, oidc_wrap_password and every write
+ * format are untouched; this only classifies the DIAGNOSTIC TRIGGER in
+ * stored_password(). */
+static bool blob_looks_encrypted(const char *blob)
+{
+    size_t len = 0;
+    uint8_t *raw = b64url_decode(blob, &len);
+    if (!raw)
+        return false;
+    free(raw);
+    return len >= GCM_NONCE_LEN + GCM_TAG_LEN;
+}
+
 /* Recover the plaintext server password from the stored value:
  * unwrap the platform protection (DPAPI / Keychain), then GCM-decrypt
  * the LEGACY ciphertext format (pre-plaintext servers.json files).
@@ -76,10 +100,25 @@ static char *stored_password(const char *stored, const char *domain,
      * fed to the auth stack as if it were the real password. We keep the
      * tolerant legacy fallback (no contract change), but it must no
      * longer be silent. A fuller fix (blob format marker etc.) is a
-     * design change, deliberately out of scope here. */
-    log_err("stored password decrypt failed; falling back to treating "
-            "the stored blob as a legacy plaintext password — this may "
-            "indicate corruption/tampering or a secret change");
+     * design change, deliberately out of scope here.
+     * R49-L4: the alert must only fire when the blob actually HAS the
+     * legacy ciphertext shape — the modern --fetch flow stores plaintext,
+     * and decrypt_password can never GCM-decode a plaintext blob, so its
+     * failure there is the EXPECTED path on every connection/reconnect
+     * (dynamically proven in R49: 34-byte plaintext blob -> decrypt NULL
+     * every time). Unconditional log_err diluted the real corruption
+     * signal into wallpaper. Now only a ciphertext-shaped blob that fails
+     * to decrypt raises the corruption/tampering/secret-change alert;
+     * a non-ciphertext-shaped blob falls back as plaintext with a debug
+     * note instead. */
+    if (blob_looks_encrypted(blob))
+        log_err("stored password decrypt failed; falling back to treating "
+                "the stored blob as a legacy plaintext password — this may "
+                "indicate corruption/tampering or a secret change");
+    else
+        log_debug("stored password is not legacy-ciphertext shaped "
+                  "(undecodable as base64url or shorter than the GCM "
+                  "nonce+tag overhead); using it as a plaintext password");
     return blob;   /* plaintext format: the blob is the password */
 }
 
