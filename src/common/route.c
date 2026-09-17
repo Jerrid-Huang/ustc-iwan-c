@@ -901,6 +901,14 @@ bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
     /* every step mutates system state, so a failure must stop the
      * sequence and undo what was applied (mirror the Linux sequence) */
     if (!route_iface_up(tun, tun_ip, mtu)) {
+        /* R50-D1: route_iface_up failed BEFORE tun_iface_up6 ran, so no
+         * ULA was added THIS run — but a previous same-shape ULA may
+         * still be on the persistent adapter, and route_iface_down's
+         * NULL-whitelist sweep would delete its /96 while leaving the
+         * address (the pair would then be split for every later run).
+         * Drop the current v6 side first so address and /96 vanish
+         * together and the next run re-adds both cleanly. */
+        route_rollback_v6(tun, tun_ip, routes6);
         route_iface_down(tun);   /* undo any partial bring-up */
         return false;            /* nothing applied yet */
     }
@@ -930,6 +938,16 @@ bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
         }
         pin[pi] = NULL;
         if (!netsh_run(pin, "route_setup: pin server route")) {
+            /* R50-D1: route_iface_up already added the derived ULA +
+             * its on-link /96; the R49-L5 sweep inside route_iface_down
+             * (tun_ip/routes6 NULL) would delete the /96 but leave the
+             * ULA ADDRESS on the persistent wintun adapter, and the next
+             * same-inner-IPv4 run's `netsh add address <ula>/96` would
+             * then fail (address already present) — the /96 is never
+             * rebuilt and the v6 client pool's on-link route is lost
+             * across runs. Delete the current v6 side first so address
+             * and route vanish together. */
+            route_rollback_v6(tun, tun_ip, routes6);
             route_iface_down(tun);
             return false;
         }
@@ -976,8 +994,14 @@ bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
 rollback:
     /* the loop applied at least one route: drop every entry it may have
      * installed (route_teardown tolerates entries never applied), then
-     * tear the device down below */
+     * tear the device down below. R50-D1: route_iface_up already added
+     * the derived ULA + its /96; route_teardown's tail (route_iface_down
+     * -> NULL-whitelist sweep) would delete the /96 but leave the ULA
+     * ADDRESS — the next same-inner-IPv4 run's `netsh add address`
+     * would then fail and never rebuild the /96. Delete the current v6
+     * side FIRST so address and /96 vanish together. */
     log_err("route_setup: rolling back applied routes");
+    route_rollback_v6(tun, tun_ip, routes6);
     route_teardown(tun, srv, ogw, odev, metric, routes_with_default);
     return false;
 }
@@ -1273,6 +1297,59 @@ rollback_routes:
     return false;
 }
 #endif /* _WIN32 */
+
+/* R50-D1: restore the ULA/96 pair invariant on the Windows rollback
+ * paths (see route.h). A setup/pump session that fails AFTER
+ * tun_iface_up6 added the derived ULA address (and the on-link /96
+ * route the stack attaches to it) rolls back through route_iface_down,
+ * whose R49-L5 sweep keeps only fe80::/64 — it deletes the /96 route
+ * but NOTHING deletes the ULA ADDRESS (address deletion lives in
+ * route_teardown6, which the rollback never reaches; proxy.c's teardown6
+ * only runs on the normal-close path). A later run with the same inner
+ * IPv4 then sees the address already present: `netsh interface ipv6 add
+ * address <ula>/96` fails, the /96 is never rebuilt and the v6 client
+ * pool's on-link route is missing across runs. This helper deletes the
+ * current run's routes6 prefixes and its derived ULA BEFORE the rollback
+ * sweep runs, so BOTH legs of the pair disappear and the next run
+ * re-adds address + /96 atomically. Every delete is best-effort with
+ * "not present" at debug level; no-op on Apple/Linux (no persistent
+ * adapter, v6 routes vanish with the tun device — the pair cannot be
+ * split, and netstack re-derives everything on the next setup). */
+void route_rollback_v6(const char *tun, const char *tun_ip,
+                       const slist_t *routes6)
+{
+#ifdef _WIN32
+    char ifa[32];
+    snprintf(ifa, sizeof ifa, "interface=%s", tun);
+    if (routes6 != NULL) {
+        for (size_t i = 0; i < routes6->n; i++) {
+            const char *c = routes6->v[i];
+            /* none of these routes was installed by the failed session
+             * (route_setup6 runs only after route_setup succeeds), so a
+             * present one is a crash/stale leftover being cleaned — a
+             * missing one is the common case and logs at debug only */
+            char *d[] = { "netsh", "interface", "ipv6", "delete",
+                          "route", (char *)c, ifa, NULL };
+            if (port_run_cmd(d) != 0)
+                log_debug("route_rollback_v6: del %s: not present", c);
+        }
+    }
+    /* the derived ULA the current run added (or a previous same-shape
+     * one a re-run preserved): delete the bare address, mirroring
+     * route_teardown6's address arm */
+    char ula[64];
+    if (tun_ula_str(tun_ip, ula)) {
+        char *u[] = { "netsh", "interface", "ipv6", "delete",
+                      "address", ifa, ula, NULL };
+        if (port_run_cmd(u) != 0)
+            log_debug("route_rollback_v6: delete ULA %s: not present", ula);
+    }
+#else
+    (void)tun;
+    (void)tun_ip;
+    (void)routes6;
+#endif
+}
 
 #ifdef _WIN32
 void route_teardown(const char *tun, const char *srv, const char *ogw,

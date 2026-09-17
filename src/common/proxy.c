@@ -1394,7 +1394,14 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
     } else {
         if (!route_iface_up(tun_name, auth_tun_ip, auth_mtu)) {
             /* address/MTU assignment failed: undo the partial bring-up
-             * instead of claiming the tunnel is up */
+             * instead of claiming the tunnel is up. R50-D1: on Windows a
+             * previous same-shape derived ULA may survive this abort on
+             * the persistent wintun adapter, and route_iface_down's
+             * NULL-whitelist sweep would delete its /96 while leaving the
+             * address — a later run's `netsh add address` would then fail
+             * and never rebuild the /96. Delete the current v6 side first
+             * so address and /96 vanish together (no-op outside Windows). */
+            route_rollback_v6(tun_name, auth_tun_ip, &routes6);
             route_iface_down(tun_name);
             slist_free(&routes);
             slist_free(&routes6);

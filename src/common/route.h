@@ -38,6 +38,22 @@ void route_teardown(const char *tun, const char *srv, const char *ogw,
 void route_setup6(const char *tun, const slist_t *routes6);
 void route_teardown6(const char *tun, const char *tun_ip,
                      const slist_t *routes6);
+/* R50-D1: drop the CURRENT run's IPv6 side (each configured routes6
+ * prefix + the derived ULA), used only on the Windows ROLLBACK legs —
+ * route_setup failing after route_iface_up already added the ULA, and
+ * the no-route-hijack pump path failing at route_iface_up — BEFORE the
+ * rollback's route_iface_down. That function's R49-L5 sweep keeps only
+ * fe80::/64 (tun_ip/routes6 are NULL there), so it would delete the
+ * on-link /96 route while leaving the live ULA ADDRESS on the
+ * persistent wintun adapter: the next run's `netsh add address` then
+ * fails on the existing address and the /96 is never rebuilt. Called
+ * first, the address and its /96 vanish TOGETHER and the next run
+ * re-adds both cleanly. No-op outside _WIN32 (v6 routes there die with
+ * the tun device; the pair cannot be split); all deletes best-effort
+ * ("not present" logs at debug, matching the R49-L5 setup6 pre-delete
+ * convention). */
+void route_rollback_v6(const char *tun, const char *tun_ip,
+                       const slist_t *routes6);
 
 /* bring the tunnel interface up with an address and MTU (no routes);
  * shared by route_setup and the no-route-hijack pump path. Returns
