@@ -691,6 +691,13 @@ static struct rate_shard g_rate_shards[RATE_SHARDS];
  * once per over-budget source per window. See rate_allow_sid_miss() for
  * the full argument (why the fast path cannot change delivery, why a hash
  * collision is harmless, why relaxed atomics are sufficient).
+ * R49-L1: claims are EXCLUSIVE (rate_gate_claim): a slot validly held by
+ * another source is never overwritten, so two over-budget sources that
+ * hash to the same slot do not spend the window evicting each other — the
+ * earlier source keeps the lock-free fast path and the later one keeps
+ * the shard-locked slow path instead of replaying it on every frame (the
+ * collision's inherent cost), which the old publish-unconditionally shape
+ * turned into a degenerate per-frame thrash.
  * over_until_ms == 0 means "no gate": now_ms() is a monotonic count from
  * boot, so the `> now` test is false for a zeroed slot. */
 struct rate_gate {
@@ -705,7 +712,7 @@ static struct rate_gate g_rate_gate[RATE_BUCKETS];
  * one budget's storm flip the other's over-budget flag (only counting /
  * lock-cost, never delivery, but the accounting cross-talk is needless).
  * Same slot function, same static sizing, same relaxed-atomic discipline
- * as g_rate_gate. */
+ * as g_rate_gate (R49-L1: exclusive claim, rate_gate_claim). */
 static struct rate_gate g_tokbad_gate[RATE_BUCKETS];
 /* R48-F1(2/3): third, independent lock-free over-budget gate table for the
  * per-source known-sid wrong-token CLOSE budget (rate_allow_close).
@@ -714,7 +721,7 @@ static struct rate_gate g_tokbad_gate[RATE_BUCKETS];
  * would let one class's storm flip another's over-budget flag (only
  * counting / lock-cost, never delivery, but the accounting cross-talk is
  * needless). Same slot function, same static sizing, same relaxed-atomic
- * discipline. */
+ * discipline (R49-L1: exclusive claim, rate_gate_claim). */
 static struct rate_gate g_close_gate[RATE_BUCKETS];
 
 /* guards g_rate_shards: each shard has its own lock, taken for the
@@ -833,6 +840,46 @@ static inline void rate_shard_unlock(uint32_t ip)
 static inline unsigned rate_gate_slot(uint32_t ip)
 {
     return (unsigned)((ip * RATE_HASH_MUL) >> RATE_HASH_SHIFT);
+}
+
+/* R49-L1: claim `g` for `ip` until `until` (a deadline in now_ms()),
+ * UNLESS the slot is currently validly claimed by a different source, in
+ * which case back off and leave the holder's claim untouched. Called only
+ * by over-budget publishers, from inside the shard-locked slow path.
+ *
+ * Why the guard: before this helper every over-budget source published
+ * its claim unconditionally (deadline first, ip second). Two over-budget
+ * sources that hash to the SAME slot therefore spent the whole window
+ * overwriting each other: A's frame saw B's claim, missed the lock-free
+ * fast path, went through the shard lock + bucket probe + counter RMW and
+ * re-published A; B's next frame saw A's claim and did the same — so BOTH
+ * sources took the slow path on EVERY frame for the whole window, the
+ * opposite of the "a collision costs at most one extra count" claim. With
+ * the exclusive rule the first source to publish keeps the slot and stays
+ * on the fast path; the colliding source backs off and keeps the shard-
+ * locked slow path (the collision's inherent, unavoidable cost) instead
+ * of actively evicting the holder. Delivery never changes either way:
+ * this is a cost gate, and a missed fast path only means one more shard-
+ * locked drop decision on a frame that is dropped regardless.
+ *
+ * Store ordering is unchanged from the callers' old publish sequence:
+ * over_until_ms is stored before ip, so a reader that observes its own ip
+ * can only have observed a deadline stored before it. All accesses stay
+ * relaxed; the only cost of the check-then-act race (two sources reading
+ * the slot as free at once and both publishing) is exactly the old
+ * spurious-count worst case, after which the loser backs off on its next
+ * over-budget publish — the slot still settles to a single holder. */
+static inline void rate_gate_claim(struct rate_gate *g, uint32_t ip,
+                                   uint64_t until, uint64_t now)
+{
+    uint32_t cur_ip =
+        atomic_load_explicit(&g->ip, memory_order_relaxed);
+    uint64_t cur_until =
+        atomic_load_explicit(&g->over_until_ms, memory_order_relaxed);
+    if (cur_ip != 0 && cur_ip != ip && cur_until > now)
+        return; /* validly claimed by another source: back off */
+    atomic_store_explicit(&g->over_until_ms, until, memory_order_relaxed);
+    atomic_store_explicit(&g->ip, ip, memory_order_relaxed);
 }
 
 /* locate (or claim) the rate bucket for ip inside its shard; caller must
@@ -974,6 +1021,12 @@ static bool rate_allow(const struct sockaddr_in *peer, uint8_t typ, uint64_t now
  *    can at worst make the fast path fire for a source that is not over
  *    budget, which only over-counts g_rate_drops for a frame that was
  *    dropped anyway (never a delivery difference);
+ *  - R49-L1: the gate claim is exclusive (rate_gate_claim), so a collision
+ *    between two over-budget sources can no longer make BOTH replay the
+ *    shard-locked slow path on every frame: the earlier claimant keeps
+ *    the lock-free fast path and the colliding source falls back to the
+ *    slow path (its necessary cost), instead of the two of them
+ *    overwriting each other's claim all window;
  *  - all accesses are relaxed atomics on two dedicated fields, so there
  *    is no data race with the shard-locked bucket update (TSan clean);
  *  - `now`/over_until_ms are now_ms() (monotonic) and compared with >,
@@ -989,7 +1042,11 @@ static bool rate_allow_sid_miss(uint32_t ip, uint64_t now)
 
     /* fast path (lock-free): this source already spent its unknown-sid
      * budget earlier in the current window, so it is known to be over it
-     * for the rest of that window — drop without touching the shard */
+     * for the rest of that window — drop without touching the shard.
+     * R49-L1: the published claim is exclusive (rate_gate_claim backs off
+     * on a slot validly held by another source), so a hash collision can
+     * only keep the LATER source on the slow path below — it can never
+     * evict this source from the fast path mid-window. */
     if (atomic_load_explicit(&g->ip, memory_order_relaxed) == ip &&
         atomic_load_explicit(&g->over_until_ms, memory_order_relaxed) > now)
         return false;
@@ -1001,14 +1058,12 @@ static bool rate_allow_sid_miss(uint32_t ip, uint64_t now)
          * window this frame was charged to (rate_bucket_touch() has just
          * (re)started it, so b->win is that window's start and
          * b->win + RATE_WINDOW_MS is exactly when the budget refills).
-         * The deadline is stored before the ip so that a concurrent
-         * reader that observes its own ip also observes a deadline that
-         * belongs to it; under relaxed ordering the worst case is a
-         * spurious false (one extra g_rate_drops count on a frame that is
-         * dropped either way) — never a missed drop. */
-        atomic_store_explicit(&g->over_until_ms, b->win + RATE_WINDOW_MS,
-                              memory_order_relaxed);
-        atomic_store_explicit(&g->ip, ip, memory_order_relaxed);
+         * R49-L1: rate_gate_claim keeps the original store ordering
+         * (deadline before ip) and adds the exclusive-claim back-off; any
+         * missed fast path is just one extra shard-locked count on a
+         * frame that is dropped either way — never a delivery difference,
+         * and never a missed drop. */
+        rate_gate_claim(g, ip, b->win + RATE_WINDOW_MS, now);
     }
     rate_shard_unlock(ip);
     return ok;
@@ -1067,7 +1122,8 @@ static bool rate_allow_tokbad(const struct sockaddr_in *peer, uint64_t now)
 
     /* fast path (lock-free): this source already spent its bound-class
      * wrong-token budget earlier in the current window; drop the frame
-     * on a single relaxed load pair, exactly like rate_allow_sid_miss */
+     * on a single relaxed load pair, exactly like rate_allow_sid_miss.
+     * R49-L1: exclusive claim (rate_gate_claim), same as sid_miss. */
     if (atomic_load_explicit(&g->ip, memory_order_relaxed) == ip &&
         atomic_load_explicit(&g->over_until_ms, memory_order_relaxed) > now)
         return false;
@@ -1075,13 +1131,12 @@ static bool rate_allow_tokbad(const struct sockaddr_in *peer, uint64_t now)
     b = rate_bucket_enter(ip, now);
     ok = ++b->tokbad_cnt <= g_rate_tokbad_max;
     if (!ok) {
-        /* publish before the ip so a reader that sees its own ip also
-         * sees a deadline that belongs to it (same ordering argument as
-         * rate_allow_sid_miss: worst case is a spurious count on a frame
-         * that is dropped either way) */
-        atomic_store_explicit(&g->over_until_ms, b->win + RATE_WINDOW_MS,
-                              memory_order_relaxed);
-        atomic_store_explicit(&g->ip, ip, memory_order_relaxed);
+        /* R49-L1: rate_gate_claim keeps the publish-before-ip ordering so
+         * a reader that sees its own ip also sees a deadline that belongs
+         * to it, and adds the exclusive-claim back-off (same ordering
+         * argument as rate_allow_sid_miss: worst case is a spurious count
+         * on a frame that is dropped either way). */
+        rate_gate_claim(g, ip, b->win + RATE_WINDOW_MS, now);
     }
     rate_shard_unlock(ip);
     return ok;
@@ -1143,7 +1198,8 @@ static bool rate_allow_close(const struct sockaddr_in *peer, uint64_t now)
 
     /* fast path (lock-free): this source already spent its known-sid
      * wrong-token CLOSE budget earlier in the current window; drop the
-     * frame on a single relaxed load pair, exactly like rate_allow_tokbad */
+     * frame on a single relaxed load pair, exactly like rate_allow_tokbad.
+     * R49-L1: exclusive claim (rate_gate_claim), same as the family. */
     if (atomic_load_explicit(&g->ip, memory_order_relaxed) == ip &&
         atomic_load_explicit(&g->over_until_ms, memory_order_relaxed) > now)
         return false;
@@ -1151,13 +1207,12 @@ static bool rate_allow_close(const struct sockaddr_in *peer, uint64_t now)
     b = rate_bucket_enter(ip, now);
     ok = ++b->close_cnt <= g_rate_close_max;
     if (!ok) {
-        /* publish before the ip so a reader that sees its own ip also
-         * sees a deadline that belongs to it (same ordering argument as
-         * rate_allow_tokbad: worst case is a spurious count on a frame
-         * that is dropped either way) */
-        atomic_store_explicit(&g->over_until_ms, b->win + RATE_WINDOW_MS,
-                              memory_order_relaxed);
-        atomic_store_explicit(&g->ip, ip, memory_order_relaxed);
+        /* R49-L1: rate_gate_claim keeps the publish-before-ip ordering so
+         * a reader that sees its own ip also sees a deadline that belongs
+         * to it, and adds the exclusive-claim back-off (same ordering
+         * argument as rate_allow_tokbad: worst case is a spurious count on
+         * a frame that is dropped either way). */
+        rate_gate_claim(g, ip, b->win + RATE_WINDOW_MS, now);
     }
     rate_shard_unlock(ip);
     return ok;
