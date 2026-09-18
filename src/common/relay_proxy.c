@@ -1308,14 +1308,40 @@ static void rp_http_bad(struct rp_hs *hs, int fd)
  * re-dispatch and no response to annotate — nothing this rewrite could
  * add.
  *
+ * Upgrade/101 (WebSocket, RFC 7230 §6.7, RFC 6455 §4.1) is a second
+ * exemption: a 101 does not end the exchange, it switches the connection
+ * to a bidirectional tunnel — no second request can be re-dispatched and
+ * no cross-origin reuse is possible, so the single-request defence has
+ * no hazard to defend here, while the close injection itself would
+ * corrupt the handshake (compliant origins only answer 101 to a request
+ * that still bears `Connection: Upgrade`). See R53-A-1 below.
+ *
  * Implementation: head[0..hlen) is the request-line + header block ending
- * in \r\n\r\n. The rewrite drops every existing `Connection` header line
- * (skipped) and inserts one `Connection: close\r\n` as the last header,
- * so the forwarded head carries exactly one, canonical, non-ambiguous
- * close option. Header names are matched case-insensitively per RFC 7230
- * §3.2. Returns the rewritten length, or 0 on buffer overrun (caller
- * falls back to forwarding the original head verbatim — same guarantee
- * as forever: the relay never misroutes MORE than today). */
+ * in \r\n\r\n. A request carrying an `Upgrade:` header field is forwarded
+ * VERBATIM (R53-A-1, see below). Otherwise the rewrite drops every
+ * existing `Connection` header line (skipped) and inserts one
+ * `Connection: close\r\n` as the last header, so the forwarded head
+ * carries exactly one, canonical, non-ambiguous close option. Header
+ * names are matched case-insensitively per RFC 7230 §3.2. Returns the
+ * rewritten length, or 0 meaning "no rewrite: forward the original head
+ * verbatim" — for an Upgrade request (R53-A-1) or on buffer overrun
+ * (caller falls back to the original head — same guarantee as forever:
+ * the relay never misroutes MORE than today).
+ *
+ * R53-A-1: the R52-B1 rewrite must NOT touch Upgrade requests. RFC 7230
+ * §6.7 / RFC 6455 §4.1: a proxy has to forward the Upgrade verbatim so a
+ * compliant origin can answer 101 — rewriting `Connection: Upgrade` into
+ * `Connection: close` made every strict origin reply 400 and killed
+ * WebSocket-over-HTTP-proxy handshakes (a real probe: relay leg got
+ * 400 where the direct leg got 101). And the B1 rationale does not apply
+ * to a 101: 101 does not END the exchange, it switches the connection to
+ * a bidirectional tunnel — there is no second request, no cross-origin
+ * keep-alive frame to re-dispatch, the origin was bound at handshake and
+ * the pipe is opaque. So an Upgrade request is exempt: return 0 and the
+ * caller forwards the head byte-for-byte, preserving the client's own
+ * Connection header family, which for an Upgrade request legitimately
+ * contains Upgrade plus whatever else the client paired with it —
+ * rewriting any part of it would corrupt the handshake. */
 static size_t rp_http_force_close(uint8_t *out, size_t outcap,
                                   const uint8_t *head, size_t hlen)
 {
@@ -1329,6 +1355,59 @@ static size_t rp_http_force_close(uint8_t *out, size_t outcap,
         memcpy(out + o, (b), _bl);                                       \
         o += _bl;                                                        \
     } while (0)
+
+    /* R53-A-1: pre-scan over the same line structure as the rewrite
+     * below (the two walks must agree byte-for-byte, so the terminator
+     * is skipped identically). An `Upgrade:` field is signalled by the
+     * case-insensitive 7-byte name "upgrade" followed by a ':' and a
+     * value holding at least one non-OWS byte (a bare "Upgrade: " is
+     * not a protocol switch; RFC 6455 requires a protocol name). The
+     * request line cannot false-positive: it has no ':' of its own (or
+     * only the one inside an absolute-form request-URI, whose authority
+     * text never equals the 7-byte name "upgrade"). On a match we stop
+     * walking and return 0 — NOTHING is written, the caller forwards
+     * the original head verbatim. */
+    bool is_upgrade = false;
+    size_t i2 = 0;
+    while (i2 < hlen && !is_upgrade) {
+        size_t e2 = i2;
+        while (e2 < hlen && head[e2] != '\r' && head[e2] != '\n')
+            e2++;
+        if (e2 == i2)
+            break;                  /* final blank line */
+        size_t llen2 = e2 - i2;
+        size_t j = 0;
+        while (j < llen2 && head[i2 + j] != ':')
+            j++;
+        if (j < llen2 && j == 7) {
+            static const char want[] = "upgrade";
+            is_upgrade = true;
+            for (size_t k = 0; k < j; k++) {
+                char a = (char)head[i2 + k];
+                if (a >= 'A' && a <= 'Z')
+                    a = (char)(a - 'A' + 'a');
+                if (a != want[k]) {
+                    is_upgrade = false;
+                    break;
+                }
+            }
+            if (is_upgrade) {
+                size_t v = j + 1;
+                while (v < llen2 && (head[i2 + v] == ' ' ||
+                                     head[i2 + v] == '\t'))
+                    v++;
+                is_upgrade = (v < llen2);
+            }
+        }
+        /* skip this line's terminator exactly like the rewrite */
+        if (e2 < hlen && head[e2] == '\r')
+            e2++;
+        if (e2 < hlen && head[e2] == '\n')
+            e2++;
+        i2 = e2;
+    }
+    if (is_upgrade)
+        return 0;    /* verbatim forward; nothing written */
 
     size_t i = 0;
     while (i < hlen) {
