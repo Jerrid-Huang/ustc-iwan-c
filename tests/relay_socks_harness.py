@@ -37,6 +37,21 @@ peer-lockout table is file-static and must start clean per case):
             asserts the upstream received it byte-for-byte (no truncation,
             no half-rewrite, no injected Connection: close — the explicit
             need>outcap fallback).
+  http_space_upgrade
+            R54-WG1-1: courtesy mode, WS absolute-URI request spelled
+            "Upgrade : websocket" (OWS before the colon): asserts the
+            Upgrade exemption still fires and the upstream got the head
+            byte-for-byte (Connection: Upgrade preserved, no close).
+  http_space_conn
+            R54-WG1-1 (same family as R53-A-2): courtesy mode, a
+            NON-Upgrade request with "Connection : keep-alive": asserts
+            the upstream got the exact rewrite — the OWS-spelled line
+            dropped, exactly ONE canonical "Connection: close" (no
+            duplicate Connection).
+  http_space_both
+            R54-WG1-1: courtesy mode, both fields spelled with OWS
+            ("Upgrade : websocket" + "Connection : Upgrade"): asserts
+            verbatim forward (exemption fires).
 
 A case fails if the binary exits non-zero (crash, sanitizer report,
 assertion) or prints RESULT ...: FAIL. Exits 0 iff all cases pass.
@@ -118,7 +133,8 @@ def main():
 
     all_ok = True
     for case in ("tokpr2", "notokpr2", "pr0",
-                 "http_upgrade_exempt", "http_overflow_fallback"):
+                 "http_upgrade_exempt", "http_overflow_fallback",
+                 "http_space_upgrade", "http_space_conn", "http_space_both"):
         ok = run_case(path, case, args.token, args.show_output)
         all_ok = all_ok and ok
         if not ok:

@@ -57,6 +57,26 @@
  *             the upstream must receive it VERBATIM — no truncation, no
  *             half-rewrite, no injected Connection: close (the explicit
  *             need>outcap fallback).
+ *   http_space_upgrade
+ *             R54-WG1-1: courtesy mode, WS absolute-URI request spelled
+ *             `Upgrade : websocket` (OWS before the colon, RFC 7230
+ *             §3.2-allowed and real-world reachable). The Upgrade
+ *             detector must tolerate that OWS so the R53-A-1 exemption
+ *             still fires: upstream receives the head VERBATIM
+ *             (Connection: Upgrade preserved, no injected close) and a
+ *             strict origin can answer 101.
+ *   http_space_conn
+ *             R54-WG1-1 (same family as R53-A-2): courtesy mode, a
+ *             NON-Upgrade absolute-URI request bearing
+ *             `Connection : keep-alive` (OWS before the colon). The
+ *             Connection detector must tolerate that OWS in BOTH the
+ *             pre-scan and the emit loop: upstream receives the exact
+ *             rewrite — that line dropped, exactly ONE canonical
+ *             `Connection: close` injected, never a duplicate Connection.
+ *   http_space_both
+ *             R54-WG1-1: courtesy mode, BOTH fields spaced
+ *             (`Upgrade : websocket` + `Connection : Upgrade`); the
+ *             Upgrade exemption must still fire and forward VERBATIM.
  *
  * Exit code 0 only when every step of the case passed.
  *
@@ -610,6 +630,205 @@ static int case_http_overflow_fallback(uint16_t port)
     return bad;
 }
 
+/* R54-WG1-1: `Upgrade : websocket` — RFC 7230 §3.2 lets a sender place
+ * optional whitespace (OWS: SP/HTAB) between the field name and the
+ * colon, and real clients do. The R53-A-1 upgrade detector used to
+ * require the colon at exactly index 7, so this spelling escaped the
+ * exemption and the R52-B1 rewrite dropped `Connection: Upgrade` while
+ * injecting `Connection: close` — a strict RFC 7230 §6.7 origin then
+ * answers 400 and the WS-over-proxy handshake dies. The upstream must
+ * receive the client's exact head VERBATIM. */
+static int case_http_space_upgrade(uint16_t port)
+{
+    uint16_t uport = 0;
+    int lfd = cap_upstream_listen(&uport);
+    if (lfd < 0)
+        return 1;
+    struct RelayProxy *rp = relay_start(NULL, port);   /* courtesy mode */
+    if (!rp) {
+        port_close(lfd);
+        return 1;
+    }
+    char head[512];
+    size_t hlen = (size_t)snprintf(
+        head, sizeof head,
+        "GET http://127.0.0.1:%u/chat HTTP/1.1\r\n"
+        "Host: ws.local\r\n"
+        "Upgrade : websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "\r\n", (unsigned)uport);
+    int bad = 1;
+    int fd = cli_connect(port);
+    if (fd < 0) {
+        note_fail("http_space_upgrade: relay connect failed");
+    } else {
+        if (cli_send_all(fd, (const uint8_t *)head, hlen) != 0) {
+            note_fail("http_space_upgrade: head send failed");
+        } else {
+            uint8_t *up = NULL;
+            size_t upn = 0;
+            int cr = cap_upstream_capture(lfd, &up, &upn);
+            if (cr != 0) {
+                note_fail("http_space_upgrade: upstream capture failed");
+            } else if (upn == hlen && memcmp(up, head, hlen) == 0) {
+                note_ok("PASS http_space_upgrade: upstream got the "
+                        "%zu-byte head VERBATIM despite `Upgrade :` OWS: "
+                        "Connection: Upgrade preserved, no Connection: "
+                        "close injected", upn);
+                bad = 0;
+            } else {
+                note_fail("http_space_upgrade: upstream got %zu bytes, "
+                          "expected %zu verbatim (Connection: "
+                          "Upgrade=%d, Connection: close=%d)",
+                          upn, hlen,
+                          mem_contains(up, upn, "Connection: Upgrade"),
+                          mem_contains(up, upn, "Connection: close"));
+            }
+            free(up);
+        }
+        port_close(fd);
+    }
+    relay_proxy_stop(rp);
+    port_close(lfd);
+    printf("RESULT http_space_upgrade: %s\n", bad ? "FAIL" : "PASS");
+    return bad;
+}
+
+/* R54-WG1-1 (same family as R53-A-2): a NON-Upgrade absolute-URI request
+ * whose Connection field carries OWS before the colon (`Connection :
+ * keep-alive`). Both the pre-scan and the emit loop used to require the
+ * colon at exactly index 10, so this spelling was NOT recognized as a
+ * Connection field: the original line was forwarded unchanged AND a
+ * second `Connection: close` was appended — two Connection headers on
+ * the wire (per RFC 7230 §3.2 a field name is a single token; a proxy
+ * MUST NOT forward a duplicate Connection field family). The rewrite must
+ * drop the OWS-spelled line and inject exactly ONE canonical
+ * `Connection: close`. */
+static int case_http_space_conn(uint16_t port)
+{
+    uint16_t uport = 0;
+    int lfd = cap_upstream_listen(&uport);
+    if (lfd < 0)
+        return 1;
+    struct RelayProxy *rp = relay_start(NULL, port);   /* courtesy mode */
+    if (!rp) {
+        port_close(lfd);
+        return 1;
+    }
+    char head[512];
+    size_t hlen = (size_t)snprintf(
+        head, sizeof head,
+        "GET http://127.0.0.1:%u/connsp HTTP/1.1\r\n"
+        "Host: conn.local\r\n"
+        "Connection : keep-alive\r\n"
+        "\r\n", (unsigned)uport);
+    /* the exact expected rewrite: the `Connection : keep-alive` line is
+     * dropped and ONE canonical `Connection: close` replaces the blank
+     * line before the terminator */
+    char want[512];
+    size_t wlen = (size_t)snprintf(
+        want, sizeof want,
+        "GET http://127.0.0.1:%u/connsp HTTP/1.1\r\n"
+        "Host: conn.local\r\n"
+        "Connection: close\r\n"
+        "\r\n", (unsigned)uport);
+    int bad = 1;
+    int fd = cli_connect(port);
+    if (fd < 0) {
+        note_fail("http_space_conn: relay connect failed");
+    } else {
+        if (cli_send_all(fd, (const uint8_t *)head, hlen) != 0) {
+            note_fail("http_space_conn: head send failed");
+        } else {
+            uint8_t *up = NULL;
+            size_t upn = 0;
+            int cr = cap_upstream_capture(lfd, &up, &upn);
+            if (cr != 0) {
+                note_fail("http_space_conn: upstream capture failed");
+            } else if (upn == wlen && memcmp(up, want, wlen) == 0) {
+                note_ok("PASS http_space_conn: `Connection : keep-alive` "
+                        "dropped, exactly one canonical `Connection: "
+                        "close` injected (%zu-byte rewrite, no duplicate "
+                        "Connection)", upn);
+                bad = 0;
+            } else {
+                note_fail("http_space_conn: upstream got %zu bytes, "
+                          "expected the %zu-byte rewrite (kept `Connection "
+                          ": keep-alive`=%d, `Connection: close`=%d)",
+                          upn, wlen,
+                          mem_contains(up, upn, "Connection : keep-alive"),
+                          mem_contains(up, upn, "Connection: close"));
+            }
+            free(up);
+        }
+        port_close(fd);
+    }
+    relay_proxy_stop(rp);
+    port_close(lfd);
+    printf("RESULT http_space_conn: %s\n", bad ? "FAIL" : "PASS");
+    return bad;
+}
+
+/* R54-WG1-1: BOTH header fields carry OWS before the colon. The Upgrade
+ * exemption must still fire (verbatim forward) — if either detector
+ * missed its spelling, the rewrite would drop `Connection : Upgrade`
+ * and inject `Connection: close`, corrupting the 101 handshake. */
+static int case_http_space_both(uint16_t port)
+{
+    uint16_t uport = 0;
+    int lfd = cap_upstream_listen(&uport);
+    if (lfd < 0)
+        return 1;
+    struct RelayProxy *rp = relay_start(NULL, port);   /* courtesy mode */
+    if (!rp) {
+        port_close(lfd);
+        return 1;
+    }
+    char head[512];
+    size_t hlen = (size_t)snprintf(
+        head, sizeof head,
+        "GET http://127.0.0.1:%u/chat HTTP/1.1\r\n"
+        "Host: ws.local\r\n"
+        "Upgrade : websocket\r\n"
+        "Connection : Upgrade\r\n"
+        "\r\n", (unsigned)uport);
+    int bad = 1;
+    int fd = cli_connect(port);
+    if (fd < 0) {
+        note_fail("http_space_both: relay connect failed");
+    } else {
+        if (cli_send_all(fd, (const uint8_t *)head, hlen) != 0) {
+            note_fail("http_space_both: head send failed");
+        } else {
+            uint8_t *up = NULL;
+            size_t upn = 0;
+            int cr = cap_upstream_capture(lfd, &up, &upn);
+            if (cr != 0) {
+                note_fail("http_space_both: upstream capture failed");
+            } else if (upn == hlen && memcmp(up, head, hlen) == 0) {
+                note_ok("PASS http_space_both: upstream got the "
+                        "%zu-byte head VERBATIM (Upgrade + Connection both "
+                        "spelled with OWS; exemption still fires, no "
+                        "rewrite)", upn);
+                bad = 0;
+            } else {
+                note_fail("http_space_both: upstream got %zu bytes, "
+                          "expected %zu verbatim (Connection: "
+                          "Upgrade=%d, Connection: close=%d)",
+                          upn, hlen,
+                          mem_contains(up, upn, "Connection: Upgrade"),
+                          mem_contains(up, upn, "Connection: close"));
+            }
+            free(up);
+        }
+        port_close(fd);
+    }
+    relay_proxy_stop(rp);
+    port_close(lfd);
+    printf("RESULT http_space_both: %s\n", bad ? "FAIL" : "PASS");
+    return bad;
+}
+
 int main(int argc, char **argv)
 {
     const char *token = NULL;
@@ -622,7 +841,8 @@ int main(int argc, char **argv)
             casename = argv[++i];
         } else {
             fprintf(stderr, "usage: %s --case tokpr2|notokpr2|pr0|"
-                    "http_upgrade_exempt|http_overflow_fallback "
+                    "http_upgrade_exempt|http_overflow_fallback|"
+                    "http_space_upgrade|http_space_conn|http_space_both "
                     "[--token STR]\n", argv[0]);
             return 2;
         }
@@ -633,7 +853,10 @@ int main(int argc, char **argv)
     }
     if (strcmp(casename, "notokpr2") != 0 &&
         strcmp(casename, "http_upgrade_exempt") != 0 &&
-        strcmp(casename, "http_overflow_fallback") != 0 && !token) {
+        strcmp(casename, "http_overflow_fallback") != 0 &&
+        strcmp(casename, "http_space_upgrade") != 0 &&
+        strcmp(casename, "http_space_conn") != 0 &&
+        strcmp(casename, "http_space_both") != 0 && !token) {
         fprintf(stderr, "harness: --token required for --case %s\n",
                 casename);
         return 2;
@@ -659,6 +882,12 @@ int main(int argc, char **argv)
         rc = case_http_upgrade_exempt(port);
     else if (strcmp(casename, "http_overflow_fallback") == 0)
         rc = case_http_overflow_fallback(port);
+    else if (strcmp(casename, "http_space_upgrade") == 0)
+        rc = case_http_space_upgrade(port);
+    else if (strcmp(casename, "http_space_conn") == 0)
+        rc = case_http_space_conn(port);
+    else if (strcmp(casename, "http_space_both") == 0)
+        rc = case_http_space_both(port);
     else {
         fprintf(stderr, "harness: unknown case '%s'\n", casename);
         return 2;
