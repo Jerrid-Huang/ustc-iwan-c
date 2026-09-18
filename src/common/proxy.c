@@ -183,6 +183,15 @@ static int send_ctrl(pump_ctx_t *ctx, uint8_t typ, uint8_t enc, uint16_t sid,
  * hiccup) must not kill the session, while a persistent failure means
  * the socket is gone */
 #define PUMP_KA_FAIL_MAX 3
+/* R54-WG4-1 (C3): consecutive poll_error-only rounds (revents has
+ * POLLERR/POLLHUP but no POLLIN) before the no-data poll/recv pair is
+ * declared session loss. Linux consumes each pending ICMP error on the
+ * next recvmmsg (ECONNREFUSED), so one error = one poll/recv pair =
+ * network-paced, not a hot spin — but a state that keeps producing
+ * error polls without ever yielding a datagram must terminate instead
+ * of spinning the pump; 64 is far above any legitimate burst before
+ * the error bit clears. */
+#define PUMP_ERR_POLL_MAX 64
 /* no downlink for this long => session lost: the server purged or
  * rebooted the session. Not all servers answer ECHO_REQ keepalives (a
  * live-but-silent session then produces no downlink at all), so the
@@ -702,6 +711,9 @@ static void *udp2tun_thread(void *ud) {
     uint64_t last_rx = now_ms();   /* any downlink resets the stale clock */
     int ka_fail = 0;
     int ka_res_fail = 0;   /* M13: consecutive ECHO_RES reply failures */
+    /* R54-WG4-1 (C3): consecutive no-data poll-error rounds (see
+     * PUMP_ERR_POLL_MAX); reset on any real datagram or a clean poll */
+    int err_poll_n = 0;
     int i;
 
     if (!batch) {
@@ -759,8 +771,11 @@ static void *udp2tun_thread(void *ud) {
         int v = port_recvmmsg(ctx->sockfd, msgs, (unsigned)rxbatch,
                               MSG_DONTWAIT, NULL);
         pump_prof_add(&ctx->prof[PP_RECV], now_us() - t_recv);
-        if (v > 0 && pump_prof_on())
-            atomic_fetch_add(&g_prof_recv_dgrams, (uint64_t)v);
+        if (v > 0) {
+            err_poll_n = 0;   /* C3: a real datagram clears the error streak */
+            if (pump_prof_on())
+                atomic_fetch_add(&g_prof_recv_dgrams, (uint64_t)v);
+        }
         if (v == 0 || (v < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))) {
             /* R04: empty queue is now -1/EAGAIN on all three platforms
              * (M12/M3-8 fixed macOS/Windows to match Linux), so it is
@@ -791,6 +806,43 @@ static void *udp2tun_thread(void *ud) {
                 ctx->session_lost = true;   /* abnormal: reconnect */
                 g_stop = 1;   /* any pump-fatal error stops the tunnel */
                 break;
+            }
+            /* R54-WG4-1 (C3): poll() error bits used to be invisible here —
+             * only pr<0 was checked, so a connected-UDP session socket that
+             * kept receiving ICMP port-unreachable errors (POLLERR) made poll
+             * return instantly with no POLLIN, and the recvmmsg/poll pair
+             * churned at error-arrival pace. Handle the bits explicitly so
+             * the error state CONVERGES:
+             *  - POLLNVAL = the fd is no longer a valid socket (closed /
+             *    replaced): recvmmsg on it can only fail/loop — fail safe
+             *    and let the caller reconnect.
+             *  - POLLERR/POLLHUP with no POLLIN: fall through to recvmmsg,
+             *    which consumes the pending ICMP error (ECONNREFUSED ->
+             *    continue above) and clears the bit; while it persists the
+             *    pair repeats network-paced. Only a streak past
+             *    PUMP_ERR_POLL_MAX that NEVER yields a datagram is treated
+             *    as session loss, so a pathological state cannot spin here. */
+            if (pr > 0 && (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+                if (pfd.revents & POLLNVAL) {
+                    err_printf("[UDP->TUN] poll POLLNVAL: session socket "
+                            "invalid; session lost\n");
+                    ctx->session_lost = true;
+                    g_stop = 1;
+                    break;
+                }
+                if (!(pfd.revents & POLLIN)) {
+                    if (++err_poll_n > PUMP_ERR_POLL_MAX) {
+                        log_err("[UDP->TUN] %d consecutive poll errors "
+                                "without data; session lost", err_poll_n);
+                        ctx->session_lost = true;
+                        g_stop = 1;
+                        break;
+                    }
+                } else {
+                    err_poll_n = 0;   /* data readable: normal path */
+                }
+            } else {
+                err_poll_n = 0;   /* POLLIN or a clean timeout: state clear */
             }
             continue;
         }

@@ -110,16 +110,23 @@ static unsigned socks_rx_stale_ms(void)
 void wait_events(int listener, int sockfd, int dns_evfd, int timeout_ms)
 {
     struct pollfd fds[3 + MAX_FLOWS];
+    Flow *fmap[3 + MAX_FLOWS];  /* poll slot -> owning flow (R54-WG4-1):
+                                 * flows are registered with skips (inactive
+                                 * / fd<0), so the slot index is NOT the flow
+                                 * index — map each slot back to its Flow */
     int n = 0;
     fds[n].fd = PORT_FD_ARG(listener);
     fds[n].events = POLLIN;
+    fmap[n] = NULL;
     n++;
     fds[n].fd = PORT_FD_ARG(sockfd);
     fds[n].events = POLLIN;
+    fmap[n] = NULL;
     n++;
     if (dns_evfd >= 0) {
         fds[n].fd = PORT_FD_ARG(dns_evfd);
         fds[n].events = POLLIN;
+        fmap[n] = NULL;
         n++;
     }
     for (int i = 0; i < MAX_FLOWS; i++) {
@@ -164,10 +171,55 @@ void wait_events(int listener, int sockfd, int dns_evfd, int timeout_ms)
                 : POLLIN;
         if (f->output.len > 0 || f->rxq_waiting)
             fds[n].events |= POLLOUT;
+        fmap[n] = f;
         n++;
     }
-    if (port_poll(fds, (nfds_t)n, timeout_ms) < 0 && errno != EINTR)
+    int pr = port_poll(fds, (nfds_t)n, timeout_ms);
+    if (pr < 0 && errno != EINTR)
         log_err("poll: %s", strerror(errno));
+    /* R54-WG4-1 (C3): poll() error bits were ignored here — a slot whose
+     * fd is invalid (POLLNVAL) makes poll return INSTANTLY with no
+     * readable data, so wait_events would turn the parked event loop
+     * into an immediate-return busy spin while the round kept reading/
+     * writing the dead fd. The error states that DO converge must stay
+     * untouched: POLLERR/POLLHUP on a client fd are terminal socket
+     * states that service_local_inputs/outputs already converge on
+     * every round (readv EOF/RST -> ST_CLOSING, buffered output still
+     * flushed), and POLLERR on the session socket is consumed by
+     * receive_vpn's recvmmsg — acting on them here would risk dropping
+     * f->output. Only POLLNVAL (the fd is NOT open: an invariant
+     * violation) is acted on, fail-safe:
+     *  - flow fd: close/free the flow (it could never be read again);
+     *  - listener / session socket / DNS eventfd: log and stop /
+     *    session-lost so the caller reconnects instead of spinning on a
+     *    dead core. (The dead LISTENER fd is additionally tolerated by
+     *    accept_connections' own EBADF pacing at ~1 line/s + 50ms —
+     *    that keep-alive path is preserved; a listener POLLNVAL here
+     *    only fires with a listener-fd bug, which cannot recover.) */
+    if (pr > 0) {
+        for (int i = 0; i < n; i++) {
+            if (!(fds[i].revents & POLLNVAL))
+                continue;
+            Flow *f = fmap[i];
+            if (f) {
+                log_err("[flow %lu] poll POLLNVAL on fd %d: flow closed",
+                        (unsigned long)f->id, f->fd);
+                flow_free(f);
+            } else if (i == 0) {
+                log_err("poll POLLNVAL on listener fd %d",
+                        (int)listener);
+            } else if (i == 1) {
+                log_err("poll POLLNVAL on session socket fd %d: "
+                        "session lost", (int)sockfd);
+                if (g_socks_cfg)
+                    g_socks_cfg->session_lost = true;
+                g_stop = 1;
+            } else {
+                log_err("poll POLLNVAL on DNS eventfd: DNS wakeups "
+                        "degraded");
+            }
+        }
+    }
 }
 
 void accept_connections(int listener) {
