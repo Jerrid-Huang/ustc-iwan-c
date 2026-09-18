@@ -23,6 +23,20 @@ peer-lockout table is file-static and must start clean per case):
   notokpr2  no-token (courtesy) mode: pr==2 answers {1,1}, no crash.
   pr0       token mode: 10 x malformed ulen=0 frames answered {1,1} but
             NOT counted (11th connection still served) -> R46-L4 split.
+  http_upgrade_exempt
+            R53-A-1: courtesy mode, HTTP absolute-URI forward of an
+            `Upgrade: websocket` + `Connection: Upgrade` request through
+            the REAL relay to the harness's own raw-TCP capture upstream;
+            asserts the upstream received the head byte-for-byte
+            (Connection: Upgrade preserved, no injected Connection: close
+            — the R52-B1 rewrite must exempt Upgrade/101 handshakes).
+  http_overflow_fallback
+            R53-A-3: courtesy mode, a mixed-line-ending head (4000 x
+            "A\n" + CRLFCRLF, 8045 B < the 8191 B handshake cap) whose
+            exact rewritten size exceeds the relay's conn_head buffer;
+            asserts the upstream received it byte-for-byte (no truncation,
+            no half-rewrite, no injected Connection: close — the explicit
+            need>outcap fallback).
 
 A case fails if the binary exits non-zero (crash, sanitizer report,
 assertion) or prints RESULT ...: FAIL. Exits 0 iff all cases pass.
@@ -37,6 +51,11 @@ import sys
 # default to --token seckey001)
 DEFAULT_TOKEN = "seckey001"
 
+# cases that need --token; the courtesy (no-token) cases get none — an
+# HTTP case must NOT be given a token (a token-mode relay refuses plain
+# HTTP: HTTP clients cannot do RFC1929)
+TOKEN_CASES = ("tokpr2", "pr0")
+
 
 def harness_path():
     here = os.path.dirname(os.path.abspath(__file__))
@@ -49,7 +68,7 @@ def harness_path():
 
 def run_case(path, case, token, show_output):
     args = [path, "--case", case]
-    if case != "notokpr2":
+    if case in TOKEN_CASES:
         args += ["--token", token]
     try:
         proc = subprocess.run(args, capture_output=True, text=True,
@@ -98,7 +117,8 @@ def main():
         return 1
 
     all_ok = True
-    for case in ("tokpr2", "notokpr2", "pr0"):
+    for case in ("tokpr2", "notokpr2", "pr0",
+                 "http_upgrade_exempt", "http_overflow_fallback"):
         ok = run_case(path, case, args.token, args.show_output)
         all_ok = all_ok and ok
         if not ok:

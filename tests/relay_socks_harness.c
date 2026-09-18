@@ -41,6 +41,23 @@
  *             answers {1,1}, then an 11th connection is STILL served
  *             (not blocked) — malformed frames must NOT count.
  *
+ *   http_upgrade_exempt
+ *             R53-A-1: courtesy (no-token) mode, HTTP absolute-URI
+ *             forward of a request with `Upgrade: websocket` +
+ *             `Connection: Upgrade` through the REAL relay to a raw-TCP
+ *             capture upstream; the upstream must receive the head
+ *             VERBATIM — Connection: Upgrade survives, no injected
+ *             Connection: close (the R52-B1 rewrite must exempt
+ *             Upgrade/101 handshakes; a rewrite would make every strict
+ *             origin reply 400 and kill WS-over-proxy).
+ *   http_overflow_fallback
+ *             R53-A-3: courtesy mode, a mixed-line-ending head (4000 x
+ *             "A\n" + CRLFCRLF, 8045 B < the 8191 B handshake cap) whose
+ *             exact rewritten size would exceed the conn_head buffer;
+ *             the upstream must receive it VERBATIM — no truncation, no
+ *             half-rewrite, no injected Connection: close (the explicit
+ *             need>outcap fallback).
+ *
  * Exit code 0 only when every step of the case passed.
  *
  * This binary exists ONLY for tests; it must never be shipped.
@@ -48,6 +65,7 @@
 
 #include <signal.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -238,6 +256,128 @@ static int attempt(uint16_t port, const uint8_t *frm, size_t flen,
     return bad;
 }
 
+/* ---- R53-A-1 / R53-A-3: raw-TCP capture upstream for the HTTP
+ * absolute-URI forward path.
+ *
+ * The harness has no capture-upstream mode, so the case itself IS the
+ * upstream: a plain loopback TCP server the relay connects to (the
+ * authority in the forwarded request's absolute URI) that accepts one
+ * connection and captures every byte the relay forwards. Everything here
+ * is blocking and runs on the harness thread while the REAL relay works
+ * in its own threads — there is no cross-thread state to share.
+ *
+ * Both HTTP cases run in courtesy (token = NULL) mode: a token-mode
+ * relay refuses plain HTTP (HTTP clients cannot do RFC1929; see
+ * rp_conn_main). */
+
+static int cap_upstream_listen(uint16_t *port_out)
+{
+    int fd = (int)port_socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        note_fail("cap: upstream socket: %s", strerror(errno));
+        return -1;
+    }
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port = 0;
+    if (port_bind(fd, (const struct sockaddr *)&a, sizeof a) != 0) {
+        note_fail("cap: upstream bind: %s", strerror(errno));
+        port_close(fd);
+        return -1;
+    }
+    socklen_t al = sizeof a;
+    if (getsockname(PORT_FD_ARG(fd), (struct sockaddr *)&a, &al) != 0) {
+        note_fail("cap: upstream getsockname: %s", strerror(errno));
+        port_close(fd);
+        return -1;
+    }
+    *port_out = (uint16_t)ntohs(a.sin_port);
+    if (port_listen(fd, 2) != 0) {
+        note_fail("cap: upstream listen: %s", strerror(errno));
+        port_close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/* Accept the relay's outbound connection and read everything it
+ * forwards. Returns 0 with a heap copy in *out / *out_n, or -1. The relay
+ * connects promptly after parsing the request head (10 s poll cap turns
+ * a relay/forward failure into a clean FAIL, not a hang). After the head
+ * the relay keeps the duplex pipe OPEN (no EOF), so capture ends on a
+ * quiet recv: a full timeout with no more data means everything arrived
+ * (the cases below forward one request head in a single burst). */
+static int cap_upstream_capture(int lfd, uint8_t **out, size_t *out_n)
+{
+    struct pollfd pfd = { .fd = PORT_FD_ARG(lfd), .events = POLLIN };
+    int pr = port_poll(&pfd, 1, 10000);
+    if (pr <= 0) {
+        note_fail("cap: upstream accept: relay never connected "
+                  "(poll rc=%d %s)", pr, strerror(errno));
+        return -1;
+    }
+    int cfd = port_accept(lfd, NULL, NULL);
+    if (cfd < 0) {
+        note_fail("cap: upstream accept: %s", strerror(errno));
+        return -1;
+    }
+    struct timeval rtv = { .tv_sec = 2, .tv_usec = 0 };
+    port_setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof rtv);
+
+    size_t cap = 8192, n = 0;
+    uint8_t *b = (uint8_t *)malloc(cap);
+    if (!b) {
+        note_fail("cap: malloc(%zu) failed", cap);
+        port_close(cfd);
+        return -1;
+    }
+    for (;;) {
+        if (n == cap) {
+            size_t ncap = cap * 2;
+            uint8_t *nb = (uint8_t *)realloc(b, ncap);
+            if (!nb) {
+                note_fail("cap: realloc(%zu) failed", ncap);
+                free(b);
+                port_close(cfd);
+                return -1;
+            }
+            b = nb;
+            cap = ncap;
+        }
+        ssize_t r = (ssize_t)port_recv(cfd, b + n, cap - n, 0);
+        if (r > 0) {
+            n += (size_t)r;
+            continue;
+        }
+        if (r == 0)
+            break;   /* relay closed its upstream side (not expected) */
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT)
+            break;   /* quiet: capture complete */
+        note_fail("cap: upstream recv: %s", strerror(errno));
+        free(b);
+        port_close(cfd);
+        return -1;
+    }
+    port_close(cfd);
+    *out = b;
+    *out_n = n;
+    return 0;
+}
+
+static bool mem_contains(const uint8_t *hay, size_t hn, const char *needle)
+{
+    size_t nn = strlen(needle);
+    if (nn == 0 || nn > hn)
+        return false;
+    for (size_t i = 0; i + nn <= hn; i++) {
+        if (memcmp(hay + i, needle, nn) == 0)
+            return true;
+    }
+    return false;
+}
+
 /* ---- relay instance management ---- */
 
 static uint16_t pick_port(void)
@@ -339,6 +479,137 @@ static int case_pr0(const char *token, uint16_t port)
     return bad;
 }
 
+/* R53-A-1: an Upgrade request must be forwarded verbatim — the R52-B1
+ * `Connection: close` rewrite would corrupt a 101 handshake (a compliant
+ * origin only answers 101 to a request that still bears
+ * `Connection: Upgrade`). The upstream must see the client's exact head:
+ * `Connection: Upgrade` preserved, no injected/rewritten close. */
+static int case_http_upgrade_exempt(uint16_t port)
+{
+    uint16_t uport = 0;
+    int lfd = cap_upstream_listen(&uport);
+    if (lfd < 0)
+        return 1;
+    struct RelayProxy *rp = relay_start(NULL, port);   /* courtesy mode */
+    if (!rp) {
+        port_close(lfd);
+        return 1;
+    }
+    char head[512];
+    size_t hlen = (size_t)snprintf(
+        head, sizeof head,
+        "GET http://127.0.0.1:%u/u HTTP/1.1\r\n"
+        "Host: u.local\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "\r\n", (unsigned)uport);
+    int bad = 1;
+    int fd = cli_connect(port);
+    if (fd < 0) {
+        note_fail("http_upgrade_exempt: relay connect failed");
+    } else {
+        if (cli_send_all(fd, (const uint8_t *)head, hlen) != 0) {
+            note_fail("http_upgrade_exempt: head send failed");
+        } else {
+            uint8_t *up = NULL;
+            size_t upn = 0;
+            int cr = cap_upstream_capture(lfd, &up, &upn);
+            if (cr != 0) {
+                note_fail("http_upgrade_exempt: upstream capture failed");
+            } else if (upn == hlen && memcmp(up, head, hlen) == 0) {
+                note_ok("PASS http_upgrade_exempt: upstream got the %zu-byte "
+                        "head VERBATIM: Connection: Upgrade preserved, "
+                        "no Connection: close injected", upn);
+                bad = 0;
+            } else {
+                note_fail("http_upgrade_exempt: upstream got %zu bytes, "
+                          "expected %zu verbatim (Connection: Upgrade=%d, "
+                          "Connection: close=%d)",
+                          upn, hlen,
+                          mem_contains(up, upn, "Connection: Upgrade"),
+                          mem_contains(up, upn, "Connection: close"));
+            }
+            free(up);
+        }
+        port_close(fd);
+    }
+    relay_proxy_stop(rp);
+    port_close(lfd);
+    printf("RESULT http_upgrade_exempt: %s\n", bad ? "FAIL" : "PASS");
+    return bad;
+}
+
+/* R53-A-3: a mixed-line-ending head whose exact rewritten size would
+ * exceed conn_head (8224) is forwarded verbatim. 4000 x "A\n" lines give
+ * a ~8045 B head that fits the relay's 8191 B handshake cap, but the
+ * lone-\n -> \r\n rewrite needs ~12 KiB out; the exact `need` precompute
+ * detects the overflow and falls back to the ORIGINAL head, never a
+ * truncated / half-rewritten / close-injected stream. */
+static int case_http_overflow_fallback(uint16_t port)
+{
+    uint16_t uport = 0;
+    int lfd = cap_upstream_listen(&uport);
+    if (lfd < 0)
+        return 1;
+    struct RelayProxy *rp = relay_start(NULL, port);   /* courtesy mode */
+    if (!rp) {
+        port_close(lfd);
+        return 1;
+    }
+    char head[9000];
+    size_t o = (size_t)snprintf(
+        head, sizeof head,
+        "GET http://127.0.0.1:%u/ooo HTTP/1.1\r\n", (unsigned)uport);
+    for (int i = 0; i < 4000; i++) {
+        head[o++] = 'A';
+        head[o++] = '\n';
+    }
+    memcpy(head + o, "\r\n\r\n", 4);
+    o += 4;
+    size_t hlen = o;
+    if (hlen >= 8191) {
+        /* the case must exercise the fallback, not the 431 over-cap path */
+        note_fail("http_overflow_fallback: head too long (%zu >= 8191)",
+                  hlen);
+        relay_proxy_stop(rp);
+        port_close(lfd);
+        return 1;
+    }
+    int bad = 1;
+    int fd = cli_connect(port);
+    if (fd < 0) {
+        note_fail("http_overflow_fallback: relay connect failed");
+    } else {
+        if (cli_send_all(fd, (const uint8_t *)head, hlen) != 0) {
+            note_fail("http_overflow_fallback: head send failed");
+        } else {
+            uint8_t *up = NULL;
+            size_t upn = 0;
+            int cr = cap_upstream_capture(lfd, &up, &upn);
+            if (cr != 0) {
+                note_fail("http_overflow_fallback: upstream capture failed");
+            } else if (upn == hlen && memcmp(up, head, hlen) == 0) {
+                note_ok("PASS http_overflow_fallback: %zu-byte mixed-EOL "
+                        "head forwarded VERBATIM (need>outcap explicit "
+                        "fallback: no truncation, no half-rewrite, no "
+                        "Connection: close)", upn);
+                bad = 0;
+            } else {
+                note_fail("http_overflow_fallback: upstream got %zu bytes, "
+                          "expected %zu verbatim (Connection: close=%d)",
+                          upn, hlen,
+                          mem_contains(up, upn, "Connection: close"));
+            }
+            free(up);
+        }
+        port_close(fd);
+    }
+    relay_proxy_stop(rp);
+    port_close(lfd);
+    printf("RESULT http_overflow_fallback: %s\n", bad ? "FAIL" : "PASS");
+    return bad;
+}
+
 int main(int argc, char **argv)
 {
     const char *token = NULL;
@@ -350,7 +621,8 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[i], "--case") == 0 && i + 1 < argc) {
             casename = argv[++i];
         } else {
-            fprintf(stderr, "usage: %s --case tokpr2|notokpr2|pr0 "
+            fprintf(stderr, "usage: %s --case tokpr2|notokpr2|pr0|"
+                    "http_upgrade_exempt|http_overflow_fallback "
                     "[--token STR]\n", argv[0]);
             return 2;
         }
@@ -359,7 +631,9 @@ int main(int argc, char **argv)
         fprintf(stderr, "harness: --case required\n");
         return 2;
     }
-    if (strcmp(casename, "notokpr2") != 0 && !token) {
+    if (strcmp(casename, "notokpr2") != 0 &&
+        strcmp(casename, "http_upgrade_exempt") != 0 &&
+        strcmp(casename, "http_overflow_fallback") != 0 && !token) {
         fprintf(stderr, "harness: --token required for --case %s\n",
                 casename);
         return 2;
@@ -381,6 +655,10 @@ int main(int argc, char **argv)
         rc = case_notokpr2(port);
     else if (strcmp(casename, "pr0") == 0)
         rc = case_pr0(token, port);
+    else if (strcmp(casename, "http_upgrade_exempt") == 0)
+        rc = case_http_upgrade_exempt(port);
+    else if (strcmp(casename, "http_overflow_fallback") == 0)
+        rc = case_http_overflow_fallback(port);
     else {
         fprintf(stderr, "harness: unknown case '%s'\n", casename);
         return 2;
