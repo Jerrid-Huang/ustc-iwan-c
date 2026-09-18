@@ -1322,7 +1322,9 @@ static void rp_http_bad(struct rp_hs *hs, int fd)
  * existing `Connection` header line (skipped) and inserts one
  * `Connection: close\r\n` as the last header, so the forwarded head
  * carries exactly one, canonical, non-ambiguous close option. Header
- * names are matched case-insensitively per RFC 7230 §3.2. Returns the
+ * names are matched case-insensitively per RFC 7230 §3.2, tolerating
+ * OWS before the ':' (R54-WG1-1), via a single shared rp_hdr_name_eq()
+ * used by both the exact-size pre-scan and the emit loop. Returns the
  * rewritten length, or 0 meaning "no rewrite: forward the original head
  * verbatim" — for an Upgrade request (R53-A-1) or when the exact
  * rewritten size `need` (R53-A-3, precomputed exactly) exceeds outcap. In
@@ -1344,6 +1346,51 @@ static void rp_http_bad(struct rp_hs *hs, int fd)
  * Connection header family, which for an Upgrade request legitimately
  * contains Upgrade plus whatever else the client paired with it —
  * rewriting any part of it would corrupt the handshake. */
+/* R54-WG1-1 (same family as the un-fixed R53-A-2): per RFC 7230 §3.2 a
+ * sender may put optional whitespace (OWS: SP/HTAB) between a header
+ * field name and its ':'. Real clients do ("Upgrade : websocket",
+ * "Connection : keep-alive"), and the relay must recognise the name in
+ * both of its walks over the head. To find the effective field name,
+ * locate the protocol colon, then walk BACK over SP/HTAB to the last
+ * name byte and compare that fixed-length prefix case-insensitively
+ * against `name`. A line with no ':' at all (the request line, or an
+ * obs-fold continuation that lacks one) never matches; an obs-fold
+ * continuation line (leading SP/HTAB) that DOES contain a ':' cannot
+ * false-positive either, because only whitespace IMMEDIATELY before the
+ * colon is stripped — its leading whitespace stays part of the compared
+ * prefix, and a leading SP/HTAB byte can never equal the first byte of
+ * the 7-byte/10-byte names. On a match the colon's index is written to
+ * *colon_out (when non-NULL) so callers can inspect the value.
+ * rp_http_force_close uses THIS ONE helper in both its pre-scan and its
+ * emit walk, so the two passes agree byte-for-byte on which lines are an
+ * Upgrade field and which are a Connection field — they can never drift
+ * (the R53-A-3 exact-size `need` contract holds for every spelling). */
+static bool rp_hdr_name_eq(const uint8_t *line, size_t llen,
+                           const char *name, size_t namelen,
+                           size_t *colon_out)
+{
+    size_t j = 0;
+    while (j < llen && line[j] != ':')
+        j++;
+    if (j >= llen)
+        return false;
+    size_t j_eff = j;
+    while (j_eff > 0 && (line[j_eff - 1] == ' ' || line[j_eff - 1] == '\t'))
+        j_eff--;
+    if (j_eff != namelen)
+        return false;
+    for (size_t k = 0; k < namelen; k++) {
+        char a = (char)line[k];
+        if (a >= 'A' && a <= 'Z')
+            a = (char)(a - 'A' + 'a');
+        if (a != name[k])
+            return false;
+    }
+    if (colon_out)
+        *colon_out = j;
+    return true;
+}
+
 static size_t rp_http_force_close(uint8_t *out, size_t outcap,
                                   const uint8_t *head, size_t hlen)
 {
@@ -1367,15 +1414,23 @@ static size_t rp_http_force_close(uint8_t *out, size_t outcap,
      * with NOTHING written and the caller forwards the original head
      * verbatim:
      *
-     *   is_upgrade (R53-A-1): an `Upgrade:` field — case-insensitive
-     *     7-byte name "upgrade", ':' and a value holding at least one
-     *     non-OWS byte (a bare "Upgrade: " is not a protocol switch; RFC
-     *     6455 requires a protocol name). RFC 7230 §6.7 / RFC 6455 §4.1:
+     *   is_upgrade (R53-A-1 + R54-WG1-1): an `Upgrade:` field —
+     *     case-insensitive 7-byte name "upgrade", ':' and a value
+     *     holding at least one non-OWS byte (a bare "Upgrade: " is not
+     *     a protocol switch; RFC 6455 requires a protocol name). The
+     *     name match is OWS-tolerant: RFC 7230 §3.2 lets a sender place
+     *     SP/HTAB before the ':' ("Upgrade : websocket") and real
+     *     clients do, so the match walks back over that whitespace —
+     *     see the shared rp_hdr_name_eq() helper used by BOTH this
+     *     pre-scan and the rewrite below (one code path, two calls, so
+     *     the passes can never drift). RFC 7230 §6.7 / RFC 6455 §4.1:
      *     the proxy must forward the Upgrade so a compliant origin can
-     *     answer 101, and the close injection would corrupt the handshake
-     *     (see the function doc). The request line cannot false-positive:
-     *     its only ':' is the one inside an absolute-form request-URI,
-     *     whose authority text never equals the 7-byte name.
+     *     answer 101, and the close injection would corrupt the
+     *     handshake (see the function doc). The request line cannot
+     *     false-positive: its only ':' is the one inside an
+     *     absolute-form request-URI, whose authority text never equals
+     *     the 7-byte name; an obs-fold continuation's leading SP/HTAB
+     *     likewise stays part of the compared prefix.
      *
      *   need (R53-A-3): the EXACT number of bytes the rewrite would emit,
      *     accumulated with the same rules (a kept line = content + 2, a
@@ -1403,46 +1458,28 @@ static size_t rp_http_force_close(uint8_t *out, size_t outcap,
             need += cclen + 2;
             break;
         }
-        size_t j = 0;
-        while (j < llen2 && head[i2 + j] != ':')
-            j++;
-        if (j < llen2 && j == 7) {
-            static const char upnm[] = "upgrade";
-            bool is_up = true;
-            for (size_t k = 0; k < j; k++) {
-                char a = (char)head[i2 + k];
-                if (a >= 'A' && a <= 'Z')
-                    a = (char)(a - 'A' + 'a');
-                if (a != upnm[k]) {
-                    is_up = false;
-                    break;
-                }
-            }
-            if (is_up) {
-                size_t v = j + 1;
-                while (v < llen2 && (head[i2 + v] == ' ' ||
-                                     head[i2 + v] == '\t'))
-                    v++;
-                is_upgrade = (v < llen2);
-            }
+        /* R54-WG1-1 + R53-A-1: field-name recognition runs through the
+         * SAME rp_hdr_name_eq() helper as the rewrite walk below — both
+         * passes locate the ':', walk back over any OWS before it and
+         * compare the same fixed-length name, so `Connection : ...` and
+         * `Upgrade : ...` spellings are recognised IDENTICALLY in the
+         * pre-scan and the emit loop (they can never drift). */
+        size_t colon = 0;
+        if (rp_hdr_name_eq(head + i2, llen2, "upgrade", 7, &colon)) {
+            /* R53-A-1: the value must hold at least one non-OWS byte (a
+             * bare "Upgrade: " is not a protocol switch; RFC 6455
+             * requires a protocol name) */
+            size_t v = colon + 1;
+            while (v < llen2 && (head[i2 + v] == ' ' ||
+                                 head[i2 + v] == '\t'))
+                v++;
+            is_upgrade = (v < llen2);
         }
         /* exact-size accumulation, mirroring the rewrite's decision:
          * a Connection line contributes 0 bytes (dropped, one injected
          * at the end), every other line contributes content + CRLF */
-        bool is_conn = false;
-        if (j < llen2 && j == 10) {   /* strlen("connection") */
-            static const char connm[] = "connection";
-            is_conn = true;
-            for (size_t k = 0; k < j; k++) {
-                char a = (char)head[i2 + k];
-                if (a >= 'A' && a <= 'Z')
-                    a = (char)(a - 'A' + 'a');
-                if (a != connm[k]) {
-                    is_conn = false;
-                    break;
-                }
-            }
-        }
+        bool is_conn = rp_hdr_name_eq(head + i2, llen2, "connection", 10,
+                                      NULL);
         if (!is_conn)
             need += llen2 + 2;
         /* skip this line's terminator exactly like the rewrite */
@@ -1464,25 +1501,12 @@ static size_t rp_http_force_close(uint8_t *out, size_t outcap,
             e++;
         size_t llen = e - i;
         if (llen > 0) {
-            bool is_conn = false;
-            /* field name = up to ':' (request line has none; a ':' inside
-             * e.g. the request-URI can never equal "Connection") */
-            size_t j = 0;
-            while (j < llen && head[i + j] != ':')
-                j++;
-            if (j < llen && j == 10) {   /* strlen("connection") */
-                static const char want[] = "connection";
-                is_conn = true;
-                for (size_t k = 0; k < j; k++) {
-                    char a = (char)head[i + k];
-                    if (a >= 'A' && a <= 'Z')
-                        a = (char)(a - 'A' + 'a');
-                    if (a != want[k]) {
-                        is_conn = false;
-                        break;
-                    }
-                }
-            }
+            /* R54-WG1-1: same OWS-tolerant, case-insensitive name match
+             * as the pre-scan (rp_hdr_name_eq) — the request line has no
+             * ':' that could equal "connection", and a ':' inside e.g.
+             * the request-URI can never match after the walk-back */
+            bool is_conn = rp_hdr_name_eq(head + i, llen, "connection", 10,
+                                          NULL);
             if (!is_conn) {
                 RP_HTTP_W(head + i, llen);
                 RP_HTTP_W("\r\n", 2);
