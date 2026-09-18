@@ -52,20 +52,48 @@ static bool is_default_v4(const char *c)
 }
 
 #ifdef _WIN32
-/* R46-L2: reconcile the wintun adapter's derived-ULA address surface.
+/* R53-E-1: audit the wintun adapter's derived-ULA address surface.
+ *
  * A crashed run (whose teardown never ran) leaves ITS ULA — derived
  * from that run's inner IPv4 — on the persistent adapter, and
- * route_teardown6 only ever deletes the CURRENT run's ULA: once the
- * inner IPv4 changes, the old ULA address (plus its on-link /96 route)
- * survives forever. Enumerate the adapter's v6 unicast addresses and
- * delete every fd00::/96-shaped address that is not `cur`. Only the
- * deterministic derived-ULA shape (byte0 = 0xfd, bytes 1..11 zero;
- * protocol.c ip6_derive_ula) is ever touched, so the stack-managed
- * link-local address and any user-added global address are left alone.
- * When a stale ULA was deleted and the current one is not yet present,
- * the shared fd00::/96 on-link route is also dropped; the caller
- * (tun_iface_up6) re-adds the current ULA/96 right after, restoring
- * pool reachability either way. Best-effort: failures are logged only. */
+ * route_teardown6 only ever deletes the CURRENT run's ULA, so once the
+ * inner IPv4 changes the old ULA address can survive on the adapter.
+ * R46-L2 (74437c5) first handled this by auto-deleting every
+ * fd00::/96-shaped address that was not `cur`; that predicate had to be
+ * pulled back, and this pass now only REPORTS (R53-E-1):
+ *
+ *   The shape test (byte0 = 0xfd, bytes 1..11 zero) selects EXACTLY
+ *   the whole fd00::/96 space. `cur` is fd00:0:0:0:0:0:0:<inner IPv4>,
+ *   so ANY fd00:0:0:0:0:0:0:yyyy address could equally be the derived
+ *   ULA of SOME inner IPv4 — there is no byte-level marker that tells a
+ *   history residue apart from an address the user configured by hand
+ *   (say fd00::1/96). No additional enumerable signal helps either: the
+ *   address row's prefix length is 96 both for our `netsh ... add
+ *   address <ula>/96` and for a user's `/96` add; and the fd00::/96
+ *   on-link route exists whenever EITHER was added with a /96 (and is
+ *   absent exactly when a user added a bare /128 address) — route
+ *   presence says only "some fd00::/96 address was added with a /96",
+ *   never WHO added it. The "delete only isolated addresses" idea is
+ *   therefore still unsound: a user's fd00::1/128 has no on-link /96
+ *   route either, so it would again be auto-deleted (the R46 over-delete
+ *   reproduced for /128-spelled user config). Over-deleting silently
+ *   destroys user state — the mirror image of the over-retention that
+ *   74437c5 itself promised to avoid ("any user-added global address
+ *   ... left alone") — so the only sound policy is: NEVER auto-delete
+ *   inside fd00::/96.
+ *
+ * Consequence (accepted): residue of prior inner IPv4s is no longer
+ * cleaned automatically. Under-deletion is the safe direction — a
+ * leftover fd00:: address is inert: the single shared fd00::/96
+ * on-link route already makes the whole client pool reachable, that
+ * route is kept by the R49-L5 v6 route sweep (all derived ULAs share
+ * the same /96 network, so the route matches the sweep's current-ULA/96
+ * whitelist entry) and is re-created by the `add` below — residue never
+ * affects routing, it only accumulates as invisible addresses. This
+ * pass compensates by LOGGING every such address on every run (debug
+ * level), naming the manual cleanup command (`netsh interface ipv6
+ * delete address interface=<tun> <addr>`). Best-effort: enumeration
+ * failures are silent returns; this pass runs no commands at all. */
 static void reconcile_stale_ula(const char *tun, const char *tun_ip)
 {
     uint8_t v4[4], cur[16];
@@ -81,53 +109,42 @@ static void reconcile_stale_ula(const char *tun, const char *tun_ip)
     PMIB_UNICASTIPADDRESS_TABLE tbl;
     if (GetUnicastIpAddressTable(AF_INET6, &tbl) != NO_ERROR)
         return;
-    char ifa[32], ds[INET6_ADDRSTRLEN];
+    char ifa[32], ds[INET6_ADDRSTRLEN], cstr[INET6_ADDRSTRLEN];
     snprintf(ifa, sizeof ifa, "interface=%s", tun);
-    bool cur_present = false, deleted_any = false;
+    inet_ntop(AF_INET6, cur, cstr, sizeof cstr);   /* cannot fail */
     for (ULONG i = 0; i < tbl->NumEntries; i++) {
         MIB_UNICASTIPADDRESS_ROW *r = &tbl->Table[i];
         if (r->InterfaceLuid.Value != luid.Value ||
             r->Address.si_family != AF_INET6)
             continue;
         const uint8_t *a = (const uint8_t *)&r->Address.Ipv6.sin6_addr;
-        /* our derived-ULA shape only: fd00::/96 + the inner IPv4 */
+        /* the derived-ULA space only: fd00::/96 (byte0 = 0xfd, bytes
+         * 1..11 zero). Link-local, global and every other address is
+         * never examined further. */
         if (a[0] != 0xfd)
             continue;
         if (!(a[1] == 0 && a[2] == 0 && a[3] == 0 && a[4] == 0 &&
               a[5] == 0 && a[6] == 0 && a[7] == 0 && a[8] == 0 &&
               a[9] == 0 && a[10] == 0 && a[11] == 0))
             continue;
-        if (memcmp(a, cur, 16) == 0) {
-            cur_present = true;
-            continue;
-        }
+        if (memcmp(a, cur, 16) == 0)
+            continue;   /* the current run's own ULA: the add below is
+                         * idempotent, nothing to do or to log */
         if (inet_ntop(AF_INET6, a, ds, sizeof ds) == NULL)
             continue;
-        {
-            char *d[] = { "netsh", "interface", "ipv6", "delete",
-                          "address", ifa, ds, NULL };
-            if (port_run_cmd(d) == 0)
-                deleted_any = true;
-            else
-                log_debug("route: delete stale ULA %s on %s: not present",
-                          ds, tun);
-        }
+        log_debug("route: fd00::/96 address %s on %s not deleted "
+                  "(current derived ULA is %s): may be a user-"
+                  "configured address or residue of a prior inner IPv4; "
+                  "delete by hand if it is ours: netsh interface ipv6 "
+                  "delete address %s %s", ds, tun, cstr, ifa, ds);
+        /* ds/ifa/cstr are read only by log_debug above — the strict
+         * gates build IWAN_DEBUG_STRIP (log_debug compiles out), so
+         * the set-but-unused locals must be marked read */
+        (void)ds;
+        (void)ifa;
+        (void)cstr;
     }
     FreeMibTable(tbl);
-    if (deleted_any) {
-        log_info("route: dropped stale derived-ULA residue on %s", tun);
-        if (!cur_present) {
-            /* no derived ULA remains on the adapter: the fd00::/96
-             * on-link route (created by the stale address's add) is a
-             * bare leftover; drop it — the current add below
-             * re-creates it */
-            char *d[] = { "netsh", "interface", "ipv6", "delete",
-                          "route", "fd00::/96", ifa, NULL };
-            if (port_run_cmd(d) != 0)
-                log_debug("route: delete stale fd00::/96 on %s: "
-                          "not present", tun);
-        }
-    }
 }
 #endif /* _WIN32 */
 
@@ -140,10 +157,14 @@ static void tun_iface_up6(const char *tun, const char *tun_ip)
     char ula[64], ula96[72], ifa[32];
     if (!tun_ula_str(tun_ip, ula))
         return;
-    /* R46-L2: before adding the current ULA, drop stale derived ULAs a
-     * crashed run / an inner-IPv4 change left on this adapter — the add
-     * below is an append (netsh has no replace) and would otherwise
-     * accumulate every historical ULA on the persistent wintun adapter */
+    /* R53-E-1: before adding the current ULA, audit the derived-ULA
+     * address surface (reconcile_stale_ula). Stale fd00::/96-shaped
+     * addresses are REPORTED, never auto-deleted: any one of them is
+     * byte-for-byte indistinguishable from a user-configured address in
+     * that space, so R46-L2's auto-delete (74437c5) was an over-delete.
+     * The add below is an append (netsh has no replace), so historical
+     * ULAs may accumulate as inert residue; the per-run debug log names
+     * the manual cleanup command. */
     reconcile_stale_ula(tun, tun_ip);
     /* netsh would default a bare address to no /96 prefix, breaking the
      * client-pool on-link semantics; pass the explicit /96 like Linux.
@@ -756,16 +777,19 @@ static bool sweep6_keep(const uint8_t *addr, UCHAR plen,
  * The v6 arm mirrors the v4 shape but with a PRECISE keep set: an
  * on-link route is preserved only when it is exactly fe80::/64 (the
  * interface link-local), the current derived ULA fd00::/96 (derived from
- * tun_ip, so a changed inner IPv4 is swept here and reconcile_stale_ula
- * handles the address side), or one of the currently configured routes6
- * prefixes. R49-L5 tightened this: the old "every on-link >= /64" keep
- * could not tell a stack route from a user proxy-cidr6 prefix (both are
- * on-link with no nexthop), so a >= /64 v6 proxy prefix the user REMOVED
- * from config — or a crash left behind — was never swept and the tool
- * could not remove it. tun_ip/routes6 are optional (NULL): the pump-path
- * teardown (route_iface_down) has neither at hand, and there the current
- * config and ULA were just deleted by route_teardown6, so keeping only
- * fe80::/64 is exactly right. */
+ * tun_ip, so a changed inner IPv4's /96 ROUTE is swept here; the
+ * address side of the residue is handled by reconcile_stale_ula
+ * (R53-E-1: reported, never auto-deleted — fd00::/96-shaped addresses
+ * are indistinguishable from user config), or one of the currently
+ * configured routes6 prefixes. R49-L5 tightened this: the old "every
+ * on-link >= /64" keep could not tell a stack route from a user
+ * proxy-cidr6 prefix (both are on-link with no nexthop), so a >= /64 v6
+ * proxy prefix the user REMOVED from config — or a crash left behind —
+ * was never swept and the tool could not remove it. tun_ip/routes6 are
+ * optional (NULL): the pump-path teardown (route_iface_down) has
+ * neither at hand, and there the current config and ULA were just
+ * deleted by route_teardown6, so keeping only fe80::/64 is exactly
+ * right. */
 static void sweep_stale_routes(const char *tun, const char *tun_ip,
                                const slist_t *routes6)
 {
