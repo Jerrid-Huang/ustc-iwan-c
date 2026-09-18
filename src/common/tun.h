@@ -149,14 +149,31 @@ struct tun_pool *tun_pool_create_pre(const char *name, int fd0, int maxq,
 int tun_pool_queues(const struct tun_pool *p);
 /* queue fd for uplink writer `tid` (spread writes across queue fds so
  * the device write lock is not a single serialization point); -1 when
- * the pool is empty. Safe to call concurrently with tun_pool_tick. */
+ * the pool is empty. Safe to call concurrently with tun_pool_tick.
+ * R54-WG3-3: returns a RAW fd — the caller's own write is NOT protected
+ * against a concurrent tun_pool_del closing-and-recycling the number.
+ * The server therefore writes through tun_pool_write below, which holds
+ * the pool lock across the write and closes that window; use this only
+ * when the documented "EBADF = transient drop" contract is acceptable. */
 int tun_pool_write_fd(const struct tun_pool *p, unsigned tid);
+/* R54-WG3-3: lock-protected uplink write — select the queue fd for
+ * writer `tid`, and perform the whole tun_write_retry (budget max_ms;
+ * mirrors the raw path's EAGAIN-retry "still full after the bound:
+ * dropped" contract) under the pool's read lock. tun_pool_del /
+ * tun_pool_destroy close queue fds under the write lock, so the close can
+ * never race an in-flight write: a stale write can never land on a
+ * closed-and-recycled fd number. Returns 0 fully written, -1 dropped
+ * (errno preserved on fatal; persistent EAGAIN / EBADF are transient
+ * drops, the same contract as before). Linux/macOS only — the Windows
+ * wintun backend is single-queue and writes through its own fd. */
+#ifndef _WIN32
+int tun_pool_write(struct tun_pool *p, unsigned tid, const uint8_t *pkt,
+                   size_t len, int max_ms);
 /* R54-WG3-1: number of pool queues whose reader exited unexpectedly
  * (device deleted externally without a pool stop). >0 even while the
  * same-named device still exists (a racing grow re-created it); normal
  * del/destroy reads never raise it. The server's dead-tunnel probe
  * treats >0 as fatal. Linux/macOS only (tun_win.c has no such signal). */
-#ifndef _WIN32
 int tun_pool_readers_lost(const struct tun_pool *p);
 #endif
 /* uplink write hit the device queue: prevents the AIMD shrink for the

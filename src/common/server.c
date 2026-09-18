@@ -2407,19 +2407,31 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                  * makes the client RTO-retry; under a burst that can
                  * degrade into a stall. */
                 int wfd = ctx->tun_fd;
+                int wr;
                 if (ctx->qpool != NULL && !srv_tun_single()) {
                     /* spread uplink writes across the reader pool's
                      * queue fds: the device write lock is otherwise a
                      * single serialization point (measured: TUN write
                      * was 85-90% of per-frame cost at multi-client
                      * aggregate >5 Gbit/s). IWAN_SRV_TUN_SINGLE=1
-                     * reverts to the owner fd for A/B benchs. */
-                    int pf = tun_pool_write_fd(ctx->qpool, tid);
-                    if (pf >= 0)
-                        wfd = pf;
+                     * reverts to the owner fd for A/B benchs.
+                     * R54-WG3-3: tun_pool_write performs the write UNDER
+                     * the pool's read lock, and tun_pool_del /
+                     * tun_pool_destroy close removed queue fds under the
+                     * write lock, so a del can never close-and-recycle
+                     * this fd number while we are writing into it — the
+                     * old tun_pool_write_fd + tun_write_retry pair left
+                     * that microsecond TOCTOU open (a recycled fd would
+                     * silently receive a TUN frame). Budget and return
+                     * contract are identical to the raw path below. */
+                    wr = tun_pool_write(ctx->qpool, tid,
+                                        raw + IWAN_HDR_LEN,
+                                        len - IWAN_HDR_LEN, 1);
+                } else {
+                    wr = tun_write_retry(wfd, raw + IWAN_HDR_LEN,
+                                         len - IWAN_HDR_LEN, 1, NULL);
                 }
-                if (tun_write_retry(wfd, raw + IWAN_HDR_LEN,
-                                    len - IWAN_HDR_LEN, 1, NULL) == 0)
+                if (wr == 0)
                     PROF_ADD(g_prof_srv_tunw, len - IWAN_HDR_LEN);
                 else {
                     /* still full: drop, client retransmits. Also tell

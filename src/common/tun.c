@@ -459,6 +459,18 @@ struct tun_pool {
                             * writers signal congestion so the AIMD
                             * never shrinks the pool under upload load
                             * (write-side fan-out must not collapse) */
+    pthread_rwlock_t rw;   /* R54-WG3-3: bounds the writer-fd TOCTOU once
+                            * and for all. Uplink writers (tun_pool_write)
+                            * hold the READ side across the entire device
+                            * write; tun_pool_del / tun_pool_destroy close
+                            * the extra queue fds holding the WRITE side.
+                            * A closed-and-recycled fd number can therefore
+                            * never be hit by an in-flight write: the close
+                            * cannot even start until every writer that
+                            * selected the queue has released its read
+                            * lock. Always taken by the pool owner thread
+                            * (tick) or by writers — never by reader
+                            * threads, whose exit path does not touch it. */
     int maxq;
     int slow_start;   /* AIMD state: slow-start phase flag */
     int idle_cycles;  /* consecutive idle ticks before shrink */
@@ -650,8 +662,23 @@ static void tun_pool_del(struct tun_pool *pool)
                           memory_order_relaxed);
     atomic_store(&pool->nq, i);
     pthread_join(pool->qs[i].th, NULL);
+    /* R54-WG3-3 (writer-fd TOCTOU): from the nq publish above no NEW
+     * uplink writer can select queue i (writers spread across tid % nq
+     * and i is now out of range). A writer that had already read the old
+     * nq and selected i is either (a) still writing under the pool's
+     * read lock — the write lock below waits for it, so its write lands
+     * on the still-open fd and only then do we close — or (b) already
+     * dropped on stop==1. Under this ordering the close can never be
+     * followed by a stale writer write to a recycled fd number: the
+     * detach/close hold the write lock, and every writer holds the read
+     * lock across the whole write (tun_pool_write). The join stays
+     * BEFORE the lock: it only waits for the reader thread to leave the
+     * fd (never touches rw), so the lock is held just for the two ioctl/
+     * close syscalls, never across a thread join. */
+    pthread_rwlock_wrlock(&pool->rw);
     tun_detach(pool->qs[i].fd);
     tun_close(pool->qs[i].fd);
+    pthread_rwlock_unlock(&pool->rw);
 }
 
 struct tun_pool *tun_pool_create_pre(const char *name, int fd0, int maxq,
@@ -665,6 +692,10 @@ struct tun_pool *tun_pool_create_pre(const char *name, int fd0, int maxq,
 
     if (!pool)
         return NULL;
+    if (pthread_rwlock_init(&pool->rw, NULL) != 0) {
+        free(pool);
+        return NULL;
+    }
     pool->cb = cb;
     pool->ud = ud;
     pool->abort = abort;
@@ -684,10 +715,12 @@ struct tun_pool *tun_pool_create_pre(const char *name, int fd0, int maxq,
         log_err("tun pool: fd %d cannot be switched to nonblocking (%s); "
                 "refusing to start a reader that could block in read() "
                 "forever", fd0, strerror(errno));
+        pthread_rwlock_destroy(&pool->rw);
         free(pool);
         return NULL;
     }
     if (pthread_create(&q->th, NULL, tun_reader_main, q) != 0) {
+        pthread_rwlock_destroy(&pool->rw);
         free(pool);
         return NULL;
     }
@@ -750,7 +783,15 @@ int tun_pool_write_fd(const struct tun_pool *pool, unsigned tid)
      * classic "loaded old nq then used the just-removed fd" TOCTOU window.
      * (The stop flag is atomic; a reader that raced a del can still get an
      * EBADF in the tiny gap before close, which the caller treats as a
-     * transient drop — this removes the deterministic reuse-of-removed-fd.) */
+     * transient drop — this removes the deterministic reuse-of-removed-fd.)
+     * R54-WG3-3: this API returns a raw fd, so it CANNOT hold the pool's
+     * read lock across the caller's write; the residual window (del closes
+     * the fd after we return it, the fd number is recycled by a concurrent
+     * open, and our write lands on an unrelated socket) is real. The
+     * server no longer calls it — uplink writes go through tun_pool_write,
+     * which performs the write under the pool lock and makes that window
+     * unreachable. Kept for callers that need the raw fd and accept the
+     * documented transient-drop contract. */
     for (int attempt = 0; attempt < 2; attempt++) {
         int nq = atomic_load(&pool->nq);
         if (nq <= 0)
@@ -760,6 +801,54 @@ int tun_pool_write_fd(const struct tun_pool *pool, unsigned tid)
             return q->fd;
     }
     return -1;   /* still pointing at a queue being removed: caller drops */
+}
+
+/* R54-WG3-3: lock-protected uplink write — the server's ONLY pool write
+ * path. Selects the queue fd for uplink writer `tid` exactly like
+ * tun_pool_write_fd, but performs the whole tun_write_retry while holding
+ * the pool's read lock, and tun_pool_del / tun_pool_destroy close queue
+ * fds under the write lock. Static argument that a stale write can then
+ * never hit a closed-and-recycled fd number:
+ *   - while the write runs, del's close cannot even start (write lock
+ *     acquisition blocks until we release the read lock), so the fd is
+ *     open for the whole write — the byte we write goes to the tun device
+ *     and nothing else;
+ *   - once del's close has run, every writer that selected that queue has
+ *     already released its read lock (that is the only way del obtained
+ *     the write lock), and no NEW writer can select the removed queue
+ *     because nq no longer includes it (writers spread across tid % nq).
+ * A lock-free epoch counter cannot give this guarantee: the writer could
+ * only compare epochs before/after the write syscall, leaving the syscall
+ * itself as a window in which the fd could be closed+reused; mutual
+ * exclusion is the only way to bind fd validity to the write itself.
+ * Returns tun_write_retry's result: 0 fully written, -1 transient drop
+ * (persistent EAGAIN past max_ms, or EBADF-class fd death — serving the
+ * same "drop, the client retransmits" contract as before). */
+int tun_pool_write(struct tun_pool *pool, unsigned tid,
+                   const uint8_t *pkt, size_t len, int max_ms)
+{
+    int r;
+
+    if (!pool)
+        return -1;
+    pthread_rwlock_rdlock(&pool->rw);
+    int nq = atomic_load(&pool->nq);
+    if (nq <= 0) {
+        pthread_rwlock_unlock(&pool->rw);
+        return -1;
+    }
+    const struct tun_queue *q = &pool->qs[tid % (unsigned)nq];
+    if (atomic_load_explicit(&q->stop, memory_order_acquire)) {
+        /* Defensive only: under the read lock a completed del already
+         * excluded this queue from nq (del publishes nq before taking the
+         * write lock), so a stop==1 queue inside [0, nq) is unobservable —
+         * this guards against future ownership patterns, not today's. */
+        pthread_rwlock_unlock(&pool->rw);
+        return -1;
+    }
+    r = tun_write_retry(q->fd, pkt, len, max_ms, NULL);
+    pthread_rwlock_unlock(&pool->rw);
+    return r;
 }
 
 /* R54-WG3-1: count pool queues whose reader exited unexpectedly (dead
@@ -810,10 +899,18 @@ void tun_pool_destroy(struct tun_pool *pool)
                           memory_order_relaxed);
     for (i = 0; i < nq; i++)
         pthread_join(pool->qs[i].th, NULL);
+    /* R54-WG3-3: close the extra queue fds under the write lock so a
+     * concurrently writing tun_pool_write (in a caller that tears the
+     * pool down before joining its writers) can never hit a closed-and-
+     * recycled fd. The server joins its recv threads first, so this is
+     * normally uncontended. */
+    pthread_rwlock_wrlock(&pool->rw);
     for (i = 1; i < nq; i++) {
         tun_detach(pool->qs[i].fd);
         tun_close(pool->qs[i].fd);
     }
+    pthread_rwlock_unlock(&pool->rw);
+    pthread_rwlock_destroy(&pool->rw);
     free(pool);
 }
 
