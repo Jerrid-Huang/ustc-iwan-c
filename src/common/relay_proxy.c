@@ -1324,9 +1324,11 @@ static void rp_http_bad(struct rp_hs *hs, int fd)
  * carries exactly one, canonical, non-ambiguous close option. Header
  * names are matched case-insensitively per RFC 7230 §3.2. Returns the
  * rewritten length, or 0 meaning "no rewrite: forward the original head
- * verbatim" — for an Upgrade request (R53-A-1) or on buffer overrun
- * (caller falls back to the original head — same guarantee as forever:
- * the relay never misroutes MORE than today).
+ * verbatim" — for an Upgrade request (R53-A-1) or when the exact
+ * rewritten size `need` (R53-A-3, precomputed exactly) exceeds outcap. In
+ * both cases nothing is written and the caller forwards the original
+ * head (same guarantee as forever: the relay never misroutes MORE than
+ * today).
  *
  * R53-A-1: the R52-B1 rewrite must NOT touch Upgrade requests. RFC 7230
  * §6.7 / RFC 6455 §4.1: a proxy has to forward the Upgrade verbatim so a
@@ -1356,42 +1358,67 @@ static size_t rp_http_force_close(uint8_t *out, size_t outcap,
         o += _bl;                                                        \
     } while (0)
 
-    /* R53-A-1: pre-scan over the same line structure as the rewrite
-     * below (the two walks must agree byte-for-byte, so the terminator
-     * is skipped identically). An `Upgrade:` field is signalled by the
-     * case-insensitive 7-byte name "upgrade" followed by a ':' and a
-     * value holding at least one non-OWS byte (a bare "Upgrade: " is
-     * not a protocol switch; RFC 6455 requires a protocol name). The
-     * request line cannot false-positive: it has no ':' of its own (or
-     * only the one inside an absolute-form request-URI, whose authority
-     * text never equals the 7-byte name "upgrade"). On a match we stop
-     * walking and return 0 — NOTHING is written, the caller forwards
-     * the original head verbatim. */
+    /* R53-A-1 + R53-A-3: one pre-scan over the same line structure as the
+     * rewrite below (the two walks MUST agree byte-for-byte on which and
+     * how many bytes the rewrite emits, so the terminator is skipped
+     * identically and the Connection-header / Upgrade-header recognition
+     * is identical). It computes two facts before any byte is written —
+     * if either makes the rewrite undesired or impossible, we return 0
+     * with NOTHING written and the caller forwards the original head
+     * verbatim:
+     *
+     *   is_upgrade (R53-A-1): an `Upgrade:` field — case-insensitive
+     *     7-byte name "upgrade", ':' and a value holding at least one
+     *     non-OWS byte (a bare "Upgrade: " is not a protocol switch; RFC
+     *     6455 requires a protocol name). RFC 7230 §6.7 / RFC 6455 §4.1:
+     *     the proxy must forward the Upgrade so a compliant origin can
+     *     answer 101, and the close injection would corrupt the handshake
+     *     (see the function doc). The request line cannot false-positive:
+     *     its only ':' is the one inside an absolute-form request-URI,
+     *     whose authority text never equals the 7-byte name.
+     *
+     *   need (R53-A-3): the EXACT number of bytes the rewrite would emit,
+     *     accumulated with the same rules (a kept line = content + 2, a
+     *     dropped Connection line = 0, the final blank line = cclen + 2).
+     *     There is no useful closed-form upper bound — a lone-EOL head
+     *     that still fits the 8 KiB read buffer can balloon ~1.5x (e.g.
+     *     4000 x "A\n" + CRLFCRLF needs ~12 KiB out), so the old "8 KiB
+     *     +32B always fits" claim was false: the check-then-write macro
+     *     returned 0 mid-rewrite and the caller silently fell back to the
+     *     verbatim head, defeating close injection without announcing it.
+     *     Checking need BEFORE writing makes that fallback explicit and
+     *     predictable, never a half-written rewrite. Every conformant
+     *     CRLF head still fits: need <= hlen + 19, so the largest legal
+     *     head (hlen = 8192) needs 8211 <= 8224 = outcap. */
     bool is_upgrade = false;
+    size_t need = 0;
     size_t i2 = 0;
-    while (i2 < hlen && !is_upgrade) {
+    while (i2 < hlen) {
         size_t e2 = i2;
         while (e2 < hlen && head[e2] != '\r' && head[e2] != '\n')
             e2++;
-        if (e2 == i2)
-            break;                  /* final blank line */
         size_t llen2 = e2 - i2;
+        if (llen2 == 0) {
+            /* the final blank line is replaced by cc + CRLF */
+            need += cclen + 2;
+            break;
+        }
         size_t j = 0;
         while (j < llen2 && head[i2 + j] != ':')
             j++;
         if (j < llen2 && j == 7) {
-            static const char want[] = "upgrade";
-            is_upgrade = true;
+            static const char upnm[] = "upgrade";
+            bool is_up = true;
             for (size_t k = 0; k < j; k++) {
                 char a = (char)head[i2 + k];
                 if (a >= 'A' && a <= 'Z')
                     a = (char)(a - 'A' + 'a');
-                if (a != want[k]) {
-                    is_upgrade = false;
+                if (a != upnm[k]) {
+                    is_up = false;
                     break;
                 }
             }
-            if (is_upgrade) {
+            if (is_up) {
                 size_t v = j + 1;
                 while (v < llen2 && (head[i2 + v] == ' ' ||
                                      head[i2 + v] == '\t'))
@@ -1399,6 +1426,25 @@ static size_t rp_http_force_close(uint8_t *out, size_t outcap,
                 is_upgrade = (v < llen2);
             }
         }
+        /* exact-size accumulation, mirroring the rewrite's decision:
+         * a Connection line contributes 0 bytes (dropped, one injected
+         * at the end), every other line contributes content + CRLF */
+        bool is_conn = false;
+        if (j < llen2 && j == 10) {   /* strlen("connection") */
+            static const char connm[] = "connection";
+            is_conn = true;
+            for (size_t k = 0; k < j; k++) {
+                char a = (char)head[i2 + k];
+                if (a >= 'A' && a <= 'Z')
+                    a = (char)(a - 'A' + 'a');
+                if (a != connm[k]) {
+                    is_conn = false;
+                    break;
+                }
+            }
+        }
+        if (!is_conn)
+            need += llen2 + 2;
         /* skip this line's terminator exactly like the rewrite */
         if (e2 < hlen && head[e2] == '\r')
             e2++;
@@ -1407,7 +1453,9 @@ static size_t rp_http_force_close(uint8_t *out, size_t outcap,
         i2 = e2;
     }
     if (is_upgrade)
-        return 0;    /* verbatim forward; nothing written */
+        return 0;    /* verbatim forward (R53-A-1); nothing written */
+    if (need > outcap)
+        return 0;    /* verbatim forward (R53-A-3); nothing written */
 
     size_t i = 0;
     while (i < hlen) {
@@ -1652,9 +1700,12 @@ static int rp_handle_http(int fd, const uint8_t *first, size_t first_n,
      * the client connection ends after a single request — the relay
      * stops promising keep-alive it cannot honor (see the R52-B1
      * comment on rp_http_force_close). Head-only, at handshake time,
-     * zero data-path parsing; on a rewrite overrun (practically
-     * unreachable — the 8 KiB head cap leaves 32 bytes of margin) the
-     * original head is forwarded verbatim, same guarantee as before.
+     * zero data-path parsing; rp_http_force_close returns 0 — no rewrite,
+     * nothing written — for an Upgrade request (R53-A-1) or when the
+     * EXACT rewritten size would exceed conn_head (R53-A-3; a mixed-EOL
+     * head can legitimately need up to ~1.5x its own length, so the old
+     * "8 KiB +32B always fits" claim was false), and the original head
+     * is then forwarded verbatim, same guarantee as before B1.
      * R37 R6 (K-5): rp_send_full — the head is sent in one piece and a
      * short write/EINTR used to abort the forward. R23 (T2): the head
      * is the CLIENT'S OWN REQUEST BYTES (user payload, not a generated
