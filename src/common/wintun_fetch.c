@@ -83,20 +83,32 @@ static int file_exists(const char *path)
 
 /* Escape a value for a PowerShell single-quoted literal: embedded
  * single quotes are doubled. The exe dir is attacker-influenceable
- * (install path), so every interpolated path goes through here. */
-static void ps_squote(char *out, size_t cap, const char *src)
+ * (install path), so every interpolated path goes through here.
+ * Returns 0 on success and -1 when the escaped form does not fit in
+ * `cap` — like every snprintf-based sibling above, a truncation is
+ * REPORTED, never silent, and the caller fails closed. (The ceiling
+ * cannot be reached through a MAX_PATH-limited directory — even a
+ * directory made entirely of single quotes would need >240 of them to
+ * overflow 2*MAX_PATH — but a consistency check costs nothing and the
+ * sibling paths all fail loud.) */
+static int ps_squote(char *out, size_t cap, const char *src)
 {
     size_t o = 0;
     char q = 39;
-    for (size_t i = 0; src && src[i] && o + 1 < cap; i++) {
-        if (src[i] == q) {
-            if (o + 1 < cap) out[o++] = q;
-            if (o + 1 < cap) out[o++] = q;
-        } else {
-            out[o++] = src[i];
+    if (cap == 0)
+        return -1;   /* cannot even store the NUL terminator */
+    for (size_t i = 0; src && src[i]; i++) {
+        size_t need = (size_t)((src[i] == q) ? 2 : 1);
+        if (o + need + 1 > cap) {
+            out[o] = 0;   /* leave a NUL-terminated partial for the log */
+            return -1;
         }
+        out[o++] = src[i];
+        if (src[i] == q)
+            out[o++] = q;
     }
     out[o] = 0;
+    return 0;
 }
 
 /* run a command and capture its stdout (line-oriented use only).
@@ -333,8 +345,13 @@ int wintun_ensure(void)
     char cmd[PS_CMD_MAX];
     int rc = 1;
     char zipq[PS_PATH_MAX], tmpq[PS_PATH_MAX];
-    ps_squote(zipq, sizeof zipq, zip);
-    ps_squote(tmpq, sizeof tmpq, tmpdir);
+    if (ps_squote(zipq, sizeof zipq, zip) != 0 ||
+        ps_squote(tmpq, sizeof tmpq, tmpdir) != 0) {
+        log_err("internal error: wintun path does not fit its escaped "
+                "PowerShell buffer");
+        return -1;   /* fail closed like every sibling snprintf check;
+                      * nothing has been downloaded or extracted yet */
+    }
     /* FIND-W-1: the two %s slots were reversed — the URL wants the
      * VERSION (wintun-%s.zip), -OutFile wants the local zip path. As
      * written, every download produced a 404 URL + a file named "0.14.1".
