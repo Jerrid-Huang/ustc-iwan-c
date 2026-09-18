@@ -1343,12 +1343,44 @@ static int https_verify_cb(int preverify_ok, X509_STORE_CTX *xctx)
 static SSL *https_ssl_new(SSL_CTX *ctx, int fd, const char *host)
 {
     SSL *ssl = SSL_new(ctx);
+    /* R54-WG4-5: SSL_set1_host matches only dNSName SAN entries (it is
+     * the X509_check_host path); an IP-literal authority — e.g. a
+     * jwks_uri or a redirect Location of the form https://x.x.x.x/… —
+     * would fail the handshake even when the peer certificate's SAN
+     * carries exactly that IP (verified on OpenSSL 3.5.5:
+     * X509_check_host("127.0.0.1")==0 vs X509_check_ip_asc(...)==1).
+     * Decision by inet_pton (strict, no octal/short forms): an IP
+     * literal configures the verify param with
+     * X509_VERIFY_PARAM_set1_ip_asc (the X509_check_ip_asc path —
+     * matches IP SANs only, never falls back to a wildcard); anything
+     * else keeps SSL_set1_host, so the dNSName path is unchanged.
+     * (There is no SSL_set1_ip_asc in OpenSSL's public SSL API; the
+     * documented equivalent is SSL_get0_param + set1_ip_asc, the same
+     * mechanism SSL_set1_host wraps for hostnames, present since
+     * OpenSSL 1.1.0.)
+     * The host is port-free on every caller path: https_url_split
+     * rejects any ':' in the authority (explicit ports unsupported),
+     * for the primary URL and for every redirect Location.  Fail
+     * closed: if the ip_asc setup itself fails the connection is
+     * refused. */
+    struct in_addr a4;
+    struct in6_addr a6;
+    int is_ip = inet_pton(AF_INET, host, &a4) == 1 ||
+                inet_pton(AF_INET6, host, &a6) == 1;
 
     if (!ssl)
         return NULL;
     if (SSL_set_fd(ssl, fd) != 1 ||
-        SSL_set_tlsext_host_name(ssl, host) != 1 ||
-        SSL_set1_host(ssl, host) != 1) {
+        SSL_set_tlsext_host_name(ssl, host) != 1) {
+        SSL_free(ssl);
+        return NULL;
+    }
+    if (is_ip) {
+        if (X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), host) != 1) {
+            SSL_free(ssl);
+            return NULL;
+        }
+    } else if (SSL_set1_host(ssl, host) != 1) {
         SSL_free(ssl);
         return NULL;
     }
