@@ -35,8 +35,27 @@
                                  * has a slot.
                                  * 36B per entry (measured sizeof
                                  * DnsResult), 513*36 = 18468B ~ 18KiB */
-#define DNS_DRAIN_MAX    16     /* results handled per event-loop round */
-#define DNS_WAIT_MAX     16     /* concurrent pending queries */
+/* R54-WG4-2 (C1): DNS_WAIT_MAX was 16, but spawn_dns has no spawn-side cap
+ * (R33 N1) and a multi-tab / multi-domain browser burst can easily exceed
+ * 16 concurrent pending domain CONNECTs; the 17th+ worker then spun in
+ * dns_register for up to 2s with no slot and pseudo-failed its flow with
+ * rep=4. The wait table is now sized 64 — a conservative subset of the
+ * result ring's 512 usable slots (every in-flight worker is guaranteed a
+ * push slot by R33-N1/R34-B3-1 regardless). 64 covers a large browser
+ * burst with ample headroom while keeping the per-entry cost flat:
+ * sizeof(DnsWait) = 288B (domain[256] dominates), so 64 * 288B = 18432B
+ * ~= 18KiB static (16 * 288B = 4608B before); every loop over the table
+ * (dns_register / dns_sport_in_use / dns_try_handle_response / dns_reset)
+ * just scans 64 flat entries, no algorithmic change. Pushing it to the
+ * full 512 would quadruple the static table to ~144KiB for no real burst
+ * benefit. DNS timeout/retransmit semantics (DNS_TIMEOUT_MS, resends,
+ * backoff) are untouched. */
+#define DNS_DRAIN_MAX    64     /* results handled per event-loop round
+                                 * (synced with DNS_WAIT_MAX so a full
+                                 * wait-table burst is drained in one
+                                 * round; the ring is 512 so 64 per round
+                                 * can never starve a later push) */
+#define DNS_WAIT_MAX     64     /* concurrent pending queries */
 #define DNS_POLL_MS      250u   /* worker retry/poll interval */
 #define DNS_TIMEOUT_MS   1500u  /* query lifetime (registration + 6 x 250ms) */
 
