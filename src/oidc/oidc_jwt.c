@@ -152,6 +152,7 @@ static int aud_matches(Json *tok, const char *aud)
 
 /* build an RSA EVP_PKEY from JWKS n/e (base64url big-endian integers,
  * no padding); NULL on failure */
+#define JWKS_RSA_MIN_BITS 2048
 static EVP_PKEY *jwks_rsa_key(Json *key)
 {
     const char *n_b64 = json_get_str(key, "n");
@@ -188,6 +189,36 @@ static EVP_PKEY *jwks_rsa_key(Json *key)
     }
     if (!pkey)
         RSA_free(rsa);
+    /* R54-WG4-6: strength floor on the RSA signing key BEFORE it is
+     * accepted (defense in depth). A token that passes RS256 is enough
+     * to authenticate as the user; a weak n (factorable) or a broken e
+     * (e=1/2/even: fixed-point or degenerate verification) would let a
+     * forger mint id_tokens. The issuer is the configured trust root,
+     * so this guards the "IdP key compromised / mis-issued" case — the
+     * client fails closed rather than verify with a weak key. Rejecting
+     * the key only SKIPS it (select_jwks_key moves on; other keys are
+     * still usable, and if none is left the verify fails closed). */
+    if (pkey) {
+        const BIGNUM *ke = NULL;
+        int bits = EVP_PKEY_get_bits(pkey);
+        int bad_bits, bad_e;
+
+        RSA_get0_key(rsa, NULL, &ke, NULL);
+        bad_bits = bits < JWKS_RSA_MIN_BITS;
+        bad_e = !ke || BN_cmp(ke, BN_value_one()) <= 0 || !BN_is_odd(ke);
+        if (bad_bits || bad_e) {
+            /* only small local integers are printed — the kid is left
+             * to the caller's filtered diagnostic */
+            oidc_eprintf("oidc_jwt_verify: refusing weak JWKS RSA key: "
+                         "%d-bit modulus (min %d)%s, exponent=%d bits%s\n",
+                         bits, JWKS_RSA_MIN_BITS,
+                         bad_bits ? " [below floor]" : "",
+                         ke ? BN_num_bits(ke) : -1,
+                         bad_e ? " [e<=1 or even]" : "");
+            EVP_PKEY_free(pkey);   /* strength check failed: skip this key */
+            pkey = NULL;
+        }
+    }
 #pragma GCC diagnostic pop
 out:
     free(n_raw);
