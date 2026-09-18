@@ -2115,6 +2115,32 @@ void service_local_inputs(Flow *fs) {
                         if (dc) {
                             size_t tail = (size_t)r2 - left;
                             buf_put(&f->input, dc->scratch + tail, left);
+                        } else {
+                            /* R54-WG4-4 (C4): DEAD-ZONE DEFENSE — if the
+                             * netstack connection were already gone, the
+                             * tail cannot be re-linked (dc->scratch is its
+                             * only copy) and these `left` bytes would be
+                             * silently dropped. Under today's single-
+                             * threaded event loop this branch is
+                             * UNREACHABLE: ns_conn() only returns NULL for
+                             * ns_idx < 0 / out of range (lwip_bridge.c),
+                             * the guard above guarantees ns_idx >= 0, and
+                             * nothing in the readv/ns_send_commit window
+                             * detaches the flow; bridge_err() requires an
+                             * lwIP callback entry that cannot interleave
+                             * here. It is kept as armed dead code: a future
+                             * multithreaded rewrite that can race bridge_err
+                             * into this window MUST preserve the tail before
+                             * touching anything — log_debug is the tripwire
+                             * so the loss is never silent. rx_paused stays
+                             * set (harmless: service_local_inputs clears it
+                             * at the top of every round). */
+                            if (debug_enabled())
+                                log_debug("[flow %lu] ns_conn() NULL: "
+                                          "dropping %llu uncommitted readv "
+                                          "tail bytes (dead-zone defense)",
+                                          (unsigned long)f->id,
+                                          (unsigned long long)left);
                         }
                         f->rx_paused = true;
                         /* stop this round's readv loop: further batches
