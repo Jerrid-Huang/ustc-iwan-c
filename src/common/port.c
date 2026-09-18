@@ -939,19 +939,93 @@ char *port_cmd_capture(char *const argv[], size_t max)
         oom_abort();
     }
     size_t got = 0;
-    DWORD r = 0;
-    while (got < max && ReadFile(rd, out + got, (DWORD)(max - got), &r,
-                                 NULL) && r > 0)
-        got += r;
-    out[got] = '\0';
-    CloseHandle(rd);
-    if (WaitForSingleObject(pi.hProcess, 60000) == WAIT_TIMEOUT) {
+    bool timed_out = false;
+    /* single 60s budget shared by the bounded read phase and the bounded
+     * reap below (one deadline for the whole capture, mirroring util.c
+     * cmd_capture R15 / the POSIX arm above) */
+    uint64_t deadline = port_now_ms() + 60000;
+    while (got < max) {
+        /* bounded read: a plain blocking ReadFile could block forever if
+         * the helper hangs without writing and without closing stdout,
+         * so the 60s budget would never be reached. Anonymous-pipe read
+         * handles are NOT reliable wait objects (WaitForSingleObject on
+         * an empty read end returns immediately, not when data lands), so
+         * mirror the POSIX arm's "poll with remaining budget" as:
+         * non-blocking PeekNamedPipe probe + ReadFile when data is there,
+         * plus a process-exit probe and a Sleep yield when it is empty —
+         * every step bounded by the shared deadline. */
+        uint64_t now = port_now_ms();
+        int remaining = deadline > now ? (int)(deadline - now) : 0;
+        if (remaining == 0) {
+            timed_out = true;
+            break;
+        }
+        DWORD avail = 0;
+        if (!PeekNamedPipe(rd, NULL, 0, NULL, &avail, NULL)) {
+            if (GetLastError() == ERROR_BROKEN_PIPE)
+                break;      /* EOF: the child closed stdout */
+            break;          /* hard peek error: keep what we already
+                             * have (same semantic as poll/read errors) */
+        }
+        if (avail > 0) {
+            /* data is parked in the pipe and we are the only reader, so
+             * ReadFile cannot block: it drains what PeekNamedPipe saw */
+            DWORD r = 0;
+            if (!ReadFile(rd, out + got, (DWORD)(max - got), &r, NULL)) {
+                if (GetLastError() == ERROR_BROKEN_PIPE)
+                    break;  /* EOF: drained, then broken */
+                break;      /* hard read error: keep what we have */
+            }
+            if (r == 0)
+                break;      /* EOF */
+            got += (size_t)r;
+            continue;
+        }
+        /* no pending data and the pipe still alive: if the child has
+         * already exited it can never produce more (EOF), otherwise
+         * yield and re-probe within the budget (PeekNamedPipe never
+         * blocks, so an explicit sleep is what bounds our poll rate). */
+        if (WaitForSingleObject(pi.hProcess, 0) != WAIT_TIMEOUT)
+            break;
+        port_sleep_ms(5);
+    }
+    if (timed_out) {
+        /* the 60s read budget expired (child hung without writing and
+         * without closing stdout): the child is still alive, so kill it
+         * NOW and let the bounded reap below just collect it — this
+         * avoids a second full 60s wait inside the reap. */
         TerminateProcess(pi.hProcess, 1);
-        CloseHandle(pi.hProcess);
-        return out;   /* partial output beats an indefinite wedge */
+    }
+    /* close the read end BEFORE reaping: the child's write end is now
+     * the only remaining reference, so a child that overruns `max` gets
+     * a broken pipe on its next write instead of blocking on a full
+     * pipe forever (same pre-reap close rationale as the POSIX arm). */
+    CloseHandle(rd);
+    out[got] = '\0';
+    /* bounded reap, same policy as port_run_cmd and the POSIX arm (the
+     * shared 60s budget + TerminateProcess + keep collecting): a wedged
+     * helper must not hang the caller indefinitely. Whatever we captured
+     * is returned — partial output beats an indefinite wedge. */
+    for (;;) {
+        uint64_t now = port_now_ms();
+        int remaining = deadline > now ? (int)(deadline - now) : 0;
+        DWORD ws = WaitForSingleObject(pi.hProcess,
+                                       (DWORD)(remaining ? remaining : 1));
+        if (ws == WAIT_OBJECT_0)
+            break;          /* process terminated: collected it */
+        if (ws == WAIT_TIMEOUT) {
+            timed_out = true;
+            TerminateProcess(pi.hProcess, 1);
+            continue;       /* keep collecting (1ms polls past the
+                             * deadline) until the process really dies */
+        }
+        break;              /* WAIT_FAILED: nothing more to collect */
     }
     CloseHandle(pi.hProcess);
-    return out;
+    if (timed_out)
+        log_err("port_cmd_capture: %s timed out after 60s; returning "
+                "partial output", argv[0]);
+    return out;   /* partial output beats an indefinite wedge */
 #else
     int fds[2];
     if (pipe(fds) != 0)
