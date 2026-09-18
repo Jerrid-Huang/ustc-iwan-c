@@ -432,6 +432,17 @@ struct tun_queue {
     pthread_t th;
     _Atomic int stop;   /* R30-f2E: atomic so the reader thread and uplink
                           * writers never race the pool owner's del/destroy */
+    _Atomic int dead;   /* R54-WG3-1: set by the reader thread when it exits
+                          * WITHOUT a pool-owner stop (its queue fd died:
+                          * POLLHUP/POLLERR after an external device
+                          * deletion, or a hard poll error). tun_pool_tick
+                          * consults it before the AIMD grow (growing would
+                          * re-create the vanished device under the same
+                          * name and mask the caller's dead-tunnel probe),
+                          * and tun_pool_readers_lost() reports it to the
+                          * server's fail-fast probe. tun_pool_add_fd
+                          * re-arms the slot to 0 when a new reader starts
+                          * in it (shrink-then-grow slot reuse). */
     atomic_uint_fast64_t waits; /* poll timeouts in current window */
 };
 
@@ -465,8 +476,14 @@ static void *tun_reader_main(void *ud)
     while (!atomic_load_explicit(&q->stop, memory_order_acquire) &&
        (pool->abort == NULL || !*pool->abort)) {
         int pr = poll(&pfd, 1, TUN_POLL_MS);
-        if (pr < 0 && errno != EINTR)
+        if (pr < 0 && errno != EINTR) {
+            /* R54-WG3-1: hard poll error on a pool fd without a
+             * pool-owner stop = the queue is gone (same class as the
+             * POLLHUP path below). Mark it dead so tun_pool_tick never
+             * grows onto a vanished device. */
+            atomic_store_explicit(&q->dead, 1, memory_order_release);
             break;
+        }
         if (pr == 0) {
             atomic_fetch_add(&q->waits, 1);
             continue;
@@ -519,6 +536,17 @@ static void *tun_reader_main(void *ud)
             if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
                 log_debug("tun reader q=%ld: fd gone (%s)",
                           (long)(q - pool->qs), strerror(errno));
+            /* R54-WG3-1: this exit has NO pool-owner stop — the queue's
+             * device fd died under us, which for a pool-owned tun means
+             * external deletion (`ip link del`, netns teardown, driver
+             * unload). Publish dead BEFORE leaving so tun_pool_tick can
+             * tell "quietly empty queues" (legitimate AIMD grow: readers
+             * alive and just idle) apart from "readers have vanished"
+             * (device gone: growing would re-create the same-named device
+             * and mask the caller's dead-tunnel probe). Reader threads
+             * exited by tun_pool_del / destroy always carry stop==1 and
+             * never take this branch. */
+            atomic_store_explicit(&q->dead, 1, memory_order_release);
             break;
         }
     }
@@ -572,6 +600,12 @@ static int tun_pool_add_fd(struct tun_pool *pool, int fd)
         q->pool = pool;
         q->fd = fd;
         atomic_store_explicit(&q->stop, 0, memory_order_relaxed);
+        /* R54-WG3-1: a slot whose previous reader died (dead==1) is
+         * reusable after the pool removed it (shrink): a fresh reader
+         * must not inherit the stale dead mark or every later tick would
+         * refuse to grow and tun_pool_readers_lost() would report a
+         * phantom loss. */
+        atomic_store_explicit(&q->dead, 0, memory_order_relaxed);
         atomic_store(&q->waits, 0);
         if (pthread_create(&q->th, NULL, tun_reader_main, q) != 0)
             return -1;
@@ -641,6 +675,7 @@ struct tun_pool *tun_pool_create_pre(const char *name, int fd0, int maxq,
     q->pool = pool;
     q->fd = fd0;
     q->stop = 0;
+    q->dead = 0;   /* R54-WG3-1: queue 0 must not start as "lost" */
     atomic_store(&q->waits, 0);
     /* R37 WG-E2 (R3-L6): the pool owns fd0's reader from here on; if the
      * fd cannot be made nonblocking the reader would block in read() and
@@ -727,6 +762,28 @@ int tun_pool_write_fd(const struct tun_pool *pool, unsigned tid)
     return -1;   /* still pointing at a queue being removed: caller drops */
 }
 
+/* R54-WG3-1: count pool queues whose reader exited unexpectedly (dead
+ * mark set). The server's fail-fast probe reads this once per second as
+ * an INDEPENDENT death signal: after an external device deletion every
+ * reader gets POLLHUP and exits with stop==0, so this is >0 even in the
+ * sub-second window before if_nametoindex runs — and, crucially, even if
+ * a racing tun_pool_tick grow already re-created the same-named device
+ * (the dead reader marks stay in the pool, so the recreation cannot hide
+ * the loss from this probe). Normal pool death (del/destroy stop, then
+ * join) never sets the mark. */
+int tun_pool_readers_lost(const struct tun_pool *pool)
+{
+    int nq, lost = 0;
+
+    if (!pool)
+        return 0;
+    nq = atomic_load(&pool->nq);
+    for (int i = 0; i < nq; i++)
+        if (atomic_load_explicit(&pool->qs[i].dead, memory_order_acquire))
+            lost++;
+    return lost;
+}
+
 /* An uplink writer hit the device queue (EAGAIN / write-budget expiry):
  * record the congestion so the next tun_pool_tick treats the pool as
  * busy and never shrinks the write fan-out under upload load. */
@@ -767,6 +824,36 @@ void tun_pool_tick(struct tun_pool *pool)
     double busy;
     int target;
     int nq = atomic_load(&pool->nq);
+
+    /* R54-WG3-1: unexpected reader exits (dead marks) mean the device fds
+     * died without a pool-owner stop — external `ip link del`, netns
+     * teardown, driver unload. The wait-based busy signal then reads
+     * "no poll ever timed out" as busy=1.0 and would GROW: tun_pool_add ->
+     * tun_attach would re-create a fresh device with the same name, attach
+     * a new reader, and the caller's if_nametoindex dead-tunnel probe
+     * would see a live index again — the deleted tunnel "resurrects" as a
+     * nameless, route-less device while keepalives still look alive,
+     * masking the R43-C1-L1 fail-fast. Refuse BOTH grow and shrink while
+     * any in-range reader is dead: growing would mask the loss, shrinking
+     * would merely drop queues whose fd is already gone, and every
+     * legitimate queue death sets stop (del/destroy) and never reaches
+     * this branch — so AIMD grow under load (all readers alive polling)
+     * is untouched. The server's probe exits the process promptly; this
+     * guard is what prevents the rebuild in the window before that. */
+    {
+        int dead = 0;
+        for (int i = 0; i < nq; i++)
+            if (atomic_load_explicit(&pool->qs[i].dead,
+                                     memory_order_acquire))
+                dead++;
+        if (dead > 0) {
+            fprintf(stderr,
+                    "tun reader pool: %d reader(s) lost without a pool "
+                    "stop (device deleted?); refusing AIMD resize\n",
+                    dead);
+            return;   /* leave waits/wstall accounting untouched */
+        }
+    }
 
     for (int i = 0; i < nq; i++)
         wsum += atomic_exchange(&pool->qs[i].waits, 0);

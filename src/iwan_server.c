@@ -1046,34 +1046,63 @@ static void *recv_thread_main(void *v)
         if (a->tid == 0) {
             /* periodic housekeeping: primary thread only */
             uint64_t now = now_ms();
-            if (a->ctx->qpool && now - last_qctl >= TUN_POOL_TICK_MS) {
-                tun_pool_tick(a->ctx->qpool);
-                last_qctl = now;
-            }
-            /* R43-C1-L1: TUN device deleted externally (ip link del,
-             * netns teardown, driver unload): each pool reader exits on
-             * POLLHUP leaving the pool's nq/stop accounting untouched,
-             * so uplink writes keep targeting the dead queue fd and the
-             * tunnel goes silently dark while UDP keepalives still look
-             * alive. Probe the interface index once per second (mirrors
-             * the client sentinel, proxy.c cmd_proxy): zero means the
-             * device is gone — say so out loud and fail fast (exit 1
-             * via poll_err) instead of serving a dead tunnel until a
-             * manual restart. Gated on !g_stop so a normal shutdown
-             * (which stops the readers through the same poll path) never
-             * probes, reports, or mis-exits. */
+            /* R43-C1-L1 (R54-WG3-1): TUN device deleted externally (ip
+             * link del, netns teardown, driver unload): each pool reader
+             * exits on POLLHUP leaving the pool's nq/stop accounting
+             * untouched, so uplink writes keep targeting the dead queue
+             * fd and the tunnel goes silently dark while UDP keepalives
+             * still look alive. Probe the interface index once per
+             * second (mirrors the client sentinel, proxy.c cmd_proxy):
+             * zero means the device is gone — say so out loud and fail
+             * fast (exit 1 via poll_err) instead of serving a dead
+             * tunnel until a manual restart. This probe must run BEFORE
+             * tun_pool_tick below: the old order let the tick grow
+             * first, and with every reader dead the tick saw busy=1.0
+             * and re-created the same-named device via tun_attach in the
+             * microseconds before the probe ran — if_nametoindex then
+             * saw a live index and the fail-fast never fired. Two
+             * independent death signals cover both sides of that:
+             *  - if_nametoindex==0 catches the plain deletion;
+             *  - tun_pool_readers_lost() stays >0 even if a racing tick
+             *    already re-created the device (the dead reader marks
+             *    persist in the pool), so the rebuild can never hide the
+             *    loss from this probe.
+             * Gated on !g_stop so a normal shutdown (which stops the
+             * readers through the same poll path) never probes, reports,
+             * or mis-exits. */
             if (now - last_probe >= 1000) {
                 last_probe = now;
                 if (!atomic_load_explicit(&g_stop, memory_order_relaxed) &&
-                    a->ctx->qpool && if_nametoindex(a->tun_name) == 0) {
-                    log_err("tun device %s vanished (deleted externally); "
-                            "tunnel dead — restart to recover",
-                            a->tun_name);
-                    atomic_store_explicit(&g_stop, true,
-                                          memory_order_relaxed);
-                    atomic_store_explicit(a->poll_err, 1,
-                                          memory_order_relaxed);
+                    a->ctx->qpool) {
+                    int rlost = tun_pool_readers_lost(a->ctx->qpool);
+                    /* if_nametoindex returns unsigned (index 0 = none) */
+                    unsigned int idx = if_nametoindex(a->tun_name);
+                    if (rlost > 0 || idx == 0) {
+                        log_err("tun device %s %s; tunnel dead — restart "
+                                "to recover", a->tun_name,
+                                idx == 0
+                                    ? "vanished (deleted externally)"
+                                    : "readers lost (device deleted/"
+                                      "replaced while server ran)");
+                        atomic_store_explicit(&g_stop, true,
+                                              memory_order_relaxed);
+                        atomic_store_explicit(a->poll_err, 1,
+                                              memory_order_relaxed);
+                    }
                 }
+            }
+            if (!atomic_load_explicit(&g_stop, memory_order_relaxed) &&
+                a->ctx->qpool && now - last_qctl >= TUN_POOL_TICK_MS) {
+                /* Runs strictly AFTER the probe above, and only while
+                 * the probe has not failed: with the device gone the
+                 * probe has already armed exit-1 before this tick could
+                 * grow-and-resurrect it, and even in the sub-second
+                 * window before the next probe the tick's own dead-reader
+                 * guard (tun.c) refuses the grow. Skipping housekeeping
+                 * resizes once g_stop is set is also the correct
+                 * teardown behaviour (no resizes mid-shutdown). */
+                tun_pool_tick(a->ctx->qpool);
+                last_qctl = now;
             }
             if (now - last_purge >= 1000) {
 #ifndef IWAN_DEBUG_STRIP

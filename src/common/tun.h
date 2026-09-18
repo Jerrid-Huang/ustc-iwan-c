@@ -151,6 +151,14 @@ int tun_pool_queues(const struct tun_pool *p);
  * the device write lock is not a single serialization point); -1 when
  * the pool is empty. Safe to call concurrently with tun_pool_tick. */
 int tun_pool_write_fd(const struct tun_pool *p, unsigned tid);
+/* R54-WG3-1: number of pool queues whose reader exited unexpectedly
+ * (device deleted externally without a pool stop). >0 even while the
+ * same-named device still exists (a racing grow re-created it); normal
+ * del/destroy reads never raise it. The server's dead-tunnel probe
+ * treats >0 as fatal. Linux/macOS only (tun_win.c has no such signal). */
+#ifndef _WIN32
+int tun_pool_readers_lost(const struct tun_pool *p);
+#endif
 /* uplink write hit the device queue: prevents the AIMD shrink for the
  * next tick (write fan-out must not collapse under upload congestion) */
 void tun_pool_note_stall(struct tun_pool *p);
