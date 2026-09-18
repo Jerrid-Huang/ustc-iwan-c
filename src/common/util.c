@@ -832,8 +832,27 @@ void pace_take(pace_bucket *b, int npk)
     if ((uint64_t)npk > budget) {
         uint64_t need = ((uint64_t)npk - budget) * 1000000u / b->pps;
         b->budget = 0;
-        if (need > 0)
-            port_sleep_us((unsigned)need);
+        /* R54-WG4-3 (C2): the old single port_sleep_us((unsigned)need)
+         * was unbounded, uninterruptible and a uint truncation hazard
+         * (pps=1, npk=128 => ~128s under one call, holding the caller's
+         * send_lock / parking the event loop; Ctrl-C could not cut it
+         * short). Slice the wait into <=10ms chunks with a g_stop check
+         * between slices: a shutdown signal breaks out within one slice
+         * instead of after minutes, the total is still CAS bounded on
+         * uint64_t (no truncation), and a normal small need (<= one
+         * slice) sleeps exactly as before — pause semantics are byte-for-
+         * byte unchanged, only the interruptibility of a LONG pause is
+         * new (and only when the process is stopping anyway). */
+        if (need > 0) {
+            const uint64_t slice = 10000;   /* 10ms */
+            while (need > 0) {
+                uint64_t s = need < slice ? need : slice;
+                port_sleep_us((unsigned)s);
+                need -= s;
+                if (atomic_load_explicit(&g_stop, memory_order_relaxed))
+                    break;
+            }
+        }
     } else {
         b->budget = budget - (uint64_t)npk;
     }
