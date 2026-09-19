@@ -274,7 +274,7 @@ static int tx_enqueue(Netstack *ns, FramedPkt *fp, uint8_t conn)
 static int bridge_output_parse(Netstack *ns, const struct pbuf *p,
                                int *has_payload)
 {
-    uint8_t h[80];   /* 40B IPv6 hdr + 40B TCP (v6 SYN has thlen 28..40) */
+    uint8_t h[80];   /* 40B IPv6 hdr + 40B TCP; only the base 20B TCP is read */
     const uint8_t *hb;   /* header bytes: h, or p->payload when contiguous */
     const uint8_t *t;
     uint16_t sport, dport;
@@ -309,7 +309,22 @@ static int bridge_output_parse(Netstack *ns, const struct pbuf *p,
         tot = ((size_t)hb[4] << 8) | hb[5];   /* payload length */
         t = hb + 40;
         thlen = (size_t)(t[12] >> 4) * 4;
-        if (thlen < 20 || thlen > 40 || tot < thlen)
+        /* R56-004: the v4 branch bounds the TCP header with
+         * `ihl + thlen > sizeof h`, which accepts thlen up to 60 for a
+         * normal 20-byte IP header. The old v6-only "thlen > 40" bound
+         * was an asymmetry with no basis in the wire format: the TCP
+         * data-offset field is 4 bits (max thlen 60) for BOTH IP
+         * versions, so a v6 SYN carrying >20B of options (thlen
+         * 44..60) is valid — rejecting it misclassified the SYN as
+         * NS_TX_CONN_CTL and lost the per-conn fair-share accounting.
+         * v6 has no ihl (fixed 40-byte header), so the v4 guard minus
+         * ihl is "thlen > sizeof h", unreachable because a 4-bit
+         * offset caps thlen at 60 < 80 — i.e. the branch now accepts
+         * the full valid thlen range exactly like v4. Safe: only the
+         * base 20-byte TCP header is read here (ports at t[0..3],
+         * data offset at t[12]) and got >= 60 guarantees those bytes;
+         * a larger thlen only feeds the tot/thlen sanity + has_payload. */
+        if (thlen < 20 || thlen > sizeof h || tot < thlen)
             return -1;
         *has_payload = tot > thlen;
         sport = (uint16_t)((t[0] << 8) | t[1]);
