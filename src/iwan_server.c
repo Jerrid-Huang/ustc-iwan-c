@@ -601,6 +601,7 @@ struct srv_dl_batch {
     struct iovec iovs[SRV_DL_BATCH * 2];
     struct mmsghdr msgs[SRV_DL_BATCH];
     int n;
+    uint64_t last_hard_err;   /* R56-102: rate-limiter for hard-error logs */
 };
 
 struct srv_pool_ud {
@@ -616,7 +617,20 @@ struct srv_pool_ud {
  * congestion event amplified every client's RTO simultaneously, R28-C1).
  * The reader retries on its next TUN read; a permanently-full peer
  * simply backpressures (bounded at SRV_DL_BATCH, see the guard in
- * srv_tun_pkt). */
+ * srv_tun_pkt).
+ * R56-102: any NON-EAGAIN/EINTR failure is a persistent hard error
+ * (ENETDOWN/ENETUNREACH/EHOSTUNREACH: link or route gone; EMSGSIZE:
+ * inner datagram too large; ENOBUFS: system buffer exhaustion;
+ * ETIMEDOUT/ECONNREFUSED: peer unreachable surfacing on the send;
+ * EPERM: netfilter OUTPUT DROP; EOPNOTSUPP/EINVAL/EBADF/...: socket
+ * unusable). The designed backpressure signal is EAGAIN only, so these
+ * errnos describe a condition that will NOT clear by keeping the batch:
+ * retained, the batch stays full forever, srv_tun_pkt's
+ * b->n >= SRV_DL_BATCH guard drops every new TUN packet and downlink
+ * stalls silently with no diagnostic. So drop the whole batch with a
+ * rate-limited log instead; UDP loss is acceptable (dropped DATA
+ * recovers by TCP RTO, pure ACKs regenerate) and the next TUN read
+ * stages a fresh batch that succeeds as soon as the condition clears. */
 static void srv_dl_flush(struct srv_dl_batch *b, int fd)
 {
     int n = b->n, sent = 0;
@@ -625,14 +639,33 @@ static void srv_dl_flush(struct srv_dl_batch *b, int fd)
         return;
     while (sent < n) {
         int r = port_sendmmsg(fd, &b->msgs[sent], (unsigned)(n - sent), 0);
-        if (r < 0 && errno == EINTR)
+        if (r > 0) {
+            for (int i = 0; i < r; i++)
+                PROF_ADD(g_prof_srv_dlsend,
+                         b->iovs[(size_t)(sent + i) * 2 + 1].iov_len);
+            sent += r;
             continue;
-        if (r <= 0)
-            break;   /* EAGAIN / fatal: keep the rest */
-        for (int i = 0; i < r; i++)
-            PROF_ADD(g_prof_srv_dlsend,
-                     b->iovs[(size_t)(sent + i) * 2 + 1].iov_len);
-        sent += r;
+        }
+        if (errno == EINTR)
+            continue;   /* interrupted by a signal: retry, nothing consumed */
+        if (r == 0 || errno == EAGAIN || errno == EWOULDBLOCK)
+            break;   /* r==0 is not a real UDP outcome; EAGAIN is the
+                      * designed backpressure — retain the rest below */
+        /* R56-102: persistent hard error — drop the batch + rate-limited
+         * log (see the function comment for the errno rationale). The
+         * timestamp lives in the batch (per-queue) so the multiple TUN
+         * reader threads never share a cache line / race on a static. */
+        {
+            uint64_t nowm = now_ms();
+            if (nowm - b->last_hard_err >= 1000) {
+                b->last_hard_err = nowm;
+                log_err("downlink sendmmsg: %s (%d); dropping %d-frame "
+                        "batch (UDP loss — TCP RTO recovers)",
+                        strerror(errno), errno, n);
+            }
+        }
+        b->n = 0;
+        return;   /* fresh batch re-attempts on the next TUN read */
     }
     if (sent == n) {
         b->n = 0;
