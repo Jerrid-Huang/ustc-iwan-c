@@ -1964,6 +1964,13 @@ static bool flow_conn_dead(const Flow *f)
     return c == NULL || c->pcb == NULL;
 }
 
+#if defined(__linux__) /* R56-001: this is called ONLY from wait_events
+                        * (socks.c), whose POLLERR|POLLHUP flow convergence
+                        * is Linux-gated. On Windows/macOS WSAPoll/poll
+                        * report POLLHUP on a half-open socket (peer FIN
+                        * read, write still open), so the ERR|HUP logic is
+                        * not compiled there and this symbol must not be
+                        * emitted (no undefined/dead reference). */
 /* R55-SK-1: converge a flow whose local client fd just poll-reported
  * POLLERR/POLLHUP in wait_events (socks.c). Probe-verified on Linux: those
  * two bits are reported by poll() UNCONDITIONALLY (ignoring the events
@@ -2006,6 +2013,7 @@ void flow_kill_dead_client(Flow *f)
         f->fd = -1;
     }
 }
+#endif /* defined(__linux__) */
 
 void service_local_inputs(Flow *fs) {
     /* R4-09-F1: detach every flow from a dead netstack connection before

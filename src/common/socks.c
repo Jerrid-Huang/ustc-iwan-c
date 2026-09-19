@@ -160,20 +160,18 @@ void wait_events(int listener, int sockfd, int dns_evfd, int timeout_ms)
          * f->input with no cap (ST_CLOSING is outside the GREETING/REQUEST
          * HANDSHAKE_INPUT_MAX and the RESOLVING 1MB cap), letting a client
          * feed hundreds of MB in ~30s -> buf_ensure -> oom_abort. Closing
-         * POLLIN here + A's feed stop together prevent the POLLIN/POLLOUT
-         * wake and the unbounded buffering; the ST_CLOSING flow is then
-         * force-reaped by reap_flows after ST_CLOSING_TIMEOUT_MS (30s).
-         * POLLOUT below stays enabled (f->output.len > 0), so any queued
-         * reply/data is still delivered by service_local_outputs before
-         * the flow dies.
-         * R55-SK-1: NOTE that "events = 0" does NOT stop a dead client's
-         * wakeup — see the ERR|HUP note after the events assignment. */
+         * POLLIN here + A's feed stop together prevent the busy-spin and
+         * the unbounded buffering; the ST_CLOSING flow is then force-reaped
+         * by reap_flows after ST_CLOSING_TIMEOUT_MS (30s). POLLOUT below
+         * stays enabled (f->output.len > 0), so any queued reply/data is
+         * still delivered by service_local_outputs before the flow dies. */
         fds[n].events =
             (f->rx_paused || f->local_eof || f->state == ST_CLOSING)
                 ? 0
                 : POLLIN;
         if (f->output.len > 0 || f->rxq_waiting)
             fds[n].events |= POLLOUT;
+#if defined(__linux__)
         /* R55-SK-1: "events = 0" stops POLLIN/POLLOUT wakes — but NOT
          * POLLERR/POLLHUP, which Linux poll reports UNCONDITIONALLY on a
          * dead fd (probe: poll(events=0) on an RST'd peer returns
@@ -186,12 +184,14 @@ void wait_events(int listener, int sockfd, int dns_evfd, int timeout_ms)
          * A clean FIN / half-open socket never gets those bits (control:
          * revents=0 with events=0), so the clean-FIN data path below is
          * untouched. */
+#endif /* defined(__linux__) */
         fmap[n] = f;
         n++;
     }
     int pr = port_poll(fds, (nfds_t)n, timeout_ms);
     if (pr < 0 && errno != EINTR)
         log_err("poll: %s", strerror(errno));
+#if defined(__linux__)
     /* R54-WG4-1 (C3): poll() error bits were ignored here — a slot whose
      * fd is invalid (POLLNVAL) makes poll return INSTANTLY with no
      * readable data, so wait_events would turn the parked event loop
@@ -322,6 +322,59 @@ void wait_events(int listener, int sockfd, int dns_evfd, int timeout_ms)
              * flush to the client this round. */
         }
     }
+#else /* !defined(__linux__) — R56-001: R55-SK-1's (POLLERR|POLLHUP) flow
+       * convergence is gated to Linux. Windows WSAPoll reports POLLHUP
+       * unconditionally on a half-open socket that has read its peer's FIN
+       * but can still send (send() still succeeds), so on Windows/macOS
+       * acting on ERR|HUP would silently truncate in-flight responses of
+       * a half-closed client; macOS semantics were never verified either.
+       * Non-Linux therefore keeps the R54-WG4-1 behavior verbatim: only
+       * POLLNVAL is acted on (flow/listener/session/DNS classification
+       * unchanged), POLLERR/POLLHUP are never touched. */
+    /* R54-WG4-1 (C3): poll() error bits were ignored here — a slot whose
+     * fd is invalid (POLLNVAL) makes poll return INSTANTLY with no
+     * readable data, so wait_events would turn the parked event loop
+     * into an immediate-return busy spin while the round kept reading/
+     * writing the dead fd. The error states that DO converge must stay
+     * untouched: POLLERR/POLLHUP on a client fd are terminal socket
+     * states that service_local_inputs/outputs already converge on
+     * every round (readv EOF/RST -> ST_CLOSING, buffered output still
+     * flushed), and POLLERR on the session socket is consumed by
+     * receive_vpn's recvmmsg — acting on them here would risk dropping
+     * f->output. Only POLLNVAL (the fd is NOT open: an invariant
+     * violation) is acted on, fail-safe:
+     *  - flow fd: close/free the flow (it could never be read again);
+     *  - listener / session socket / DNS eventfd: log and stop /
+     *    session-lost so the caller reconnects instead of spinning on a
+     *    dead core. (The dead LISTENER fd is additionally tolerated by
+     *    accept_connections' own EBADF pacing at ~1 line/s + 50ms —
+     *    that keep-alive path is preserved; a listener POLLNVAL here
+     *    only fires with a listener-fd bug, which cannot recover.) */
+    if (pr > 0) {
+        for (int i = 0; i < n; i++) {
+            if (!(fds[i].revents & POLLNVAL))
+                continue;
+            Flow *f = fmap[i];
+            if (f) {
+                log_err("[flow %lu] poll POLLNVAL on fd %d: flow closed",
+                        (unsigned long)f->id, f->fd);
+                flow_free(f);
+            } else if (i == 0) {
+                log_err("poll POLLNVAL on listener fd %d",
+                        (int)listener);
+            } else if (i == 1) {
+                log_err("poll POLLNVAL on session socket fd %d: "
+                        "session lost", (int)sockfd);
+                if (g_socks_cfg)
+                    g_socks_cfg->session_lost = true;
+                g_stop = 1;
+            } else {
+                log_err("poll POLLNVAL on DNS eventfd: DNS wakeups "
+                        "degraded");
+            }
+        }
+    }
+#endif /* defined(__linux__) */
 }
 
 void accept_connections(int listener) {
