@@ -2422,11 +2422,28 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                      * this fd number while we are writing into it — the
                      * old tun_pool_write_fd + tun_write_retry pair left
                      * that microsecond TOCTOU open (a recycled fd would
-                     * silently receive a TUN frame). Budget and return
-                     * contract are identical to the raw path below. */
+                     * silently receive a TUN frame).
+                     * R55-TUN-1: tun_pool_write can still return -1 for
+                     * a NON-congestion reason (pool momentarily empty —
+                     * nq<=0 mid-shrink — or a stop-marked queue selected
+                     * just as the owner swaps it out), a case the
+                     * pre-R54 path survived: write_fd selection failure
+                     * kept wfd == ctx->tun_fd, so the raw path still
+                     * completed the send on the owner fd. Restore that
+                     * fallback: on -1 we retry once on ctx->tun_fd. This
+                     * does NOT reopen the R54-WG3-3 fd-reuse window —
+                     * tun_pool_write has released the pool read lock on
+                     * return, and ctx->tun_fd is the owner fd, which is
+                     * never closed; the retry runs entirely outside the
+                     * pool (no pool lock, no pool fd), so no del-close
+                     * can race it. Only when the owner-fd retry also
+                     * fails does the frame drop below. */
                     wr = tun_pool_write(ctx->qpool, tid,
                                         raw + IWAN_HDR_LEN,
                                         len - IWAN_HDR_LEN, 1);
+                    if (wr != 0)
+                        wr = tun_write_retry(wfd, raw + IWAN_HDR_LEN,
+                                             len - IWAN_HDR_LEN, 1, NULL);
                 } else {
                     wr = tun_write_retry(wfd, raw + IWAN_HDR_LEN,
                                          len - IWAN_HDR_LEN, 1, NULL);
