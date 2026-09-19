@@ -1415,11 +1415,14 @@ int port_sendmmsg(int fd, struct mmsghdr *msgvec, unsigned vlen, int flags)
     unsigned sent = 0;
     if (ensure_dontwait(fd, flags) != 0)
         return -1;
-    /* Fast path: every caller in this project builds sendmmsg entries
-     * with exactly one iovec. Convert the whole batch to WSABUF once
-     * instead of re-doing iov_to_wsabuf + stack setup per datagram.
-     * Windows still performs one WSASendTo per datagram (no native
-     * sendmmsg), but the per-call conversion overhead is eliminated. */
+    /* Fast path: most callers build sendmmsg entries with one iovec
+     * (R58-I-01: srv_dl_flush and handle_tun_downlink use two — hdr +
+     * payload — and correctly fall to the general per-datagram path via
+     * the msg_iovlen != 1 check below). Convert the batch to WSABUF once
+     * for the single-iovec case instead of re-doing iov_to_wsabuf + stack
+     * setup per datagram. Windows still performs one WSASendTo per
+     * datagram (no native sendmmsg), but the per-call conversion
+     * overhead is eliminated. */
     {
         int single = 1;
         for (unsigned i = 0; i < vlen; i++) {

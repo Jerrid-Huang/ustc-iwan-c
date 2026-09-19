@@ -728,8 +728,13 @@ static void srv_tun_pkt(void *ud, uint8_t *pkt, size_t len, bool last)
         /* too small for an inner header: drop (previous staged packets
          * still flush on the reader's signal below) */
     } else if (len > SRV_DL_SLOT) {
-        /* oversized (never on an MTU-1500 TUN): flush first so per-queue
-         * ordering is preserved, then prep + direct-send */
+        /* oversized (never on an MTU-1500 TUN): flush first so the
+         * staged batch is sent before this direct-send (R58-I-02: if the
+         * flush retains a remainder on EAGAIN backpressure, this
+         * direct-sent datagram may still overtake those retained frames
+         * for the same peer — harmless: each frame is an independent UDP
+         * datagram carrying one inner TCP segment, which reassembles
+         * out of order and RTO-recovers pure loss) */
         srv_dl_flush(b, fd);
         handle_tun_downlink(pu->ctx, pkt, len, fd);
     } else if (tun_prep_downlink(pu->ctx, pkt, len, &snap, hdr)) {
