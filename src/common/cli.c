@@ -114,10 +114,28 @@ static void validate_aliases(const cli_opt *opts, size_t nopts,
     if (!ctl->short_aliases)
         return;
     for (const char *const(*p)[2] = ctl->short_aliases; (*p)[0]; p++) {
-        if (find_opt(opts, nopts, (*p)[1] + 2, strlen((*p)[1] + 2)) == NULL) {
+        const char *t = (*p)[1];
+        /* R56-101 (defensive): the alias table is internal, but guard
+         * against a malformed target that is not "--<name>": on a short
+         * string like "-a" the old "+2" would walk one byte past the
+         * terminating NUL and strlen() would read out of bounds. Treat a
+         * malformed entry as a hard internal error (same fatal exit(2)
+         * contract as the unknown-target check below) instead of ever
+         * dereferencing past the string. Every read stays in-bounds: t
+         * is NULL-checked first, t[0]/t[1] exist for any non-NULL
+         * string, and t[2] is reached only when t[0]=='-' && t[1]=='-'
+         * — i.e. at a length-2 string ("--") where t[2] is the
+         * terminating NUL, or a longer string with a real character. */
+        if (t == NULL || t[0] != '-' || t[1] != '-' || t[2] == '\0') {
+            fprintf(stderr,
+                    "error: internal: short alias '%s' has malformed "
+                    "target '%s'\n", (*p)[0], t != NULL ? t : "(null)");
+            exit(2);
+        }
+        if (find_opt(opts, nopts, t + 2, strlen(t + 2)) == NULL) {
             fprintf(stderr,
                     "error: internal: short alias '%s' targets unknown "
-                    "option '%s'\n", (*p)[0], (*p)[1]);
+                    "option '%s'\n", (*p)[0], t);
             exit(2);
         }
     }
