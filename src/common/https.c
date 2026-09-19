@@ -1687,59 +1687,72 @@ static int https_tls_read(SSL *ssl, int fd, struct sbuf *resp,
         r = SSL_read(ssl, buf, sizeof buf);
         if (r > 0) {
             sbuf_app(resp, buf, (size_t)r);
-            if (content_len < 0) {
-                /* once the header block has fully arrived, learn the
-                 * body length so we can stop at the last body byte
-                 * instead of waiting for the peer to close (a
-                 * keep-alive server would otherwise stall every
-                 * request until the 60s deadline) */
-                if (!crlf_hit) {
-                    const char *p = sbuf_find(resp->d + crlf_probe,
-                                              resp->len - crlf_probe,
-                                              "\r\n\r\n", 4);
-                    if (p) {
-                        crlf_hit = true;
-                        crlf_pos = (size_t)(p - resp->d);
-                    } else if (resp->len >= 4) {
-                        crlf_probe = resp->len - 3;
-                    }
+            /* R56-201/202 FRAMING RULE — mirrors https_hdr_body() exactly,
+             * so the raw read and the parse side can never disagree:
+             *
+             *   * The FIRST CRLFCRLF anywhere in the buffer is the
+             *     AUTHORITATIVE end of the header block; it alone pins
+             *     Content-Length.
+             *   * A bare LFLF is only a FALLBACK for a peer that never
+             *     emits CRLFCRLF at all (nothing in the response so far
+             *     forms one) — i.e. plausibly an LF-only server.
+             *   * The scan keeps running past an LFLF latch (it is NOT
+             *     gated on content_len being unknown), so when a real
+             *     CRLFCRLF later arrives from a mixed-EOL / non-conformant
+             *     peer, the frame is REPLACED — body_start and
+             *     content_len are overwritten, never frozen on the first
+             *     LFLF. The upgrade is monotone (LF -> CRLF only, found
+             *     at most once per response because a hit is permanent),
+             *     so the frame converges to a pure function of the final
+             *     buffer and cannot flip-flop with read granularity. */
+            if (!crlf_hit) {
+                const char *p = sbuf_find(resp->d + crlf_probe,
+                                          resp->len - crlf_probe,
+                                          "\r\n\r\n", 4);
+                if (p) {
+                    crlf_hit = true;
+                    crlf_pos = (size_t)(p - resp->d);
+                } else if (resp->len >= 4) {
+                    crlf_probe = resp->len - 3;
                 }
-                if (!crlf_hit && !lf_hit) {
-                    const char *p = sbuf_find(resp->d + lf_probe,
-                                              resp->len - lf_probe,
-                                              "\n\n", 2);
-                    if (p) {
-                        lf_hit = true;
-                        lf_pos = (size_t)(p - resp->d);
-                    } else if (resp->len >= 2) {
-                        lf_probe = resp->len - 1;
-                    }
+            }
+            if (!crlf_hit && !lf_hit) {
+                const char *p = sbuf_find(resp->d + lf_probe,
+                                          resp->len - lf_probe,
+                                          "\n\n", 2);
+                if (p) {
+                    lf_hit = true;
+                    lf_pos = (size_t)(p - resp->d);
+                } else if (resp->len >= 2) {
+                    lf_probe = resp->len - 1;
                 }
-                if ((crlf_hit || lf_hit) &&
-                    body_start != (crlf_hit ? crlf_pos + 4 : lf_pos + 2)) {
-                    /* the terminator choice can still move from LF-only to
-                     * CRLF (preferred) while content_len is unknown; that
-                     * is the only case that re-parses */
-                    body_start = crlf_hit ? crlf_pos + 4 : lf_pos + 2;
+            }
+            if (crlf_hit || lf_hit) {
+                size_t want = crlf_hit ? crlf_pos + 4 : lf_pos + 2;
+                if (want != body_start) {
+                    /* the frame moved: first terminator seen, or an LFLF
+                     * latch replaced by a later (authoritative) CRLFCRLF.
+                     * Adopt the new terminator and re-derive the framing
+                     * from the new header block. */
+                    body_start = want;
+                    /* R12 T4 (R41-1A2-1): the framing decision is taken
+                     * from the CURRENT settled header block and only
+                     * re-derived when that block itself moves (at most
+                     * once, the LF->CRLF upgrade above). TE: chunked
+                     * overrides any Content-Length (RFC 7230 §3.3.3):
+                     * keep content_len == -1 so the raw read runs to
+                     * EOF/close_notify and the FULL chunk stream is
+                     * captured — CL counts decoded payload bytes, not
+                     * the chunk-framed wire octets, so stopping at CL
+                     * would truncate the stream and chunk_decode()
+                     * below would hard-fail. Only the non-chunked
+                     * path parses Content-Length (behavior unchanged). */
+                    chunked = https_te_header_chunked(resp->d, body_start);
                     if (!chunked) {
-                        /* R12 T4 (R41-1A2-1): decide the framing ONCE, at
-                         * the first settled header block. TE: chunked
-                         * overrides any Content-Length (RFC 7230 §3.3.3):
-                         * keep content_len == -1 so the raw read runs to
-                         * EOF/close_notify and the FULL chunk stream is
-                         * captured — CL counts decoded payload bytes, not
-                         * the chunk-framed wire octets, so stopping at CL
-                         * would truncate the stream and chunk_decode()
-                         * below would hard-fail. Only the non-chunked
-                         * path parses Content-Length (behavior unchanged). */
-                        chunked = https_te_header_chunked(resp->d,
-                                                          body_start);
-                        if (!chunked) {
-                            content_len =
-                                https_content_length(resp->d, body_start);
-                            if (content_len == 0)
-                                return 0;   /* declared empty body */
-                        }
+                        content_len =
+                            https_content_length(resp->d, body_start);
+                        if (content_len == 0)
+                            return 0;   /* declared empty body */
                     }
                 }
             }
@@ -1930,7 +1943,34 @@ static int https_resp_parse(struct sbuf *resp, int *status, char **body_out)
         }
         out = dec.d ? dec.d : empty_str();
     } else {
-        size_t blen = resp->len - (size_t)(body - resp->d);
+        /* Non-chunked framing is EXACTLY Content-Length (R56-201):
+         * blen is the declared count whenever a CL is present, so bytes
+         * past it — pipelined/trailing/attacker data that SSL_read
+         * pulled in beyond the message (e.g. a tail after a CL:0
+         * response) — are never part of the body. A declared body that
+         * is SHORTER than its CL has been truncated on the wire, and
+         * fails closed ("complete body or nothing") instead of shipping
+         * a torn blob. With no CL the raw tail IS the body (pre-existing
+         * EOF-delimited semantics for Connection: close responses).
+         * https_content_length uses the same header block that
+         * https_hdr_body just delimited, and the read side frames with
+         * the identical "first CRLFCRLF else first LFLF" rule, so these
+         * two never disagree. */
+        size_t tail = resp->len - (size_t)(body - resp->d);
+        long long cl = https_content_length(hdr_start, hdr_len);
+        size_t blen;
+
+        if (cl < 0) {
+            blen = tail;   /* no CL: EOF-delimited, whole tail is body */
+        } else if ((unsigned long long)tail < (unsigned long long)cl) {
+            log_err("HTTPS: response body truncated (%llu of %lld bytes)",
+                    (unsigned long long)tail, cl);
+            free(resp->d);
+            *body_out = empty_str();
+            return 0;
+        } else {
+            blen = (size_t)cl;   /* clamp: exactly CL, drop the tail */
+        }
         out = malloc(blen + 1);
         if (!out)
             oom_abort();
