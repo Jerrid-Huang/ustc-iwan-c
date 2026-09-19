@@ -864,8 +864,9 @@ int main(int argc, char **argv)
 
     port_socket_init();   /* WSAStartup on Windows; no-op on Linux */
     /* a lockout drop closes the connection mid-handshake: a send() on
-     * the RST-ed socket must not kill the harness with SIGPIPE */
-    signal(SIGPIPE, SIG_IGN);
+     * the RST-ed socket must not kill the harness with SIGPIPE (Windows
+     * has no SIGPIPE — port_ignore_sigpipe is a no-op there) */
+    port_ignore_sigpipe();
 
     uint16_t port = pick_port();
     printf("LISTEN 127.0.0.1:%u\n", (unsigned)port);
