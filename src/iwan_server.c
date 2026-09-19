@@ -661,8 +661,13 @@ static void srv_dl_flush(struct srv_dl_batch *b, int fd)
                 b->last_hard_err = nowm;
                 log_err("downlink sendmmsg: %s (%d); dropping %d-frame "
                         "batch (UDP loss — TCP RTO recovers)",
-                        strerror(errno), errno, n);
+                        strerror(errno), errno, n - sent);
             }
+            /* R57-001: count the actually-dropped remainder in the PROF
+             * send-drop counter — without it, hard-error loss (unlike the
+             * stage-guard drops in srv_tun_pkt) was invisible in the
+             * profiler. n-sent frames were never handed to the kernel. */
+            server_add_send_drops((unsigned)(n - sent));
         }
         b->n = 0;
         return;   /* fresh batch re-attempts on the next TUN read */
