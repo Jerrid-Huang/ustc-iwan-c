@@ -100,6 +100,21 @@ typedef struct {
                                 * the local socket was not writable: keep
                                 * POLLOUT registered so the loop wakes when
                                 * the client drains (wait_events reads this) */
+    uint8_t  err_rounds;       /* R55-SK-1: consecutive event-loop rounds in
+                                * which wait_events saw POLLERR/POLLHUP on
+                                * this flow's local fd WHILE output/rxq was
+                                * still queued (0xff-saturating). wait_events
+                                * (socks.c) uses it to bound the ERR|HUP
+                                * convergence: past FLOW_ERR_ROUNDS_MAX the
+                                * client is confirmed dead and the
+                                * undeliverable queue is dropped (force-reap
+                                * semantic, see socks.c wait_events). It only
+                                * ever grows on a REAL error — poll never
+                                * reports these bits on a half-open socket
+                                * (R55-SK-1 probe) — so no reset is
+                                * required; flow_alloc's memset starts it at
+                                * 0 and any future ERR on the same fd is the
+                                * same confirmation. */
     uint8_t  target_af;        /* request target family: 0 unknown (domain),
                                 * 4 = IPv4, 6 = IPv6 (SOCKS5 reply BND.ADDR
                                 * and the reply-format decision) */
@@ -179,6 +194,10 @@ void queue_socks_error(Flow *f, uint8_t rep);
 void set_flow_state(Flow *f, FlowState st);
 Flow *flow_alloc(struct sockaddr_in *peer);
 void flow_free(Flow *f);
+/* R55-SK-1: converge a flow whose local client fd poll-reported
+ * POLLERR/POLLHUP in wait_events (socks.c). See the definition in
+ * socks_flow.c for the full rationale. */
+void flow_kill_dead_client(Flow *f);
 void open_tcp_connection(Flow *f, uint32_t rip, uint16_t rport);
 void open_tcp_connection6(Flow *f, const uint8_t rip6[16], uint16_t rport);
 void process_socks_handshake(Flow *f);

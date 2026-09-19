@@ -160,17 +160,32 @@ void wait_events(int listener, int sockfd, int dns_evfd, int timeout_ms)
          * f->input with no cap (ST_CLOSING is outside the GREETING/REQUEST
          * HANDSHAKE_INPUT_MAX and the RESOLVING 1MB cap), letting a client
          * feed hundreds of MB in ~30s -> buf_ensure -> oom_abort. Closing
-         * POLLIN here + A's feed stop together prevent the busy-spin and
-         * the unbounded buffering; the ST_CLOSING flow is then force-reaped
-         * by reap_flows after ST_CLOSING_TIMEOUT_MS (30s). POLLOUT below
-         * stays enabled (f->output.len > 0), so any queued reply/data is
-         * still delivered by service_local_outputs before the flow dies. */
+         * POLLIN here + A's feed stop together prevent the POLLIN/POLLOUT
+         * wake and the unbounded buffering; the ST_CLOSING flow is then
+         * force-reaped by reap_flows after ST_CLOSING_TIMEOUT_MS (30s).
+         * POLLOUT below stays enabled (f->output.len > 0), so any queued
+         * reply/data is still delivered by service_local_outputs before
+         * the flow dies.
+         * R55-SK-1: NOTE that "events = 0" does NOT stop a dead client's
+         * wakeup — see the ERR|HUP note after the events assignment. */
         fds[n].events =
             (f->rx_paused || f->local_eof || f->state == ST_CLOSING)
                 ? 0
                 : POLLIN;
         if (f->output.len > 0 || f->rxq_waiting)
             fds[n].events |= POLLOUT;
+        /* R55-SK-1: "events = 0" stops POLLIN/POLLOUT wakes — but NOT
+         * POLLERR/POLLHUP, which Linux poll reports UNCONDITIONALLY on a
+         * dead fd (probe: poll(events=0) on an RST'd peer returns
+         * revents=0x18 immediately, 1000 rounds in 0.287 ms; after a
+         * clean FIN it stays quiet). So an events=0 slot on a dead client
+         * fd makes port_poll return instantly every round — the zero-wait
+         * busy spin — until the flow is reaped. The revents scan below
+         * therefore detects (POLLERR|POLLHUP) and converges by closing
+         * the dead fd (flow_kill_dead_client), so it leaves the poll set.
+         * A clean FIN / half-open socket never gets those bits (control:
+         * revents=0 with events=0), so the clean-FIN data path below is
+         * untouched. */
         fmap[n] = f;
         n++;
     }
@@ -181,43 +196,130 @@ void wait_events(int listener, int sockfd, int dns_evfd, int timeout_ms)
      * fd is invalid (POLLNVAL) makes poll return INSTANTLY with no
      * readable data, so wait_events would turn the parked event loop
      * into an immediate-return busy spin while the round kept reading/
-     * writing the dead fd. The error states that DO converge must stay
-     * untouched: POLLERR/POLLHUP on a client fd are terminal socket
-     * states that service_local_inputs/outputs already converge on
-     * every round (readv EOF/RST -> ST_CLOSING, buffered output still
-     * flushed), and POLLERR on the session socket is consumed by
-     * receive_vpn's recvmmsg — acting on them here would risk dropping
-     * f->output. Only POLLNVAL (the fd is NOT open: an invariant
-     * violation) is acted on, fail-safe:
-     *  - flow fd: close/free the flow (it could never be read again);
-     *  - listener / session socket / DNS eventfd: log and stop /
-     *    session-lost so the caller reconnects instead of spinning on a
-     *    dead core. (The dead LISTENER fd is additionally tolerated by
-     *    accept_connections' own EBADF pacing at ~1 line/s + 50ms —
-     *    that keep-alive path is preserved; a listener POLLNVAL here
-     *    only fires with a listener-fd bug, which cannot recover.) */
+     * writing the dead fd.
+     *
+     * R55-SK-1 (correction to the C3 reasoning): the claim that
+     * "POLLERR/POLLHUP on a client fd ... already converge on every round
+     * (readv EOF/RST -> ST_CLOSING)" is TRUE only while the flow is still
+     * being read (POLLIN registered). The moment the read-EOF/RST path
+     * moves the flow to ST_CLOSING / local_eof, wait_events registers the
+     * slot with events=0 — and Linux poll reports POLLERR/POLLHUP
+     * UNCONDITIONALLY, ignoring the events mask (probe-verified: an
+     * RST'd fd with events=0 returns revents=0x18 instantly, 1000 rounds
+     * in 0.287 ms). So an events=0 slot on a dead client fd keeps
+     * port_poll returning immediately every round — the same zero-wait
+     * busy spin C3 removed for POLLNVAL — held until reap_flows finally
+     * collects the flow (up to ST_CLOSING_TIMEOUT_MS = 30s, or same-round
+     * when removable). A clean-FIN / half-open socket NEVER gets these
+     * bits (control: events=0 returns revents=0), so acting on them is
+     * unambiguous: the local client is dead, and any queue it has not
+     * drained can never be delivered.
+     *
+     * The scan below therefore handles, for FLOW slots:
+     *  - POLLNVAL: close/free the flow (invariant violation, C3, kept).
+     *  - POLLERR|POLLHUP while this slot's event mask has POLLIN: the flow
+     *    is still in a read-consuming state — LEAVE the wake to
+     *    service_local_inputs' readv/recv, which harvests any in-flight
+     *    data (probe: unread bytes survive an RST until read) and then
+     *    converges on the EOF/RST exactly as before. This is the
+     *    clean-FIN data path and must stay untouched; POLLERR on the
+     *    session socket is likewise left to receive_vpn's recvmmsg.
+     *  - POLLERR|POLLHUP and nothing left to deliver (output empty, no
+     *    rxq_waiting): the slot is events=0 and dead — close the local fd
+     *    now (wait_events skips fd<0, so the fd leaves the poll set and
+     *    cannot wake us again) and converge the flow via
+     *    flow_kill_dead_client (local_eof + ns_close + ST_CLOSING, the
+     *    same transition readv-EOF makes); reap_flows then collects it on
+     *    its normal rules.
+     *  - POLLERR|POLLHUP with output/rxq still queued (POLLOUT armed):
+     *    keep polling so service_local_outputs attempts the final flush —
+     *    a half-open client that can still read must receive its queued
+     *    bytes, which is why we must NOT drop f->output here. The write
+     *    to a dead socket fails hard (EPIPE/ECONNRESET, probe-verified)
+     *    and service_local_outputs' own hard-error arm drains the queue.
+     *    Bounded convergence: count consecutive ERR|HUP rounds in
+     *    f->err_rounds; past FLOW_ERR_ROUNDS_MAX the client is confirmed
+     *    gone (the bits never appear on a live socket) and the
+     *    undeliverable queue is dropped — the same force-reap semantic
+     *    reap_flows' 30s timeout applies — then the flow converges as
+     *    above. This caps even the pathological case of a dead socket
+     *    whose send keeps returning EAGAIN.
+     *
+     * Non-flow slots (listener / session socket / DNS eventfd) stay
+     * POLLNVAL-only, exactly as C3: POLLERR on the session socket is
+     * consumed by receive_vpn's recvmmsg, and ERR/HUP on the listener /
+     * DNS evfd have a non-spinning recovery (accept's EBADF pacing, the
+     * poll timeout), so acting on them would risk dropping f->output. */
+#define FLOW_ERR_ROUNDS_MAX 32u /* R55-SK-1: consecutive ERR|HUP rounds
+                                 * before an undeliverable queue is dropped */
     if (pr > 0) {
         for (int i = 0; i < n; i++) {
-            if (!(fds[i].revents & POLLNVAL))
-                continue;
             Flow *f = fmap[i];
-            if (f) {
+            unsigned re = (unsigned)fds[i].revents;
+            if (!(re & (POLLNVAL | POLLERR | POLLHUP)))
+                continue;
+            if (!f) {
+                /* listener / session socket / DNS eventfd: POLLNVAL only
+                 * (R54-WG4-1); see the R55-SK-1 rationale above. */
+                if (re & POLLNVAL) {
+                    if (i == 0) {
+                        log_err("poll POLLNVAL on listener fd %d",
+                                (int)listener);
+                    } else if (i == 1) {
+                        log_err("poll POLLNVAL on session socket fd %d: "
+                                "session lost", (int)sockfd);
+                        if (g_socks_cfg)
+                            g_socks_cfg->session_lost = true;
+                        g_stop = 1;
+                    } else {
+                        log_err("poll POLLNVAL on DNS eventfd: DNS "
+                                "wakeups degraded");
+                    }
+                }
+                continue;
+            }
+            if (re & POLLNVAL) {
                 log_err("[flow %lu] poll POLLNVAL on fd %d: flow closed",
                         (unsigned long)f->id, f->fd);
                 flow_free(f);
-            } else if (i == 0) {
-                log_err("poll POLLNVAL on listener fd %d",
-                        (int)listener);
-            } else if (i == 1) {
-                log_err("poll POLLNVAL on session socket fd %d: "
-                        "session lost", (int)sockfd);
-                if (g_socks_cfg)
-                    g_socks_cfg->session_lost = true;
-                g_stop = 1;
-            } else {
-                log_err("poll POLLNVAL on DNS eventfd: DNS wakeups "
-                        "degraded");
+                continue;
             }
+            /* flow slot reporting POLLERR and/or POLLHUP (no POLLNVAL) */
+            if (fds[i].events & POLLIN) {
+                /* flow still being read: readv/recv will harvest any
+                 * in-flight data and converge on the error — the
+                 * clean-FIN POLLIN path, untouched (R55-SK-1) */
+                continue;
+            }
+            if (f->output.len == 0 && !f->rxq_waiting) {
+                /* dead client + nothing left to deliver: the slot was
+                 * events=0, yet poll still woke us every round on ERR/HUP
+                 * — the R55-SK-1 busy spin. Close the dead fd so it
+                 * leaves the poll set, then converge like readv-EOF;
+                 * reap_flows collects the flow. */
+                log_debug("[flow %lu] poll ERR/HUP on fd %d: closing dead "
+                          "client (no output pending)",
+                          (unsigned long)f->id, f->fd);
+                flow_kill_dead_client(f);
+            } else if (++f->err_rounds > FLOW_ERR_ROUNDS_MAX) {
+                /* output/rxq still queued, but the client has reported
+                 * ERR|HUP for too many consecutive rounds: it is dead and
+                 * can never drain the queue. Drop the undeliverable
+                 * output (reap_flows' force-reap semantic) and converge.
+                 * In practice the first flush after the RST fails hard
+                 * and drains the queue itself; this caps the pathological
+                 * EAGAIN-on-dead-socket case. */
+                log_debug("[flow %lu] poll ERR/HUP on fd %d for %u rounds: "
+                          "dropping undeliverable output (%zuB)",
+                          (unsigned long)f->id, f->fd,
+                          (unsigned)f->err_rounds, f->output.len);
+                buf_clear(&f->output);
+                f->rxq_waiting = false;
+                flow_kill_dead_client(f);
+            }
+            /* else: output/rxq queued and under the cap — keep the POLLOUT
+             * registration so service_local_outputs attempts the final
+             * flush to the client this round. */
         }
     }
 }

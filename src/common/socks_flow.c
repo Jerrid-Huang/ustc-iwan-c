@@ -1964,6 +1964,49 @@ static bool flow_conn_dead(const Flow *f)
     return c == NULL || c->pcb == NULL;
 }
 
+/* R55-SK-1: converge a flow whose local client fd just poll-reported
+ * POLLERR/POLLHUP in wait_events (socks.c). Probe-verified on Linux: those
+ * two bits are reported by poll() UNCONDITIONALLY (ignoring the events
+ * mask), and only ever on a truly dead client socket — a clean FIN /
+ * half-close never sets them while our write side is still open (a socket
+ * in that state wakes only with POLLIN/POLLOUT; the events=0 control
+ * returns 0), and only a pure POLLHUP (no POLLERR) appears once BOTH sides
+ * have fully closed. ERR therefore means the client is gone (RST / hard
+ * error): nothing more will ever be read (readv/recv would return
+ * -1/ECONNRESET) and nothing more can be delivered (writes fail
+ * EPIPE/ECONNRESET).
+ *
+ * wait_events calls this ONLY when nothing is left to deliver (output
+ * empty, no rxq waiting) or after the FLOW_ERR_ROUNDS_MAX cap (whose
+ * caller-side branch clears the undeliverable output first), so no queued
+ * data is dropped by the transition itself.
+ *
+ * The transition mirrors the readv-EOF / readv-hard-error paths below
+ * (local_eof, ns_close for a graceful tunnel half-close so the remote side
+ * still gets its FIN, ST_CLOSING), then closes the local fd and sets
+ * f->fd = -1. That fd close is the actual R55-SK-1 fix: wait_events' flow
+ * registration skips fd < 0, so the dead fd leaves the poll set and can no
+ * longer force port_poll() to return instantly every round — an events=0
+ * slot on a POLLERR|POLLHUP fd measured 1000 rounds in 0.287 ms, i.e. the
+ * zero-wait busy spin (held until reap_flows finally collected the flow,
+ * ST_CLOSING_TIMEOUT_MS later, or same-round when removable). reap_flows
+ * then collects the flow on its normal rules (ST_CLOSING + output empty,
+ * or the 30s no-progress watchdog), and flow_free's `if (f->fd >= 0)`
+ * guard skips the already-closed descriptor, so g_flow_len and the
+ * fd-close ownership stay exactly as before. */
+void flow_kill_dead_client(Flow *f)
+{
+    flowdbg(f, "poll ERR/HUP -> ns_close");
+    f->local_eof = true;
+    if (f->ns_idx >= 0)
+        ns_close(&g_ns, f->ns_idx);
+    set_flow_state(f, ST_CLOSING);
+    if (f->fd >= 0) {
+        port_close(f->fd);
+        f->fd = -1;
+    }
+}
+
 void service_local_inputs(Flow *fs) {
     /* R4-09-F1: detach every flow from a dead netstack connection before
      * any handshake this round can allocate the freed slot (conn_slot_alloc
@@ -2184,11 +2227,29 @@ void service_local_inputs(Flow *fs) {
                     /* hard read error (ECONNRESET when the local app
                      * RSTs, e.g. a cancelled browser tab): treat it as
                      * client EOF — close the netstack conn and move to
-                     * ST_CLOSING. Leaving ST_ESTABLISHED would keep the
-                     * fd in the poll set with the kernel reporting
-                     * POLLERR forever (the error is not cleared by
-                     * read), busy-spinning one core and leaking the
-                     * fd/conn/flow triple. */
+                     * ST_CLOSING.
+                     *
+                     * R55-SK-1: the OLD argument said leaving
+                     * ST_ESTABLISHED "would keep the fd in the poll set
+                     * with the kernel reporting POLLERR forever (the
+                     * error is not cleared by read), busy-spinning one
+                     * core and leaking the fd/conn/flow triple" — i.e.
+                     * that moving to ST_CLOSING was enough to stop the
+                     * spin. That is FALSE on Linux: poll() reports
+                     * POLLERR/POLLHUP unconditionally, ignoring the
+                     * events mask, so the events=0 slot wait_events
+                     * registers for this ST_CLOSING flow STILL wakes
+                     * every round (measured: poll(events=0) on an
+                     * RST'd fd returns revents=0x18 in ~0.287 ms/1000
+                     * rounds), holding the zero-wait busy spin until
+                     * reap_flows finally collects the flow. The move to
+                     * ST_CLOSING (plus the feed-stop below) is still
+                     * REQUIRED — it stops POLLIN/POLLOUT wakes and the
+                     * unbounded buffering — but the spin is actually
+                     * broken by wait_events (socks.c) now detecting the
+                     * unconditional ERR/HUP wake and calling
+                     * flow_kill_dead_client() to close the dead fd, so
+                     * it leaves the poll set entirely. */
                     flowdbg(f, "readv err -> ns_close");
                     f->local_eof = true;
                     ns_close(&g_ns, f->ns_idx);
@@ -2206,8 +2267,12 @@ void service_local_inputs(Flow *fs) {
              * peer no longer needs the reads anyway (we already sent our
              * close). socks.c wait_events drops the POLLIN registration
              * for ST_CLOSING in lockstep (parallel agent C), so this
-             * branch is not re-entered with buffered-but-unread data —
-             * no busy-spin. */
+             * branch is not re-entered with buffered-but-unread data.
+             * R55-SK-1: that events=0 registration alone does NOT stop
+             * the wakeup on a dead client — poll reports ERR/HUP
+             * unconditionally — so wait_events additionally closes the
+             * dead fd (flow_kill_dead_client); until that happens this
+             * branch has no data to lose and simply skips. */
             if (f->state == ST_CLOSING)
                 continue;
             /* greeting/request (or CONNECTING): read into rbuf for the
