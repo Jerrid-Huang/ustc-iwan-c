@@ -262,7 +262,7 @@ set(IWAN_CORE_SRCS
   src/common/proto_parse.c
   src/common/proxy.c
   src/common/relay_proxy.c
-  src/common/route.c
+  src/common/route_common.c
   src/common/socks.c
   src/common/socks_flow.c
   src/common/udp_send.c
@@ -272,7 +272,8 @@ if(WIN32)
   # and server.c is Linux-only (TUN/iptables/BPF, see src/common/server.c).
   # single-thread zero-copy uplink (the SPSC + sender-thread variant
   # was removed; pump_win_single.c is the only Windows pump)
-  list(APPEND IWAN_CORE_SRCS src/common/tun_win.c
+  list(APPEND IWAN_CORE_SRCS src/common/route.c
+    src/common/tun_win.c
     src/common/wintun_fetch.c
     src/common/wintun_pin.c
     src/common/pump_win_single.c)
@@ -280,9 +281,9 @@ elseif(APPLE)
   # macOS client: tun.c holds the generic code (reader pool, write
   # retry, close; its Linux-only ioctl/BPF parts are #ifdef __linux__),
   # tun_mac.c provides the utun open/attach/detach + name mapping.
-  list(APPEND IWAN_CORE_SRCS src/common/tun.c src/common/tun_mac.c)
+  list(APPEND IWAN_CORE_SRCS src/common/route.c src/common/tun.c src/common/tun_mac.c)
 else()
-  list(APPEND IWAN_CORE_SRCS src/common/server.c src/common/tun.c)
+  list(APPEND IWAN_CORE_SRCS src/common/route_linux.c src/common/server.c src/common/tun.c)
 endif()
 
 # Userspace TCP stack for the SOCKS mode: the vendored lwIP bridge is
