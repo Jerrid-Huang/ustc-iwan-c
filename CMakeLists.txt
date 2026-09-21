@@ -287,7 +287,7 @@ elseif(APPLE)
   # tun_mac.c provides the utun open/attach/detach + name mapping.
   list(APPEND IWAN_CORE_SRCS src/common/route.c src/common/tun.c src/common/tun_mac.c)
 else()
-  list(APPEND IWAN_CORE_SRCS src/common/route_linux.c src/common/server.c src/common/tun.c)
+  list(APPEND IWAN_CORE_SRCS src/common/route_linux.c src/common/server.c src/common/server_rate.c src/common/tun.c)
 endif()
 
 # Userspace TCP stack for the SOCKS mode: the vendored lwIP bridge is

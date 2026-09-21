@@ -14,6 +14,7 @@
 #include "profile.h"
 #include "protocol.h"
 #include "server.h"
+#include "server_rate.h"
 #include "tun.h"
 #include "util.h"
 
@@ -239,7 +240,7 @@ static int echo_mirror(struct server_ctx *ctx, uint8_t *p, size_t len,
  * frames may take the session table's global write lock, switching
  * over-budget sources to a lock-free drop. Since it fires only after the
  * compare and only on frames that are dropped either way, it changes no
- * delivery — see rate_allow_tokbad(). */
+ * delivery — see server_rate_allow_tokbad(). */
 #define RATE_TOKEN_MISMATCH_MAX 4        /* non-peer sources, per session */
 #define RATE_TOKEN_MISMATCH_BOUND_MAX 64 /* bound-peer address, per session */
 /* Rate-table hashing: Knuth's multiplicative hash. The constant is
@@ -275,11 +276,9 @@ static atomic_ullong g_dl_pkts;   /* UDP datagrams sent (incl. control
                                    * frames like OPEN_ACK/PING_RSP — the
                                    * counter is not a pure data metric) */
 static atomic_ullong g_dl_drops;  /* downlink inner-IPv4 gate drops (H1) */
-static atomic_ullong g_rate_drops; /* per-source rate-limit drops (silent) */
 /* L37: unknown-sid DATA/PT_DATA_ENC/CLOSE frames per source per window.
  * Charged only AFTER a session-table miss (rate_allow_sid_miss), so it
  * can never gate a frame that resolves to a live session. */
-#define RATE_MISS_MAX_DEFAULT 2000
 /* R47-H2-M2: per-source pre-budget for BOUND-class wrong-token DATA
  * frames (rate_allow_tokbad, same family as rate_allow_sid_miss: shared
  * per-source shard buckets + a lock-free over-budget gate). Default
@@ -292,9 +291,8 @@ static atomic_ullong g_rate_drops; /* per-source rate-limit drops (silent) */
  * cap on write-lock acquisitions, never a delivery gate: it fires only
  * AFTER a token compare failed, so a correct-token frame can never touch
  * it, and a wrong-token frame is dropped either way — see
- * rate_allow_tokbad() and the RATE_TOKEN_MISMATCH bound-class note.
+ * server_rate_allow_tokbad() and the RATE_TOKEN_MISMATCH bound-class note.
  * Env IWAN_RATE_TOKBAD_MAX (rate_limit_env: 1..65535). */
-#define RATE_TOKBAD_MAX_DEFAULT 4096
 /* R48-F1(2/3): per-source pre-budget for known-sid wrong-token CLOSE
  * frames (rate_allow_close, same family as rate_allow_sid_miss /
  * rate_allow_tokbad: shared per-source shard buckets + a lock-free
@@ -309,9 +307,8 @@ static atomic_ullong g_rate_drops; /* per-source rate-limit drops (silent) */
  * RATE_WINDOW_MS (1 s), same cost-cap-not-delivery-gate argument: it
  * fires only AFTER a CLOSE token compare failed, so the real peer's
  * correct-token CLOSE wipe is never even charged, and it bounds
- * write-lock acquisitions, not delivery — see rate_allow_close().
+ * write-lock acquisitions, not delivery — see server_rate_allow_close().
  * Env IWAN_RATE_CLOSE_MAX (rate_limit_env: 1..65535). */
-#define RATE_CLOSE_MAX_DEFAULT 4096
 /* R47-H2-M1: default per-session uplink fairness throttle window (ms),
  * applied only after THIS session's TUN write hit a full device queue.
  * 2 ms: one window per queue-full drop lets the flooder's OWN next
@@ -319,22 +316,16 @@ static atomic_ullong g_rate_drops; /* per-source rate-limit drops (silent) */
  * sessions; the flooder still retries every ~2 ms, so it keeps its
  * fair share while never monopolizing the shared device. */
 #define SRV_THROTTLE_DEFAULT_MS 2u
-static unsigned g_rate_open_max = RATE_OPEN_MAX_DEFAULT;
-static unsigned g_rate_echo_max = RATE_ECHO_MAX_DEFAULT;
-static unsigned g_rate_miss_max = RATE_MISS_MAX_DEFAULT;
 /* R47-H2-M2: per-source bound-class wrong-token DATA budget
  * (IWAN_RATE_TOKBAD_MAX, default RATE_TOKBAD_MAX_DEFAULT); see the
  * RATE_TOKBAD_MAX_DEFAULT block above. */
-static unsigned g_rate_tokbad_max = RATE_TOKBAD_MAX_DEFAULT;
 /* R48-F1(2/3): per-source known-sid wrong-token CLOSE budget
  * (IWAN_RATE_CLOSE_MAX, default RATE_CLOSE_MAX_DEFAULT); see the
  * RATE_CLOSE_MAX_DEFAULT block above. */
-static unsigned g_rate_close_max = RATE_CLOSE_MAX_DEFAULT;
 /* R47-H2-M1: per-session uplink fairness throttle window (ms) applied on
  * a queue-full TUN drop (IWAN_SRV_THROTTLE_MS, default SRV_THROTTLE_DEFAULT_MS;
  * rate_limit_env rejects 0 -> range is 1..65535). See server.h
  * throttle_until_ms. */
-static unsigned g_up_throttle_ms = SRV_THROTTLE_DEFAULT_MS;
 static pthread_mutex_t g_log_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static uint64_t server_dl_pkts(void);
@@ -434,7 +425,6 @@ static uint64_t now_ns(void)
  * in src/iwan_server.c gates both on tid==0 — so no atomic is needed;
  * server_up_stats_print() refreshes it so the always-on line does not
  * repeat a number the stats line just printed. */
-static uint64_t g_rate_drops_reported;
 
 void server_up_stats_print(void)
 {
@@ -468,12 +458,11 @@ void server_up_stats_print(void)
             (unsigned long long)sum.h1,
             (unsigned long long)server_dl_pkts(),
             (unsigned long long)atomic_load(&g_dl_drops),
-            (unsigned long long)atomic_load(&g_rate_drops));
+            (unsigned long long)server_rate_drops_total());
     /* R37 R7 (R3-L37): this line already reported the ratedrop total, so
-     * mark it as reported — server_rate_drops_maybe_print() then stays
+     * mark it as reported — server_server_rate_drops_maybe_print() then stays
      * quiet instead of repeating the same number on its own line. */
-    g_rate_drops_reported =
-        (uint64_t)atomic_load_explicit(&g_rate_drops, memory_order_relaxed);
+    server_rate_drops_mark_reported();
     for (int t = 0; t < g_up_nthreads; t++) {
         atomic_store_explicit(&g_up[t].n, 0, memory_order_relaxed);
         atomic_store_explicit(&g_up[t].parse, 0, memory_order_relaxed);
@@ -518,24 +507,7 @@ void server_up_stats_print(void)
  *    server_up_stats_print(); see the R38 P2-14 contract in server.h. */
 #define RATE_DROPS_PRINT_MS 1000
 
-void server_rate_drops_maybe_print(void)
-{
-    static uint64_t last_ms;
-    uint64_t total =
-        (uint64_t)atomic_load_explicit(&g_rate_drops, memory_order_relaxed);
-    uint64_t now;
 
-    if (total == g_rate_drops_reported)
-        return; /* nothing new since the last line */
-    now = now_ms();
-    if (last_ms != 0 && now - last_ms < RATE_DROPS_PRINT_MS)
-        return; /* rate-limited: the next line carries the accumulated delta */
-    last_ms = now;
-    fprintf(stderr, "rate: ratedrop=%llu (+%llu)\n",
-            (unsigned long long)total,
-            (unsigned long long)(total - g_rate_drops_reported));
-    g_rate_drops_reported = total;
-}
 
 /* best-effort scrub of secrets, immune to optimizer elision */
 /* wipe: shared constant-time erasure from crypto.h */
@@ -629,783 +601,6 @@ static void log_escape(const char *in, char out[], size_t outsz)
         n++;
     }
     out[i] = '\0';
-}
-
-struct rate_bucket {
-    uint32_t ip;       /* network-order source address */
-    uint64_t win;      /* window start (monotonic ms) */
-    /* per-type counts in the current window. OPEN, PING and ECHO are
-     * limited independently (a PING flood no longer eats the ECHO
-     * budget); uint32_t so env-configured limits above 255 stay
-     * representable. */
-    uint32_t open_cnt, ping_cnt, echo_cnt;
-    /* L37: unknown-sid DATA/PT_DATA_ENC/CLOSE frames only
-     * (IWAN_RATE_MISS_MAX). A SEPARATE counter on purpose: a random-sid
-     * flood must not spend the OPEN/PING/ECHO allowance of the address it
-     * shares with honest clients, and conversely. Charged strictly after
-     * a session-table miss — see rate_allow_sid_miss(). */
-    uint32_t miss_cnt;
-    /* R47-H2-M2: BOUND-class wrong-token DATA frames from this source
-     * (IWAN_RATE_TOKBAD_MAX). A SEPARATE counter on purpose, like
-     * miss_cnt: the worst-case flood (a spoofer forging a live session's
-     * peer ip:port) must not spend the OPEN/PING/ECHO or unknown-sid
-     * allowance of the (real) address it claims. Charged only by
-     * rate_allow_tokbad(), i.e. strictly after a token compare failed —
-     * never by a frame that carries the correct token. Unlike the
-     * (session, source-class) tok_mis_* counters this one CAN live in the
-     * per-source bucket because it is a COST cap, not a delivery gate
-     * (see rate_allow_tokbad). */
-    uint32_t tokbad_cnt;
-    /* R48-F1(2/3): known-sid wrong-token CLOSE frames from this source
-     * (IWAN_RATE_CLOSE_MAX). A SEPARATE counter on purpose, like
-     * miss_cnt/tokbad_cnt: a bound-class CLOSE storm (a spoofer forging a
-     * live session's peer ip:port) must not spend the tokbad allowance the
-     * same source needs for its live DATA, nor the OPEN/PING/ECHO or
-     * unknown-sid allowances. Charged only by rate_allow_close(), i.e.
-     * strictly after a CLOSE token compare failed. Same
-     * cost-cap-not-delivery-gate argument as tokbad_cnt: this CAN live in
-     * the per-source bucket because it bounds write-lock cost, never
-     * delivery (see rate_allow_close). */
-    uint32_t close_cnt;
-    /* R1-D-1: the DATA/CLOSE token-mismatch budget is deliberately NOT a
-     * field of this per-source bucket any more. Keyed by source IP it let
-     * one host behind a NAT (or an ex-token device of the same account)
-     * spend the budget that gated every session on that address, silently
-     * dropping the neighbours' legitimate data. It now lives in
-     * struct server_session as two (session, source-class) counters —
-     * see tok_budget_over / tok_budget_charge / tok_rebind_allowed. */
-};
-
-struct rate_shard {
-    struct rate_bucket buckets[RATE_BUCKETS_PER_SHARD];
-    pthread_mutex_t mu;
-};
-
-static struct rate_shard g_rate_shards[RATE_SHARDS];
-
-/* R37 R6 (R3-L37): lock-free per-source "over the unknown-sid budget for
- * the rest of this window" gate. One fixed, statically allocated slot per
- * rate bucket, indexed by the SAME Knuth top-bit hash, so one hash maps an
- * IP into both tables and the gate needs no lock, no allocation and no
- * growth path. Read on every sid-miss ahead of the shard lock; written
- * once per over-budget source per window. See rate_allow_sid_miss() for
- * the full argument (why the fast path cannot change delivery, why a hash
- * collision is harmless, why relaxed atomics are sufficient).
- * R49-L1: claims are EXCLUSIVE (rate_gate_claim): a slot validly held by
- * another source is never overwritten, so two over-budget sources that
- * hash to the same slot do not spend the window evicting each other — the
- * earlier source keeps the lock-free fast path and the later one keeps
- * the shard-locked slow path instead of replaying it on every frame (the
- * collision's inherent cost), which the old publish-unconditionally shape
- * turned into a degenerate per-frame thrash.
- * over_until_ms == 0 means "no gate": now_ms() is a monotonic count from
- * boot, so the `> now` test is false for a zeroed slot.
- *
- * R50-A1 (+R51-H2): the gate tables are RATE_GATE_WAYS-WAY SET-ASSOCIATIVE.
- * A single-way slot could "park" only ONE source per window, so under
- * eviction churn (a shard with more live sources than buckets) sources
- * that shared a slot endlessly lost the claim (rate_gate_claim) and
- * stayed on the shard-locked slow path / write-lock path the whole
- * window. With RATE_GATE_WAYS ways per slot, up to RATE_GATE_WAYS sources
- * that hash to the same set are gated (fast-path) at once, so a whole
- * shard (up to RATE_GATE_WAYS * RATE_BUCKETS_PER_SHARD live sources) can
- * be carried on the lock-free fast path while its buckets churn: exactly
- * the per-source budget population whose counters the churn keeps
- * resetting. R51-H2: at 4 ways the 5th+ source per set had EVERY claim
- * backed off while churn kept zeroing its counters, so its per-source
- * budget died for the whole window with NO cap (measured: 640/1280
- * same-shard sources collapsed to exactly 4*64*M drops, and >=20
- * colliding tokbad sessions reopened part of the R48-M1 write-lock
- * convoy); the ways were raised to 16 so that <=16 sources per set
- * (<=16*64 = 1024 live sources per shard) are all carried on the fast
- * path — the R51-H2 acceptance boundary. Beyond that (a 17th+ source per
- * set) the claim backs off and the source keeps the slow path for its
- * window: the documented bounded-multiplier residual, same shape as
- * R49-I2, now with a real per-window cap per source (see
- * rate_evict_publish). Residual is HONEST and recorded, not claimed
- * bounded: a finite way table cannot bound an unbounded number of
- * colliding pseudo-sources; it only moves the boundary to 16/set
- * (1024/shard), 4x the R50-A1 boundary, and any acceptance beyond it is
- * explicitly a recorded residual. R49-L1's no-thrash property is
- * preserved per way: a way validly held by another source is never
- * overwritten, so two over-budget sources in one set do not evict each
- * other — they settle into different ways and each keeps its fast path.
- * Memory: each gate set is RATE_GATE_WAYS * 16 B, four tables of
- * RATE_BUCKETS sets => 4 * 1024 * 16 * 16 B = 1 MiB BSS (the four-table
- * total was 256 KiB at 4 ways; +768 KiB for this fix). */
-struct rate_gate {
-    _Atomic uint32_t ip;            /* network-order source address */
-    _Atomic uint64_t over_until_ms; /* budget refills at this monotonic ms */
-};
-#define RATE_GATE_WAYS 16
-struct rate_gate_set {
-    struct rate_gate way[RATE_GATE_WAYS];
-};
-static struct rate_gate_set g_rate_gate[RATE_BUCKETS];
-/* R47-H2-M2: second, independent lock-free over-budget gate table for the
- * per-source bound-class wrong-token budget (rate_allow_tokbad). Separate
- * from g_rate_gate on purpose: the sid-miss gate and the tokbad gate
- * bound different costs of different frames, and sharing a slot would let
- * one budget's storm flip the other's over-budget flag (only counting /
- * lock-cost, never delivery, but the accounting cross-talk is needless).
- * Same slot function, same static sizing, same relaxed-atomic discipline
- * as g_rate_gate (R49-L1: exclusive claim, rate_gate_claim). */
-static struct rate_gate_set g_tokbad_gate[RATE_BUCKETS];
-/* R48-F1(2/3): third, independent lock-free over-budget gate table for the
- * per-source known-sid wrong-token CLOSE budget (rate_allow_close).
- * Separate from both g_rate_gate and g_tokbad_gate on purpose: each gate
- * bounds a different cost of a different frame class, and sharing a slot
- * would let one class's storm flip another's over-budget flag (only
- * counting / lock-cost, never delivery, but the accounting cross-talk is
- * needless). Same slot function, same static sizing, same relaxed-atomic
- * discipline (R49-L1: exclusive claim, rate_gate_claim). */
-static struct rate_gate_set g_close_gate[RATE_BUCKETS];
-/* No ctrl (OPEN/PING/ECHO) gate table, R51-H1: rate_allow() is the ONLY
- * rate path whose verdict doubles as a DELIVERY gate (an in-budget OPEN
- * is processed), and the only cheap way to arm such a gate is from an
- * eviction event — which any attacker can fabricate with a small pool of
- * colliding source IPs (the bucket hash is public), turning "the source
- * was evicted" into a targeted delivery veto (R50-A1 armed exactly this
- * g_ctrl_gate from rate_evict_publish; R51-H1 removed the table). The
- * delivery face is therefore bounded by the per-source bucket accounting
- * alone (see rate_allow). */
-
-/* guards g_rate_shards: each shard has its own lock, taken for the
- * unauthenticated control types (rate_allow). The F4/R1-D-1 DATA/CLOSE
- * token-mismatch budget is NOT in this table any more: it is per
- * (session, source class), lives in struct server_session and is
- * protected by ctx->sess_lock (see tok_budget_over and friends). Sections
- * are short and, per flow, effectively uncontended (SO_REUSEPORT pins
- * one client flow to one recv thread), but independent flows now spread
- * over RATE_SHARDS locks instead of one global one. Lock order is always
- * sess_lock (outer) -> shard lock (inner) when both are held; the DATA
- * path releases sess_lock before touching the rate table. A source's
- * shard follows from its IP, so no code path holds two shard locks. */
-static int g_rate_shards_init;
-
-/* IWAN_RATE_* limits are read once at startup (server_rate_limits_init);
- * malformed or out-of-range values fall back to the defaults with a
- * logged warning. The 65535 ceiling keeps one source from claiming an
- * unbounded per-window allowance.
- *
- * R37 R5-WG-E (R4-L3): strict base-10 parse — the WHOLE string must be
- * [0-9]+. strtoul() was permissive: " 1" and "+1" parsed to 1 and were
- * applied SILENTLY, i.e. a typo tightened the default 20 by 20x with no
- * diagnostic at all, while the SAME binary warns and falls back for the
- * equally malformed IWAN_SRV_THREADS=" 1" (that one goes through
- * util.c's parse_uint(), R3-L18's authoritative numeric parser). The
- * accepted domain is deliberately identical to parse_uint()'s: leading
- * zeros are LEGAL ("007" -> 7); rejected are empty (an explicitly set
- * empty value warns, an unset variable does not), leading/trailing
- * whitespace, a sign, any non-digit, out-of-range, and overflow (the
- * per-digit check below cannot wrap around). util.h is not used for
- * this — another agent owns that file this round — so the helper is
- * file-local. */
-static bool rate_limit_parse(const char *s, unsigned *out)
-{
-    uint64_t v = 0;
-
-    if (!s || !*s)
-        return false;
-    for (const char *p = s; *p; p++) {
-        uint64_t d;
-        if (*p < '0' || *p > '9')
-            return false;
-        d = (uint64_t)(*p - '0');
-        /* reject BEFORE the multiply: a 20+ digit string must not wrap
-         * around and be admitted as a small in-range value (same
-         * pre-check shape as util.c parse_uint) */
-        if (v > (65535u - d) / 10u)
-            return false;
-        v = v * 10 + d;
-    }
-    if (v == 0) /* range is 1..65535: "0"/"00" is invalid, not a limit */
-        return false;
-    *out = (unsigned)v;
-    return true;
-}
-
-static unsigned rate_limit_env(const char *name, unsigned dflt)
-{
-    const char *v = getenv(name);
-    unsigned n;
-
-    /* unset: silently keep the default (the normal configuration) */
-    if (!v)
-        return dflt;
-    if (!rate_limit_parse(v, &n)) {
-        log_err("invalid %s='%s': using default %u", name, v, dflt);
-        return dflt;
-    }
-    return n;
-}
-
-void server_rate_limits_init(void)
-{
-    /* one-time init of the per-shard locks (called once before the recv
-     * threads are spawned; guarded so a second call is a no-op) */
-    if (!g_rate_shards_init) {
-        for (int i = 0; i < RATE_SHARDS; i++)
-            pthread_mutex_init(&g_rate_shards[i].mu, NULL);
-        g_rate_shards_init = 1;
-    }
-    g_rate_open_max = rate_limit_env("IWAN_RATE_OPEN_MAX",
-                                     RATE_OPEN_MAX_DEFAULT);
-    g_rate_echo_max = rate_limit_env("IWAN_RATE_ECHO_MAX",
-                                     RATE_ECHO_MAX_DEFAULT);
-    g_rate_miss_max = rate_limit_env("IWAN_RATE_MISS_MAX",
-                                     RATE_MISS_MAX_DEFAULT);
-    g_rate_tokbad_max = rate_limit_env("IWAN_RATE_TOKBAD_MAX",
-                                       RATE_TOKBAD_MAX_DEFAULT);
-    g_rate_close_max = rate_limit_env("IWAN_RATE_CLOSE_MAX",
-                                      RATE_CLOSE_MAX_DEFAULT);
-    g_up_throttle_ms = rate_limit_env("IWAN_SRV_THROTTLE_MS",
-                                      SRV_THROTTLE_DEFAULT_MS);
-}
-
-/* source address -> owning shard. Top 4 hashed bits select the shard, so
- * sequential IPs spread evenly over all 16 shards (same Knuth hash as the
- * bucket index below). */
-static inline unsigned rate_ip_shard(uint32_t ip)
-{
-    unsigned h = (unsigned)((ip * RATE_HASH_MUL) >> RATE_HASH_SHIFT);
-    return (h >> RATE_SHARD_BITS) & (RATE_SHARDS - 1);
-}
-
-/* release the lock rate_bucket_enter took; pass the SAME ip that was
- * passed to enter (it selects the shard). */
-static inline void rate_shard_unlock(uint32_t ip)
-{
-    pthread_mutex_unlock(&g_rate_shards[rate_ip_shard(ip)].mu);
-}
-
-/* source address -> its slot in the flat gate table. This is exactly
- * rate_ip_shard(ip) * RATE_BUCKETS_PER_SHARD + the per-shard bucket index
- * (top 10 hashed bits = 4 shard bits + 6 bucket bits), so the gate stays
- * aligned with the bucket a source would use. */
-static inline unsigned rate_gate_slot(uint32_t ip)
-{
-    return (unsigned)((ip * RATE_HASH_MUL) >> RATE_HASH_SHIFT);
-}
-
-/* R49-L1 (+ R50-A1): claim `gs` (a RATE_GATE_WAYS-way set) for `ip` until
- * `until` (a deadline in now_ms()), writing the FIRST way that is either
- * this source's own, stale, or never used — UNLESS every way is currently
- * validly claimed by a different source, in which case back off and leave
- * the holders' claims untouched. Called only by over-budget publishers,
- * from inside the shard-locked slow path.
- *
- * Why the guard (R49-L1): before this helper every over-budget source
- * published its claim unconditionally (deadline first, ip second). Two
- * over-budget sources that hash to the SAME slot therefore spent the whole
- * window overwriting each other: A's frame saw B's claim, missed the
- * lock-free fast path, went through the shard lock + bucket probe +
- * counter RMW and re-published A; B's next frame saw A's claim and did the
- * same — so BOTH sources took the slow path on EVERY frame for the whole
- * window, the opposite of the "a collision costs at most one extra count"
- * claim. With the exclusive rule the first source to publish keeps its way
- * and stays on the fast path; the colliding source takes the next free way
- * (R50-A1) or, when all RATE_GATE_WAYS ways are validly held by other
- * sources, backs off and keeps the shard-locked slow path (the collision's
- * inherent, unavoidable cost) instead of actively evicting the holder.
- * Delivery never changes either way: this is a cost gate, and a missed
- * fast path only means one more shard-locked drop decision on a frame that
- * is dropped regardless.
- *
- * Store ordering is unchanged from the callers' old publish sequence:
- * over_until_ms is stored before ip, so a reader that observes its own ip
- * in a way can only have observed a deadline stored before it. All
- * accesses stay relaxed; the only cost of the check-then-act race (two
- * sources reading a way as free at once and both publishing) is exactly
- * the old spurious-count worst case, after which the loser settles into
- * another free way or backs off on its next over-budget publish — the set
- * still settles to stable holders. */
-static inline void rate_gate_claim(struct rate_gate_set *gs, uint32_t ip,
-                                   uint64_t until, uint64_t now)
-{
-    for (unsigned w = 0; w < RATE_GATE_WAYS; w++) {
-        struct rate_gate *g = &gs->way[w];
-        uint32_t cur_ip =
-            atomic_load_explicit(&g->ip, memory_order_relaxed);
-        uint64_t cur_until =
-            atomic_load_explicit(&g->over_until_ms, memory_order_relaxed);
-        if (cur_ip != 0 && cur_ip != ip && cur_until > now)
-            continue; /* this way is validly claimed by another source */
-        atomic_store_explicit(&g->over_until_ms, until, memory_order_relaxed);
-        atomic_store_explicit(&g->ip, ip, memory_order_relaxed);
-        return;
-    }
-    /* all RATE_GATE_WAYS ways validly claimed by other sources this
-     * window: back off — the source keeps the (shard-locked, bounded)
-     * slow path until a way frees at the next window roll. */
-}
-
-/* R50-A1: is `ip` currently gated by any way of `gs`? Lock-free fast-path
- * reader; same relaxed discipline and store-ordering argument as
- * rate_gate_claim (a way's deadline is stored before its ip, so seeing our
- * own ip guarantees the deadline in that way predates it and therefore
- * belongs to us). */
-static inline bool rate_gate_check(const struct rate_gate_set *gs,
-                                   uint32_t ip, uint64_t now)
-{
-    for (unsigned w = 0; w < RATE_GATE_WAYS; w++) {
-        const struct rate_gate *g = &gs->way[w];
-        if (atomic_load_explicit(&g->ip, memory_order_relaxed) == ip &&
-            atomic_load_explicit(&g->over_until_ms, memory_order_relaxed) > now)
-            return true;
-    }
-    return false;
-}
-
-/* locate (or claim) the rate bucket for ip inside its shard; caller must
- * hold that shard's lock. Linear probing: the hashed slot may belong to
- * another source, so scan up to RATE_PROBE_MAX slots for a bucket of this
- * IP or a never-used one instead of clobbering a neighbour's counters
- * (that would let one source reset another's window or dodge the limit by
- * rehashing). Only when the whole probe window is occupied by other
- * sources do we evict the slot whose window started longest ago. */
-static struct rate_bucket *rate_bucket_find(struct rate_shard *sh,
-                                            uint32_t ip)
-{
-    /* low 6 hashed bits within the shard: bits 22..27 (the shard took
-     * 28..31), still evenly spread for packet-flood neighbour IPs */
-    unsigned h = (unsigned)((ip * RATE_HASH_MUL) >> RATE_HASH_SHIFT) &
-                 (RATE_BUCKETS_PER_SHARD - 1);
-    unsigned evict = 0;
-    uint64_t oldest = UINT64_MAX;
-
-    for (unsigned i = 0; i < RATE_PROBE_MAX; i++) {
-        struct rate_bucket *c = &sh->buckets[(h + i) % RATE_BUCKETS_PER_SHARD];
-        if (c->win < oldest) {
-            oldest = c->win;
-            evict = i;
-        }
-        if (c->ip == ip || (c->ip == 0 && c->win == 0)) {
-            return c;
-        }
-    }
-    return &sh->buckets[(h + evict) % RATE_BUCKETS_PER_SHARD];
-}
-
-/* R50-A1: a bucket being stolen from its holder mid-window means the
- * holder's budget state dies with the counters about to be zeroed for the
- * new occupant. If the holder had actually consumed anything this window
- * (a live window AND any non-zero count), its per-window cost has not yet
- * been capped — under churn its counter was reset before it could reach
- * `max`, so `++cnt <= max` would otherwise stay true forever and the
- * source would keep the shard-locked slow path / sess_lock WRITE path on
- * every frame (the R50-A1 nullification). Carrying the budget instead of
- * losing it: publish the holder's over-budget gates with its window's
- * deadline BEFORE the counters are reset. From its next frame on the
- * source hits the lock-free fast path (rate_gate_check), i.e. it is
- * treated exactly like a source that exceeded its budget — which never
- * changes delivery (all three gated classes drop such frames anyway) and
- * counts one g_rate_drops per dropped frame, precisely like a slow-path
- * over-budget drop. The OPEN/PING/ECHO face is deliberately NOT armed
- * here (R51-H1): it is the one class whose rate verdict doubles as a
- * delivery gate, and eviction events are attacker-fabricable (a handful
- * of colliding source IPs suffices — the hash is public), so a delivery
- * gate armed from eviction becomes a targeted delivery veto. See
- * rate_allow() for the full argument and the CPU-cap consequence.
- *
- * Boundedness: per window, each source spends at most `max` frames on the
- * slow path / write-lock path, then stays on the fast path until the
- * window it was evicted in rolls. Under bucket churn the eviction of a
- * live-counted bucket is what closes the source's window early, and a
- * source can be re-churned within AT MOST one further slow-path frame per
- * eviction; repeated evictions (a must under sustained oversubscription)
- * therefore re-arm it at its original window deadline — the eviction
- * deadline is fixed (it never shrinks), so total per-window cost is bounded
- * by `max` + (# evictions it survives, each costing one extra in-budget
- * frame) per source, and the aggregate over a shard is bounded by the gate
- * sets' capacity (RATE_GATE_WAYS * RATE_BUCKETS_PER_SHARD sources keep the
- * fast path; sources beyond that keep the shard-locked slow path for the
- * window — the bounded-multiplier residual, same shape as R49-I2 but now
- * with a real per-window cap per source instead of an unbounded one;
- * see rate_gate for the honest R51-H2 boundary). Caller must
- * hold the shard lock (runs inside rate_bucket_touch). */
-static void rate_evict_publish(struct rate_bucket *b, uint64_t now)
-{
-    uint64_t until;
-    uint32_t ip = b->ip;
-    unsigned slot;
-
-    if (ip == 0 || now - b->win >= RATE_WINDOW_MS)
-        return; /* never-claimed slot, or the window already elapsed (a
-                 * fresh window is a legit budget refill, not an eviction) */
-    if (b->open_cnt == 0 && b->ping_cnt == 0 && b->echo_cnt == 0 &&
-        b->miss_cnt == 0 && b->tokbad_cnt == 0 && b->close_cnt == 0)
-        return; /* claimed this window but spent nothing: nothing to carry */
-    /* the holder is being evicted with live spending: gate it for the
-     * remainder of ITS window on the three COST gates only. The ctrl
-     * (OPEN/PING/ECHO) face is never armed from an eviction — R51-H1
-     * (a delivery veto must not be triggerable by an attacker-made
-     * eviction; see rate_allow). */
-    until = b->win + RATE_WINDOW_MS;
-    slot = rate_gate_slot(ip);
-    rate_gate_claim(&g_rate_gate[slot], ip, until, now);
-    rate_gate_claim(&g_tokbad_gate[slot], ip, until, now);
-    rate_gate_claim(&g_close_gate[slot], ip, until, now);
-}
-
-/* (re)start the source's window when the bucket is stale or was just
- * evicted from another source; caller must hold the shard lock.
- * R51-A1: the window arithmetic samples now_ms() HERE, under the shard
- * lock, instead of trusting the caller's `now` (sampled once per frame
- * BEFORE any lock — server.c handle_udp line ~2132 — so it can be ≥1 ms
- * stale by the time this lock is taken). Waiting for this shard can span
- * another recv thread's write of b->win with a newer clock tick; the
- * unsigned subtraction `now - b->win` then underflows to ~2^64 and a
- * LIVE window is treated as elapsed: rate_evict_publish early-returns
- * (its gates for the evicted holder are not armed for that eviction) and
- * the counters/win are zeroed/rewound, granting a fresh mid-window
- * budget (measured: 64-socket single-IP PING flood, 16 recv threads,
- * maxbin 118 > the strict 60/window). Under the lock no writer can move
- * b->win forward while this thread runs, and now_ms() is monotonic, so
- * the sampled clock is always >= the last writer's sample that produced
- * b->win — the subtraction cannot underflow. Mirrors purge_expired's
- * under-lock re-read and R48-L1 (dd89178). The caller's `now` is still
- * used for the lock-free gate checks and the post-lock claims' validity
- * test; a stale sample there only errs toward "another way's deadline
- * still valid" (a claim backs off / a gate stays armed slightly longer —
- * never an early budget refill, and for the three cost gates a missed
- * fast path is just one extra shard-locked drop decision on a frame
- * dropped regardless). This re-read changes ONLY the window
- * adjudication, not gate-deadline semantics and not delivery/accounting. */
-static void rate_bucket_touch(struct rate_bucket *b, uint32_t ip)
-{
-    uint64_t now = now_ms();
-
-    if (b->ip != ip || now - b->win >= RATE_WINDOW_MS) {
-        rate_evict_publish(b, now);
-        b->ip = ip;
-        b->win = now;
-        b->open_cnt = b->ping_cnt = b->echo_cnt = b->miss_cnt = 0;
-        b->tokbad_cnt = 0;
-        b->close_cnt = 0;
-    }
-}
-
-/* shared skeleton for the per-source rate paths below: lock the source's
- * shard, (re)locate its bucket, (re)start its window, and hand the bucket
- * back with the lock STILL HELD — the caller does its per-type accounting
- * and then calls rate_shard_unlock(ip) (the counter read-modify-write must
- * stay inside the critical section). Small enough that the compiler
- * inlines it on the per-packet path. */
-static struct rate_bucket *rate_bucket_enter(uint32_t ip)
-{
-    struct rate_shard *sh = &g_rate_shards[rate_ip_shard(ip)];
-    pthread_mutex_lock(&sh->mu);
-    struct rate_bucket *b = rate_bucket_find(sh, ip);
-    rate_bucket_touch(b, ip);
-    return b;
-}
-
-/* Per-source token limits on unauthenticated control paths. Over-limit
- * sources are silently dropped (no reject, no log; each drop is counted
- * in g_rate_drops for the per-second stats line) so a single host
- * cannot saturate the single-threaded loop with cheap forged packets. */
-static bool rate_allow(const struct sockaddr_in *peer, uint8_t typ)
-{
-    uint32_t ip = (uint32_t)peer->sin_addr.s_addr;
-    struct rate_bucket *b;
-    uint32_t *cnt;
-    unsigned limit;
-    bool ok = true;
-
-    switch (typ) {
-    case PT_OPEN:
-        limit = g_rate_open_max;
-        break;
-    case PT_PING_REQ:
-    case PT_ECHO_REQ:
-        limit = g_rate_echo_max;
-        break;
-    default:
-        return true; /* authenticated or negligible-cost paths */
-    }
-    /* R51-H1: deliberately NO lock-free over-budget fast path on this
-     * face. OPEN/PING/ECHO are the only rate class whose check doubles as
-     * a DELIVERY gate (an in-budget OPEN is processed), and the only cheap
-     * way to arm such a gate was from an eviction event (R50-A1's
-     * g_ctrl_gate, armed by rate_evict_publish) — but an eviction carries
-     * NO evidence that its target is genuinely over the OPEN/PING/ECHO
-     * budget: the attacker who keeps a handful of colliding source IPs
-     * (the bucket hash is public, ~16k candidates per hash set) can
-     * fabricate an eviction per window at ~8 frames/s and use the gate to
-     * SILENTLY veto the victim's OPEN/PING/ECHO for the rest of its window,
-     * repeatably — a cheap targeted delivery blackout. So the delivery
-     * face is never vetoed by eviction: an in-budget OPEN/PING/ECHO is
-     * always processed, and the per-source budget below stays exact per
-     * window (verified by the R50-fix e1e2/e9 class, unchanged here).
-     *
-     * Honest CPU-cap consequence of dropping the ctrl gate: under
-     * SUSTAINED eviction churn a possibly-over-budget source keeps a
-     * fresh budget whenever its bucket is stolen, so a flood that also
-     * churns is processed on the shard-locked slow path. That is exactly
-     * the pre-R50-A1 (R49) shape, and this face's CPU is then bounded only
-     * by sustained attacker bandwidth (every such eviction/stolen-bucket
-     * frame must be SENT by an attacker already flooding at rate) — the
-     * cheap 8-frames-per-window sniper of the gated shape is gone. */
-    /* the sharded rate tables are shared by the multi-threaded uplink
-     * recv threads; the per-shard mutex is taken on the unauthenticated
-     * control types above (the F4/R1-D-1 DATA/CLOSE budget is no longer
-     * here — it is per session, under ctx->sess_lock) */
-    b = rate_bucket_enter(ip);
-    /* independent per-type counters: a PING flood cannot eat the ECHO
-     * budget (or vice versa); OPEN keeps its own, tighter limit */
-    cnt = (typ == PT_OPEN) ? &b->open_cnt :
-          (typ == PT_PING_REQ) ? &b->ping_cnt : &b->echo_cnt;
-    if (*cnt >= limit)
-        ok = false;
-    else
-        (*cnt)++;
-    rate_shard_unlock(ip);
-    if (!ok)
-        atomic_fetch_add(&g_rate_drops, 1);
-    return ok;
-}
-
-/* L37: charged ONLY for frames whose sid is absent from the session table
- * (DATA/PT_DATA_ENC/CLOSE map misses), in their own per-source counter.
- *
- * Why this does not regress R1-D-1 (NAT collateral damage): both callers
- * run it strictly AFTER find_session_unlocked() returned NULL, so a frame
- * that resolves to a live session — from any source, carrying any token —
- * never touches this bucket. A source that is over its unknown-sid budget
- * still gets its own live sessions' data through and can still OPEN; a
- * neighbour behind the same NAT pays nothing for someone else's spray.
- *
- * R37 R6 (R3-L37): the budget is now a real per-source per-window COST
- * cap, not just a counter. Before this change the return value only
- * decided whether g_rate_drops was incremented: both call sites return
- * unconditionally, so an unknown-sid frame was dropped either way and an
- * over-budget source (IWAN_RATE_MISS_MAX=1) still paid a shard mutex,
- * a bucket probe and a counter RMW for every single frame — measured
- * identical cost for =1 and =65535 (R6-C/R6-H, re-measured here).
- *
- * The charge point cannot move in front of the session-table probe (that
- * probe is what tells us the sid is unknown), so a pre-probe cap keyed on
- * the source would drop live-session frames too — exactly the NAT
- * collateral damage R1-D-1 forbids. What CAN be bounded is the cost
- * AFTER the miss, which is what this gate does: once a source has spent
- * its budget in the current window, g_rate_gate[hash] records it until
- * the window ends and every further miss from that source is dropped
- * after a single relaxed atomic load, with no shard lock and no bucket
- * update.
- *
- * Safety (why this can never change delivery or hurt a live session):
- *  - the return value gates NO delivery at either call site (both return
- *    before it is even inspected); it only decides the g_rate_drops
- *    increment, so every frame this function sees is dropped regardless;
- *  - a live session's frames never reach this function (the session-table
- *    probe succeeds first), so no legitimate, NAT-shared or rebound
- *    client can be affected — including from the same source IP;
- *  - the gate key is the same source-IP hash as the bucket. A collision
- *    can at worst make the fast path fire for a source that is not over
- *    budget, which only over-counts g_rate_drops for a frame that was
- *    dropped anyway (never a delivery difference);
- *  - R49-L1: the gate claim is exclusive (rate_gate_claim), so a collision
- *    between two over-budget sources can no longer make BOTH replay the
- *    shard-locked slow path on every frame: the earlier claimant keeps
- *    the lock-free fast path and the colliding source falls back to the
- *    slow path (its necessary cost), instead of the two of them
- *    overwriting each other's claim all window;
- *  - all accesses are relaxed atomics on two dedicated fields, so there
- *    is no data race with the shard-locked bucket update (TSan clean);
- *  - `now`/over_until_ms are now_ms() (monotonic) and compared with >,
- *    so the deadline never wraps.
- * Locking: the caller MUST NOT hold ctx->sess_lock — lock order is always
- * sess_lock (outer) -> rate-shard lock (inner), and both call sites
- * release sess_lock before calling this. */
-static bool rate_allow_sid_miss(uint32_t ip, uint64_t now)
-{
-    struct rate_gate_set *g = &g_rate_gate[rate_gate_slot(ip)];
-    struct rate_bucket *b;
-    bool ok;
-
-    /* fast path (lock-free): this source already spent its unknown-sid
-     * budget earlier in the current window, so it is known to be over it
-     * for the rest of that window — drop without touching the shard.
-     * R49-L1: the published claim is exclusive per way (rate_gate_claim
-     * backs off on a way validly held by another source), so a hash
-     * collision can only keep the LATER source on the slow path below —
-     * it can never evict this source from the fast path mid-window.
-     * R50-A1: rate_evict_publish arms this same gate when the source's
-     * bucket was evicted with live spending, closing the churn hole. */
-    if (rate_gate_check(g, ip, now))
-        return false;
-
-    b = rate_bucket_enter(ip);
-    ok = ++b->miss_cnt <= g_rate_miss_max;
-    if (!ok) {
-        /* publish the source as over-budget for the remainder of the
-         * window this frame was charged to (rate_bucket_touch() has just
-         * (re)started it, so b->win is that window's start and
-         * b->win + RATE_WINDOW_MS is exactly when the budget refills).
-         * R49-L1: rate_gate_claim keeps the original store ordering
-         * (deadline before ip) and adds the exclusive-claim back-off; any
-         * missed fast path is just one extra shard-locked count on a
-         * frame that is dropped either way — never a delivery difference,
-         * and never a missed drop. */
-        rate_gate_claim(g, ip, b->win + RATE_WINDOW_MS, now);
-    }
-    rate_shard_unlock(ip);
-    return ok;
-}
-
-/* ---- R47-H2-M2: per-source budget for BOUND-class wrong-token DATA ----
- *
- * R37-R2's token-mismatch budget gates only the NON-peer class at the
- * pre-compare step (tok_budget_over): a source that is not the session's
- * peer spends tok_mis_cnt, and once that is spent its next wrong-token
- * frame is dropped before the token compare. The BOUND class — a frame
- * whose source equals the session's current peer ip:port VERBATIM — is
- * deliberately not pre-gated, because a spoofer can present it to spend a
- * pre-compare budget on the victim's behalf. The consequence (R37 R2,
- * acknowledged at the time): a spoofer who forges the victim's address
- * could test wrong tokens against a live sid at line rate, and every
- * such frame went through tok_charge_upgrade() taking the session table's
- * GLOBAL write lock per frame, convoying every recv thread that holds the
- * read lock and the downlink.
- *
- * rate_allow_tokbad() is that missing bound-class throttle. Three
- * properties make it safe where a per-session pre-compare budget is not:
- *
- *  1. It is keyed per SOURCE-IP and charges the source's own rate_bucket
- *     (the source the server observes is the one making the claim — the
- *     forged victim address — so an attacker flooding one victim spends
- *     that address's budget, not a shared session counter the victim's
- *     own frames draw on).
- *  2. It runs strictly AFTER the token compare has failed, so a frame
- *     carrying the correct token NEVER touches this budget — the real
- *     client's DATA is byte-for-byte unaffected, which is exactly the
- *     property a pre-compare bound gate would break (R37 R2).
- *  3. Its false result only skips a charge that is pure observability
- *     (tok_mis_bound saturates at RATE_TOKEN_MISMATCH_BOUND_MAX and never
- *     gates) and the write lock that accompanies it. Every frame the
- *     caller subjects to it is a wrong-token frame that is dropped either
- *     way, so this is a COST cap on write-lock acquisitions, not a
- *     delivery gate — the R1-D-1 "one NAT neighbour must not spend a
- *     budget that gates the neighbours' sessions" argument does not apply
- *     (a NAT neighbour's tokbad spending cannot change what any other
- *     frame delivers).
- *
- * Rate/lock shape (same family as rate_allow_sid_miss): charge the shard
- * bucket under the shard mutex; once over g_rate_tokbad_max in the
- * current window publish the source in the lock-free g_tokbad_gate slot,
- * after which every further over-budget frame from that source costs one
- * relaxed atomic load and a drop — no shard lock, no bucket update.
- * Caller must NOT hold ctx->sess_lock (lock order: sess_lock outer ->
- * shard lock inner; the DATA call site has already released sess_lock). */
-static bool rate_allow_tokbad(const struct sockaddr_in *peer, uint64_t now)
-{
-    uint32_t ip = (uint32_t)peer->sin_addr.s_addr;
-    struct rate_gate_set *g = &g_tokbad_gate[rate_gate_slot(ip)];
-    struct rate_bucket *b;
-    bool ok;
-
-    /* fast path (lock-free): this source already spent its bound-class
-     * wrong-token budget earlier in the current window; drop the frame
-     * on a relaxed load scan, exactly like rate_allow_sid_miss.
-     * R49-L1: exclusive claim per way (rate_gate_claim), same as sid_miss.
-     * R50-A1: rate_evict_publish arms this gate for a source whose bucket
-     * was evicted mid-window (the tokbad write-lock cap is the R50-A1
-     * headline: without it the source's counter reset each eviction and
-     * every frame re-entered tok_charge_upgrade — one global sess_lock
-     * WRITE lock). */
-    if (rate_gate_check(g, ip, now))
-        return false;
-
-    b = rate_bucket_enter(ip);
-    ok = ++b->tokbad_cnt <= g_rate_tokbad_max;
-    if (!ok) {
-        /* R49-L1: rate_gate_claim keeps the publish-before-ip ordering so
-         * a reader that sees its own ip also sees a deadline that belongs
-         * to it, and adds the exclusive-claim back-off (same ordering
-         * argument as rate_allow_sid_miss: worst case is a spurious count
-         * on a frame that is dropped either way). */
-        rate_gate_claim(g, ip, b->win + RATE_WINDOW_MS, now);
-    }
-    rate_shard_unlock(ip);
-    return ok;
-}
-
-/* ---- R48-F1(2/3): per-source budget for known-sid wrong-token CLOSE ----
- *
- * F1-1 (3c68d8c) moved the unknown-sid CLOSE probe under the READ lock,
- * killing the per-frame global write lock for the random-sid spray. The
- * KNOWN-sid wrong-token CLOSE keeps one write lock per frame in its wake:
- * the CLOSE branch ran its token compare under the write lock (it must
- * wipe under it), and R37-R2's non-peer pre-compare budget
- * (tok_budget_over, 4/s/session) never gates the class that claims the
- * session's peer address verbatim — the bound class. A spoofer who knows
- * a live sid (the plaintext 8-byte header, ~16-33 s blind scan) and
- * forges the victim peer's ip:port byte-for-byte can therefore still take
- * one global sess_lock WRITE lock (plus the observable tok_mis_bound
- * charge) per frame at line rate: R48-CLOSE-1's residual, exactly the
- * shape R47-H2-M2 capped on the DATA side (rate_allow_tokbad) but which
- * it never covered for CLOSE.
- *
- * rate_allow_close() is that missing CLOSE-side budget, a verbatim mirror
- * of rate_allow_tokbad (same family as rate_allow_sid_miss). The same
- * three properties make it safe:
- *
- *  1. It is keyed per SOURCE-IP and charges the source's own rate_bucket
- *     (the source the server observes is the forged victim address, so an
- *     attacker flooding one victim spends only that address's budget).
- *  2. It runs strictly AFTER a CLOSE token compare has failed, so a frame
- *     carrying the correct token — the real peer's live wipe — NEVER
- *     touches this budget; the wipe path stays byte-for-byte unchanged
- *     (which is exactly why a pre-compare bound gate would be unsafe).
- *  3. Its false result only skips a charge that is pure observability
- *     (tok_mis_bound saturates at RATE_TOKEN_MISMATCH_BOUND_MAX and never
- *     gates) and the write lock that accompanies it. Every frame the
- *     caller subjects to it is a wrong-token CLOSE, which is dropped
- *     either way (CLOSE never rebinds, so a wrong token can never wipe).
- *     It is therefore a COST cap on write-lock acquisitions, not a
- *     delivery gate — the R1-D-1 "one NAT neighbour must not spend a
- *     budget that gates the neighbours' sessions" argument does not apply
- *     here either (a NAT neighbour's close spending cannot change what
- *     any other frame delivers).
- *
- * Rate/lock shape (same family as rate_allow_sid_miss / rate_allow_tokbad):
- * charge the shard bucket under the shard mutex; once over
- * g_rate_close_max in the current window publish the source in the
- * lock-free g_close_gate slot, after which every further over-budget
- * wrong-token CLOSE from that source costs one relaxed atomic load pair
- * and a drop — no shard lock, no bucket update, no sess_lock write.
- * Caller must NOT hold ctx->sess_lock (lock order: sess_lock outer ->
- * shard lock inner); the CLOSE call site releases the lock before calling
- * (see the PT_CLOSE branch). */
-static bool rate_allow_close(const struct sockaddr_in *peer, uint64_t now)
-{
-    uint32_t ip = (uint32_t)peer->sin_addr.s_addr;
-    struct rate_gate_set *g = &g_close_gate[rate_gate_slot(ip)];
-    struct rate_bucket *b;
-    bool ok;
-
-    /* fast path (lock-free): this source already spent its known-sid
-     * wrong-token CLOSE budget earlier in the current window; drop the
-     * frame on a relaxed load scan, exactly like rate_allow_tokbad.
-     * R49-L1: exclusive claim per way (rate_gate_claim), same as the
-     * family. R50-A1: rate_evict_publish arms this gate too when the
-     * source's bucket was evicted mid-window with live spending. */
-    if (rate_gate_check(g, ip, now))
-        return false;
-
-    b = rate_bucket_enter(ip);
-    ok = ++b->close_cnt <= g_rate_close_max;
-    if (!ok) {
-        /* R49-L1: rate_gate_claim keeps the publish-before-ip ordering so
-         * a reader that sees its own ip also sees a deadline that belongs
-         * to it, and adds the exclusive-claim back-off (same ordering
-         * argument as rate_allow_tokbad: worst case is a spurious count on
-         * a frame that is dropped either way). */
-        rate_gate_claim(g, ip, b->win + RATE_WINDOW_MS, now);
-    }
-    rate_shard_unlock(ip);
-    return ok;
 }
 
 /* ---- F4/R1-D-1: per-session token-mismatch budget (DATA/CLOSE) ----
@@ -2181,7 +1376,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
         uint64_t now = now_ms(); /* one clock read shared by the rate checks */
         if (debug_enabled())
             ta = now_ns();
-        if (!rate_allow(peer, typ))
+        if (!server_rate_allow_control(peer, typ))
             return; /* unauthenticated flood from this source: silent drop */
 
         switch (typ) {
@@ -2207,8 +1402,8 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                 /* L37: the miss itself is now charged to a dedicated
                  * per-source counter (sess_lock released: shard lock
                  * inside, never nested). Over budget => drop + count. */
-                if (!rate_allow_sid_miss((uint32_t)peer->sin_addr.s_addr, now))
-                    atomic_fetch_add(&g_rate_drops, 1);
+                if (!server_rate_allow_sid_miss((uint32_t)peer->sin_addr.s_addr, now))
+                    server_rate_drop_inc();
                 return;
             }
             /* F4 (per session, R1-D-1; R37 R2 regression fix): the
@@ -2222,7 +1417,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
             peer_is_peer = memcmp(&s->peer, peer, sizeof *peer) == 0;
             if (!peer_is_peer && tok_budget_over(s, now)) {
                 pthread_rwlock_unlock(&ctx->sess_lock);
-                atomic_fetch_add(&g_rate_drops, 1);
+                server_rate_drop_inc();
                 return;
             }
             if (CRYPTO_memcmp(&s->token, &tok, sizeof tok) != 0) {
@@ -2248,8 +1443,8 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                  * reach this; R37-R2's non-peer pre-compare budget is
                  * untouched; the default 4096/window is ~3 orders above
                  * any legitimate stale-token retry rate. */
-                if (peer_is_peer && !rate_allow_tokbad(peer, now)) {
-                    atomic_fetch_add(&g_rate_drops, 1);
+                if (peer_is_peer && !server_rate_allow_tokbad(peer, now)) {
+                    server_rate_drop_inc();
                     return; /* bound-class wrong-token storm: drop */
                 }
                 tok_charge_upgrade(ctx, sid, tok, peer, now);
@@ -2271,7 +1466,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                 pthread_rwlock_unlock(&ctx->sess_lock);
                 atomic_fetch_add_explicit(&g_up[tid].drop, 1,
                                           memory_order_relaxed);
-                atomic_fetch_add(&g_rate_drops, 1);
+                server_rate_drop_inc();
                 return;
             }
             /* source binding: only the session's peer may drive the
@@ -2460,7 +1655,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                      * (re-lock — the DATA path released the read lock
                      * before the TUN write; this path is rare: it runs
                      * only per queue-full drop). Its own next frames are
-                     * dropped at the gate above for g_up_throttle_ms,
+                     * dropped at the gate above for server_rate_get_throttle_ms(),
                      * letting other sessions write while the device
                      * drains. The token is re-verified so a wiped/replaced
                      * session (new token) is not throttled. */
@@ -2472,7 +1667,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                                                 sizeof tok) == 0)
                             atomic_store_explicit(
                                 &s2->throttle_until_ms,
-                                now_ms() + g_up_throttle_ms,
+                                now_ms() + server_rate_get_throttle_ms(),
                                 memory_order_relaxed);
                     }
                     pthread_rwlock_unlock(&ctx->sess_lock);
@@ -2516,8 +1711,8 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
             pthread_rwlock_unlock(&ctx->sess_lock);
             /* L37: dedicated per-source unknown-sid budget (see the DATA
              * path / rate_allow_sid_miss note); sess_lock already released */
-            if (!rate_allow_sid_miss((uint32_t)peer->sin_addr.s_addr, now))
-                atomic_fetch_add(&g_rate_drops, 1);
+            if (!server_rate_allow_sid_miss((uint32_t)peer->sin_addr.s_addr, now))
+                server_rate_drop_inc();
             return;
         }
         /* known sid: R48-F1(2/3) runs the token and peer checks under the
@@ -2534,7 +1729,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
          * the real peer's CLOSE dropped. */
         if (!cls_bound && tok_budget_over(s, now)) {
             pthread_rwlock_unlock(&ctx->sess_lock);
-            atomic_fetch_add(&g_rate_drops, 1);
+            server_rate_drop_inc();
             return;
         }
         if (CRYPTO_memcmp(&s->token, &tok, sizeof tok) != 0) {
@@ -2556,8 +1751,8 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
              * lock inner, so rate_allow_close runs with sess_lock
              * released. */
             pthread_rwlock_unlock(&ctx->sess_lock);
-            if (!rate_allow_close(peer, now)) {
-                atomic_fetch_add(&g_rate_drops, 1);
+            if (!server_rate_allow_close(peer, now)) {
+                server_rate_drop_inc();
                 return; /* wrong-token CLOSE storm from this source: drop */
             }
             /* within budget: re-lock and charge the session's mismatch
