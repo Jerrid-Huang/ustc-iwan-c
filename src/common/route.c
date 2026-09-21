@@ -4,6 +4,7 @@
 
 #include "protocol.h"
 #include "route.h"
+#include "route_common.h"
 #include "tun.h"
 #include "util.h"
 
@@ -27,29 +28,6 @@ static bool mac_run(char *const argv[], const char *what)
 #else
 #  include <arpa/inet.h>
 #endif
-
-/* derived inner ULA (fd00::/96 + the inner IPv4, protocol.h) as text;
- * returns false when tun_ip is not a valid IPv4. */
-static bool tun_ula_str(const char *tun_ip, char out[64])
-{
-    uint8_t v4[4], b6[16];
-    if (!s2ip4(tun_ip, v4))
-        return false;
-    ip6_derive_ula(ip4_u32(v4), b6);
-    snprintf(out, 64,
-             "%02x%02x:%02x%02x:%02x%02x:%02x%02x:"
-             "%02x%02x:%02x%02x:%02x%02x:%02x%02x",
-             b6[0], b6[1], b6[2], b6[3], b6[4], b6[5], b6[6], b6[7],
-             b6[8], b6[9], b6[10], b6[11], b6[12], b6[13], b6[14], b6[15]);
-    return true;
-}
-
-/* true when `c` names the IPv4 default route (either spelling); used when
- * splitting the routes with/without the default to handle it specially. */
-static bool is_default_v4(const char *c)
-{
-    return strcmp(c, "default") == 0 || strcmp(c, "0.0.0.0/0") == 0;
-}
 
 #ifdef _WIN32
 /* R53-E-1: audit the wintun adapter's derived-ULA address surface.
@@ -347,51 +325,6 @@ void route_iface_down(const char *tun)
     ip_run(d6);
 }
 #endif /* _WIN32 */
-
-/* strict "A.B.C.D/n" parser: exact dotted-quad, 0 <= n <= 32, no
- * trailing garbage. net is filled in host byte order (unmasked).
- * Pure string parsing (s2ip4/strtol): shared by both backends. */
-int cidr_parse(const char *s, uint32_t *net, int *prefix)
-{
-    const char *slash = strchr(s, '/');
-    if (slash == NULL || slash == s || strchr(slash + 1, '/') != NULL)
-        return -1;
-    size_t ilen = (size_t)(slash - s);
-    if (ilen == 0 || ilen >= 16)
-        return -1;
-    char ip[16];
-    memcpy(ip, s, ilen);
-    ip[ilen] = '\0';
-    uint8_t b[4];
-    if (!s2ip4(ip, b))
-        return -1;
-    char *pend;
-    if (slash[1] < '0' || slash[1] > '9')
-        return -1;   /* strict: reject "/ 8" and "/+8" */
-    long p = strtol(slash + 1, &pend, 10);
-    if (pend == slash + 1 || *pend != '\0' || p < 0 || p > 32)
-        return -1;
-    *net = ip4_u32(b);
-    /* R23-F3 F2: a /0 that is not 0.0.0.0/0 is a typo, not a route — the
-     * canonicalization later turns ANY /0 into a default route on all
-     * three backends, so accepting "1.2.3.4/0" would silently replace the
-     * real default with one via the tunnel. Only the true 0.0.0.0/0 is
-     * legal. */
-    if (p == 0 && *net != 0)
-        return -1;
-    *prefix = (int)p;
-    return 0;
-}
-
-#ifndef _WIN32
-static void copy_token(char *dst, size_t cap, const char *tok) {
-    size_t n = strlen(tok);
-    if (n >= cap)
-        n = cap - 1;
-    memcpy(dst, tok, n);
-    dst[n] = '\0';
-}
-#endif
 
 #ifdef _WIN32
 bool capture_default(char gw[16], char dev[16], char metric[16])
