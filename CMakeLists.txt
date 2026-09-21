@@ -265,7 +265,10 @@ set(IWAN_CORE_SRCS
   src/common/relay_proxy.c
   src/common/route_common.c
   src/common/socks.c
+  src/common/socks_auth_guard.c
+  src/common/socks_dns.c
   src/common/socks_flow.c
+  src/common/socks_handshake.c
   src/common/udp_send.c
   src/common/util.c)
 if(WIN32)
