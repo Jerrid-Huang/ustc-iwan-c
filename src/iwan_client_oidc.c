@@ -45,7 +45,7 @@ int main(int argc, char **argv)
     memset(&o, 0, sizeof o);
     o.config_dir = "~/.config/iwan";
     o.tun = "iwan0";
-    o.socks_listen = "127.0.0.1:1080";
+    o.socks_listen = NULL;
     o.socks_mtu = 1380;
     slist_init(&o.proxy_cidr);
     slist_init(&o.proxy_ip);
@@ -54,6 +54,9 @@ int main(int argc, char **argv)
 
     Cli usage;
     oidc_parse_cli(argc, argv, &o, &usage);
+
+    if (o.socks && !o.socks_listen)
+        o.socks_listen = "127.0.0.1:1080";
 
     if (!(o.fetch || o.list || o.connect || o.all))
         usage_error(&usage,
