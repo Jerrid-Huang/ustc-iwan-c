@@ -17,6 +17,25 @@
 
 #define MAX_FLOWS       256
 
+/* Result of an async DNS lookup, queued for the event loop. */
+typedef struct {
+    int      flow_id;
+    bool     ok;
+    uint8_t  af;               /* 4 or 6 */
+    uint32_t ip;               /* host-order MSB-first (af == 4) */
+    uint8_t  ip6[16];          /* raw bytes (af == 6) */
+    uint16_t port;
+    unsigned gen;              /* session generation at push time: the
+                                * drain side drops entries from a torn-
+                                * down session so a stale worker's
+                                * result can never reach a new session's
+                                * flow (socks.c resets g_next_id) */
+} DnsResult;
+
+#include "socks_auth_guard.h"
+#include "socks_dns.h"
+#include "socks_handshake.h"
+
 /* ---- tunnel DNS (socks_flow.c) ---- */
 #define DNS_RESULT_Q_LEN 513    /* DNS result ring size (dns_push/dns_drain).
                                  * The ring treats tl==hd as empty, so a
@@ -70,7 +89,7 @@ typedef enum {
 } FlowState;
 
 /* One accepted SOCKS5 client connection and its netstack mapping. */
-typedef struct {
+typedef struct Flow_s {
     int      active;
     uint64_t id;               /* monotonically increasing flow id */
     int      fd;               /* local client stream */
@@ -141,21 +160,6 @@ typedef struct {
     uint8_t  tgt_ip6[16];
     uint16_t tgt_port;
 } Flow;
-
-/* Result of an async DNS lookup, queued for the event loop. */
-typedef struct {
-    int      flow_id;
-    bool     ok;
-    uint8_t  af;               /* 4 or 6 */
-    uint32_t ip;               /* host-order MSB-first (af == 4) */
-    uint8_t  ip6[16];          /* raw bytes (af == 6) */
-    uint16_t port;
-    unsigned gen;              /* session generation at push time: the
-                                * drain side drops entries from a torn-
-                                * down session so a stale worker's
-                                * result can never reach a new session's
-                                * same-numbered flow (SUMMARY-2 H3) */
-} DnsResult;
 
 /* ---- shared state between socks.c (server) and socks_flow.c (flows) ---- */
 extern Netstack g_ns;
