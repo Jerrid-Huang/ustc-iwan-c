@@ -253,6 +253,7 @@ set(IWAN_CORE_SRCS
   src/common/config.c
   src/common/crypto.c
   src/common/gcm.c
+  src/common/http_parser.c
   src/common/https.c
   src/common/ipv4.c
   src/common/json.c
