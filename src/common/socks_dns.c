@@ -102,6 +102,33 @@ static DnsWait g_dns_wait[DNS_WAIT_MAX];
 static pthread_mutex_t g_dns_wait_mu = PTHREAD_MUTEX_INITIALIZER;
 static atomic_int g_dns_wait_n;
 
+/* getaddrinfo() has no portable timeout, so a black-holed system resolver
+ * would let every domain CONNECT block a worker thread indefinitely (each
+ * with a default 8MB stack, up to 2 per flow). Bound the concurrency of
+ * the local-resolver fallback rather than its duration: workers past the
+ * cap take the ordinary resolution-failure path immediately. */
+#define DNS_LOCAL_MAX_INFLIGHT 8
+static atomic_int g_dns_local_inflight;
+
+/* Reserve one local-resolver slot; false means the cap is reached and
+ * nothing was reserved (no release needed). */
+static bool dns_local_try_enter(void)
+{
+    int n = atomic_load_explicit(&g_dns_local_inflight, memory_order_relaxed);
+    while (n < DNS_LOCAL_MAX_INFLIGHT) {
+        if (atomic_compare_exchange_weak_explicit(
+                &g_dns_local_inflight, &n, n + 1,
+                memory_order_acq_rel, memory_order_relaxed))
+            return true;
+    }
+    return false;
+}
+
+static void dns_local_leave(void)
+{
+    atomic_fetch_sub_explicit(&g_dns_local_inflight, 1, memory_order_release);
+}
+
 void dns_session_lock(void) { pthread_mutex_lock(&g_dns_wait_mu); }
 void dns_session_unlock(void) { pthread_mutex_unlock(&g_dns_wait_mu); }
 
@@ -248,32 +275,35 @@ static size_t dns_wrap_outer(const uint8_t *inner, size_t inlen,
 
 static int dns_register(uint16_t id, uint16_t sport, const DnsJob *j)
 {
-    for (int spin = 0; spin < 200; spin++) {  /* up to 2s for a free slot */
-        if (dns_stale(j))
-            return -1;
-        pthread_mutex_lock(&g_dns_wait_mu);
-        for (int i = 0; i < DNS_WAIT_MAX; i++) {
-            DnsWait *w = &g_dns_wait[i];
-            if (w->in_use)
-                continue;
-            memset(w, 0, sizeof *w);
-            w->dns_id = id;
-            w->sport = sport;
-            w->ipid = g_dns_ip_id++;
-            w->deadline = now_ms() + DNS_TIMEOUT_MS;
-            w->resends = DNS_MAX_RESEND;
-            w->flow_id = j->flow_id;
-            w->port = j->port;
-            w->qtype = j->qtype;
-            snprintf(w->domain, sizeof w->domain, "%s", j->domain);
-            w->in_use = true;
-            atomic_fetch_add_explicit(&g_dns_wait_n, 1, memory_order_release);
-            pthread_mutex_unlock(&g_dns_wait_mu);
-            return i;
-        }
+    /* A full table means we are already at capacity: the old 200 x 10ms
+     * sleep-spin only pinned this worker for up to 2s while delaying the
+     * honest rep=4 the caller derives from -1 (the dns_worker fail arm
+     * pushes dns_push_g(false) -> queue_socks_error(4) in socks_flow.c).
+     * Clients retry a rep=4 either way, so fail fast instead: one scan,
+     * no waiting. */
+    if (dns_stale(j))
+        return -1;
+    pthread_mutex_lock(&g_dns_wait_mu);
+    for (int i = 0; i < DNS_WAIT_MAX; i++) {
+        DnsWait *w = &g_dns_wait[i];
+        if (w->in_use)
+            continue;
+        memset(w, 0, sizeof *w);
+        w->dns_id = id;
+        w->sport = sport;
+        w->ipid = g_dns_ip_id++;
+        w->deadline = now_ms() + DNS_TIMEOUT_MS;
+        w->resends = DNS_MAX_RESEND;
+        w->flow_id = j->flow_id;
+        w->port = j->port;
+        w->qtype = j->qtype;
+        snprintf(w->domain, sizeof w->domain, "%s", j->domain);
+        w->in_use = true;
+        atomic_fetch_add_explicit(&g_dns_wait_n, 1, memory_order_release);
         pthread_mutex_unlock(&g_dns_wait_mu);
-        port_sleep_us(10 * 1000);
+        return i;
     }
+    pthread_mutex_unlock(&g_dns_wait_mu);
     return -1;
 }
 
@@ -539,7 +569,15 @@ static void *dns_worker(void *arg) {
     if (srv4 == 0 || j->qtype == 0) {
         uint32_t lip4 = 0;
         uint8_t lip6[16] = {0}, af = 4;
-        bool resolved = dns_query_local(j->domain, &af, &lip4, lip6);
+        bool resolved = false;
+        /* At the in-flight cap: dns_query_local is not called at all, so
+         * nothing is reserved and the job fails exactly like a resolution
+         * error below. Otherwise the slot is released on every return
+         * path of dns_query_local (the call has no early exit here). */
+        if (dns_local_try_enter()) {
+            resolved = dns_query_local(j->domain, &af, &lip4, lip6);
+            dns_local_leave();
+        }
         if (dns_stale(j))
             goto done;
         if (resolved)
@@ -698,6 +736,31 @@ void spawn_dns(int flow_id, const char *domain, uint16_t port) {
         j->domain = xstrdup(domain);
         j->gen = atomic_load(&g_dns_gen);
         j->qtype = qtypes[k];
+        /* Admission gate (spawn-side cap): the wait table has DNS_WAIT_MAX
+         * slots and this job needs room for all nq of its qtypes, so
+         * refuse to start a worker that is known to be unable to register.
+         * Saturation is logged at most once a second. The query then takes
+         * the same failure path as the malloc/pthread_create arms below
+         * instead of pinning a thread for the dns_register wait. */
+        if (atomic_load_explicit(&g_dns_wait_n, memory_order_acquire) >
+            DNS_WAIT_MAX - nq) {
+            static atomic_uint_fast64_t last_full_warn_ms;
+            uint64_t wnow = now_ms();
+            uint64_t wprev = atomic_exchange_explicit(&last_full_warn_ms,
+                                                      wnow,
+                                                      memory_order_relaxed);
+            if (wnow - wprev >= 1000)
+                log_err("dns: wait table saturated (%d/%d in use), "
+                        "failing lookup for %s",
+                        atomic_load_explicit(&g_dns_wait_n,
+                                             memory_order_relaxed),
+                        (int)DNS_WAIT_MAX, domain);
+            free(j->domain);
+            free(j);
+            dns_push_g(atomic_load(&g_dns_gen), flow_id, false, 4, 0,
+                       NULL, port);
+            continue;
+        }
         if (pthread_create(&th, NULL, dns_worker, j) != 0) {
             free(j->domain);
             free(j);
