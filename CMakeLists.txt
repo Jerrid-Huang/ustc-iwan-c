@@ -571,6 +571,26 @@ if(BUILD_TESTING)
   # table is file-static).
   add_executable(relay_socks_harness tests/relay_socks_harness.c)
   target_link_libraries(relay_socks_harness PRIVATE iwan_core)
+  # R55-SK-1 dynamic probe: drives the REAL wait_events() with injected flows
+  # against real loopback sockets, so the poll-convergence contract is tested
+  # at runtime rather than only by reading code. Asserts three things:
+  #   (a) a flow whose events=0 slot sits on an RST'd fd (POLLERR|POLLHUP)
+  #       must converge and let wait_events sleep again, instead of returning
+  #       instantly every round (the zero-wait busy spin = 100% CPU);
+  #   (b) the clean-FIN control keeps NOT waking (no spin pre- or post-fix);
+  #   (c) a half-open client (SHUT_WR, still reading) still receives its
+  #       queued output -- i.e. R56-001's deliberate "do not tear down a
+  #       half-closed client" trade-off is preserved by the (a) fix.
+  # (c) is the guard that matters when touching the convergence arm.
+  # Self-asserting: exit 0 = all assertions held. IWAN_PROBE_WAIT_MS (500) and
+  # IWAN_PROBE_ROUNDS (10) tune the measurement.
+  add_executable(r55_skspin_harness tests/probes/r55_skspin_harness.c)
+  target_link_libraries(r55_skspin_harness PRIVATE iwan_core)
+  # Diagnostic helper: maps which revents bits this platform reports for a
+  # given socket state (used to establish the per-platform poll semantics the
+  # convergence arm depends on).
+  add_executable(pollmap tests/probes/pollmap.c)
+  target_link_libraries(pollmap PRIVATE iwan_core)
 endif()
 
 if(UNIX AND NOT APPLE)

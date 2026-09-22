@@ -37,3 +37,9 @@ build-tsan/
 build-wstrict/
 build-*/
 bughunt/
+
+# release deliverables (dist/ holds the built+stripped iwan-client-oidc)
+dist/
+
+# stress harness output (tests/stress_socks*.sh write here by default)
+stress-out/
