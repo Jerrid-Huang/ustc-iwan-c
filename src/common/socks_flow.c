@@ -340,22 +340,16 @@ static uint16_t alloc_port(void)
  * no reason). Only an allocation that cannot get a slot may retire the
  * stalest idle candidate, and only then does the new flow take its place.
  *
- * The victim's slot is not the only resource the new flow takes over: its
- * local port comes with it (recycle_lport) once the abort has freed it.
- * Rebinding a port the client just released is legal (the abort sent an
- * RST, so lwIP holds no TIME_WAIT for it) and keeps the eviction from
- * burning a second ephemeral port while the client is already at
- * capacity; it also keeps the new connection on the victim's path, so
- * any stateful hop on it (NAT/conntrack, a peer that keys its state by
- * 4-tuple) sees the replacement rather than a cold flow.
+ * Only the slot is reclaimed: the new flow keeps its own fresh local port.
+ * Reusing the victim's just-released source port would hand a server or
+ * stateful hop still holding 4-tuple state for the retired connection a
+ * look-alike replacement it could misattribute.
  */
-static bool evict_stalest_idle_flow(const Flow *self, uint16_t *recycle_lport)
+static bool evict_stalest_idle_flow(const Flow *self)
 {
     Flow *victim = NULL;
     uint64_t now = now_ms();
 
-    if (recycle_lport != NULL)
-        *recycle_lport = 0;
     for (int i = 0; i < MAX_FLOWS; i++) {
         Flow *f = &g_flows[i];
         TcpConn *c;
@@ -386,39 +380,31 @@ static bool evict_stalest_idle_flow(const Flow *self, uint16_t *recycle_lport)
             (unsigned long)victim->id,
             (unsigned long long)(now - victim->last_progress_ms));
 
-    /* Hand the victim's local port to the caller's retry. Only a live pcb
-     * owns a port worth/valid to recycle: a pcb==NULL slot is already
-     * being reclaimed (and its port may be a TIME_WAIT one), so leave
-     * recycle_lport at 0 there and let the caller keep its fresh port. */
-    if (recycle_lport != NULL) {
-        TcpConn *vc = ns_conn(&g_ns, victim->ns_idx);
-        if (vc != NULL && vc->pcb != NULL)
-            *recycle_lport = victim->lport;
-    }
-
     /* Retire the victim exactly like reap_flows' force-kill arm for a
      * live-pcb wedge: ns_abort is TIME_WAIT-safe (clears c->pcb), then
      * the slot reference is released and f->ns_idx detached IN THE SAME
      * ROUND — so the caller's retried ns_connect can allocate the slot
      * immediately. ST_CLOSING + the drained output above make the
      * existing reap arms collect the flow on their normal rules. */
-    ns_abort(&g_ns, victim->ns_idx);
-    ns_flow_unref(victim->ns_idx);
+    int vidx = victim->ns_idx;
+    /* conns[] lives at a fixed address: this pointer survives the detach. */
+    TcpConn *vc = ns_conn(&g_ns, vidx);
+
+    ns_abort(&g_ns, vidx);
+    ns_flow_unref(vidx);
     victim->ns_idx = -1;
     victim->local_eof = true;          /* stops POLLIN being armed */
     set_flow_state(victim, ST_CLOSING);
 
-    /* ns_abort also leaves conn_slot_alloc's one-round reuse guard
-     * (c->reap_pending, set by bridge_err so a ST_CONNECTING flow can
-     * still read term_reason) on the slot, and ns_tick is what clears it.
-     * The victim was ESTABLISHED with its reply already sent and is now
-     * detached, so no one needs its term_reason: advance the bridge tick
-     * exactly as the next loop round would, which makes the slot
-     * allocatable for the retry below. Safe mid-round: g_flow_ref is
-     * still held by every flow that references a slot, so conn_slot_alloc
-     * cannot hand out a slot another flow might still read (FIND-R2-5),
-     * and this runs on the same single event-loop thread as ns_tick. */
-    ns_tick(&g_ns, now_ms());
+    /* bridge_err set reap_pending so a ST_CONNECTING flow could still read
+     * term_reason, but the victim was ESTABLISHED with its reply already
+     * sent and is now fully detached, so nobody needs that reason: clear
+     * the guard directly and the slot is allocatable for this round's
+     * retry. This replaces a mid-round ns_tick(), which would run the
+     * whole bridge tick (lwIP timers) a second time in one round and let
+     * flows see mixed pre-/post-tick conn state. */
+    if (vc != NULL)
+        vc->reap_pending = false;
     return true;
 }
 
@@ -436,15 +422,11 @@ static void open_tcp_conn_af(Flow *f, uint8_t af, uint32_t rip,
     idx = (af == 6) ? ns_connect6(&g_ns, lport, rip6, rport)
                     : ns_connect(&g_ns, lport, rip, rport);
     if (idx < 0) {
-        uint16_t recycle_lport = 0;
         /* F4b: the table was full of idle-but-alive flows. The eviction
-         * released one slot (and, when it had a live pcb, its local port)
-         * in this same round, so retry ONCE — with the victim's port when
-         * it was handed over, else with the one alloc_port picked. Only a
-         * second failure is a real capacity rejection. */
-        if (evict_stalest_idle_flow(f, &recycle_lport)) {
-            if (recycle_lport != 0)
-                lport = recycle_lport;
+         * released one slot in this same round, so retry ONCE with the
+         * fresh port alloc_port already picked. Only a second failure is
+         * a real capacity rejection. */
+        if (evict_stalest_idle_flow(f)) {
             idx = (af == 6) ? ns_connect6(&g_ns, lport, rip6, rport)
                             : ns_connect(&g_ns, lport, rip, rport);
         }
