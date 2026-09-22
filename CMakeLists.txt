@@ -584,13 +584,22 @@ if(BUILD_TESTING)
   # (c) is the guard that matters when touching the convergence arm.
   # Self-asserting: exit 0 = all assertions held. IWAN_PROBE_WAIT_MS (500) and
   # IWAN_PROBE_ROUNDS (10) tune the measurement.
-  add_executable(r55_skspin_harness tests/probes/r55_skspin_harness.c)
-  target_link_libraries(r55_skspin_harness PRIVATE iwan_core)
-  # Diagnostic helper: maps which revents bits this platform reports for a
-  # given socket state (used to establish the per-platform poll semantics the
-  # convergence arm depends on).
-  add_executable(pollmap tests/probes/pollmap.c)
-  target_link_libraries(pollmap PRIVATE iwan_core)
+  #
+  # POSIX-only: the probes drive POSIX poll()/shutdown() semantics directly
+  # (poll.h, SHUT_WR, setsockopt(const void*)). MinGW has no <poll.h> and its
+  # Winsock setsockopt takes const char*, so they cannot be built there. A
+  # Windows port would be a winsock-WSAPoll variant of the probe driver (the
+  # per-platform poll-semantics question the probe exists to settle), not a
+  # rename of these constants.
+  if(UNIX)
+    add_executable(r55_skspin_harness tests/probes/r55_skspin_harness.c)
+    target_link_libraries(r55_skspin_harness PRIVATE iwan_core)
+    # Diagnostic helper: maps which revents bits this platform reports for a
+    # given socket state (used to establish the per-platform poll semantics
+    # the convergence arm depends on).
+    add_executable(pollmap tests/probes/pollmap.c)
+    target_link_libraries(pollmap PRIVATE iwan_core)
+  endif()
 endif()
 
 if(UNIX AND NOT APPLE)
