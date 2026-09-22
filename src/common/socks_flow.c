@@ -1612,6 +1612,12 @@ void reap_flows(void) {
         int removable = 0;
         if (!f->active)
             continue;
+        if (f->state == ST_ESTABLISHED && f->ns_idx < 0) {
+            log_err("[flow %lu] ESTABLISHED with no netstack conn: converging "
+                    "(invariant repair)", (unsigned long)f->id);
+            f->local_eof = true;            /* stops POLLIN being armed */
+            set_flow_state(f, ST_CLOSING);  /* existing arms then reap it */
+        }
         if (f->ns_idx >= 0) {
             TcpConn *c = ns_conn(&g_ns, f->ns_idx);
             if (c == NULL || c->pcb == NULL) {

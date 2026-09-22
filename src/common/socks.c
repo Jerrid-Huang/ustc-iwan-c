@@ -1363,6 +1363,16 @@ static void socks_reauth_flows(void)
             open_tcp_connection6(f, f->tgt_ip6, port);
         else if (af == 4)
             open_tcp_connection(f, f->tgt_ip4, port);
+        else {
+            /* A5-4: af must be 4 or 6 here (tgt_af is validated at flow
+             * creation); an unexpected af (0) would fall through with
+             * ns_idx == -1 and the flow left in ST_ESTABLISHED — a state
+             * nothing can read, re-establish or reap, so the fd + flow slot
+             * are pinned and POLLIN busy-polls poll() forever. Converge to
+             * ST_CLOSING like the ST_RESOLVING arm above. */
+            queue_socks_error(f, 1);
+            set_flow_state(f, ST_CLOSING);
+        }
     }
 }
 
