@@ -322,6 +322,106 @@ static uint16_t alloc_port(void)
     return alloc_ephemeral(tcp_port_in_use);
 }
 
+/* F4b: capacity pressure, not idleness, decides when a flow may be evicted.
+ *
+ * The netstack connection table has only NS_MAX_CONN (64) slots and no
+ * eviction of its own: a flow pins its slot while f->ns_idx >= 0, i.e.
+ * until its connection really dies. An ESTABLISHED-but-idle flow never
+ * dies on its own — lwIP's keepalive probes are echoed back by the peer,
+ * so the pcb stays healthy and reap_flows' no-progress watchdog (which
+ * deliberately requires ST_CLOSING, or CLOSE_WAIT/NS_CLOSED) never fires
+ * on it. After 64 idle-but-alive flows, every later open_tcp_conn_af
+ * finds conn_slot_alloc refusing, ns_connect returns -1, and the CONNECT
+ * is answered rep=0x01 forever.
+ *
+ * The fix is eviction UNDER PRESSURE, not a standing idle timeout: an
+ * idle-but-healthy session must NOT be killed while capacity is free (a
+ * quiet SOCKS session is legitimate — an idle timeout would break it for
+ * no reason). Only an allocation that cannot get a slot may retire the
+ * stalest idle candidate, and only then does the new flow take its place.
+ *
+ * The victim's slot is not the only resource the new flow takes over: its
+ * local port comes with it (recycle_lport) once the abort has freed it.
+ * Rebinding a port the client just released is legal (the abort sent an
+ * RST, so lwIP holds no TIME_WAIT for it) and keeps the eviction from
+ * burning a second ephemeral port while the client is already at
+ * capacity; it also keeps the new connection on the victim's path, so
+ * any stateful hop on it (NAT/conntrack, a peer that keys its state by
+ * 4-tuple) sees the replacement rather than a cold flow.
+ */
+static bool evict_stalest_idle_flow(const Flow *self, uint16_t *recycle_lport)
+{
+    Flow *victim = NULL;
+    uint64_t now = now_ms();
+
+    if (recycle_lport != NULL)
+        *recycle_lport = 0;
+    for (int i = 0; i < MAX_FLOWS; i++) {
+        Flow *f = &g_flows[i];
+        TcpConn *c;
+        if (!f->active || f == self || f->state != ST_ESTABLISHED ||
+            f->ns_idx < 0)
+            continue;
+        /* Freeing a flow that still holds undelivered data would close()
+         * the local client fd with bytes unread -> RST, and drop the
+         * payload. Only a fully drained flow may be evicted. */
+        if (f->output.len > 0 || f->rxq_waiting)
+            continue;
+        c = ns_conn(&g_ns, f->ns_idx);
+        if (c != NULL && c->rxq.len > 0)
+            continue;
+        /* Not actually idle: a healthy flow in the middle of an
+         * allocation burst (handshake/relay) must keep its slot. */
+        if (now - f->last_progress_ms < 1000)
+            continue;
+        if (victim == NULL || f->last_progress_ms < victim->last_progress_ms)
+            victim = f;   /* stalest last_progress_ms wins */
+    }
+    if (victim == NULL)
+        return false;
+
+    log_err("[flow %lu] netstack conn table full (%d slots): evicting stalest "
+            "idle flow %lu (idle %llu ms)",
+            (unsigned long)self->id, (int)NS_MAX_CONN,
+            (unsigned long)victim->id,
+            (unsigned long long)(now - victim->last_progress_ms));
+
+    /* Hand the victim's local port to the caller's retry. Only a live pcb
+     * owns a port worth/valid to recycle: a pcb==NULL slot is already
+     * being reclaimed (and its port may be a TIME_WAIT one), so leave
+     * recycle_lport at 0 there and let the caller keep its fresh port. */
+    if (recycle_lport != NULL) {
+        TcpConn *vc = ns_conn(&g_ns, victim->ns_idx);
+        if (vc != NULL && vc->pcb != NULL)
+            *recycle_lport = victim->lport;
+    }
+
+    /* Retire the victim exactly like reap_flows' force-kill arm for a
+     * live-pcb wedge: ns_abort is TIME_WAIT-safe (clears c->pcb), then
+     * the slot reference is released and f->ns_idx detached IN THE SAME
+     * ROUND — so the caller's retried ns_connect can allocate the slot
+     * immediately. ST_CLOSING + the drained output above make the
+     * existing reap arms collect the flow on their normal rules. */
+    ns_abort(&g_ns, victim->ns_idx);
+    ns_flow_unref(victim->ns_idx);
+    victim->ns_idx = -1;
+    victim->local_eof = true;          /* stops POLLIN being armed */
+    set_flow_state(victim, ST_CLOSING);
+
+    /* ns_abort also leaves conn_slot_alloc's one-round reuse guard
+     * (c->reap_pending, set by bridge_err so a ST_CONNECTING flow can
+     * still read term_reason) on the slot, and ns_tick is what clears it.
+     * The victim was ESTABLISHED with its reply already sent and is now
+     * detached, so no one needs its term_reason: advance the bridge tick
+     * exactly as the next loop round would, which makes the slot
+     * allocatable for the retry below. Safe mid-round: g_flow_ref is
+     * still held by every flow that references a slot, so conn_slot_alloc
+     * cannot hand out a slot another flow might still read (FIND-R2-5),
+     * and this runs on the same single event-loop thread as ns_tick. */
+    ns_tick(&g_ns, now_ms());
+    return true;
+}
+
 static void open_tcp_conn_af(Flow *f, uint8_t af, uint32_t rip,
                              const uint8_t rip6[16], uint16_t rport)
 {
@@ -335,6 +435,20 @@ static void open_tcp_conn_af(Flow *f, uint8_t af, uint32_t rip,
     }
     idx = (af == 6) ? ns_connect6(&g_ns, lport, rip6, rport)
                     : ns_connect(&g_ns, lport, rip, rport);
+    if (idx < 0) {
+        uint16_t recycle_lport = 0;
+        /* F4b: the table was full of idle-but-alive flows. The eviction
+         * released one slot (and, when it had a live pcb, its local port)
+         * in this same round, so retry ONCE — with the victim's port when
+         * it was handed over, else with the one alloc_port picked. Only a
+         * second failure is a real capacity rejection. */
+        if (evict_stalest_idle_flow(f, &recycle_lport)) {
+            if (recycle_lport != 0)
+                lport = recycle_lport;
+            idx = (af == 6) ? ns_connect6(&g_ns, lport, rip6, rport)
+                            : ns_connect(&g_ns, lport, rip, rport);
+        }
+    }
     if (idx < 0) {
         queue_socks_error(f, 1);
         return;
