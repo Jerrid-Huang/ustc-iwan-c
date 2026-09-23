@@ -28,7 +28,7 @@ cmake_minimum_required(VERSION 3.16)
 #   IWAN_BPF           Linux: compile+embed the tun steering eBPF program.
 #   IWAN_WERROR        Treat compiler warnings as errors (CI).
 
-project(iwan VERSION 0.7.3 LANGUAGES C)
+project(iwan VERSION 0.8.0 LANGUAGES C)
 
 # F: interprocedural optimization (LTO). OFF by default: the mingw/musl
 # cross toolchains have uneven LTO support, so opt in after an A/B on
