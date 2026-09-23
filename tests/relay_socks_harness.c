@@ -229,11 +229,24 @@ static int attempt(uint16_t port, const uint8_t *frm, size_t flen,
         return -1;
     uint8_t g[8];
     size_t gl = frame_greeting(g);
-    if (cli_send_all(fd, g, gl) != 0 ||
-        cli_send_all(fd, frm, flen) != 0) {
+    int send_err = (cli_send_all(fd, g, gl) != 0 ||
+                    cli_send_all(fd, frm, flen) != 0);
+    if (send_err && want_reply) {
+        /* served peer: the connection must stay healthy; a send error
+         * there is a real failure */
         note_fail("%s: send failed", what);
         port_close(fd);
         return -1;
+    }
+    if (send_err) {
+        /* drop case: the server's lockout close() happens right after
+         * accept(), so its RST can be observed on send() instead of
+         * recv() when the two race. A send error before any reply is
+         * still the drop (the client never sees {5,2}); only a complete
+         * reply proves the peer was served, and that is checked below. */
+        note_ok("PASS %s: dropped (RST raced the send)", what);
+        port_close(fd);
+        return 0;
     }
     uint8_t r[8];
     int bad = 0;
