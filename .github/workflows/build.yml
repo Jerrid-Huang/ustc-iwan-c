@@ -26,9 +26,20 @@ on:
   pull_request:
   # manual full run (bench included); release stays tag-gated
   workflow_dispatch:
+    inputs:
+      win_build_type:
+        description: 'win-cross CMake build type (Debug keeps log_debug + IWAN_DEBUG)'
+        type: choice
+        default: Release
+        options: [Release, Debug]
+      only_win_cross:
+        description: 'skip all non win-cross legs'
+        type: boolean
+        default: false
 
 jobs:
   linux-native:
+    if: ${{ !inputs.only_win_cross }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -122,6 +133,7 @@ jobs:
           if-no-files-found: error
 
   sanitize:
+    if: ${{ !inputs.only_win_cross }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -248,6 +260,7 @@ jobs:
   # steering object is arch-neutral and compiles against the host's
   # linux headers (clang -target bpf), so it is embedded in all arches.
   linux-cross:
+    if: ${{ !inputs.only_win_cross }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -465,6 +478,7 @@ jobs:
         run: |
           cmake -B build \
             -DBUILD_TESTING=ON \
+            -DCMAKE_BUILD_TYPE=${{ inputs.win_build_type || 'Release' }} \
             -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/${{ matrix.toolchain }} \
             -DIWAN_OPENSSL_DIR=/opt/ossl-${{ matrix.arch }} \
             -DIWAN_STATIC=ON -DIWAN_WERROR=ON
@@ -585,6 +599,7 @@ jobs:
   # prebuilt MSYS2 clangarm64 package. Link check + PE verification only
   # (no wine support for arm64 Windows binaries on Linux runners).
   win-arm64:
+    if: ${{ !inputs.only_win_cross }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -676,6 +691,7 @@ jobs:
   # iwan-server binary exists on macOS — the TUN/route paths (utun +
   # ifconfig/route) need root and are validated on real Macs by users.
   macos:
+    if: ${{ !inputs.only_win_cross }}
     runs-on: macos-14
     permissions:
       contents: read
@@ -820,7 +836,7 @@ jobs:
   # job). Real data-plane throughput needs TUN devices + root and stays
   # local (sudo tests/bench.sh).
   bench:
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    if: (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') && !inputs.only_win_cross
     runs-on: ubuntu-24.04
     permissions:
       contents: read
