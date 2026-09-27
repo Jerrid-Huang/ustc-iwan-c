@@ -571,6 +571,11 @@ if(BUILD_TESTING)
   # table is file-static).
   add_executable(relay_socks_harness tests/relay_socks_harness.c)
   target_link_libraries(relay_socks_harness PRIVATE iwan_core)
+  # Loop-guard predicate: table test for route_target_hits_server() — the
+  # rule behind "policy route covers the tunnel server -> warn + ignore".
+  # Pure logic, exit code = failure count.
+  add_executable(route_loop_harness tests/route_loop_harness.c)
+  target_link_libraries(route_loop_harness PRIVATE iwan_core)
   # R55-SK-1 dynamic probe: drives the REAL wait_events() with injected flows
   # against real loopback sockets, so the poll-convergence contract is tested
   # at runtime rather than only by reading code. Asserts three things:
@@ -627,7 +632,7 @@ if(IWAN_STRICT)
   endif()
   foreach(_tgt iwan_core iwan_oidc iwan-client iwan-client-oidc iwan-server
                socks_handshake_harness lwip_data_harness lwip_fairness_harness
-               relay_socks_harness)
+               relay_socks_harness route_loop_harness)
     if(TARGET ${_tgt})
       target_compile_options(${_tgt} PRIVATE ${_iwan_strict_flags})
     endif()

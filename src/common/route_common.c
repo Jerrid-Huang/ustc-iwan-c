@@ -2,6 +2,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+/* winsock2 (via port.h) provides inet_pton and getaddrinfo */
+#else
+#  include <arpa/inet.h>
+#  include <netdb.h>
+#endif
+
 #include "protocol.h"
 #include "route_common.h"
 #include "util.h"
@@ -81,4 +88,62 @@ void copy_token(char *dst, size_t cap, const char *tok)
         n = cap - 1;
     memcpy(dst, tok, n);
     dst[n] = '\0';
+}
+
+/* Loop guard for policy-route targets (see route_common.h). The server
+ * may be a literal or a name; a name is resolved (per family) and EVERY
+ * returned address counts, so a multi-homed server cannot hide behind
+ * its first A record. Resolution failure is never a match: the guard
+ * only fires on positive knowledge of a covered server. */
+bool route_target_hits_server(int family, const uint8_t *net, int prefix,
+                              const char *srv, bool *exact)
+{
+    if (exact)
+        *exact = false;
+    if (!srv || !*srv || prefix == 0)
+        return false;
+
+    int alen = family == AF_INET ? 4 : 16;
+    uint8_t addrs[8][16];
+    int n = 0;
+    uint8_t one[16];
+    if (inet_pton(family, srv, one) == 1) {
+        memcpy(addrs[n++], one, (size_t)alen);
+    } else {
+        struct addrinfo hints;
+        memset(&hints, 0, sizeof hints);
+        hints.ai_family = family;
+        hints.ai_socktype = SOCK_STREAM;
+        struct addrinfo *res = NULL;
+        if (getaddrinfo(srv, NULL, &hints, &res) == 0) {
+            for (struct addrinfo *ai = res; ai != NULL && n < 8;
+                 ai = ai->ai_next) {
+                if (ai->ai_family != family)
+                    continue;
+                const uint8_t *ab =
+                    family == AF_INET
+                        ? (const uint8_t *)&((struct sockaddr_in *)
+                                                ai->ai_addr)->sin_addr
+                        : (const uint8_t *)&((struct sockaddr_in6 *)
+                                                ai->ai_addr)->sin6_addr;
+                memcpy(addrs[n++], ab, (size_t)alen);
+            }
+            freeaddrinfo(res);
+        }
+    }
+
+    int full = prefix / 8;
+    int rem = prefix % 8;
+    for (int i = 0; i < n; i++) {
+        if (memcmp(net, addrs[i], (size_t)full) != 0)
+            continue;
+        if (rem != 0 &&
+            ((net[full] ^ addrs[i][full]) & (0xff << (8 - rem))) != 0)
+            continue;
+        if (exact && prefix == alen * 8 &&
+            memcmp(net, addrs[i], (size_t)alen) == 0)
+            *exact = true;
+        return true;
+    }
+    return false;
 }

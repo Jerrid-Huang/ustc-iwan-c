@@ -194,6 +194,9 @@ jobs:
           # case in its own process (relay lockout table is file-static).
           # BUILD_TESTING=ON builds the relay_socks_harness binary.
           python3 tests/relay_socks_harness.py
+          # Policy-route loop guard (route target covering the tunnel
+          # server -> warn + drop): table harness over the predicate.
+          ./bin/route_loop_harness
 
       # Root-free data-plane test: the lwIP bridge uploads a pattern through
       # the readv/commit path against an in-process fake TCP peer and verifies

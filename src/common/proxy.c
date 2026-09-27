@@ -26,6 +26,7 @@
 #include "proxy.h"
 #include "proxy_internal.h"
 #include "route.h"
+#include "route_common.h"
 #include "tun.h"
 #include "udp_send.h"
 #include "util.h"
@@ -1185,8 +1186,28 @@ static bool numeric_v4_spelling(const char *s)
     }
 }
 
+/* Loop guard for policy-route targets that cover the tunnel server (see
+ * route_common.h). Exact host routes (/32, /128) are the pin-collision
+ * case: warn and DROP the target (dropping is NOT an error — the tunnel
+ * must still come up with the remaining routes). Broader prefixes that
+ * merely contain the server are kept: the /32 server pin always outranks
+ * them by longest prefix, so they cannot loop — they are warned because
+ * the covered server is config smell (and --ustc legitimately relies on
+ * exactly this case). */
+static void warn_srv_covered_target(const char *raw, bool exact)
+{
+    if (exact) {
+        log_err("warning: route target '%s' IS the tunnel server; ignored "
+                "(it would route the tunnel's own uplink into the tunnel)",
+                raw);
+        return;
+    }
+    log_err("warning: route target '%s' covers the tunnel server; kept "
+            "(harmless: the server's /32 pin route outranks it)", raw);
+}
+
 static int expand_route_targets_fam(const slist_t *targets, slist_t *out,
-                                    int family)
+                                    int family, const char *srv)
 {
     const int v6 = family == AF_INET6;
     if (targets == NULL)
@@ -1218,6 +1239,17 @@ static int expand_route_targets_fam(const slist_t *targets, slist_t *out,
                     log_err("invalid CIDR route target '%s'", p);
                     free(t);
                     return -1;
+                }
+                uint8_t nb[4] = { (uint8_t)(net >> 24), (uint8_t)(net >> 16),
+                                  (uint8_t)(net >> 8), (uint8_t)net };
+                bool exact;
+                if (route_target_hits_server(AF_INET, nb, prefix, srv,
+                                             &exact)) {
+                    warn_srv_covered_target(p, exact);
+                    if (exact) {
+                        free(t);
+                        continue;
+                    }
                 }
                 push_unique(out, p);
             } else {
@@ -1253,11 +1285,29 @@ static int expand_route_targets_fam(const slist_t *targets, slist_t *out,
                     free(t);
                     return -1;
                 }
+                bool exact;
+                if (route_target_hits_server(AF_INET6,
+                                             (const uint8_t *)&a6,
+                                             (int)plen, srv, &exact)) {
+                    warn_srv_covered_target(p, exact);
+                    if (exact) {
+                        free(t);
+                        continue;
+                    }
+                }
                 push_unique(out, p);
             }
         } else if (!v6) {
             struct in_addr a4;
             if (inet_pton(AF_INET, p, &a4) == 1) {
+                bool exact;
+                if (route_target_hits_server(AF_INET,
+                                             (const uint8_t *)&a4, 32, srv,
+                                             &exact)) {
+                    warn_srv_covered_target(p, exact);
+                    free(t);
+                    continue;
+                }
                 char r32[64];
                 snprintf(r32, sizeof r32, "%s/32", p);
                 push_unique(out, r32);
@@ -1283,9 +1333,19 @@ static int expand_route_targets_fam(const slist_t *targets, slist_t *out,
                     return -1;
                 }
                 int found = 0;
+                int srv_dropped = 0;
                 for (struct addrinfo *ai = res; ai != NULL; ai = ai->ai_next) {
                     if (ai->ai_family != AF_INET)
                         continue;
+                    const uint8_t *ab = (const uint8_t *)
+                        &((const struct sockaddr_in *)ai->ai_addr)->sin_addr;
+                    bool exact;
+                    if (route_target_hits_server(AF_INET, ab, 32, srv,
+                                                 &exact)) {
+                        warn_srv_covered_target(p, exact);
+                        srv_dropped = 1;
+                        continue;
+                    }
                     char ip[INET_ADDRSTRLEN];
                     const struct sockaddr_in *sin =
                         (const struct sockaddr_in *)ai->ai_addr;
@@ -1297,6 +1357,13 @@ static int expand_route_targets_fam(const slist_t *targets, slist_t *out,
                 }
                 freeaddrinfo(res);
                 if (!found) {
+                    if (srv_dropped) {
+                        /* every address WAS the server: the target is
+                         * fully subsumed by the loop guard — the warning
+                         * above already fired, do not fail the run */
+                        free(t);
+                        continue;
+                    }
                     log_err("domain has no IPv4 address: %s", p);
                     free(t);
                     return -1;
@@ -1305,6 +1372,14 @@ static int expand_route_targets_fam(const slist_t *targets, slist_t *out,
         } else {
             struct in6_addr a6;
             if (inet_pton(AF_INET6, p, &a6) == 1) {
+                bool exact;
+                if (route_target_hits_server(AF_INET6,
+                                             (const uint8_t *)&a6, 128, srv,
+                                             &exact)) {
+                    warn_srv_covered_target(p, exact);
+                    free(t);
+                    continue;
+                }
                 char r128[64];
                 snprintf(r128, sizeof r128, "%s/128", p);
                 push_unique(out, r128);
@@ -1331,9 +1406,19 @@ static int expand_route_targets_fam(const slist_t *targets, slist_t *out,
                     return -1;
                 }
                 int found = 0;
+                int srv_dropped = 0;
                 for (struct addrinfo *ai = res; ai != NULL; ai = ai->ai_next) {
                     if (ai->ai_family != AF_INET6)
                         continue;
+                    const uint8_t *ab = (const uint8_t *)
+                        &((const struct sockaddr_in6 *)ai->ai_addr)->sin6_addr;
+                    bool exact;
+                    if (route_target_hits_server(AF_INET6, ab, 128, srv,
+                                                 &exact)) {
+                        warn_srv_covered_target(p, exact);
+                        srv_dropped = 1;
+                        continue;
+                    }
                     char ip[INET6_ADDRSTRLEN];
                     const struct sockaddr_in6 *s6 =
                         (const struct sockaddr_in6 *)ai->ai_addr;
@@ -1348,6 +1433,10 @@ static int expand_route_targets_fam(const slist_t *targets, slist_t *out,
                 }
                 freeaddrinfo(res);
                 if (!found) {
+                    if (srv_dropped) {
+                        free(t);
+                        continue;   /* subsumed by the loop guard (above) */
+                    }
                     log_err("domain has no IPv6 address: %s", p);
                     free(t);
                     return -1;
@@ -1359,14 +1448,16 @@ static int expand_route_targets_fam(const slist_t *targets, slist_t *out,
     return 0;
 }
 
-static int expand_route_targets(const slist_t *targets, slist_t *out)
+static int expand_route_targets(const slist_t *targets, slist_t *out,
+                                const char *srv)
 {
-    return expand_route_targets_fam(targets, out, AF_INET);
+    return expand_route_targets_fam(targets, out, AF_INET, srv);
 }
 
-static int expand_route_targets6(const slist_t *targets, slist_t *out)
+static int expand_route_targets6(const slist_t *targets, slist_t *out,
+                                 const char *srv)
 {
-    return expand_route_targets_fam(targets, out, AF_INET6);
+    return expand_route_targets_fam(targets, out, AF_INET6, srv);
 }
 
 static void teardown_routes(const char *tun, const char *tun_ip,
@@ -1404,13 +1495,13 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
 
     slist_t routes;
     slist_init(&routes);
-    if (expand_route_targets(route_targets, &routes) != 0) {
+    if (expand_route_targets(route_targets, &routes, server) != 0) {
         slist_free(&routes);
         return -1;
     }
     slist_t routes6;
     slist_init(&routes6);
-    if (expand_route_targets6(route_targets6, &routes6) != 0) {
+    if (expand_route_targets6(route_targets6, &routes6, server) != 0) {
         slist_free(&routes);
         slist_free(&routes6);
         return -1;
