@@ -533,6 +533,21 @@ target_link_libraries(iwan-client PRIVATE iwan_core)
 add_executable(iwan-client-oidc src/iwan_client_oidc.c)
 target_link_libraries(iwan-client-oidc PRIVATE iwan_oidc)
 
+# Windows service front-end (svc_win.c): reuses iwan_client.c verbatim —
+# IWAN_HEADLESS_SVC only renames its main() so the shell can drive the
+# same command paths from the SCM. Classic protocol only; see README
+# "Windows 服务" and the header comment of svc_win.c.
+if(WIN32)
+  option(IWAN_WIN_SVC "Build the Windows service front-end (iwan-winsvc)" ON)
+  if(IWAN_WIN_SVC)
+    add_executable(iwan-winsvc src/iwan_client.c src/common/svc_win.c)
+    target_include_directories(iwan-winsvc PRIVATE src/common)
+    target_compile_definitions(iwan-winsvc PRIVATE IWAN_HEADLESS_SVC
+                             IWAN_SVC_VERSION="${PROJECT_VERSION}")
+    target_link_libraries(iwan-winsvc PRIVATE iwan_core advapi32)
+  endif()
+endif()
+
 if(APPLE)
   # Keychain branch: SecItem* from Security, CF* helpers from CoreFoundation.
   # SHELL: keeps each "-framework X" as one argument and stops CMake from
@@ -625,9 +640,9 @@ if(IWAN_STRICT)
     # extras that produce these diagnostics; see the options block above.
     list(APPEND _iwan_strict_flags ${IWAN_STRICT_EXTRA_NOWERROR_FLAGS})
   endif()
-  foreach(_tgt iwan_core iwan_oidc iwan-client iwan-client-oidc iwan-server
-               socks_handshake_harness lwip_data_harness lwip_fairness_harness
-               relay_socks_harness)
+  foreach(_tgt iwan_core iwan_oidc iwan-client iwan-client-oidc iwan-winsvc
+               iwan-server socks_handshake_harness lwip_data_harness
+               lwip_fairness_harness relay_socks_harness)
     if(TARGET ${_tgt})
       target_compile_options(${_tgt} PRIVATE ${_iwan_strict_flags})
     endif()

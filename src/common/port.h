@@ -264,6 +264,12 @@ char *port_home_dir(void);
  * this layer. May be called once; later calls replace the handler. */
 int port_set_stop_handler(void (*fn)(int sig));
 
+/* Fire the currently registered stop handler from another thread
+ * (Windows service control handler -> the same path a console Ctrl+C
+ * takes; the service has no console). POSIX: no-op, signals arrive on
+ * their own. Safe before port_set_stop_handler: does nothing. */
+void port_raise_stop(void);
+
 /* Elevated/admin check: geteuid()==0 on POSIX, Administrators-group
  * membership on Windows (TUN + routing require it there). */
 bool port_is_admin(void);

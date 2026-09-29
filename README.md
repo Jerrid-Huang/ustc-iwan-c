@@ -151,6 +151,34 @@ Usage: iwan-client socks [OPTIONS] --server <SERVER>
 ./iwan-client auth --server <IP> --port 6001 --user <USER> --pass '<PASSWORD>'
 ```
 
+## iwan-winsvc（Windows 服务，classic 协议）
+
+`iwan-winsvc.exe` 与 `iwan-client.exe` 同一构建产物（Windows 构建默认开启，
+CMake 可用 `-DIWAN_WIN_SVC=OFF` 关闭）：**同一个镜像**，`--service` 前缀走服务
+管理，其余参数即 `iwan-client` 前台运行。服务以 LocalSystem 开机自启、无控制
+台，在会话 0 里驱动**完全相同**的 proxy/socks 命令路径。
+
+```bat
+:: 安装（管理员命令行；-- 之后是原样保存的客户端参数）
+iwan-winsvc --service install --start -- ^
+    proxy -c --server 1.2.3.4:6001 --config-dir C:\ProgramData\iwan
+iwan-winsvc --service status
+iwan-winsvc --service stop
+iwan-winsvc --service uninstall
+```
+
+- **仅限 classic 协议**（服务器地址 + 用户口令，凭据放 `--config-dir` 指定的
+  `servers.json`）。OIDC 登录需要浏览器与终端输入，且其凭据缓存是 DPAPI
+  **用户级**加密——服务（SYSTEM）在结构上无法完成，OIDC profile 请继续在用户
+  态登录运行。
+- 服务日志：`%PROGRAMDATA%\iwan\service.log`（启动时滚动为 `.old`），
+  `--log` 可改路径。停止走与控制台 Ctrl+C 相同的清理路径（撤销路由、恢复默认
+  路由）；崩溃则依赖既有兜底：tun 路由随适配器消失、残留路由启动时清扫。
+- 失败重启策略 10s/30s/60s（`--manual` 可改为手动启动）；wintun 安装/校验逻辑
+  对服务已免交互（缺 DLL 时直接报错并给出手动安装指引，不会挂起）。
+- 凭据目录若含明文口令，建议收紧 ACL：
+  `icacls C:\ProgramData\iwan /inheritance:r /grant "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F"`
+
 ## iwan-server（自建测试服务端，仅 Linux）
 
 用户文件每行 `username:password`，权限必须为 600：

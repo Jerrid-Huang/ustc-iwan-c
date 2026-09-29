@@ -348,6 +348,17 @@ int port_set_stop_handler(void (*fn)(int sig))
 #endif
 }
 
+void port_raise_stop(void)
+{
+#ifdef _WIN32
+    /* same call iwan_ctrl_handler makes for a console event; the SCM
+     * control handler thread of a session-0 service has no console, so
+     * this direct route is the only stop path it has */
+    if (g_stop_fn)
+        g_stop_fn(SIGINT);
+#endif
+}
+
 bool port_is_admin(void)
 {
 #ifdef _WIN32

@@ -34,6 +34,13 @@
 #include "tun.h"
 #include "util.h"
 
+#ifdef IWAN_HEADLESS_SVC
+/* the iwan-winsvc front-end (svc_win.c) owns main() for this target and
+ * calls the renamed entry below; no other code changes — the service is
+ * just another caller of the exact same command paths */
+#define main iwan_client_main
+#endif
+
 #define VERSION     "0.8.0"
 #define PING_BUF_SZ 64
 /* PING round-trip bound: udp_connect's recv timeout (ms). PING has no
