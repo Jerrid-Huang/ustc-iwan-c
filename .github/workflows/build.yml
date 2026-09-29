@@ -502,18 +502,17 @@ jobs:
 
       - name: Verify PE binaries (${{ matrix.arch }})
         run: |
-          file bin/iwan-client.exe bin/iwan-client-oidc.exe
-          if ! file bin/iwan-client.exe | grep -q '${{ matrix.pe }}'; then
-            echo "::error::bin/iwan-client.exe is not a ${{ matrix.pe }} binary"
-            exit 1
-          fi
-          if ! file bin/iwan-client-oidc.exe | grep -q '${{ matrix.pe }}'; then
-            echo "::error::bin/iwan-client-oidc.exe is not a ${{ matrix.pe }} binary"
-            exit 1
-          fi
           # static-link gate: the exes must not import OpenSSL or
-          # winpthread DLLs — they must run on a stock Windows
-          for b in bin/iwan-client.exe bin/iwan-client-oidc.exe; do
+          # winpthread DLLs — they must run on a stock Windows.
+          # iwan-winsvc.exe (service front-end) shares iwan_core with the
+          # classic client and is gated exactly the same way.
+          for b in bin/iwan-client.exe bin/iwan-client-oidc.exe \
+                   bin/iwan-winsvc.exe; do
+            file "$b"
+            if ! file "$b" | grep -q '${{ matrix.pe }}'; then
+              echo "::error::$b is not a ${{ matrix.pe }} binary"
+              exit 1
+            fi
             if objdump -p "$b" | grep -E 'DLL Name: .*(libssl|libcrypto|winpthread)'; then
               echo "::error::$b has a non-system DLL dependency"
               exit 1
@@ -533,6 +532,10 @@ jobs:
           ls -la bin/ >> /tmp/wine-smoke.log
           "$WINE_BIN" bin/iwan-client.exe --help 2>&1 | tee -a /tmp/wine-smoke.log
           "$WINE_BIN" bin/iwan-client-oidc.exe --help 2>&1 | tee -a /tmp/wine-smoke.log
+          "$WINE_BIN" bin/iwan-winsvc.exe --help 2>&1 | tee -a /tmp/wine-smoke.log
+          # the --service front-end must answer its own usage (rc 2 by
+          # design: no subcommand) without ever touching the SCM
+          "$WINE_BIN" bin/iwan-winsvc.exe --service 2>&1 | tee -a /tmp/wine-smoke.log || true
 
       - name: Show wine smoke failure details (annotations)
         if: failure()
@@ -591,6 +594,7 @@ jobs:
           path: |
             bin/iwan-client.exe
             bin/iwan-client-oidc.exe
+            bin/iwan-winsvc.exe
             build-${{ matrix.arch }}.log
           if-no-files-found: error
 
@@ -661,16 +665,15 @@ jobs:
 
       - name: Verify PE binaries (arm64)
         run: |
-          file bin/iwan-client.exe bin/iwan-client-oidc.exe
           # GNU file prints the arch as "Aarch64" (older) or "aarch64"
-          if ! file bin/iwan-client.exe | grep -qiE 'PE32\+.*(aarch64|arm64)'; then
-            echo "::error::bin/iwan-client.exe is not a PE32+ aarch64 binary"
-            exit 1
-          fi
-          if ! file bin/iwan-client-oidc.exe | grep -qiE 'PE32\+.*(aarch64|arm64)'; then
-            echo "::error::bin/iwan-client-oidc.exe is not a PE32+ aarch64 binary"
-            exit 1
-          fi
+          for b in bin/iwan-client.exe bin/iwan-client-oidc.exe \
+                   bin/iwan-winsvc.exe; do
+            file "$b"
+            if ! file "$b" | grep -qiE 'PE32\+.*(aarch64|arm64)'; then
+              echo "::error::$b is not a PE32+ aarch64 binary"
+              exit 1
+            fi
+          done
 
       - name: Upload artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -679,6 +682,7 @@ jobs:
           path: |
             bin/iwan-client.exe
             bin/iwan-client-oidc.exe
+            bin/iwan-winsvc.exe
             build-arm64.log
           if-no-files-found: error
 
