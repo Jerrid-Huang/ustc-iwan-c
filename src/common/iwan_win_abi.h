@@ -44,6 +44,15 @@ typedef int                int32_t;
 typedef unsigned int       uint32_t;
 typedef long long          int64_t;
 typedef unsigned long long uint64_t;
+
+/*
+ * 同理没有 offsetof：它是 <stddef.h> 的宏，内核包含路径里没有这个头。
+ * 用编译器内建的那套写法自己给一个；C11 允许同一宏重定义为相同展开，
+ * 所以万一将来某个 WDK 提供了它也不会冲突。size_t 由 WDK 自己提供。
+ */
+#  ifndef offsetof
+#    define offsetof(type, member) ((size_t)(ULONG_PTR)&(((type *)0)->member))
+#  endif
 #elif defined(IWAN_WIN_ABI_BARE)
 /* 裸模式：主机侧对拍测试（tests/win_frame_test.c）只要结构与常量，
  * 不引入 windows.h，这样同一份 ABI 能在 Linux 上编译检查。 */
