@@ -91,7 +91,6 @@ iwan_win_nbl_wrap(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		  _In_ ULONG len)
 {
 	NET_BUFFER_LIST *nbl = NULL;
-	NET_BUFFER *nb;
 	NTSTATUS st;
 
 	ctx->mdl = IoAllocateMdl(ctx->buf, len, FALSE, FALSE, NULL);
@@ -99,19 +98,17 @@ iwan_win_nbl_wrap(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		return STATUS_INSUFFICIENT_RESOURCES;
 	MmBuildMdlForNonPagedPool(ctx->mdl);
 
-	/* 池句柄由 iwan_win_wfp_init 预建：FwpsAllocateNetBufferAndNetBufferList0
-	 * 要的是池句柄，不是在栈上摆一份池参数 */
-	st = FwpsAllocateNetBufferAndNetBufferList(ext->nbl_pool, 0, 0, NULL, 0, 0,
-						   &nbl);
+	/* MDL 直接交给分配器，而不是事后再往 NET_BUFFER_FIRST_MDL 上塞：
+	 * NBL 从出生那一刻就是完整形态，不依赖“分配完再改内部字段”这种
+	 * 未文档化的用法。MDL 的所有权仍在调用者（ctx->mdl 由完成回调或
+	 * 失败路径 IoFreeMdl 释放），这里只是借给 NBL 描述数据。
+	 * 池句柄由 iwan_win_wfp_init 预建：FwpsAllocateNetBufferAndNetBufferList0
+	 * 要的是池句柄，不是在栈上摆一份池参数。 */
+	st = FwpsAllocateNetBufferAndNetBufferList(ext->nbl_pool, 0, 0, ctx->mdl,
+						   0, len, &nbl);
 	if (!NT_SUCCESS(st))
 		return st;
 
-	nb = NET_BUFFER_LIST_FIRST_NB(nbl);
-	NET_BUFFER_FIRST_MDL(nb) = ctx->mdl;
-	NET_BUFFER_DATA_OFFSET(nb) = 0;
-	NET_BUFFER_DATA_LENGTH(nb) = len;
-	NET_BUFFER_CURRENT_MDL(nb) = ctx->mdl;
-	NET_BUFFER_CURRENT_MDL_OFFSET(nb) = 0;
 	*out_nbl = nbl;
 	return STATUS_SUCCESS;
 }
@@ -208,6 +205,27 @@ fail:
 	return STATUS_INSUFFICIENT_RESOURCES;
 }
 
+/*
+ * 这个 NBL 是不是我们自己注入进去的？
+ *
+ * 注入不是“绕过协议栈”：注进去的包会重新走一遍同一层，于是又进我们的
+ * classify。认不出来就会二次封装（外层套外层），所以出向必须放行自己注入
+ * 的外层包、入向必须放行自己注入的内层包。用 WFP 自己的记账
+ * （FwpsQueryPacketInjectionState0）判断，而不是靠“目的地址不在目标集合里”
+ * 这种巧合。
+ */
+static BOOLEAN
+iwan_win_nbl_from_self(_In_ HANDLE handle, _In_ const NET_BUFFER_LIST *nbl)
+{
+	FWPS_PACKET_INJECTION_STATE st = FWPS_PACKET_NOT_INJECTED;
+
+	if (handle == NULL || nbl == NULL)
+		return FALSE;
+	FwpsQueryPacketInjectionState0(handle, nbl, &st);
+	return st == FWPS_PACKET_INJECTED_BY_SELF ||
+	       st == FWPS_PACKET_PREVIOUSLY_INJECTED_BY_SELF;
+}
+
 static VOID NTAPI
 iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 		       _In_ const FWPS_INCOMING_METADATA_VALUES *inMetaValues,
@@ -240,6 +258,11 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 	/* 快速路径：没有会话时一个 volatile 读就返回（Linux 侧同样先看开关） */
 	s = &ext->sess;
 	if (s->valid == 0 || s->inner_ip == 0)
+		return;
+
+	/* 自己注入的外层包：放行，绝不再封装一层 */
+	if (iwan_win_nbl_from_self(ext->inj_send4, nbl) ||
+	    iwan_win_nbl_from_self(ext->inj_send6, nbl))
 		return;
 
 	if (!ExAcquireRundownProtection(&ext->rundown))
@@ -545,6 +568,11 @@ iwan_win_inbound_worker(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 	s = &ext->sess;
 	if (s->valid == 0 || iwan_win_session_is_v6(s) != outer_v6)
 		return;
+
+	/* 自己注入的内层包：放行，让它正常往上交付 */
+	if (iwan_win_nbl_from_self(ext->inj_recv4, nbl) ||
+	    iwan_win_nbl_from_self(ext->inj_recv6, nbl))
+		return;
 	if (!ExAcquireRundownProtection(&ext->rundown))
 		return;
 	if (s->valid == 0)
@@ -728,6 +756,11 @@ iwan_win_classify_out6(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 	s = &ext->sess;
 	if (s->valid == 0)
 		return;
+
+	/* 自己注入的外层包：放行，绝不再封装一层 */
+	if (iwan_win_nbl_from_self(ext->inj_send4, nbl) ||
+	    iwan_win_nbl_from_self(ext->inj_send6, nbl))
+		return;
 	overhead = iwan_win_session_is_v6(s) ? IWAN_OUTER6_TOTAL
 					     : IWAN_OUTER4_TOTAL;
 
@@ -876,6 +909,10 @@ iwan_win_add_callout(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		return st;
 
 	RtlZeroMemory(&filter, sizeof(filter));
+	/* 过滤器也用 callout 的 GUID 做键：注销时按 key 删即可（filterKey 与
+	 * calloutKey 是两个独立命名空间，同一 GUID 不冲突），省掉保存
+	 * FwpmFilterAdd 回填 id 的那套状态。 */
+	filter.filterKey = *key;
 	filter.layerKey = *layer;
 	filter.displayData.name = (PWSTR)name;
 	filter.action.type = action;
@@ -918,8 +955,9 @@ iwan_win_wfp_init(_In_ PDEVICE_OBJECT devobj,
 		  _Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 {
 	FWPM_SESSION session;
-	GUID lyr_out4, lyr_in4, lyr_out6, lyr_in6;
 	NTSTATUS st;
+
+	ext->devobj = devobj;	/* callout 注册推迟到会话建立，那时要用它 */
 
 	RtlZeroMemory(&session, sizeof(session));
 	/* 动态会话：引擎句柄一关，本驱动加进去的 callout 与过滤器全部消失
@@ -969,57 +1007,102 @@ iwan_win_wfp_init(_In_ PDEVICE_OBJECT devobj,
 	if (!NT_SUCCESS(st))
 		return st;
 
-	/* 四个层的层键都在运行时向 BFE 要（见 iwan_win_layer_key 的注释） */
-	st = iwan_win_layer_key(ext, FWPS_LAYER_OUTBOUND_IPPACKET_V4, &lyr_out4);
-	if (!NT_SUCCESS(st))
-		return st;
-	st = iwan_win_layer_key(ext, FWPS_LAYER_INBOUND_IPPACKET_V4, &lyr_in4);
-	if (!NT_SUCCESS(st))
-		return st;
-	st = iwan_win_layer_key(ext, FWPS_LAYER_OUTBOUND_IPPACKET_V6, &lyr_out6);
-	if (!NT_SUCCESS(st))
-		return st;
-	st = iwan_win_layer_key(ext, FWPS_LAYER_INBOUND_IPPACKET_V6, &lyr_in6);
-	if (!NT_SUCCESS(st))
-		return st;
-
-	st = iwan_win_add_callout(ext, devobj, &IWAN_CALLOUT_OUT4,
-				  iwan_win_classify_out4,
-				  FWP_ACTION_CALLOUT_TERMINATING,
-				  &lyr_out4,
-				  L"iwan out4", &ext->callout_id_out4);
-	if (!NT_SUCCESS(st))
-		return st;
-	st = iwan_win_add_callout(ext, devobj, &IWAN_CALLOUT_IN4,
-				  iwan_win_classify_in4,
-				  FWP_ACTION_CALLOUT_TERMINATING,
-				  &lyr_in4,
-				  L"iwan in4", &ext->callout_id_in4);
-	if (!NT_SUCCESS(st))
-		return st;
-	st = iwan_win_add_callout(ext, devobj, &IWAN_CALLOUT_OUT6,
-				  iwan_win_classify_out6,
-				  FWP_ACTION_CALLOUT_TERMINATING,
-				  &lyr_out6,
-				  L"iwan out6", &ext->callout_id_out6);
-	if (!NT_SUCCESS(st))
-		return st;
-	st = iwan_win_add_callout(ext, devobj, &IWAN_CALLOUT_IN6,
-				  iwan_win_classify_in6,
-				  FWP_ACTION_CALLOUT_TERMINATING,
-				  &lyr_in6,
-				  L"iwan in6", &ext->callout_id_in6);
-	if (!NT_SUCCESS(st))
-		return st;
-
-	ext->wfp_ready = TRUE;
+	/* 到这里只是“工具就绪”：引擎、NBL 池、四个注入句柄都不会拦截任何
+	 * 报文。四个 callout 与过滤器由 iwan_win_wfp_start 在会话建立时装上
+	 * —— 于是 sc start 只验证“驱动能加载、设备能打开”。 */
+	InterlockedExchange(&ext->wfp_started, 0);
 	return STATUS_SUCCESS;
 }
 
-VOID
-iwan_win_wfp_fini(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
+/*
+ * 装上数据面：向 BFE 取四个层的层键，然后逐层注册 callout + 过滤器。
+ *
+ * 为什么不在 DriverEntry 里做：一注册就等于全机每一个出向/入向 IP 包都要
+ * 先过我们的 classify，而“能不能加载驱动”和“接管流量”应该分开验证。放到
+ * 这里之后，加载失败的排查范围只剩 DriverEntry 与控制面。
+ *
+ * 幂等：wfp_started 做一次性闸门，并发 OPEN 只有一个真正注册。
+ */
+NTSTATUS
+iwan_win_wfp_start(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 {
-	ULONG spin;
+	GUID lyr_out4, lyr_in4, lyr_out6, lyr_in6;
+	NTSTATUS st;
+
+	if (InterlockedCompareExchange(&ext->wfp_started, 1, 0) != 0)
+		return STATUS_SUCCESS;		/* 已装好，或有人正在装 */
+	if (ext->engine == NULL || ext->devobj == NULL) {
+		InterlockedExchange(&ext->wfp_started, 0);
+		return STATUS_INVALID_DEVICE_STATE;
+	}
+
+	/* 四个层的层键都在运行时向 BFE 要（见 iwan_win_layer_key 的注释） */
+	st = iwan_win_layer_key(ext, FWPS_LAYER_OUTBOUND_IPPACKET_V4, &lyr_out4);
+	if (NT_SUCCESS(st))
+		st = iwan_win_layer_key(ext, FWPS_LAYER_INBOUND_IPPACKET_V4,
+					&lyr_in4);
+	if (NT_SUCCESS(st))
+		st = iwan_win_layer_key(ext, FWPS_LAYER_OUTBOUND_IPPACKET_V6,
+					&lyr_out6);
+	if (NT_SUCCESS(st))
+		st = iwan_win_layer_key(ext, FWPS_LAYER_INBOUND_IPPACKET_V6,
+					&lyr_in6);
+
+	if (NT_SUCCESS(st))
+		st = iwan_win_add_callout(ext, ext->devobj, &IWAN_CALLOUT_OUT4,
+					  iwan_win_classify_out4,
+					  FWP_ACTION_CALLOUT_TERMINATING,
+					  &lyr_out4, L"iwan out4",
+					  &ext->callout_id_out4);
+	if (NT_SUCCESS(st))
+		st = iwan_win_add_callout(ext, ext->devobj, &IWAN_CALLOUT_IN4,
+					  iwan_win_classify_in4,
+					  FWP_ACTION_CALLOUT_TERMINATING,
+					  &lyr_in4, L"iwan in4",
+					  &ext->callout_id_in4);
+	if (NT_SUCCESS(st))
+		st = iwan_win_add_callout(ext, ext->devobj, &IWAN_CALLOUT_OUT6,
+					  iwan_win_classify_out6,
+					  FWP_ACTION_CALLOUT_TERMINATING,
+					  &lyr_out6, L"iwan out6",
+					  &ext->callout_id_out6);
+	if (NT_SUCCESS(st))
+		st = iwan_win_add_callout(ext, ext->devobj, &IWAN_CALLOUT_IN6,
+					  iwan_win_classify_in6,
+					  FWP_ACTION_CALLOUT_TERMINATING,
+					  &lyr_in6, L"iwan in6",
+					  &ext->callout_id_in6);
+	if (!NT_SUCCESS(st)) {
+		iwan_win_wfp_stop(ext);		/* 半个数据面比不装更危险 */
+		return st;
+	}
+
+	InterlockedExchange(&ext->wfp_started, 2);
+	return STATUS_SUCCESS;
+}
+
+/*
+ * 摘掉数据面。顺序不能颠倒：先删过滤器，再注销 callout —— 反过来会留下
+ * 引用“已注销 callout”的终止型过滤器，那是全机流量的黑洞（动作无法解析
+ * 时协议栈只能丢包），比根本不装还危险。
+ *
+ * 按 key 删而不是按 id 删：filterKey 在 iwan_win_add_callout 里显式设成了
+ * 每个 callout 自己的 GUID，因此不必再保存 FwpmFilterAdd 回填的 id。
+ * 调用方都在控制面串行路径上（IOCTL 或卸载），这里的闸门只防重复与重入。
+ */
+VOID
+iwan_win_wfp_stop(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
+{
+	if (InterlockedCompareExchange(&ext->wfp_started, 1, 2) != 2)
+		return;				/* 本来就没装，或有人正在装/摘 */
+
+	if (ext->engine != NULL) {
+		FwpmFilterDeleteByKey0(ext->engine, &IWAN_CALLOUT_OUT4);
+		FwpmFilterDeleteByKey0(ext->engine, &IWAN_CALLOUT_IN4);
+		FwpmFilterDeleteByKey0(ext->engine, &IWAN_CALLOUT_OUT6);
+		FwpmFilterDeleteByKey0(ext->engine, &IWAN_CALLOUT_IN6);
+	}
+
 	if (ext->callout_id_out4 != 0)
 		FwpsCalloutUnregisterById(ext->callout_id_out4);
 	if (ext->callout_id_in4 != 0)
@@ -1030,6 +1113,24 @@ iwan_win_wfp_fini(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 		FwpsCalloutUnregisterById(ext->callout_id_in6);
 	ext->callout_id_out4 = ext->callout_id_in4 = 0;
 	ext->callout_id_out6 = ext->callout_id_in6 = 0;
+
+	if (ext->engine != NULL) {
+		FwpmCalloutDeleteByKey0(ext->engine, &IWAN_CALLOUT_OUT4);
+		FwpmCalloutDeleteByKey0(ext->engine, &IWAN_CALLOUT_IN4);
+		FwpmCalloutDeleteByKey0(ext->engine, &IWAN_CALLOUT_OUT6);
+		FwpmCalloutDeleteByKey0(ext->engine, &IWAN_CALLOUT_IN6);
+	}
+
+	InterlockedExchange(&ext->wfp_started, 0);
+}
+
+
+VOID
+iwan_win_wfp_fini(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
+{
+	ULONG spin;
+
+	iwan_win_wfp_stop(ext);		/* 先停数据面（幂等） */
 
 	/* 排空在途注入：完成回调要归还 NBL 到池、释放报文缓冲。注销 callout
 	 * 已保证不再有新的注入进来，这里只等已发出的那批回完。有界等待后仍
@@ -1045,7 +1146,7 @@ iwan_win_wfp_fini(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 		DbgPrint("iwan-win: 仍有过期注入 %ld 个，保留注入句柄与 NBL 池不释放\n",
 			 ext->inject_outstanding);
 		ext->engine = NULL;
-		ext->wfp_ready = FALSE;
+		InterlockedExchange(&ext->wfp_started, 0);
 		return;
 	}
 
@@ -1068,5 +1169,5 @@ iwan_win_wfp_fini(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 		FwpmEngineClose(ext->engine);
 		ext->engine = NULL;
 	}
-	ext->wfp_ready = FALSE;
+	InterlockedExchange(&ext->wfp_started, 0);
 }

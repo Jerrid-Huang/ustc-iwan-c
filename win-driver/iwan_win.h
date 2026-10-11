@@ -22,6 +22,10 @@
  *   · 控制面要改会话状态时先 ExWaitForRundownProtectionRelease 把数据面排空，
  *     改完再 ExReInitializeRundownProtection 放行 —— 这样数据面永远不会看到
  *     正在被替换的 targets 指针，也不会有 use-after-free。
+ *   · 会话建立之前数据面根本不存在：callout 与过滤器由 IOCTL_OPEN 装上、
+ *     IOCTL_CLOSE 摘掉（iwan_win_wfp_start/stop）。所以 sc start 只验证
+ *     “驱动能加载、设备能打开”，接管流量是后面单独一步 —— 与 Linux 侧
+ *     “路由指向 iwan0 才碰得到出向报文”同一形式。
  */
 #ifndef IWAN_WIN_H
 #define IWAN_WIN_H
@@ -111,6 +115,10 @@ typedef struct _IWAN_WIN_SESSION {
 typedef struct _IWAN_WIN_DEVICE_EXTENSION {
 	IWAN_WIN_SESSION	sess;
 
+	/* 设备对象：callout 注册推迟到会话建立时做，那时手上只有 ext，
+	 * 所以入口把它存下来（FwpsCalloutRegister 需要它）。 */
+	PDEVICE_OBJECT		devobj;
+
 	KMUTEX			ctrl_mutex;	/* 控制面串行化（PASSIVE_LEVEL） */
 	EX_RUNDOWN_REF		rundown;	/* 数据面读者保护 */
 
@@ -129,7 +137,11 @@ typedef struct _IWAN_WIN_DEVICE_EXTENSION {
 	HANDLE			inj_send6;
 	HANDLE			inj_recv4;
 	HANDLE			inj_recv6;
-	BOOLEAN			wfp_ready;
+	/* 数据面是否已装上：0=未注册，1=正在装/正在摘，2=已注册。
+	 * 注册推迟到会话建立时，多个 OPEN 并发也只能注册一次，所以用
+	 * LONG + InterlockedCompareExchange 做闸门。数据面不看这个字段，
+	 * 它只看 sess.valid。 */
+	volatile LONG		wfp_started;
 } IWAN_WIN_DEVICE_EXTENSION;
 
 #define IWAN_DEVEXT(devobj) \
@@ -174,8 +186,13 @@ VOID iwan_win_session_mark_close(_Inout_ IWAN_WIN_SESSION *s);
 
 /* ---- WFP 数据面（iwan_win_wfp.c） ------------------------------------- */
 
+/* 准备工具：打开 BFE 引擎、建 NBL 池与四个注入句柄。这一步不拦截任何报文。 */
 NTSTATUS iwan_win_wfp_init(_In_ PDEVICE_OBJECT devobj,
 			   _Inout_ IWAN_WIN_DEVICE_EXTENSION *ext);
+/* 装上/摘掉数据面：四个层的 callout 与过滤器。start 幂等；由 IOCTL_OPEN
+ * 与 IOCTL_CLOSE 驱动，所以“加载驱动”与“接管流量”是两件可分开验证的事。 */
+NTSTATUS iwan_win_wfp_start(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext);
+VOID iwan_win_wfp_stop(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext);
 VOID iwan_win_wfp_fini(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext);
 
 #endif /* IWAN_WIN_H */

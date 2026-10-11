@@ -41,16 +41,29 @@ iwan_win_dispatch_ioctl(_In_ PDEVICE_OBJECT devobj, _Inout_ PIRP irp)
 			st = STATUS_BUFFER_TOO_SMALL;
 			break;
 		}
+		/* 会话建立之前先把数据面装上：装上之后才置 valid，第一个报文
+		 * 就不会漏。start 幂等，重复 OPEN 不会重复注册。 */
+		st = iwan_win_wfp_start(ext);
+		if (!NT_SUCCESS(st))
+			break;
 		st = iwan_win_session_open(ext,
 					   (const IWAN_WIN_SESSION_OPEN *)buf, in_len);
-		if (NT_SUCCESS(st)) {
-			iwan_win_session_info(ext, (IWAN_WIN_SESSION_INFO *)buf);
-			info = sizeof(IWAN_WIN_SESSION_INFO);
+		if (!NT_SUCCESS(st)) {
+			/* 装好了却没建成会话：只有在确实没有会话在跑时才摘掉。
+			 * 旧会话还在就摘，等于把正在用的隧道打断。 */
+			if (!ext->sess.valid)
+				iwan_win_wfp_stop(ext);
+			break;
 		}
+		iwan_win_session_info(ext, (IWAN_WIN_SESSION_INFO *)buf);
+		info = sizeof(IWAN_WIN_SESSION_INFO);
 		break;
 
 	case IOCTL_IWAN_SESSION_CLOSE:
 		st = iwan_win_session_close(ext);
+		/* 会话已经拆完，数据面没有存在理由：摘掉过滤器，让系统回到
+		 * “装了驱动但没跑隧道”的状态。 */
+		iwan_win_wfp_stop(ext);
 		break;
 
 	case IOCTL_IWAN_SESSION_GET:
