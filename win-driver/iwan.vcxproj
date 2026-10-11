@@ -42,6 +42,12 @@
   <PropertyGroup Label="Configuration">
     <ConfigurationType>Driver</ConfigurationType>
     <DriverType>WDM</DriverType>
+    <!-- 关掉工具集自带的测试签名：它调 signtool 时不带 /fd，现代 signtool 会报
+         "No file digest algorithm specified"，然后 RemoveUnsignedOutput 把刚链接
+         出来的 iwan.sys 和 iwan.pdb 一起删掉（上一轮就是这样：链接成功、产物却没有）。
+         签名是虚拟机侧的 vm-load.ps1 用 New-SelfSignedCertificate + Set-AuthenticodeSignature
+         做的，CI 只负责编译。 -->
+    <SignMode>Off</SignMode>
     <DriverTargetPlatform>Desktop</DriverTargetPlatform>
     <TargetVersion>Windows10</TargetVersion>
     <UseDebugLibraries Condition="'$(Configuration)'=='Debug'">true</UseDebugLibraries>
