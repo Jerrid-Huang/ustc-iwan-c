@@ -122,7 +122,7 @@ static const GUID iwan_win_devclass_guid = {
 NTSTATUS
 DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registry_path)
 {
-	UNICODE_STRING dev_name, dos_name;
+	UNICODE_STRING dev_name, dos_name, sddl;
 	PDEVICE_OBJECT devobj = NULL;
 	IWAN_WIN_DEVICE_EXTENSION *ext;
 	NTSTATUS st;
@@ -132,13 +132,15 @@ DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registry_path)
 	/* 默认 SDDL：只有 System 与 Administrators 能打开设备。用户态客户端
 	 * 需要管理员权限（对应 Linux 侧需要 root），这与 Linux 一致。
 	 *
-	 * 这里直接给字符串字面量：wdmsec.h 里的 SDDL_DEVOBJ_* 是 UNICODE_STRING
-	 * 常量，而 IoCreateDeviceSecure 要的是 PCWSTR（第一次真编译报 C2440）。 */
+	 * 注意 IoCreateDeviceSecure 的第 7 个参数是 PCUNICODE_STRING，不是 PCWSTR：
+	 * 所以既不能直接把字面量递进去（C4133），也不能把 wdmsec.h 里的
+	 * SDDL_DEVOBJ_* 宏结果再喂给 RtlInitUnicodeString（那个宏本身就是
+	 * UNICODE_STRING，C4024/C2440）。自己建一个最不含糊。 */
+	RtlInitUnicodeString(&sddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
 	RtlInitUnicodeString(&dev_name, IWAN_WIN_DEVICE_NAME);
 	st = IoCreateDeviceSecure(driver, sizeof(IWAN_WIN_DEVICE_EXTENSION),
 				  &dev_name, IWAN_WIN_DEVICE_TYPE,
-				  FILE_DEVICE_SECURE_OPEN, FALSE,
-				  L"D:P(A;;GA;;;SY)(A;;GA;;;BA)",
+				  FILE_DEVICE_SECURE_OPEN, FALSE, &sddl,
 				  &iwan_win_devclass_guid, &devobj);
 	if (!NT_SUCCESS(st))
 		return st;
