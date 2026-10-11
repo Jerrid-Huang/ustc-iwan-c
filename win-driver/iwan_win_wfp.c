@@ -63,11 +63,11 @@ typedef struct _IWAN_INJECT_CTX {
 
 static VOID NTAPI
 iwan_win_inject_complete(_In_ VOID *context, _Inout_ NET_BUFFER_LIST *nbl,
-			 _In_ ULONG flags)
+			 _In_ BOOLEAN dispatch_level)
 {
 	IWAN_INJECT_CTX *ctx = (IWAN_INJECT_CTX *)context;
 
-	UNREFERENCED_PARAMETER(flags);
+	UNREFERENCED_PARAMETER(dispatch_level);
 	if (nbl != NULL)
 		FwpsFreeNetBufferList(nbl);
 	if (ctx != NULL) {
@@ -424,13 +424,13 @@ iwan_win_inject_net_recv(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	}
 
 	InterlockedIncrement(&ext->inject_outstanding);
-	/* 参数表（10 个）：handle, context, flags, addressFamily, compartment,
-	 * interfaceIndex, subInterfaceIndex, nbl, complete, completeContext —— 少写
-	 * addressFamily 会让后面全部错位，而且错得"能编译过但行为诡异"的地方在
-	 * 于 IF_INDEX 与 COMPARTMENT_ID 同为整数。 */
-	st = FwpsInjectNetworkReceiveAsync(handle, NULL, 0,
-					   family == 6 ? AF_INET6 : AF_INET,
-					   compartment, (IF_INDEX)ifindex, 0, nbl,
+	/* 参数表就是 9 个：handle, context, flags, compartment, interfaceIndex,
+	 * subInterfaceIndex, nbl, complete, completeContext。
+	 * 上一次我"照文档补了个 addressFamily"其实是错的 —— 编译器把真原型
+	 * 打了出来（C2197），按它改回来才是对的：这个 API 没有地址族参数，
+	 * 地址族由注入句柄自己带（inj_recv4 / inj_recv6 分开注册）。 */
+	st = FwpsInjectNetworkReceiveAsync(handle, NULL, 0, compartment,
+					   (IF_INDEX)ifindex, 0, nbl,
 					   iwan_win_inject_complete, ctx);
 	if (!NT_SUCCESS(st)) {
 		InterlockedDecrement(&ext->inject_outstanding);
@@ -467,6 +467,18 @@ iwan_win_inbound_kind6(_In_ const IWAN_WIN_SESSION *s,
 		return IWAN_WIN_IN_DROP;
 	}
 }
+
+/* 前向声明：in4/in6 是薄封装，worker 的实体在它们后面（第一次真编译在这里
+ * 报"undefined; assuming extern returning int" + 重定义） */
+static VOID NTAPI
+iwan_win_inbound_worker(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
+			_In_ const FWPS_INCOMING_METADATA_VALUES *inMetaValues,
+			_Inout_opt_ void *layerData,
+			_In_opt_ const void *classifyContext,
+			_In_ const FWPS_FILTER *filter,
+			_In_ UINT64 flowContext,
+			_Inout_ FWPS_CLASSIFY_OUT *classifyOut,
+			_In_ BOOLEAN outer_v6);
 
 static VOID NTAPI
 iwan_win_classify_in4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
@@ -542,8 +554,6 @@ iwan_win_inbound_worker(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 		if (FWPS_IS_METADATA_FIELD_PRESENT(
 			    inMetaValues, FWPS_METADATA_FIELD_COMPARTMENT_ID))
 			compartment = (UINT16)inMetaValues->compartmentId;
-		if (inMetaValues->interfaceIndex != 0)
-			ifindex = (UINT32)inMetaValues->interfaceIndex;
 	}
 
 	/* 第一遍：整块判定。只要有一个包不是我们的（或超出批缓冲），
@@ -868,7 +878,9 @@ iwan_win_add_callout(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	filter.weight.type = FWP_EMPTY;		/* 由 BFE 自动分配权重 */
 	filter.numFilterConditions = 0;		/* 全部报文进 callout，由我们判断 */
 	filter.filterCondition = NULL;
-	filter.context = (UINT64)(ULONG_PTR)ext;
+	/* FWPM_FILTER0 里放用户上下文用的成员叫 rawContext；classify 回调
+	 * 通过 FWPS_FILTER0.context 读到的就是它（名字不一样，别想当然）。 */
+	filter.rawContext = (UINT64)(ULONG_PTR)ext;
 	return FwpmFilterAdd(ext->engine, &filter, NULL, NULL);
 }
 
@@ -899,9 +911,12 @@ iwan_win_wfp_init(_In_ PDEVICE_OBJECT devobj,
 			NDIS_SIZEOF_NET_BUFFER_LIST_POOL_PARAMETERS_REVISION_1;
 		pp.fAllocateNetBuffer = TRUE;
 		pp.PoolTag = IWAN_TAG_PKT;
-		st = NdisAllocateNetBufferListPool(NULL, &pp, &ext->nbl_pool);
-		if (!NT_SUCCESS(st))
-			return st;
+		/* 池句柄是**返回值**，不是出参：NdisAllocateNetBufferListPool(
+		 * NDIS_HANDLE, const NET_BUFFER_LIST_POOL_PARAMETERS *) -> NDIS_HANDLE。
+		 * 非 NDIS 驱动第一个参数传 NULL。 */
+		ext->nbl_pool = NdisAllocateNetBufferListPool(NULL, &pp);
+		if (ext->nbl_pool == NULL)
+			return STATUS_INSUFFICIENT_RESOURCES;
 	}
 
 	st = FwpsInjectionHandleCreate(AF_INET, FWPS_INJECTION_TYPE_NETWORK,

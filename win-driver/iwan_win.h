@@ -26,7 +26,10 @@
 #ifndef IWAN_WIN_H
 #define IWAN_WIN_H
 
-#include <ntddk.h>
+/* ntifs.h 而不是 ntddk.h：KeStackAttachProcess / KAPC_STATE 只在那里声明
+ * （解除用户态共享内存映射时必须切到属主进程的地址空间）。ntifs.h 是
+ * ntddk/wdm 的超集，WDK 文档也要求"需要这些 API 时用它替代 ntddk.h"。 */
+#include <ntifs.h>
 #include <wdm.h>
 #include <wdmsec.h>		/* IoCreateDeviceSecure */
 #include <ndis.h>		/* NdisGetDataBuffer 与 NET_BUFFER_* 宏 */

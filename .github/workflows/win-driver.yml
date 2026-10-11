@@ -94,6 +94,33 @@ jobs:
           & $cl.FullName @clArgs 2>&1 | Tee-Object -FilePath cl-syntax.log
           "cl 退出码=$LASTEXITCODE"
 
+      # 把我不确定的 API 原型/结构成员直接从 WDK 头里打出来：猜签名是上一次
+      # 反复出错的原因（FwpsInjectNetworkReceiveAsync0 我上一次"修"错了方向）。
+      - name: 查 WDK 头里的原型与结构成员
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $h = "$env:WDKINC\km"
+          $log = "$env:GITHUB_WORKSPACE\api-probe.log"
+          function P($title, $file, $pattern, $after) {
+            "`n=== $title ===" | Tee-Object -FilePath $log -Append
+            if (Test-Path $file) {
+              Select-String -Path $file -Pattern $pattern -Context 0, $after |
+                Select-Object -First 3 | Out-String -Width 240 |
+                Tee-Object -FilePath $log -Append
+            } else { "缺文件 $file" | Tee-Object -FilePath $log -Append }
+          }
+          P 'FWPS_INJECT_COMPLETE0 定义' "$h\fwpsk.h" 'typedef.*FWPS_INJECT_COMPLETE0' 3
+          P 'FwpsInjectNetworkReceiveAsync0 原型' "$h\fwpsk.h" 'FwpsInjectNetworkReceiveAsync0' 12
+          P 'FWPS_INCOMING_METADATA_VALUES0 的索引/接口成员' "$h\fwpsk.h" 'incomingInterfaceIndex|interfaceIndex|subInterfaceIndex' 1
+          P 'FWPM_FILTER0 的上下文成员' "$h\fwpmk.h" 'rawContext|providerContextKey' 2
+          P 'NdisAllocateNetBufferListPool 原型' "$h\ndis.h" 'NdisAllocateNetBufferListPool\(' 6
+          P 'NET_BUFFER_LIST_POOL_PARAMETERS 定义' "$h\ndis\nbl.h" 'typedef struct _NET_BUFFER_LIST_POOL_PARAMETERS' 12
+          "`n=== 哪个头声明 KeStackAttachProcess ===" | Tee-Object -FilePath $log -Append
+          Get-ChildItem $h -Filter '*.h' | ForEach-Object {
+            if (Select-String -Path $_.FullName -Pattern 'KeStackAttachProcess' -Quiet) { $_.Name }
+          } | Tee-Object -FilePath $log -Append
+
       # 先只编译：/t:ClCompile 不链接、不校验 INF，即使后面两步有问题也能拿到
       # 完整的 C 侧诊断（上一轮就是被 InfVerif 挡在编译之前，白等一轮）。
       - name: msbuild 只编译（不链接）
