@@ -127,26 +127,43 @@ jobs:
         shell: pwsh
         run: |
           $log = "$env:GITHUB_WORKSPACE\lib-probe.log"
-          $km = Join-Path (Split-Path $env:WDKINC -Parent) "Lib\10.0.26100.0\km\x64"
-          $um = Join-Path (Split-Path $env:WDKINC -Parent) "Lib\10.0.26100.0\um\x64"
-          "WDK km 库目录: $km" | Tee-Object -FilePath $log
-          if (Test-Path $km) {
-            "`n=== km\x64 下所有 .lib ===" | Tee-Object -FilePath $log -Append
+          $kits = Split-Path (Split-Path $env:WDKINC -Parent) -Parent   # ...\Windows Kits\10
+          # Lib 与 Include 是兄弟目录；上次把 Lib 拼到 Include 下面，于是每节都是空的
+          $dirs = @()
+          $dirs += Join-Path $kits "Lib\10.0.26100.0\km\x64"
+          $dirs += Join-Path $kits "Lib\10.0.26100.0\um\x64"
+          $dirs += (Get-ChildItem (Join-Path $kits 'Lib') -Directory -ErrorAction SilentlyContinue |
+                    Sort-Object { [version]$_.Name } | Select-Object -Last 1 |
+                    ForEach-Object { Join-Path $_.FullName 'km\x64' })
+          "WDKINC=$env:WDKINC" | Tee-Object -FilePath $log
+          foreach ($d in ($dirs | Select-Object -Unique)) {
+            "候选库目录: $d 存在=$(Test-Path $d)" | Tee-Object -FilePath $log -Append
+          }
+          $km = $dirs | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if ($km) {
+            "`n=== $km 下的 .lib ===" | Tee-Object -FilePath $log -Append
             (Get-ChildItem $km -Filter *.lib | Select-Object -ExpandProperty Name) -join ', ' |
               Tee-Object -FilePath $log -Append
           }
           foreach ($sym in @('FWPM_LAYER_OUTBOUND_IPPACKET_V4','FWPM_LAYER_INBOUND_IPPACKET_V4',
-                             'FwpmEngineOpen0','FwpsCalloutRegister0','NdisAllocateNetBufferListPool')) {
-            "`n=== $sym ===" | Tee-Object -FilePath $log -Append
-            foreach ($d in @($km, $um)) {
-              if (Test-Path $d) {
-                $hit = & cmd.exe /c "findstr /m /c:$sym `"$d\*.lib`"" 2>$null
-                if ($hit) { $hit | ForEach-Object { "  " + (Split-Path $_ -Leaf) } |
-                  Tee-Object -FilePath $log -Append }
-                else { "  ($d 里没有)" | Tee-Object -FilePath $log -Append }
-              }
+                             'FwpmEngineOpen0','FwpsCalloutRegister0')) {
+            "`n=== $sym 出现在 ===" | Tee-Object -FilePath $log -Append
+            $found = $false
+            foreach ($d in ($dirs | Select-Object -Unique)) {
+              if (-not (Test-Path $d)) { continue }
+              $hit = & cmd.exe /c "findstr /m /c:$sym `"$d\*.lib`"" 2>$null
+              if ($hit) { $found = $true; $hit | ForEach-Object { "  " + (Split-Path $_ -Leaf) } |
+                Tee-Object -FilePath $log -Append }
+            }
+            if (-not $found) {
+              "  以上目录都没有，改为在整个 Lib 树下找（慢）" | Tee-Object -FilePath $log -Append
+              & cmd.exe /c "findstr /s /m /c:$sym `"$kits\Lib\*.lib`"" 2>$null |
+                ForEach-Object { "  " + (Split-Path $_ -Leaf) } | Tee-Object -FilePath $log -Append
             }
           }
+          "`n=== fwpmk.h 里这几个 GUID 是怎么声明的 ===" | Tee-Object -FilePath $log -Append
+          Select-String -Path "$env:WDKINC\km\fwpmk.h" -Pattern 'FWPM_LAYER_OUTBOUND_IPPACKET_V4' -Context 1,1 |
+            Select-Object -First 4 | Out-String -Width 200 | Tee-Object -FilePath $log -Append
 
       # 先只编译：/t:ClCompile 不链接、不校验 INF，即使后面两步有问题也能拿到
       # 完整的 C 侧诊断（上一轮就是被 InfVerif 挡在编译之前，白等一轮）。
