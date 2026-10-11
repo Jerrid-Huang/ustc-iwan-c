@@ -78,7 +78,7 @@
       <ExceptionHandling>false</ExceptionHandling>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>fwpkclnt.lib;ndis.lib;wdmsec.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>fwpkclnt.lib;fwpuclnt.lib;ndis.lib;wdmsec.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <!-- 入口与 Linux 一致：DriverEntry；INF 里的服务名是 iwan -->
       <EntryPointSymbol>DriverEntry</EntryPointSymbol>
     </Link>
