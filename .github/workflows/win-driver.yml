@@ -121,6 +121,33 @@ jobs:
             if (Select-String -Path $_.FullName -Pattern 'KeStackAttachProcess' -Quiet) { $_.Name }
           } | Tee-Object -FilePath $log -Append
 
+      # 链接期缺符号时，直接问"这个符号到底在哪个 .lib 里"——猜库名等于猜签名。
+      - name: 查符号落在哪个 .lib
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $log = "$env:GITHUB_WORKSPACE\lib-probe.log"
+          $km = Join-Path (Split-Path $env:WDKINC -Parent) "Lib\10.0.26100.0\km\x64"
+          $um = Join-Path (Split-Path $env:WDKINC -Parent) "Lib\10.0.26100.0\um\x64"
+          "WDK km 库目录: $km" | Tee-Object -FilePath $log
+          if (Test-Path $km) {
+            "`n=== km\x64 下所有 .lib ===" | Tee-Object -FilePath $log -Append
+            (Get-ChildItem $km -Filter *.lib | Select-Object -ExpandProperty Name) -join ', ' |
+              Tee-Object -FilePath $log -Append
+          }
+          foreach ($sym in @('FWPM_LAYER_OUTBOUND_IPPACKET_V4','FWPM_LAYER_INBOUND_IPPACKET_V4',
+                             'FwpmEngineOpen0','FwpsCalloutRegister0','NdisAllocateNetBufferListPool')) {
+            "`n=== $sym ===" | Tee-Object -FilePath $log -Append
+            foreach ($d in @($km, $um)) {
+              if (Test-Path $d) {
+                $hit = & cmd.exe /c "findstr /m /c:$sym `"$d\*.lib`"" 2>$null
+                if ($hit) { $hit | ForEach-Object { "  " + (Split-Path $_ -Leaf) } |
+                  Tee-Object -FilePath $log -Append }
+                else { "  ($d 里没有)" | Tee-Object -FilePath $log -Append }
+              }
+            }
+          }
+
       # 先只编译：/t:ClCompile 不链接、不校验 INF，即使后面两步有问题也能拿到
       # 完整的 C 侧诊断（上一轮就是被 InfVerif 挡在编译之前，白等一轮）。
       - name: msbuild 只编译（不链接）
