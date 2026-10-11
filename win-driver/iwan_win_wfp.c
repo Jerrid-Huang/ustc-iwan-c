@@ -119,6 +119,23 @@ iwan_win_nbl_wrap(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
  * 绝不改动协议栈正在用的缓冲（Linux 侧是独占 skb 才原地改）。
  */
 /*
+ * 临时诊断：把“失败在哪一步、真实 NTSTATUS、compartment”带出内核。
+ * 借两个纯出向路径上恒为 0 的入向计数器（rx_reasm / rx_batch_skip），
+ * 这样不用内核调试器也能从用户态统计里读到原因：
+ *   rx_reasm      = 阶段：0 分配之前、1 外层 v6 头、2 外层 v4 头、
+ *                   3 NBL 分配、4 注入
+ *   rx_batch_skip = 低 32 位真实 NTSTATUS，高 32 位 compartment
+ * 定位完成即撤。
+ */
+#define IWAN_DIAG_FAIL(_ext, _stage, _st, _comp)			\
+	do {								\
+		(_ext)->sess.stats.rx_reasm = (UINT64)(_stage);		\
+		(_ext)->sess.stats.rx_batch_skip =			\
+			(UINT64)(UINT32)(_st) |				\
+			((UINT64)(UINT32)(_comp) << 32);		\
+	} while (0)
+
+/*
  * 出向封装 + 注入。外层用 v4 还是 v6 由**会话**决定（outer_v6），与内层版本
  * 无关 —— 这一点照 Linux 侧：内层版本由 iwan_inner_hdr_check() 判，外层版本
  * 由承载网卡决定，所以 v6-in-v4 与 v4-in-v6 都成立。
@@ -140,15 +157,20 @@ iwan_win_encap_inject(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	ULONG flen = IWAN_FRAME_HDR_LEN + inner_len;
 	NTSTATUS st;
 
-	if (inner_len == 0 || total > 0xFFFF)
+	if (inner_len == 0 || total > 0xFFFF) {
+		IWAN_DIAG_FAIL(ext, 0, STATUS_INVALID_BUFFER_SIZE, compartment);
 		return STATUS_INVALID_BUFFER_SIZE;
+	}
 
 	ctx = (IWAN_INJECT_CTX *)IWAN_ALLOC(sizeof(*ctx), IWAN_TAG_PKT);
-	if (ctx == NULL)
+	if (ctx == NULL) {
+		IWAN_DIAG_FAIL(ext, 0, STATUS_INSUFFICIENT_RESOURCES, compartment);
 		return STATUS_INSUFFICIENT_RESOURCES;
+	}
 
 	buf = (UINT8 *)IWAN_ALLOC(total, IWAN_TAG_PKT);
 	if (buf == NULL) {
+		IWAN_DIAG_FAIL(ext, 0, STATUS_INSUFFICIENT_RESOURCES, compartment);
 		ExFreePoolWithTag(ctx, IWAN_TAG_PKT);
 		return STATUS_INSUFFICIENT_RESOURCES;
 	}
@@ -169,18 +191,24 @@ iwan_win_encap_inject(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	if (outer_v6) {
 		if (iwan_win_outer_hdr6(buf, total, flen, s->outer_src6,
 					s->outer_dst6, s->sport,
-					s->dport) != total)
+					s->dport) != total) {
+			IWAN_DIAG_FAIL(ext, 1, 0, compartment);
 			goto fail;
+		}
 	} else {
 		if (iwan_win_outer_hdr4(buf, total, flen, s->outer_src,
 					s->outer_dst, s->sport,
-					s->dport) != total)
+					s->dport) != total) {
+			IWAN_DIAG_FAIL(ext, 2, 0, compartment);
 			goto fail;
+		}
 	}
 
 	st = iwan_win_nbl_wrap(ext, ctx, &nbl, total);
-	if (!NT_SUCCESS(st))
+	if (!NT_SUCCESS(st)) {
+		IWAN_DIAG_FAIL(ext, 3, st, compartment);
 		goto fail;
+	}
 
 	/* 在途注入计数：注销/卸载时必须等它归零，才谈得上销毁注入句柄与池 */
 	InterlockedIncrement(&ext->inject_outstanding);
@@ -189,6 +217,7 @@ iwan_win_encap_inject(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 					iwan_win_inject_complete, ctx);
 	if (!NT_SUCCESS(st)) {
 		/* 注入失败：注入所有权没有转移，自己收回 */
+		IWAN_DIAG_FAIL(ext, 4, st, compartment);
 		InterlockedDecrement(&ext->inject_outstanding);
 		FwpsFreeNetBufferList(nbl);
 		goto fail;
