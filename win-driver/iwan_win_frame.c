@@ -375,7 +375,11 @@ iwan_win_outer_hdr4(_Out_writes_bytes_(bufsz) UINT8 *buf, _In_ ULONG bufsz,
 		    _In_ ULONG flen, _In_ UINT32 src_be, _In_ UINT32 dst_be,
 		    _In_ USHORT sport, _In_ USHORT dport)
 {
-	ULONG total = IWAN_OUTER4_TOTAL + flen;
+	/* flen 是整帧长度（含 8 字节帧头），而 IWAN_OUTER4_TOTAL 已经把帧头
+	 * 算进“封装总开销”里了：真实包长 = 帧起始偏移 + flen，也就是
+	 * IWAN_OUTER4_TOTAL - IWAN_FRAME_HDR_LEN + flen。不减这一个帧头长度，外层 IP
+	 * 就会声称比实际多 8 字节，接收侧照声明长度取到的尾部是垃圾。 */
+	ULONG total = IWAN_OUTER4_TOTAL - IWAN_FRAME_HDR_LEN + flen;
 	ULONG ulen = IWAN_OUTER_UDP_LEN + flen;
 	ULONG sum;
 
@@ -436,7 +440,11 @@ iwan_win_outer_hdr6(_Out_writes_bytes_(bufsz) UINT8 *buf, _In_ ULONG bufsz,
 		    _In_reads_bytes_(16) const UINT8 *dst6, _In_ USHORT sport,
 		    _In_ USHORT dport)
 {
-	ULONG total = IWAN_OUTER6_TOTAL + flen;
+	/* flen 是整帧长度（含 8 字节帧头），而 IWAN_OUTER6_TOTAL 已经把帧头
+	 * 算进“封装总开销”里了：真实包长 = 帧起始偏移 + flen，也就是
+	 * IWAN_OUTER6_TOTAL - IWAN_FRAME_HDR_LEN + flen。不减这一个帧头长度，外层 IP
+	 * 就会声称比实际多 8 字节，接收侧照声明长度取到的尾部是垃圾。 */
+	ULONG total = IWAN_OUTER6_TOTAL - IWAN_FRAME_HDR_LEN + flen;
 	ULONG ulen = IWAN_OUTER_UDP_LEN + flen;
 	ULONG sum;
 
