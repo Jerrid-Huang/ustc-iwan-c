@@ -9,6 +9,14 @@
 ;   rundll32 setupapi.dll,InstallHinfSection DefaultInstall 132 .\iwan.inf
 ; 卸载：
 ;   rundll32 setupapi.dll,InstallHinfSection DefaultUninstall 132 .\iwan.inf
+;
+; 注意：本文件**不参与驱动编译**（iwan.vcxproj 里没有 <Inf> 项）。原因是 WDK 的
+; InfVerif 按设计拒绝 [DefaultInstall] 形式的 primitive 驱动 INF（1420/1421/1423），
+; 而这类 INF 恰恰是非 PnP 内核服务的正统写法。实际安装走 install.ps1 的 sc.exe
+; 路径（见 README），INF 是给"想用 setupapi/pnputil 装"的人留的备选材料。
+;
+; 架构装饰（.NTamd64 / .NTx86）是 InfVerif 的硬要求，两个架构都写全 —— 驱动本身
+; 在 x64 与 x86 上都能编。
 
 [Version]
 Signature   = "$Windows NT$"
@@ -22,10 +30,22 @@ PnpLockdown = 1
 [DestinationDirs]
 DefaultDestDir = 12
 
-[DefaultInstall]
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+iwan.sys = 1,,
+
+[DefaultInstall.NTamd64]
 CopyFiles = @iwan.sys
 
-[DefaultInstall.Services]
+[DefaultInstall.NTamd64.Services]
+AddService = iwan,2,iwan_Service
+
+[DefaultInstall.NTx86]
+CopyFiles = @iwan.sys
+
+[DefaultInstall.NTx86.Services]
 AddService = iwan,2,iwan_Service
 
 [iwan_Service]
@@ -36,13 +56,20 @@ StartType      = 3
 ErrorControl   = 1
 ServiceBinary  = %12%\iwan.sys
 
-[DefaultUninstall]
+[DefaultUninstall.NTamd64]
 DelFiles = @iwan.sys
 
-[DefaultUninstall.Services]
+[DefaultUninstall.NTamd64.Services]
+DelService = iwan,0x200
+
+[DefaultUninstall.NTx86]
+DelFiles = @iwan.sys
+
+[DefaultUninstall.NTx86.Services]
 DelService = iwan,0x200
 
 [Strings]
 ProviderName = "iWAN"
+DiskName     = "iWAN kernel data plane"
 ServiceName  = "iWAN kernel data plane (WFP callout)"
 ServiceDesc  = "把 iWAN 数据面放进内核：WFP callout 出向封装、入向解封，报文不进用户态。"

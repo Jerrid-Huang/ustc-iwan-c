@@ -98,9 +98,12 @@
     <ClInclude Include="iwan_win_frame.h" />
     <ClInclude Include="..\src\common\iwan_win_abi.h" />
   </ItemGroup>
-  <ItemGroup>
-    <Inf Include="iwan.inf" />
-  </ItemGroup>
+  <!--
+    这里**故意**没有 <Inf Include="iwan.inf" />：加进来就会触发 WDK 的 InfVerif，
+    而它按设计拒绝 [DefaultInstall] 形式的 primitive 驱动 INF（错误 1420/1421/1423），
+    这类 INF 恰恰是非 PnP 内核服务的正统写法。安装走 install.ps1 的 sc.exe 路径，
+    INF 只作为备选部署材料留在仓库里（已补齐架构装饰与 SourceDisksFiles）。
+  -->
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

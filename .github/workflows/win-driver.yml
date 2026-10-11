@@ -88,11 +88,24 @@ jobs:
                   Where-Object { Test-Path $_ } | ForEach-Object { "/I$_" }
           $clArgs = @('/nologo', '/kernel', '/c', '/Zs', '/std:c11', '/W4', '/WX-',
                     '/Iwin-driver', '/Isrc\common') + $incs +
-                  @('/DNDIS630') +
+                  @('/DNDIS630', '/D_AMD64_') +
                   @('win-driver\iwan_win_drv.c', 'win-driver\iwan_win_session.c',
                     'win-driver\iwan_win_wfp.c', 'win-driver\iwan_win_frame.c')
           & $cl.FullName @clArgs 2>&1 | Tee-Object -FilePath cl-syntax.log
           "cl 退出码=$LASTEXITCODE"
+
+      # 先只编译：/t:ClCompile 不链接、不校验 INF，即使后面两步有问题也能拿到
+      # 完整的 C 侧诊断（上一轮就是被 InfVerif 挡在编译之前，白等一轮）。
+      - name: msbuild 只编译（不链接）
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & $env:MSBUILD 'win-driver\iwan.vcxproj' /nologo /v:normal /t:ClCompile `
+              /p:Configuration=Release /p:Platform=x64 `
+              "/p:SolutionDir=$env:GITHUB_WORKSPACE\" `
+              "/p:OutDir=$env:GITHUB_WORKSPACE\build\x64\Release\" 2>&1 |
+              Tee-Object -FilePath cl-build.log
+          "ClCompile 退出码=$LASTEXITCODE"
 
       - name: msbuild 驱动
         continue-on-error: true
