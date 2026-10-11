@@ -554,6 +554,12 @@ iwan_win_inbound_worker(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 		if (FWPS_IS_METADATA_FIELD_PRESENT(
 			    inMetaValues, FWPS_METADATA_FIELD_COMPARTMENT_ID))
 			compartment = (UINT16)inMetaValues->compartmentId;
+		/* 入向注入要"这个包是从哪张网卡收到的"，对应元数据里真实存在的
+		 * sourceInterfaceIndex（探测步骤从 fwpsk.h 打出来的名字；我原先写的
+		 * interfaceIndex 根本不是成员）。取不到就留 0，让协议栈按目的地址
+		 * 自己路由 —— 内层包是投给本机的，不影响可达性。 */
+		if (inMetaValues->sourceInterfaceIndex != 0)
+			ifindex = (UINT32)inMetaValues->sourceInterfaceIndex;
 	}
 
 	/* 第一遍：整块判定。只要有一个包不是我们的（或超出批缓冲），
@@ -705,7 +711,6 @@ iwan_win_classify_out6(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 	ULONG overhead;
 	BOOLEAN all_ours = TRUE, overflow = FALSE;
 	UINT32 kinds[IWAN_WIN_MAX_BATCH];
-	ULONG lens[IWAN_WIN_MAX_BATCH];
 	ULONG n = 0;
 
 	UNREFERENCED_PARAMETER(inFixedValues);
