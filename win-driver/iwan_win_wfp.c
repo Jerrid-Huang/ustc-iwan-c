@@ -889,11 +889,36 @@ iwan_win_add_callout(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	return FwpmFilterAdd(ext->engine, &filter, NULL, NULL);
 }
 
+/*
+ * 取某个内建层的层键（layerKey）。
+ *
+ * 为什么不直接引用 FWPM_LAYER_OUTBOUND_IPPACKET_V4 这些现成符号：它们在 WDK 的
+ * km 库里没有定义 —— 链接期报 4 个 unresolved external，fwpkclnt.lib、
+ * fwpuclnt.lib、netio.lib 试过都没有。层 ID 是 fwpsk.h 里的枚举常量
+ * （FWPS_BUILTIN_LAYERS），不需要任何库；FwpmLayerGetById0 返回的 layerKey
+ * 正是过滤器与 callout 要的那个 GUID。这样链接期不再依赖"哪个库导出了层 GUID"。
+ */
+static NTSTATUS
+iwan_win_layer_key(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext, _In_ UINT16 layer_id,
+		   _Out_ GUID *out)
+{
+	FWPM_LAYER *layer = NULL;
+	NTSTATUS st;
+
+	st = FwpmLayerGetById0(ext->engine, layer_id, &layer);
+	if (!NT_SUCCESS(st))
+		return st;
+	*out = layer->layerKey;
+	FwpmFreeMemory0((void **)&layer);
+	return STATUS_SUCCESS;
+}
+
 NTSTATUS
 iwan_win_wfp_init(_In_ PDEVICE_OBJECT devobj,
 		  _Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 {
 	FWPM_SESSION session;
+	GUID lyr_out4, lyr_in4, lyr_out6, lyr_in6;
 	NTSTATUS st;
 
 	RtlZeroMemory(&session, sizeof(session));
@@ -944,31 +969,45 @@ iwan_win_wfp_init(_In_ PDEVICE_OBJECT devobj,
 	if (!NT_SUCCESS(st))
 		return st;
 
+	/* 四个层的层键都在运行时向 BFE 要（见 iwan_win_layer_key 的注释） */
+	st = iwan_win_layer_key(ext, FWPS_LAYER_OUTBOUND_IPPACKET_V4, &lyr_out4);
+	if (!NT_SUCCESS(st))
+		return st;
+	st = iwan_win_layer_key(ext, FWPS_LAYER_INBOUND_IPPACKET_V4, &lyr_in4);
+	if (!NT_SUCCESS(st))
+		return st;
+	st = iwan_win_layer_key(ext, FWPS_LAYER_OUTBOUND_IPPACKET_V6, &lyr_out6);
+	if (!NT_SUCCESS(st))
+		return st;
+	st = iwan_win_layer_key(ext, FWPS_LAYER_INBOUND_IPPACKET_V6, &lyr_in6);
+	if (!NT_SUCCESS(st))
+		return st;
+
 	st = iwan_win_add_callout(ext, devobj, &IWAN_CALLOUT_OUT4,
 				  iwan_win_classify_out4,
 				  FWP_ACTION_CALLOUT_TERMINATING,
-				  &FWPM_LAYER_OUTBOUND_IPPACKET_V4,
+				  &lyr_out4,
 				  L"iwan out4", &ext->callout_id_out4);
 	if (!NT_SUCCESS(st))
 		return st;
 	st = iwan_win_add_callout(ext, devobj, &IWAN_CALLOUT_IN4,
 				  iwan_win_classify_in4,
 				  FWP_ACTION_CALLOUT_TERMINATING,
-				  &FWPM_LAYER_INBOUND_IPPACKET_V4,
+				  &lyr_in4,
 				  L"iwan in4", &ext->callout_id_in4);
 	if (!NT_SUCCESS(st))
 		return st;
 	st = iwan_win_add_callout(ext, devobj, &IWAN_CALLOUT_OUT6,
 				  iwan_win_classify_out6,
 				  FWP_ACTION_CALLOUT_TERMINATING,
-				  &FWPM_LAYER_OUTBOUND_IPPACKET_V6,
+				  &lyr_out6,
 				  L"iwan out6", &ext->callout_id_out6);
 	if (!NT_SUCCESS(st))
 		return st;
 	st = iwan_win_add_callout(ext, devobj, &IWAN_CALLOUT_IN6,
 				  iwan_win_classify_in6,
 				  FWP_ACTION_CALLOUT_TERMINATING,
-				  &FWPM_LAYER_INBOUND_IPPACKET_V6,
+				  &lyr_in6,
 				  L"iwan in6", &ext->callout_id_in6);
 	if (!NT_SUCCESS(st))
 		return st;
