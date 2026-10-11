@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  iwan.vcxproj — Windows 内核数据面驱动（WFP callout）的 MSBuild 工程。
+
+  这是 WDM 驱动（不用 KMDF：少一层框架依赖，也更容易测试签名），链接
+  fwpkclnt.lib（WFP 内核 API）+ ndis.lib（NBL 工具）+ wdmsec.lib（设备 ACL）。
+  构建（在装了 WDK 的 Windows 上，管理员 VS 开发者命令提示符里）：
+
+    msbuild win-driver\iwan.vcxproj /p:Configuration=Release /p:Platform=x64
+
+  与 Linux 侧 kernel/ 的对应：iwan.sys 就是 iwan.ko。
+-->
+<Project DefaultTargets="Build" ToolsVersion="Current"
+         xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|Win32">
+      <Configuration>Debug</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|Win32">
+      <Configuration>Release</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{6D1A9B20-7C4E-4E2B-9F31-1A2B3C4D5E60}</ProjectGuid>
+    <RootNamespace>iwan</RootNamespace>
+    <ProjectName>iwan</ProjectName>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Driver</ConfigurationType>
+    <DriverType>WDM</DriverType>
+    <DriverTargetPlatform>Desktop</DriverTargetPlatform>
+    <TargetVersion>Windows10</TargetVersion>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Debug'">true</UseDebugLibraries>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"
+            Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')"
+            Label="LocalAppDataPlatform" />
+  </ImportGroup>
+
+  <PropertyGroup>
+    <OutDir>$(SolutionDir)build\$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>$(SolutionDir)build\obj\$(Platform)\$(Configuration)\</IntDir>
+    <TargetName>iwan</TargetName>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <!-- 与 Linux 模块同一取向：注释与日志用中文，字符集用 Unicode -->
+      <AdditionalIncludeDirectories>$(ProjectDir)..\src\common;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <WarningLevel>Level4</WarningLevel>
+      <TreatWarningAsError>true</TreatWarningAsError>
+      <SDLCheck>true</SDLCheck>
+      <!-- NDIS630：数据面用 NdisAllocateNetBufferListPool / NdisGetDataBuffer，
+           必须显式选一个 NDIS 版本宏才拿得到 6.30 的声明。
+           POOL_NX_ALLOCATION 而非 POOL_NX_OPTIN：免掉 DriverEntry 里那次
+           ExInitializeDriverRuntime(DrvRtPoolNxOptIn)，内核侧运行期前提越少越好。 -->
+      <PreprocessorDefinitions>_KERNEL_MODE=1;NDIS630;POOL_NX_ALLOCATION=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <LanguageStandard_C>stdc11</LanguageStandard_C>
+      <ExceptionHandling>false</ExceptionHandling>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>fwpkclnt.lib;ndis.lib;wdmsec.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <!-- 入口与 Linux 一致：DriverEntry；INF 里的服务名是 iwan -->
+      <EntryPointSymbol>DriverEntry</EntryPointSymbol>
+    </Link>
+    <Inf>
+      <TimeStamp>1.0.0.0</TimeStamp>
+    </Inf>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <ClCompile Include="iwan_win_drv.c" />
+    <ClCompile Include="iwan_win_session.c" />
+    <ClCompile Include="iwan_win_wfp.c" />
+    <ClCompile Include="iwan_win_frame.c" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="iwan_win.h" />
+    <ClInclude Include="iwan_win_frame.h" />
+    <ClInclude Include="..\src\common\iwan_win_abi.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <Inf Include="iwan.inf" />
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

@@ -1,0 +1,106 @@
+# Windows 内核驱动（WFP callout 数据面）的编译流水线。
+#
+# 为什么单独一个 workflow：开发机（Linux）与测试机（nano11 虚拟机）都没有
+# WDK/MSVC，编译器只能借 GitHub 的 windows runner（镜像自带 VS + WDK）。
+# 本机只做可测层对拍（tests/win_frame_test.c），虚拟机只做签名/加载/联调。
+#
+# 触发：只碰 win-driver/**、共享 ABI 头或本文件时跑；也支持手动触发，
+# 方便改完驱动后用 `gh workflow run win-driver.yml --ref <branch>` 单独重跑，
+# 不必连带触发 build.yml 的全平台矩阵。
+name: win-driver
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'win-driver/**'
+      - 'src/common/iwan_win_abi.h'
+      - '.github/workflows/win-driver.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  wdk:
+    runs-on: windows-2022
+    concurrency:
+      group: win-driver-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+
+      - name: 探测工具链（VS / WDK / 头 / 库）
+        shell: pwsh
+        run: |
+          $log = "$env:GITHUB_WORKSPACE\env.log"
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -property installationPath
+          $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild `
+                     -find 'MSBuild\**\Bin\MSBuild.exe' | Select-Object -First 1
+          "VSDIR=$vs"       | Tee-Object -FilePath $log -Append
+          "MSBUILD=$msbuild" | Tee-Object -FilePath $log -Append
+          "VSDIR=$vs"        >> $env:GITHUB_ENV
+          "MSBUILD=$msbuild" >> $env:GITHUB_ENV
+
+          $sdk = "${env:ProgramFiles(x86)}\Windows Kits\10"
+          $inc = Get-ChildItem "$sdk\Include" -Directory -ErrorAction SilentlyContinue |
+                 Sort-Object Name | Select-Object -Last 1
+          "WDKINC=$($inc.FullName)" | Tee-Object -FilePath $log -Append
+          "WDKINC=$($inc.FullName)" >> $env:GITHUB_ENV
+
+          $probe = @(
+            @{ n = 'sdk include 版本'; v = (Get-ChildItem "$sdk\Include" -Directory -ErrorAction SilentlyContinue | Select-Object -Expand Name) -join ',' },
+            @{ n = 'km\fwpsk.h';       v = (Test-Path "$($inc.FullName)\km\fwpsk.h") },
+            @{ n = 'km\ndis.h';        v = (Test-Path "$($inc.FullName)\km\ndis.h") },
+            @{ n = 'km\wdmsec.h';      v = (Test-Path "$($inc.FullName)\km\wdmsec.h") },
+            @{ n = 'fwpkclnt.lib';     v = (Get-ChildItem "$sdk\Lib" -Recurse -Filter fwpkclnt.lib -ErrorAction SilentlyContinue | Select-Object -First 2 -Expand FullName) -join ';' },
+            @{ n = 'ndis.lib';         v = (Get-ChildItem "$sdk\Lib" -Recurse -Filter ndis.lib -ErrorAction SilentlyContinue | Select-Object -First 2 -Expand FullName) -join ';' },
+            @{ n = 'wdmsec.lib';       v = (Get-ChildItem "$sdk\Lib" -Recurse -Filter wdmsec.lib -ErrorAction SilentlyContinue | Select-Object -First 2 -Expand FullName) -join ';' },
+            @{ n = 'devcon.exe';       v = (Get-ChildItem "$sdk\Tools" -Recurse -Filter devcon.exe -ErrorAction SilentlyContinue | Select-Object -First 2 -Expand FullName) -join ';' },
+            @{ n = '驱动工具集 props';  v = (Get-ChildItem "$vs\MSBuild" -Recurse -Filter 'WindowsKernelModeDriver*.props' -ErrorAction SilentlyContinue | Select-Object -First 2 -Expand FullName) -join ';' }
+          )
+          foreach ($p in $probe) { "$($p.n) = $($p.v)" | Tee-Object -FilePath $log -Append }
+
+      # cl 语法检查先行：/Zs 只解析不产 object、不链接，因此不依赖驱动工具集
+      # 是否装好。它能在 msbuild 之前把所有编译错误一次性打全，省去来回。
+      - name: cl 语法检查（不拦，只为拿全量报错）
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $msvc = Get-ChildItem "$env:VSDIR\VC\Tools\MSVC" -Directory |
+                  Sort-Object Name | Select-Object -Last 1
+          $cl = Get-ChildItem $msvc.FullName -Recurse -Filter cl.exe |
+                Where-Object { $_.FullName -match 'Hostx64\\x64' } | Select-Object -First 1
+          "CL=$($cl.FullName)"
+          $incs = @("$env:WDKINC\km", "$env:WDKINC\km\crt", "$env:WDKINC\shared",
+                    "$env:WDKINC\ucrt", "$($msvc.FullName)\include") |
+                  Where-Object { Test-Path $_ } | ForEach-Object { "/I$_" }
+          $clArgs = @('/nologo', '/kernel', '/c', '/Zs', '/std:c11', '/W4', '/WX-',
+                    '/Iwin-driver', '/Isrc\common') + $incs +
+                  @('/D_KERNEL_MODE=1', '/DNDIS630', '/DPOOL_NX_ALLOCATION=1') +
+                  @('win-driver\iwan_win_drv.c', 'win-driver\iwan_win_session.c',
+                    'win-driver\iwan_win_wfp.c', 'win-driver\iwan_win_frame.c')
+          & $cl.FullName @clArgs 2>&1 | Tee-Object -FilePath cl-syntax.log
+          "cl 退出码=$LASTEXITCODE"
+
+      - name: msbuild 驱动
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & $env:MSBUILD 'win-driver\iwan.vcxproj' /nologo /v:normal `
+              /p:Configuration=Release /p:Platform=x64 `
+              "/p:SolutionDir=$env:GITHUB_WORKSPACE\" `
+              "/p:OutDir=$env:GITHUB_WORKSPACE\build\x64\Release\" 2>&1 |
+              Tee-Object -FilePath msbuild.log
+          "msbuild 退出码=$LASTEXITCODE"
+
+      - name: 回传产物与日志
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: win-driver-x64
+          path: |
+            build/x64/Release/iwan.sys
+            build/x64/Release/iwan.pdb
+            **/*.log
+          if-no-files-found: warn

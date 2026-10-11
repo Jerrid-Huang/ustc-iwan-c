@@ -1,0 +1,48 @@
+; iwan.inf — Windows 内核数据面驱动（WFP callout）安装信息
+;
+; 这是一个"非 PnP 的内核服务"INF：驱动不绑定任何硬件，由客户端/服务按需启动，
+; 对应 Linux 侧 modprobe iwan。ServiceType=1（内核驱动）、StartType=3（按需）。
+;
+; 安装（管理员）：
+;   pnputil /add-driver iwan.inf /install
+; 或（不走驱动库，直接落文件并建服务）：
+;   rundll32 setupapi.dll,InstallHinfSection DefaultInstall 132 .\iwan.inf
+; 卸载：
+;   rundll32 setupapi.dll,InstallHinfSection DefaultUninstall 132 .\iwan.inf
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %ProviderName%
+CatalogFile = iwan.cat
+DriverVer   = 10/11/2026,1.0.0.0
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[DefaultInstall]
+CopyFiles = @iwan.sys
+
+[DefaultInstall.Services]
+AddService = iwan,2,iwan_Service
+
+[iwan_Service]
+DisplayName    = %ServiceName%
+Description    = %ServiceDesc%
+ServiceType    = 1
+StartType      = 3
+ErrorControl   = 1
+ServiceBinary  = %12%\iwan.sys
+
+[DefaultUninstall]
+DelFiles = @iwan.sys
+
+[DefaultUninstall.Services]
+DelService = iwan,0x200
+
+[Strings]
+ProviderName = "iWAN"
+ServiceName  = "iWAN kernel data plane (WFP callout)"
+ServiceDesc  = "把 iWAN 数据面放进内核：WFP callout 出向封装、入向解封，报文不进用户态。"
