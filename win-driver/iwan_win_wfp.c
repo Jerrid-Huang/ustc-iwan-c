@@ -217,11 +217,19 @@ fail:
 static BOOLEAN
 iwan_win_nbl_from_self(_In_ HANDLE handle, _In_ const NET_BUFFER_LIST *nbl)
 {
-	FWPS_PACKET_INJECTION_STATE st = FWPS_PACKET_NOT_INJECTED;
+	FWPS_PACKET_INJECTION_STATE st;
 
 	if (handle == NULL || nbl == NULL)
 		return FALSE;
-	FwpsQueryPacketInjectionState0(handle, nbl, &st);
+	/* 第三个参数是 [out, optional]，这里传 NULL，只取返回值 —— 返回值本身
+	 * 就是注入状态。原因：WDK 10.0.26100 的 fwpsk.h 把它声明成 HANDLE *
+	 * （文档写的是 FWPS_PACKET_INJECTION_STATE *），/WX 下 C4022 直接当错误。
+	 * 传 NULL 后两种声明都能编过，语义也不依赖那个出参。
+	 *
+	 * 另外说明：即使这个判断因为声明差异失灵，也不会造成外层套外层 ——
+	 * 目标集合判定时我们显式把对端地址（s->outer_dst）排除在外，自己注入
+	 * 的外层包本来就不会命中目标。这里是第二道保险，不是唯一防线。 */
+	st = FwpsQueryPacketInjectionState0(handle, nbl, NULL);
 	return st == FWPS_PACKET_INJECTED_BY_SELF ||
 	       st == FWPS_PACKET_PREVIOUSLY_INJECTED_BY_SELF;
 }
