@@ -68,11 +68,12 @@
       <WarningLevel>Level4</WarningLevel>
       <TreatWarningAsError>true</TreatWarningAsError>
       <SDLCheck>true</SDLCheck>
-      <!-- NDIS630：数据面用 NdisAllocateNetBufferListPool / NdisGetDataBuffer，
+      <!-- 只留 NDIS630：数据面用 NdisAllocateNetBufferListPool / NdisGetDataBuffer，
            必须显式选一个 NDIS 版本宏才拿得到 6.30 的声明。
-           POOL_NX_ALLOCATION 而非 POOL_NX_OPTIN：免掉 DriverEntry 里那次
-           ExInitializeDriverRuntime(DrvRtPoolNxOptIn)，内核侧运行期前提越少越好。 -->
-      <PreprocessorDefinitions>_KERNEL_MODE=1;NDIS630;POOL_NX_ALLOCATION=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+           _KERNEL_MODE 由工具集的 /kernel 定义、POOL_NX_ALLOCATION 由 wdm.h 自己
+           定义 —— 在这里重复定义会触发 C4005，配合 TreatWarningAsError 直接变
+           C2220（第一次真编译就是这么被拦下的）。 -->
+      <PreprocessorDefinitions>NDIS630;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <LanguageStandard_C>stdc11</LanguageStandard_C>
       <ExceptionHandling>false</ExceptionHandling>
     </ClCompile>

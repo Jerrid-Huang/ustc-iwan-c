@@ -27,6 +27,23 @@
 #if defined(_KERNEL_MODE)
 #  include <ntddk.h>
 #  include <wdm.h>          /* CTL_CODE */
+/*
+ * 内核态没有 C99 定长类型：WDK 的内核包含路径里没有 <stdint.h>，wdm.h 只提供
+ * INT8..UINT64 这组 WDK 名字。本文件通篇用 C99 名字（用户态那两侧本来就有
+ * <stdint.h>），所以在这里补一层等宽别名，而不是把上百处字段类型改成 WDK 名字
+ * 再分两套维护 —— ABI 结构体的字段类型在三个编译目标里必须是同一份声明。
+ *
+ * C11 允许把 typedef 重定义成同一类型（6.7/3），MSVC 在 /std:c11 下同样接受，
+ * 所以将来某个 WDK 若自己提供了这些名字，只要宽度相同也不会冲突。
+ */
+typedef signed char        int8_t;
+typedef unsigned char      uint8_t;
+typedef short              int16_t;
+typedef unsigned short     uint16_t;
+typedef int                int32_t;
+typedef unsigned int       uint32_t;
+typedef long long          int64_t;
+typedef unsigned long long uint64_t;
 #elif defined(IWAN_WIN_ABI_BARE)
 /* 裸模式：主机侧对拍测试（tests/win_frame_test.c）只要结构与常量，
  * 不引入 windows.h，这样同一份 ABI 能在 Linux 上编译检查。 */

@@ -35,16 +35,25 @@ jobs:
           $log = "$env:GITHUB_WORKSPACE\env.log"
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $vs = & $vswhere -latest -products * -property installationPath
+          # 64 位 MSBuild：32 位那套会去加载 x86\InfVerif.dll（WDK 只装了 x64 的），
+          # INF 校验步骤直接抛 "Unable to load DLL 'x86\InfVerif.dll'"。
           $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild `
-                     -find 'MSBuild\**\Bin\MSBuild.exe' | Select-Object -First 1
+                     -find 'MSBuild\**\Bin\amd64\MSBuild.exe' | Select-Object -First 1
+          if (-not $msbuild) {
+            $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild `
+                       -find 'MSBuild\**\Bin\MSBuild.exe' | Select-Object -First 1
+          }
           "VSDIR=$vs"       | Tee-Object -FilePath $log -Append
           "MSBUILD=$msbuild" | Tee-Object -FilePath $log -Append
           "VSDIR=$vs"        >> $env:GITHUB_ENV
           "MSBUILD=$msbuild" >> $env:GITHUB_ENV
 
           $sdk = "${env:ProgramFiles(x86)}\Windows Kits\10"
+          # 注意：$sdk\Include 下除版本目录外还有 wdf；按名字排序会把 wdf 排到最后，
+          # 于是 ntddk.h/fwpsk.h 全都找不到 —— 必须只认 10.* 并按版本号排序。
           $inc = Get-ChildItem "$sdk\Include" -Directory -ErrorAction SilentlyContinue |
-                 Sort-Object Name | Select-Object -Last 1
+                 Where-Object { $_.Name -match '^10\.' } |
+                 Sort-Object { [version]$_.Name } | Select-Object -Last 1
           "WDKINC=$($inc.FullName)" | Tee-Object -FilePath $log -Append
           "WDKINC=$($inc.FullName)" >> $env:GITHUB_ENV
 
@@ -53,6 +62,8 @@ jobs:
             @{ n = 'km\fwpsk.h';       v = (Test-Path "$($inc.FullName)\km\fwpsk.h") },
             @{ n = 'km\ndis.h';        v = (Test-Path "$($inc.FullName)\km\ndis.h") },
             @{ n = 'km\wdmsec.h';      v = (Test-Path "$($inc.FullName)\km\wdmsec.h") },
+            @{ n = 'km\stdint.h';      v = (Test-Path "$($inc.FullName)\km\stdint.h") },
+            @{ n = 'km\crt\stdint.h';  v = (Test-Path "$($inc.FullName)\km\crt\stdint.h") },
             @{ n = 'fwpkclnt.lib';     v = (Get-ChildItem "$sdk\Lib" -Recurse -Filter fwpkclnt.lib -ErrorAction SilentlyContinue | Select-Object -First 2 -Expand FullName) -join ';' },
             @{ n = 'ndis.lib';         v = (Get-ChildItem "$sdk\Lib" -Recurse -Filter ndis.lib -ErrorAction SilentlyContinue | Select-Object -First 2 -Expand FullName) -join ';' },
             @{ n = 'wdmsec.lib';       v = (Get-ChildItem "$sdk\Lib" -Recurse -Filter wdmsec.lib -ErrorAction SilentlyContinue | Select-Object -First 2 -Expand FullName) -join ';' },
@@ -77,7 +88,7 @@ jobs:
                   Where-Object { Test-Path $_ } | ForEach-Object { "/I$_" }
           $clArgs = @('/nologo', '/kernel', '/c', '/Zs', '/std:c11', '/W4', '/WX-',
                     '/Iwin-driver', '/Isrc\common') + $incs +
-                  @('/D_KERNEL_MODE=1', '/DNDIS630', '/DPOOL_NX_ALLOCATION=1') +
+                  @('/DNDIS630') +
                   @('win-driver\iwan_win_drv.c', 'win-driver\iwan_win_session.c',
                     'win-driver\iwan_win_wfp.c', 'win-driver\iwan_win_frame.c')
           & $cl.FullName @clArgs 2>&1 | Tee-Object -FilePath cl-syntax.log
@@ -94,6 +105,21 @@ jobs:
               Tee-Object -FilePath msbuild.log
           "msbuild 退出码=$LASTEXITCODE"
 
+      - name: 取 x64 devcon.exe（虚拟机建承载网卡用）
+        if: always()
+        shell: pwsh
+        run: |
+          $sdk = "${env:ProgramFiles(x86)}\Windows Kits\10"
+          $dev = Get-ChildItem "$sdk\Tools" -Recurse -Filter devcon.exe -ErrorAction SilentlyContinue |
+                 Where-Object { $_.FullName -match '\\x64\\' } | Select-Object -First 1
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\out" | Out-Null
+          if ($dev) {
+            Copy-Item $dev.FullName "$env:GITHUB_WORKSPACE\out\devcon.exe"
+            "已取到 $($dev.FullName)"
+          } else {
+            "runner 上没找到 x64 devcon.exe"
+          }
+
       - name: 回传产物与日志
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -102,5 +128,6 @@ jobs:
           path: |
             build/x64/Release/iwan.sys
             build/x64/Release/iwan.pdb
+            out/devcon.exe
             **/*.log
           if-no-files-found: warn
