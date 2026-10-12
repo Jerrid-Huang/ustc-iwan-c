@@ -101,6 +101,10 @@ jobs:
         shell: pwsh
         run: |
           $h = "$env:WDKINC\km"
+          P 'INBOUND_TRANSPORT_V4 fields' "$h\fwpsk.h" 'FWPS_FIELD_INBOUND_TRANSPORT_V4_IP_PROTOCOL' 70
+          P 'INBOUND_TRANSPORT_V6 fields' "$h\fwpsk.h" 'FWPS_FIELD_INBOUND_TRANSPORT_V6_IP_PROTOCOL' 70
+          P 'FWPS_INCOMING_VALUES0' "$h\fwpsk.h" 'typedef struct FWPS_INCOMING_VALUES0_' 14
+          P 'layer id enum' "$h\fwpsk.h" 'FWPS_LAYER_INBOUND_TRANSPORT_V4,' 3
           $log = "$env:GITHUB_WORKSPACE\api-probe.log"
           function P($title, $file, $pattern, $after) {
             "`n=== $title ===" | Tee-Object -FilePath $log -Append
