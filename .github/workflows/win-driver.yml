@@ -110,11 +110,10 @@ jobs:
                 Tee-Object -FilePath $log -Append
             } else { "缺文件 $file" | Tee-Object -FilePath $log -Append }
           }
-          P 'FWPS_INJECT_COMPLETE0 定义'
+          P 'FWPS_INJECT_COMPLETE0 定义' "$h\fwpsk.h" 'typedef.*FWPS_INJECT_COMPLETE0' 3
           P 'INBOUND_TRANSPORT_V4 fields' "$h\fwpsk.h" 'FWPS_FIELD_INBOUND_TRANSPORT_V4_IP_PROTOCOL' 60
           P 'INBOUND_TRANSPORT_V6 fields' "$h\fwpsk.h" 'FWPS_FIELD_INBOUND_TRANSPORT_V6_IP_PROTOCOL' 60
           P 'FWPS_INCOMING_VALUES0 定义' "$h\shared\fwpstypes.h" 'typedef struct FWPS_INCOMING_VALUES0_' 10
- "$h\fwpsk.h" 'typedef.*FWPS_INJECT_COMPLETE0' 3
           P 'FwpsInjectNetworkReceiveAsync0 原型' "$h\fwpsk.h" 'FwpsInjectNetworkReceiveAsync0' 12
           P 'FWPS_INCOMING_METADATA_VALUES0 的索引/接口成员' "$h\fwpsk.h" 'incomingInterfaceIndex|interfaceIndex|subInterfaceIndex' 1
           P 'FWPM_FILTER0 的上下文成员' "$h\fwpmk.h" 'rawContext|providerContextKey' 2
