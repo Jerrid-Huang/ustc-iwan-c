@@ -199,6 +199,19 @@ iwan_win_should_tunnel4(_In_reads_(count) const IWAN_WIN_TARGET *targets,
 
 /* ---- 入向（M2）：外层解析、帧分类、解封 ------------------------------- */
 
+/* 从帧头取 type/enc/sid/tok：三种外层形态共用一份，改一处不会漏两处 */
+static VOID
+iwan_win_frame_hdr_read(_In_ const UINT8 *pkt, _Out_ IWAN_WIN_OUTER *out)
+{
+	out->type = pkt[out->frame_off + 0];
+	out->enc = pkt[out->frame_off + 1];
+	out->sid = iwan_win_rd16(pkt + out->frame_off + 2);
+	out->tok = ((UINT32)pkt[out->frame_off + 4] << 24) |
+		   ((UINT32)pkt[out->frame_off + 5] << 16) |
+		   ((UINT32)pkt[out->frame_off + 6] << 8) |
+		   (UINT32)pkt[out->frame_off + 7];
+}
+
 BOOLEAN
 iwan_win_outer_parse4(_In_reads_bytes_(len) const UINT8 *pkt, _In_ ULONG len,
 		      _Out_ IWAN_WIN_OUTER *out)
@@ -235,6 +248,8 @@ iwan_win_outer_parse4(_In_reads_bytes_(len) const UINT8 *pkt, _In_ ULONG len,
 	if (len < need)
 		return FALSE;
 
+	out->sport = iwan_win_rd16(pkt + ihl + 0);
+	out->dport = iwan_win_rd16(pkt + ihl + 2);
 	out->frame_off = ihl + IWAN_OUTER_UDP_LEN;
 	out->frame_len = ulen - IWAN_OUTER_UDP_LEN;
 	if (out->frame_len < IWAN_FRAME_HDR_LEN)
@@ -244,13 +259,7 @@ iwan_win_outer_parse4(_In_reads_bytes_(len) const UINT8 *pkt, _In_ ULONG len,
 	if (out->inner_len == 0)
 		return FALSE;
 
-	out->type = pkt[out->frame_off + 0];
-	out->enc = pkt[out->frame_off + 1];
-	out->sid = iwan_win_rd16(pkt + out->frame_off + 2);
-	out->tok = ((UINT32)pkt[out->frame_off + 4] << 24) |
-		   ((UINT32)pkt[out->frame_off + 5] << 16) |
-		   ((UINT32)pkt[out->frame_off + 6] << 8) |
-		   (UINT32)pkt[out->frame_off + 7];
+	iwan_win_frame_hdr_read(pkt, out);
 	return TRUE;
 }
 
@@ -506,6 +515,8 @@ iwan_win_outer_parse6(_In_reads_bytes_(len) const UINT8 *pkt, _In_ ULONG len,
 	if (len < need)
 		return FALSE;
 
+	out->sport = iwan_win_rd16(pkt + IWAN_OUTER_IP6_LEN + 0);
+	out->dport = iwan_win_rd16(pkt + IWAN_OUTER_IP6_LEN + 2);
 	out->frame_off = IWAN_OUTER6_TOTAL - IWAN_FRAME_HDR_LEN;
 	out->frame_len = ulen - IWAN_OUTER_UDP_LEN;
 	if (out->frame_len < IWAN_FRAME_HDR_LEN)
@@ -515,13 +526,53 @@ iwan_win_outer_parse6(_In_reads_bytes_(len) const UINT8 *pkt, _In_ ULONG len,
 	if (out->inner_len == 0)
 		return FALSE;
 
-	out->type = pkt[out->frame_off + 0];
-	out->enc = pkt[out->frame_off + 1];
-	out->sid = iwan_win_rd16(pkt + out->frame_off + 2);
-	out->tok = ((UINT32)pkt[out->frame_off + 4] << 24) |
-		   ((UINT32)pkt[out->frame_off + 5] << 16) |
-		   ((UINT32)pkt[out->frame_off + 6] << 8) |
-		   (UINT32)pkt[out->frame_off + 7];
+	iwan_win_frame_hdr_read(pkt, out);
+	return TRUE;
+}
+
+BOOLEAN
+iwan_win_dgram_parse(_In_reads_bytes_(len) const UINT8 *pkt, _In_ ULONG len,
+		     _Out_ IWAN_WIN_OUTER *out)
+{
+	ULONG off = 0, ulen, avail;
+
+	if (len < IWAN_OUTER_UDP_LEN)
+		return FALSE;
+
+	/* 先判"是不是仍带 IP 头"：四项自洽才认，否则一律当裸数据报 */
+	if ((pkt[0] >> 4) == 4 && len >= IWAN_OUTER_IP4_LEN) {
+		ULONG ihl = (ULONG)(pkt[0] & 0x0F) * 4;
+
+		if (ihl >= IWAN_OUTER_IP4_LEN && ihl <= len &&
+		    pkt[9] == IWAN_IPPROTO_UDP &&
+		    (iwan_win_rd16(pkt + 6) & 0x3FFF) == 0)
+			off = ihl;
+	} else if ((pkt[0] >> 4) == 6 && len >= IWAN_OUTER_IP6_LEN) {
+		if (pkt[6] == IWAN_IPPROTO_UDP)
+			off = IWAN_OUTER_IP6_LEN;
+	}
+
+	if (len < off + IWAN_OUTER_UDP_LEN + IWAN_FRAME_HDR_LEN)
+		return FALSE;
+	ulen = iwan_win_rd16(pkt + off + 4);
+	if (ulen < IWAN_OUTER_UDP_LEN)
+		return FALSE;
+	avail = len - off;
+	if (ulen > avail)
+		ulen = avail;		/* UDP 长度撒谎时按实际长度兜底 */
+
+	out->sport = iwan_win_rd16(pkt + off + 0);
+	out->dport = iwan_win_rd16(pkt + off + 2);
+	out->frame_off = off + IWAN_OUTER_UDP_LEN;
+	out->frame_len = ulen - IWAN_OUTER_UDP_LEN;
+	if (out->frame_len < IWAN_FRAME_HDR_LEN)
+		return FALSE;
+	out->inner_off = out->frame_off + IWAN_FRAME_HDR_LEN;
+	out->inner_len = out->frame_len - IWAN_FRAME_HDR_LEN;
+	if (out->inner_len == 0)
+		return FALSE;
+
+	iwan_win_frame_hdr_read(pkt, out);
 	return TRUE;
 }
 

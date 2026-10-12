@@ -131,8 +131,8 @@ typedef struct _IWAN_WIN_DEVICE_EXTENSION {
 	HANDLE			engine;
 	UINT32			callout_id_out4;	/* FWPS_LAYER_OUTBOUND_IPPACKET_V4 */
 	UINT32			callout_id_out6;	/* FWPS_LAYER_OUTBOUND_IPPACKET_V6 */
-	UINT32			callout_id_in4;		/* FWPS_LAYER_INBOUND_IPPACKET_V4  */
-	UINT32			callout_id_in6;		/* FWPS_LAYER_INBOUND_IPPACKET_V6  */
+	UINT32			callout_id_in4;		/* FWPS_LAYER_INBOUND_TRANSPORT_V4 */
+	UINT32			callout_id_in6;		/* FWPS_LAYER_INBOUND_TRANSPORT_V6 */
 	HANDLE			inj_send4;
 	HANDLE			inj_send6;
 	HANDLE			inj_recv4;

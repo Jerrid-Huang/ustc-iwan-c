@@ -2,6 +2,16 @@
 /*
  * iwan_win_wfp.c — WFP callout 数据面：出向封装 +（M2）入向解封。
  *
+ * 两层的位置（入向这一层是特意选的）：
+ *   · 出向：FWPS_LAYER_OUTBOUND_IPPACKET_V4/V6 —— IP 头已组好、还没分片；
+ *   · 入向：FWPS_LAYER_INBOUND_TRANSPORT_V4/V6 —— **协议栈重组之后**：外层分片
+ *     已经拼好、IP 头已被摘掉，layerData 从 UDP 头开始，地址由 WFP 固定字段给。
+ *     Linux 侧是站在"两次重组之间"自己补一次 ip_defrag（见 kernel/iwan_rx.c 的
+ *     注释），Windows 侧把这一步交给协议栈，换来的是不必自己处理分片。
+ *   · 注入仍然回到**重组之前**（网络层 FwpsInjectNetworkReceiveAsync）：内层包
+ *     照常走完整的 IP 解析、重组与分流 —— 与 Linux 侧解封后 NF_ACCEPT/netif_rx
+ *     回到 ip_defrag 之前同一语义。
+ *
  * 对应 Linux 侧 kernel/iwan_tx.c 的 iwan_xmit（出向）与 kernel/iwan_rx.c 的
  * 钩子（入向）。线上格式与 Linux 模块**逐字节一致**，这是互通的硬前提：
  *
@@ -25,8 +35,7 @@
  * M1 边界（明确不做的事，全部 fail-closed 并计数，绝不把明文放出去）：
  *   · 分段卸载的大段（内层长度 > 内层 MTU）暂不封装：计数后**丢弃**；
  *     不实现"透传"，避免明文泄漏；软件分段见 README 的 M1.1；
- *   · 非线性（数据跨多个 MDL）的报文暂不处理：计数后放行（不吸收）；
- *   · 入向解封在 M2，当前只匹配并计数。
+ *   · 非线性（数据跨多个 MDL）的报文暂不处理：计数后放行（不吸收）。
  */
 #include "iwan_win.h"
 
@@ -118,22 +127,6 @@ iwan_win_nbl_wrap(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
  * inner 指向**只读**的内层报文；本函数自己复制一份再变换，
  * 绝不改动协议栈正在用的缓冲（Linux 侧是独占 skb 才原地改）。
  */
-/*
- * 临时诊断：把“失败在哪一步、真实 NTSTATUS、compartment”带出内核。
- * 借两个纯出向路径上恒为 0 的入向计数器（rx_reasm / rx_batch_skip），
- * 这样不用内核调试器也能从用户态统计里读到原因：
- *   rx_reasm      = 阶段：0 分配之前、1 外层 v6 头、2 外层 v4 头、
- *                   3 NBL 分配、4 注入
- *   rx_batch_skip = 低 32 位真实 NTSTATUS，高 32 位 compartment
- * 定位完成即撤。
- */
-#define IWAN_DIAG_FAIL(_ext, _stage, _st, _comp)			\
-	do {								\
-		(_ext)->sess.stats.rx_reasm = (UINT64)(_stage);		\
-		(_ext)->sess.stats.rx_batch_skip =			\
-			(UINT64)(UINT32)(_st) |				\
-			((UINT64)(UINT32)(_comp) << 32);		\
-	} while (0)
 
 /*
  * 出向封装 + 注入。外层用 v4 还是 v6 由**会话**决定（outer_v6），与内层版本
@@ -158,19 +151,16 @@ iwan_win_encap_inject(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	NTSTATUS st;
 
 	if (inner_len == 0 || total > 0xFFFF) {
-		IWAN_DIAG_FAIL(ext, 0, STATUS_INVALID_BUFFER_SIZE, compartment);
 		return STATUS_INVALID_BUFFER_SIZE;
 	}
 
 	ctx = (IWAN_INJECT_CTX *)IWAN_ALLOC(sizeof(*ctx), IWAN_TAG_PKT);
 	if (ctx == NULL) {
-		IWAN_DIAG_FAIL(ext, 0, STATUS_INSUFFICIENT_RESOURCES, compartment);
 		return STATUS_INSUFFICIENT_RESOURCES;
 	}
 
 	buf = (UINT8 *)IWAN_ALLOC(total, IWAN_TAG_PKT);
 	if (buf == NULL) {
-		IWAN_DIAG_FAIL(ext, 0, STATUS_INSUFFICIENT_RESOURCES, compartment);
 		ExFreePoolWithTag(ctx, IWAN_TAG_PKT);
 		return STATUS_INSUFFICIENT_RESOURCES;
 	}
@@ -192,21 +182,18 @@ iwan_win_encap_inject(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		if (iwan_win_outer_hdr6(buf, total, flen, s->outer_src6,
 					s->outer_dst6, s->sport,
 					s->dport) != total) {
-			IWAN_DIAG_FAIL(ext, 1, 0, compartment);
 			goto fail;
 		}
 	} else {
 		if (iwan_win_outer_hdr4(buf, total, flen, s->outer_src,
 					s->outer_dst, s->sport,
 					s->dport) != total) {
-			IWAN_DIAG_FAIL(ext, 2, 0, compartment);
 			goto fail;
 		}
 	}
 
 	st = iwan_win_nbl_wrap(ext, ctx, &nbl, total);
 	if (!NT_SUCCESS(st)) {
-		IWAN_DIAG_FAIL(ext, 3, st, compartment);
 		goto fail;
 	}
 
@@ -217,7 +204,6 @@ iwan_win_encap_inject(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 					iwan_win_inject_complete, ctx);
 	if (!NT_SUCCESS(st)) {
 		/* 注入失败：注入所有权没有转移，自己收回 */
-		IWAN_DIAG_FAIL(ext, 4, st, compartment);
 		InterlockedDecrement(&ext->inject_outstanding);
 		FwpsFreeNetBufferList(nbl);
 		goto fail;
@@ -404,7 +390,10 @@ done:
 
 /*
  * 入向判定：这个包是不是"本隧道的、我们能处理的数据帧"。
- * 五元组命中（源=外层服务器、外层端口成对）才算我们的包；命中之后，
+ * 五元组里的地址那一半（协议必须是 UDP、源地址必须是外层服务器）由 worker 用
+ * WFP 固定字段判 —— 传输层 IP 头已被摘掉，包上没得比；端口这一半在这里判，
+ * 取自 UDP 头本身（iwan_win_dgram_parse 顺手填进 IWAN_WIN_OUTER）。
+ * 命中之后，
  * 处理不了的一律吞掉（绝不放给本机协议栈，否则残缺/伪造的隧道内容会被
  * 当成正常入站流量）；只有校验通过的控制帧才原样放行给用户态套接字 ——
  * 与 kernel/iwan_rx.c 同一策略：数据帧内核收，控制帧转用户态。
@@ -424,20 +413,12 @@ iwan_win_inbound_kind(_In_ const IWAN_WIN_SESSION *s,
 		      _In_reads_bytes_(len) const UINT8 *pkt, _In_ ULONG len,
 		      _Out_ IWAN_WIN_OUTER *o)
 {
-	/* 五元组：源地址必须是外层服务器，源端口 = 服务端端口，
-	 * 目的端口 = 本会话端口（客户端套接字就绑在它上面）。 */
-	if (len < IWAN_OUTER_IP4_LEN + IWAN_OUTER_UDP_LEN ||
-	    pkt[9] != IWAN_IPPROTO_UDP)
+	/* 端口成对：源端口 = 服务端端口，目的端口 = 本会话端口（客户端套接字
+	 * 绑在它上面）。地址那一半已经在 worker 的固定字段闸门里过了。 */
+	if (!iwan_win_dgram_parse(pkt, len, o))
+		return IWAN_WIN_IN_DROP;	/* 是本会话的包但结构不合法：吞 */
+	if (o->sport != s->dport || o->dport != s->sport)
 		return IWAN_WIN_IN_NONE;
-	if (RtlCompareMemory(pkt + 12, &s->outer_dst, 4) != 4)
-		return IWAN_WIN_IN_NONE;
-	if (iwan_win_rd16(pkt + IWAN_OUTER_IP4_LEN + 0) != s->dport ||
-	    iwan_win_rd16(pkt + IWAN_OUTER_IP4_LEN + 2) != s->sport)
-		return IWAN_WIN_IN_NONE;
-
-	/* 到这里这条包就是我们的：解析不了（分片、截断、长度撒谎）就吞掉 */
-	if (!iwan_win_outer_parse4(pkt, len, o))
-		return IWAN_WIN_IN_DROP;
 
 	switch (iwan_win_frame_classify(o, s->sid, s->tok, s->enc != 0, TRUE)) {
 	case IWAN_WIN_FRAME_DATA:
@@ -502,32 +483,6 @@ iwan_win_inject_net_recv(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	return st;
 }
 
-/* 入向 v6 的判定：与外层 v4 同一套闸门，只是地址/端口字段换成 v6。
- * 外层 v6 由 iwan_tx_outer6 构造：nexthdr 直接是 UDP，没有扩展头。 */
-static UINT32
-iwan_win_inbound_kind6(_In_ const IWAN_WIN_SESSION *s,
-		       _In_reads_bytes_(len) const UINT8 *pkt, _In_ ULONG len,
-		       _Out_ IWAN_WIN_OUTER *o)
-{
-	if (len < IWAN_OUTER6_TOTAL || pkt[6] != IWAN_IPPROTO_UDP)
-		return IWAN_WIN_IN_NONE;
-	if (RtlCompareMemory(pkt + 8, s->outer_dst6, 16) != 16)
-		return IWAN_WIN_IN_NONE;
-	if (iwan_win_rd16(pkt + IWAN_OUTER_IP6_LEN + 0) != s->dport ||
-	    iwan_win_rd16(pkt + IWAN_OUTER_IP6_LEN + 2) != s->sport)
-		return IWAN_WIN_IN_NONE;
-	if (!iwan_win_outer_parse6(pkt, len, o))
-		return IWAN_WIN_IN_DROP;
-	switch (iwan_win_frame_classify(o, s->sid, s->tok, s->enc != 0, TRUE)) {
-	case IWAN_WIN_FRAME_DATA:
-		return IWAN_WIN_IN_DATA;
-	case IWAN_WIN_FRAME_CTRL:
-		return IWAN_WIN_IN_CTRL;
-	default:
-		return IWAN_WIN_IN_DROP;
-	}
-}
-
 /* 前向声明：in4/in6 是薄封装，worker 的实体在它们后面（第一次真编译在这里
  * 报"undefined; assuming extern returning int" + 重定义） */
 static VOID NTAPI
@@ -590,8 +545,8 @@ iwan_win_inbound_worker(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 	ULONG lens[IWAN_WIN_MAX_BATCH];
 	ULONG n = 0;			/* 本批报文数 */
 	ULONG i;
+	UINT32 fidx;
 
-	UNREFERENCED_PARAMETER(inFixedValues);
 	UNREFERENCED_PARAMETER(classifyContext);
 	UNREFERENCED_PARAMETER(flowContext);
 
@@ -605,6 +560,31 @@ iwan_win_inbound_worker(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 	s = &ext->sess;
 	if (s->valid == 0 || iwan_win_session_is_v6(s) != outer_v6)
 		return;
+
+	/* 传输层没有 IP 头可看：协议与外层对端地址只能问 WFP 固定字段。
+	 * 取值前先断言类型（类型不符读到的是垃圾），拿不到就放行 —— 判不了
+	 * 归属就不该动这个包。 */
+	if (inFixedValues == NULL)
+		return;
+	fidx = outer_v6 ? FWPS_FIELD_INBOUND_TRANSPORT_V6_IP_PROTOCOL
+			: FWPS_FIELD_INBOUND_TRANSPORT_V4_IP_PROTOCOL;
+	if (inFixedValues->incomingValue[fidx].value.type != FWP_UINT8 ||
+	    inFixedValues->incomingValue[fidx].value.uint8 != IWAN_IPPROTO_UDP)
+		return;
+	fidx = outer_v6 ? FWPS_FIELD_INBOUND_TRANSPORT_V6_IP_REMOTE_ADDRESS
+			: FWPS_FIELD_INBOUND_TRANSPORT_V4_IP_REMOTE_ADDRESS;
+	if (outer_v6) {
+		if (inFixedValues->incomingValue[fidx].value.type !=
+			    FWP_BYTE_ARRAY16_TYPE ||
+		    RtlCompareMemory(inFixedValues->incomingValue[fidx]
+					     .value.byteArray16->byteArray16,
+				     s->outer_dst6, 16) != 16)
+			return;
+	} else {
+		if (inFixedValues->incomingValue[fidx].value.type != FWP_UINT32 ||
+		    inFixedValues->incomingValue[fidx].value.uint32 != s->outer_dst)
+			return;
+	}
 
 	/* 自己注入的内层包：放行，让它正常往上交付 */
 	if (iwan_win_nbl_from_self(ext->inj_recv4, nbl) ||
@@ -648,7 +628,7 @@ iwan_win_inbound_worker(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 			all_ours = FALSE;
 			break;
 		}
-		kind = (outer_v6 ? iwan_win_inbound_kind6 : iwan_win_inbound_kind)(s, pkt, len, &o);
+		kind = iwan_win_inbound_kind(s, pkt, len, &o);
 		if (kind == IWAN_WIN_IN_NONE) {
 			all_ours = FALSE;
 			break;
@@ -678,7 +658,7 @@ iwan_win_inbound_worker(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 			UINT8 *pkt = (UINT8 *)NdisGetDataBuffer(nb, lens[i], NULL, 1, 0);
 			IWAN_WIN_OUTER o;
 
-			if (pkt == NULL || !(outer_v6 ? iwan_win_outer_parse6 : iwan_win_outer_parse4)(pkt, lens[i], &o)) {
+			if (pkt == NULL || !iwan_win_dgram_parse(pkt, lens[i], &o)) {
 				IWAN_STAT_INC(ext, rx_bad_hdr);
 				absorb = TRUE;
 				continue;
@@ -752,7 +732,6 @@ done:
 	ExReleaseRundownProtection(&ext->rundown);
 }
 
-/* v6 的两层：M3。当前只放行，绝不改动报文。 */
 /*
  * 出向 v6：判定完全用 v6 目标集合（最长前缀 + 服务器外层地址除外），封装时
  * 外层族由会话决定 —— 所以 v6-in-v4（外层 v4 会话承载内层 v6）与 v6-in-v6
@@ -1053,6 +1032,7 @@ iwan_win_wfp_init(_In_ PDEVICE_OBJECT devobj,
 
 /*
  * 装上数据面：向 BFE 取四个层的层键，然后逐层注册 callout + 过滤器。
+ * 出向两层在 IP 包层；入向两层在**传输层**（协议栈重组之后，见文件头说明）。
  *
  * 为什么不在 DriverEntry 里做：一注册就等于全机每一个出向/入向 IP 包都要
  * 先过我们的 classify，而“能不能加载驱动”和“接管流量”应该分开验证。放到
@@ -1076,13 +1056,13 @@ iwan_win_wfp_start(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 	/* 四个层的层键都在运行时向 BFE 要（见 iwan_win_layer_key 的注释） */
 	st = iwan_win_layer_key(ext, FWPS_LAYER_OUTBOUND_IPPACKET_V4, &lyr_out4);
 	if (NT_SUCCESS(st))
-		st = iwan_win_layer_key(ext, FWPS_LAYER_INBOUND_IPPACKET_V4,
+		st = iwan_win_layer_key(ext, FWPS_LAYER_INBOUND_TRANSPORT_V4,
 					&lyr_in4);
 	if (NT_SUCCESS(st))
 		st = iwan_win_layer_key(ext, FWPS_LAYER_OUTBOUND_IPPACKET_V6,
 					&lyr_out6);
 	if (NT_SUCCESS(st))
-		st = iwan_win_layer_key(ext, FWPS_LAYER_INBOUND_IPPACKET_V6,
+		st = iwan_win_layer_key(ext, FWPS_LAYER_INBOUND_TRANSPORT_V6,
 					&lyr_in6);
 
 	if (NT_SUCCESS(st))

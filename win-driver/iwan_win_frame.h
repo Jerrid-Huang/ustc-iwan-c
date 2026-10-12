@@ -134,6 +134,8 @@ typedef struct _IWAN_WIN_OUTER {
 	UINT32	frame_len;	/* 帧字节数（含 8 字节帧头） */
 	UINT32	inner_off;	/* 内层包相对包首的偏移 */
 	UINT32	inner_len;	/* 内层包长度 */
+	UINT16	sport;		/* 外层 UDP 源端口（网络序，取自 UDP 头本身） */
+	UINT16	dport;		/* 外层 UDP 目的端口 */
 	UINT8	type;
 	UINT8	enc;
 	UINT16	sid;
@@ -197,6 +199,19 @@ BOOLEAN iwan_win_should_tunnel6(_In_reads_(count) const IWAN_WIN_TARGET *targets
  * 不做凭据判断（那是 iwan_win_frame_classify 的事）。 */
 BOOLEAN iwan_win_outer_parse4(_In_reads_bytes_(len) const UINT8 *pkt,
 			      _In_ ULONG len, _Out_ IWAN_WIN_OUTER *out);
+
+/*
+ * 解析"协议栈已重组"的数据报形态：入向 callout 装在 INBOUND_TRANSPORT_V4/V6，
+ * 那里分片已经由协议栈拼好、IP 头已经被摘掉，layerData 从外层 UDP 头开始。
+ * 端口与长度都从 UDP 头本身取，因此这一层不依赖 WFP 固定字段里的端口。
+ *
+ * 兼容"仍带 IP 头"的形态：只有版本号、IHL、协议(UDP)、无分片位四项全部自洽
+ * 时才跳过 IP 头，否则按裸数据报解析 —— 层形态与预期不符时不至于静默失效，
+ * 而误判也进不来：裸数据报偏移 9 那个字节是帧头的 enc 字段（只可能是 0/1），
+ * 永远不可能等于 17。
+ */
+BOOLEAN iwan_win_dgram_parse(_In_reads_bytes_(len) const UINT8 *pkt,
+			     _In_ ULONG len, _Out_ IWAN_WIN_OUTER *out);
 
 /* 帧分类：与 kernel/iwan_rx.c 的 iwan_frame_check 逐条一致 ——
  *   · PT_DATA / PT_DATA_ENC：类型必须与会话 enc 模式一致，且 sid/tok 相符；
