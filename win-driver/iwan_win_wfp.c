@@ -578,7 +578,7 @@ iwan_win_inbound_worker(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 		return;
 	fidx = outer_v6 ? FWPS_FIELD_INBOUND_TRANSPORT_V6_IP_PROTOCOL
 			: FWPS_FIELD_INBOUND_TRANSPORT_V4_IP_PROTOCOL;
-	if (fidx >= inFixedValues->incomingValueCount)
+	if (fidx >= inFixedValues->valueCount)
 		return;
 	if (inFixedValues->incomingValue[fidx].value.type != FWP_UINT8 ||
 	    inFixedValues->incomingValue[fidx].value.uint8 != IWAN_IPPROTO_UDP)
@@ -586,7 +586,7 @@ iwan_win_inbound_worker(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 	IWAN_STAT_INC(ext, rx_batch);
 	fidx = outer_v6 ? FWPS_FIELD_INBOUND_TRANSPORT_V6_IP_REMOTE_ADDRESS
 			: FWPS_FIELD_INBOUND_TRANSPORT_V4_IP_REMOTE_ADDRESS;
-	if (fidx >= inFixedValues->incomingValueCount)
+	if (fidx >= inFixedValues->valueCount)
 		return;
 	if (outer_v6) {
 		if (inFixedValues->incomingValue[fidx].value.type !=
