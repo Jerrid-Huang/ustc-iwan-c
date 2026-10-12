@@ -273,6 +273,21 @@ iwan_win_targets_import(_In_reads_bytes_(in_len) const IWAN_WIN_SESSION_OPEN *re
 	return STATUS_SUCCESS;
 }
 
+/*
+ * ABI 里的端口是"网络序字节"（iwan_win_abi.h 写明 be16；Windows 客户端直接放
+ * sockaddr 的 sin_port，本来就是网络序）。会话内部统一成**大端整数**这一种表示，
+ * 与 IWAN_WIN_OUTER.sport/dport（iwan_win_rd16 读出来的值）一致：
+ *   · 出向用 iwan_win_wr16 写回字节，得到正确的外层端口；
+ *   · 入向闸门拿 iwan_win_rd16 读出的端口直接比。
+ * 曾经原样当 uint16 用，等于两边差一次字节序：入向闸门永远不相等 -> 整批放行，
+ * 外层帧一路交付到用户态套接字；出向封装出去的端口也是反的。
+ */
+static USHORT
+iwan_win_abi_port(_In_ USHORT be)
+{
+	return iwan_win_rd16((const UINT8 *)&be);
+}
+
 /* 参数是否完全一致（用于 SESSION_OPEN 的幂等语义） */
 static BOOLEAN
 iwan_win_session_same(_In_ const IWAN_WIN_SESSION *s,
@@ -284,8 +299,9 @@ iwan_win_session_same(_In_ const IWAN_WIN_SESSION *s,
 	return s->sid == req->sid && s->tok == req->tok && s->enc == req->enc &&
 	       RtlCompareMemory(s->key, req->key, sizeof(s->key)) == sizeof(s->key) &&
 	       s->outer_src == req->outer_src && s->outer_dst == req->outer_dst &&
-	       s->sport == (req->sport != 0 ? req->sport : req->dport) &&
-	       s->dport == req->dport &&
+	       s->sport == iwan_win_abi_port(req->sport != 0 ? req->sport
+							     : req->dport) &&
+	       s->dport == iwan_win_abi_port(req->dport) &&
 	       RtlCompareMemory(s->outer_src6, req->outer_src6, 16) == 16 &&
 	       RtlCompareMemory(s->outer_dst6, req->outer_dst6, 16) == 16 &&
 	       s->flags == req->flags && s->oif_index == req->oif_index &&
@@ -367,8 +383,8 @@ iwan_win_session_open(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	RtlCopyMemory(s->key, req->key, sizeof(s->key));
 	s->outer_src = req->outer_src;
 	s->outer_dst = req->outer_dst;
-	s->sport = req->sport != 0 ? req->sport : req->dport;
-	s->dport = req->dport;
+	s->sport = iwan_win_abi_port(req->sport != 0 ? req->sport : req->dport);
+	s->dport = iwan_win_abi_port(req->dport);
 	RtlCopyMemory(s->outer_src6, req->outer_src6, 16);
 	RtlCopyMemory(s->outer_dst6, req->outer_dst6, 16);
 	s->flags = req->flags;

@@ -271,10 +271,6 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 	UNREFERENCED_PARAMETER(classifyContext);
 	UNREFERENCED_PARAMETER(flowContext);
 
-	/* 临时诊断：出向 callout 有没有被调用（rx_reasm 本无使用者） */
-	if (ext != NULL && nbl != NULL)
-		IWAN_STAT_INC(ext, rx_reasm);
-
 	/* 先把"放行"写进结论，再谈别的。
 	 *
 	 * 本层挂的是**终止型**过滤器：终止型没有"下一条"可继续，结论只能是 PERMIT
@@ -284,11 +280,8 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 	 * 写权限（FWPS_RIGHT_ACTION_WRITE）管的是"能不能收紧成 BLOCK"，不是"能不能
 	 * 放行"：拿不到就只放行、不再收紧。 */
 	classifyOut->actionType = FWP_ACTION_PERMIT;
-	if ((classifyOut->rights & FWPS_RIGHT_ACTION_WRITE) == 0) {
-		if (ext != NULL)	/* 临时诊断：本层没给写权限的次数 */
-			IWAN_STAT_INC(ext, rx_batch);
+	if ((classifyOut->rights & FWPS_RIGHT_ACTION_WRITE) == 0)
 		return;
-	}
 
 	if (ext == NULL || nbl == NULL)
 		return;
@@ -564,10 +557,6 @@ iwan_win_inbound_worker(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 	UNREFERENCED_PARAMETER(classifyContext);
 	UNREFERENCED_PARAMETER(flowContext);
 
-	/* 临时诊断：出向 callout 有没有被调用（rx_reasm 本无使用者） */
-	if (ext != NULL && nbl != NULL)
-		IWAN_STAT_INC(ext, rx_reasm);
-
 	/* 先把"放行"写进结论，再谈别的。
 	 *
 	 * 本层挂的是**终止型**过滤器：终止型没有"下一条"可继续，结论只能是 PERMIT
@@ -577,11 +566,8 @@ iwan_win_inbound_worker(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 	 * 写权限（FWPS_RIGHT_ACTION_WRITE）管的是"能不能收紧成 BLOCK"，不是"能不能
 	 * 放行"：拿不到就只放行、不再收紧。 */
 	classifyOut->actionType = FWP_ACTION_PERMIT;
-	if ((classifyOut->rights & FWPS_RIGHT_ACTION_WRITE) == 0) {
-		if (ext != NULL)	/* 临时诊断：本层没给写权限的次数 */
-			IWAN_STAT_INC(ext, rx_batch);
+	if ((classifyOut->rights & FWPS_RIGHT_ACTION_WRITE) == 0)
 		return;
-	}
 	if (ext == NULL || nbl == NULL)
 		return;
 	s = &ext->sess;
@@ -793,10 +779,6 @@ iwan_win_classify_out6(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 	UNREFERENCED_PARAMETER(classifyContext);
 	UNREFERENCED_PARAMETER(flowContext);
 
-	/* 临时诊断：入向 callout 有没有被调用（rx_batch_skip 本无使用者） */
-	if (ext != NULL && nbl != NULL)
-		IWAN_STAT_INC(ext, rx_batch_skip);
-
 	/* 先把"放行"写进结论，再谈别的。
 	 *
 	 * 本层挂的是**终止型**过滤器：终止型没有"下一条"可继续，结论只能是 PERMIT
@@ -806,11 +788,8 @@ iwan_win_classify_out6(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 	 * 写权限（FWPS_RIGHT_ACTION_WRITE）管的是"能不能收紧成 BLOCK"，不是"能不能
 	 * 放行"：拿不到就只放行、不再收紧。 */
 	classifyOut->actionType = FWP_ACTION_PERMIT;
-	if ((classifyOut->rights & FWPS_RIGHT_ACTION_WRITE) == 0) {
-		if (ext != NULL)	/* 临时诊断：本层没给写权限的次数 */
-			IWAN_STAT_INC(ext, rx_batch);
+	if ((classifyOut->rights & FWPS_RIGHT_ACTION_WRITE) == 0)
 		return;
-	}
 	if (ext == NULL || nbl == NULL)
 		return;
 
