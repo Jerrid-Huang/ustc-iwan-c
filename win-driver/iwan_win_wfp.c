@@ -720,7 +720,11 @@ iwan_win_inbound_worker(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 					absorb = TRUE;
 					break;
 				}
-				if (!NT_SUCCESS(iwan_win_inject_net_recv(
+				if ((ext->test_flags & IWAN_WIN_TEST_NO_INJECT) != 0) {
+					/* 临时诊断：解封与合法性检查都做，就是不注入 ——
+					 * 用来区分"注入本身出问题"与"解封/判定出问题" */
+					IWAN_STAT_INC(ext, rx_batch_skip);
+				} else if (!NT_SUCCESS(iwan_win_inject_net_recv(
 						ext, inner, ilen, fam, ifindex,
 						compartment))) {
 					IWAN_STAT_INC(ext, rx_nomem);

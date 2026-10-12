@@ -155,7 +155,8 @@ typedef struct _IWAN_WIN_DEVICE_EXTENSION {
 #define IWAN_WIN_TEST_SKIP_IN_CALLOUT	0x10000000u	/* 入向两层连 callout 都不注册 */
 #define IWAN_WIN_TEST_NO_IN_FILTER	0x20000000u	/* 入向 callout 注册但不装过滤器 */
 #define IWAN_WIN_TEST_STUB_CLASSIFY	0x40000000u	/* 入向分类函数立刻返回 */
-#define IWAN_WIN_TEST_MASK		0x70000000u
+#define IWAN_WIN_TEST_NO_INJECT		0x08000000u	/* 数据帧只解封校验，不注入内层 */
+#define IWAN_WIN_TEST_MASK		0x78000000u
 
 /* 记录注册进度：写注册表 + 存进 ext（见上面注释） */
 VOID iwan_win_wfp_stage(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext, _In_ ULONG stage);
