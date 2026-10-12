@@ -77,6 +77,20 @@ iwan_win_inject_complete(_In_ VOID *context, _Inout_ NET_BUFFER_LIST *nbl,
 	IWAN_INJECT_CTX *ctx = (IWAN_INJECT_CTX *)context;
 
 	UNREFERENCED_PARAMETER(dispatch_level);
+	/* 临时诊断：入向注入"排队成功"不等于"上栈成功"，完成回调里的
+	 * NET_BUFFER_LIST_STATUS 才是 WFP 的最终裁决。成功/失败各占一个
+	 * 空闲计数器，失败时把状态码原值累加进 rx_reasm（同码多次 -> 可除）。 */
+	if (ctx != NULL && ctx->ext != NULL) {
+		ULONG ist = nbl != NULL ? NET_BUFFER_LIST_STATUS(nbl)
+					: (ULONG)0xC0000001L;
+
+		if (ist == STATUS_SUCCESS)
+			IWAN_STAT_INC(ctx->ext, rx_batch_skip);
+		else {
+			IWAN_STAT_INC(ctx->ext, rx_batch);
+			IWAN_STAT_ADD(ctx->ext, rx_reasm, (LONG64)ist);
+		}
+	}
 	if (nbl != NULL)
 		FwpsFreeNetBufferList(nbl);
 	if (ctx != NULL) {
@@ -620,9 +634,13 @@ iwan_win_inbound_worker(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 			compartment = (UINT16)inMetaValues->compartmentId;
 		/* 入向注入要"这个包是从哪张网卡收到的"，对应元数据里真实存在的
 		 * sourceInterfaceIndex（探测步骤从 fwpsk.h 打出来的名字；我原先写的
-		 * interfaceIndex 根本不是成员）。取不到就留 0，让协议栈按目的地址
-		 * 自己路由 —— 内层包是投给本机的，不影响可达性。 */
-		if (inMetaValues->sourceInterfaceIndex != 0)
+		 * interfaceIndex 根本不是成员）。**必须先问存在性**：元数据是按需
+		 * 填写的，没填的项留在那里的是栈上垃圾，拿它当网卡索引注入，
+		 * 报文会在 WFP 里被静默丢弃。取不到就留 0。 */
+		if (FWPS_IS_METADATA_FIELD_PRESENT(
+			    inMetaValues,
+			    FWPS_METADATA_FIELD_SOURCE_INTERFACE_INDEX) &&
+		    inMetaValues->sourceInterfaceIndex != 0)
 			ifindex = (UINT32)inMetaValues->sourceInterfaceIndex;
 	}
 
