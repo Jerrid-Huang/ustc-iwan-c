@@ -74,7 +74,7 @@ typedef struct _IWAN_WIN_SESSION {
 	UINT8			key[8];
 
 	/* 外层端点（地址/端口为网络序） */
-	UINT32			outer_src;
+	UINT32			outer_src;	/* v4 外层地址，大端整数 */
 	UINT32			outer_dst;
 	UINT16			sport;
 	UINT16			dport;

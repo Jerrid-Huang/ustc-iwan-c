@@ -266,6 +266,7 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 	UINT16 compartment = 0;
 	BOOLEAN all_hit = TRUE;
 	NTSTATUS st;
+	UINT8 od[4];
 
 	UNREFERENCED_PARAMETER(inFixedValues);
 	UNREFERENCED_PARAMETER(classifyContext);
@@ -334,8 +335,9 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 			all_hit = FALSE;
 			break;
 		}
+		iwan_win_wr32(od, s->outer_dst);	/* 会话里是大端整数，这里要字节 */
 		if (!iwan_win_should_tunnel4(s->targets, s->target_count,
-						  (const UINT8 *)&s->outer_dst, pkt + 16)) {
+						  od, pkt + 16)) {
 			all_hit = FALSE;
 			break;
 		}

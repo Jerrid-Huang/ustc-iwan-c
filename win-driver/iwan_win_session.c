@@ -288,6 +288,14 @@ iwan_win_abi_port(_In_ USHORT be)
 	return iwan_win_rd16((const UINT8 *)&be);
 }
 
+/* v4 地址同理：ABI 里是网络序字节，内部统一成大端整数（iwan_win_outer_hdr4
+ * 的参数、WFP 固定字段 IP_LOCAL/REMOTE_ADDRESS 都是这个表示）。 */
+static UINT32
+iwan_win_abi_addr(_In_ UINT32 be)
+{
+	return iwan_win_rd32((const UINT8 *)&be);
+}
+
 /* 参数是否完全一致（用于 SESSION_OPEN 的幂等语义） */
 static BOOLEAN
 iwan_win_session_same(_In_ const IWAN_WIN_SESSION *s,
@@ -298,7 +306,8 @@ iwan_win_session_same(_In_ const IWAN_WIN_SESSION *s,
 		return FALSE;
 	return s->sid == req->sid && s->tok == req->tok && s->enc == req->enc &&
 	       RtlCompareMemory(s->key, req->key, sizeof(s->key)) == sizeof(s->key) &&
-	       s->outer_src == req->outer_src && s->outer_dst == req->outer_dst &&
+	       s->outer_src == iwan_win_abi_addr(req->outer_src) &&
+	       s->outer_dst == iwan_win_abi_addr(req->outer_dst) &&
 	       s->sport == iwan_win_abi_port(req->sport != 0 ? req->sport
 							     : req->dport) &&
 	       s->dport == iwan_win_abi_port(req->dport) &&
@@ -381,8 +390,8 @@ iwan_win_session_open(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	s->tok = req->tok;
 	s->enc = req->enc;
 	RtlCopyMemory(s->key, req->key, sizeof(s->key));
-	s->outer_src = req->outer_src;
-	s->outer_dst = req->outer_dst;
+	s->outer_src = iwan_win_abi_addr(req->outer_src);
+	s->outer_dst = iwan_win_abi_addr(req->outer_dst);
 	s->sport = iwan_win_abi_port(req->sport != 0 ? req->sport : req->dport);
 	s->dport = iwan_win_abi_port(req->dport);
 	RtlCopyMemory(s->outer_src6, req->outer_src6, 16);
