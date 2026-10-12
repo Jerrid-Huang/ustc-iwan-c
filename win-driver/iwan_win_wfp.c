@@ -946,28 +946,35 @@ iwan_win_add_callout(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 }
 
 /*
- * 取某个内建层的层键（layerKey）。
+ * 四个内建层的层键（layerKey）—— 写死的公开常量。
  *
- * 为什么不直接引用 FWPM_LAYER_OUTBOUND_IPPACKET_V4 这些现成符号：它们在 WDK 的
- * km 库里没有定义 —— 链接期报 4 个 unresolved external，fwpkclnt.lib、
- * fwpuclnt.lib、netio.lib 试过都没有。层 ID 是 fwpsk.h 里的枚举常量
- * （FWPS_BUILTIN_LAYERS），不需要任何库；FwpmLayerGetById0 返回的 layerKey
- * 正是过滤器与 callout 要的那个 GUID。这样链接期不再依赖"哪个库导出了层 GUID"。
+ * 数值来源：WDK 用户态的 fwpuclnt.lib（用户态能链到这些符号）。内核态的
+ * fwpkclnt.lib / fwpuclnt.lib / netio.lib 都不导出它们，链接期直接报
+ * unresolved external，所以只能把数值抄进来。
+ *
+ * 曾经的做法是运行时用 FwpmLayerGetById0(engine, FWPS_LAYER_* 枚举值) 反查，
+ * 那个 id 空间与 FWPM 的层 ID 不是一回事：查出来的层键指向别处（很可能落在
+ * ALE 授权层），过滤器装上去之后 callout 的判定根本无法解析 —— 表现为
+ * "会话一开，全机流量立刻中断，两个方向都断，而客体本身活得好好的；callout
+ * 一次都没被调用（所有计数器全 0）；CLOSE 一返回网络立刻恢复"。层键是稳定
+ * 常量，抄数值比隔着 id 空间猜要可靠。
  */
-static NTSTATUS
-iwan_win_layer_key(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext, _In_ UINT16 layer_id,
-		   _Out_ GUID *out)
-{
-	FWPM_LAYER *layer = NULL;
-	NTSTATUS st;
-
-	st = FwpmLayerGetById0(ext->engine, layer_id, &layer);
-	if (!NT_SUCCESS(st))
-		return st;
-	*out = layer->layerKey;
-	FwpmFreeMemory0((void **)&layer);
-	return STATUS_SUCCESS;
-}
+static const GUID IWAN_LAYER_OUT4 = {
+	0x1E5C9FAE, 0x8A84, 0x4135,
+	{ 0xA3, 0x31, 0x95, 0x0B, 0x54, 0x22, 0x9E, 0xCD }
+};					/* FWPM_LAYER_OUTBOUND_IPPACKET_V4 */
+static const GUID IWAN_LAYER_IN4 = {
+	0x5926DFC8, 0xE3CF, 0x4426,
+	{ 0xA2, 0x83, 0xDC, 0x39, 0x3F, 0x5D, 0x0F, 0x9D }
+};					/* FWPM_LAYER_INBOUND_TRANSPORT_V4 */
+static const GUID IWAN_LAYER_OUT6 = {
+	0xA3B3AB6B, 0x3564, 0x488C,
+	{ 0x91, 0x17, 0xF3, 0x4E, 0x82, 0x14, 0x27, 0x63 }
+};					/* FWPM_LAYER_OUTBOUND_IPPACKET_V6 */
+static const GUID IWAN_LAYER_IN6 = {
+	0x634A869F, 0xFC23, 0x4B90,
+	{ 0xB0, 0xC1, 0xBF, 0x62, 0x0A, 0x36, 0xAE, 0x6F }
+};					/* FWPM_LAYER_INBOUND_TRANSPORT_V6 */
 
 NTSTATUS
 iwan_win_wfp_init(_In_ PDEVICE_OBJECT devobj,
@@ -1046,7 +1053,6 @@ iwan_win_wfp_init(_In_ PDEVICE_OBJECT devobj,
 NTSTATUS
 iwan_win_wfp_start(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 {
-	GUID lyr_out4, lyr_in4, lyr_out6, lyr_in6;
 	NTSTATUS st;
 
 	if (InterlockedCompareExchange(&ext->wfp_started, 1, 0) != 0)
@@ -1056,47 +1062,31 @@ iwan_win_wfp_start(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 		return STATUS_INVALID_DEVICE_STATE;
 	}
 
-	/* 四个层的层键都在运行时向 BFE 要（见 iwan_win_layer_key 的注释） */
-	st = iwan_win_layer_key(ext, FWPS_LAYER_OUTBOUND_IPPACKET_V4, &lyr_out4);
-	if (NT_SUCCESS(st)) {
-		st = iwan_win_layer_key(ext, FWPS_LAYER_INBOUND_TRANSPORT_V4,
-					&lyr_in4);
-	}
-	if (NT_SUCCESS(st)) {
-		st = iwan_win_layer_key(ext, FWPS_LAYER_OUTBOUND_IPPACKET_V6,
-					&lyr_out6);
-	}
-	if (NT_SUCCESS(st)) {
-		st = iwan_win_layer_key(ext, FWPS_LAYER_INBOUND_TRANSPORT_V6,
-					&lyr_in6);
-	}
-
-	if (NT_SUCCESS(st)) {
-		st = iwan_win_add_callout(ext, ext->devobj, &IWAN_CALLOUT_OUT4,
-					  iwan_win_classify_out4,
-					  FWP_ACTION_CALLOUT_TERMINATING,
-					  &lyr_out4, L"iwan out4",
-					  &ext->callout_id_out4);
-	}
+	/* 层键是写死的公开常量（见上面四个 GUID 的说明）：不再运行时向 BFE 反查 */
+	st = iwan_win_add_callout(ext, ext->devobj, &IWAN_CALLOUT_OUT4,
+				  iwan_win_classify_out4,
+				  FWP_ACTION_CALLOUT_TERMINATING,
+				  &IWAN_LAYER_OUT4, L"iwan out4",
+				  &ext->callout_id_out4);
 	if (NT_SUCCESS(st)) {
 		st = iwan_win_add_callout(ext, ext->devobj, &IWAN_CALLOUT_IN4,
 					  iwan_win_classify_in4,
 					  FWP_ACTION_CALLOUT_TERMINATING,
-					  &lyr_in4, L"iwan in4",
+					  &IWAN_LAYER_IN4, L"iwan in4",
 					  &ext->callout_id_in4);
 	}
 	if (NT_SUCCESS(st)) {
 		st = iwan_win_add_callout(ext, ext->devobj, &IWAN_CALLOUT_OUT6,
 					  iwan_win_classify_out6,
 					  FWP_ACTION_CALLOUT_TERMINATING,
-					  &lyr_out6, L"iwan out6",
+					  &IWAN_LAYER_OUT6, L"iwan out6",
 					  &ext->callout_id_out6);
 	}
 	if (NT_SUCCESS(st)) {
 		st = iwan_win_add_callout(ext, ext->devobj, &IWAN_CALLOUT_IN6,
 					  iwan_win_classify_in6,
 					  FWP_ACTION_CALLOUT_TERMINATING,
-					  &lyr_in6, L"iwan in6",
+					  &IWAN_LAYER_IN6, L"iwan in6",
 					  &ext->callout_id_in6);
 	}
 	if (!NT_SUCCESS(st)) {
