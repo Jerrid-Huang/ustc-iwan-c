@@ -96,6 +96,10 @@ jobs:
 
       # 把我不确定的 API 原型/结构成员直接从 WDK 头里打出来：猜签名是上一次
       # 反复出错的原因（FwpsInjectNetworkReceiveAsync0 我上一次"修"错了方向）。
+      - name: 枚举 WFP 层 ID -> 层键（核对 FWPS 枚举值能否当 FWPM id 用）
+        shell: pwsh
+        run: pwsh -NoProfile -File .github/probe/wfp-layers.ps1
+
       - name: 查 WDK 头里的原型与结构成员
         continue-on-error: true
         shell: pwsh
