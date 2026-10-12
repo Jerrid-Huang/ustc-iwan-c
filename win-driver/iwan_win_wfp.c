@@ -277,12 +277,13 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 
 	/* 先把"放行"写进结论，再谈别的。
 	 *
-	 * 本层挂的是**终止型**过滤器：callout 若不留下结论，协议栈没有别的依据，
-	 * 只能丢包。曾经这里在"拿不到写权限"时直接 return（什么都没写），现场就是
-	 * "会话一建立、全机流量两个方向立刻中断，客体本身却活得好好的，CLOSE 一
-	 * 返回立刻恢复"。写权限的语义是"能不能收紧成 BLOCK"，不是"能不能放行"：
-	 * 拿不到就只放行、不再收紧。 */
-	classifyOut->actionType = FWP_ACTION_CONTINUE;
+	 * 本层挂的是**终止型**过滤器：终止型没有"下一条"可继续，结论只能是 PERMIT
+	 * 或 BLOCK。写 CONTINUE（"不表态"）的现场是：会话一建立、全机流量两个方向
+	 * 立刻中断 —— 出向 callout 明明被调用了 233 次、每次都返回放行，包却一个都
+	 * 没出去；客体本身活得好好的，CLOSE 一返回立刻恢复。
+	 * 写权限（FWPS_RIGHT_ACTION_WRITE）管的是"能不能收紧成 BLOCK"，不是"能不能
+	 * 放行"：拿不到就只放行、不再收紧。 */
+	classifyOut->actionType = FWP_ACTION_PERMIT;
 	if ((classifyOut->rights & FWPS_RIGHT_ACTION_WRITE) == 0) {
 		if (ext != NULL)	/* 临时诊断：本层没给写权限的次数 */
 			IWAN_STAT_INC(ext, rx_batch);
@@ -569,12 +570,13 @@ iwan_win_inbound_worker(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 
 	/* 先把"放行"写进结论，再谈别的。
 	 *
-	 * 本层挂的是**终止型**过滤器：callout 若不留下结论，协议栈没有别的依据，
-	 * 只能丢包。曾经这里在"拿不到写权限"时直接 return（什么都没写），现场就是
-	 * "会话一建立、全机流量两个方向立刻中断，客体本身却活得好好的，CLOSE 一
-	 * 返回立刻恢复"。写权限的语义是"能不能收紧成 BLOCK"，不是"能不能放行"：
-	 * 拿不到就只放行、不再收紧。 */
-	classifyOut->actionType = FWP_ACTION_CONTINUE;
+	 * 本层挂的是**终止型**过滤器：终止型没有"下一条"可继续，结论只能是 PERMIT
+	 * 或 BLOCK。写 CONTINUE（"不表态"）的现场是：会话一建立、全机流量两个方向
+	 * 立刻中断 —— 出向 callout 明明被调用了 233 次、每次都返回放行，包却一个都
+	 * 没出去；客体本身活得好好的，CLOSE 一返回立刻恢复。
+	 * 写权限（FWPS_RIGHT_ACTION_WRITE）管的是"能不能收紧成 BLOCK"，不是"能不能
+	 * 放行"：拿不到就只放行、不再收紧。 */
+	classifyOut->actionType = FWP_ACTION_PERMIT;
 	if ((classifyOut->rights & FWPS_RIGHT_ACTION_WRITE) == 0) {
 		if (ext != NULL)	/* 临时诊断：本层没给写权限的次数 */
 			IWAN_STAT_INC(ext, rx_batch);
@@ -797,12 +799,13 @@ iwan_win_classify_out6(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 
 	/* 先把"放行"写进结论，再谈别的。
 	 *
-	 * 本层挂的是**终止型**过滤器：callout 若不留下结论，协议栈没有别的依据，
-	 * 只能丢包。曾经这里在"拿不到写权限"时直接 return（什么都没写），现场就是
-	 * "会话一建立、全机流量两个方向立刻中断，客体本身却活得好好的，CLOSE 一
-	 * 返回立刻恢复"。写权限的语义是"能不能收紧成 BLOCK"，不是"能不能放行"：
-	 * 拿不到就只放行、不再收紧。 */
-	classifyOut->actionType = FWP_ACTION_CONTINUE;
+	 * 本层挂的是**终止型**过滤器：终止型没有"下一条"可继续，结论只能是 PERMIT
+	 * 或 BLOCK。写 CONTINUE（"不表态"）的现场是：会话一建立、全机流量两个方向
+	 * 立刻中断 —— 出向 callout 明明被调用了 233 次、每次都返回放行，包却一个都
+	 * 没出去；客体本身活得好好的，CLOSE 一返回立刻恢复。
+	 * 写权限（FWPS_RIGHT_ACTION_WRITE）管的是"能不能收紧成 BLOCK"，不是"能不能
+	 * 放行"：拿不到就只放行、不再收紧。 */
+	classifyOut->actionType = FWP_ACTION_PERMIT;
 	if ((classifyOut->rights & FWPS_RIGHT_ACTION_WRITE) == 0) {
 		if (ext != NULL)	/* 临时诊断：本层没给写权限的次数 */
 			IWAN_STAT_INC(ext, rx_batch);
