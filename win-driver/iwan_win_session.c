@@ -389,6 +389,8 @@ iwan_win_session_open(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 
 	ExReInitializeRundownProtection(&ext->rundown);	/* 放行数据面 */
 	KeReleaseMutex(&ext->ctrl_mutex, FALSE);
+	/* 临时诊断：会话已经放行，数据面从这里开始真的会处理报文 */
+	iwan_win_wfp_stage(ext, 30);
 	return STATUS_SUCCESS;
 }
 

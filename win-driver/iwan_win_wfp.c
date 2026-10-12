@@ -556,6 +556,9 @@ iwan_win_inbound_worker(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 	classifyOut->actionType = FWP_ACTION_CONTINUE;
 	if (ext == NULL || nbl == NULL)
 		return;
+	/* 临时诊断：分类函数立刻返回（只验证"过滤器生效"这一步本身安全） */
+	if ((ext->test_flags & IWAN_WIN_TEST_STUB_CLASSIFY) != 0)
+		return;
 
 	s = &ext->sess;
 	if (s->valid == 0 || iwan_win_session_is_v6(s) != outer_v6)
@@ -891,13 +894,70 @@ iwan_win_notify(_In_ FWPS_CALLOUT_NOTIFY_TYPE notifyType,
 
 /* ---- 注册/注销 -------------------------------------------------------- */
 
+/* ---- 临时诊断：注册进度与分步开关（定位完即撤） ----------------------- */
+
+#define IWAN_WIN_REG_PATH \
+	L"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\iwan"
+
+/*
+ * 把"注册走到哪一步"写进服务注册表键。
+ * 为什么用注册表：它在重启后还在 —— 万一某一步把机器卡死（数据面在
+ * DISPATCH_LEVEL，出问题往往整机不响应），重启后读 WfpStage 就知道卡在哪一步。
+ * 只在 PASSIVE_LEVEL 的控制面路径调用（Zw* 系列要求 PASSIVE_LEVEL）。
+ */
+VOID
+iwan_win_wfp_stage(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext, _In_ ULONG stage)
+{
+	UNICODE_STRING key_name, value_name;
+	OBJECT_ATTRIBUTES oa;
+	HANDLE key = NULL;
+	ULONG v = stage;
+
+	ext->wfp_stage = (LONG)stage;
+	RtlInitUnicodeString(&key_name, IWAN_WIN_REG_PATH);
+	InitializeObjectAttributes(&oa, &key_name,
+				   OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+				   NULL, NULL);
+	if (!NT_SUCCESS(ZwOpenKey(&key, KEY_SET_VALUE, &oa)))
+		return;
+	RtlInitUnicodeString(&value_name, L"WfpStage");
+	ZwSetValueKey(key, &value_name, 0, REG_DWORD, &v, sizeof(v));
+	ZwClose(key);
+}
+
+/* 读分步开关（TestFlags，DWORD）。没有这个值就是 0 = 正常路径。 */
+static ULONG
+iwan_win_wfp_test_flags(VOID)
+{
+	UNICODE_STRING key_name, value_name;
+	OBJECT_ATTRIBUTES oa;
+	HANDLE key = NULL;
+	UCHAR buf[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(ULONG)];
+	KEY_VALUE_PARTIAL_INFORMATION *info = (KEY_VALUE_PARTIAL_INFORMATION *)buf;
+	ULONG len = 0, ret = 0;
+
+	RtlInitUnicodeString(&key_name, IWAN_WIN_REG_PATH);
+	InitializeObjectAttributes(&oa, &key_name,
+				   OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+				   NULL, NULL);
+	if (!NT_SUCCESS(ZwOpenKey(&key, KEY_QUERY_VALUE, &oa)))
+		return 0;
+	RtlInitUnicodeString(&value_name, L"TestFlags");
+	if (NT_SUCCESS(ZwQueryValueKey(key, &value_name, KeyValuePartialInformation,
+				       buf, sizeof(buf), &len)) &&
+	    info->Type == REG_DWORD && info->DataLength == sizeof(ULONG))
+		ret = *(ULONG *)info->Data;
+	ZwClose(key);
+	return ret;
+}
+
 static NTSTATUS
 iwan_win_add_callout(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		     _In_ PDEVICE_OBJECT devobj, _In_ const GUID *key,
 		     _In_ FWPS_CALLOUT_CLASSIFY_FN classify,
 		     _In_ FWP_ACTION_TYPE action,
 		     _In_ const GUID *layer, _In_ PCWSTR name,
-		     _Out_ UINT32 *callout_id)
+		     _Out_ UINT32 *callout_id, _In_ BOOLEAN skip_filter)
 {
 	FWPS_CALLOUT callout;
 	FWPM_CALLOUT mcallout;
@@ -923,6 +983,8 @@ iwan_win_add_callout(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	st = FwpmCalloutAdd(ext->engine, &mcallout, NULL, NULL);
 	if (!NT_SUCCESS(st))
 		return st;
+	if (skip_filter)
+		return STATUS_SUCCESS;	/* 临时诊断：只注册 callout，不装过滤器 */
 
 	RtlZeroMemory(&filter, sizeof(filter));
 	/* 过滤器也用 callout 的 GUID 做键：注销时按 key 删即可（filterKey 与
@@ -1044,6 +1106,8 @@ NTSTATUS
 iwan_win_wfp_start(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 {
 	GUID lyr_out4, lyr_in4, lyr_out6, lyr_in6;
+	ULONG tf;
+	BOOLEAN skip_in, no_in_filter;
 	NTSTATUS st;
 
 	if (InterlockedCompareExchange(&ext->wfp_started, 1, 0) != 0)
@@ -1053,48 +1117,71 @@ iwan_win_wfp_start(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 		return STATUS_INVALID_DEVICE_STATE;
 	}
 
+	/* 临时诊断：分步开关从注册表读（TestFlags），默认 0 = 正常路径 */
+	tf = iwan_win_wfp_test_flags();
+	ext->test_flags = (LONG)tf;
+	skip_in = (tf & IWAN_WIN_TEST_SKIP_IN_CALLOUT) != 0;
+	no_in_filter = (tf & IWAN_WIN_TEST_NO_IN_FILTER) != 0;
+	iwan_win_wfp_stage(ext, 1);
+
 	/* 四个层的层键都在运行时向 BFE 要（见 iwan_win_layer_key 的注释） */
 	st = iwan_win_layer_key(ext, FWPS_LAYER_OUTBOUND_IPPACKET_V4, &lyr_out4);
-	if (NT_SUCCESS(st))
+	iwan_win_wfp_stage(ext, 2);
+	if (NT_SUCCESS(st)) {
 		st = iwan_win_layer_key(ext, FWPS_LAYER_INBOUND_TRANSPORT_V4,
 					&lyr_in4);
-	if (NT_SUCCESS(st))
+		iwan_win_wfp_stage(ext, 3);
+	}
+	if (NT_SUCCESS(st)) {
 		st = iwan_win_layer_key(ext, FWPS_LAYER_OUTBOUND_IPPACKET_V6,
 					&lyr_out6);
-	if (NT_SUCCESS(st))
+		iwan_win_wfp_stage(ext, 4);
+	}
+	if (NT_SUCCESS(st)) {
 		st = iwan_win_layer_key(ext, FWPS_LAYER_INBOUND_TRANSPORT_V6,
 					&lyr_in6);
+		iwan_win_wfp_stage(ext, 5);
+	}
 
-	if (NT_SUCCESS(st))
+	if (NT_SUCCESS(st)) {
 		st = iwan_win_add_callout(ext, ext->devobj, &IWAN_CALLOUT_OUT4,
 					  iwan_win_classify_out4,
 					  FWP_ACTION_CALLOUT_TERMINATING,
 					  &lyr_out4, L"iwan out4",
-					  &ext->callout_id_out4);
-	if (NT_SUCCESS(st))
+					  &ext->callout_id_out4, FALSE);
+		iwan_win_wfp_stage(ext, 6);
+	}
+	if (NT_SUCCESS(st) && !skip_in) {
 		st = iwan_win_add_callout(ext, ext->devobj, &IWAN_CALLOUT_IN4,
 					  iwan_win_classify_in4,
 					  FWP_ACTION_CALLOUT_TERMINATING,
 					  &lyr_in4, L"iwan in4",
-					  &ext->callout_id_in4);
-	if (NT_SUCCESS(st))
+					  &ext->callout_id_in4, no_in_filter);
+		iwan_win_wfp_stage(ext, 7);
+	}
+	if (NT_SUCCESS(st)) {
 		st = iwan_win_add_callout(ext, ext->devobj, &IWAN_CALLOUT_OUT6,
 					  iwan_win_classify_out6,
 					  FWP_ACTION_CALLOUT_TERMINATING,
 					  &lyr_out6, L"iwan out6",
-					  &ext->callout_id_out6);
-	if (NT_SUCCESS(st))
+					  &ext->callout_id_out6, FALSE);
+		iwan_win_wfp_stage(ext, 8);
+	}
+	if (NT_SUCCESS(st) && !skip_in) {
 		st = iwan_win_add_callout(ext, ext->devobj, &IWAN_CALLOUT_IN6,
 					  iwan_win_classify_in6,
 					  FWP_ACTION_CALLOUT_TERMINATING,
 					  &lyr_in6, L"iwan in6",
-					  &ext->callout_id_in6);
+					  &ext->callout_id_in6, no_in_filter);
+		iwan_win_wfp_stage(ext, 9);
+	}
 	if (!NT_SUCCESS(st)) {
 		iwan_win_wfp_stop(ext);		/* 半个数据面比不装更危险 */
 		return st;
 	}
 
 	InterlockedExchange(&ext->wfp_started, 2);
+	iwan_win_wfp_stage(ext, 10);
 	return STATUS_SUCCESS;
 }
 
@@ -1112,6 +1199,7 @@ iwan_win_wfp_stop(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 {
 	if (InterlockedCompareExchange(&ext->wfp_started, 1, 2) != 2)
 		return;				/* 本来就没装，或有人正在装/摘 */
+	iwan_win_wfp_stage(ext, 20);
 
 	if (ext->engine != NULL) {
 		FwpmFilterDeleteByKey0(ext->engine, &IWAN_CALLOUT_OUT4);
