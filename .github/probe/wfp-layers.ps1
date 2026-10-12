@@ -1,11 +1,10 @@
-# 枚举 WFP 层：对 id 0..150 调 FwpmLayerGetById0，打印 id -> 层名与层键。
-# 目的：核对驱动里用 FWPS_LAYER_* 枚举值当 FwpmLayerGetById0 的 id 是否真的
-# 命中"Outbound IP Packet v4 / Inbound Transport v4"这些层。
-# 这个脚本不建会话、不装过滤器，所以不会把网络打死。
-param([int]$Max = 150, [string]$Out = 'C:\iwan\wfp-layers.txt')
+# 在 CI 上核对 WFP 的层 ID 空间：FWPS_LAYER_* 枚举值（out4=4 out6=6 in-transport4=12
+# in-transport6=14）能不能当 FWPM 的层 ID 用，以及它们各自指向哪个层。
+# 顺带用 FwpmLayerEnum0 把全部内建层（id/名字/层键）打出来，作为权威对照。
 $ErrorActionPreference = 'Continue'
+Get-Service BFE | Select-Object Name, Status, StartType | Format-Table | Out-String -Width 120 | Write-Host
 
-$sig = @"
+$cs = @'
 using System;
 using System.Runtime.InteropServices;
 public static class Wfp {
@@ -13,50 +12,65 @@ public static class Wfp {
     public struct GUID { public uint D1; public ushort D2; public ushort D3;
         [MarshalAs(UnmanagedType.ByValArray, SizeConst=8)] public byte[] D4; }
     [StructLayout(LayoutKind.Sequential)]
-    public struct FWPM_DISPLAY_DATA0 { public IntPtr name; public IntPtr description; }
+    public struct DD { public IntPtr name; public IntPtr description; }
     [StructLayout(LayoutKind.Sequential)]
-    public struct FWPM_LAYER0 {
-        public GUID layerKey; public GUID displayData_key_unused;
-        public FWPM_DISPLAY_DATA0 displayData; public uint flags;
-        public uint numFields; public IntPtr field; public GUID defaultSubLayerKey;
-        public ushort layerId; }
+    public struct LAYER { public GUID key; public GUID reserved; public DD dd; public uint flags;
+        public uint numFields; public IntPtr field; public GUID sublayer; public ushort layerId;
+        public ushort reserved2; public ulong reserved3; }
     [StructLayout(LayoutKind.Sequential)]
-    public struct FWPM_SESSION0 { public GUID sessionKey; public FWPM_DISPLAY_DATA0 displayData;
-        public uint flags; public uint txnWaitTimeoutInMSec; public uint processId;
-        public IntPtr sid; public IntPtr username; public int kernelMode; }
+    public struct SESS { public GUID key; public DD dd; public uint flags; public uint tmo;
+        public uint pid; public IntPtr sid; public IntPtr user; public int kernel; }
     [DllImport("fwpuclnt.dll")] public static extern uint FwpmEngineOpen0(
-        [MarshalAs(UnmanagedType.LPWStr)] string serverName, uint authnService,
-        IntPtr authIdentity, ref FWPM_SESSION0 session, out IntPtr engine);
-    [DllImport("fwpuclnt.dll")] public static extern uint FwpmEngineClose0(IntPtr engine);
-    [DllImport("fwpuclnt.dll")] public static extern uint FwpmLayerGetById0(
-        IntPtr engine, ushort id, out IntPtr layer);
+        [MarshalAs(UnmanagedType.LPWStr)] string srv, uint auth, IntPtr id, ref SESS s, out IntPtr e);
+    [DllImport("fwpuclnt.dll")] public static extern uint FwpmEngineClose0(IntPtr e);
+    [DllImport("fwpuclnt.dll")] public static extern uint FwpmLayerCreateEnumHandle0(IntPtr e, IntPtr tpl, out IntPtr h);
+    [DllImport("fwpuclnt.dll")] public static extern uint FwpmLayerEnum0(IntPtr e, IntPtr h, out IntPtr entries, out uint count);
+    [DllImport("fwpuclnt.dll")] public static extern uint FwpmLayerDestroyEnumHandle0(IntPtr e, IntPtr h);
     [DllImport("fwpuclnt.dll")] public static extern void FwpmFreeMemory0(ref IntPtr p);
 }
-"@
-Add-Type -TypeDefinition $sig -ErrorAction Stop
+'@
+Add-Type -TypeDefinition $cs -ErrorAction Stop
 
-$sess = New-Object Wfp+FWPM_SESSION0
-$sess.flags = 0
-$engine = [IntPtr]::Zero
-$rc = [Wfp]::FwpmEngineOpen0($null, 10, [IntPtr]::Zero, [ref]$sess, [ref]$engine)   # 10 = RPC_C_AUTHN_WINNT
-if ($rc -ne 0) { Write-Host "FwpmEngineOpen0 失败 rc=$rc"; exit 1 }
-Write-Host "引擎已打开"
-
-$lines = New-Object System.Collections.Generic.List[string]
-for ($id = 0; $id -le $Max; $id++) {
-    $p = [IntPtr]::Zero
-    $rc = [Wfp]::FwpmLayerGetById0($engine, [uint16]$id, [ref]$p)
-    if ($rc -ne 0 -or $p -eq [IntPtr]::Zero) { continue }
-    $lyr = [System.Runtime.InteropServices.Marshal]::PtrToStructure($p, [type]([Wfp+FWPM_LAYER0]))
-    $name = if ($lyr.displayData.name -ne [IntPtr]::Zero) {
-        [System.Runtime.InteropServices.Marshal]::PtrToStringUni($lyr.displayData.name) } else { '?' }
-    $d4 = ($lyr.layerKey.D4 | ForEach-Object { $_.ToString('x2') }) -join ''
-    $line = "id={0,-4} layerId={1,-4} {2}  key={3:x8}-{4:x4}-{5:x4}-{6}" -f `
-        $id, $lyr.layerId, $name, $lyr.layerKey.D1, $lyr.layerKey.D2, $lyr.layerKey.D3, $d4
-    $lines.Add($line)
-    Write-Host $line
-    [Wfp]::FwpmFreeMemory0([ref]$p)
+function Key-Of($g) {
+    $d4 = ($g.D4 | ForEach-Object { $_.ToString('x2') }) -join ''
+    '{0:x8}-{1:x4}-{2:x4}-{3}' -f $g.D1, $g.D2, $g.D3, $d4
 }
+
+# 引擎打开：把几种 authnService 都试一遍（用户态常用 RPC_C_AUTHN_DEFAULT）
+$engine = [IntPtr]::Zero
+foreach ($auth in @(0xFFFFFFFF, 10, 0)) {
+    $sess = New-Object Wfp+SESS
+    $sess.flags = 0
+    $rc = [Wfp]::FwpmEngineOpen0($null, [uint32]$auth, [IntPtr]::Zero, [ref]$sess, [ref]$engine)
+    Write-Host ("FwpmEngineOpen0 auth={0} rc={1}" -f $auth, $rc)
+    if ($rc -eq 0) { break }
+}
+if ($engine -eq [IntPtr]::Zero) { Write-Host '引擎打不开，后面的核对做不了'; exit 0 }
+
+# 全量枚举，建 id -> 层 的权威表
+$h = [IntPtr]::Zero
+if ([Wfp]::FwpmLayerCreateEnumHandle0($engine, [IntPtr]::Zero, [ref]$h) -eq 0) {
+    $entries = [IntPtr]::Zero; $count = 0
+    if ([Wfp]::FwpmLayerEnum0($engine, $h, [ref]$entries, [ref]$count) -eq 0) {
+        $size = [System.Runtime.InteropServices.Marshal]::SizeOf([type]([Wfp+LAYER]))
+        $map = @{}
+        Write-Host "`n=== 全部内建层（$count 个）==="
+        for ($i = 0; $i -lt $count; $i++) {
+            $p = [IntPtr]::Add($entries, $i * $size)
+            $lyr = [System.Runtime.InteropServices.Marshal]::PtrToStructure($p, [type]([Wfp+LAYER]))
+            $name = if ($lyr.dd.name -ne [IntPtr]::Zero) {
+                [System.Runtime.InteropServices.Marshal]::PtrToStringUni($lyr.dd.name) } else { '?' }
+            $map[[int]$lyr.layerId] = $name
+            Write-Host ("  layerId={0,-4} {1,-42} key={2}" -f $lyr.layerId, $name, (Key-Of $lyr.key))
+        }
+        [Wfp]::FwpmFreeMemory0([ref]$entries)
+        Write-Host "`n=== 驱动用的四个 id 指向谁 ==="
+        foreach ($id in @(4, 6, 12, 14)) {
+            $nm = if ($map.ContainsKey($id)) { $map[$id] } else { '<枚举里没有这个 id>' }
+            Write-Host ("  id={0,-3} -> {1}" -f $id, $nm)
+        }
+    } else { Write-Host 'FwpmLayerEnum0 失败' }
+    [Wfp]::FwpmLayerDestroyEnumHandle0($engine, $h) | Out-Null
+} else { Write-Host 'FwpmLayerCreateEnumHandle0 失败' }
+
 [Wfp]::FwpmEngineClose0($engine) | Out-Null
-$lines | Set-Content -Path $Out -Encoding UTF8
-Write-Host "`n共 $($lines.Count) 层，已写入 $Out"
