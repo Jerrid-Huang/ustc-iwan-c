@@ -563,19 +563,31 @@ iwan_win_inbound_worker(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 	s = &ext->sess;
 	if (s->valid == 0 || iwan_win_session_is_v6(s) != outer_v6)
 		return;
+	/* 临时诊断阶梯（Windows 侧这三个计数器本来是空的）：
+	 *   rx_reasm      = 入向分类被调用次数（过滤器是否真的生效）
+	 *   rx_batch      = 过了"协议是 UDP"这一关的次数
+	 *   rx_batch_skip = 过了"源地址是外层对端"这一关的次数
+	 * 定位完即撤。 */
+	IWAN_STAT_INC(ext, rx_reasm);
 
 	/* 传输层没有 IP 头可看：协议与外层对端地址只能问 WFP 固定字段。
 	 * 取值前先断言类型（类型不符读到的是垃圾），拿不到就放行 —— 判不了
-	 * 归属就不该动这个包。 */
+	 * 归属就不该动这个包。索引先卡上界：固定字段数组是按层实际字段数
+	 * 分配的，越界读就是读别人的内存。 */
 	if (inFixedValues == NULL)
 		return;
 	fidx = outer_v6 ? FWPS_FIELD_INBOUND_TRANSPORT_V6_IP_PROTOCOL
 			: FWPS_FIELD_INBOUND_TRANSPORT_V4_IP_PROTOCOL;
+	if (fidx >= inFixedValues->incomingValueCount)
+		return;
 	if (inFixedValues->incomingValue[fidx].value.type != FWP_UINT8 ||
 	    inFixedValues->incomingValue[fidx].value.uint8 != IWAN_IPPROTO_UDP)
 		return;
+	IWAN_STAT_INC(ext, rx_batch);
 	fidx = outer_v6 ? FWPS_FIELD_INBOUND_TRANSPORT_V6_IP_REMOTE_ADDRESS
 			: FWPS_FIELD_INBOUND_TRANSPORT_V4_IP_REMOTE_ADDRESS;
+	if (fidx >= inFixedValues->incomingValueCount)
+		return;
 	if (outer_v6) {
 		if (inFixedValues->incomingValue[fidx].value.type !=
 			    FWP_BYTE_ARRAY16_TYPE ||
@@ -588,6 +600,7 @@ iwan_win_inbound_worker(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 		    inFixedValues->incomingValue[fidx].value.uint32 != s->outer_dst)
 			return;
 	}
+	IWAN_STAT_INC(ext, rx_batch_skip);
 
 	/* 自己注入的内层包：放行，让它正常往上交付 */
 	if (iwan_win_nbl_from_self(ext->inj_recv4, nbl) ||
