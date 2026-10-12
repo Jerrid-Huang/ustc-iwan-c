@@ -143,23 +143,7 @@ typedef struct _IWAN_WIN_DEVICE_EXTENSION {
 	 * 它只看 sess.valid。 */
 	volatile LONG		wfp_started;
 
-	/* ---- 临时诊断（定位"注册在哪一步卡死"用，定位完即撤）----
-	 * test_flags 从 SESSION_OPEN.flags 的高位带进来，只影响 wfp_start 装什么；
-	 * wfp_stage 是最后完成的注册步骤，同时写一份到服务注册表键下
-	 * （注册表在重启后还在，所以就算这一步把机器卡死，重启后也能读到卡在哪）。 */
-	volatile LONG		test_flags;
-	volatile LONG		wfp_stage;
 } IWAN_WIN_DEVICE_EXTENSION;
-
-/* 临时诊断用的 flags 位（与 ABI 的 IWAN_WIN_FLAG_* 不冲突：只取最高几位） */
-#define IWAN_WIN_TEST_SKIP_IN_CALLOUT	0x10000000u	/* 入向两层连 callout 都不注册 */
-#define IWAN_WIN_TEST_NO_IN_FILTER	0x20000000u	/* 入向 callout 注册但不装过滤器 */
-#define IWAN_WIN_TEST_STUB_CLASSIFY	0x40000000u	/* 入向分类函数立刻返回 */
-#define IWAN_WIN_TEST_NO_INJECT		0x08000000u	/* 数据帧只解封校验，不注入内层 */
-#define IWAN_WIN_TEST_MASK		0x78000000u
-
-/* 记录注册进度：写注册表 + 存进 ext（见上面注释） */
-VOID iwan_win_wfp_stage(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext, _In_ ULONG stage);
 
 #define IWAN_DEVEXT(devobj) \
 	((IWAN_WIN_DEVICE_EXTENSION *)(devobj)->DeviceExtension)
