@@ -114,6 +114,7 @@ jobs:
           P 'INBOUND_TRANSPORT_V4 fields' "$h\fwpsk.h" 'FWPS_FIELD_INBOUND_TRANSPORT_V4_IP_PROTOCOL' 60
           P 'INBOUND_TRANSPORT_V6 fields' "$h\fwpsk.h" 'FWPS_FIELD_INBOUND_TRANSPORT_V6_IP_PROTOCOL' 60
           P 'FWPS_INCOMING_VALUES0 定义' "$h\shared\fwpstypes.h" 'typedef struct FWPS_INCOMING_VALUES0_' 10
+          P 'FWPS_BUILTIN_LAYERS 枚举（层 ID 数值）' "$h\fwpsk.h" 'FWPS_LAYER_OUTBOUND_IPPACKET_V4' 40
           P 'FwpsInjectNetworkReceiveAsync0 原型' "$h\fwpsk.h" 'FwpsInjectNetworkReceiveAsync0' 12
           P 'FWPS_INCOMING_METADATA_VALUES0 的索引/接口成员' "$h\fwpsk.h" 'incomingInterfaceIndex|interfaceIndex|subInterfaceIndex' 1
           P 'FWPM_FILTER0 的上下文成员' "$h\fwpmk.h" 'rawContext|providerContextKey' 2
