@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0 */
+﻿/* SPDX-License-Identifier: GPL-2.0 */
 /*
  * iwan_win_frame.c — 见 iwan_win_frame.h。纯函数，无锁、无分配、无 WDK 依赖。
  */
@@ -100,11 +100,19 @@ iwan_win_inner_fix_csum(_Inout_updates_bytes_(len) UINT8 *pkt, _In_ ULONG len,
 	if (tot == 0 || tot > len)
 		tot = len;
 
-	/* IPv4 头校验和：清零后重算 */
-	pkt[12] = 0;
-	pkt[13] = 0;
+	/* IPv4 头校验和：清零后重算。
+	 * 偏移是 10，不是 12 —— 12 是**源地址**的头两个字节。写错了两件事同时发生：
+	 * 内层源地址被校验和盖掉（现场表现为 122.x.0.2 这种随包递减的值，因为
+	 * IP ID 每包 +2、校验和就每包 -2），回包永远回不来；下面算 L4 伪首部时
+	 * 读的又是同一段被污染的地址，TCP/UDP 校验和跟着一起错。
+	 * 金标用例抓不到它：那边用"含校验和字段时总和为 0xFFFF"自证，而校验和
+	 * 正是对"12/13 清零后的头"算的、又写回同一位置，自洽。
+	 * tests/win_frame_test.c 的 test_inner_fix_csum_keeps_addrs() 以
+	 * "地址必须原样"为锚，专门守这一处。 */
+	pkt[10] = 0;
+	pkt[11] = 0;
 	sum = iwan_win_csum_add(0, pkt, ihl, 0);
-	iwan_win_wr16(pkt + 12, iwan_win_csum_finish(sum));
+	iwan_win_wr16(pkt + 10, iwan_win_csum_finish(sum));
 
 	if (!l4_offloaded)
 		return;
