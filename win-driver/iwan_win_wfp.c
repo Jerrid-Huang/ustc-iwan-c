@@ -459,7 +459,7 @@ static NTSTATUS
 iwan_win_inject_net_recv(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 			 _In_reads_bytes_(len) const UINT8 *inner, _In_ ULONG len,
 			 _In_ UINT32 family, _In_ UINT32 ifindex,
-			 _In_ UINT16 compartment)
+			 _In_ UINT32 sub_ifindex, _In_ UINT16 compartment)
 {
 	IWAN_INJECT_CTX *ctx;
 	NET_BUFFER_LIST *nbl = NULL;
@@ -495,7 +495,8 @@ iwan_win_inject_net_recv(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	 * 打了出来（C2197），按它改回来才是对的：这个 API 没有地址族参数，
 	 * 地址族由注入句柄自己带（inj_recv4 / inj_recv6 分开注册）。 */
 	st = FwpsInjectNetworkReceiveAsync(handle, NULL, 0, compartment,
-					   (IF_INDEX)ifindex, 0, nbl,
+					   (IF_INDEX)ifindex,
+					   (IF_INDEX)sub_ifindex, nbl,
 					   iwan_win_inject_complete, ctx);
 	if (!NT_SUCCESS(st)) {
 		InterlockedDecrement(&ext->inject_outstanding);
@@ -564,6 +565,7 @@ iwan_win_inbound_worker(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 	NET_BUFFER_LIST *cur;
 	UINT16 compartment = 0;
 	UINT32 ifindex = 0;
+	UINT32 sub_ifindex = 0;
 	BOOLEAN all_ours = TRUE, overflow = FALSE;
 	UINT32 kinds[IWAN_WIN_MAX_BATCH];
 	ULONG lens[IWAN_WIN_MAX_BATCH];
@@ -629,21 +631,64 @@ iwan_win_inbound_worker(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 	if (s->valid == 0)
 		goto done;
 
+	/* 入向注入必须告诉 WFP"这个包是从哪张网卡、哪个子接口收到的"，而入向
+	 * 的权威来源是**固定字段**（值本身随层而定，见 fwpsk.h 的
+	 * FWPS_FIELDS_INBOUND_TRANSPORT_V4：INTERFACE_INDEX / SUB_INTERFACE_INDEX）。
+	 * 之前只从元数据取 sourceInterfaceIndex，在 INBOUND_TRANSPORT 上拿不到
+	 * 真值，等于给注入 API 传 interfaceIndex = 0 —— 报文能排进队列（调用返回
+	 * 成功、rx_delivered 照涨），随后被 WFP 异步退回：完成回调里
+	 * NET_BUFFER_LIST_STATUS 全是 0xC000000D（STATUS_INVALID_PARAMETER），
+	 * 33 个包 33 次失败、一次都没上栈。出向注入不需要网卡索引，所以出向
+	 * 一直是通的 —— 这条不对称就是当时的线索。
+	 * 取值前照例卡上界与类型：固定字段按层分配，越界就是读别人的内存。 */
+	fidx = outer_v6 ? FWPS_FIELD_INBOUND_TRANSPORT_V6_INTERFACE_INDEX
+			: FWPS_FIELD_INBOUND_TRANSPORT_V4_INTERFACE_INDEX;
+	if (inFixedValues != NULL && fidx < inFixedValues->valueCount &&
+	    inFixedValues->incomingValue[fidx].value.type == FWP_UINT32)
+		ifindex = inFixedValues->incomingValue[fidx].value.uint32;
+	fidx = outer_v6 ? FWPS_FIELD_INBOUND_TRANSPORT_V6_SUB_INTERFACE_INDEX
+			: FWPS_FIELD_INBOUND_TRANSPORT_V4_SUB_INTERFACE_INDEX;
+	if (inFixedValues != NULL && fidx < inFixedValues->valueCount &&
+	    inFixedValues->incomingValue[fidx].value.type == FWP_UINT32)
+		sub_ifindex = inFixedValues->incomingValue[fidx].value.uint32;
+
 	if (inMetaValues != NULL) {
 		if (FWPS_IS_METADATA_FIELD_PRESENT(
 			    inMetaValues, FWPS_METADATA_FIELD_COMPARTMENT_ID))
 			compartment = (UINT16)inMetaValues->compartmentId;
-		/* 入向注入要"这个包是从哪张网卡收到的"，对应元数据里真实存在的
-		 * sourceInterfaceIndex（探测步骤从 fwpsk.h 打出来的名字；我原先写的
-		 * interfaceIndex 根本不是成员）。**必须先问存在性**：元数据是按需
-		 * 填写的，没填的项留在那里的是栈上垃圾，拿它当网卡索引注入，
-		 * 报文会在 WFP 里被静默丢弃。取不到就留 0。 */
+		/* 兜底：元数据里的 sourceInterfaceIndex。注意它在头文件里紧挨着
+		 * destinationInterfaceIndex，是**出向语义**的成员，入向上通常取不到
+		 * 真值 —— 权威来源是下面那段固定字段。 */
 		if (FWPS_IS_METADATA_FIELD_PRESENT(
 			    inMetaValues,
 			    FWPS_METADATA_FIELD_SOURCE_INTERFACE_INDEX) &&
 		    inMetaValues->sourceInterfaceIndex != 0)
 			ifindex = (UINT32)inMetaValues->sourceInterfaceIndex;
 	}
+
+	/* 临时诊断：把入向注入实际拿到的参数记进三个此刻为 0 的计数器，
+	 * 取值 = 原值 × 注入次数（除以 rx_batch 还原）：
+	 *   tx_bad_state += ifindex（网卡索引）
+	 *   tx_bad_inner += compartment（隔离舱）
+	 *   tx_err       += 元数据掩码：1=有元数据 2=存在源网卡索引项
+	 *                   4=存在隔离舱项 8=源网卡索引非零
+	 * 每个包都退 STATUS_INVALID_PARAMETER 时，先确认喂进去的参数长什么样，
+	 * 再谈 API 用法 —— 计数器是数据面唯一的输出通道。 */
+	IWAN_STAT_ADD(ext, tx_bad_state, (LONG64)ifindex);
+	IWAN_STAT_ADD(ext, tx_bad_inner, (LONG64)compartment);
+	IWAN_STAT_ADD(ext, tx_err,
+		      (LONG64)((inMetaValues != NULL ? 1 : 0) |
+			       (inMetaValues != NULL &&
+				FWPS_IS_METADATA_FIELD_PRESENT(
+					inMetaValues,
+					FWPS_METADATA_FIELD_SOURCE_INTERFACE_INDEX)
+					? 2 : 0) |
+			       (inMetaValues != NULL &&
+				FWPS_IS_METADATA_FIELD_PRESENT(
+					inMetaValues,
+					FWPS_METADATA_FIELD_COMPARTMENT_ID)
+					? 4 : 0) |
+			       (ifindex != 0 ? 8 : 0)));
 
 	/* 第一遍：整块判定。只要有一个包不是我们的（或超出批缓冲），
 	 * 就整块放行 —— 绝不做"吸收一半"。 */
@@ -744,7 +789,7 @@ iwan_win_inbound_worker(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 				}
 				if (!NT_SUCCESS(iwan_win_inject_net_recv(
 						ext, inner, ilen, fam, ifindex,
-						compartment))) {
+						sub_ifindex, compartment))) {
 					IWAN_STAT_INC(ext, rx_nomem);
 				} else {
 					IWAN_STAT_INC(ext, rx_delivered);
