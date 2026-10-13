@@ -154,7 +154,7 @@ iwan_win_nbl_wrap(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
  * 出向吸收又同时取消了发送端的反压 —— 池以 GB/s 量级净增长，秒级耗尽非分页
  * 池，整机硬挂且来不及写 BugCheck（对应 Kernel-Power 41 + 6008）。
  * 超限就丢当前包并计 tx_bad_state，把背压还给协议栈。 */
-#define IWAN_WIN_MAX_INFLIGHT 1024u
+#define IWAN_WIN_MAX_INFLIGHT 4096u
 
 /* 出向被拒/被丢的原因记录（只写不判，用户态经 SHM_QUERY 读）。
  * 只在拒绝路径上写，正常路径零开销。 */
