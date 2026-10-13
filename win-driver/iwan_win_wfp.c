@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0 */
+﻿/* SPDX-License-Identifier: GPL-2.0 */
 /*
  * iwan_win_wfp.c — WFP callout 数据面：出向封装 +（M2）入向解封。
  *
@@ -149,6 +149,13 @@ iwan_win_nbl_wrap(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
  *
  * 失败一律自己回收，绝不让"半封装"的缓冲流出去。
  */
+/* 在途注入上限（每个在途包约占 2 KB 非分页池：缓冲 + MDL + NBL，要等完成
+ * 回调才归还）。没有上限的现场是：洪泛速率远高于承载通道（实测 21k pps），
+ * 出向吸收又同时取消了发送端的反压 —— 池以 GB/s 量级净增长，秒级耗尽非分页
+ * 池，整机硬挂且来不及写 BugCheck（对应 Kernel-Power 41 + 6008）。
+ * 超限就丢当前包并计 tx_bad_state，把背压还给协议栈。 */
+#define IWAN_WIN_MAX_INFLIGHT 1024u
+
 static NTSTATUS
 iwan_win_encap_inject(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		      _In_reads_bytes_(inner_len) const UINT8 *inner,
@@ -166,6 +173,11 @@ iwan_win_encap_inject(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 
 	if (inner_len == 0 || total > 0xFFFF) {
 		return STATUS_INVALID_BUFFER_SIZE;
+	}
+
+	if (ext->inject_outstanding >= IWAN_WIN_MAX_INFLIGHT) {
+		IWAN_STAT_INC(ext, tx_bad_state);
+		return STATUS_DEVICE_BUSY;
 	}
 
 	ctx = (IWAN_INJECT_CTX *)IWAN_ALLOC(sizeof(*ctx), IWAN_TAG_PKT);
@@ -220,6 +232,10 @@ iwan_win_encap_inject(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		/* 注入失败：注入所有权没有转移，自己收回 */
 		InterlockedDecrement(&ext->inject_outstanding);
 		FwpsFreeNetBufferList(nbl);
+		/* 必须置空：fail 分支还会判一次 nbl，不置空就是同一个 NBL 被释放
+		 * 两次 —— 空闲链同一节点挂两遍，两个分配者拿到同一块内存，属于
+		 * 静默的池损坏/随机硬挂（未开 Verifier 不会当场抓）。 */
+		nbl = NULL;
 		goto fail;
 	}
 	return STATUS_SUCCESS;
@@ -295,15 +311,26 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 	 * 写权限（FWPS_RIGHT_ACTION_WRITE）管的是"能不能收紧成 BLOCK"，不是"能不能
 	 * 放行"：拿不到就只放行、不再收紧。 */
 	classifyOut->actionType = FWP_ACTION_PERMIT;
-	if ((classifyOut->rights & FWPS_RIGHT_ACTION_WRITE) == 0)
-		return;
 
 	if (ext == NULL || nbl == NULL)
 		return;
+
+	/* 放行本身不是失败，但**必须留痕**：否则"会话在、包却一个没进隧道"会
+	 * 表现为 17 个计数器全零，和"callout 压根没被调用"完全无法区分。 */
+	if ((classifyOut->rights & FWPS_RIGHT_ACTION_WRITE) == 0) {
+		IWAN_STAT_INC(ext, tx_bad_state);
+		return;
+	}
+
 	/* 快速路径：没有会话时一个 volatile 读就返回（Linux 侧同样先看开关） */
 	s = &ext->sess;
-	if (s->valid == 0 || s->inner_ip == 0)
+	if (s->valid == 0 || s->inner_ip == 0) {
+		/* inner_ip 由客户端填。真实客户端曾经长期不填它 —— 这一支会放行
+		 * 全部出向流量、一个包都不封装，而计数器全零（kdp_win.c:350 有
+		 * 同样的记录）。所以这里必须计数。 */
+		IWAN_STAT_INC(ext, tx_bad_state);
 		return;
+	}
 
 	/* 自己注入的外层包：放行，绝不再封装一层 */
 	if (iwan_win_nbl_from_self(ext->inj_send4, nbl) ||
@@ -359,7 +386,7 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 		 * Linux 参考实现遇到 GSO/巨帧同样是丢（记 tx_bad_state），
 		 * 不做软件分段 —— 这里保持两侧一致，不实现 M1.1 的软件切分。 */
 		if (tot + IWAN_OUTER4_TOTAL > s->carrier_mtu) {
-			IWAN_STAT_INC(ext, tx_bad_inner);
+			IWAN_STAT_INC(ext, tx_bad_state);
 			classifyOut->actionType = FWP_ACTION_BLOCK;
 			classifyOut->flags |= FWPS_CLASSIFY_OUT_FLAG_ABSORB;
 			goto done;
@@ -392,7 +419,12 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 		st = iwan_win_encap_inject(ext, pkt, tot, l4_offloaded, compartment,
 					   iwan_win_session_is_v6(s));
 		if (!NT_SUCCESS(st)) {
+			/* 命中目标集合的包没能进隧道 = 明文会漏到承载网。与"装不下
+			 * 就丢"、以及 v6 侧 done: 的无条件吸收同一条规矩：宁可丢，
+			 * 绝不透传。v4 这里原来只 goto done，动作还是 PERMIT。 */
 			IWAN_STAT_INC(ext, tx_err);
+			classifyOut->actionType = FWP_ACTION_BLOCK;
+			classifyOut->flags |= FWPS_CLASSIFY_OUT_FLAG_ABSORB;
 			goto done;
 		}
 		IWAN_STAT_INC(ext, tx_pkts);
