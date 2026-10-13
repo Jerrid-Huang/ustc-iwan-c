@@ -400,16 +400,46 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 		NET_BUFFER *nb = NET_BUFFER_LIST_FIRST_NB(cur);
 		NDIS_TCP_IP_CHECKSUM_NET_BUFFER_LIST_INFO ci;
 		BOOLEAN l4_offloaded = FALSE;
+		UINT8 hdr[IWAN_OUTER_IP4_LEN];
+		UINT8 *stor = NULL;
 		UINT8 *pkt;
-		ULONG tot;
+		ULONG nblen, tot;
 
-		pkt = (UINT8 *)NdisGetDataBuffer(nb, NET_BUFFER_DATA_LENGTH(nb),
-						 NULL, 1, 0);
-		if (pkt == NULL) {		/* 判定时连续、这里不连续：不可能，保险 */
+		nblen = NET_BUFFER_DATA_LENGTH(nb);
+		/* 判定只需要前 20 字节连续，封装却需要**整包**连续：大包一跨 MDL，
+		 * NdisGetDataBuffer(tot, NULL) 就返回 NULL —— 现场表现是"805 B ICMP
+		 * 进得了隧道、1228 B UDP 一个都进不去"，也就是隧道没有吞吐。
+		 * 这里给一块 tot 大小的非分页缓冲让 NDIS 把散块拼进来；拼好的内容紧
+		 * 接着被封装层整块拷走，所以即用即还，不跨迭代持有。
+		 * tot 上限由上面"装不下就丢"的分支保证（<= carrier_mtu），不会出现
+		 * 巨帧级别的分配。*/
+		pkt = (UINT8 *)NdisGetDataBuffer(nb, IWAN_OUTER_IP4_LEN, hdr, 1, 0);
+		if (pkt == NULL || nblen < IWAN_OUTER_IP4_LEN) {
 			IWAN_STAT_INC(ext, tx_bad_inner);
 			goto done;
 		}
 		tot = iwan_win_rd16(pkt + 2);
+		if (tot < IWAN_OUTER_IP4_LEN || tot > nblen) {
+			IWAN_STAT_INC(ext, tx_bad_inner);
+			goto done;
+		}
+		pkt = (UINT8 *)NdisGetDataBuffer(nb, tot, NULL, 1, 0);
+		if (pkt == NULL) {
+			stor = (UINT8 *)IWAN_ALLOC(tot, IWAN_TAG_PKT);
+			if (stor == NULL) {
+				/* 池压力下不能默默放明文出去 */
+				IWAN_STAT_INC(ext, tx_err);
+				classifyOut->actionType = FWP_ACTION_BLOCK;
+				classifyOut->flags |= FWPS_CLASSIFY_OUT_FLAG_ABSORB;
+				goto done;
+			}
+			pkt = (UINT8 *)NdisGetDataBuffer(nb, tot, stor, 1, 0);
+			if (pkt == NULL) {
+				ExFreePoolWithTag(stor, IWAN_TAG_PKT);
+				IWAN_STAT_INC(ext, tx_bad_inner);
+				goto done;
+			}
+		}
 		/* 出向 IP 包层拿到的报文可能仍带"校验和由网卡补"的标记：
 		 * 内层一旦被 XOR，网卡就再也补不了，所以必须先自己算。 */
 		ci.Value = NET_BUFFER_LIST_INFO(cur, TcpIpChecksumNetBufferListInfo);
@@ -418,6 +448,13 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 
 		st = iwan_win_encap_inject(ext, pkt, tot, l4_offloaded, compartment,
 					   iwan_win_session_is_v6(s));
+		if (stor != NULL) {
+			/* 封装层已整块拷走，这里即用即还 */
+			ExFreePoolWithTag(stor, IWAN_TAG_PKT);
+			/* 必须置空：下一轮若走零拷贝分支不再分配 stor，而循环末尾
+			 * 还会判一次 stor —— 不置空就是同一块缓冲释放两次。 */
+			stor = NULL;
+		}
 		if (!NT_SUCCESS(st)) {
 			/* 命中目标集合的包没能进隧道 = 明文会漏到承载网。与"装不下
 			 * 就丢"、以及 v6 侧 done: 的无条件吸收同一条规矩：宁可丢，
