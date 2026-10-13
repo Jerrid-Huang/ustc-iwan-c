@@ -96,18 +96,6 @@ jobs:
 
       # 把我不确定的 API 原型/结构成员直接从 WDK 头里打出来：猜签名是上一次
       # 反复出错的原因（FwpsInjectNetworkReceiveAsync0 我上一次"修"错了方向）。
-      - name: 取 FWPM 层键真实 GUID（用户态能链到 fwpuclnt.lib 里的符号）
-        shell: pwsh
-        run: |
-          $dev = "$env:ProgramFiles\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\Launch-VsDevShell.ps1"
-          if (Test-Path $dev) { & $dev -Arch amd64 -HostArch amd64 -SkipAutomaticLocation } else { "缺少 VsDevShell: $dev" }
-          cl /nologo /W3 .github\probe\layerkey.c /Fe:layerkey.exe /link fwpuclnt.lib
-          if (Test-Path layerkey.exe) { "=== 层键数值 ==="; .\layerkey.exe } else { "编译/链接失败" }
-
-      - name: 枚举 WFP 层 ID -> 层键（核对 FWPS 枚举值能否当 FWPM id 用）
-        shell: pwsh
-        run: pwsh -NoProfile -File .github/probe/wfp-layers.ps1
-
       - name: 查 WDK 头里的原型与结构成员
         continue-on-error: true
         shell: pwsh
@@ -123,10 +111,6 @@ jobs:
             } else { "缺文件 $file" | Tee-Object -FilePath $log -Append }
           }
           P 'FWPS_INJECT_COMPLETE0 定义' "$h\fwpsk.h" 'typedef.*FWPS_INJECT_COMPLETE0' 3
-          P 'INBOUND_TRANSPORT_V4 fields' "$h\fwpsk.h" 'FWPS_FIELD_INBOUND_TRANSPORT_V4_IP_PROTOCOL' 60
-          P 'INBOUND_TRANSPORT_V6 fields' "$h\fwpsk.h" 'FWPS_FIELD_INBOUND_TRANSPORT_V6_IP_PROTOCOL' 60
-          P 'FWPS_INCOMING_VALUES0 定义' "$h\shared\fwpstypes.h" 'typedef struct FWPS_INCOMING_VALUES0_' 10
-          P 'FWPS_BUILTIN_LAYERS 枚举（层 ID 数值）' "$h\fwpsk.h" 'FWPS_LAYER_OUTBOUND_IPPACKET_V4' 40
           P 'FwpsInjectNetworkReceiveAsync0 原型' "$h\fwpsk.h" 'FwpsInjectNetworkReceiveAsync0' 12
           P 'FWPS_INCOMING_METADATA_VALUES0 的索引/接口成员' "$h\fwpsk.h" 'incomingInterfaceIndex|interfaceIndex|subInterfaceIndex' 1
           P 'FWPM_FILTER0 的上下文成员' "$h\fwpmk.h" 'rawContext|providerContextKey' 2
@@ -174,6 +158,20 @@ jobs:
             "已取到 $($dev.FullName)"
           } else {
             "runner 上没找到 x64 devcon.exe"
+          }
+
+      # 上面两步都是 continue-on-error，所以"工作流成功"从来不等于"编译成功"：
+      # 曾经带着一个 C2220 报 success，而工件里没有 iwan.sys。判据只能是产物。
+      - name: 断言 iwan.sys 真的产出了
+        if: always()
+        shell: pwsh
+        run: |
+          $sys = "$env:GITHUB_WORKSPACE\build\x64\Release\iwan.sys"
+          if (Test-Path $sys) {
+            "iwan.sys 存在：$((Get-Item $sys).Length) 字节"
+          } else {
+            "编译没有产出 iwan.sys —— 本次构建判为失败"
+            exit 1
           }
 
       - name: 回传产物与日志

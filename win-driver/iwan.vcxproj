@@ -69,7 +69,11 @@
 
   <ItemDefinitionGroup>
     <ClCompile>
-      <!-- 与 Linux 模块同一取向：注释与日志用中文，字符集用 Unicode -->
+      <!-- 与 Linux 模块同一取向：注释与日志用中文。
+           必须显式 /utf-8：源文件是 UTF-8，而默认执行字符集是运行器的 1252，
+           中文字符串字面量会报 C4566，配合 TreatWarningAsError 变成 C2220
+           —— 曾经带着这个错报"构建成功"，工件里却没有 iwan.sys。 -->
+      <AdditionalOptions>/source-charset:utf-8 /execution-charset:utf-8 %(AdditionalOptions)</AdditionalOptions>
       <AdditionalIncludeDirectories>$(ProjectDir)..\src\common;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <WarningLevel>Level4</WarningLevel>
       <TreatWarningAsError>true</TreatWarningAsError>

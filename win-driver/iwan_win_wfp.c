@@ -494,7 +494,7 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 			/* 命中目标集合的包没能进隧道 = 明文会漏到承载网。与"装不下
 			 * 就丢"、以及 v6 侧 done: 的无条件吸收同一条规矩：宁可丢，
 			 * 绝不透传。v4 这里原来只 goto done，动作还是 PERMIT。 */
-			iwan_win_diag_tx(s, IWAN_WIN_DIAG_TX_ENCAP_FAIL, len, tot,
+			iwan_win_diag_tx(s, IWAN_WIN_DIAG_TX_ENCAP_FAIL, nblen, tot,
 					 pkt[0], pkt);
 			IWAN_STAT_INC(ext, tx_err);
 			classifyOut->actionType = FWP_ACTION_BLOCK;
