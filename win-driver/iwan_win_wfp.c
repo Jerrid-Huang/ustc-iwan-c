@@ -666,29 +666,16 @@ iwan_win_inbound_worker(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 			ifindex = (UINT32)inMetaValues->sourceInterfaceIndex;
 	}
 
-	/* 临时诊断：把入向注入实际拿到的参数记进三个此刻为 0 的计数器，
-	 * 取值 = 原值 × 注入次数（除以 rx_batch 还原）：
-	 *   tx_bad_state += ifindex（网卡索引）
-	 *   tx_bad_inner += compartment（隔离舱）
-	 *   tx_err       += 元数据掩码：1=有元数据 2=存在源网卡索引项
-	 *                   4=存在隔离舱项 8=源网卡索引非零
-	 * 每个包都退 STATUS_INVALID_PARAMETER 时，先确认喂进去的参数长什么样，
-	 * 再谈 API 用法 —— 计数器是数据面唯一的输出通道。 */
-	IWAN_STAT_ADD(ext, tx_bad_state, (LONG64)ifindex);
-	IWAN_STAT_ADD(ext, tx_bad_inner, (LONG64)compartment);
-	IWAN_STAT_ADD(ext, tx_err,
-		      (LONG64)((inMetaValues != NULL ? 1 : 0) |
-			       (inMetaValues != NULL &&
-				FWPS_IS_METADATA_FIELD_PRESENT(
-					inMetaValues,
-					FWPS_METADATA_FIELD_SOURCE_INTERFACE_INDEX)
-					? 2 : 0) |
-			       (inMetaValues != NULL &&
-				FWPS_IS_METADATA_FIELD_PRESENT(
-					inMetaValues,
-					FWPS_METADATA_FIELD_COMPARTMENT_ID)
-					? 4 : 0) |
-			       (ifindex != 0 ? 8 : 0)));
+	/* 这里曾经临时把 ifindex / compartment / 元数据掩码累加进
+	 * tx_bad_state / tx_bad_inner / tx_err，用来定位"每个包都被退
+	 * STATUS_INVALID_PARAMETER"。线测实测结论（诊断值 = 原值 × 注入次数）：
+	 *   tx_bad_state/12 = 7   —— 网卡索引取自固定字段 INTERFACE_INDEX，是
+	 *                            NDIS 索引（7），与会话里那个 MIB 索引（6）
+	 *                            不是同一套编号；拿错了 WFP 就整批退包；
+	 *   tx_bad_inner/12 = 1   —— 隔离舱 1；
+	 *   tx_err/12       = 15  —— 元数据四项俱全（1|2|4|8）。
+	 * 改对之后 12 个包 12 次注入全部成功（rx_batch_skip=12、rx_batch=0）。
+	 * 这三个计数器已归还给原语义，别再借用 —— 借来的计数器会污染后续测量。 */
 
 	/* 第一遍：整块判定。只要有一个包不是我们的（或超出批缓冲），
 	 * 就整块放行 —— 绝不做"吸收一半"。 */
