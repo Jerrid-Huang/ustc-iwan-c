@@ -202,6 +202,11 @@ iwan_win_encap_inject(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	}
 
 	if (ext->inject_outstanding >= IWAN_WIN_MAX_INFLIGHT) {
+		/* 在途窗口满 = 主动限流，不是封装失败。诊断区必须分开记，
+		 * 否则现场会把"背压丢包"读成"报文畸形"。 */
+		iwan_win_diag_tx(s, IWAN_WIN_DIAG_TX_INFLIGHT, inner_len,
+				 total, inner_len > 0 ? (ULONG)inner[0] : 0xFFFFu,
+				 inner);
 		IWAN_STAT_INC(ext, tx_bad_state);
 		return STATUS_DEVICE_BUSY;
 	}
@@ -497,9 +502,12 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 		if (!NT_SUCCESS(st)) {
 			/* 命中目标集合的包没能进隧道 = 明文会漏到承载网。与"装不下
 			 * 就丢"、以及 v6 侧 done: 的无条件吸收同一条规矩：宁可丢，
-			 * 绝不透传。v4 这里原来只 goto done，动作还是 PERMIT。 */
-			iwan_win_diag_tx(s, IWAN_WIN_DIAG_TX_ENCAP_FAIL, nblen, tot,
-					 pkt[0], pkt);
+			 * 绝不透传。v4 这里原来只 goto done，动作还是 PERMIT。
+			 * 在途窗口满（DEVICE_BUSY）已在 encap_inject 里记过
+			 * INFLIGHT，这里不能再覆盖成 ENCAP_FAIL。 */
+			if (st != STATUS_DEVICE_BUSY)
+				iwan_win_diag_tx(s, IWAN_WIN_DIAG_TX_ENCAP_FAIL,
+						 nblen, tot, pkt[0], pkt);
 			IWAN_STAT_INC(ext, tx_err);
 			classifyOut->actionType = FWP_ACTION_BLOCK;
 			classifyOut->flags |= FWPS_CLASSIFY_OUT_FLAG_ABSORB;
