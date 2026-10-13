@@ -355,8 +355,9 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 			all_hit = FALSE;
 			break;
 		}
-		/* 装不下就丢（fail-closed）：绝不透传明文。
-		 * M1.1 在这里做软件分段（对应 Linux 侧 GSO 分支）。 */
+		/* 装不下就丢（fail-closed）：绝不透传明文，也不让网卡去分。
+		 * Linux 参考实现遇到 GSO/巨帧同样是丢（记 tx_bad_state），
+		 * 不做软件分段 —— 这里保持两侧一致，不实现 M1.1 的软件切分。 */
 		if (tot + IWAN_OUTER4_TOTAL > s->carrier_mtu) {
 			IWAN_STAT_INC(ext, tx_bad_inner);
 			classifyOut->actionType = FWP_ACTION_BLOCK;
@@ -898,9 +899,18 @@ iwan_win_classify_out6(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 							TcpIpChecksumNetBufferListInfo);
 			if (ci.Transmit.TcpChecksum || ci.Transmit.UdpChecksum)
 				l4_offloaded = TRUE;
-			if (l4_offloaded) {
-				/* 分段/校验和卸载的大段：M1.1 尚未做软件切分，
-				 * 保持 fail-closed（计数并吞掉，不发明文） */
+			/* 校验和卸载不等于大段：多数 TCP/UDP 都带这个标记，而网卡
+			 * 补不了已经被 XOR 过的内层，只能自己算。这里与出向 v4 走
+			 * 同一条路 —— l4_offloaded 交给封装层，由
+			 * iwan_win_inner_fix_csum() 补算 L4 校验和。曾经把这一类
+			 * 整批丢弃，等于把绝大多数 v6 流量挡在隧道外。
+			 *
+			 * 真正装不下的大段（LSO/巨帧）仍然 fail-closed：外层 v6
+			 * 不参与分片，内层加封装开销越过承载 MTU 就丢，绝不让网卡
+			 * 再去分。Linux 参考实现遇到 GSO 同样是丢（记
+			 * tx_bad_state），并不做软件分段 —— 所以这里不是缺陷，
+			 * 是两侧一致的选择。 */
+			if (len + IWAN_OUTER6_TOTAL > s->carrier_mtu) {
 				IWAN_STAT_INC(ext, tx_bad_state);
 				continue;
 			}
