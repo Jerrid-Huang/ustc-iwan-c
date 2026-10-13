@@ -1,4 +1,4 @@
-﻿/* SPDX-License-Identifier: GPL-2.0 */
+/* SPDX-License-Identifier: GPL-2.0 */
 /*
  * iwan_win_wfp.c — WFP callout 数据面：出向封装 +（M2）入向解封。
  *
@@ -378,6 +378,7 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 	 * 绝不做"吸收一半"（半个 NBL 被吃掉会让协议栈状态错乱）。 */
 	for (cur = nbl; cur != NULL; cur = NET_BUFFER_LIST_NEXT_NBL(cur)) {
 		NET_BUFFER *nb = NET_BUFFER_LIST_FIRST_NB(cur);
+		UINT8 hdr[IWAN_OUTER_IP4_LEN];
 		UINT8 *pkt;
 		ULONG len, ihl, tot;
 
@@ -387,11 +388,14 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 			break;
 		}
 		len = NET_BUFFER_DATA_LENGTH(nb);
-		/* 需要一个连续的头部才能解析；非线性报文不处理 */
-		pkt = (UINT8 *)NdisGetDataBuffer(nb, len < IWAN_OUTER_IP4_LEN ?
-						      len : IWAN_OUTER_IP4_LEN,
-						 NULL, 1, 0);
-		if (pkt == NULL || len < IWAN_OUTER_IP4_LEN || (pkt[0] >> 4) != 4) {
+		/* 头部可能跨 MDL（UDP 走校验和卸载时就是这样：首部与载荷分属
+		 * 不同的内存块）。给一块 20 字节的栈缓冲让 NDIS 把头部拼进来，
+		 * 不能像以前那样"取不到连续指针就判 HDR_BAD"——那样凡是不连续的
+		 * 出向报文都被放行到承载网，现场表现就是隧道没有吞吐。
+		 * 缓冲只有 20 字节且在栈上，不跨调用、不涉及非分页池。 */
+		pkt = (UINT8 *)NdisGetDataBuffer(nb, IWAN_OUTER_IP4_LEN, hdr, 1, 0);
+		if (pkt == NULL || (pkt[0] >> 4) != 4) {
+			/* pkt == NULL 只可能是报文短于 20 字节（拼不出来） */
 			iwan_win_diag_tx(s, IWAN_WIN_DIAG_TX_HDR_BAD, len, 0,
 					 pkt != NULL ? (ULONG)pkt[0] : 0xFFFFu, pkt);
 			IWAN_STAT_INC(ext, tx_bad_inner);
