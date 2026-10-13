@@ -316,8 +316,6 @@ IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_SESSION_INFO, stats) == 64,
 IWAN_WIN_STATIC_ASSERT(sizeof(IWAN_WIN_SESSION_INFO) == 200,
 		       "IWAN_WIN_SESSION_INFO 必须是 200 字节");
 
-#endif /* IWAN_WIN_ABI_H */
-
 /* ---- 出向拒绝样本（诊断区，只写不判） ---------------------------------
  *
  * 共享页 0x00..0x27 是跨平台布局，0x100 起两边都没用（kernel/iwan_shm.h 的
@@ -352,3 +350,5 @@ typedef struct _IWAN_WIN_DIAG {
 IWAN_WIN_STATIC_ASSERT(sizeof(IWAN_WIN_DIAG) == 40, "IWAN_WIN_DIAG 大小");
 IWAN_WIN_STATIC_ASSERT(IWAN_WIN_SHM_OFF_DIAG + sizeof(IWAN_WIN_DIAG) <= 4096,
 		       "诊断区必须在共享页内");
+
+#endif /* IWAN_WIN_ABI_H */
