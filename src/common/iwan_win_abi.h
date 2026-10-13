@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0 */
+﻿/* SPDX-License-Identifier: GPL-2.0 */
 /*
  * iwan_win_abi.h — Windows 内核数据面（WFP callout）与用户态客户端之间的 ABI。
  *
@@ -317,3 +317,38 @@ IWAN_WIN_STATIC_ASSERT(sizeof(IWAN_WIN_SESSION_INFO) == 200,
 		       "IWAN_WIN_SESSION_INFO 必须是 200 字节");
 
 #endif /* IWAN_WIN_ABI_H */
+
+/* ---- 出向拒绝样本（诊断区，只写不判） ---------------------------------
+ *
+ * 共享页 0x00..0x27 是跨平台布局，0x100 起两边都没用（kernel/iwan_shm.h 的
+ * 偏移止于 0x20）。放这里而不是扩 STATS：SESSION_INFO 的大小与偏移一个都
+ * 不动，用户态旧解析器继续可用。
+ *
+ * 存在的理由：计数器只能说明"被拒了几个"，说明不了"为什么被拒"。UDP 全拒、
+ * ICMP 全过时，只有这一条记录能区分"缓冲区不以 IPv4 首部开头"和"total
+ * length 与 NET_BUFFER 长度矛盾"。
+ */
+#define IWAN_WIN_SHM_OFF_DIAG	0x100
+#define IWAN_WIN_DIAG_MAGIC	0x49574447u	/* 'IWDG' */
+
+#define IWAN_WIN_DIAG_TX_NB_NULL	1
+#define IWAN_WIN_DIAG_TX_HDR_BAD	2	/* 头部不连续/不足 20 字节/非 IPv4 */
+#define IWAN_WIN_DIAG_TX_LEN_BAD	3	/* ihl 或 tot 与 NB 长度矛盾 */
+#define IWAN_WIN_DIAG_TX_MTU		4	/* 加封装开销超过承载 MTU */
+#define IWAN_WIN_DIAG_TX_ENCAP_FAIL	5
+#define IWAN_WIN_DIAG_TX_INFLIGHT	6	/* 在途注入数达上限 */
+#define IWAN_WIN_DIAG_TX_COALESCE	7	/* 第二遍取整包失败 */
+
+typedef struct _IWAN_WIN_DIAG {
+	uint32_t magic;
+	uint32_t reason;
+	uint32_t len;		/* NET_BUFFER_DATA_LENGTH */
+	uint32_t tot;		/* 读到的 IPv4 total length，未取到为 0 */
+	uint32_t pkt0;		/* 被拒缓冲区首字节，未取到为 0xFFFF */
+	uint32_t seq;		/* 每次写入自增，读者据此判断记录已更新 */
+	uint8_t  first[16];	/* 被拒缓冲区前 16 字节 */
+} IWAN_WIN_DIAG, *PIWAN_WIN_DIAG;
+
+IWAN_WIN_STATIC_ASSERT(sizeof(IWAN_WIN_DIAG) == 40, "IWAN_WIN_DIAG 大小");
+IWAN_WIN_STATIC_ASSERT(IWAN_WIN_SHM_OFF_DIAG + sizeof(IWAN_WIN_DIAG) <= 4096,
+		       "诊断区必须在共享页内");

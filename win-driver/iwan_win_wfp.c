@@ -156,6 +156,32 @@ iwan_win_nbl_wrap(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
  * 超限就丢当前包并计 tx_bad_state，把背压还给协议栈。 */
 #define IWAN_WIN_MAX_INFLIGHT 1024u
 
+/* 出向被拒/被丢的原因记录（只写不判，用户态经 SHM_QUERY 读）。
+ * 只在拒绝路径上写，正常路径零开销。 */
+static VOID
+iwan_win_diag_tx(_Inout_ IWAN_WIN_SESSION *s, _In_ UINT32 reason,
+		 _In_ ULONG len, _In_ ULONG tot, _In_ ULONG pkt0,
+		 _In_reads_bytes_opt_(len) const UINT8 *pkt)
+{
+	IWAN_WIN_DIAG *d;
+	ULONG n;
+
+	if (s->shm == NULL)
+		return;
+	d = (IWAN_WIN_DIAG *)((UINT8 *)s->shm + IWAN_WIN_SHM_OFF_DIAG);
+	d->magic = IWAN_WIN_DIAG_MAGIC;
+	d->reason = reason;
+	d->len = (UINT32)len;
+	d->tot = (UINT32)tot;
+	d->pkt0 = (UINT32)pkt0;
+	RtlZeroMemory(d->first, sizeof(d->first));
+	if (pkt != NULL) {
+		n = len < sizeof(d->first) ? len : sizeof(d->first);
+		RtlCopyMemory(d->first, pkt, n);
+	}
+	InterlockedIncrement((volatile LONG *)&d->seq);
+}
+
 static NTSTATUS
 iwan_win_encap_inject(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		      _In_reads_bytes_(inner_len) const UINT8 *inner,
@@ -356,6 +382,7 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 		ULONG len, ihl, tot;
 
 		if (nb == NULL) {
+			iwan_win_diag_tx(s, IWAN_WIN_DIAG_TX_NB_NULL, 0, 0, 0xFFFFu, NULL);
 			all_hit = FALSE;
 			break;
 		}
@@ -365,6 +392,8 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 						      len : IWAN_OUTER_IP4_LEN,
 						 NULL, 1, 0);
 		if (pkt == NULL || len < IWAN_OUTER_IP4_LEN || (pkt[0] >> 4) != 4) {
+			iwan_win_diag_tx(s, IWAN_WIN_DIAG_TX_HDR_BAD, len, 0,
+					 pkt != NULL ? (ULONG)pkt[0] : 0xFFFFu, pkt);
 			IWAN_STAT_INC(ext, tx_bad_inner);
 			all_hit = FALSE;
 			break;
@@ -372,6 +401,7 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 		ihl = (ULONG)(pkt[0] & 0x0F) * 4;
 		tot = iwan_win_rd16(pkt + 2);
 		if (ihl < IWAN_OUTER_IP4_LEN || tot < ihl || tot > len) {
+			iwan_win_diag_tx(s, IWAN_WIN_DIAG_TX_LEN_BAD, len, tot, pkt[0], pkt);
 			IWAN_STAT_INC(ext, tx_bad_inner);
 			all_hit = FALSE;
 			break;
@@ -386,6 +416,7 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 		 * Linux 参考实现遇到 GSO/巨帧同样是丢（记 tx_bad_state），
 		 * 不做软件分段 —— 这里保持两侧一致，不实现 M1.1 的软件切分。 */
 		if (tot + IWAN_OUTER4_TOTAL > s->carrier_mtu) {
+			iwan_win_diag_tx(s, IWAN_WIN_DIAG_TX_MTU, len, tot, pkt[0], pkt);
 			IWAN_STAT_INC(ext, tx_bad_state);
 			classifyOut->actionType = FWP_ACTION_BLOCK;
 			classifyOut->flags |= FWPS_CLASSIFY_OUT_FLAG_ABSORB;
@@ -415,6 +446,8 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 		 * 巨帧级别的分配。*/
 		pkt = (UINT8 *)NdisGetDataBuffer(nb, IWAN_OUTER_IP4_LEN, hdr, 1, 0);
 		if (pkt == NULL || nblen < IWAN_OUTER_IP4_LEN) {
+			iwan_win_diag_tx(s, IWAN_WIN_DIAG_TX_COALESCE, nblen, 0,
+					 pkt != NULL ? (ULONG)pkt[0] : 0xFFFFu, pkt);
 			IWAN_STAT_INC(ext, tx_bad_inner);
 			goto done;
 		}
@@ -435,6 +468,8 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 			}
 			pkt = (UINT8 *)NdisGetDataBuffer(nb, tot, stor, 1, 0);
 			if (pkt == NULL) {
+				iwan_win_diag_tx(s, IWAN_WIN_DIAG_TX_COALESCE,
+						 nblen, tot, 0xFFFFu, NULL);
 				ExFreePoolWithTag(stor, IWAN_TAG_PKT);
 				IWAN_STAT_INC(ext, tx_bad_inner);
 				goto done;
@@ -459,6 +494,8 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 			/* 命中目标集合的包没能进隧道 = 明文会漏到承载网。与"装不下
 			 * 就丢"、以及 v6 侧 done: 的无条件吸收同一条规矩：宁可丢，
 			 * 绝不透传。v4 这里原来只 goto done，动作还是 PERMIT。 */
+			iwan_win_diag_tx(s, IWAN_WIN_DIAG_TX_ENCAP_FAIL, len, tot,
+					 pkt[0], pkt);
 			IWAN_STAT_INC(ext, tx_err);
 			classifyOut->actionType = FWP_ACTION_BLOCK;
 			classifyOut->flags |= FWPS_CLASSIFY_OUT_FLAG_ABSORB;
