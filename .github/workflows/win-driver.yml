@@ -242,6 +242,19 @@ jobs:
           P2 'ExInitializeDriverRuntime 原型' 'ExInitializeDriverRuntime\(' 4 1
           P2 'NdisAllocateNetBufferAndNetBufferList 原型' 'NdisAllocateNetBufferAndNetBufferList\(' 8 1
           P2 'NdisMQueryAdapterInstanceName/接口辅助' 'NdisMQueryAdapterInstanceName\(' 6 1
+          # 第四轮：NdisMRegisterMiniportDriver 在客体上返回 0xC0010005，必须知道
+          # 这个名字；顺带把头部原件抓进工件，之后本地就能直接 grep，省掉往返。
+          P2 'NDIS_STATUS 0xC00100xx 定义' 'define +NDIS_STATUS_[A-Z_0-9]+ +\(' 1 40
+          P2 'NDIS_RUNTIME_VERSION_ 定义' 'define +NDIS_RUNTIME_VERSION_' 1 40
+          P2 'NDIS_MINIPORT_DRIVER_CHARACTERISTICS_REVISION 定义' 'define +NDIS_SIZEOF_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_' 1 20
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\wdk-src" | Out-Null
+          foreach ($f in @('ndis.h', 'nblapi.h', 'miniportgeneralattributes.h', 'netioapi.h')) {
+            $p = Join-Path $h $f
+            if (Test-Path $p) { Copy-Item $p "$env:GITHUB_WORKSPACE\wdk-src\" -Force }
+          }
+          Copy-Item "$env:WDKINC\shared\ndis\version.h" "$env:GITHUB_WORKSPACE\wdk-src\ndis-version.h" -Force -ErrorAction SilentlyContinue
+          Get-ChildItem "$env:GITHUB_WORKSPACE\wdk-src" -ErrorAction SilentlyContinue |
+            Select-Object Name, Length | Out-String | Tee-Object -FilePath $log -Append
 
       # 第三轮：两个编译期问题只能让编译器回答。
       #   · iwanmp 同时是微型端口与协议驱动，工程该定义哪几个版本宏？
@@ -427,6 +440,7 @@ jobs:
             build/x64/Release/iwanmp.sys
             build/x64/Release/iwanmp.pdb
             win-driver/iwanmp.inf
+            wdk-src/**
             out/devcon.exe
             **/*.log
           if-no-files-found: warn
