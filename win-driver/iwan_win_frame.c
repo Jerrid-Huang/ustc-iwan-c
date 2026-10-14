@@ -1,4 +1,4 @@
-﻿/* SPDX-License-Identifier: GPL-2.0 */
+/* SPDX-License-Identifier: GPL-2.0 */
 /*
  * iwan_win_frame.c — 见 iwan_win_frame.h。纯函数，无锁、无分配、无 WDK 依赖。
  */
@@ -19,14 +19,65 @@ iwan_win_build_frame_hdr(_Out_writes_bytes_(IWAN_FRAME_HDR_LEN) UINT8 *out,
 	out[7] = (UINT8)tok;
 }
 
+/*
+ * 把 8 字节密钥旋转到"从 off 开始"的相位，得到一个 64 位掩码字。
+ * 逐字节写法是 p[i] ^= key[(off + i) & 7]；按 8 字节分组时组内第 j 字节
+ * 对应的密钥下标是 (off + j) & 7（组起始下标是 8 的倍数），与掩码字的
+ * 第 j 个字节一致，所以两种写法逐位等价，与主机字节序无关。
+ */
+static UINT64
+iwan_win_xor_mask(_In_reads_bytes_(IWAN_KEY_LEN) const UINT8 *key, _In_ ULONG off)
+{
+	UINT64 k = 0;
+	ULONG j;
+
+	for (j = 0; j < IWAN_KEY_LEN; j++)
+		k |= (UINT64)key[(off + j) & (IWAN_KEY_LEN - 1)] << (8 * j);
+	return k;
+}
+
 VOID
 iwan_win_xor(_Inout_updates_bytes_(len) UINT8 *p, _In_ ULONG len,
 	     _In_reads_bytes_(IWAN_KEY_LEN) const UINT8 *key, _In_ ULONG off)
 {
-	ULONG i;
+	UINT64 k = iwan_win_xor_mask(key, off);
+	ULONG i = 0;
 
-	for (i = 0; i < len; i++)
+	/* 每轮一个 64 位字；用 RtlCopyMemory 取值与回写，未对齐也安全 */
+	while (i + IWAN_KEY_LEN <= len) {
+		UINT64 v;
+
+		RtlCopyMemory(&v, p + i, sizeof(v));
+		v ^= k;
+		RtlCopyMemory(p + i, &v, sizeof(v));
+		i += IWAN_KEY_LEN;
+	}
+	for (; i < len; i++)
 		p[i] ^= key[(off + i) & (IWAN_KEY_LEN - 1)];
+}
+
+/*
+ * 拷贝与解密一遍完成，等价于"先逐字节拷贝、再 iwan_win_xor(out, len, key, 0)"。
+ * 调用方保证 out 与 in 不重叠：驱动里 out 是新分配的解封缓冲。
+ */
+static VOID
+iwan_win_copy_dec(_Out_writes_bytes_(len) UINT8 *out,
+		  _In_reads_bytes_(len) const UINT8 *in, _In_ ULONG len,
+		  _In_reads_bytes_(IWAN_KEY_LEN) const UINT8 *key)
+{
+	UINT64 k = iwan_win_xor_mask(key, 0);
+	ULONG i = 0;
+
+	while (i + IWAN_KEY_LEN <= len) {
+		UINT64 v;
+
+		RtlCopyMemory(&v, in + i, sizeof(v));
+		v ^= k;
+		RtlCopyMemory(out + i, &v, sizeof(v));
+		i += IWAN_KEY_LEN;
+	}
+	for (; i < len; i++)
+		out[i] = in[i] ^ key[i & (IWAN_KEY_LEN - 1)];
 }
 
 USHORT
@@ -323,10 +374,10 @@ iwan_win_decap(_In_reads_bytes_(len) const UINT8 *pkt, _In_ ULONG len,
 	if (o->inner_off + o->inner_len > len)
 		return 0;
 
-	for (ULONG i = 0; i < o->inner_len; i++)
-		out[i] = pkt[o->inner_off + i];
 	if (o->enc)
-		iwan_win_xor(out, o->inner_len, key, 0);
+		iwan_win_copy_dec(out, pkt + o->inner_off, o->inner_len, key);
+	else
+		RtlCopyMemory(out, pkt + o->inner_off, o->inner_len);
 	return o->inner_len;
 }
 
