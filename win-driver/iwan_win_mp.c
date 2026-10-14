@@ -570,6 +570,11 @@ iwan_win_mp_init(_In_ PDRIVER_OBJECT driver, _In_ PDEVICE_OBJECT devobj,
 	ExInitializeDriverRuntime(DrvRtPoolNxOptIn);
 	KeInitializeSpinLock(&ext->mp.lock);
 
+	/* 阶段 30 记的是"环境"：T30 = NdisGetVersion()（形如 0x00060055 表示
+	 * NDIS 6.85）。注册失败时要能区分"驱动写错了"与"这台机器的 NDIS
+	 * 比驱动声明的版本还旧"，这一条是唯一的判据。 */
+	iwan_win_mp_trace(30, (LONG)NdisGetVersion());
+
 	RtlZeroMemory(&ch, sizeof(ch));
 	ch.Header.Type = NDIS_OBJECT_TYPE_MINIPORT_DRIVER_CHARACTERISTICS;
 	ch.Header.Revision = NDIS_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_1;

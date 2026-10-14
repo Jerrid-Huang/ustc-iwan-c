@@ -87,6 +87,7 @@ VOID
 iwan_win_mp_trace(_In_ ULONG stage, _In_ LONG status)
 {
 	UNICODE_STRING path, vn;
+	PCWSTR name;
 	OBJECT_ATTRIBUTES oa;
 	HANDLE key = NULL;
 
@@ -104,6 +105,28 @@ iwan_win_mp_trace(_In_ ULONG stage, _In_ LONG status)
 	(void)ZwSetValueKey(key, &vn, 0, REG_DWORD, &stage, sizeof(stage));
 	RtlInitUnicodeString(&vn, L"Status");
 	(void)ZwSetValueKey(key, &vn, 0, REG_DWORD, &status, sizeof(status));
+
+	/* 每个阶段再各写一个不会互相覆盖的键：Stage/Status 只留最后一次，
+	 * 而"哪一步失败"往往要靠更早的那一次才能判读（后写的会盖掉先写的）。 */
+	switch (stage) {
+	case 1:  name = L"T1";  break;
+	case 2:  name = L"T2";  break;
+	case 3:  name = L"T3";  break;
+	case 4:  name = L"T4";  break;
+	case 10: name = L"T10"; break;
+	case 11: name = L"T11"; break;
+	case 12: name = L"T12"; break;
+	case 20: name = L"T20"; break;
+	case 21: name = L"T21"; break;
+	case 22: name = L"T22"; break;
+	case 30: name = L"T30"; break;
+	default: name = NULL;   break;
+	}
+	if (name != NULL) {
+		RtlInitUnicodeString(&vn, name);
+		(void)ZwSetValueKey(key, &vn, 0, REG_DWORD, &status,
+				    sizeof(status));
+	}
 	ZwClose(key);
 }
 #endif /* IWAN_WIN_PLANE_MP */
