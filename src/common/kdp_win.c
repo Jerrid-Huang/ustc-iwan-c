@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <wchar.h>      /* wcscmp：按设备路径判别是哪个内核平面 */
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -394,6 +395,18 @@ int kdp_win_run(int sockfd, const uint8_t xor_key[8], uint16_t sid, uint32_t tok
         log_debug("Windows 内核数据面: 默认路由 %s dev %s metric %s",
                   ogw, odev, ometric);
     }
+    /* NDIS 平面：内层适配器是本驱动自己的那张，Windows 给它的连接名由系统
+     * 决定（"Local Area Connection"，重装后带序号），而 route_setup 与 netsh
+     * 只认名字 —— 先把它对上我们约定的别名。WFP 平面的内层适配器是用户用
+     * KM-TEST 建的、名字由 --dev 给定，不走这一步。 */
+    if (device_path != NULL && wcscmp(device_path, IWAN_WIN_USER_PATH_MP) == 0 &&
+        !route_iface_ensure_name(tun, IWAN_WIN_MP_ADAPTER_DESC)) {
+        log_err("Windows 内核数据面: 找不到描述为 \"%s\" 的内层适配器"
+                "（--dev %s）", IWAN_WIN_MP_ADAPTER_DESC, tun);
+        rc = -1;
+        goto out;
+    }
+
     if (routes.n > 0 || routes6.n > 0) {
         if (!route_setup(tun, auth_tun_ip, auth_mtu, server, ogw, odev,
                          ometric, &routes, &routes6)) {

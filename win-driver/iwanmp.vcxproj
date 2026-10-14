@@ -114,7 +114,7 @@
          REVISION_3 与 SynchronousOidRequestHandler 都在那个门后面——注册
          时要能按运行时版本挑最新 revision，编译期就得先有它。 -->
     <ClCompile Include="iwan_win_mp.c">
-      <PreprocessorDefinitions>NDIS_MINIPORT_DRIVER;NDIS620_MINIPORT;NDIS683_MINIPORT;NDIS_WDM;IWAN_WIN_PLANE_MP</PreprocessorDefinitions>
+      <PreprocessorDefinitions>NDIS_MINIPORT_DRIVER;NDIS620_MINIPORT;NDIS683_MINIPORT;NDIS_WDM;IWAN_WIN_PLANE_MP;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>

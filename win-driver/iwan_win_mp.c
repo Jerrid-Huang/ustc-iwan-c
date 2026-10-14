@@ -586,7 +586,7 @@ iwan_win_mp_sync_oid(_In_ NDIS_HANDLE MiniportAdapterHandle,
  * 与 revision 严格对应：选了高 revision 就必须给齐那一档的字段。 */
 static VOID
 iwan_win_mp_fill_ch(_Out_ PNDIS_MINIPORT_DRIVER_CHARACTERISTICS ch,
-		    _In_ UINT16 minor, _In_ UCHAR revision)
+		    _In_ UCHAR minor, _In_ UCHAR revision)
 {
 	RtlZeroMemory(ch, sizeof(*ch));
 	ch->Header.Type = NDIS_OBJECT_TYPE_MINIPORT_DRIVER_CHARACTERISTICS;
@@ -666,7 +666,7 @@ iwan_win_mp_register(_In_ PDRIVER_OBJECT driver,
 				NDIS_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_3;
 			NDIS_STATUS st;
 
-			iwan_win_mp_fill_ch(&ch, minor, rev);
+			iwan_win_mp_fill_ch(&ch, (UCHAR)minor, rev);
 			st = NdisMRegisterMiniportDriver(driver, registry_path,
 							 ext, &ch,
 							 &ext->mp.mp_handle);
