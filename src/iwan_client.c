@@ -836,9 +836,11 @@ static int proxy_tun_prepare(const CmdOpts *o, struct RelayProxy **rp)
     if (fd < 0) {
         e = errno;
 #ifdef _WIN32
-        log_err("Error: open tun failed (see earlier log; wintun.dll must "
-                "sit next to the executable and the wintun driver must be "
-                "installed)");
+        /* errno 的取值在 Windows 上没有可动作的区分（见下面那段 Linux
+         * 分支的分类），所以只把它打出来，不做判断。 */
+        log_err("Error: open tun failed (errno=%d, %s; see earlier log; "
+                "wintun.dll must sit next to the executable and the wintun "
+                "driver must be installed)", e, strerror(e));
 #else
         if (e == EBUSY || e == EEXIST || e == EINVAL)
             log_err("Error: 打开 TUN 设备 %s 失败：内核拒绝了这个名字（%s）\n"
@@ -1220,8 +1222,15 @@ static int cmd_proxy(int argc, char **argv, int start)
 #if defined(_WIN32)
             if (!kdp_win_plane_precheck(win_device_path(plane),
                                         perr, sizeof(perr), &busy)) {
-#else
+#elif defined(__linux__)
             if (!kdp_plane_precheck(perr, sizeof(perr), &busy)) {
+#else
+            /* 别的平台没有内核数据面（cli_common 的 validate_data_plane
+             * 早就不让 --data-plane kernel 通过，auto 也不会落到它上面），
+             * 这一段只是为了让三平台都能编译。 */
+            (void)busy;
+            snprintf(perr, sizeof perr, "本平台没有内核数据面");
+            if (true) {
 #endif
                 log_err("内核数据面: %s", perr);
                 if (plane_auto && !busy) {

@@ -27,8 +27,23 @@
 #define RATE_BUCKETS_PER_SHARD  (RATE_BUCKETS / RATE_SHARDS)
 #define RATE_GATE_WAYS          16
 
+/* 族无关的限速键。v6 的 128 位地址必须全部参与（绝不能只取前 4 字节：同
+ * 一个 /32 前缀下一堆 v6 客户端会被并成一桶，20/s 的 OPEN 预算被单个客户
+ * 端吃光）；v4 走的哈希与加 v6 之前逐位相同，所以 v4 的限速口径与桶分布
+ * 完全不变。 */
+struct rate_key {
+    uint8_t addr[16];   /* 网络序；AF_INET 只用 addr[0..3]，其余为 0 */
+    uint8_t fam;        /* AF_INET / AF_INET6 */
+};
+
 struct rate_bucket {
-    uint32_t ip;       /* network-order source address */
+    /* 存完整源地址（不是索引哈希）：v4 的键就是精确的 32 位地址，v6 是
+     * 精确的 16 字节地址，不同源绝不共桶。 */
+    struct rate_key key;
+    /* 槽位是否已被占用。显式 valid 位取代旧的 `ip != 0` 空槽哨兵：v6 地址
+     * 的前 4 字节常常是 0（::1、::ffff:0:x…），旧哨兵会把不同源当成同一个
+     * 空槽。 */
+    bool valid;
     uint64_t win;      /* window start (monotonic ms) */
     uint32_t open_cnt, ping_cnt, echo_cnt;
     uint32_t miss_cnt;
@@ -44,7 +59,11 @@ struct rate_shard {
 static struct rate_shard g_rate_shards[RATE_SHARDS];
 
 struct rate_gate {
-    _Atomic uint32_t ip;            /* network-order source address */
+    /* 完整源身份：v4 = 32 位网络序地址（与旧实现存的 ip 逐位相同），
+     * v6 = 64 位 FNV-1a 哈希（碰撞概率 2^-64，槽位只做 "该源超预算" 的
+     * 记忆，不是计数表）。 */
+    _Atomic uint64_t id;
+    _Atomic uint8_t valid;          /* 显式占用位，取代 `ip != 0` 哨兵 */
     _Atomic uint64_t over_until_ms; /* budget refills at this monotonic ms */
 };
 
@@ -155,53 +174,131 @@ void server_rate_limits_init(void)
     g_up_throttle_ms = rate_limit_env("IWAN_SRV_THROTTLE_MS", SRV_THROTTLE_DEFAULT_MS);
 }
 
-static inline unsigned rate_ip_shard(uint32_t ip)
+/* 从规范化后的外层对端构造限速键 */
+static struct rate_key rate_key_from_peer(const struct iwan_peer *peer)
 {
-    unsigned h = (unsigned)((ip * RATE_HASH_MUL) >> RATE_HASH_SHIFT);
-    return (h >> RATE_SHARD_BITS) & (RATE_SHARDS - 1);
+    struct rate_key k;
+
+    memset(&k, 0, sizeof k);
+    memcpy(k.addr, peer->addr, sizeof k.addr);
+    k.fam = (uint8_t)peer->family;
+    return k;
 }
 
-static inline void rate_shard_unlock(uint32_t ip)
+static inline bool rate_key_is_v4(const struct rate_key *k)
 {
-    pthread_mutex_unlock(&g_rate_shards[rate_ip_shard(ip)].mu);
+    return k->fam == (uint8_t)AF_INET;
 }
 
-static inline unsigned rate_gate_slot(uint32_t ip)
+/* AF_INET 的 32 位网络序地址（= 旧实现里当键用的那个值） */
+static inline uint32_t rate_key_v4(const struct rate_key *k)
 {
-    return (unsigned)((ip * RATE_HASH_MUL) >> RATE_HASH_SHIFT);
+    uint32_t ip;
+
+    memcpy(&ip, k->addr, sizeof ip);
+    return ip;
 }
 
-static inline void rate_gate_claim(struct rate_gate_set *gs, uint32_t ip,
-                                   uint64_t until, uint64_t now)
+/* v6：16 字节地址 + 族标签的 64 位 FNV-1a */
+static inline uint64_t rate_key_mix6(const struct rate_key *k)
 {
+    uint64_t h = 1469598103934665603ull;   /* FNV-1a offset basis */
+
+    for (size_t i = 0; i < sizeof k->addr; i++) {
+        h ^= (uint64_t)k->addr[i];
+        h *= 1099511628211ull;             /* FNV-1a prime */
+    }
+    h ^= (uint64_t)k->fam;
+    h *= 1099511628211ull;
+    return h;
+}
+
+static inline bool rate_key_eq(const struct rate_key *a,
+                              const struct rate_key *b)
+{
+    return a->fam == b->fam && memcmp(a->addr, b->addr, sizeof a->addr) == 0;
+}
+
+/* gate 槽位里存的完整身份值：v4 = 32 位地址（与旧实现逐位相同），
+ * v6 = 64 位哈希。 */
+static inline uint64_t rate_key_id(const struct rate_key *k)
+{
+    if (rate_key_is_v4(k))
+        return (uint64_t)rate_key_v4(k);
+    return rate_key_mix6(k);
+}
+
+/* 分片/桶内位置的 32 位索引哈希：v4 与旧实现完全一致（10 位：低 6 位是桶
+ * 内位置、次 4 位是分片）；v6 用 64 位哈希折叠。 */
+static inline uint32_t rate_key_hash32(const struct rate_key *k)
+{
+    uint64_t h;
+
+    if (rate_key_is_v4(k))
+        return (rate_key_v4(k) * RATE_HASH_MUL) >> RATE_HASH_SHIFT;
+    h = rate_key_mix6(k);
+    return (uint32_t)((h >> 32) ^ h);
+}
+
+static inline unsigned rate_ip_shard(const struct rate_key *k)
+{
+    return (rate_key_hash32(k) >> RATE_SHARD_BITS) & (RATE_SHARDS - 1);
+}
+
+static inline void rate_shard_unlock(const struct rate_key *k)
+{
+    pthread_mutex_unlock(&g_rate_shards[rate_ip_shard(k)].mu);
+}
+
+/* 1024 个 gate 槽的下标：v4 走旧的 (ip * MUL) >> 22，逐位不变；v6 取哈希
+ * 高 10 位。 */
+static inline unsigned rate_gate_slot(const struct rate_key *k)
+{
+    if (rate_key_is_v4(k))
+        return (unsigned)((rate_key_v4(k) * RATE_HASH_MUL) >> RATE_HASH_SHIFT);
+    return (unsigned)(rate_key_mix6(k) >> 54) & (RATE_BUCKETS - 1);
+}
+
+static inline void rate_gate_claim(struct rate_gate_set *gs,
+                                   const struct rate_key *k, uint64_t until,
+                                   uint64_t now)
+{
+    uint64_t id = rate_key_id(k);
+
     for (unsigned w = 0; w < RATE_GATE_WAYS; w++) {
         struct rate_gate *g = &gs->way[w];
-        uint32_t cur_ip = atomic_load_explicit(&g->ip, memory_order_relaxed);
+        uint8_t cur_valid = atomic_load_explicit(&g->valid, memory_order_relaxed);
+        uint64_t cur_id = atomic_load_explicit(&g->id, memory_order_relaxed);
         uint64_t cur_until = atomic_load_explicit(&g->over_until_ms, memory_order_relaxed);
-        if (cur_ip != 0 && cur_ip != ip && cur_until > now)
+        if (cur_valid && cur_id != id && cur_until > now)
             continue;
         atomic_store_explicit(&g->over_until_ms, until, memory_order_relaxed);
-        atomic_store_explicit(&g->ip, ip, memory_order_relaxed);
+        atomic_store_explicit(&g->id, id, memory_order_relaxed);
+        atomic_store_explicit(&g->valid, 1, memory_order_relaxed);
         return;
     }
 }
 
 static inline bool rate_gate_check(const struct rate_gate_set *gs,
-                                   uint32_t ip, uint64_t now)
+                                   const struct rate_key *k, uint64_t now)
 {
+    uint64_t id = rate_key_id(k);
+
     for (unsigned w = 0; w < RATE_GATE_WAYS; w++) {
         const struct rate_gate *g = &gs->way[w];
-        if (atomic_load_explicit(&g->ip, memory_order_relaxed) == ip &&
+        if (atomic_load_explicit(&g->valid, memory_order_relaxed) &&
+            atomic_load_explicit(&g->id, memory_order_relaxed) == id &&
             atomic_load_explicit(&g->over_until_ms, memory_order_relaxed) > now)
             return true;
     }
     return false;
 }
 
-static struct rate_bucket *rate_bucket_find(struct rate_shard *sh, uint32_t ip)
+static struct rate_bucket *rate_bucket_find(struct rate_shard *sh,
+                                            const struct rate_key *k)
 {
-    unsigned h = (unsigned)((ip * RATE_HASH_MUL) >> RATE_HASH_SHIFT) &
-                 (RATE_BUCKETS_PER_SHARD - 1);
+    unsigned h = (unsigned)(rate_key_hash32(k) &
+                            (unsigned)(RATE_BUCKETS_PER_SHARD - 1));
     unsigned evict = 0;
     uint64_t oldest = UINT64_MAX;
 
@@ -211,9 +308,8 @@ static struct rate_bucket *rate_bucket_find(struct rate_shard *sh, uint32_t ip)
             oldest = c->win;
             evict = i;
         }
-        if (c->ip == ip || (c->ip == 0 && c->win == 0)) {
+        if (!c->valid || rate_key_eq(&c->key, k))
             return c;
-        }
     }
     return &sh->buckets[(h + evict) % RATE_BUCKETS_PER_SHARD];
 }
@@ -221,28 +317,29 @@ static struct rate_bucket *rate_bucket_find(struct rate_shard *sh, uint32_t ip)
 static void rate_evict_publish(struct rate_bucket *b, uint64_t now)
 {
     uint64_t until;
-    uint32_t ip = b->ip;
     unsigned slot;
 
-    if (ip == 0 || now - b->win >= RATE_WINDOW_MS)
+    if (!b->valid || now - b->win >= RATE_WINDOW_MS)
         return;
     if (b->open_cnt == 0 && b->ping_cnt == 0 && b->echo_cnt == 0 &&
         b->miss_cnt == 0 && b->tokbad_cnt == 0 && b->close_cnt == 0)
         return;
     until = b->win + RATE_WINDOW_MS;
-    slot = rate_gate_slot(ip);
-    rate_gate_claim(&g_rate_gate[slot], ip, until, now);
-    rate_gate_claim(&g_tokbad_gate[slot], ip, until, now);
-    rate_gate_claim(&g_close_gate[slot], ip, until, now);
+    slot = rate_gate_slot(&b->key);
+    rate_gate_claim(&g_rate_gate[slot], &b->key, until, now);
+    rate_gate_claim(&g_tokbad_gate[slot], &b->key, until, now);
+    rate_gate_claim(&g_close_gate[slot], &b->key, until, now);
 }
 
-static void rate_bucket_touch(struct rate_bucket *b, uint32_t ip)
+static void rate_bucket_touch(struct rate_bucket *b, const struct rate_key *k)
 {
     uint64_t now = now_ms();
 
-    if (b->ip != ip || now - b->win >= RATE_WINDOW_MS) {
+    if (!b->valid || !rate_key_eq(&b->key, k) ||
+        now - b->win >= RATE_WINDOW_MS) {
         rate_evict_publish(b, now);
-        b->ip = ip;
+        b->key = *k;
+        b->valid = true;
         b->win = now;
         b->open_cnt = b->ping_cnt = b->echo_cnt = b->miss_cnt = 0;
         b->tokbad_cnt = 0;
@@ -250,18 +347,18 @@ static void rate_bucket_touch(struct rate_bucket *b, uint32_t ip)
     }
 }
 
-static struct rate_bucket *rate_bucket_enter(uint32_t ip)
+static struct rate_bucket *rate_bucket_enter(const struct rate_key *k)
 {
-    struct rate_shard *sh = &g_rate_shards[rate_ip_shard(ip)];
+    struct rate_shard *sh = &g_rate_shards[rate_ip_shard(k)];
     pthread_mutex_lock(&sh->mu);
-    struct rate_bucket *b = rate_bucket_find(sh, ip);
-    rate_bucket_touch(b, ip);
+    struct rate_bucket *b = rate_bucket_find(sh, k);
+    rate_bucket_touch(b, k);
     return b;
 }
 
-bool server_rate_allow_control(const struct sockaddr_in *peer, uint8_t typ)
+bool server_rate_allow_control(const struct iwan_peer *peer, uint8_t typ)
 {
-    uint32_t ip = (uint32_t)peer->sin_addr.s_addr;
+    struct rate_key k = rate_key_from_peer(peer);
     struct rate_bucket *b;
     uint32_t *cnt;
     unsigned limit;
@@ -279,71 +376,72 @@ bool server_rate_allow_control(const struct sockaddr_in *peer, uint8_t typ)
         return true;
     }
 
-    b = rate_bucket_enter(ip);
+    b = rate_bucket_enter(&k);
     cnt = (typ == PT_OPEN) ? &b->open_cnt :
           (typ == PT_PING_REQ) ? &b->ping_cnt : &b->echo_cnt;
     if (*cnt >= limit)
         ok = false;
     else
         (*cnt)++;
-    rate_shard_unlock(ip);
+    rate_shard_unlock(&k);
     if (!ok)
         atomic_fetch_add(&g_rate_drops, 1);
     return ok;
 }
 
-bool server_rate_allow_sid_miss(uint32_t ip, uint64_t now)
+bool server_rate_allow_sid_miss(const struct iwan_peer *peer, uint64_t now)
 {
-    struct rate_gate_set *g = &g_rate_gate[rate_gate_slot(ip)];
+    struct rate_key k = rate_key_from_peer(peer);
+    struct rate_gate_set *g = &g_rate_gate[rate_gate_slot(&k)];
     struct rate_bucket *b;
     bool ok;
 
-    if (rate_gate_check(g, ip, now))
+    if (rate_gate_check(g, &k, now))
         return false;
 
-    b = rate_bucket_enter(ip);
+    b = rate_bucket_enter(&k);
     ok = ++b->miss_cnt <= g_rate_miss_max;
     if (!ok) {
-        rate_gate_claim(g, ip, b->win + RATE_WINDOW_MS, now);
+        rate_gate_claim(g, &k, b->win + RATE_WINDOW_MS, now);
     }
-    rate_shard_unlock(ip);
+    rate_shard_unlock(&k);
     return ok;
 }
 
-bool server_rate_allow_tokbad(const struct sockaddr_in *peer, uint64_t now)
+bool server_rate_allow_tokbad(const struct iwan_peer *peer, uint64_t now)
 {
-    uint32_t ip = (uint32_t)peer->sin_addr.s_addr;
-    struct rate_gate_set *g = &g_tokbad_gate[rate_gate_slot(ip)];
+    struct rate_key k = rate_key_from_peer(peer);
+    struct rate_gate_set *g = &g_tokbad_gate[rate_gate_slot(&k)];
     struct rate_bucket *b;
     bool ok;
 
-    if (rate_gate_check(g, ip, now))
+    if (rate_gate_check(g, &k, now))
         return false;
 
-    b = rate_bucket_enter(ip);
+    b = rate_bucket_enter(&k);
     ok = ++b->tokbad_cnt <= g_rate_tokbad_max;
     if (!ok) {
-        rate_gate_claim(g, ip, b->win + RATE_WINDOW_MS, now);
+        rate_gate_claim(g, &k, b->win + RATE_WINDOW_MS, now);
     }
-    rate_shard_unlock(ip);
+    rate_shard_unlock(&k);
     return ok;
 }
 
-bool server_rate_allow_close(const struct sockaddr_in *peer, uint64_t now)
+bool server_rate_allow_close(const struct iwan_peer *peer, uint64_t now)
 {
-    uint32_t ip = (uint32_t)peer->sin_addr.s_addr;
-    struct rate_gate_set *g = &g_close_gate[rate_gate_slot(ip)];
+    struct rate_key k = rate_key_from_peer(peer);
+    struct rate_gate_set *g = &g_close_gate[rate_gate_slot(&k)];
     struct rate_bucket *b;
     bool ok;
 
-    if (rate_gate_check(g, ip, now))
+    if (rate_gate_check(g, &k, now))
         return false;
 
-    b = rate_bucket_enter(ip);
+    b = rate_bucket_enter(&k);
     ok = ++b->close_cnt <= g_rate_close_max;
     if (!ok) {
-        rate_gate_claim(g, ip, b->win + RATE_WINDOW_MS, now);
+        rate_gate_claim(g, &k, b->win + RATE_WINDOW_MS, now);
     }
-    rate_shard_unlock(ip);
+    rate_shard_unlock(&k);
     return ok;
 }

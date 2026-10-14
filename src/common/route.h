@@ -62,4 +62,17 @@ bool route_iface_up(const char *tun, const char *tun_ip, uint16_t mtu);
 /* take the tunnel interface down and flush its addresses (no routes) */
 void route_iface_down(const char *tun);
 
+/* Make the alias `want` refer to the adapter whose driver description is
+ * `desc_match`, renaming that adapter when needed, and return true when
+ * an adapter with the alias exists afterwards.
+ *
+ * Windows needs this for the NDIS data plane: that adapter is created by
+ * our own INF, so Windows picks its connection name ("Local Area
+ * Connection", "... 2" after a reinstall), while the route code and
+ * netsh address interfaces by name. The other platforms name their
+ * tunnel interface themselves, so there this is a no-op returning true.
+ * No adapter matches, or the rename failed: false (caller decides
+ * whether that is fatal). */
+bool route_iface_ensure_name(const char *want, const char *desc_match);
+
 #endif

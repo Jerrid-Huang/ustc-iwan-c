@@ -49,8 +49,20 @@
 /* MTU sane range: the OPEN_ACK is only header-signed, so never trust a
  * huge MTU; clamp to the IPv4-over-UDP range (also the default). */
 #define IWAN_MTU_MIN       576
-#define IWAN_MTU_MAX       1500
+/* 度量档（CMake -DIWAN_JUMBO_MTU=N，默认关闭）会覆盖这两个值：把内层 MTU
+ * 抬到接近外层链路能装下的上限，让"每包固定成本"按 MTU 摊销掉 —— 这是不写
+ * 任何 GSO/分段代码就能量出摊销收益上限的办法。见 docs/perf-plan.md。 */
+/* 内层 MTU 上限由规范推出：外层 IPv4 总长 <= 65535，减去封装开销
+ * 20(IP) + 8(UDP) + 8(定长首部) = 36 ⇒ 65499。与内核模块的
+ * IWAN_MAX_MTU（65535 - IWAN_OVERHEAD）同值。承载链路 MTU 必须能装下
+ * 内层分组 + 50B（含 14B 链路首部），否则外层会在承载网络上分片。
+ * 用户态泵按协商 MTU 动态定尺（proxy.c pump_slot_init），没有 2048 上限。 */
+#ifndef IWAN_MTU_MAX
+#define IWAN_MTU_MAX       65499
+#endif
+#ifndef IWAN_DEFAULT_MTU
 #define IWAN_DEFAULT_MTU   1400
+#endif
 
 /* TLV value-length ceiling: the length byte stores vlen+2, so vlen is
  * at most 253 (254/255 would wrap the length byte and corrupt the
@@ -61,6 +73,17 @@
  * 20-byte IPv4 header minus the 8-byte UDP header. Shared by the GSO
  * fast paths in socks.c and proxy.c. */
 #define IWAN_UDP_GSO_UNIT 65507
+
+/*
+ * 外层 v6 的两把尺子（与内核的 IWAN_OVERHEAD_V6 = 56 对齐）：
+ *   · 内层 MTU 上限 = 65535 - 56 = 65479（外层头 40B 比 v4 多 20B）；
+ *   · 单个外层 UDP 报文载荷上限 = 65535 - 40 - 8 = 65487。
+ * 可达性说明（别误以为它们在当前配置下会咬人）：冻结口径要求内核
+ * max_mtu <= 1500，此时 IWAN_MTU_MAX 那一档根本够不到，只有 jumbo 度量档
+ * （CMake -DIWAN_JUMBO_MTU=N 且内核抬高 max_mtu）+ 外层 v6 才会碰上。
+ * 真到那一步时，各调用点应按会话的外层族选这两个值，而不是继续用 v4 形状。 */
+#define IWAN_MTU_MAX_V6      65479
+#define IWAN_UDP_GSO_UNIT_V6 65487
 
 /* safe ceiling for ONE GSO unit (total payload of a uniform batch).
  * Linux's software GSO segmentation (loopback, veth, ...) drops units

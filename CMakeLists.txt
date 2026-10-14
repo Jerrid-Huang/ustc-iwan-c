@@ -263,6 +263,7 @@ set(IWAN_CORE_SRCS
   src/common/proto_parse.c
   src/common/proxy.c
   src/common/relay_proxy.c
+  src/common/reply_route.c
   src/common/route_common.c
   src/common/socks.c
   src/common/socks_auth_guard.c
@@ -276,7 +277,13 @@ if(WIN32)
   # and server.c is Linux-only (TUN/iptables/BPF, see src/common/server.c).
   # single-thread zero-copy uplink (the SPSC + sender-thread variant
   # was removed; pump_win_single.c is the only Windows pump)
+  # WFP kernel data plane: kdp_win.c is the session/liveness loop that owns
+  # the data plane (kdp.c is its Linux counterpart) and windev.c is the
+  # \\.\iwan device layer. iwan_client.c calls kdp_win_run() under _WIN32,
+  # so leaving these two out is an undefined-reference at link time.
   list(APPEND IWAN_CORE_SRCS src/common/route.c
+    src/common/kdp_win.c
+    src/common/windev.c
     src/common/tun_win.c
     src/common/wintun_fetch.c
     src/common/wintun_pin.c
@@ -287,7 +294,12 @@ elseif(APPLE)
   # tun_mac.c provides the utun open/attach/detach + name mapping.
   list(APPEND IWAN_CORE_SRCS src/common/route.c src/common/tun.c src/common/tun_mac.c)
 else()
-  list(APPEND IWAN_CORE_SRCS src/common/route_linux.c src/common/server.c src/common/server_rate.c src/common/tun.c)
+  # genl_iwan.c / kdp.c = 内核数据面（--data-plane kernel，Linux only）。
+  # 与 route_linux.c 同处一个分支不是巧合：两者都直接依赖 Linux 的内核
+  # 接口（genetlink 与 /dev/iwan）；而 src/iwan_client.c 同时被编进 Windows
+  # 的 iwan-winsvc.exe，所以这两个文件除了不在这里列出，文件体自己也用
+  # #ifdef __linux__ 包住（非 Linux 下只留空翻译单元，不会出现半成品 stub）。
+  list(APPEND IWAN_CORE_SRCS src/common/route_linux.c src/common/server.c src/common/server_rate.c src/common/tun.c src/common/genl_iwan.c src/common/kdp.c)
 endif()
 
 # Userspace TCP stack for the SOCKS mode: the vendored lwIP bridge is
@@ -351,6 +363,17 @@ endif()
 # the third-party library only; the function is used solely for debug
 # printing, never in the data path. Known to both gcc and clang.
 target_compile_options(lwip PRIVATE -Wno-array-bounds)
+
+# 度量档：把内层 MTU 上限与默认值一起抬到 N（默认空 = 关闭，正常构建完全不变）。
+# 打开后客户端与服务端在同一版本下协商出 N；外层 veth 的 MTU 由
+# tests/bench_proto.sh 的 VETH_MTU 负责（必须 >= N + 50）。
+set(IWAN_JUMBO_MTU "" CACHE STRING
+    "度量用内层 MTU（上限 65499：外层 IPv4 总长 65535 - 36B 封装开销）；空=关闭")
+if(IWAN_JUMBO_MTU)
+  add_compile_definitions(IWAN_MTU_MAX=${IWAN_JUMBO_MTU}
+                          IWAN_DEFAULT_MTU=${IWAN_JUMBO_MTU})
+  message(STATUS "jumbo MTU 度量档：内层 MTU 上限/默认 = ${IWAN_JUMBO_MTU}")
+endif()
 
 add_library(iwan_core STATIC ${IWAN_CORE_SRCS})
 target_include_directories(iwan_core PUBLIC src/common)
@@ -615,6 +638,18 @@ if(BUILD_TESTING)
     add_executable(pollmap tests/probes/pollmap.c)
     target_link_libraries(pollmap PRIVATE iwan_core)
   endif()
+
+  # 单向容量基准发生器，由 tests/bench_proto.sh 调用：内层 tcp / udp / 裸 IP
+  # （IP 协议号 253），send 与 recv 各一个进程。纯 socket 代码，**故意不链
+  # iwan_core** —— 它不碰生产代码，也就不需要 OpenSSL，能在任何环境单独编译。
+  # 它仍然列在下面的严格告警目标表里（-Werror 一视同仁）。
+  #
+  # Linux 专属：raw socket + IP_HDRINCL + struct iphdr 都是 Linux 语义，
+  # Apple 的 <netinet/ip.h> 没有 struct iphdr。要移植得另写一个 Winsock/
+  # Darwin 版本，不是加个宏的事，所以这里直接不建。
+  if(UNIX AND NOT APPLE)
+    add_executable(bench_proto tests/bench_proto.c)
+  endif()
 endif()
 
 if(UNIX AND NOT APPLE)
@@ -642,7 +677,7 @@ if(IWAN_STRICT)
   endif()
   foreach(_tgt iwan_core iwan_oidc iwan-client iwan-client-oidc iwan-winsvc
                iwan-server socks_handshake_harness lwip_data_harness
-               lwip_fairness_harness relay_socks_harness)
+               lwip_fairness_harness relay_socks_harness bench_proto)
     if(TARGET ${_tgt})
       target_compile_options(${_tgt} PRIVATE ${_iwan_strict_flags})
     endif()

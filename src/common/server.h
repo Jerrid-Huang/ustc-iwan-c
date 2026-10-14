@@ -5,8 +5,10 @@
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdatomic.h>
+#include <sys/socket.h>
 
 #define SERVER_MAX_SESSIONS 256
 #define SERVER_MAX_USERS    256
@@ -14,6 +16,45 @@
 /* max uplink recv threads (SO_REUSEPORT fan-out); the session table's
  * rwlock and the rate-table mutex are the shared state */
 #define IWAN_SRV_THREADS_MAX 16
+
+/* 外层对端的族无关表示。外层 v4+v6 双栈后 sockaddr_in 不再够用：会话表、
+ * 快照、handle_udp 入参、限速键全部改用本结构。接收路径一进来就规范化
+ * （唯一入口 iwan_peer_from_sockaddr，v4-mapped 的 AF_INET6 在那里归一到
+ * AF_INET），此后服务端只认这一种表示。
+ *
+ * 所有字段都由构造函数确定性填充（未用的地址字节为 0，scope_id 默认 0），
+ * 但比较一律走 iwan_peer_eq()/iwan_peer_eq_addr()，绝不对整个结构体做
+ * memcmp —— 那会算进结构体填充字节，同源判定会随机为假（每帧走 rebind 写
+ * 锁路径、OPEN 侧误判 "session active elsewhere"）。 */
+struct iwan_peer {
+    uint8_t addr[16];   /* 网络序；AF_INET 只用 addr[0..3]，其余为 0 */
+    uint16_t port;      /* 主机序 */
+    uint32_t scope_id;  /* 仅 AF_INET6（fe80:: 链路本地需要），否则 0 */
+    sa_family_t family; /* AF_INET / AF_INET6 */
+};
+
+/* iwan_peer_to_string 的最长输出加余量：v6 文面 45 + "%scope" 11 + "[]" 2
+ * + ":port" 6 + NUL = 65，取 80。原来 v4 专用的 INET_ADDRSTRLEN + 8 缓冲
+ * 装不下 v6，所有 peerstr 缓冲一律用这个尺寸。 */
+#define IWAN_PEER_STRLEN 80
+
+/* sockaddr -> peer（接收侧唯一的规范化点）。族不支持、或 len 小于该族的
+ * sockaddr 长度（内核截断）时返回 false，调用方丢弃该报文。 */
+bool iwan_peer_from_sockaddr(struct iwan_peer *p, const struct sockaddr *sa,
+                             socklen_t len);
+/* peer -> sockaddr_storage；返回可传给 sendto/sendmsg 的长度
+ * （AF_INET 16 / AF_INET6 28），族非法时返回 0。 */
+socklen_t iwan_peer_to_sockaddr(const struct iwan_peer *p,
+                                struct sockaddr_storage *ss);
+/* 族 + 地址 + scope，忽略端口：会话顶替判定用（旧代码只比 4 字节 v4 地址，
+ * 端口变化不算换了源，这里保持同一口径）。 */
+bool iwan_peer_eq_addr(const struct iwan_peer *a, const struct iwan_peer *b);
+/* 族 + 地址 + scope + 端口：会话绑定判定用（等价于旧代码的
+ * memcmp(&s->peer, peer, sizeof(sockaddr_in))）。 */
+bool iwan_peer_eq(const struct iwan_peer *a, const struct iwan_peer *b);
+/* v4 输出 "%s:%u"（与旧日志逐字节相同）；v6 输出 "[%s]:%u"，scope_id 非 0
+ * 时输出 "[%s%%%u]:%u"（链路本地）。out 至少 IWAN_PEER_STRLEN 字节。 */
+void iwan_peer_to_string(const struct iwan_peer *p, char *out, size_t outlen);
 
 /* One authenticated client. Sessions are shared between the UDP main
  * thread (writes) and TUN reader threads (downlink lookups); every
@@ -23,7 +64,7 @@ struct server_session {
     bool valid;
     uint16_t sid;
     uint32_t token;
-    struct sockaddr_in peer;
+    struct iwan_peer peer;   /* 外层源（v4 或 v6；见 iwan_peer） */
     uint8_t ip[4];
     uint8_t xor_key[8];      /* session_key(user,pass)[0..7] */
     uint8_t enc;
@@ -59,13 +100,18 @@ struct server_session {
      * read for the drop-path store) — see server.c. */
     atomic_uint_fast64_t throttle_until_ms;
     char user[SERVER_USER_MAX + 1]; /* owning account; one slot per user */
+    /* IWAN_SRV_SINK=1（仅计量模式）：本会话的报文数与“外层 UDP 净荷字节
+     * 数”计数（口径见 server.c sink_account）。只在 server.c 的 DATA
+     * 分支里 relaxed 原子加，其他模式下恒为 0；handle_open 对新会话的
+     * memset(s, 0) 会归零，所以不跨会话累计。 */
+    _Atomic uint64_t sink_pkts, sink_bytes;
 };
 
 /* Snapshot of a session taken under the read lock; the only fields a
  * downlink thread needs to build and send a packet without holding the
  * lock during sendto(). */
 struct server_sess_snap {
-    struct sockaddr_in peer;
+    struct iwan_peer peer;   /* 外层目的（v4 或 v6） */
     uint8_t xor_key[8];
     uint16_t sid;
     uint32_t token;
@@ -107,6 +153,17 @@ struct server_ctx {
     uint32_t subnet_mask;    /* BE u32; --subnet netmask (length 8..30) */
     bool subnet_set;         /* false => full reject set (strict) */
     int tun_fd;              /* -1 when running in --no-tun mode */
+    /* 外层 v6 下行兜底 socket：main 在建好第二套 AF_INET6 套接字后写入，
+     * -1 表示宿主没有 IPv6（这套套接字整体不存在）。下行目的 peer 是 v6
+     * 时 handle_tun_downlink 必须用它 —— 调用方传入的 fd 可能是报文到达
+     * 的 v4 套接字（--no-tun echo 模式下跨族的内层转发），族不匹配的
+     * sendmsg 会 EAFNOSUPPORT/EINVAL 而丢掉整批。v4 下行保持调用方传入的
+     * fd 不变，所以这里不存 v4 的那套。 */
+    int dl_fd6;
+    /* IWAN_SRV_SINK=1：仅计量接收端点 —— 不建 TUN，数据帧只计数（不解密、
+     * 不解析内层、不写 TUN、不回发），控制面路径不变。main 在起线程前
+     * 设置一次，之后只读；零初始化为 false，默认行为不变。 */
+    bool sink;
     void *qpool;             /* struct tun_pool *, owned by main() */
 };
 
@@ -127,12 +184,14 @@ void server_rate_limits_init(void);
 
 /* Multithread-safe printf (server log lines). */
 
-/* Handle one UDP packet from peer. May write decrypted data to the TUN
- * (only when ctx->tun_fd >= 0, else dropped). Called from the uplink
- * recv threads (tid selects the per-thread stats slot). */
+/* Handle one UDP packet from peer (v4 或 v6 外层源，已在接收侧规范化；见
+ * iwan_peer). May write decrypted data to the TUN (only when
+ * ctx->tun_fd >= 0, else dropped). Called from the uplink recv threads
+ * (tid selects the per-thread stats slot). sockfd is the socket the
+ * datagram arrived on, i.e. the matching address family for peer. */
 void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nusers,
                 const uint8_t *raw, size_t len,
-                const struct sockaddr_in *peer, int sockfd, unsigned tid);
+                const struct iwan_peer *peer, int sockfd, unsigned tid);
 
 /* Send one IP packet from the TUN to the session owning dst IP.
  * Thread-safe: called from TUN reader threads. Takes a session snapshot
@@ -152,6 +211,15 @@ void server_add_send_drops(unsigned long long n);
 
 /* Drop sessions idle for more than 120s; log each. Main thread only. */
 void purge_expired(struct server_ctx *ctx, uint64_t now_ms);
+
+/* IWAN_SRV_SINK=1: 打印计量统计 —— 一行总计
+ *   SINK pkts=<报文数> bytes=<外层 UDP 净荷字节数> pps=<区间报文率>
+ *   gbps=<区间比特率>
+ * 外加每个有计数会话一行。非 final 调用按 5s 间隔门控（多余调用直接
+ * 返回）；final=true（退出前）无条件打印并以“距上次打印”为区间。
+ * 区间 latch 是普通静态变量：只能由主 recv 线程的 1s 心跳和 main 在
+ * join 完所有 recv 线程之后调用（同 server_up_stats_print 的约定）。 */
+void server_sink_print(struct server_ctx *ctx, bool final);
 
 /* [prof] server stage byte counters (IWAN_PROFILE=1); incremented by
  * recv threads / tun readers, printed by the primary recv thread. */

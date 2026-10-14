@@ -90,6 +90,10 @@ struct opts {
     char nat_if[64];
     char user[64];   /* drop root privileges to this account (A1) */
     bool no_tun;
+    /* --data-plane: v1 只接受 "tun"（占位选项，见 parse_opts 的 'D' 分支）。
+     * 保留成 opts 字段是为了让"值已校验"这件事有一个落点，并让 --help 与
+     * 客户端的三份 CLI 在选项集合上对齐。 */
+    const char *data_plane;
 };
 
 static const struct option long_opts[] = {
@@ -102,6 +106,7 @@ static const struct option long_opts[] = {
     { "nat-if",    required_argument, NULL, 'n' },
     { "no-tun",    no_argument,       NULL, 'T' },
     { "user",      required_argument, NULL, 'U' },
+    { "data-plane", required_argument, NULL, 'D' },
     { "help",      no_argument,       NULL, 'h' },
     { NULL, 0, NULL, 0 },
 };
@@ -124,6 +129,9 @@ static void usage(const char *prog, FILE *out)
     fprintf(out, "  -n, --nat-if <IF>      outbound interface for MASQUERADE (default eth0)\n");
     fprintf(out, "  -T, --no-tun           (testing) skip TUN device\n");
     fprintf(out, "      --user <NAME>      drop root privileges to this user after setup (default nobody)\n");
+    fprintf(out, "      --data-plane <tun> data-plane selector; only 'tun' is accepted by the\n");
+    fprintf(out, "                         v1 kernel ABI ('kernel' is a usage error: the module\n");
+    fprintf(out, "                         is one session per netns, the server needs 256)\n");
     fprintf(out, "  -h, --help             show this help\n");
     fprintf(out, "  note: repeating an option is allowed: the LAST value wins\n");
     fprintf(out, "        (no 'cannot be used multiple times' error, unlike iwan-client)\n");
@@ -140,6 +148,16 @@ static void usage(const char *prog, FILE *out)
     fprintf(out, "                        a bad value warns and keeps 4)\n");
     fprintf(out, "    IWAN_SRV_TUN_SINGLE=1  use one TUN queue instead of the multi-queue\n");
     fprintf(out, "                        fan-out (A/B benchmark switch; default: off)\n");
+    fprintf(out, "    IWAN_SRV_SINK=1     metering-only receive endpoint: no TUN device is\n");
+    fprintf(out, "                        created, DATA frames are only counted (never\n");
+    fprintf(out, "                        XOR-decrypted, inner-parsed, written to a TUN or\n");
+    fprintf(out, "                        answered); the control plane (OPEN/OPEN_ACK,\n");
+    fprintf(out, "                        keepalive, CLOSE, session timeouts) is unchanged.\n");
+    fprintf(out, "                        bytes counts the OUTER UDP payload (8-byte iwan\n");
+    fprintf(out, "                        header + payload), not inner IP bytes. Prints\n");
+    fprintf(out, "                        'SINK pkts=.. bytes=.. pps=.. gbps=..' every 5s\n");
+    fprintf(out, "                        plus one line per session, and a final line on\n");
+    fprintf(out, "                        SIGINT/SIGTERM (default: off)\n");
     fprintf(out, "    IWAN_ALLOW_INSECURE_USERS=1  accept a group/world-readable users\n");
     fprintf(out, "                        file instead of refusing to start (default:\n");
     fprintf(out, "                        off; only 1/true/yes/on enable it)\n");
@@ -267,6 +285,35 @@ static void parse_opts(int argc, char **argv, struct opts *o)
             break;
         case 'T':
             o->no_tun = true;
+            break;
+        case 'D':
+            /* --data-plane 占位：只接受 tun（当前唯一实现，且是默认）。
+             *
+             * 为什么服务端不支持 kernel（v1 ABI 的限制，不是没时间做）：
+             *   1. 内核模块的控制面是"每 netns 一份会话"、设备名固定 iwan0
+             *      （CONTROL-PLANE.md §2/§10），而服务端要在同一个 netns 里
+             *      同时服务最多 256 个客户端会话；
+             *   2. 服务端的状态机整个在 handle_udp() 里（OPEN 验签、会话表、
+             *      PT_* 分发、内层包写 TUN），没有"每会话一个内核数据面"这种
+             *      可以下移的切分点；
+             *   3. 真要支持得先有 v2 ABI：一个 netns 多会话 + DEVNAME 入参 +
+             *      按会话分流，属于模块侧的设计变更。
+             * 显式传 kernel 按用法错误处理（exit 2），不静默忽略。 */
+            if (strcmp(optarg, "tun") == 0) {
+                o->data_plane = "tun";
+                break;
+            }
+            if (strcmp(optarg, "kernel") == 0)
+                usage_error(argv[0],
+                            "error: --data-plane kernel 不被 v1 ABI 支持："
+                            "内核模块是“每 netns 单会话”（设备固定 iwan0），"
+                            "而服务端要同时服务最多 256 个客户端会话；"
+                            "且服务端状态机全部在 handle_udp() 里，"
+                            "没有可下移的每会话数据面。"
+                            "服务端请用默认的 --data-plane tun");
+            usage_error(argv[0],
+                        "error: invalid --data-plane '%s' (expected 'tun'; "
+                        "'kernel' is rejected by the v1 ABI)", optarg);
             break;
         case 'U':
             /* M5: same over-length guard as -t — a truncated account name
@@ -597,10 +644,16 @@ static void server_cleanup_nat(void)
 struct srv_dl_batch {
     uint8_t hdrs[SRV_DL_BATCH][IWAN_HDR_LEN];
     uint8_t pl[SRV_DL_BATCH][SRV_DL_SLOT];
-    struct sockaddr_in peers[SRV_DL_BATCH];
+    /* 目的地可能是 v4 也可能是 v6：每个槽存 sockaddr_storage（容量取两族
+     * 最大）+ 实际长度，msg_namelen 必须按族给准（v4 16 / v6 28）。 */
+    struct sockaddr_storage peers[SRV_DL_BATCH];
+    socklen_t peerlens[SRV_DL_BATCH];
     struct iovec iovs[SRV_DL_BATCH * 2];
     struct mmsghdr msgs[SRV_DL_BATCH];
     int n;
+    int fd;              /* 本批目的族对应的发送 socket（n > 0 时有效） */
+    sa_family_t fam;     /* 本批所有目的地的族；混族先 flush 再装（一个 fd
+                          * 只能发一个族） */
     uint64_t last_hard_err;   /* R56-102: rate-limiter for hard-error logs */
 };
 
@@ -608,8 +661,24 @@ struct srv_pool_ud {
     struct server_ctx *ctx;
     const int *udp_fds;    /* A2: per-reader send socket (qid % nfds) */
     int nfds;
+    const int *udp_fds6;   /* 外层 v6 那套（nfds6 == 0 = 宿主无 IPv6） */
+    int nfds6;
     struct srv_dl_batch b[TUN_POOL_MAX];  /* one batch state per queue */
 };
+
+/* 目的 peer 的族选发送 socket：v4 与加 v6 之前逐位一致（同一个
+ * udp_fds[qid % nfds]），v6 走第二套。返回 -1 = 该族在宿主上不可用
+ * （nfds6 == 0），调用方按发送失败计一次 drop。 */
+static int srv_dl_fd_for(const struct srv_pool_ud *pu,
+                         const struct iwan_peer *p, int qid)
+{
+    if (p->family == AF_INET6) {
+        if (pu->nfds6 <= 0)
+            return -1;
+        return pu->udp_fds6[qid % pu->nfds6];
+    }
+    return pu->udp_fds[qid % pu->nfds];
+}
 
 /* flush the batch with one sendmmsg. On EAGAIN the unsent remainder is
  * RETAINED at the front of the batch for the next flush (backpressure,
@@ -691,6 +760,8 @@ static void srv_dl_flush(struct srv_dl_batch *b, int fd)
         memmove(b->pl, b->pl + sent, (size_t)kept * SRV_DL_SLOT);
         memmove(b->peers, b->peers + sent,
                 (size_t)kept * sizeof b->peers[0]);
+        memmove(b->peerlens, b->peerlens + sent,
+                (size_t)kept * sizeof b->peerlens[0]);
         memmove(b->msgs, &b->msgs[sent], (size_t)kept * sizeof b->msgs[0]);
         memmove(b->iovs, &b->iovs[sent * 2],
                 (size_t)kept * 2 * sizeof b->iovs[0]);
@@ -703,7 +774,8 @@ static void srv_dl_flush(struct srv_dl_batch *b, int fd)
             b->iovs[i * 2 + 1].iov_len = plen;
             b->msgs[i].msg_hdr.msg_iov = &b->iovs[i * 2];
             b->msgs[i].msg_hdr.msg_name = &b->peers[i];
-            b->msgs[i].msg_hdr.msg_namelen = sizeof b->peers[0];
+            /* 长度必须跟着槽一起搬：v4 16 / v6 28，不能一律用 sizeof */
+            b->msgs[i].msg_hdr.msg_namelen = b->peerlens[i];
         }
         b->n = kept;
     }
@@ -716,12 +788,10 @@ static void srv_tun_pkt(void *ud, uint8_t *pkt, size_t len, bool last)
     struct srv_dl_batch *b;
     struct server_sess_snap snap;
     uint8_t hdr[IWAN_HDR_LEN];
-    int fd;
 
     if (qid < 0 || qid >= TUN_POOL_MAX)
         qid = 0;
     b = &pu->b[qid];
-    fd = pu->udp_fds[qid % pu->nfds];
     PROF_ADD(g_prof_srv_tunr, len);
 
     if (len < 20) {
@@ -735,35 +805,65 @@ static void srv_tun_pkt(void *ud, uint8_t *pkt, size_t len, bool last)
          * for the same peer — harmless: each frame is an independent UDP
          * datagram carrying one inner TCP segment, which reassembles
          * out of order and RTO-recovers pure loss) */
-        srv_dl_flush(b, fd);
-        handle_tun_downlink(pu->ctx, pkt, len, fd);
+        srv_dl_flush(b, b->fd);
+        /* 直发的 socket 仍按 v4 队列号给（与改动前同一个 fd）；目的 peer
+         * 是 v6 时 handle_tun_downlink 内部会换成 ctx->dl_fd6 */
+        handle_tun_downlink(pu->ctx, pkt, len, pu->udp_fds[qid % pu->nfds]);
     } else if (tun_prep_downlink(pu->ctx, pkt, len, &snap, hdr)) {
-        if (b->n >= SRV_DL_BATCH) {
-            /* R28-C1: the send buffer is full and the retained batch is at
-             * capacity (the flush could not drain it) — drop just this one
-             * packet rather than overflow the batch arrays. */
+        int sfd = srv_dl_fd_for(pu, &snap.peer, qid);
+
+        if (sfd < 0) {
+            /* 宿主没有该族的套接字（无 IPv6）：按发送失败丢弃 */
             server_add_send_drops(1);
         } else {
-            int i = b->n;
-            memcpy(b->hdrs[i], hdr, IWAN_HDR_LEN);
-            memcpy(b->pl[i], pkt, len);
-            b->peers[i] = snap.peer;
-            b->iovs[i * 2].iov_base = b->hdrs[i];
-            b->iovs[i * 2].iov_len = IWAN_HDR_LEN;
-            b->iovs[i * 2 + 1].iov_base = b->pl[i];
-            b->iovs[i * 2 + 1].iov_len = len;
-            memset(&b->msgs[i], 0, sizeof b->msgs[i]);
-            b->msgs[i].msg_hdr.msg_name = &b->peers[i];
-            b->msgs[i].msg_hdr.msg_namelen = sizeof b->peers[i];
-            b->msgs[i].msg_hdr.msg_iov = &b->iovs[i * 2];
-            b->msgs[i].msg_hdr.msg_iovlen = 2;
-            b->n++;
-            if (b->n == SRV_DL_BATCH)
-                srv_dl_flush(b, fd);
+            /* 一个 sendmmsg 只用一个 fd、只能发一个族：批内出现另一族时先
+             * 把已装的 flush 掉。若这次 flush 因 EAGAIN 仍留有残留
+             * （b->n > 0），就绝不能再把本帧装进去 —— 混族批会让下一次
+             * sendmmsg 对整批（含残留）报 EINVAL/EAFNOSUPPORT，损失远大于
+             * 丢这一帧；按背压丢本帧，内层 TCP 由 RTO 恢复。
+             * 纯 v4 流量下 fam 恒为 AF_INET，这个分支不进入，路径不变。 */
+            bool may_stage = true;
+            if (b->n > 0 && b->fam != snap.peer.family) {
+                srv_dl_flush(b, b->fd);
+                may_stage = b->n == 0;
+            }
+            if (!may_stage) {
+                server_add_send_drops(1);
+            } else if (b->n >= SRV_DL_BATCH) {
+                /* R28-C1: the send buffer is full and the retained batch is at
+                 * capacity (the flush could not drain it) — drop just this one
+                 * packet rather than overflow the batch arrays. */
+                server_add_send_drops(1);
+            } else {
+                int i = b->n;
+                socklen_t slen = iwan_peer_to_sockaddr(&snap.peer,
+                                                       &b->peers[i]);
+                if (slen == 0) {
+                    server_add_send_drops(1);
+                } else {
+                    memcpy(b->hdrs[i], hdr, IWAN_HDR_LEN);
+                    memcpy(b->pl[i], pkt, len);
+                    b->peerlens[i] = slen;
+                    b->fd = sfd;
+                    b->fam = snap.peer.family;
+                    b->iovs[i * 2].iov_base = b->hdrs[i];
+                    b->iovs[i * 2].iov_len = IWAN_HDR_LEN;
+                    b->iovs[i * 2 + 1].iov_base = b->pl[i];
+                    b->iovs[i * 2 + 1].iov_len = len;
+                    memset(&b->msgs[i], 0, sizeof b->msgs[i]);
+                    b->msgs[i].msg_hdr.msg_name = &b->peers[i];
+                    b->msgs[i].msg_hdr.msg_namelen = slen;
+                    b->msgs[i].msg_hdr.msg_iov = &b->iovs[i * 2];
+                    b->msgs[i].msg_hdr.msg_iovlen = 2;
+                    b->n++;
+                    if (b->n == SRV_DL_BATCH)
+                        srv_dl_flush(b, b->fd);
+                }
+            }
         }
     }
     if (last)
-        srv_dl_flush(b, fd);
+        srv_dl_flush(b, b->fd);
 }
 
 /* R52-D1: clear a queue's downlink batch when its reader thread exits.
@@ -817,6 +917,14 @@ static int setup_tun(const char *name, const char *server_ip, int mask)
     set_nonblock(fd);
     (void)ip_run((char *[]){"addr", "flush", "dev", (char *)name, NULL});
     (void)ip_run((char *[]){"link", "set", (char *)name, "up", NULL});
+    /* 内层 MTU 必须与协商值一致：默认 1500 时这是 no-op；度量档
+     * （IWAN_JUMBO_MTU）下不设，服务端把内层包写进 TUN 会 EMSGSIZE。 */
+    {
+        char mtu_s[16];
+        snprintf(mtu_s, sizeof mtu_s, "%d", IWAN_DEFAULT_MTU);
+        (void)ip_run((char *[]){"link", "set", (char *)name, "mtu", mtu_s,
+                                NULL});
+    }
     snprintf(addr, sizeof addr, "%s/%d", server_ip, mask);
     /* the address assignment is load-bearing: without it the TUN has no
      * gateway and no client can reach the server, so fail startup (the
@@ -925,10 +1033,72 @@ static int setup_udp(uint16_t port, int *fds, int n)
     return n;
 }
 
-/* wire the recvmmsg batch: one 64KiB iovec per slot plus peer storage */
+/* 外层 IPv6：与 setup_udp 完全平行的一套 AF_INET6 套接字（同端口、
+ * in6addr_any、同样 n 个 SO_REUSEPORT 扇出）。调用序列与 v4 那套一致，
+ * 唯一多出来的是 IPV6_V6ONLY=1 —— 硬要求：否则 v4-mapped 流量会从 v6 套接
+ * 字漏进来，同一个客户端在会话绑定与限速键上出现两种外层表示（限速键还会
+ * 被 ::ffff:a.b.c.d 与 a.b.c.d 分成两份）。
+ *
+ * 宿主没有 IPv6（socket/bind/V6ONLY 任何一个失败）时只打一行说明并返回 0：
+ * 服务端照常用 v4 起来，绝不失败退出。返回实际创建数（== n 或 0）。 */
+static int setup_udp6(uint16_t port, int *fds, int n)
+{
+    int one = 1, sz = 16 * 1024 * 1024;
+    struct sockaddr_in6 addr;
+
+    for (int i = 0; i < n; i++) {
+        int fd = socket(AF_INET6, SOCK_DGRAM, 0);
+
+        if (fd < 0) {
+            fprintf(stderr, "warning: IPv6 不可用（%s）；只用 IPv4 监听\n",
+                    strerror(errno));
+            return 0;
+        }
+        if (setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof one) != 0) {
+            /* 设不上 V6ONLY 就不能安全地收 v6：v4-mapped 会渗进来，语义
+             * 不明的流量宁可整族不要，也不破坏 v4 的既有口径。 */
+            fprintf(stderr, "warning: 无法设置 IPV6_V6ONLY（%s）；"
+                    "只用 IPv4 监听\n", strerror(errno));
+            close(fd);
+            for (int j = 0; j < i; j++)
+                close(fds[j]);
+            return 0;
+        }
+        setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one);
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        /* 与 v4 同样的收/发缓冲设置（root 阶段调用，SO_RCVBUFFORCE 能绕过
+         * net.core.rmem_max；非 root 回退 SO_RCVBUF）。这里不重复打印
+         * "udp rcvbuf" 行，v4 的启动日志保持逐字节不变。 */
+        if (setsockopt(fd, SOL_SOCKET, SO_RCVBUFFORCE, &sz, sizeof sz) != 0)
+            setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof sz);
+        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof sz);
+        set_nonblock(fd);
+
+        memset(&addr, 0, sizeof addr);
+        addr.sin6_family = AF_INET6;
+        addr.sin6_addr = in6addr_any;
+        addr.sin6_port = htons(port);
+        if (bind(fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
+            fprintf(stderr, "warning: IPv6 UDP 端口 %u 绑定失败（%s）；"
+                    "只用 IPv4 监听\n", (unsigned)port, strerror(errno));
+            close(fd);
+            for (int j = 0; j < i; j++)
+                close(fds[j]);
+            return 0;
+        }
+        fds[i] = fd;
+    }
+    return n;
+}
+
+/* wire the recvmmsg batch: one 64KiB iovec per slot plus peer storage.
+ * cap 是该套接字的地址缓冲容量（v4 16 / v6 28），也是初始 msg_namelen：
+ * recvmmsg 每轮把 msg_namelen 改写成实际地址长度，v4/v6 两套套接字共用
+ * 同一组 msgs[] 时必须在调用前复位（见 recv_drain_socket），否则 v6 的
+ * 28 字节地址会被内核按 16 字节截断。 */
 static void setup_rx_batch(uint8_t *udp_buf, struct iovec *udp_iov,
                            struct mmsghdr *msgs,
-                           struct sockaddr_in *peers)
+                           struct sockaddr_storage *peers, socklen_t cap)
 {
     memset(msgs, 0, (size_t)UDP_RXBATCH * sizeof *msgs);
     for (int i = 0; i < UDP_RXBATCH; i++) {
@@ -937,7 +1107,7 @@ static void setup_rx_batch(uint8_t *udp_buf, struct iovec *udp_iov,
         msgs[i].msg_hdr.msg_iov = &udp_iov[i];
         msgs[i].msg_hdr.msg_iovlen = 1;
         msgs[i].msg_hdr.msg_name = &peers[i];
-        msgs[i].msg_hdr.msg_namelen = sizeof peers[i];
+        msgs[i].msg_hdr.msg_namelen = cap;
     }
 }
 
@@ -952,7 +1122,8 @@ struct recv_thr_arg {
     struct server_ctx *ctx;
     const struct server_user *users;
     int nusers;
-    int fd;
+    int fd;                  /* 外层 v4 SO_REUSEPORT socket（thread 私有槽） */
+    int fd6;                 /* 外层 v6 那套的对应 socket；-1 = 宿主无 IPv6 */
     unsigned tid;
     _Atomic int *poll_err;   /* M3-6: shared fatal-poll flag (all
                               * threads OR into it; main aggregates) */
@@ -962,12 +1133,124 @@ struct recv_thr_arg {
                               * in --no-tun mode (never probed there). */
 };
 
+/* 一套套接字上的收包：POLLERR 的错误队列排空 + recvmmsg(64) 批处理 ->
+ * handle_udp。v4 与 v6 两套套接字各调用一次，逻辑与只有 v4 时完全一致
+ * （fd 只影响回包 socket、诊断日志与下面的地址容量复位）。 */
+static void recv_drain_socket(struct recv_thr_arg *a, int fd, short revents,
+                              struct mmsghdr *msgs,
+                              struct sockaddr_storage *peers, socklen_t cap)
+{
+    if (revents & POLLERR) {
+        /* A pending ICMP error (e.g. port-unreachable for a datagram
+         * we sent to a client port that just closed) keeps POLLERR
+         * asserted on a UDP socket. Plain recv/recvmmsg does NOT
+         * consume the error queue, so without this the poll loop
+         * busy-spins at 100% CPU and the socket stops delivering
+         * data — measured: one of four REUSEPORT recv threads
+         * wedged this way and every packet hashed to its socket
+         * (including the client's OPEN) was silently lost. Drain
+         * sk_error_queue via MSG_ERRQUEUE until empty. */
+        char ebuf[512];
+        struct sockaddr_storage junk;
+        struct iovec eiov = { .iov_base = ebuf, .iov_len = sizeof ebuf };
+        struct msghdr emh = { .msg_name = &junk,
+                              .msg_namelen = sizeof junk,
+                              .msg_iov = &eiov, .msg_iovlen = 1 };
+        while (recvmsg(fd, &emh, MSG_ERRQUEUE | MSG_DONTWAIT) > 0)
+            ;
+    }
+    if (revents & (POLLIN | POLLERR)) {
+        /* recvmmsg batch (64): drains up to 64 datagrams per syscall,
+         * amortizing the per-packet recvfrom overhead that used to
+         * be the loop's throughput ceiling — a full poll burst is
+         * consumed in one syscall round */
+        int last_v = 1;
+        int full_iters = 0; /* consecutive FULL batches this drain */
+        for (;;) {
+            /* 复位地址容量：recvmmsg 把 msg_namelen 改写成实际地址长度
+             * （v4 16 / v6 28），两套套接字共用同一组 msgs[] 时必须在下一次
+             * 调用前恢复容量，否则 v6 的 28 字节源地址会被内核按 16 字节
+             * 截断（iwan_peer_from_sockaddr 会因长度不符丢掉该报文）。 */
+            if (msgs[0].msg_hdr.msg_namelen != cap) {
+                for (int i = 0; i < UDP_RXBATCH; i++)
+                    msgs[i].msg_hdr.msg_namelen = cap;
+            }
+            /* R37 WG1a: `v` would shadow recv_thread_main's parameter
+             * `void *v` under -Wshadow -Werror (no semantic change) */
+            int nready = recvmmsg(fd, msgs, UDP_RXBATCH, MSG_DONTWAIT,
+                                  NULL);
+            if (nready > 0) {
+                for (int i = 0; i < nready; i++) {
+                    struct iwan_peer peer;
+
+                    if (msgs[i].msg_len <= 0)
+                        continue;
+                    PROF_ADD(g_prof_srv_recv, (size_t)msgs[i].msg_len);
+                    /* 接收侧唯一的规范化点：sockaddr -> iwan_peer
+                     * （v4-mapped 归一为 AF_INET） */
+                    if (!iwan_peer_from_sockaddr(&peer,
+                            (const struct sockaddr *)&peers[i],
+                            msgs[i].msg_hdr.msg_namelen))
+                        continue;   /* 未知族/地址被截断：丢弃 */
+                    handle_udp(a->ctx, a->users, a->nusers,
+                               (const uint8_t *)msgs[i].msg_hdr.msg_iov[0]
+                                   .iov_base,
+                               (size_t)msgs[i].msg_len, &peer, fd,
+                               a->tid);
+                }
+                last_v = nready;
+                if (nready < UDP_RXBATCH)
+                    break; /* partial batch: drained */
+                /* full batch: R48-L2 — bound consecutive full
+                 * batches so this thread always returns to poll (and
+                 * tid==0 reaches its 1s housekeeping) even under an
+                 * unbounded flood */
+                if (++full_iters >= UDP_DRAIN_MAXBATCH)
+                    break;
+                continue;
+            }
+            if (nready < 0 && errno == EINTR)
+                continue;
+            last_v = nready;
+            break; /* EAGAIN: drained, or ICMP error */
+        }
+        /* diagnostic: poll reported readable but nothing was
+         * drained — a transient race between poll and recvmmsg, or
+         * a wedged receive path (see the MSG_ERRQUEUE drain above) */
+        if (last_v <= 0 && (revents & POLLIN)) {
+            static _Thread_local uint64_t last_pe2;
+            uint64_t nowp = now_ms();
+            if (nowp - last_pe2 >= 1000) {
+                last_pe2 = nowp;
+                log_debug("recv thread %u: POLLIN but recvmmsg=%d "
+                          "errno=%d (fd=%d)", a->tid, last_v, errno, fd);
+            }
+        }
+    } else if (revents != 0) {
+        /* unexpected poll event (POLLNVAL/POLLHUP on the socket):
+         * would busy-spin without receiving anything — log it */
+        static _Thread_local uint64_t last_pe;
+        uint64_t nowp = now_ms();
+        if (nowp - last_pe >= 1000) {
+            last_pe = nowp;
+            log_debug("recv thread %u: poll revents=0x%x (fd=%d)",
+                      a->tid, revents, fd);
+        }
+    }
+}
+
 static void *recv_thread_main(void *v)
 {
     struct recv_thr_arg *a = v;
-    struct pollfd pfd = { .fd = a->fd, .events = POLLIN, .revents = 0 };
+    /* 两个 fd：0 = v4（原样），1 = v6（无 IPv6 时 fd = -1，npfd = 1 不参与
+     * poll）。每个线程仍然只 poll 自己那对 SO_REUSEPORT socket。 */
+    struct pollfd pfd[2] = {
+        { .fd = a->fd, .events = POLLIN, .revents = 0 },
+        { .fd = a->fd6, .events = POLLIN, .revents = 0 },
+    };
+    int npfd = a->fd6 >= 0 ? 2 : 1;
     struct mmsghdr msgs[UDP_RXBATCH];
-    struct sockaddr_in peers[UDP_RXBATCH];
+    struct sockaddr_storage peers[UDP_RXBATCH];
     struct iovec iov[UDP_RXBATCH];
     uint8_t *buf;
     uint64_t last_purge = now_ms(), last_qctl = now_ms(), last_probe = now_ms(),
@@ -987,10 +1270,10 @@ static void *recv_thread_main(void *v)
         log_err("uplink recv thread: out of memory");
         return NULL;
     }
-    setup_rx_batch(buf, iov, msgs, peers);
+    setup_rx_batch(buf, iov, msgs, peers, (socklen_t)sizeof(struct sockaddr_in));
 
     while (!atomic_load_explicit(&g_stop, memory_order_relaxed)) {
-        int pr = poll(&pfd, 1, 100);
+        int pr = poll(pfd, (nfds_t)npfd, 100);
         if (pr < 0) {
             if (errno == EINTR)
                 continue;
@@ -1003,88 +1286,11 @@ static void *recv_thread_main(void *v)
             atomic_store_explicit(&g_stop, true, memory_order_relaxed);
             break;
         }
-        if (pfd.revents & POLLERR) {
-            /* A pending ICMP error (e.g. port-unreachable for a datagram
-             * we sent to a client port that just closed) keeps POLLERR
-             * asserted on a UDP socket. Plain recv/recvmmsg does NOT
-             * consume the error queue, so without this the poll loop
-             * busy-spins at 100% CPU and the socket stops delivering
-             * data — measured: one of four REUSEPORT recv threads
-             * wedged this way and every packet hashed to its socket
-             * (including the client's OPEN) was silently lost. Drain
-             * sk_error_queue via MSG_ERRQUEUE until empty. */
-            char ebuf[512];
-            struct sockaddr_in junk;
-            struct iovec eiov = { .iov_base = ebuf, .iov_len = sizeof ebuf };
-            struct msghdr emh = { .msg_name = &junk,
-                                  .msg_namelen = sizeof junk,
-                                  .msg_iov = &eiov, .msg_iovlen = 1 };
-            while (recvmsg(a->fd, &emh, MSG_ERRQUEUE | MSG_DONTWAIT) > 0)
-                ;
-        }
-        if (pfd.revents & (POLLIN | POLLERR)) {
-            /* recvmmsg batch (64): drains up to 64 datagrams per syscall,
-             * amortizing the per-packet recvfrom overhead that used to
-             * be the loop's throughput ceiling — a full poll burst is
-             * consumed in one syscall round */
-            int last_v = 1;
-            int full_iters = 0; /* consecutive FULL batches this drain */
-            for (;;) {
-                /* R37 WG1a: `v` would shadow recv_thread_main's parameter
-                 * `void *v` under -Wshadow -Werror (no semantic change) */
-                int nready = recvmmsg(a->fd, msgs, UDP_RXBATCH, MSG_DONTWAIT,
-                                      NULL);
-                if (nready > 0) {
-                    for (int i = 0; i < nready; i++) {
-                        if (msgs[i].msg_len <= 0)
-                            continue;
-                        PROF_ADD(g_prof_srv_recv, (size_t)msgs[i].msg_len);
-                        handle_udp(a->ctx, a->users, a->nusers,
-                                   (const uint8_t *)msgs[i].msg_hdr.msg_iov[0]
-                                       .iov_base,
-                                   (size_t)msgs[i].msg_len, &peers[i], a->fd,
-                                   a->tid);
-                    }
-                    last_v = nready;
-                    if (nready < UDP_RXBATCH)
-                        break; /* partial batch: drained */
-                    /* full batch: R48-L2 — bound consecutive full
-                     * batches so this thread always returns to poll (and
-                     * tid==0 reaches its 1s housekeeping) even under an
-                     * unbounded flood */
-                    if (++full_iters >= UDP_DRAIN_MAXBATCH)
-                        break;
-                    continue;
-                }
-                if (nready < 0 && errno == EINTR)
-                    continue;
-                last_v = nready;
-                break; /* EAGAIN: drained, or ICMP error */
-            }
-            /* diagnostic: poll reported readable but nothing was
-             * drained — a transient race between poll and recvmmsg, or
-             * a wedged receive path (see the MSG_ERRQUEUE drain above) */
-            if (last_v <= 0 && (pfd.revents & POLLIN)) {
-                static _Thread_local uint64_t last_pe2;
-                uint64_t nowp = now_ms();
-                if (nowp - last_pe2 >= 1000) {
-                    last_pe2 = nowp;
-                    log_debug("recv thread %u: POLLIN but recvmmsg=%d "
-                              "errno=%d (fd=%d)", a->tid, last_v, errno,
-                              a->fd);
-                }
-            }
-        } else if (pfd.revents != 0) {
-            /* unexpected poll event (POLLNVAL/POLLHUP on the socket):
-             * would busy-spin without receiving anything — log it */
-            static _Thread_local uint64_t last_pe;
-            uint64_t nowp = now_ms();
-            if (nowp - last_pe >= 1000) {
-                last_pe = nowp;
-                log_debug("recv thread %u: poll revents=0x%x (fd=%d)",
-                          a->tid, pfd.revents, a->fd);
-            }
-        }
+        /* pfd[0] 的容量仍是 16（与只有 v4 时逐位相同），pfd[1] 是 v6 的 28 */
+        for (int k = 0; k < npfd; k++)
+            recv_drain_socket(a, pfd[k].fd, pfd[k].revents, msgs, peers,
+                              k == 0 ? (socklen_t)sizeof(struct sockaddr_in)
+                                     : (socklen_t)sizeof(struct sockaddr_in6));
 
         if (a->tid == 0) {
             /* periodic housekeeping: primary thread only */
@@ -1174,6 +1380,11 @@ static void *recv_thread_main(void *v)
                             (unsigned long long)drops);
                     last_drops = drops;
                 }
+                /* IWAN_SRV_SINK=1：每 5 秒一行计量统计（函数内部按 5s
+                 * 门控，多余的 1s 调用直接返回）。只在主 recv 线程调用：
+                 * 区间速率 latch 是非原子的。 */
+                if (a->ctx->sink)
+                    server_sink_print(a->ctx, false);
                 last_purge = now;
             }
         }
@@ -1182,11 +1393,13 @@ static void *recv_thread_main(void *v)
     return NULL;
 }
 
-/* orderly shutdown: stop the TUN reader pool, close fds, and — in the
- * original root process — undo the NAT changes; returns the process
- * exit status (poll_err surfaces fatal runtime failures) */
+/* orderly shutdown: stop the TUN reader pool, close fds (both address
+ * families), and — in the original root process — undo the NAT changes;
+ * returns the process exit status (poll_err surfaces fatal runtime
+ * failures) */
 static int server_shutdown(struct server_ctx *ctx, int tun_fd,
-                           const int *udp_fds, int nfds, bool drop_child,
+                           const int *udp_fds, int nfds,
+                           const int *udp_fds6, int nfds6, bool drop_child,
                            int poll_err)
 {
     tun_pool_destroy(ctx->qpool); /* stops readers, detaches extra queues */
@@ -1195,10 +1408,35 @@ static int server_shutdown(struct server_ctx *ctx, int tun_fd,
     ctx->tun_fd = -1;
     for (int i = 0; i < nfds; i++)
         close(udp_fds[i]);
+    for (int i = 0; i < nfds6; i++)
+        close(udp_fds6[i]);
     if (!drop_child)
         server_cleanup_nat(); /* root process restores ip_forward + MASQUERADE */
     server_ctx_destroy(ctx);
     return poll_err ? 1 : 0;
+}
+
+/* IWAN_SRV_SINK=1：仅计量接收端点（见 usage 的环境变量表）。读法与其他
+ * 开关一致：非空即为开，off 拼写 {0,false,no,off}（大小写不敏感）是关；
+ * 既不是 on 也不是 off 的写法按开处理，但打一行 warning —— 与
+ * IWAN_SRV_THREADS 非法值告警的风格一致。 */
+static bool sink_env_enabled(void)
+{
+    static const char *const on[] = { "1", "true", "yes", "on" };
+    static const char *const off[] = { "0", "false", "no", "off" };
+    const char *v = getenv("IWAN_SRV_SINK");
+
+    if (v == NULL || *v == '\0')
+        return false;
+    for (size_t i = 0; i < sizeof on / sizeof on[0]; i++)
+        if (strcasecmp(v, on[i]) == 0)
+            return true;
+    for (size_t i = 0; i < sizeof off / sizeof off[0]; i++)
+        if (strcasecmp(v, off[i]) == 0)
+            return false;
+    fprintf(stderr, "warning: unrecognized IWAN_SRV_SINK '%s' "
+            "(treating as on)\n", v);
+    return true;
 }
 
 int main(int argc, char **argv)
@@ -1211,7 +1449,8 @@ int main(int argc, char **argv)
     uint32_t subnet_base;
     char subnet_net[64];
     int udp_fds[IWAN_SRV_THREADS_MAX];
-    int nusers, tun_fd = -1, nfds;
+    int udp_fds6[IWAN_SRV_THREADS_MAX];
+    int nusers, tun_fd = -1, nfds, nfds6;
     /* H-3: queue fds pre-opened in the root section (before fork+setuid)
      * and handed to tun_pool_create_pre; `pre` lives on main's stack and
      * is inherited by the child across the fork. maxq/initq are computed
@@ -1251,6 +1490,10 @@ int main(int argc, char **argv)
     }
     server_up_stats_set_threads(recv_threads);
 
+    /* IWAN_SRV_SINK=1：仅计量接收端点 —— 不建 TUN、不解密、不转发，只按
+     * 外层 UDP 净荷计数（见 usage）。读一次，之后只读。 */
+    bool sink_mode = sink_env_enabled();
+
     memset(&o, 0, sizeof o);
     o.port = 6001;
     strcpy(o.tun, "iwan-srv");
@@ -1260,6 +1503,7 @@ int main(int argc, char **argv)
     strcpy(o.users, "/etc/iwan/users.txt");
     strcpy(o.nat_if, "eth0");
     strcpy(o.user, "nobody");
+    o.data_plane = "tun";   /* v1 服务端只有 TUN 数据面（见 parse_opts 的 'D'） */
 
     parse_opts(argc, argv, &o);
 
@@ -1296,7 +1540,8 @@ int main(int argc, char **argv)
     /* The argument checks below are pure string/path validation and must stay
      * libcrypto-free: on e07fe75 an invalid --subnet/--tun/--server-ip/--dns
      * exited rc=1 without touching libcrypto at all. */
-    if (!o.no_tun && !tun_name_valid(o.tun)) {
+    /* sink 模式不建 TUN，--tun 的值不参与任何事（与 --no-tun 同） */
+    if (!o.no_tun && !sink_mode && !tun_name_valid(o.tun)) {
         fprintf(stderr, "error: invalid tun device name '%s'\n", o.tun);
         return 1;
     }
@@ -1391,6 +1636,9 @@ int main(int argc, char **argv)
     ctx.ip_end = (subnet_base | ~(0xFFFFFFFFu << (32 - o.mask))) - 1; /* pre-broadcast */
     ctx.next_ip = ctx.ip_base;
     ctx.tun_fd = -1;
+    /* IWAN_SRV_SINK=1：数据帧在 server.c 的 DATA 分支里只计数（不解密、
+     * 不解析内层、不写 TUN、不回发）；其他路径零初始化为 false */
+    ctx.sink = sink_mode;
     /* R12 T1: make the H1 gate subnet-aware (see server.h/server.c).  An
      * uplink inner packet to the gateway (-s) or to any address inside
      * --subnet is THIS tunnel's own address space, not a springboard into
@@ -1468,7 +1716,9 @@ int main(int argc, char **argv)
     if (crypto_init() != 0)
         oom_abort();
 
-    if (o.no_tun) {
+    if (sink_mode) {
+        printf("sink mode: metering only (no TUN, no decrypt, no forward)\n");
+    } else if (o.no_tun) {
         printf("no-tun mode: TCP echo mirror (bench harness)\n");
     } else {
         enable_ip_forward();
@@ -1522,6 +1772,11 @@ int main(int argc, char **argv)
     }
 
     nfds = setup_udp(o.port, udp_fds, recv_threads);
+    /* 外层 IPv6：第二套同端口 AF_INET6 套接字（IPV6_V6ONLY=1）。v4 那套的
+     * 调用序列与创建个数完全不变；宿主没有 IPv6 时 setup_udp6 打一行说明
+     * 并返回 0，服务端照常用 v4 起来。 */
+    nfds6 = setup_udp6(o.port, udp_fds6, recv_threads);
+    ctx.dl_fd6 = nfds6 > 0 ? udp_fds6[0] : -1;
 
     /* A1: drop root.  All root-only work (TUN setup, NAT rules, socket
      * bind) is done; from here on the server loop runs unprivileged.
@@ -1637,7 +1892,7 @@ int main(int argc, char **argv)
      * undoes the NAT changes. */
     sigprocmask(SIG_SETMASK, &stop_orig, NULL);
 
-    if (!o.no_tun) {
+    if (!o.no_tun && !sink_mode) {
         static struct srv_pool_ud pu; /* readers reference this for life */
         /* maxq/initq were computed once in the root section above (H-3)
          * so the same geometry drives both the queue pre-open and this
@@ -1646,6 +1901,8 @@ int main(int argc, char **argv)
         pu.ctx = &ctx;
         pu.udp_fds = udp_fds;
         pu.nfds = nfds;
+        pu.udp_fds6 = udp_fds6;
+        pu.nfds6 = nfds6;
         /* eager full pool: uplink writers spread across the queue fds
          * (tun_pool_write_fd, tid % nq); starting at the recv-thread
          * count means the write-side fan-out is effective immediately
@@ -1717,6 +1974,32 @@ int main(int argc, char **argv)
                (unsigned)bound_port, recv_threads,
                recv_threads > 1 ? "s" : "");
     }
+    /* 外层 v6 的监听行与 v4 平行（同一条 L23 口径：报内核实际绑定的端口）。
+     * 宿主没有 IPv6 时 setup_udp6 已经打过那一行说明，这里整段跳过。 */
+    if (nfds6 > 0) {
+        struct sockaddr_in6 ba6;
+        socklen_t blen6 = sizeof ba6;
+        uint16_t bound6 = o.port;
+        if (getsockname(udp_fds6[0], (struct sockaddr *)&ba6, &blen6) == 0)
+            bound6 = ntohs(ba6.sin6_port);
+        for (int i = 1; i < nfds6; i++) {
+            struct sockaddr_in6 b62;
+            socklen_t l62 = sizeof b62;
+            if (getsockname(udp_fds6[i], (struct sockaddr *)&b62, &l62) == 0 &&
+                ntohs(b62.sin6_port) != bound6) {
+                fprintf(stderr,
+                        "warning: v6 SO_REUSEPORT 套接字绑到了不同端口"
+                        "（fd[0]=%u, fd[%d]=%u）；--port 0 的临时端口下没有"
+                        "客户端能连的单一端口，请传固定 --port\n",
+                        (unsigned)bound6, i,
+                        (unsigned)ntohs(b62.sin6_port));
+                break;
+            }
+        }
+        printf("listening UDP [::]:%u (%d recv thread%s)\n",
+               (unsigned)bound6, recv_threads,
+               recv_threads > 1 ? "s" : "");
+    }
     printf("server ready.\n");
     fflush(stdout);   /* readiness contract: callers grep the log */
 
@@ -1737,6 +2020,7 @@ int main(int argc, char **argv)
          * udp_fds[1] had no consumer at all (~25% of packets lost). */
         args[i + 1] = (struct recv_thr_arg){ &ctx, users, nusers,
                                              udp_fds[i + 1],
+                                             nfds6 > 0 ? udp_fds6[i + 1] : -1,
                                              (unsigned)(i + 1),
                                              &poll_err, o.tun };
         /* R37 L3 convention (see relay_proxy.c): pthread_create returns
@@ -1757,7 +2041,8 @@ int main(int argc, char **argv)
         }
         ncreated++;
     }
-    args[0] = (struct recv_thr_arg){ &ctx, users, nusers, udp_fds[0], 0,
+    args[0] = (struct recv_thr_arg){ &ctx, users, nusers, udp_fds[0],
+                                     nfds6 > 0 ? udp_fds6[0] : -1, 0,
                                      &poll_err, o.tun };
     recv_thread_main(&args[0]);   /* primary loop, inline */
 
@@ -1771,6 +2056,10 @@ int main(int argc, char **argv)
      * in its final window is not lost (previously only the primary's
      * flag was surfaced and a secondary fatal still exited 0) */
     int shutdown_poll_err = atomic_load(&poll_err);
-    return server_shutdown(&ctx, tun_fd, udp_fds, nfds, drop_child,
-                           shutdown_poll_err);
+    /* IWAN_SRV_SINK=1：退出前的最终统计（SIGINT/SIGTERM 的优雅退出走这
+     * 条路）。所有 recv 线程已 join，打印函数的非原子 latch 可以安全用。 */
+    if (sink_mode)
+        server_sink_print(&ctx, true);
+    return server_shutdown(&ctx, tun_fd, udp_fds, nfds, udp_fds6, nfds6,
+                           drop_child, shutdown_poll_err);
 }

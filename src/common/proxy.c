@@ -177,6 +177,11 @@ static int send_ctrl(pump_ctx_t *ctx, uint8_t typ, uint8_t enc, uint16_t sid,
 
 #define PUMP_BATCH 32
 #define PUMP_SLOT  2048
+/* PUMP_SLOT 是槽位**下限**，不是上限：槽位尺寸由协商出的内层 MTU 决定
+ * （pump_slot_init）。历史实现把它当上限用，于是大 MTU 会话的内层分组在
+ * 入队处被 log_debug 级静默丢弃 —— 2026-10-07 实测内层 MTU 60000 时 TCP
+ * 两向 100% 不通而日志无痕。现在按 MTU 定尺，并把批数相应减少，使每队列
+ * 缓冲仍约 64 KiB 量级；MTU<=2040 时与原行为逐字节一致。 */
 #define PUMP_KEEPALIVE_MS 10000u
 /* keepalive send must fail this many times in a row before the tunnel
  * is declared dead: a transient network blip (wifi roam, carrier
@@ -213,7 +218,7 @@ static int send_ctrl(pump_ctx_t *ctx, uint8_t typ, uint8_t enc, uint16_t sid,
 /* parsed once per process: the pump loop would otherwise re-run
  * getenv+strtoul on every iteration; 0 disables the watchdog (aligned
  * with the README contract and socks.c) */
-static unsigned pump_rx_stale_ms(void)
+unsigned pump_rx_stale_ms(void)
 {
     static unsigned cached;
     static int parsed;
@@ -228,8 +233,47 @@ static unsigned pump_rx_stale_ms(void)
                                                  "30s..24h)");
     return cached;
 }
+
+/* Liveness-contract accessors shared with the kernel data plane supervisor
+ * (src/common/kdp.c, Linux-only): the two data planes must agree on the
+ * keepalive cadence and the consecutive-send-failure budget, and kdp must
+ * inherit the EXACT IWAN_RX_STALE_MS parsing above (default 120s, 0
+ * disables, 30s..24h) instead of keeping a second copy. TUN-path semantics
+ * are untouched: these are pure readers of the macros. */
+unsigned pump_keepalive_ms(void)
+{
+    return PUMP_KEEPALIVE_MS;
+}
+
+unsigned pump_ka_fail_max(void)
+{
+    return PUMP_KA_FAIL_MAX;
+}
 #define PUMP_POLL_CEIL_MS 1000  /* cap on the recvmmsg park timeout */
 #define RX_BATCH 64             /* recvmmsg batch size (iov/msgs arrays) */
+
+/* 槽位定尺：内层 MTU 决定每报文缓冲（8B 封装首部 + 内层分组）。下限
+ * PUMP_SLOT 保证小 MTU 会话的行为与历史一致（slot=8+PUMP_SLOT、每批
+ * PUMP_BATCH 个槽位）；MTU 变大时槽位变大、批数减少，使每队列缓冲维持
+ * 在 64 KiB 量级而不是随 MTU 线性膨胀。上限 IWAN_MTU_MAX 由 protocol.h
+ * 按外层 IPv4 总长 65535 推出。 */
+static void pump_slot_init(pump_ctx_t *ctx, uint16_t auth_mtu)
+{
+    size_t inner = auth_mtu > PUMP_SLOT ? (size_t)auth_mtu : (size_t)PUMP_SLOT;
+    if (inner > IWAN_MTU_MAX)
+        inner = IWAN_MTU_MAX;   /* 控制面已钳制；这里兜底 */
+    ctx->inner_max = inner;
+    ctx->slot = 8 + inner;
+    ctx->nbatch = PUMP_BATCH;
+    if (ctx->slot > 8 + PUMP_SLOT) {
+        unsigned n = (unsigned)(65536u / ctx->slot);
+        if (n < 1)
+            n = 1;
+        if (n > PUMP_BATCH)
+            n = PUMP_BATCH;
+        ctx->nbatch = n;
+    }
+}
 
 /* aggregate send-rate pacing: shared token bucket from util.h
  * (pace_bucket / pace_bucket_init / pace_take), same policy as socks.c.
@@ -547,11 +591,13 @@ static void pump_tun_pkt(void *ud, uint8_t *pkt, size_t len, bool last)
      * oversized inner packet must never be copied into the batch
      * buffer, or it would clobber the adjacent slot (heap overflow).
      * The pool's last=true flush signal carries len==0, so this check
-     * lives after the drain path above. */
-    if (len == 0 || len > PUMP_SLOT) {
-        /* %llu, never %zu: msvcrt printf (Windows) lacks %zu (json.c:55) */
-        log_debug("pump: drop packet, len %llu out of [1, %d]",
-                  (unsigned long long)len, PUMP_SLOT);
+     * lives after the drain path above. 上限是协商出的内层 MTU，不是固定
+     * 的 2048：这样大 MTU 会话的内层分组才进得了槽位。 */
+    if (len == 0 || len > ctx->inner_max) {
+        /* %llu/%zu：Windows 的 msvcrt printf 没有 %zu（json.c:55） */
+        log_debug("pump: drop packet, len %llu out of [1, %llu]",
+                  (unsigned long long)len,
+                  (unsigned long long)ctx->inner_max);
         return;
     }
     if (q->n == 0) {
@@ -559,8 +605,8 @@ static void pump_tun_pkt(void *ud, uint8_t *pkt, size_t len, bool last)
             /* one slot per packet: 8-byte iWAN header followed by the
              * (XOR'd) payload, contiguous and 8-byte aligned, so the
              * final wire packet is a single iovec with no assembly */
-            const size_t slot = 8 + PUMP_SLOT;
-            q->batch = malloc((size_t)PUMP_BATCH * slot);
+            const size_t slot = ctx->slot;
+            q->batch = malloc((size_t)ctx->nbatch * slot);
             if (!q->batch) {
                 log_err("out of memory");
                 /* R1-B2-1: mark it abnormal like every other pump-fatal
@@ -579,7 +625,7 @@ static void pump_tun_pkt(void *ud, uint8_t *pkt, size_t len, bool last)
     if (g_stop)
         return;
     {
-        const size_t slot = 8 + PUMP_SLOT;
+        const size_t slot = ctx->slot;
         uint8_t *s = q->batch + (size_t)q->n * slot;
         uint64_t t0 = now_us();
         memcpy(s, q->hdr, 8);
@@ -594,7 +640,10 @@ static void pump_tun_pkt(void *ud, uint8_t *pkt, size_t len, bool last)
     /* latency cap: under sustained load, stop filling this batch after
      * PUMP_MAX_LAT_US so no packet waits a full batch (32 x
      * inter-arrival) before being sent */
-    if (q->n == PUMP_BATCH || now_us() - q->t0 >= PUMP_MAX_LAT_US)
+    /* 批满即发：容量是 ctx->nbatch（= min(PUMP_BATCH, 64KiB/slot)），不是
+     * 固定的 PUMP_BATCH —— 大 MTU 时 nbatch 可能只有 1，仍按 PUMP_BATCH
+     * 刷新就会写到分配区之外（2026-10-07 内层 MTU 65499 时客户端因此段错误）。 */
+    if (q->n >= ctx->nbatch || now_us() - q->t0 >= PUMP_MAX_LAT_US)
         pump_flush(ctx, q);
 }
 #elif defined(_WIN32)
@@ -700,8 +749,8 @@ static void *udp2tun_thread(void *ud) {
      * A non-NULL timeout argument must NOT be passed to recvmmsg: the
      * kernel checks it only after the first datagram and it never bounds
      * the first-message wait (documented bug). */
-    const size_t slot = 8 + PUMP_SLOT;
-    const int rxbatch = RX_BATCH;
+    const size_t slot = ctx->slot;
+    const int rxbatch = (int)ctx->nbatch;   /* <= PUMP_BATCH <= RX_BATCH */
     uint8_t *batch = malloc((size_t)rxbatch * slot);
     struct iovec iov[RX_BATCH];
     struct mmsghdr msgs[RX_BATCH];
@@ -749,22 +798,26 @@ static void *udp2tun_thread(void *ud) {
             if (send_ctrl(ctx, PT_ECHO_REQ, ctx->enc, ctx->sid,
                           ctx->tok) != 0) {
                 int e = errno;
-                /* transient errors (roaming, carrier hiccup) recover;
-                 * only repeated failures declare the socket dead */
+                /* transient errors (roaming, carrier hiccup) recover, but
+                 * the recovery evidence is a RECEIVED frame (ka_fail is
+                 * cleared on the downlink path below), not a send that
+                 * returned success: a connected UDP socket reports the
+                 * ICMP port-unreachable on alternating sends, so a
+                 * send-success reset made this budget unreachable */
                 if (++ka_fail >= PUMP_KA_FAIL_MAX) {
-                    log_err("[UDP->TUN] keepalive send err: %s (%d "
-                            "consecutive); session lost",
-                            strerror(e), ka_fail);
+                    log_err("[UDP->TUN] %d unanswered keepalive failures "
+                            "(last: %s); session lost", ka_fail,
+                            strerror(e));
                     ctx->session_lost = true;
                     g_stop = 1;
                     break;
                 }
-                err_printf("[UDP->TUN] keepalive send err: %s (retry "
+                err_printf("[UDP->TUN] keepalive send err: %s (unanswered "
                         "%d/%d)\n", strerror(e), ka_fail,
                         PUMP_KA_FAIL_MAX);
-            } else {
-                ka_fail = 0;
             }
+            /* both outcomes advance the cadence: a failure is retried one
+             * keepalive period later, not once per poll round */
             last_ka = now_ms();
         }
         uint64_t t_recv = now_us();
@@ -847,11 +900,31 @@ static void *udp2tun_thread(void *ud) {
             continue;
         }
         if (v < 0) {
-            if (errno == EINTR || errno == ECONNREFUSED)
-                continue;   /* EINTR: signal; ECONNREFUSED: one-shot
-                             * connected-UDP ICMP artifact (Linux side;
-                             * Windows is silenced via SIO_UDP_CONNRESET)
-                             * — the keepalive logic detects real loss */
+            if (errno == EINTR)
+                continue;   /* signal */
+            if (errno == ECONNREFUSED || errno == EHOSTUNREACH ||
+                errno == ENETUNREACH || errno == ECONNRESET) {
+                /* 连通 UDP 套接字的 ICMP 端口不可达/主机不可达（Windows 由
+                 * SIO_UDP_CONNRESET 静音，Linux/macOS 会看到）——这是"对端
+                 * 不在"的证据。以前这里直接 continue，指望 keepalive 的发送
+                 * 侧发现；实测发送侧看不到它（错误先被这里的 recvmmsg 消费，
+                 * 于是 send 成功），预算永远不累积。现在计入同一条"无人应答"
+                 * 预算，只有收到过门限的帧才清零。 */
+                int e = errno;
+
+                if (++ka_fail >= PUMP_KA_FAIL_MAX) {
+                    log_err("[UDP->TUN] %d unanswered transport failures "
+                            "(last: %s); session lost", ka_fail,
+                            strerror(e));
+                    ctx->session_lost = true;
+                    g_stop = 1;
+                    break;
+                }
+                err_printf("[UDP->TUN] peer not answering: %s (unanswered "
+                        "%d/%d)\n", strerror(e), ka_fail,
+                        PUMP_KA_FAIL_MAX);
+                continue;
+            }
             log_err("[UDP->TUN] recv err: %s (%d)", strerror(errno),
                     errno);
             ctx->session_lost = true;   /* abnormal: reconnect */
@@ -894,6 +967,9 @@ static void *udp2tun_thread(void *ud) {
              * client a zombie. Mirrors the A-4 fix in socks.c
              * (vpn_handle_datagram). */
             last_rx = now_ms();
+            /* 只有过了 sid/token 门限的帧才算对端活着（与 last_rx 同口径），
+             * 同时清零"无人应答"失败预算：send 成功不算，收到帧才算。 */
+            ka_fail = 0;
             if (t == PT_CLOSE) {
                 /* control packets carry the 16-byte header sig */
                 if (!verify_sig(m, (size_t)n))
@@ -1359,12 +1435,16 @@ static int expand_route_targets_fam(const slist_t *targets, slist_t *out,
     return 0;
 }
 
-static int expand_route_targets(const slist_t *targets, slist_t *out)
+/* Route-target expansion shared with kdp.c (kernel data plane): the two data
+ * planes must expand --proxy-cidr/--proxy-ip/--proxy-domain/--proxy-cidr6
+ * identically (same validation, same DNS resolution, same ordering), so these
+ * are exported instead of copied. The bodies are unchanged. */
+int expand_route_targets(const slist_t *targets, slist_t *out)
 {
     return expand_route_targets_fam(targets, out, AF_INET);
 }
 
-static int expand_route_targets6(const slist_t *targets, slist_t *out)
+int expand_route_targets6(const slist_t *targets, slist_t *out)
 {
     return expand_route_targets_fam(targets, out, AF_INET6);
 }
@@ -1500,6 +1580,7 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
     pump_ctx_t ctx;
     memset(ctx.prof, 0, sizeof ctx.prof);
     pump_prof_gate_init();   /* C4: parse IWAN_PUMP_PROF once, up front */
+    pump_slot_init(&ctx, auth_mtu);   /* 槽位按协商 MTU 定尺 */
     ctx.tun_fd = tun_fd;
     ctx.sockfd = sockfd;
     /* R33-FIX-B: the session socket comes from udp_connect() as a
@@ -1637,8 +1718,9 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
                     ogw_metric, &routes, had_routes, &routes6);
 
     send_ctrl(&ctx, PT_CLOSE, enc, sid, tok);
-    if (debug_enabled())
-        err_printf("CLOSE sent\n");
+    /* 无条件打印：与内核数据面（kdp.c）保持一致 —— 这是客户端侧唯一一处"已向对端
+     * 发出告别帧"的可见证据，每条会话一行，不是调试噪音。 */
+    err_printf("CLOSE sent\n");
 
     if (pump_prof_wanted())
         pump_prof_print(&ctx);

@@ -109,6 +109,12 @@ typedef struct {
     uint32_t tok;
     uint32_t inner_ip; /* session IP, host order: downlink addr filter */
     uint8_t  enc;
+    /* 槽位定尺（proxy.c pump_slot_init）：内层分组上限取协商 MTU 与
+     * PUMP_SLOT 的较大者，槽位 = 8B 定长封装首部 + 内层分组。固定 2048
+     * 会让大 MTU 会话的内层分组在入队处被静默丢弃。 */
+    size_t   inner_max; /* 内层分组上限字节数 */
+    size_t   slot;      /* 每报文槽位字节数 = 8 + inner_max */
+    unsigned nbatch;    /* 每批槽位数（大 MTU 时自动减少） */
     size_t   gso_mss;   /* last UDP_SEGMENT value set, 0 = none */
     int      gso_ok;    /* 1 = UDP_SEGMENT usable, 0 = failed, -1 = untried */
     size_t   gso_pending_mss; /* C1 hysteresis: mss seen in recent batches */

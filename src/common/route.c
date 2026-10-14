@@ -197,6 +197,82 @@ static void prefix_str(uint32_t net, int prefix, char out[24])
 
 #endif /* _WIN32 */
 
+/* Windows: the NDIS data-plane adapter comes from our own INF, so Windows
+ * names the connection itself ("Local Area Connection", "... 2" after a
+ * reinstall, "... 3" with a second adapter of the same kind), while
+ * route_iface_up/route_setup address the interface by name. Map the name
+ * onto the adapter by its driver description (the INF DeviceDesc, which
+ * Get-NetAdapter shows as InterfaceDescription) and rename it when the
+ * alias differs. Already named that way: true. No such adapter, or netsh
+ * refused: false — the caller decides whether that is fatal (the WFP
+ * data plane uses a KM-TEST adapter the user created, whose name is
+ * already whatever --dev says, and never calls this). */
+bool route_iface_ensure_name(const char *want, const char *desc_match)
+{
+#ifdef _WIN32
+    IP_ADAPTER_ADDRESSES *aa;
+    ULONG buflen = 16 * 1024, rc;
+    WCHAR wwant[64], wdesc[128];
+    bool ok = false;
+
+    if (want == NULL || want[0] == '\0' || desc_match == NULL)
+        return false;
+    if (MultiByteToWideChar(CP_UTF8, 0, want, -1, wwant, 64) <= 0 ||
+        MultiByteToWideChar(CP_UTF8, 0, desc_match, -1, wdesc, 128) <= 0)
+        return false;
+
+    rc = GetAdaptersAddresses(AF_UNSPEC, 0, NULL, NULL, &buflen);
+    if (rc != NO_ERROR && rc != ERROR_BUFFER_OVERFLOW)
+        return false;
+    if (buflen == 0)
+        return false;
+    aa = malloc(buflen);
+    if (aa == NULL)
+        oom_abort();
+    rc = GetAdaptersAddresses(AF_UNSPEC, 0, NULL, aa, &buflen);
+    if (rc != NO_ERROR) {
+        free(aa);
+        return false;
+    }
+
+    for (IP_ADAPTER_ADDRESSES *p = aa; p != NULL; p = p->Next) {
+        char cur[128];
+        char *a[8];
+
+        if (p->Description == NULL || p->FriendlyName == NULL)
+            continue;
+        if (_wcsicmp(p->FriendlyName, wwant) == 0) {
+            ok = true;
+            break;
+        }
+        if (_wcsicmp(p->Description, wdesc) != 0)
+            continue;
+        if (!WideCharToMultiByte(CP_UTF8, 0, p->FriendlyName, -1, cur,
+                                 (int)sizeof cur, NULL, NULL))
+            continue;
+        a[0] = "netsh";
+        a[1] = "interface";
+        a[2] = "set";
+        a[3] = "interface";
+        a[4] = cur;
+        a[5] = "newname";
+        a[6] = (char *)want;
+        a[7] = NULL;
+        ok = netsh_run(a, "iface rename");
+        log_info("iface rename: %s -> %s: %s", cur, want,
+                 ok ? "ok" : "failed");
+        break;
+    }
+    free(aa);
+    return ok;
+#else
+    /* elsewhere the tunnel interface is created by us under this name */
+    (void)want;
+    (void)desc_match;
+    return true;
+#endif
+}
+
 /* bring the tunnel interface up with an address and MTU (no routes):
  * addr flush / link up / mtu / addr add. Shared by route_setup (which
  * then installs routes) and the no-route-hijack pump path in proxy.c.

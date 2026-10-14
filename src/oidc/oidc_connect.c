@@ -20,6 +20,12 @@ extern char **environ;     /* macOS unistd.h does not declare it */
 #include "common.h"
 #include "crypto.h"
 #include "gcm.h"
+#ifdef __linux__
+#include "kdp.h"      /* 内核数据面（Linux only）：与 kdp.c 同处条件编译 */
+#endif
+#if defined(_WIN32)
+#include "kdp_win.h"   /* Windows 内核数据面（WFP 驱动）：与 kdp_win.c 同处条件编译 */
+#endif
 #include "oidc.h"
 #include "oidc_pwsecret.h"
 #include "protocol.h"
@@ -278,7 +284,10 @@ void oidc_elevate_root(int argc, char **argv)
     for (int i = 1; i < argc; i++)
         args[i + 1] = argv[i];
     args[argc + 1] = NULL;
-    oidc_eprintf("TUN mode requires root; re-running via sudo...\n");
+    /* 两种数据面都需要 root（内核面要 CAP_NET_ADMIN 建会话/设备），所以
+     * 这里不能说成 "TUN mode" —— 与 tcp 报错里"must be root"同类，
+     * 内核面 + 这条消息会把用户往错的方向带。 */
+    oidc_eprintf("data plane requires root; re-running via sudo...\n");
     exec_sanitize();
     execve("/usr/bin/sudo", args, environ);
     if (errno == ENOENT)
@@ -304,6 +313,69 @@ int oidc_server_port(const Json *srv, uint16_t *out, double *raw)
         return -1;
     *out = (uint16_t)v;
     return 1;
+}
+
+/* TUN 面的资源准备（与 iwan-client 的 proxy_tun_prepare 同语义）：开设备
+ * （非阻塞）+ 可选的 SOCKS5/HTTP side-car。默认的 auto 先试内核面，因此
+ * 这个函数在"本来就选 TUN"与"内核面起不来回退"两条路径上都会被调用；
+ * 内核面下不能预先开着 iwan0（会让 SESSION_UP 报 -EBUSY）。
+ *
+ * 返回 fd（>=0，rp 由 relay_proxy_start 填，失败时保持 NULL）；失败返回 -1
+ * 并已打印原因（调用者决定是 oidc_die 还是继续）。
+ *
+ * 不预删设备：我们建的 TUN 是非持久的（open_tun 不设 TUNSETPERSIST），fd
+ * 一关内核就删；名字被别人的接口占着时 TUNSETIFF 失败，这里按 errno 分类
+ * 报错（EBUSY = 名字被占，不再笼统说成 "must be root"），绝不去动别人的
+ * 设备。 */
+static int oidc_tun_prepare(const Opts *o, struct RelayProxy **rp)
+{
+    int fd, e;
+
+    *rp = NULL;
+    if (!tun_name_valid(o->tun)) {
+        log_err("Error: invalid TUN device name '%s'", o->tun);
+        return -1;
+    }
+    errno = 0;
+    fd = open_tun(o->tun);
+    if (fd < 0) {
+        e = errno;
+        if (e == EBUSY || e == EEXIST || e == EINVAL)
+            log_err("Error: 打开 TUN 设备 %s 失败：内核拒绝了这个名字（%s）\n"
+                    "  同一个 netns 里同一时刻只能有一个虚拟网卡客户端持有"
+                    "这个设备名。先停掉占用者（可能是另一个客户端，也可能是"
+                    "内核模块建的 %s —— --data-plane kernel 的会话残留，用"
+                    "sudo iwan_ctl session-down 清掉）后重试",
+                    o->tun, strerror(e), o->tun);
+        else if (e == EACCES || e == EPERM)
+            log_err("Error: 打开 TUN 设备 %s 失败：权限不足（%s）—— TUN "
+                    "数据面需要 root（或 CAP_NET_ADMIN）", o->tun,
+                    strerror(e));
+        else if (e != 0)
+            log_err("Error: 打开 TUN 设备 %s 失败: %s", o->tun, strerror(e));
+        else
+            log_err("Error: 打开 TUN 设备 %s 失败", o->tun);
+        return -1;
+    }
+    set_nonblock(fd);
+    if (debug_enabled())
+        oidc_eprintf("  tun %s fd=%d\n", o->tun, fd);
+    /* optional SOCKS5+HTTP proxy sharing the TUN routes.
+     * R38-L02: a failed listener start (most commonly 127.0.0.1:1080
+     * already in use) must NOT kill the whole tunnel — the side-car
+     * is a convenience on top of the TUN, so degrade to "no local
+     * proxy" and keep going. rp is left NULL (relay_proxy_start sets
+     * *out = NULL before returning -1 on every failure arm) and
+     * relay_proxy_stop(NULL) at teardown is a no-op. The OIDC SOCKS
+     * MODE (--socks) never reaches this branch — it is guarded by
+     * !o->socks above — and keeps the proxy as the tunnel itself. */
+    if (o->socks_listen &&
+        relay_proxy_start(o->socks_listen, o->socks_token,
+                          o->socks_no_token, o->allow_remote, rp) != 0)
+        log_err("cannot start the SOCKS5+HTTP side-car proxy on %s; "
+                "continuing without it (tunnel unaffected)",
+                o->socks_listen);
+    return fd;
 }
 
 void oidc_connect_server(const Opts *o, const Config *cf)
@@ -368,40 +440,34 @@ void oidc_connect_server(const Opts *o, const Config *cf)
 
     /* TUN device and route prep are session-independent: prepared once,
      * reused across reconnects (the server keeps the assigned IP on a
-     * re-OPEN, so routing stays valid). */
+     * re-OPEN, so routing stays valid).
+     *
+     * 数据面选面与 iwan-client 同一套规则（cli_common.h）：--data-plane
+     * auto（默认）在 Linux 上选内核面并允许"起不来就回退 TUN"；显式 tun/
+     * kernel 不回退。--socks 模式既不用 TUN 也不用内核面（run_socks_mode
+     * 自己终结 TCP），所以整段跳过。 */
+    bool plane_auto = false;
+    const char *plane = data_plane_resolve(o->data_plane, &plane_auto);
+    /* 内层 IPv6 不再影响选面（与 iwan-client 同规则，见那边的长注释）：
+     * 内核模块同样解封内层 v6，--socks 模式的用户态协议栈不装路由也谈不
+     * 上黑洞。唯一门槛是内层 MTU ≥ 1280（RFC 8200 §5），拿到生效 MTU 后
+     * 检查，见下面的 want_v6 警告。 */
+    const bool want_v6 = o->proxy_cidr6.n > 0;
+    if (plane_auto && (o->socks_listen || o->socks_token ||
+                       o->socks_no_token || o->allow_remote)) {
+        /* 与 iwan-client 同规则：这些是 TUN 面的用户态代理/SOCKS 特性，
+         * 用户没点名数据面时选 TUN（互斥检查只对显式 --data-plane kernel
+         * 生效）。--socks 模式本来就不用任何数据面。 */
+        plane = IWAN_DATA_PLANE_TUN;
+        plane_auto = false;
+    }
+    bool kernel_plane = data_plane_is_kernel(plane);
     int tun_fd = -1;
     struct RelayProxy *rp = NULL;
-    if (!o->socks) {
-        /* Validate the name shape up front. We deliberately do NOT
-         * pre-delete: the TUN devices we create are non-persistent
-         * (open_tun never sets TUNSETPERSIST), so the kernel removes
-         * them when the fd closes — at shutdown and on any crash. If
-         * `o->tun` is occupied by an interface we do not own, TUNSETIFF
-         * fails below and we abort instead of deleting it. */
-        if (!tun_name_valid(o->tun))
-            oidc_die("invalid TUN device name '%s'", o->tun);
-        tun_fd = open_tun(o->tun);
+    if (!o->socks && !kernel_plane) {
+        tun_fd = oidc_tun_prepare(o, &rp);
         if (tun_fd < 0)
-            oidc_die("open tun (must be root)");
-        set_nonblock(tun_fd);
-        if (debug_enabled())
-            oidc_eprintf("  tun %s fd=%d\n", o->tun, tun_fd);
-        /* optional SOCKS5+HTTP proxy sharing the TUN routes.
-         * R38-L02: a failed listener start (most commonly 127.0.0.1:1080
-         * already in use) must NOT kill the whole tunnel — the side-car
-         * is a convenience on top of the TUN, so degrade to "no local
-         * proxy" and keep going. rp is left NULL (relay_proxy_start sets
-         * *out = NULL before returning -1 on every failure arm) and
-         * relay_proxy_stop(NULL) at teardown is a no-op. The OIDC SOCKS
-         * MODE (--socks) never reaches this branch — it is guarded by
-         * !o->socks above — and keeps the proxy as the tunnel itself. */
-        if (o->socks_listen &&
-            relay_proxy_start(o->socks_listen, o->socks_token,
-                              o->socks_no_token, o->allow_remote,
-                              &rp) != 0)
-            log_err("cannot start the SOCKS5+HTTP side-car proxy on %s; "
-                    "continuing without it (tunnel unaffected)",
-                    o->socks_listen);
+            oidc_die("TUN 数据面不可用（原因见上）");
     }
 
     slist_t routes;
@@ -421,6 +487,9 @@ void oidc_connect_server(const Opts *o, const Config *cf)
         .srv_user = srv_user, .encrypted_pw = encrypted_pw, .cf = cf,
     };
     bool reconnecting = false;
+    /* kdp_run 的启动失败分类（见 kdp.h）：true = 本 netns 已有内核会话/
+     * 设备被占，这种失败不回退 TUN。 */
+    bool kdp_busy = false;
 #ifndef _WIN32
     /* R36-L01: hold the stop handler across the WHOLE reconnect loop in
      * SOCKS mode. run_socks installs on_sig when it enters and restores
@@ -458,6 +527,41 @@ void oidc_connect_server(const Opts *o, const Config *cf)
 #endif
         }
         AuthResult res;
+
+        /* 握手前的内核面预检（只在首次握手之前跑，理由见 kdp.h：不先跟
+         * 服务器握手，避免白占一条服务端会话、更避免把本 netns 已有的活
+         * 会话顶掉）。--socks 模式不用内核面，跳过。 */
+        if (!o->socks && !reconnecting && kernel_plane) {
+            char perr[512];
+            bool busy = false;
+
+#if defined(_WIN32)
+            if (!kdp_win_plane_precheck(perr, sizeof(perr), &busy)) {
+#else
+            if (!kdp_plane_precheck(perr, sizeof(perr), &busy)) {
+#endif
+                log_err("内核数据面: %s", perr);
+                if (plane_auto && !busy) {
+                    log_err("内核数据面在本机不可用，自动回退到 TUN 数据面");
+                    plane_auto = false;   /* 只回退一次 */
+                    kernel_plane = false;
+                    tun_fd = oidc_tun_prepare(o, &rp);
+                    if (tun_fd < 0)
+                        oidc_die("TUN 数据面也不可用（内核面原因见上）");
+                    OPENSSL_cleanse(password, strlen(password));
+                    free(password);
+                    continue;   /* 重新走一轮：这次是 TUN 面 */
+                }
+                OPENSSL_cleanse(password, strlen(password));
+                free(password);
+                if (busy)
+                    oidc_die("内核数据面: 本 netns 已有内核会话/设备被占，"
+                             "不回退 TUN（回退会拿同一账号把那条会话顶掉）；"
+                             "先停掉它再试");
+                oidc_die("内核数据面不可用（本次运行不接受自动回退：显式指定了 "
+                         "--data-plane，或用了只有内核面支持的绑定；不回退 TUN）");
+            }
+        }
         /* R25-f3 F1: advertise the socks-mode MTU, not the 1400 default */
         int fd = authenticate_ex(user, password, NULL, o->socks_mtu,
                                  host, port, DO_AUTH_OIDC, &res);
@@ -490,6 +594,14 @@ void oidc_connect_server(const Opts *o, const Config *cf)
         oidc_eprintf("  OK  tun=%s gw=%s dns=%s mtu=%u\n", res.tun, res.gw,
                      res.dns, (unsigned)res.mtu);
         check_gw_server(host, res.gw);   /* F8 */
+        /* 内层 IPv6 需要链路 MTU ≥ 1280（RFC 8200 §5）：IPv6 路由器不做
+         * 分片，链路小于 1280 时 v6 必然不通。生效 MTU（服务端可能下调）
+         * 现在才知道，所以检查放在这里；--socks 模式不装路由，也一并检查
+         * （用户态栈的 MTU 上限同样来自这个值）。 */
+        if (want_v6 && res.mtu < 1280)
+            oidc_eprintf("  警告: --proxy-cidr6（内层 IPv6）要求内层 MTU "
+                         "≥ 1280（RFC 8200 §5），本次生效 MTU=%u：IPv6 分组"
+                         "会被对端或中间设备丢弃\n", (unsigned)res.mtu);
 
         uint8_t sk[16];
         session_key(user, password, sk);
@@ -520,10 +632,30 @@ void oidc_connect_server(const Opts *o, const Config *cf)
             if (port_set_nonblock(fd, true) != 0)
                 log_err("Error: set nonblock: %s", strerror(errno));
 #endif
-            /* run_pump does NOT own fd: the caller closes it here */
-            rc = run_pump(tun_fd, o->tun, fd, sk, res.sid, res.tok,
-                          res.enc, host, &routes, &routes6,
-                          res.tun, res.mtu);
+            /* run_pump does NOT own fd: the caller closes it here.
+             * --data-plane kernel: no TUN and no run_pump — kdp_run opens the
+             * kernel session (device created by the module), configures
+             * address/routes/MTU from the SESSION_UP reply and supervises
+             * liveness via /dev/iwan. Same three-state return as run_pump. */
+#ifdef __linux__
+            if (kernel_plane)
+                /* 绑定三模式只有 cmd_proxy 的 --bind-* 会用到；OIDC 路径
+                 * 不暴露该选项，按"什么都不绑"下传（NULL = 全 0）。 */
+                rc = kdp_run(fd, sk, res.sid, res.tok, res.enc, host,
+                             &routes, &routes6, res.tun, res.mtu, NULL,
+                             &kdp_busy);
+            else
+#elif defined(_WIN32)
+            if (kernel_plane)
+                rc = kdp_win_run(fd, sk, res.sid, res.tok,
+                                 res.enc, host, NULL, &routes,
+                                 &routes6, res.tun, res.mtu,
+                                 &kdp_busy);
+            else
+#endif
+                rc = run_pump(tun_fd, o->tun, fd, sk, res.sid, res.tok,
+                              res.enc, host, &routes, &routes6,
+                              res.tun, res.mtu);
             port_close(fd);
         }
         OPENSSL_cleanse(sk, sizeof sk);   /* session key scrub */
@@ -540,6 +672,20 @@ void oidc_connect_server(const Opts *o, const Config *cf)
          *              cannot help, and treating it as a user stop would
          *              silently mask a broken client with exit code 0 */
         if (rc < 0) {
+            /* 内核面启动失败且这是默认选的面 ⇒ 回退 TUN 再试一次（与
+             * iwan-client 同一套规则："再失败就退出"）。kdp_busy 时例外：
+             * 本 netns 已有内核会话/设备被占，回退会用同一账号把那条会话
+             * 顶掉，比直接失败更糟。 */
+            if (!o->socks && kernel_plane && plane_auto && !kdp_busy) {
+                log_err("内核数据面启动失败，自动回退到 TUN 数据面");
+                plane_auto = false;   /* 只回退一次 */
+                kernel_plane = false;
+                if (tun_fd < 0)
+                    tun_fd = oidc_tun_prepare(o, &rp);
+                if (tun_fd < 0)
+                    oidc_die("TUN 数据面也不可用（内核面原因见上）");
+                continue;
+            }
             log_err("connection startup failed (rc=%d): not a clean "
                     "stop — exiting non-zero", rc);
 #ifdef _WIN32

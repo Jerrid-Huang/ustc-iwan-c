@@ -10,6 +10,7 @@
 #endif
 
 #include "common.h"
+#include "cli_common.h"   /* IWAN_DATA_PLANE_* / data_plane_is_kernel */
 #include "crypto.h"
 #include "oidc.h"
 #include "util.h"
@@ -45,6 +46,7 @@ int main(int argc, char **argv)
     memset(&o, 0, sizeof o);
     o.config_dir = "~/.config/iwan";
     o.tun = "iwan0";
+    o.data_plane = IWAN_DATA_PLANE_AUTO;  /* 默认：内核面，起不来自动回退 TUN */
     o.socks_listen = NULL;
     o.socks_mtu = 1380;
     slist_init(&o.proxy_cidr);
@@ -82,6 +84,22 @@ int main(int argc, char **argv)
                     "password: pass --socks-token <PASS>, or "
                     "--socks-no-token to confirm an open (passwordless) "
                     "proxy");
+    /* --data-plane kernel 只在非 SOCKS 模式有意义：--socks / --socks-listen
+     * 起的是用户态 TCP/IP 栈（lwIP 终结 TCP、自己造内层包），会和内核数据面
+     * 在同一条外层套接字上抢包 —— 组合使用是用法错误。非 Linux 上的
+     * "kernel" 已经在 validate_data_plane 里被按取值错误拒掉。 */
+    if (data_plane_is_kernel(o.data_plane) &&
+        (o.socks || o.socks_listen || o.socks_token || o.allow_remote))
+        usage_error(&usage,
+                    "--data-plane kernel 与 --socks/--socks-listen/"
+                    "--socks-token/--allow-remote 互斥：用户态 SOCKS 代理"
+                    "与内核数据面会在同一条外层套接字上抢包");
+#if !defined(__linux__) && !defined(_WIN32)
+    if (data_plane_is_kernel(o.data_plane))
+        usage_error(&usage,
+                    "--data-plane kernel 只在 Linux 与 Windows 上可用"
+                    "（当前平台没有内核数据面）");
+#endif
     /* oidc_elevate_root checks the privilege itself (Windows: admin ->
      * no-op; POSIX: euid 0 -> no-op) */
     if (do_connect && !o.socks)

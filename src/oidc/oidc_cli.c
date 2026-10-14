@@ -60,7 +60,7 @@ static void print_help_footer(void)
         "                                        IWAN_DEBUG_STRIP builds) [all]\n"
         "      IWAN_RX_STALE_MS=<ms>             re-authenticate after this long without\n"
         "                                        downlink, 0 disables, 30000..86400000\n"
-        "                                        (default: 120000) [TUN, socks]\n"
+        "                                        (default: 120000) [TUN, socks, --data-plane kernel]\n"
         "      IWAN_SEND_PACING_PPS=<n>          aggregate send pacing in packets/s,\n"
         "                                        0 disables; range 1..10000000\n"
         "                                        (default: 0) [TUN, socks]\n"
@@ -122,8 +122,11 @@ static void print_help_short(void)
         "      -a, --all                      Fetch config, print servers, choose one, and connect\n"
         "      --server <NAME|HOST:PORT>     Connect directly to a server by name or host:port\n"
         "      --tun <TUN>                    TUN device name [default: iwan0]\n"
+        "      --data-plane <tun|kernel>      tun = TUN 用户态数据面（默认）；kernel = 内核模块 iwan 数据面，不再需要 TUN，仅 Linux 可用\n"
         "      --proxy-cidr <PROXY_CIDR>      CIDR ranges to route through the tunnel. Can be repeated or comma-separated (also read from proxy.conf)\n"
-        "      --proxy-cidr6 <PROXY_CIDR6>    IPv6 CIDRs/addresses/domains to route through the tunnel\n"
+        "      --proxy-cidr6 <PROXY_CIDR6>    IPv6 CIDRs/addresses/domains to route through\n"
+        "                                     the tunnel (both data planes carry inner IPv6;\n"
+        "                                     the inner MTU must be >= 1280 per RFC 8200)\n"
         "      --ustc                         Route USTC campus networks through the tunnel (shortcut for the usual --proxy-cidr list)\n"
         "      --proxy-ip <PROXY_IP>          IPv4 addresses to route through the tunnel. Can be repeated or comma-separated\n"
         "      --proxy-domain <PROXY_DOMAIN>  Domains to resolve and route through the tunnel. Can be repeated or comma-separated\n"
@@ -176,11 +179,18 @@ static void print_help_long(void)
         "          \n"
         "          [default: iwan0]\n"
         "\n"
+        "      --data-plane <tun|kernel>\n"
+        "          tun = TUN 用户态数据面（默认，行为不变）；kernel =\n"
+        "          内核模块 iwan 数据面，客户端不再需要 TUN（仅 Linux；\n"
+        "          与 --socks/--socks-listen 互斥）\n"
+        "          \n"
+        "          [default: tun]\n"
+        "\n"
         "      --proxy-cidr <PROXY_CIDR>\n"
         "          CIDR ranges to route through the tunnel. Can be repeated or comma-separated (also read from proxy.conf)\n"
         "\n"
         "      --proxy-cidr6 <PROXY_CIDR6>\n"
-        "          IPv6 CIDRs, addresses or domains to route through the tunnel. Can be repeated or comma-separated\n"
+        "          IPv6 CIDRs, addresses or domains to route through the tunnel. Can be repeated or comma-separated. Both data planes carry inner IPv6; the inner MTU must be >= 1280 (RFC 8200)\n"
         "\n"
         "      --ustc\n"
         "          Route USTC campus networks through the tunnel (shortcut for the usual --proxy-cidr list)\n"
@@ -315,6 +325,7 @@ void oidc_parse_cli(int argc, char **argv, Opts *o, Cli *usage)
         { "all",          CLI_OPT_BOOL, &o->all,           NULL,             NULL },
         { "server",       CLI_OPT_STR,  &o->server,        "<NAME|HOST:PORT>", NULL },
         { "tun",          CLI_OPT_STR,  &o->tun,           "<TUN>",          NULL },
+        { "data-plane",   CLI_OPT_STR,  &o->data_plane,    "<auto|tun|kernel>", validate_data_plane },
         { "proxy-cidr",   CLI_OPT_CSV,  &o->proxy_cidr,    "<PROXY_CIDR>",   NULL },
         { "ustc",         CLI_OPT_BOOL, &o->ustc,          NULL,             NULL },
         { "proxy-ip",     CLI_OPT_CSV,  &o->proxy_ip,      "<PROXY_IP>",     NULL },

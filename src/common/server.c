@@ -673,13 +673,121 @@ static bool tok_rebind_allowed(const struct server_session *s, uint64_t now)
     return !tok_win_live(s, now) || s->tok_mis_cnt == 0;
 }
 
+/* ---- 族无关的外层对端（见 server.h 的 struct iwan_peer） ---- */
+
+/* 接收侧唯一的规范化点：sockaddr -> iwan_peer。v4-mapped 的 AF_INET6 归一
+ * 到 AF_INET（IPV6_V6ONLY=1 时不该出现；真出现了也不能让同一个 v4 源在
+ * 绑定判定/限速键上有两种表示）。len 是内核写回的实际地址长度，小于该族
+ * 结构体长度说明被截断，返回 false 让调用方丢弃。 */
+bool iwan_peer_from_sockaddr(struct iwan_peer *p, const struct sockaddr *sa,
+                             socklen_t len)
+{
+    memset(p, 0, sizeof *p);
+    if (sa->sa_family == AF_INET) {
+        const struct sockaddr_in *s4 = (const struct sockaddr_in *)sa;
+
+        if ((size_t)len < sizeof *s4)
+            return false;
+        p->family = AF_INET;
+        memcpy(p->addr, &s4->sin_addr, 4);
+        p->port = ntohs(s4->sin_port);
+        return true;
+    }
+    if (sa->sa_family == AF_INET6) {
+        const struct sockaddr_in6 *s6 = (const struct sockaddr_in6 *)sa;
+
+        if ((size_t)len < sizeof *s6)
+            return false;
+        p->port = ntohs(s6->sin6_port);
+        if (IN6_IS_ADDR_V4MAPPED(&s6->sin6_addr)) {
+            p->family = AF_INET;
+            memcpy(p->addr, &s6->sin6_addr.s6_addr[12], 4);
+            return true;
+        }
+        p->family = AF_INET6;
+        memcpy(p->addr, &s6->sin6_addr, 16);
+        p->scope_id = s6->sin6_scope_id;
+        return true;
+    }
+    return false;   /* 未知族：调用方丢弃 */
+}
+
+socklen_t iwan_peer_to_sockaddr(const struct iwan_peer *p,
+                                struct sockaddr_storage *ss)
+{
+    memset(ss, 0, sizeof *ss);
+    if (p->family == AF_INET) {
+        struct sockaddr_in *s4 = (struct sockaddr_in *)ss;
+
+        s4->sin_family = AF_INET;
+        s4->sin_port = htons(p->port);
+        memcpy(&s4->sin_addr, p->addr, 4);
+        return (socklen_t)sizeof *s4;
+    }
+    if (p->family == AF_INET6) {
+        struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)ss;
+
+        s6->sin6_family = AF_INET6;
+        s6->sin6_port = htons(p->port);
+        memcpy(&s6->sin6_addr, p->addr, 16);
+        s6->sin6_scope_id = p->scope_id;
+        return (socklen_t)sizeof *s6;
+    }
+    return 0;
+}
+
+/* 族 + 地址 + scope，忽略端口（旧的顶替判定只比 sin_addr.s_addr 4 字节，
+ * 不看端口，这里保持同一口径） */
+bool iwan_peer_eq_addr(const struct iwan_peer *a, const struct iwan_peer *b)
+{
+    return a->family == b->family && a->scope_id == b->scope_id &&
+           memcmp(a->addr, b->addr, sizeof a->addr) == 0;
+}
+
+/* 族 + 地址 + scope + 端口（旧的 memcmp(&s->peer, peer, sizeof(sockaddr_in))
+ * 的显式等价物，不再算进结构体填充字节） */
+bool iwan_peer_eq(const struct iwan_peer *a, const struct iwan_peer *b)
+{
+    return a->port == b->port && iwan_peer_eq_addr(a, b);
+}
+
+void iwan_peer_to_string(const struct iwan_peer *p, char *out, size_t outlen)
+{
+    char ip[INET6_ADDRSTRLEN];
+
+    if (outlen == 0)
+        return;
+    if (p->family == AF_INET6) {
+        if (inet_ntop(AF_INET6, p->addr, ip, sizeof ip) == NULL) {
+            snprintf(out, outlen, "[?]:%u", (unsigned)p->port);
+        } else if (p->scope_id != 0) {
+            /* 链路本地：scope 必须一起打印，否则 fe80:: 地址不可区分 */
+            snprintf(out, outlen, "[%s%%%u]:%u", ip, (unsigned)p->scope_id,
+                     (unsigned)p->port);
+        } else {
+            snprintf(out, outlen, "[%s]:%u", ip, (unsigned)p->port);
+        }
+        return;
+    }
+    if (inet_ntop(AF_INET, p->addr, ip, sizeof ip) == NULL) {
+        snprintf(out, outlen, "?:%u", (unsigned)p->port);
+        return;
+    }
+    /* v4 文本与加 v6 之前逐字节相同（"%s:%u"） */
+    snprintf(out, outlen, "%s:%u", ip, (unsigned)p->port);
+}
+
 /* UDP send that can never block the loop; failures are counted, not
  * logged per packet (the socket is O_NONBLOCK, so EAGAIN drops). */
-static void udp_send(int sockfd, const struct sockaddr_in *peer,
+static void udp_send(int sockfd, const struct iwan_peer *peer,
                      const void *data, size_t len)
 {
-    if (sendto(sockfd, data, len, 0, (const struct sockaddr *)peer,
-               sizeof *peer) < 0) {
+    struct sockaddr_storage ss;
+    socklen_t slen = iwan_peer_to_sockaddr(peer, &ss);
+
+    if (slen == 0 ||
+        sendto(sockfd, data, len, 0, (const struct sockaddr *)&ss,
+               slen) < 0) {
         atomic_fetch_add(&g_send_drops, 1);
         return;
     }
@@ -724,13 +832,6 @@ static void log_reject(const char *peerstr, const char *user, const char *reason
         return;
     log_escape(user, u, sizeof u);
     srv_log("[%s] OPEN reject: %s (%s)", peerstr, reason, u);
-}
-
-static void peer_to_string(const struct sockaddr_in *peer, char out[INET_ADDRSTRLEN + 8])
-{
-    char ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &peer->sin_addr, ip, sizeof ip);
-    snprintf(out, INET_ADDRSTRLEN + 8, "%s:%u", ip, (unsigned)ntohs(peer->sin_port));
 }
 
 /* caller must hold ctx->sess_lock (any mode) */
@@ -832,7 +933,7 @@ static void sess_wipe(struct server_ctx *ctx, struct server_session *s)
  * racing re-OPEN (new token, same sid) must not be charged for a guess
  * aimed at the previous token. R1-D-1. */
 static void tok_charge_upgrade(struct server_ctx *ctx, uint16_t sid,
-                              uint32_t tok, const struct sockaddr_in *peer,
+                              uint32_t tok, const struct iwan_peer *peer,
                               uint64_t now)
 {
     struct server_session *s;
@@ -841,13 +942,13 @@ static void tok_charge_upgrade(struct server_ctx *ctx, uint16_t sid,
     pthread_rwlock_wrlock(&ctx->sess_lock);
     s = find_session_unlocked(ctx, sid);
     if (s && CRYPTO_memcmp(&s->token, &tok, sizeof tok) != 0) {
-        bound = memcmp(&s->peer, peer, sizeof *peer) == 0;
+        bound = iwan_peer_eq(&s->peer, peer);
         tok_budget_charge(s, bound, now);
     }
     pthread_rwlock_unlock(&ctx->sess_lock);
 }
 
-static void send_reject(int sockfd, const struct sockaddr_in *peer, const char *msg)
+static void send_reject(int sockfd, const struct iwan_peer *peer, const char *msg)
 {
     buf_t b;
     size_t mlen = strlen(msg);
@@ -866,12 +967,12 @@ static void send_reject(int sockfd, const struct sockaddr_in *peer, const char *
  * reject frame, in that order — identical at every handle_open
  * rejection. The two "server full" exits unlock ctx->sess_lock BEFORE
  * calling (the reject must never run under the session-table lock). */
-static void open_reject(int sockfd, const struct sockaddr_in *peer,
+static void open_reject(int sockfd, const struct iwan_peer *peer,
                         const char *user, const char *reason)
 {
-    char peerstr[INET_ADDRSTRLEN + 8];
+    char peerstr[IWAN_PEER_STRLEN];
 
-    peer_to_string(peer, peerstr);
+    iwan_peer_to_string(peer, peerstr, sizeof peerstr);
     log_reject(peerstr, user, reason);
     send_reject(sockfd, peer, reason);
 }
@@ -931,10 +1032,10 @@ static bool open_tlv(uint8_t typ, const uint8_t *val, uint8_t vlen, void *ud)
 
 static void handle_open(struct server_ctx *ctx, const struct server_user *users,
                         int nusers, const uint8_t *raw, size_t len,
-                        const struct sockaddr_in *peer, int sockfd)
+                        const struct iwan_peer *peer, int sockfd)
 {
     struct open_ctx a;
-    char peerstr[INET_ADDRSTRLEN + 8];
+    char peerstr[IWAN_PEER_STRLEN];
     const char *pass = NULL;
     uint8_t sk[16], expect[16];
     buf_t b;
@@ -1059,7 +1160,7 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
      * same-IP one, which is indistinguishable from a legitimate
      * reconnect without channel-bound auth. */
     if (ctx->sess[slot].valid &&
-        ctx->sess[slot].peer.sin_addr.s_addr != peer->sin_addr.s_addr &&
+        !iwan_peer_eq_addr(&ctx->sess[slot].peer, peer) &&
         now_ms() - atomic_load(&ctx->sess[slot].last_active_ms) <=
             IDLE_TIMEOUT_MS) {
         uint16_t osid = ctx->sess[slot].sid;
@@ -1170,7 +1271,7 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
     udp_send(sockfd, peer, b.data, b.len);
     buf_free(&b);
 
-    peer_to_string(peer, peerstr);
+    iwan_peer_to_string(peer, peerstr, sizeof peerstr);
     {
         uint8_t ipb2[4];
         char u[64];
@@ -1350,13 +1451,84 @@ static bool h1_drop_log_due(void)
     return true;
 }
 
+/* ---- IWAN_SRV_SINK=1：仅计量模式的计数与打印 ----
+ * 口径（与 usage 的说明保持一致）：
+ *   - pkts  = 通过会话/令牌校验的数据帧（PT_DATA / PT_DATA_ENC）个数；
+ *   - bytes = 这些帧的“外层 UDP 净荷字节数”，即收到的 UDP 载荷 len，
+ *             含 8 字节 iwan 封装首部；因为不解密，这不是内层 IP 字节数。
+ * 校验失败的数据帧（未知 sid、错令牌、超预算）仍由既有控制面代码丢弃，
+ * 不计入这里 —— 计量模式不改变、也不放宽协议状态机。
+ * 计数是 relaxed 原子加：多 recv 线程并发，精度只需要在统计周期内收敛。 */
+static _Atomic uint64_t g_sink_pkts, g_sink_bytes;
+
+#define SINK_PRINT_MS 5000
+
+static void sink_account(struct server_session *s, size_t len)
+{
+    atomic_fetch_add_explicit(&g_sink_pkts, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_sink_bytes, (uint64_t)len,
+                              memory_order_relaxed);
+    atomic_fetch_add_explicit(&s->sink_pkts, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&s->sink_bytes, (uint64_t)len,
+                              memory_order_relaxed);
+}
+
+void server_sink_print(struct server_ctx *ctx, bool final)
+{
+    /* 区间起点/上次总量：非原子，调用点由头文件约定串行化（主 recv
+     * 线程的 1s 心跳 + main 在 join 之后） */
+    static uint64_t last_ms, last_pkts, last_bytes;
+    uint64_t now = now_ms();
+    uint64_t pkts = atomic_load_explicit(&g_sink_pkts, memory_order_relaxed);
+    uint64_t bytes = atomic_load_explicit(&g_sink_bytes, memory_order_relaxed);
+    uint64_t dms;
+    double pps, gbps;
+
+    if (last_ms == 0) {
+        /* 第一次调用：只立区间起点（final 时仍照常打印，区间取 0） */
+        last_ms = now;
+        last_pkts = pkts;
+        last_bytes = bytes;
+        if (!final)
+            return;
+    }
+    if (!final && now - last_ms < SINK_PRINT_MS)
+        return;
+    dms = now - last_ms;
+    pps = dms ? (double)(pkts - last_pkts) * 1000.0 / (double)dms : 0.0;
+    gbps = dms ? (double)(bytes - last_bytes) * 8.0 / (double)dms / 1e6
+               : 0.0;
+    printf("SINK pkts=%llu bytes=%llu pps=%.1f gbps=%.3f\n",
+           (unsigned long long)pkts, (unsigned long long)bytes, pps, gbps);
+    /* 每会话一行（累计值，不是区间值）；只列有计数的活会话 */
+    pthread_rwlock_rdlock(&ctx->sess_lock);
+    for (int i = 0; i < SERVER_MAX_SESSIONS; i++) {
+        struct server_session *s = &ctx->sess[i];
+        uint64_t sp, sb;
+
+        if (!s->valid)
+            continue;
+        sp = atomic_load_explicit(&s->sink_pkts, memory_order_relaxed);
+        sb = atomic_load_explicit(&s->sink_bytes, memory_order_relaxed);
+        if (sp == 0 && sb == 0)
+            continue;
+        printf("SINK sid=0x%04x pkts=%llu bytes=%llu\n", (unsigned)s->sid,
+               (unsigned long long)sp, (unsigned long long)sb);
+    }
+    pthread_rwlock_unlock(&ctx->sess_lock);
+    fflush(stdout); /* 管道/文件下 stdout 是块缓冲：逐行落盘才可实时观测 */
+    last_ms = now;
+    last_pkts = pkts;
+    last_bytes = bytes;
+}
+
 void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nusers,
                 const uint8_t *raw, size_t len,
-                const struct sockaddr_in *peer, int sockfd, unsigned tid)
+                const struct iwan_peer *peer, int sockfd, unsigned tid)
 {
     struct server_session *s;
     buf_t b;
-    char peerstr[INET_ADDRSTRLEN + 8];
+    char peerstr[IWAN_PEER_STRLEN];
     uint8_t typ;
     uint16_t sid;
     uint32_t tok;
@@ -1402,7 +1574,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                 /* L37: the miss itself is now charged to a dedicated
                  * per-source counter (sess_lock released: shard lock
                  * inside, never nested). Over budget => drop + count. */
-                if (!server_rate_allow_sid_miss((uint32_t)peer->sin_addr.s_addr, now))
+                if (!server_rate_allow_sid_miss(peer, now))
                     server_rate_drop_inc();
                 return;
             }
@@ -1414,7 +1586,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
              * third party starve the real client. The bound class (source
              * == s->peer verbatim) is compared first and therefore never
              * blackholed by a spoofer: see tok_budget_over()'s note. */
-            peer_is_peer = memcmp(&s->peer, peer, sizeof *peer) == 0;
+            peer_is_peer = iwan_peer_eq(&s->peer, peer);
             if (!peer_is_peer && tok_budget_over(s, now)) {
                 pthread_rwlock_unlock(&ctx->sess_lock);
                 server_rate_drop_inc();
@@ -1480,8 +1652,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                 if (!s || CRYPTO_memcmp(&s->token, &tok, sizeof tok) != 0) {
                     if (s)
                         tok_budget_charge(s,
-                                          memcmp(&s->peer, peer,
-                                                 sizeof *peer) == 0, now);
+                                          iwan_peer_eq(&s->peer, peer), now);
                     pthread_rwlock_unlock(&ctx->sess_lock);
                     return; /* session gone or token rotated: drop */
                 }
@@ -1492,7 +1663,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                  * clean window and rebinds on this first packet, exactly
                  * as before. This frame already carried the right token,
                  * so no guess is tested here. */
-                if (memcmp(&s->peer, peer, sizeof *peer) != 0) {
+                if (!iwan_peer_eq(&s->peer, peer)) {
                     if (!tok_rebind_allowed(s, now)) {
                         pthread_rwlock_unlock(&ctx->sess_lock);
                         return;
@@ -1504,6 +1675,16 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
             memcpy(xk, s->xor_key, sizeof xk);
             s_ip = ip4_u32(s->ip); /* BE-value order, same as the header */
             atomic_store(&s->last_active_ms, now_ms());
+            /* IWAN_SRV_SINK=1：计量模式的数据帧在这里就结束 —— 会话与令牌
+             * 校验（上面）照旧，控制面行为不变；这里只累加计数，不解密、
+             * 不解析内层 IP、不写 TUN、不回发任何东西。放在 TUN 注入/回发
+             * 分派点（下面的 ctx->tun_fd / echo_mirror 分支）之前，也放在
+             * 内层 H1 门之前，所以数据帧不产生任何下游效果。 */
+            if (ctx->sink) {
+                sink_account(s, len);
+                pthread_rwlock_unlock(&ctx->sess_lock);
+                break;
+            }
             pthread_rwlock_unlock(&ctx->sess_lock);
             if (debug_enabled())
                 tx0 = now_ns();
@@ -1711,7 +1892,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
             pthread_rwlock_unlock(&ctx->sess_lock);
             /* L37: dedicated per-source unknown-sid budget (see the DATA
              * path / rate_allow_sid_miss note); sess_lock already released */
-            if (!server_rate_allow_sid_miss((uint32_t)peer->sin_addr.s_addr, now))
+            if (!server_rate_allow_sid_miss(peer, now))
                 server_rate_drop_inc();
             return;
         }
@@ -1722,7 +1903,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
          * exactly like the DATA path. A wrong-token CLOSE therefore never
          * takes the write lock at all; only the correct-token WIPE
          * upgrades (TOCTOU-safe re-find below). */
-        cls_bound = memcmp(&s->peer, peer, sizeof *peer) == 0;
+        cls_bound = iwan_peer_eq(&s->peer, peer);
         /* F4/R1-D-1 + R37 R2: pre-check the token compare ONLY for the
          * non-peer class (see the DATA path / tok_budget_over note); a
          * bound-class CLOSE is always compared, so a spoofer cannot get
@@ -1763,8 +1944,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
             pthread_rwlock_wrlock(&ctx->sess_lock);
             s = find_session_unlocked(ctx, sid);
             if (s && CRYPTO_memcmp(&s->token, &tok, sizeof tok) != 0)
-                tok_budget_charge(s, memcmp(&s->peer, peer,
-                                            sizeof *peer) == 0, now);
+                tok_budget_charge(s, iwan_peer_eq(&s->peer, peer), now);
             pthread_rwlock_unlock(&ctx->sess_lock);
             break;
         }
@@ -1788,20 +1968,18 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
         /* the token may have rotated between the two lock acquisitions:
          * the frame is a wrong-token CLOSE for the CURRENT session now */
         if (CRYPTO_memcmp(&s->token, &tok, sizeof tok) != 0) {
-            tok_budget_charge(s, memcmp(&s->peer, peer, sizeof *peer) == 0,
-                              now);
+            tok_budget_charge(s, iwan_peer_eq(&s->peer, peer), now);
             pthread_rwlock_unlock(&ctx->sess_lock);
             return;
         }
         /* CLOSE is terminal: never rebind to a new source, or a
          * token-holding attacker could kill the session from any
          * address */
-        if (s->peer.sin_addr.s_addr != peer->sin_addr.s_addr ||
-            s->peer.sin_port != peer->sin_port) {
+        if (!iwan_peer_eq(&s->peer, peer)) {
             pthread_rwlock_unlock(&ctx->sess_lock);
             return;
         }
-        peer_to_string(peer, peerstr);
+        iwan_peer_to_string(peer, peerstr, sizeof peerstr);
         srv_log("[%s] session 0x%04x (ip %u.%u.%u.%u) closed",
                 peerstr, s->sid, s->ip[0], s->ip[1], s->ip[2], s->ip[3]);
         sess_wipe(ctx, s);
@@ -1830,7 +2008,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
         pthread_rwlock_rdlock(&ctx->sess_lock);
         s = find_session_unlocked(ctx, sid);
         if (s && CRYPTO_memcmp(&s->token, &tok, sizeof tok) == 0) {
-            if (memcmp(&s->peer, peer, sizeof *peer) == 0) {
+            if (iwan_peer_eq(&s->peer, peer)) {
                 atomic_store(&s->last_active_ms, now_ms()); /* keepalive */
                 valid = 1;
                 pthread_rwlock_unlock(&ctx->sess_lock);
@@ -2215,16 +2393,36 @@ void handle_tun_downlink(struct server_ctx *ctx, uint8_t *ip_pkt, size_t len,
     {
         struct iovec iov[2];
         struct msghdr msg;
+        struct sockaddr_storage ss;
+        socklen_t slen;
+        int sfd = sockfd;
+
+        /* 目的 peer 的族决定发送 socket：调用方传入的 fd 是本机 v4 侧的
+         * （TUN 队列池的 v4 socket，或 --no-tun echo 模式下报文到达的
+         * socket），拿它发 v6 目的地会 EAFNOSUPPORT/EINVAL。v6 走 ctx 里
+         * 的 v6 兜底 socket；v4 完全保持调用方传入的 fd（逐位不变）。 */
+        if (snap.peer.family == AF_INET6) {
+            if (ctx->dl_fd6 < 0) {
+                atomic_fetch_add(&g_send_drops, 1);
+                return;
+            }
+            sfd = ctx->dl_fd6;
+        }
+        slen = iwan_peer_to_sockaddr(&snap.peer, &ss);
+        if (slen == 0) {
+            atomic_fetch_add(&g_send_drops, 1);
+            return;
+        }
         memset(&msg, 0, sizeof msg);
-        msg.msg_name = (struct sockaddr *)&snap.peer;
-        msg.msg_namelen = sizeof snap.peer;
+        msg.msg_name = &ss;
+        msg.msg_namelen = slen;
         iov[0].iov_base = hdr;
         iov[0].iov_len = IWAN_HDR_LEN;
         iov[1].iov_base = ip_pkt;
         iov[1].iov_len = len;
         msg.msg_iov = iov;
         msg.msg_iovlen = 2;
-        if (port_sendmsg(sockfd, &msg, 0) < 0)
+        if (port_sendmsg(sfd, &msg, 0) < 0)
             atomic_fetch_add(&g_send_drops, 1);
         else
             PROF_ADD(g_prof_srv_dlsend, len);

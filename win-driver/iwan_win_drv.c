@@ -65,6 +65,16 @@ iwan_win_dispatch_ioctl(_In_ PDEVICE_OBJECT devobj, _Inout_ PIRP irp)
 	NTSTATUS st = STATUS_INVALID_DEVICE_REQUEST;
 	ULONG info = 0;
 
+	/* 没有扩展 = 数据面还没注册或已经注销。NDIS 平面的扩展由 DriverEntry
+	 * 分配，正常不会为空；这里按"设备还没就绪"处理，而不是解引用空指针
+	 * —— 控制设备在适配器 Halt 之后仍然存在，那条路上什么都不该保证。 */
+	if (ext == NULL) {
+		irp->IoStatus.Status = STATUS_DEVICE_NOT_READY;
+		irp->IoStatus.Information = 0;
+		IoCompleteRequest(irp, IO_NO_INCREMENT);
+		return STATUS_DEVICE_NOT_READY;
+	}
+
 	switch (sp->Parameters.DeviceIoControl.IoControlCode) {
 	case IOCTL_IWAN_SESSION_OPEN:
 		/* 请求与回复共用同一块 METHOD_BUFFERED 缓冲：先按请求解释，

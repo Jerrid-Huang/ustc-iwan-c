@@ -44,6 +44,8 @@ typedef struct {
     bool        all;
     const char *server;
     const char *tun;
+    /* "tun"（默认）或 "kernel"（内核数据面，仅 Linux；见 cli_common.h） */
+    const char *data_plane;
     slist_t     proxy_cidr;
     slist_t     proxy_ip;
     slist_t     proxy_domain;

@@ -34,6 +34,12 @@
  * （见 win-driver/README.md）。 */
 #define IWAN_WIN_DEF_DEV "iWAN"
 
+/* NDIS 平面（--data-plane kernel-mp）内层适配器的别名与驱动描述。别名是
+ * 约定的连接名；描述是 iwanmp.inf 里的 DeviceDesc，用来在系统自取的
+ * 连接名（"Local Area Connection"、重装后可能带序号）与别名之间对上号。 */
+#define IWAN_WIN_DEF_DEV_MP "iwanmp"
+#define IWAN_WIN_MP_ADAPTER_DESC "iWAN Tunnel Adapter"
+
 /* 握手前的启动预检（**在 authenticate() 之前调用**，与 kdp_plane_precheck
  * 同一契约）：驱动在位、ABI 版本匹配、本机没有活会话。
  * device_path 选择设备（NULL = WFP 面 \\.\iwan；见 iwan_win_abi.h 的
