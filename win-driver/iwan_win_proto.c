@@ -297,7 +297,9 @@ iwan_win_proto_send_outer4(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	ctx->buf = eth;
 	ctx->mdl = mdl;
 
-	NdisSendNetBufferLists(b->binding, nbl, NDIS_DEFAULT_PORT_NUMBER, 0);
+	NdisSendNetBufferLists(b->binding, nbl, NDIS_DEFAULT_PORT_NUMBER,
+			       (KeGetCurrentIrql() == DISPATCH_LEVEL) ?
+				NDIS_SEND_FLAGS_DISPATCH_LEVEL : 0);
 	return TRUE;
 }
 
@@ -473,7 +475,9 @@ iwan_win_proto_recv_nbls(_In_ NDIS_HANDLE ProtocolBindingContext,
 			iwan_win_proto_recv_one(ext, nb);
 		}
 	}
-	NdisReturnNetBufferLists(b->binding, NetBufferLists, 0);
+	NdisReturnNetBufferLists(b->binding, NetBufferLists,
+				 (KeGetCurrentIrql() == DISPATCH_LEVEL) ?
+					NDIS_RETURN_FLAGS_DISPATCH_LEVEL : 0);
 }
 
 /* ---- 绑定生命周期 ----------------------------------------------------- */

@@ -268,7 +268,10 @@ iwan_win_mp_send_nbls(_In_ NDIS_HANDLE MiniportAdapterHandle,
 	UNREFERENCED_PARAMETER(SendFlags);
 
 	if (ext == NULL) {
-		NdisMSendNetBufferListsComplete(MiniportAdapterHandle, NetBufferLists, 0);
+		/* 小型端口的发送处理函数恒在 DISPATCH_LEVEL */
+		NdisMSendNetBufferListsComplete(MiniportAdapterHandle,
+						NetBufferLists,
+						NDIS_SEND_COMPLETE_FLAGS_DISPATCH_LEVEL);
 		return;
 	}
 
@@ -326,7 +329,8 @@ iwan_win_mp_send_nbls(_In_ NDIS_HANDLE MiniportAdapterHandle,
 		}
 		NET_BUFFER_LIST_STATUS(nbl) = st;
 	}
-	NdisMSendNetBufferListsComplete(MiniportAdapterHandle, NetBufferLists, 0);
+	NdisMSendNetBufferListsComplete(MiniportAdapterHandle, NetBufferLists,
+					NDIS_SEND_COMPLETE_FLAGS_DISPATCH_LEVEL);
 }
 
 static VOID
@@ -377,10 +381,13 @@ iwan_win_mp_indicate_inner(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	nbl->SourceHandle = ext->mp.mp_handle;
 	nbl->NblFlags |= (ver == 4) ? NDIS_NBL_FLAGS_IS_IPV4 : NDIS_NBL_FLAGS_IS_IPV6;
 
-	/* 不带 RESOURCES：所有权交给 NDIS，归还时释放缓冲 */
+	/* 不带 RESOURCES：所有权交给 NDIS，归还时释放缓冲。IRQL 位必须如实
+	 * 上报 —— 本函数从协议边的接收路径调用，通常就在 DISPATCH_LEVEL。 */
 	NdisMIndicateReceiveNetBufferLists(ext->mp.mp_handle, nbl,
 					   NDIS_DEFAULT_PORT_NUMBER, 1,
-					   NDIS_RECEIVE_FLAGS_SINGLE_ETHER_TYPE);
+					   NDIS_RECEIVE_FLAGS_SINGLE_ETHER_TYPE |
+					   ((KeGetCurrentIrql() == DISPATCH_LEVEL) ?
+					    NDIS_RECEIVE_FLAGS_DISPATCH_LEVEL : 0));
 	return TRUE;
 }
 
