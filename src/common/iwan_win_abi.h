@@ -66,8 +66,11 @@ typedef unsigned long long uint64_t;
 
 /* ---- 版本 ------------------------------------------------------------- */
 
-/* 设备与 IOCTL 的 ABI 版本：驱动与客户端不一致时拒绝开会话 */
-#define IWAN_WIN_ABI_VERSION      1u
+/* 设备与 IOCTL 的 ABI 版本：驱动与客户端不一致时拒绝开会话。
+ * 2：SESSION_OPEN 末尾追加 outer_hop（外层下一跳）。旧客户端送 136 字节的
+ *    请求会被 size 校验挡下，这是有意的 —— 缺了下一跳就没法在承载网上把外
+ *    层帧发出去，静默降级比当面拒绝更糟。 */
+#define IWAN_WIN_ABI_VERSION      2u
 
 /* 存活共享内存页的布局版本：与 Linux 的 IWAN_SHM_VERSION 同步（同一套
  * 用户态读取代码吃两边的页，所以版本号必须一起动） */
@@ -185,6 +188,17 @@ typedef struct _IWAN_WIN_SESSION_OPEN {
 	/* 目标集合 */
 	uint32_t target_offset;	/* 相对本结构体起始 */
 	uint32_t target_count;
+
+	/* 外层下一跳：控制面查好路由传下来（be32）。
+	 *
+	 * 为什么不让驱动自己查：内核态没有可用的取路由 API —— GetBestRoute2 那一
+	 * 族只在用户态 netioapi.h 里；协议驱动若自己猜下一跳，对端不在链路上时
+	 * ARP 永远不响，表现为"会话建立了但一个字节都出不去"。控制面本来就要为
+	 * 承载 MTU 做一次 GetBestRoute2（src/common/kdp_win.c），顺手取 NextHop
+	 * 不增加任何开销。
+	 * 0 = 未提供：按"对端在链路上"处理（对端与承载网卡同网段时这就是正确值）。 */
+	uint32_t outer_hop;
+	uint32_t reserved1;	/* 保持 8 字节对齐；必须为 0 */
 } IWAN_WIN_SESSION_OPEN, *PIWAN_WIN_SESSION_OPEN;
 
 /* ---- 统计（计数器名称与顺序对应 enum iwan_stats_attr） ---------------- */
@@ -312,8 +326,10 @@ IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_SESSION_OPEN, target_offset) == 128,
 		       "SESSION_OPEN.target_offset 偏移");
 IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_SESSION_OPEN, target_count) == 132,
 		       "SESSION_OPEN.target_count 偏移");
-IWAN_WIN_STATIC_ASSERT(sizeof(IWAN_WIN_SESSION_OPEN) == 136,
-		       "IWAN_WIN_SESSION_OPEN 必须是 136 字节");
+IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_SESSION_OPEN, outer_hop) == 136,
+		       "SESSION_OPEN.outer_hop 偏移");
+IWAN_WIN_STATIC_ASSERT(sizeof(IWAN_WIN_SESSION_OPEN) == 144,
+		       "IWAN_WIN_SESSION_OPEN 必须是 144 字节");
 IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_SESSION_INFO, last_rx_ms) == 40,
 		       "SESSION_INFO.last_rx_ms 偏移");
 IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_SESSION_INFO, shm_user_va) == 56,
@@ -343,6 +359,9 @@ IWAN_WIN_STATIC_ASSERT(sizeof(IWAN_WIN_SESSION_INFO) == 200,
 #define IWAN_WIN_DIAG_TX_ENCAP_FAIL	5
 #define IWAN_WIN_DIAG_TX_INFLIGHT	6	/* 在途注入数达上限 */
 #define IWAN_WIN_DIAG_TX_COALESCE	7	/* 第二遍取整包失败 */
+#define IWAN_WIN_DIAG_TX_NO_NEIGHBOR	8	/* 下一跳 MAC 未解析出来（NDIS 平面） */
+#define IWAN_WIN_DIAG_TX_V6_NOT_IMPL	9	/* NDIS 平面的外层 v6 尚未实现 */
+#define IWAN_WIN_DIAG_TX_SEND_FAIL	10	/* 交给承载网卡失败（NDIS 平面） */
 
 typedef struct _IWAN_WIN_DIAG {
 	uint32_t magic;

@@ -1,0 +1,73 @@
+; iwanmp.inf -- NDIS miniport + protocol driver (the second Windows data plane).
+;
+; Design notes and the Chinese rationale live in docs/win-wfp-data-plane.md.
+; This file is kept ASCII-only on purpose: setupapi parses INF files as ANSI or
+; UTF-16LE, so non-ASCII bytes in an UTF-8 file would be decoded as cp1252.
+;
+; Install on the guest (test signing on, self-signed cert trusted):
+;     devcon.exe install win-driver\iwanmp.inf iwanmp
+; Remove:
+;     devcon.exe remove iwanmp
+;
+; No CatalogFile directive: a .cat would have to be generated on the guest with
+; New-FileCatalog + Set-AuthenticodeSignature, and an INF that names a missing
+; catalog fails to install. The .sys carries its own test signature.
+
+[Version]
+Signature       = "$Windows NT$"
+Class           = Net
+ClassGUID       = {4D36E972-E325-11CE-BFC1-08002BE10318}
+Provider        = %ProviderName%
+DriverVer       = 10/14/2026,1.0.0.0
+PnpLockdown     = 1
+
+[ControlFlags]
+ExcludeFromSelect = iwanmp
+
+[Manufacturer]
+%ManufacturerName% = iwanmp, NTamd64
+
+[iwanmp.NTamd64]
+%DeviceDesc% = iwanmp_Install, iwanmp
+
+[iwanmp_Install]
+; NCF_VIRTUAL: no hardware behind it, the driver fabricates the adapter.
+Characteristics    = 0x1
+; NdisMediumIP / IF_TYPE_PROP_VIRTUAL: the tunnel side carries bare IP
+; datagrams, so there is no ethernet header and no ARP on the inner interface.
+*IfType            = 53
+*MediaType         = 19
+*PhysicalMediaType = 0
+; The inner address is assigned by the client's control plane (netsh), not DHCP.
+EnableDhcp         = 0
+CopyFiles          = iwanmp_CopyFiles
+AddReg             = iwanmp_Reg
+
+[iwanmp_Install.Services]
+AddService = iwanmp, 0x00000002, iwanmp_Service
+
+[iwanmp_Reg]
+HKR, Ndi,            Service,    0, "iwanmp"
+HKR, Ndi\Interfaces, UpperRange, 0, "ndis5"
+HKR, Ndi\Interfaces, LowerRange, 0, "nolower"
+
+[DestinationDirs]
+DefaultDestDir   = 12
+iwanmp_CopyFiles = 12
+
+[iwanmp_CopyFiles]
+iwanmp.sys
+
+[iwanmp_Service]
+DisplayName   = %ServiceDesc%
+; ServiceType 1 = kernel driver, StartType 3 = demand (PnP starts it), ErrorControl 1.
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %12%\iwanmp.sys
+
+[Strings]
+ProviderName     = "iWAN"
+ManufacturerName = "iWAN"
+DeviceDesc       = "iWAN Tunnel Adapter"
+ServiceDesc      = "iWAN Tunnel Adapter Driver (miniport + protocol)"

@@ -1,0 +1,125 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  iwanmp.vcxproj — NDIS 小型端口 + 协议驱动（第二个 Windows 数据面）的工程。
+
+  与 iwan.vcxproj（WFP 平面）的关系：两个二进制、同一套控制面。iwanmp.sys
+  自己就是内层那张虚拟网卡（小型端口），同时注册一个协议驱动把外层 UDP
+  直接放到承载网卡上；不再需要 WFP 的注入 API，也不再有"在途注入占着
+  非分页池"的限流问题。
+
+  两个翻译单元的 NDIS 版本宏**故意不同**（这也是这个平面唯一别扭的地方）：
+  ndis.h 用 NDIS_MINIPORT_DRIVER / NDIS630 这两族宏分别把小型端口侧与协议
+  侧的原型放出来，而它不允许同一翻译单元里两边都要（第一轮探针实测：
+  km\ndis.h 的宏闸门按这两种模式二选一）。所以：
+    iwan_win_mp.c     走小型端口宏（与 Wintun 同一套）
+    其余源文件         走协议/通用宏
+  两侧只通过 iwan_win.h 里那两个不依赖 NDIS 版本的结构与函数原型打交道。
+
+  构建（装了 WDK 的 Windows 上，管理员 VS 开发者命令提示符里）：
+
+    msbuild win-driver\iwanmp.vcxproj /p:Configuration=Release /p:Platform=x64
+
+  安装（客体，测试签名已打开、自签证书已受信）：
+    devcon.exe install win-driver\iwanmp.inf iwanmp
+-->
+<Project DefaultTargets="Build" ToolsVersion="Current"
+         xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|Win32">
+      <Configuration>Debug</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|Win32">
+      <Configuration>Release</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{6D1A9B22-7C4E-4E2B-9F31-1A2B3C4D5E62}</ProjectGuid>
+    <RootNamespace>iwanmp</RootNamespace>
+    <ProjectName>iwanmp</ProjectName>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Driver</ConfigurationType>
+    <DriverType>WDM</DriverType>
+    <!-- 与 iwan.vcxproj 同理：工具集自带的测试签名不带 /fd，会把产物删掉。
+         签名在客体侧做。 -->
+    <SignMode>Off</SignMode>
+    <DriverTargetPlatform>Desktop</DriverTargetPlatform>
+    <TargetVersion>Windows10</TargetVersion>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Debug'">true</UseDebugLibraries>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"
+            Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')"
+            Label="LocalAppDataPlatform" />
+  </ImportGroup>
+
+  <PropertyGroup>
+    <OutDir>$(SolutionDir)build\$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>$(SolutionDir)build\obj\$(Platform)\$(Configuration)\mp\</IntDir>
+    <TargetName>iwanmp</TargetName>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <!-- 中文注释与日志：必须显式 /utf-8，否则执行字符集 1252 会把中文字符串
+           字面量报成 C4566，配合 TreatWarningAsError 变 C2220。 -->
+      <AdditionalOptions>/source-charset:utf-8 /execution-charset:utf-8 %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\src\common;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <WarningLevel>Level4</WarningLevel>
+      <TreatWarningAsError>true</TreatWarningAsError>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>IWAN_WIN_PLANE_MP;NDIS630;NDIS_WDM;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <LanguageStandard_C>stdc11</LanguageStandard_C>
+      <ExceptionHandling>false</ExceptionHandling>
+    </ClCompile>
+    <Link>
+      <!-- netio.lib 用不到路由（下一跳由控制面给），但 Ndis* 的少数工具在
+           ndis.lib；wdmsec.lib 给 IoCreateDeviceSecure。不含 fwpkclnt：本平面
+           没有 WFP。 -->
+      <AdditionalDependencies>ndis.lib;wdmsec.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <EntryPointSymbol>DriverEntry</EntryPointSymbol>
+    </Link>
+    <Inf>
+      <TimeStamp>1.0.0.0</TimeStamp>
+    </Inf>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <ClCompile Include="iwan_win_drv.c" />
+    <ClCompile Include="iwan_win_session.c" />
+    <ClCompile Include="iwan_win_frame.c" />
+    <ClCompile Include="iwan_win_mpdata.c" />
+    <ClCompile Include="iwan_win_proto.c" />
+    <!-- 小型端口这一半单独用小型端口宏：ndis.h 两族宏不能同时要 -->
+    <ClCompile Include="iwan_win_mp.c">
+      <PreprocessorDefinitions>NDIS_MINIPORT_DRIVER;NDIS630_MINIPORT;NDIS_WDM;IWAN_WIN_PLANE_MP;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="iwan_win.h" />
+    <ClInclude Include="iwan_win_frame.h" />
+    <ClInclude Include="..\src\common\iwan_win_abi.h" />
+  </ItemGroup>
+  <!-- iwanmp.inf 与 iwan.inf 一样不进 <Inf>：PnP INF 需要 .cat，而 .cat 要在
+       客体侧用 New-FileCatalog + Set-AuthenticodeSignature 生成。安装走
+       devcon install / pnputil，INF 作为部署材料留在仓库里。 -->
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

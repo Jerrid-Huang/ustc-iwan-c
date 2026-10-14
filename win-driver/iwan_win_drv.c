@@ -3,15 +3,34 @@
  * iwan_win_drv.c — 驱动入口、设备对象与 IOCTL 分发。
  *
  * 对应 Linux 侧的：模块 init/exit + misc 设备注册 + genetlink 控制面入口。
- * 这里只有控制面：报文路径全在 iwan_win_wfp.c 的 callout 里，且不排队、
- * 不起线程、不用定时器 —— 与 Linux 模块"内核只负责数据传输"的边界一致。
+ * 这里只有控制面：报文路径全在数据面文件里（WFP 平面 iwan_win_wfp.c 的
+ * callout / NDIS 平面 iwan_win_mp.c + iwan_win_proto.c），且不排队、不起
+ * 线程、不用定时器 —— 与 Linux 模块"内核只负责数据传输"的边界一致。
+ *
+ * 本文件被两个平面共用，靠 IWAN_WIN_PLANE_MP 分叉。三处不同：
+ *   ① 设备名：WFP 平面 \Device\iwan，NDIS 平面 \Device\iwanmp（两个平面
+ *      可以同时装在一台机器上，用户态按 --data-plane 选名字打开）；
+ *   ② 数据面的"装上/摘掉"钩子：WFP 是 callout 过滤器，NDIS 是选/放承载；
+ *   ③ 卸载：WFP 要关 BFE 引擎，NDIS 只要注销小型端口与协议边。
  */
 #include "iwan_win.h"
 
+#ifdef IWAN_WIN_PLANE_MP
+#define IWAN_DRV_DEV_NAME	IWAN_WIN_DEVICE_NAME_MP
+#define IWAN_DRV_DOS_NAME	IWAN_WIN_DOS_NAME_MP
+#define IWAN_DRV_VERSION_STR	IWAN_WIN_DRV_VERSION_STR_MP
+#else
+#define IWAN_DRV_DEV_NAME	IWAN_WIN_DEVICE_NAME
+#define IWAN_DRV_DOS_NAME	IWAN_WIN_DOS_NAME
+#define IWAN_DRV_VERSION_STR	IWAN_WIN_DRV_VERSION_STR
+#endif
+
+#ifndef IWAN_WIN_PLANE_MP
 /* WFP 管理会话（fwpmk.h）：只在 init/fini 里用，进程上下文、PASSIVE_LEVEL */
 static HANDLE g_engine = NULL;
+#endif
 
-static NTSTATUS
+NTSTATUS
 iwan_win_dispatch_create(_In_ PDEVICE_OBJECT devobj, _Inout_ PIRP irp)
 {
 	UNREFERENCED_PARAMETER(devobj);
@@ -21,7 +40,7 @@ iwan_win_dispatch_create(_In_ PDEVICE_OBJECT devobj, _Inout_ PIRP irp)
 	return STATUS_SUCCESS;
 }
 
-static NTSTATUS
+NTSTATUS
 iwan_win_dispatch_ioctl(_In_ PDEVICE_OBJECT devobj, _Inout_ PIRP irp)
 {
 	PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(irp);
@@ -42,28 +61,47 @@ iwan_win_dispatch_ioctl(_In_ PDEVICE_OBJECT devobj, _Inout_ PIRP irp)
 			break;
 		}
 		/* 会话建立之前先把数据面装上：装上之后才置 valid，第一个报文
-		 * 就不会漏。start 幂等，重复 OPEN 不会重复注册。 */
+		 * 就不会漏。WFP 平面装上的是过滤器（start 幂等）；NDIS 平面
+		 * 没有"过滤器"可装，改为会话建立之后选定承载（下一段）。 */
+#ifndef IWAN_WIN_PLANE_MP
 		st = iwan_win_wfp_start(ext);
 		if (!NT_SUCCESS(st))
 			break;
+#endif
 		st = iwan_win_session_open(ext,
 					   (const IWAN_WIN_SESSION_OPEN *)buf, in_len);
 		if (!NT_SUCCESS(st)) {
+#ifndef IWAN_WIN_PLANE_MP
 			/* 装好了却没建成会话：只有在确实没有会话在跑时才摘掉。
 			 * 旧会话还在就摘，等于把正在用的隧道打断。 */
 			if (!ext->sess.valid)
 				iwan_win_wfp_stop(ext);
+#endif
 			break;
 		}
+#ifdef IWAN_WIN_PLANE_MP
+		/* 选定承载：一条会话只走一张网卡。选不到就让整个 OPEN 失败
+		 * —— 没有承载就没有外层，静默继续等于建了一条发不出包的
+		 * 会话（fail-closed）。 */
+		st = iwan_win_mp_select_carrier(ext);
+		if (!NT_SUCCESS(st)) {
+			iwan_win_session_close(ext);
+			break;
+		}
+#endif
 		iwan_win_session_info(ext, (IWAN_WIN_SESSION_INFO *)buf);
 		info = sizeof(IWAN_WIN_SESSION_INFO);
 		break;
 
 	case IOCTL_IWAN_SESSION_CLOSE:
 		st = iwan_win_session_close(ext);
-		/* 会话已经拆完，数据面没有存在理由：摘掉过滤器，让系统回到
-		 * “装了驱动但没跑隧道”的状态。 */
+		/* 会话已经拆完，数据面没有存在理由：WFP 平面摘掉过滤器（让
+		 * 系统回到"装了驱动但没跑隧道"的状态），NDIS 平面放掉承载。 */
+#ifdef IWAN_WIN_PLANE_MP
+		iwan_win_mp_release_carrier(ext);
+#else
 		iwan_win_wfp_stop(ext);
+#endif
 		break;
 
 	case IOCTL_IWAN_SESSION_GET:
@@ -108,18 +146,24 @@ iwan_win_unload(_In_ PDRIVER_OBJECT driver)
 	if (devobj != NULL) {
 		IWAN_WIN_DEVICE_EXTENSION *ext = IWAN_DEVEXT(devobj);
 
+#ifdef IWAN_WIN_PLANE_MP
+		iwan_win_mp_fini(ext);		/* 先注销小型端口与协议边 */
+#else
 		iwan_win_wfp_fini(ext);		/* 先停数据面 */
+#endif
 		iwan_win_session_teardown(ext);	/* 再排空并释放会话状态 */
 		iwan_win_ctrl_fini(ext);
 
-		RtlInitUnicodeString(&link, IWAN_WIN_DOS_NAME);
+		RtlInitUnicodeString(&link, IWAN_DRV_DOS_NAME);
 		IoDeleteSymbolicLink(&link);
 		IoDeleteDevice(devobj);
 	}
+#ifndef IWAN_WIN_PLANE_MP
 	if (g_engine != NULL) {
 		FwpmEngineClose(g_engine);
 		g_engine = NULL;
 	}
+#endif
 }
 
 /*
@@ -140,8 +184,6 @@ DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registry_path)
 	IWAN_WIN_DEVICE_EXTENSION *ext;
 	NTSTATUS st;
 
-	UNREFERENCED_PARAMETER(registry_path);
-
 	/* 默认 SDDL：只有 System 与 Administrators 能打开设备。用户态客户端
 	 * 需要管理员权限（对应 Linux 侧需要 root），这与 Linux 一致。
 	 *
@@ -150,7 +192,7 @@ DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registry_path)
 	 * SDDL_DEVOBJ_* 宏结果再喂给 RtlInitUnicodeString（那个宏本身就是
 	 * UNICODE_STRING，C4024/C2440）。自己建一个最不含糊。 */
 	RtlInitUnicodeString(&sddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
-	RtlInitUnicodeString(&dev_name, IWAN_WIN_DEVICE_NAME);
+	RtlInitUnicodeString(&dev_name, IWAN_DRV_DEV_NAME);
 	st = IoCreateDeviceSecure(driver, sizeof(IWAN_WIN_DEVICE_EXTENSION),
 				  &dev_name, IWAN_WIN_DEVICE_TYPE,
 				  FILE_DEVICE_SECURE_OPEN, FALSE, &sddl,
@@ -158,7 +200,7 @@ DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registry_path)
 	if (!NT_SUCCESS(st))
 		return st;
 
-	RtlInitUnicodeString(&dos_name, IWAN_WIN_DOS_NAME);
+	RtlInitUnicodeString(&dos_name, IWAN_DRV_DOS_NAME);
 	st = IoCreateSymbolicLink(&dos_name, &dev_name);
 	if (!NT_SUCCESS(st)) {
 		IoDeleteDevice(devobj);
@@ -174,8 +216,13 @@ DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registry_path)
 	driver->MajorFunction[IRP_MJ_DEVICE_CONTROL] = iwan_win_dispatch_ioctl;
 	driver->DriverUnload = iwan_win_unload;
 
-	/* WFP：注册 callout 与过滤器。没有它设备没有意义，所以失败就整体回滚。 */
+	/* 数据面：WFP 平面在这里注册 callout/过滤器；NDIS 平面在这里注册
+	 * 小型端口与协议驱动。没有数据面设备就没有意义，所以失败即整体回滚。 */
+#ifdef IWAN_WIN_PLANE_MP
+	st = iwan_win_mp_init(driver, devobj, ext, registry_path);
+#else
 	st = iwan_win_wfp_init(devobj, ext);
+#endif
 	if (!NT_SUCCESS(st)) {
 		driver->DriverUnload = NULL;
 		IoDeleteSymbolicLink(&dos_name);
@@ -185,6 +232,6 @@ DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registry_path)
 
 	devobj->Flags &= ~DO_DEVICE_INITIALIZING;
 
-	DbgPrint("iwan-win: loaded, %ws\n", IWAN_WIN_DRV_VERSION_STR);
+	DbgPrint("iwan-win: loaded, %ws\n", IWAN_DRV_VERSION_STR);
 	return STATUS_SUCCESS;
 }

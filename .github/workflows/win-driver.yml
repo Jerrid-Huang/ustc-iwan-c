@@ -86,13 +86,27 @@ jobs:
           $incs = @("$env:WDKINC\km", "$env:WDKINC\km\crt", "$env:WDKINC\shared",
                     "$env:WDKINC\ucrt", "$($msvc.FullName)\include") |
                   Where-Object { Test-Path $_ } | ForEach-Object { "/I$_" }
-          $clArgs = @('/nologo', '/kernel', '/c', '/Zs', '/std:c11', '/W4', '/WX-',
-                    '/Iwin-driver', '/Isrc\common') + $incs +
-                  @('/DNDIS630', '/D_AMD64_') +
+          $common = @('/nologo', '/kernel', '/c', '/Zs', '/std:c11', '/W4', '/WX-',
+                      '/Iwin-driver', '/Isrc\common') + $incs + @('/D_AMD64_')
+          # WFP 平面（iwan.sys）
+          $clArgs = $common + @('/DNDIS630') +
                   @('win-driver\iwan_win_drv.c', 'win-driver\iwan_win_session.c',
                     'win-driver\iwan_win_wfp.c', 'win-driver\iwan_win_frame.c')
           & $cl.FullName @clArgs 2>&1 | Tee-Object -FilePath cl-syntax.log
           "cl 退出码=$LASTEXITCODE"
+          # NDIS 平面（iwanmp.sys）。ndis.h 的小型端口宏与协议宏不能同时要，
+          # 所以 iwan_win_mp.c 单独跑一遍，其余源文件走协议/通用宏。
+          $mpArgs = $common + @('/DNDIS630', '/DNDIS_WDM', '/DIWAN_WIN_PLANE_MP') +
+                  @('win-driver\iwan_win_proto.c', 'win-driver\iwan_win_mpdata.c',
+                    'win-driver\iwan_win_drv.c', 'win-driver\iwan_win_session.c',
+                    'win-driver\iwan_win_frame.c')
+          & $cl.FullName @mpArgs 2>&1 | Tee-Object -FilePath cl-mp.log
+          "cl mp 退出码=$LASTEXITCODE"
+          $mpoArgs = $common + @('/DNDIS_MINIPORT_DRIVER', '/DNDIS630_MINIPORT',
+                                 '/DNDIS_WDM', '/DIWAN_WIN_PLANE_MP') +
+                  @('win-driver\iwan_win_mp.c')
+          & $cl.FullName @mpoArgs 2>&1 | Tee-Object -FilePath cl-mp-miniport.log
+          "cl mp-miniport 退出码=$LASTEXITCODE"
 
       # 把我不确定的 API 原型/结构成员直接从 WDK 头里打出来：猜签名是上一次
       # 反复出错的原因（FwpsInjectNetworkReceiveAsync0 我上一次"修"错了方向）。
@@ -356,6 +370,19 @@ jobs:
               Tee-Object -FilePath msbuild.log
           "msbuild 退出码=$LASTEXITCODE"
 
+      # NDIS 平面（小型端口 + 协议驱动）。与 iwan.sys 各自独立：一个失败不影响
+      # 另一个的产物，判据仍然是各自的 .sys 是否存在。
+      - name: msbuild iwanmp（NDIS 平面）
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & $env:MSBUILD 'win-driver\iwanmp.vcxproj' /nologo /v:normal `
+              /p:Configuration=Release /p:Platform=x64 `
+              "/p:SolutionDir=$env:GITHUB_WORKSPACE\" `
+              "/p:OutDir=$env:GITHUB_WORKSPACE\build\x64\Release\" 2>&1 |
+              Tee-Object -FilePath msbuild-mp.log
+          "msbuild-mp 退出码=$LASTEXITCODE"
+
       - name: 取 x64 devcon.exe（虚拟机建承载网卡用）
         if: always()
         shell: pwsh
@@ -371,19 +398,23 @@ jobs:
             "runner 上没找到 x64 devcon.exe"
           }
 
-      # 上面两步都是 continue-on-error，所以"工作流成功"从来不等于"编译成功"：
+      # 上面几步都是 continue-on-error，所以"工作流成功"从来不等于"编译成功"：
       # 曾经带着一个 C2220 报 success，而工件里没有 iwan.sys。判据只能是产物。
-      - name: 断言 iwan.sys 真的产出了
+      - name: 断言两个 .sys 真的产出了
         if: always()
         shell: pwsh
         run: |
-          $sys = "$env:GITHUB_WORKSPACE\build\x64\Release\iwan.sys"
-          if (Test-Path $sys) {
-            "iwan.sys 存在：$((Get-Item $sys).Length) 字节"
-          } else {
-            "编译没有产出 iwan.sys —— 本次构建判为失败"
-            exit 1
+          $bad = 0
+          foreach ($n in @('iwan.sys', 'iwanmp.sys')) {
+            $sys = "$env:GITHUB_WORKSPACE\build\x64\Release\$n"
+            if (Test-Path $sys) {
+              "$n 存在：$((Get-Item $sys).Length) 字节"
+            } else {
+              "编译没有产出 $n —— 本次构建判为失败"
+              $bad = 1
+            }
           }
+          if ($bad -ne 0) { exit 1 }
 
       - name: 回传产物与日志
         if: always()
@@ -393,6 +424,9 @@ jobs:
           path: |
             build/x64/Release/iwan.sys
             build/x64/Release/iwan.pdb
+            build/x64/Release/iwanmp.sys
+            build/x64/Release/iwanmp.pdb
+            win-driver/iwanmp.inf
             out/devcon.exe
             **/*.log
           if-no-files-found: warn

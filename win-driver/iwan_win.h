@@ -63,7 +63,8 @@
 #  define IWAN_ALLOC(size, tag) ExAllocatePoolWithTag(NonPagedPool, (size), (tag))
 #endif
 
-#define IWAN_WIN_DRV_VERSION_STR L"iwan-win 0.1 (WFP callout, ABI 1)"
+#define IWAN_WIN_DRV_VERSION_STR L"iwan-win 0.1 (WFP callout, ABI 2)"
+#define IWAN_WIN_DRV_VERSION_STR_MP L"iwan-win 0.1 (miniport + protocol, ABI 2)"
 
 
 /* ---- 会话 ------------------------------------------------------------- */
@@ -80,6 +81,8 @@ typedef struct _IWAN_WIN_SESSION {
 	/* 外层端点（地址/端口为网络序） */
 	UINT32			outer_src;	/* v4 外层地址，大端整数 */
 	UINT32			outer_dst;
+	UINT32			outer_hop;	/* 外层下一跳（控制面查路由后传入；
+						 * 0 = 未提供，按对端在链路上处理） */
 	UINT16			sport;
 	UINT16			dport;
 	UINT8			outer_src6[16];
@@ -137,27 +140,52 @@ typedef struct _IWAN_WIN_SESSION {
  */
 struct _IWAN_MP_BINDING;
 
+/* 出向 NBL 的 context 区大小：够放 IWAN_MP_TX_CTX（缓冲地址 + MDL 两个
+ * 指针）。池按这个尺寸建，两侧（协议边发送、小型端口指示）共用同一个数，
+ * IWAN_MP_TX_CTX 的实际大小在 iwan_win_proto.c 里用 C_ASSERT 对齐。 */
+#define IWAN_MP_NBL_CTX_SIZE	16u
+
+/* 承载侧的链路层常量（小型端口那侧是 NdisMediumIP，裸 IP，没有以太头） */
+#define IWAN_MP_ETH_HDR_LEN	14u
+#define IWAN_MP_ETH_TYPE_IP4	0x0800u
+#define IWAN_MP_ETH_TYPE_ARP	0x0806u
+#define IWAN_MP_ETH_TYPE_IP6	0x86DDu
+
 typedef struct _IWAN_MP_PLANE {
 	/* 小型端口侧 */
 	NDIS_HANDLE		mp_handle;	/* MiniportAdapterHandle */
-	NDIS_HANDLE		recv_pool;	/* 向上指示用的 NBL 池 */
+	/* NBL 池：两侧共用。出向要挂一个 IWAN_MP_TX_CTX（缓冲与 MDL 的
+	 * 地址，完成回调据此归还），所以建池时就把 context 区留够；
+	 * 入向指示用的 NBL 不关心里程碑里的内容，白拿这 16 字节。 */
+	NDIS_HANDLE		nbl_pool;
 	volatile LONG		mp_running;	/* Pause/Restart 闸门（1=可收可发） */
 
-	/* 协议边 */
+	/* 协议边。绑定表本身是驱动级的（见 iwan_win_proto.c 的 g_bindings），
+	 * 不放在这里：协议驱动在 DriverEntry 就注册，比小型端口（PnP）先出现、
+	 * 后消失，把表挂在设备扩展上会有生命周期错配。 */
 	NDIS_HANDLE		proto_handle;	/* NdisRegisterProtocolDriver 句柄 */
-	LIST_ENTRY		bindings;	/* 全部以太承载的绑定，见 iwan_win_proto.c */
-	KSPIN_LOCK		lock;		/* 保护 bindings 与 active */
+	KSPIN_LOCK		lock;		/* 保护 active/下一跳/MAC/时间戳 */
 	struct _IWAN_MP_BINDING	*active;	/* 会话选定的承载；NULL=未选定 */
 	UINT32			active_ifindex;
 	UINT32			next_hop_be;	/* 外层下一跳（v4，网络序） */
+	UINT8			local_mac[6];	/* 选定承载的本地 MAC（发帧时填源地址） */
 	UINT8			peer_mac[6];	/* 下一跳的 MAC */
 	volatile LONG		peer_mac_valid;
 	volatile LONG		peer_mac_pending;	/* 已发 ARP 请求、等回复 */
+	UINT64			arp_ts_ms;	/* 解析出 peer_mac 的时刻（老化用） */
+	UINT64			arp_last_ms;	/* 上次发 ARP 的时刻（限速，防请求风暴） */
 
 	/* 承载发送的进度：外层 NBL 已交给 NDIS 但还没完成的数量。
 	 * 统计一律写在 sess.stats 里（与 WFP 平面同名同义），装具与用户态不用改。 */
 	volatile LONG		outer_outstanding;
 } IWAN_MP_PLANE;
+
+/* 统计走 sess.stats，与 WFP 平面的 IWAN_STAT_INC/ADD 同名同义 —— 用户态的
+ * 解析器、共享页布局、装具的 STATS 行都不需要为新平面改一个字。 */
+#define IWAN_MP_STAT_INC(ext, f) \
+	InterlockedIncrement64((volatile LONG64 *)&(ext)->sess.stats.f)
+#define IWAN_MP_STAT_ADD(ext, f, v) \
+	InterlockedExchangeAdd64((volatile LONG64 *)&(ext)->sess.stats.f, (LONG64)(v))
 
 /* ---- 设备扩展 --------------------------------------------------------- */
 
@@ -219,6 +247,11 @@ static __inline UINT64 iwan_win_now_ms(VOID)
 VOID iwan_win_ctrl_init(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext);
 VOID iwan_win_ctrl_fini(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext);
 
+/* 控制设备分发（iwan_win_drv.c）：两个平面共用。NDIS 平面还要在上面套一层
+ * "看到 NDIS 自己的设备对象就原样转交"的外壳（见 iwan_win_mp.c）。 */
+NTSTATUS iwan_win_dispatch_create(_In_ PDEVICE_OBJECT devobj, _Inout_ PIRP irp);
+NTSTATUS iwan_win_dispatch_ioctl(_In_ PDEVICE_OBJECT devobj, _Inout_ PIRP irp);
+
 NTSTATUS iwan_win_session_open(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 			       _In_reads_bytes_(in_len) const IWAN_WIN_SESSION_OPEN *req,
 			       _In_ ULONG in_len);
@@ -237,6 +270,12 @@ BOOLEAN iwan_win_session_is_v6(_In_ const IWAN_WIN_SESSION *s);
 VOID iwan_win_session_mark_rx(_Inout_ IWAN_WIN_SESSION *s, _In_ UINT32 is_ctrl);
 /* 对端 PT_CLOSE：时间戳归零 + peer_state 置已关闭（用户态据此判断开） */
 VOID iwan_win_session_mark_close(_Inout_ IWAN_WIN_SESSION *s);
+
+/* 出向拒绝样本：把"为什么拒"写进共享页诊断区（实现 iwan_win_session.c，
+ * 两个数据面共用；只在拒绝路径调用，可在 DISPATCH_LEVEL） */
+VOID iwan_win_diag_tx(_Inout_ IWAN_WIN_SESSION *s, _In_ UINT32 reason,
+		      _In_ ULONG len, _In_ ULONG tot, _In_ ULONG pkt0,
+		      _In_reads_bytes_opt_(len) const UINT8 *pkt);
 
 /* ---- WFP 数据面（iwan_win_wfp.c） ------------------------------------- */
 
@@ -259,7 +298,15 @@ VOID iwan_win_wfp_fini(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext);
 /* 注册小型端口与协议驱动（iwan_win_mp.c）。DriverEntry 调用一次。 */
 NTSTATUS iwan_win_mp_init(_In_ PDRIVER_OBJECT driver,
 			  _In_ PDEVICE_OBJECT devobj,
-			  _Inout_ IWAN_WIN_DEVICE_EXTENSION *ext);
+			  _Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
+			  _In_ PUNICODE_STRING registry_path);
+
+/* 协议边（iwan_win_proto.c）：注册/注销 NdisRegisterProtocolDriver。
+ * init 由 iwan_win_mp_init 调用，fini 由 iwan_win_mp_fini 调用（两者都不在
+ * 数据面，PASSIVE_LEVEL）。 */
+NTSTATUS iwan_win_proto_init(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext);
+VOID iwan_win_proto_fini(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext);
+
 /* 注销（iwan_win_unload 调用）。会先停适配器再解绑协议边。 */
 VOID iwan_win_mp_fini(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext);
 
@@ -286,21 +333,25 @@ VOID iwan_win_mp_outer_recv(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 
 /* ---- 协议边与小型端口提供给引擎的出口（实现分别在 proto/ mp.c） ------- */
 
+/* 填以太头（源 = 选定承载的 MAC，目的 = 下一跳 MAC）。
+ * TRUE = 已填好；FALSE = 邻居还没解析出来（本函数已按限速发过 ARP 请求），
+ * 这一个包该丢。缓冲所有权不动：调用者（引擎）在 FALSE 时自己释放。 */
+BOOLEAN iwan_win_proto_fill_eth4(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
+				 _Inout_ UINT8 *buf);
+
 /* 把整帧外层数据报（含以太头，buf 由 IWAN_ALLOC 分配）交给承载网卡。
  * TRUE = 已交给 NDIS，所有权转移（完成回调里释放）；FALSE = 未发出，
- * 所有权仍在调用者手里，且本函数自己释放。下一跳 MAC 未知时会发 ARP 并
+ * 缓冲已被本函数释放（调用者不得再引用）。下一跳 MAC 未知时会发 ARP 并
  * 返回 FALSE。
- * 对 v4 与 v6 各有一份：外层族由会话决定，与内层族无关。 */
+ * 只有 v4：外层 v6 的邻居发现（NS/NA）留到第二阶段，现在会话是 v6 时引擎
+ * 直接拒绝并计 tx_bad_state，不做任何降级。 */
 BOOLEAN iwan_win_proto_send_outer4(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
-				   _In_reads_bytes_(len) UINT8 *eth,
-				   _In_ ULONG len);
-BOOLEAN iwan_win_proto_send_outer6(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 				   _In_reads_bytes_(len) UINT8 *eth,
 				   _In_ ULONG len);
 
 /* 把解封出来的内层数据报指示向上（buf 由 IWAN_ALLOC 分配）。
- * TRUE = 已指示，所有权转移（NBL 归还时释放）；FALSE = 失败，所有权仍在
- * 调用者手里且本函数不动它。 */
+ * TRUE = 已指示，所有权转移（NBL 归还时释放）；FALSE = 失败，且缓冲已被
+ * 本函数释放（调用者不得再引用，也不要再释放一次）。 */
 BOOLEAN iwan_win_mp_indicate_inner(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 				   _In_reads_bytes_(len) UINT8 *inner,
 				   _In_ ULONG len);

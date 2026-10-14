@@ -37,6 +37,39 @@ iwan_win_session_is_v6(_In_ const IWAN_WIN_SESSION *s)
 	return !iwan_win_is_zero16(s->outer_dst6);
 }
 
+/* ---- 出向拒绝样本（共享页诊断区） ------------------------------------- */
+
+/*
+ * 只写不判，用户态经 SHM_QUERY 读（布局见 src/common/iwan_win_abi.h）。
+ * 两个数据面（WFP 平面 iwan.sys 与 NDIS 平面 iwanmp.sys）共用这一份实现：
+ * 记录的字段布局与写入顺序是现场诊断的唯一依据，任何一处分叉都会让两边的
+ * 读数不可比。只在拒绝路径上写，正常路径零开销。
+ */
+VOID
+iwan_win_diag_tx(_Inout_ IWAN_WIN_SESSION *s, _In_ UINT32 reason,
+		 _In_ ULONG len, _In_ ULONG tot, _In_ ULONG pkt0,
+		 _In_reads_bytes_opt_(len) const UINT8 *pkt)
+{
+	IWAN_WIN_DIAG *d;
+	ULONG n;
+
+	if (s->shm == NULL)
+		return;
+	d = (IWAN_WIN_DIAG *)((UINT8 *)s->shm + IWAN_WIN_SHM_OFF_DIAG);
+	d->magic = IWAN_WIN_DIAG_MAGIC;
+	d->reason = reason;
+	d->len = (UINT32)len;
+	d->tot = (UINT32)tot;
+	d->pkt0 = (UINT32)pkt0;
+	RtlZeroMemory(d->first, sizeof(d->first));
+	if (pkt != NULL) {
+		n = len < sizeof(d->first) ? len : sizeof(d->first);
+		RtlCopyMemory(d->first, pkt, n);
+	}
+	/* 字段全部写完再自增序号：读者据此判断记录已更新（先写后记是约定） */
+	InterlockedIncrement((volatile LONG *)&d->seq);
+}
+
 /* ---- 控制面基础设施 --------------------------------------------------- */
 
 VOID
@@ -308,6 +341,7 @@ iwan_win_session_same(_In_ const IWAN_WIN_SESSION *s,
 	       RtlCompareMemory(s->key, req->key, sizeof(s->key)) == sizeof(s->key) &&
 	       s->outer_src == iwan_win_abi_addr(req->outer_src) &&
 	       s->outer_dst == iwan_win_abi_addr(req->outer_dst) &&
+	       s->outer_hop == iwan_win_abi_addr(req->outer_hop) &&
 	       s->sport == iwan_win_abi_port(req->sport != 0 ? req->sport
 							     : req->dport) &&
 	       s->dport == iwan_win_abi_port(req->dport) &&
@@ -392,6 +426,7 @@ iwan_win_session_open(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	RtlCopyMemory(s->key, req->key, sizeof(s->key));
 	s->outer_src = iwan_win_abi_addr(req->outer_src);
 	s->outer_dst = iwan_win_abi_addr(req->outer_dst);
+	s->outer_hop = iwan_win_abi_addr(req->outer_hop);
 	s->sport = iwan_win_abi_port(req->sport != 0 ? req->sport : req->dport);
 	s->dport = iwan_win_abi_port(req->dport);
 	RtlCopyMemory(s->outer_src6, req->outer_src6, 16);

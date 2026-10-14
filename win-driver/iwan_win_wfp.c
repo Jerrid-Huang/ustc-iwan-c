@@ -156,31 +156,8 @@ iwan_win_nbl_wrap(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
  * 超限就丢当前包并计 tx_bad_state，把背压还给协议栈。 */
 #define IWAN_WIN_MAX_INFLIGHT 1024u
 
-/* 出向被拒/被丢的原因记录（只写不判，用户态经 SHM_QUERY 读）。
- * 只在拒绝路径上写，正常路径零开销。 */
-static VOID
-iwan_win_diag_tx(_Inout_ IWAN_WIN_SESSION *s, _In_ UINT32 reason,
-		 _In_ ULONG len, _In_ ULONG tot, _In_ ULONG pkt0,
-		 _In_reads_bytes_opt_(len) const UINT8 *pkt)
-{
-	IWAN_WIN_DIAG *d;
-	ULONG n;
-
-	if (s->shm == NULL)
-		return;
-	d = (IWAN_WIN_DIAG *)((UINT8 *)s->shm + IWAN_WIN_SHM_OFF_DIAG);
-	d->magic = IWAN_WIN_DIAG_MAGIC;
-	d->reason = reason;
-	d->len = (UINT32)len;
-	d->tot = (UINT32)tot;
-	d->pkt0 = (UINT32)pkt0;
-	RtlZeroMemory(d->first, sizeof(d->first));
-	if (pkt != NULL) {
-		n = len < sizeof(d->first) ? len : sizeof(d->first);
-		RtlCopyMemory(d->first, pkt, n);
-	}
-	InterlockedIncrement((volatile LONG *)&d->seq);
-}
+/* 出向被拒/被丢的原因记录：实现在 iwan_win_session.c（两个数据面共用），
+ * 这里只剩调用点。 */
 
 static NTSTATUS
 iwan_win_encap_inject(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
