@@ -101,6 +101,9 @@ typedef long NTSTATUS;
 	(IWAN_OUTER_IP4_LEN + IWAN_OUTER_UDP_LEN + IWAN_FRAME_HDR_LEN)	/* 36 */
 #define IWAN_OUTER_IP6_LEN	40
 #define IWAN_OUTER6_TOTAL	(IWAN_OUTER_IP6_LEN + IWAN_OUTER_UDP_LEN + IWAN_FRAME_HDR_LEN)
+/* 内层 IPv6 首部（不含扩展头）。数值与 IWAN_OUTER_IP6_LEN 相同但含义不同：
+ * 前者是内层报文自己的头，后者是封装用外层头，别混用。 */
+#define IWAN_INNER_IP6_LEN	40
 
 #define IWAN_IPPROTO_TCP	6
 #define IWAN_IPPROTO_UDP	17

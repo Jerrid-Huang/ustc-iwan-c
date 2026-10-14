@@ -51,7 +51,11 @@
 
 /*
  * 非分页池分配：ExAllocatePool2 从 Win10 2004 起可用且默认清零，老目标回落到
- * ExAllocatePoolWithTag。两条路径都显式清零，调用者不必再管。
+ * ExAllocatePoolWithTag —— 那条路径**不清零**（旧注释写"两条路径都显式清零"，
+ * 与实现不符）。两条路径语义不一致，所以调用者必须自己初始化"失败路径上会被
+ * 读到的字段"，例如 IWAN_INJECT_CTX.mdl，不能依赖清零。
+ * 本工程未显式指定 NTDDI_VERSION（vcxproj 只给 TargetVersion=Windows10），
+ * 实际走哪条分支取决于 WDK 头里的默认值，两种都可能。
  */
 #if defined(NTDDI_WIN10_VB) && (NTDDI_VERSION >= NTDDI_WIN10_VB)
 #  define IWAN_ALLOC(size, tag) ExAllocatePool2(POOL_FLAG_NON_PAGED, (size), (tag))

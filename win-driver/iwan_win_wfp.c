@@ -223,6 +223,10 @@ iwan_win_encap_inject(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	}
 	ctx->buf = buf;
 	ctx->ext = ext;
+	/* 池分配不保证清零（见 iwan_win.h 的 IWAN_ALLOC 注释）：外层首部构造失败
+	 * 时也会走 fail，那时 mdl 还没被 nbl_wrap 赋值，不初始化就会读到野指针
+	 * 并把它交给 IoFreeMdl。 */
+	ctx->mdl = NULL;
 
 	/* 帧紧跟在 IP + UDP 之后：overhead 是"封装总开销"，比帧的起始偏移多出
 	 * 一个帧头长度。先摆帧，再让 portable 层去写外层头（两个校验和都在那里）。 */
@@ -591,6 +595,7 @@ iwan_win_inject_net_recv(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		return STATUS_INSUFFICIENT_RESOURCES;
 	ctx->buf = IWAN_ALLOC(len, IWAN_TAG_PKT);
 	ctx->ext = ext;
+	ctx->mdl = NULL;		/* 池分配不清零，见 encap 侧同样处理 */
 	if (ctx->buf == NULL) {
 		ExFreePoolWithTag(ctx, IWAN_TAG_PKT);
 		return STATUS_INSUFFICIENT_RESOURCES;
@@ -941,7 +946,7 @@ iwan_win_classify_out6(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 	IWAN_WIN_SESSION *s;
 	NET_BUFFER_LIST *nbl = (NET_BUFFER_LIST *)layerData;
 	ULONG overhead;
-	BOOLEAN all_ours = TRUE, overflow = FALSE;
+	BOOLEAN all_ours = TRUE, overflow = FALSE, fail_closed = FALSE;
 	UINT32 kinds[IWAN_WIN_MAX_BATCH];
 	ULONG n = 0;
 
@@ -981,6 +986,7 @@ iwan_win_classify_out6(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 		for (cur = nbl; cur != NULL;
 		     cur = NET_BUFFER_LIST_NEXT_NBL(cur)) {
 			NET_BUFFER *nb = NET_BUFFER_LIST_FIRST_NB(cur);
+			UINT8 hdr6[IWAN_INNER_IP6_LEN];
 			UINT8 *pkt;
 			ULONG len;
 
@@ -989,11 +995,27 @@ iwan_win_classify_out6(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 				break;
 			}
 			len = NET_BUFFER_DATA_LENGTH(nb);
-			pkt = (UINT8 *)NdisGetDataBuffer(nb, len, NULL, 1, 0);
-			if (pkt == NULL || len < 40 ||
-			    iwan_win_inner_family(pkt, len) != 6 ||
-			    !iwan_win_inner_sane(pkt, len)) {
+			/* 判定只需要内层 v6 首部那 40 字节：给一块栈缓冲让 NDIS
+			 * 跨 MDL 拼出来。原先这里要求**整包**连续
+			 * （NdisGetDataBuffer(nb, len, NULL, ...)），而校验和卸载
+			 * 下的常规报文首部与载荷分属不同 MDL，于是这些包被判成
+			 * “不是我们的”、明文走上承载网 —— 与出向 v4 修掉的是同一
+			 * 个错，v6 侧一直漏着。 */
+			pkt = (UINT8 *)NdisGetDataBuffer(nb, IWAN_INNER_IP6_LEN,
+							 hdr6, 1, 0);
+			if (pkt == NULL || len < IWAN_INNER_IP6_LEN ||
+			    iwan_win_inner_family(pkt, len) != 6) {
+				/* 短于首部或不是 v6：不是本会话的包，放行 */
 				all_ours = FALSE;
+				break;
+			}
+			if (!iwan_win_inner_sane(pkt, len)) {
+				/* 是我们的包但声明长度与整帧矛盾：丢，绝不放明文 */
+				iwan_win_diag_tx(s, IWAN_WIN_DIAG_TX_LEN_BAD, len,
+						 (ULONG)IWAN_INNER_IP6_LEN +
+						 iwan_win_rd16(pkt + 4), pkt[0], pkt);
+				IWAN_STAT_INC(ext, tx_bad_inner);
+				fail_closed = TRUE;
 				break;
 			}
 			if (!iwan_win_should_tunnel6(s->targets, s->target_count,
@@ -1002,7 +1024,13 @@ iwan_win_classify_out6(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 				break;
 			}
 			if ((ULONG)(overhead + len) > 0xFFFF) {
-				all_ours = FALSE;
+				/* 外层总长越过 16 位：装不下就丢（与 v4 的 MTU
+				 * 闸门同一规矩），不透传 */
+				iwan_win_diag_tx(s, IWAN_WIN_DIAG_TX_MTU, len,
+						 (ULONG)IWAN_INNER_IP6_LEN +
+						 iwan_win_rd16(pkt + 4), pkt[0], pkt);
+				IWAN_STAT_INC(ext, tx_bad_state);
+				fail_closed = TRUE;
 				break;
 			}
 			kinds[n] = IWAN_WIN_IN_DATA;
@@ -1012,6 +1040,13 @@ iwan_win_classify_out6(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 
 	if (overflow) {
 		IWAN_STAT_INC(ext, ev_dropped);
+		classifyOut->actionType = FWP_ACTION_BLOCK;
+		classifyOut->flags |= FWPS_CLASSIFY_OUT_FLAG_ABSORB;
+		return;
+	}
+	if (fail_closed) {
+		/* 是我们的包、但封装不了：丢。计数器在判定处已经计过，
+		 * 这里只落结论，避免同一原因被记两次。 */
 		classifyOut->actionType = FWP_ACTION_BLOCK;
 		classifyOut->flags |= FWPS_CLASSIFY_OUT_FLAG_ABSORB;
 		return;
@@ -1035,15 +1070,53 @@ iwan_win_classify_out6(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 		for (cur = nbl; cur != NULL;
 		     cur = NET_BUFFER_LIST_NEXT_NBL(cur)) {
 			NET_BUFFER *nb = NET_BUFFER_LIST_FIRST_NB(cur);
-			ULONG len = NET_BUFFER_DATA_LENGTH(nb);
-			UINT8 *pkt = (UINT8 *)NdisGetDataBuffer(nb, len, NULL, 1, 0);
 			NDIS_TCP_IP_CHECKSUM_NET_BUFFER_LIST_INFO ci;
 			BOOLEAN l4_offloaded = FALSE;
+			UINT8 hdr6[IWAN_INNER_IP6_LEN];
+			UINT8 *stor = NULL;
+			UINT8 *pkt;
+			ULONG nblen, tot;
+			NTSTATUS st;
 
-			if (pkt == NULL) {
+			nblen = NET_BUFFER_DATA_LENGTH(nb);
+			/* 与出向 v4 同一口径：判定只用首部那 40 字节，给栈缓冲让
+			 * NDIS 跨 MDL 拼；整包连续性单独探一次，不连续就拼进临时
+			 * 缓冲。原来这里一次取整包，取不到就丢，等于把校验和
+			 * 卸载下的常规 v6 报文全挡在隧道外。 */
+			pkt = (UINT8 *)NdisGetDataBuffer(nb, IWAN_INNER_IP6_LEN,
+							 hdr6, 1, 0);
+			if (pkt == NULL || nblen < IWAN_INNER_IP6_LEN) {
+				iwan_win_diag_tx(s, IWAN_WIN_DIAG_TX_COALESCE,
+						 nblen, 0,
+						 pkt != NULL ? (ULONG)pkt[0] : 0xFFFFu,
+						 pkt);
 				IWAN_STAT_INC(ext, tx_bad_inner);
-				all_ours = FALSE;
 				continue;
+			}
+			tot = (ULONG)IWAN_INNER_IP6_LEN + iwan_win_rd16(pkt + 4);
+			if (tot > nblen) {
+				iwan_win_diag_tx(s, IWAN_WIN_DIAG_TX_LEN_BAD,
+						 nblen, tot, pkt[0], pkt);
+				IWAN_STAT_INC(ext, tx_bad_inner);
+				continue;
+			}
+			pkt = (UINT8 *)NdisGetDataBuffer(nb, tot, NULL, 1, 0);
+			if (pkt == NULL) {
+				stor = (UINT8 *)IWAN_ALLOC(tot, IWAN_TAG_PKT);
+				if (stor == NULL) {
+					/* 池压力下不能默默放明文出去 */
+					IWAN_STAT_INC(ext, tx_err);
+					continue;
+				}
+				pkt = (UINT8 *)NdisGetDataBuffer(nb, tot, stor, 1, 0);
+				if (pkt == NULL) {
+					iwan_win_diag_tx(s,
+							 IWAN_WIN_DIAG_TX_COALESCE,
+							 nblen, tot, 0xFFFFu, NULL);
+					ExFreePoolWithTag(stor, IWAN_TAG_PKT);
+					IWAN_STAT_INC(ext, tx_bad_inner);
+					continue;
+				}
 			}
 			ci.Value = NET_BUFFER_LIST_INFO(cur,
 							TcpIpChecksumNetBufferListInfo);
@@ -1060,18 +1133,35 @@ iwan_win_classify_out6(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 			 * 再去分。Linux 参考实现遇到 GSO 同样是丢（记
 			 * tx_bad_state），并不做软件分段 —— 所以这里不是缺陷，
 			 * 是两侧一致的选择。 */
-			if (len + IWAN_OUTER6_TOTAL > s->carrier_mtu) {
+			if (tot + IWAN_OUTER6_TOTAL > s->carrier_mtu) {
+				iwan_win_diag_tx(s, IWAN_WIN_DIAG_TX_MTU, nblen,
+						 tot, pkt[0], pkt);
 				IWAN_STAT_INC(ext, tx_bad_state);
+				if (stor != NULL)
+					ExFreePoolWithTag(stor, IWAN_TAG_PKT);
 				continue;
 			}
-			if (!NT_SUCCESS(iwan_win_encap_inject(
-					ext, pkt, len, l4_offloaded, compartment,
-					iwan_win_session_is_v6(s)))) {
+
+			st = iwan_win_encap_inject(ext, pkt, tot, l4_offloaded,
+						   compartment,
+						   iwan_win_session_is_v6(s));
+			if (stor != NULL) {
+				/* 封装层已整块拷走，即用即还 */
+				ExFreePoolWithTag(stor, IWAN_TAG_PKT);
+				stor = NULL;
+			}
+			if (!NT_SUCCESS(st)) {
+				/* 在途窗口满已在 encap_inject 里记过 INFLIGHT，
+				 * 这里不能再覆盖成 ENCAP_FAIL */
+				if (st != STATUS_DEVICE_BUSY)
+					iwan_win_diag_tx(s,
+							 IWAN_WIN_DIAG_TX_ENCAP_FAIL,
+							 nblen, tot, pkt[0], pkt);
 				IWAN_STAT_INC(ext, tx_err);
 				continue;
 			}
 			IWAN_STAT_INC(ext, tx_pkts);
-			IWAN_STAT_ADD(ext, tx_bytes, len + overhead);
+			IWAN_STAT_ADD(ext, tx_bytes, tot + overhead);
 		}
 	}
 
