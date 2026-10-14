@@ -247,6 +247,11 @@ jobs:
           P2 'NDIS_STATUS 0xC00100xx 定义' 'define +NDIS_STATUS_[A-Z_0-9]+ +\(' 1 40
           P2 'NDIS_RUNTIME_VERSION_ 定义' 'define +NDIS_RUNTIME_VERSION_' 1 40
           P2 'NDIS_MINIPORT_DRIVER_CHARACTERISTICS_REVISION 定义' 'define +NDIS_SIZEOF_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_' 1 20
+          # 第五轮：控制设备改由 NdisRegisterDeviceEx 建（客体实测：DriverObject
+          # 上已有自己的设备时 NdisMRegisterMiniportDriver 回 0xC0010005）。
+          # NDIS_DEVICE_OBJECT_ATTRIBUTES.Header.Type 该填哪个常量？
+          P2 'NDIS_OBJECT_TYPE_DEVICE_OBJECT_ATTRIBUTES 定义' 'define +NDIS_OBJECT_TYPE_DEVICE_OBJECT_ATTRIBUTES' 1 6
+          P2 'NDIS_OBJECT_TYPE_DEFAULT 定义' 'define +NDIS_OBJECT_TYPE_DEFAULT' 1 6
           New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\wdk-src" | Out-Null
           foreach ($f in @('ndis.h', 'nblapi.h', 'miniportgeneralattributes.h', 'netioapi.h')) {
             $p = Join-Path $h $f

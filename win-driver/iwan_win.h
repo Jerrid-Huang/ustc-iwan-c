@@ -168,6 +168,11 @@ typedef struct _IWAN_MP_PLANE {
 	NDIS_HANDLE		nbl_pool;
 	volatile LONG		mp_running;	/* Pause/Restart 闸门（1=可收可发） */
 
+	/* 控制设备（\Device\iwanmp）：由 NdisRegisterDeviceEx 建，所以它是
+	 * NDIS 的设备、共享 NDIS 的 DriverObject；注销要用同一个句柄。 */
+	PDEVICE_OBJECT		ctrl_devobj;
+	NDIS_HANDLE		ctrl_handle;
+
 	/* 协议边。绑定表本身是驱动级的（见 iwan_win_proto.c 的 g_bindings），
 	 * 不放在这里：协议驱动在 DriverEntry 就注册，比小型端口（PnP）先出现、
 	 * 后消失，把表挂在设备扩展上会有生命周期错配。 */
@@ -234,8 +239,25 @@ typedef struct _IWAN_WIN_DEVICE_EXTENSION {
 
 } IWAN_WIN_DEVICE_EXTENSION;
 
+/*
+ * 控制面从设备对象取扩展。
+ *
+ * WFP 平面：设备是 DriverEntry 用 IoCreateDeviceSecure 建的，扩展就是
+ * 设备扩展。
+ *
+ * NDIS 平面：控制设备由 NdisRegisterDeviceEx 建（注册小型端口时
+ * DriverObject 必须干净，见 iwan_win_mp_init），它不带设备扩展 ——
+ * 扩展是我们自己分配的那一份，全驱动唯一，所以这里返回单例。
+ * 单例在 iwan_win_mp_init 里挂上、UnloadHandler 里撤销；控制设备的
+ * IRP 只可能在两者之间到达。
+ */
+#ifdef IWAN_WIN_PLANE_MP
+IWAN_WIN_DEVICE_EXTENSION *iwan_win_mp_device_ext(VOID);
+#define IWAN_DEVEXT(devobj)	iwan_win_mp_device_ext()
+#else
 #define IWAN_DEVEXT(devobj) \
 	((IWAN_WIN_DEVICE_EXTENSION *)(devobj)->DeviceExtension)
+#endif
 
 /* ---- 单调毫秒（对应 iwan_now_ms） ------------------------------------- */
 
@@ -257,6 +279,10 @@ VOID iwan_win_ctrl_fini(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext);
 
 /* 控制设备分发（iwan_win_drv.c）：两个平面共用。NDIS 平面还要在上面套一层
  * "看到 NDIS 自己的设备对象就原样转交"的外壳（见 iwan_win_mp.c）。 */
+/* 两个平面共用同一个设备类 GUID（只在设备对象里做标记用）：WFP 平面递给
+ * IoCreateDeviceSecure，NDIS 平面递给 NdisRegisterDeviceEx。定义在 iwan_win_drv.c。 */
+extern const GUID iwan_win_devclass_guid;
+
 NTSTATUS iwan_win_dispatch_create(_In_ PDEVICE_OBJECT devobj, _Inout_ PIRP irp);
 NTSTATUS iwan_win_dispatch_ioctl(_In_ PDEVICE_OBJECT devobj, _Inout_ PIRP irp);
 
@@ -303,18 +329,30 @@ VOID iwan_win_wfp_fini(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext);
  * PnP/非 PnP 两套生命周期纠缠在一起。用户态按设备名选平面。
  */
 
-/* 注册小型端口与协议驱动（iwan_win_mp.c）。DriverEntry 调用一次。 */
+/* 注册小型端口与协议驱动（iwan_win_mp.c）。DriverEntry 调用一次。
+ *
+ * 顺序上有一条硬约束（客体实测：否则 NdisMRegisterMiniportDriver 当场回
+ * NDIS_STATUS_BAD_CHARACTERISTICS = 0xC0010005）：调用它时 DriverObject 必须
+ * 还是"干净"的 —— 既没有自己的设备对象，也没有被换过的 MajorFunction。
+ * 所以控制设备不由 DriverEntry 用 IoCreateDevice 建，而是注册之后交给 NDIS
+ * 的 NdisRegisterDeviceEx（见 iwan_win_mp_open_control）。 */
 NTSTATUS iwan_win_mp_init(_In_ PDRIVER_OBJECT driver,
-			  _In_ PDEVICE_OBJECT devobj,
 			  _Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 			  _In_ PUNICODE_STRING registry_path);
+
+/* 建控制设备 \Device\iwanmp（+ \DosDevices\iwanmp）。必须在 iwan_win_mp_init
+ * 之后调用：NdisRegisterDeviceEx 要有小型端口句柄，而且它建出来的设备共享
+ * NDIS 的 DriverObject，所以这里才把四个 MajorFunction 换成我们的分发
+ * （自己的设备走控制面，NDIS 的设备原样转交）。 */
+NTSTATUS iwan_win_mp_open_control(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext);
 
 /* 加载期失败诊断（实现在 iwan_win_session.c，只在 IWAN_WIN_PLANE_MP 下编入）：
  * 把阶段号与状态码写进服务键的 Parameters 子键。驱动加载失败时没有别的通道
  * 可看 —— 控制设备还没建、客体上没有内核调试器。stage 约定：
- *   1-4   DriverEntry（1 控制设备、2 符号链接、3 数据面注册、4 完成）
+ *   3-5   DriverEntry（3 数据面注册、4 完成、5 控制设备）
  *   10-12 iwan_win_mp_init（10 小型端口注册失败、11 协议边注册失败、12 完成）
- *   20-22 MiniportInitializeEx（20 进入、21 失败、22 完成） */
+ *   20-22 MiniportInitializeEx（20 进入、21 失败、22 完成）
+ *   30    环境：T30 = NdisGetVersion() */
 VOID iwan_win_mp_trace(_In_ ULONG stage, _In_ LONG status);
 
 /* 协议边（iwan_win_proto.c）：注册/注销 NdisRegisterProtocolDriver。

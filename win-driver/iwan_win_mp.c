@@ -20,18 +20,20 @@
  * 生命周期上的两个要点：
  *   ① 本平面是 PnP 的（NDIS 小型端口），所以驱动卸载走 UnloadHandler，
  *      不是 DriverUnload —— 注册小型端口之后那个字段归 NDIS 管。因此
- *      iwan_win_mp_unload() 要自己做完整套清理（数据面 + 会话 + 控制设备）。
- *   ② NdisMRegisterMiniportDriver 会把 DriverObject 的几个 MajorFunction
- *      换成 NDIS 自己的（它要处理自己的设备对象）。我们的控制设备是
- *      非 PnP 的裸设备，所以要先把 NDIS 的入口存下来，再装上自己的分发：
- *      自己的设备走控制面 IOCTL，其它设备（NDIS 的 FDO）原样转交。
- *      判别用 DeviceObject->Reserved：NDIS 在自己的设备对象上塞了上下文，
- *      我们的设备它是 NULL（IoCreateDevice 会清零）。
+ *      iwan_win_mp_unload_hook() 要自己做完整套清理（数据面 + 会话 +
+ *      控制设备 + 扩展内存）。
+ *   ② 控制设备不能用 IoCreateDevice 建在 DriverEntry 里。客体实测：
+ *      DriverObject 上已经挂着自己的设备对象（或 MajorFunction 已被换过）
+ *      时，NdisMRegisterMiniportDriver 直接回 NDIS_STATUS_BAD_CHARACTERISTICS
+ *      (0xC0010005)。所以顺序是"先注册（DriverObject 干净）→ 再用 NDIS 的
+ *      NdisRegisterDeviceEx 建控制设备 → 最后才换四个 MajorFunction"。
+ *      判别哪个设备是自己的用指针比较（NDIS 的设备对象上 Reserved 也非空，
+ *      用 Reserved 判别会认错）。
  *
  * 并发：发送路径与指示路径都可能处于 DISPATCH_LEVEL；本文件不等待、不加
  * 互斥、不碰可分页内存。整个平面只支持一个隧道适配器（与"一条会话绑一张
- * 网卡"、控制设备单例一致），所以 g_mp_ext 是单例指针，在 InitializeEx
- * 里建立、HaltEx 里撤销。
+ * 网卡"、控制设备单例一致），所以 g_mp_ext 是单例指针，在 iwan_win_mp_init
+ * 里建立、UnloadHandler 里撤销。
  */
 #include "iwan_win.h"
 
@@ -41,62 +43,37 @@
 #define IWAN_MP_LINK_SPEED	10000000000ULL
 
 static IWAN_WIN_DEVICE_EXTENSION *g_mp_ext;	/* 隧道适配器上下文（单例） */
-static PDEVICE_OBJECT g_mp_devobj;		/* 控制设备对象（单例） */
 
 /* 卸载钩子：既是 MiniportUnloadHandler，也承担 WFP 平面里 DriverUnload
  * 的那部分清理（注册小型端口之后 DriverUnload 归 NDIS 管，不会调我们）。 */
 static VOID iwan_win_mp_unload_hook(_In_ PDRIVER_OBJECT driver);
 
-/* NDIS 保存下来的原始入口（注册小型端口之后才有意义） */
-static DRIVER_DISPATCH *g_ndis_create;
-static DRIVER_DISPATCH *g_ndis_close;
-static DRIVER_DISPATCH *g_ndis_ioctl;
-static DRIVER_DISPATCH *g_ndis_pnp;
+/* ---- 控制设备分发 ------------------------------------------------
+ *
+ * 控制设备由 NdisRegisterDeviceEx 建，注册时把下面这张表交给 NDIS：它按表
+ * 建一个独立的驱动对象给这个设备用，所以既不用碰 NDIS 自己的 DriverObject，
+ * 也不用在每条 IRP 上分辨"这个设备是谁的"。NDIS 自己那些设备（小型端口的
+ * FDO、协议边绑定用的设备）由 NDIS 自己分发，与本表无关。
+ *
+ * 未登记的表项（例如 IRP_MJ_PNP）由 I/O 管理器回 STATUS_INVALID_DEVICE_REQUEST
+ * —— 控制设备不在 PnP 栈里，正常收不到那些 IRP。
+ */
+static DRIVER_DISPATCH *g_mp_major[IRP_MJ_MAXIMUM_FUNCTION + 1];
 
-/* ---- 控制设备分发：自己的设备走控制面，其它交给 NDIS ---------------- */
+/* 设备对象属性的对象类型常量不在 km\ndis.h 里（那一族在 SDK 的共享对象类型
+ * 头里）。万一这个 WDK 版本没有它，就退回 NDIS 的"默认"类型：NdisRegisterDeviceEx
+ * 按 Size/Revision 解释这张表，类型只作标记。 */
+#ifndef NDIS_OBJECT_TYPE_DEVICE_OBJECT_ATTRIBUTES
+#define NDIS_OBJECT_TYPE_DEVICE_OBJECT_ATTRIBUTES NDIS_OBJECT_TYPE_DEFAULT
+#endif
 
-static BOOLEAN
-iwan_win_mp_is_foreign(_In_ PDEVICE_OBJECT devobj)
+static VOID
+iwan_win_mp_fill_major(VOID)
 {
-	/* NDIS 在自己的设备对象上用 Reserved 挂上下文；我们的控制设备是
-	 * IoCreateDevice 建的裸设备，该字段为零。 */
-	return devobj->Reserved != NULL;
-}
-
-static NTSTATUS
-iwan_win_mp_dispatch_create(_In_ PDEVICE_OBJECT devobj, _Inout_ PIRP irp)
-{
-	if (iwan_win_mp_is_foreign(devobj) && g_ndis_create != NULL)
-		return g_ndis_create(devobj, irp);
-	return iwan_win_dispatch_create(devobj, irp);
-}
-
-static NTSTATUS
-iwan_win_mp_dispatch_close(_In_ PDEVICE_OBJECT devobj, _Inout_ PIRP irp)
-{
-	if (iwan_win_mp_is_foreign(devobj) && g_ndis_close != NULL)
-		return g_ndis_close(devobj, irp);
-	return iwan_win_dispatch_create(devobj, irp);
-}
-
-static NTSTATUS
-iwan_win_mp_dispatch_ioctl(_In_ PDEVICE_OBJECT devobj, _Inout_ PIRP irp)
-{
-	if (iwan_win_mp_is_foreign(devobj) && g_ndis_ioctl != NULL)
-		return g_ndis_ioctl(devobj, irp);
-	return iwan_win_dispatch_ioctl(devobj, irp);
-}
-
-static NTSTATUS
-iwan_win_mp_dispatch_pnp(_In_ PDEVICE_OBJECT devobj, _Inout_ PIRP irp)
-{
-	if (iwan_win_mp_is_foreign(devobj) && g_ndis_pnp != NULL)
-		return g_ndis_pnp(devobj, irp);
-	/* 控制设备不在 PnP 栈里，正常不会收到这些；收到就成功收场 */
-	irp->IoStatus.Status = STATUS_SUCCESS;
-	irp->IoStatus.Information = 0;
-	IoCompleteRequest(irp, IO_NO_INCREMENT);
-	return STATUS_SUCCESS;
+	RtlZeroMemory(g_mp_major, sizeof(g_mp_major));
+	g_mp_major[IRP_MJ_CREATE] = iwan_win_dispatch_create;
+	g_mp_major[IRP_MJ_CLOSE] = iwan_win_dispatch_create;
+	g_mp_major[IRP_MJ_DEVICE_CONTROL] = iwan_win_dispatch_ioctl;
 }
 
 /* ---- 小型端口：初始化 / 停止 / 暂停 / 恢复 ---------------------------- */
@@ -557,8 +534,16 @@ iwan_win_mp_shutdown(_In_ NDIS_HANDLE MiniportAdapterContext,
 
 /* ---- 注册 / 注销 ----------------------------------------------------- */
 
+/* 控制面取扩展：本平面没有设备扩展（NdisRegisterDeviceEx 建的控制设备
+ * 不带扩展），扩展是 DriverEntry 分配的唯一那一份。 */
+IWAN_WIN_DEVICE_EXTENSION *
+iwan_win_mp_device_ext(VOID)
+{
+	return g_mp_ext;
+}
+
 NTSTATUS
-iwan_win_mp_init(_In_ PDRIVER_OBJECT driver, _In_ PDEVICE_OBJECT devobj,
+iwan_win_mp_init(_In_ PDRIVER_OBJECT driver,
 		 _Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		 _In_ PUNICODE_STRING registry_path)
 {
@@ -569,6 +554,10 @@ iwan_win_mp_init(_In_ PDRIVER_OBJECT driver, _In_ PDEVICE_OBJECT devobj,
 	 * 更高，这条更接近"默认安全"。 */
 	ExInitializeDriverRuntime(DrvRtPoolNxOptIn);
 	KeInitializeSpinLock(&ext->mp.lock);
+
+	/* 单例在注册之前就挂上：MiniportInitializeEx 可能在任何时刻被调用，
+	 * 而且控制设备的 IRP 只有在这之后才可能出现。 */
+	g_mp_ext = ext;
 
 	/* 阶段 30 记的是"环境"：T30 = NdisGetVersion()（形如 0x00060055 表示
 	 * NDIS 6.85）。注册失败时要能区分"驱动写错了"与"这台机器的 NDIS
@@ -597,37 +586,78 @@ iwan_win_mp_init(_In_ PDRIVER_OBJECT driver, _In_ PDEVICE_OBJECT devobj,
 	ch.ShutdownHandlerEx = iwan_win_mp_shutdown;
 	ch.CancelOidRequestHandler = iwan_win_mp_cancel_oid;
 
+	/* 第三个参数是小型端口驱动上下文，会原样传给 MiniportInitializeEx
+	 * （就是那份扩展）。 */
 	st = NdisMRegisterMiniportDriver(driver, registry_path, ext, &ch,
 					 &ext->mp.mp_handle);
 	if (st != NDIS_STATUS_SUCCESS) {
 		iwan_win_mp_trace(10, (LONG)st);
+		g_mp_ext = NULL;
 		DbgPrint("iwanmp: NdisMRegisterMiniportDriver 失败 0x%08lx\n",
 			 (unsigned long)st);
 		return STATUS_UNSUCCESSFUL;
 	}
-	/* 注册之后 DriverObject 的几个入口归 NDIS：它要处理自己的设备对象。
-	 * 先把它们存下来，再装上我们的分发（自己的控制设备走控制面，
-	 * NDIS 的设备原样转交）。 */
-	g_ndis_create = driver->MajorFunction[IRP_MJ_CREATE];
-	g_ndis_close = driver->MajorFunction[IRP_MJ_CLOSE];
-	g_ndis_ioctl = driver->MajorFunction[IRP_MJ_DEVICE_CONTROL];
-	g_ndis_pnp = driver->MajorFunction[IRP_MJ_PNP];
-	driver->MajorFunction[IRP_MJ_CREATE] = iwan_win_mp_dispatch_create;
-	driver->MajorFunction[IRP_MJ_CLOSE] = iwan_win_mp_dispatch_close;
-	driver->MajorFunction[IRP_MJ_DEVICE_CONTROL] = iwan_win_mp_dispatch_ioctl;
-	driver->MajorFunction[IRP_MJ_PNP] = iwan_win_mp_dispatch_pnp;
 
-	/* 协议边最后注册：它一注册就会开始收帧，那时小型端口已经在了 */
+	/* 协议边随后注册：它一注册就会开始收帧，那时小型端口已经在了。 */
 	st = iwan_win_proto_init(ext);
 	if (st != STATUS_SUCCESS) {
 		iwan_win_mp_trace(11, st);
 		NdisMDeregisterMiniportDriver(ext->mp.mp_handle);
 		ext->mp.mp_handle = NULL;
+		g_mp_ext = NULL;
 		return st;
 	}
-	g_mp_devobj = devobj;
 	iwan_win_mp_trace(12, STATUS_SUCCESS);
 	DbgPrint("iwanmp: 已装载，%ws\n", IWAN_WIN_DRV_VERSION_STR_MP);
+	return STATUS_SUCCESS;
+}
+
+/* 控制设备必须在小型端口注册之后建：NdisRegisterDeviceEx 要句柄，而且
+ * NdisMRegisterMiniportDriver 要求调用时 DriverObject 是干净的（客体实测
+ * 已经挂了自己的设备就回 NDIS_STATUS_BAD_CHARACTERISTICS = 0xC0010005）。
+ * 属性表里带自己的 MajorFunctions，NDIS 据此给这个设备建独立的驱动对象，
+ * 于是不必碰 NDIS 自己的 DriverObject。 */
+NTSTATUS
+iwan_win_mp_open_control(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
+{
+	NDIS_DEVICE_OBJECT_ATTRIBUTES attr;
+	NDIS_HANDLE handle = NULL;
+	PDEVICE_OBJECT devobj = NULL;
+	UNICODE_STRING dev_name, dos_name, sddl;
+	NDIS_STATUS st;
+
+	if (ext == NULL || ext->mp.mp_handle == NULL)
+		return STATUS_INVALID_DEVICE_STATE;
+
+	/* 与 WFP 平面同一条 SDDL：只有 System 与 Administrators 能打开。
+	 * 用户态客户端因此需要管理员权限（与 Linux 侧需要 root 一致）。 */
+	RtlInitUnicodeString(&sddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
+	RtlInitUnicodeString(&dev_name, IWAN_WIN_DEVICE_NAME_MP);
+	RtlInitUnicodeString(&dos_name, IWAN_WIN_DOS_NAME_MP);
+	iwan_win_mp_fill_major();
+
+	RtlZeroMemory(&attr, sizeof(attr));
+	attr.Header.Type = NDIS_OBJECT_TYPE_DEVICE_OBJECT_ATTRIBUTES;
+	attr.Header.Revision = NDIS_DEVICE_OBJECT_ATTRIBUTES_REVISION_1;
+	attr.Header.Size = NDIS_SIZEOF_DEVICE_OBJECT_ATTRIBUTES_REVISION_1;
+	attr.DeviceName = &dev_name;
+	attr.SymbolicName = &dos_name;
+	attr.MajorFunctions = g_mp_major;
+	attr.ExtensionSize = 0;			/* 扩展在我们自己手里 */
+	attr.DefaultSDDLString = &sddl;
+	attr.DeviceClassGuid = &iwan_win_devclass_guid;
+
+	st = NdisRegisterDeviceEx(ext->mp.mp_handle, &attr, &devobj, &handle);
+	if (st != NDIS_STATUS_SUCCESS) {
+		iwan_win_mp_trace(5, (LONG)st);
+		DbgPrint("iwanmp: NdisRegisterDeviceEx 失败 0x%08lx\n",
+			 (unsigned long)st);
+		return STATUS_UNSUCCESSFUL;
+	}
+
+	ext->mp.ctrl_devobj = devobj;
+	ext->mp.ctrl_handle = handle;
+	DbgPrint("iwanmp: 控制设备 %wZ 就绪\n", &dev_name);
 	return STATUS_SUCCESS;
 }
 
@@ -637,6 +667,11 @@ iwan_win_mp_fini(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 	if (ext == NULL)
 		return;
 	iwan_win_proto_fini(ext);		/* 先断承载收发 */
+	if (ext->mp.ctrl_handle != NULL) {
+		NdisDeregisterDeviceEx(ext->mp.ctrl_handle);
+		ext->mp.ctrl_handle = NULL;
+		ext->mp.ctrl_devobj = NULL;
+	}
 	if (ext->mp.mp_handle != NULL) {
 		NdisMDeregisterMiniportDriver(ext->mp.mp_handle);
 		ext->mp.mp_handle = NULL;
@@ -649,13 +684,13 @@ iwan_win_mp_fini(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 }
 
 /* UnloadHandler：NDIS 在驱动卸载时调用（不是 DriverUnload —— 那个字段注册
- * 小型端口之后归 NDIS 管）。这里要做完整套退出：数据面 → 会话 → 控制设备。 */
+ * 小型端口之后归 NDIS 管）。这里要做完整套退出：数据面 → 会话 → 扩展内存。
+ * 控制设备由 NdisDeregisterDeviceEx 注销（符号链接它自己会删），扩展是我们
+ * 分配的，也要在这里还掉。 */
 static VOID
 iwan_win_mp_unload_hook(_In_ PDRIVER_OBJECT driver)
 {
-	UNICODE_STRING link;
 	IWAN_WIN_DEVICE_EXTENSION *ext = g_mp_ext;
-	PDEVICE_OBJECT devobj = g_mp_devobj;
 
 	UNREFERENCED_PARAMETER(driver);
 
@@ -663,12 +698,7 @@ iwan_win_mp_unload_hook(_In_ PDRIVER_OBJECT driver)
 		iwan_win_mp_fini(ext);
 		iwan_win_session_teardown(ext);
 		iwan_win_ctrl_fini(ext);
-	}
-	if (devobj != NULL) {
-		RtlInitUnicodeString(&link, IWAN_WIN_DOS_NAME_MP);
-		IoDeleteSymbolicLink(&link);
-		IoDeleteDevice(devobj);
-		g_mp_devobj = NULL;
+		ExFreePoolWithTag(ext, IWAN_TAG_SESS);
 	}
 	driver->DeviceObject = NULL;	/* 防御：DriverUnload 若也被调用则不重复 */
 	DbgPrint("iwanmp: 已卸载\n");

@@ -54,6 +54,11 @@ iwan_win_dispatch_ioctl(_In_ PDEVICE_OBJECT devobj, _Inout_ PIRP irp)
 {
 	PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(irp);
 	IWAN_WIN_DEVICE_EXTENSION *ext = IWAN_DEVEXT(devobj);
+#ifdef IWAN_WIN_PLANE_MP
+	/* NDIS 平面的 IWAN_DEVEXT 忽略设备对象（控制设备不带扩展，扩展是
+	 * 单例），所以这里要显式声明没用到它，否则 /W4 /WX 下是 C4100。 */
+	UNREFERENCED_PARAMETER(devobj);
+#endif
 	PVOID buf = irp->AssociatedIrp.SystemBuffer;
 	ULONG in_len = sp->Parameters.DeviceIoControl.InputBufferLength;
 	ULONG out_len = sp->Parameters.DeviceIoControl.OutputBufferLength;
@@ -176,22 +181,71 @@ iwan_win_unload(_In_ PDRIVER_OBJECT driver)
 }
 
 /*
- * 非 PnP 设备没有真实设备类，但 IoCreateDeviceSecure 仍要一个 GUID。
- * GUID_DEVCLASS_UNKNOWN 这个符号在内核头里并不存在（第一次真编译报 C2065），
- * 所以用一个本项目固定的 GUID —— 它只在设备对象里做标记用。
+ * 非 PnP 设备没有真实设备类，但 IoCreateDeviceSecure / NdisRegisterDeviceEx
+ * 仍要一个 GUID。GUID_DEVCLASS_UNKNOWN 这个符号在内核头里并不存在（第一次
+ * 真编译报 C2065），所以用一个本项目固定的 GUID —— 它只在设备对象里做标记用。
+ * 两个平面共用同一个 GUID，所以它不是 static：NDIS 平面在 mp.c 里用。
  */
-static const GUID iwan_win_devclass_guid = {
+const GUID iwan_win_devclass_guid = {
 	0x6d1a9b21, 0x7c4e, 0x4e2b,
 	{ 0x9f, 0x31, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e, 0x61 }
 };
 
+/*
+ * 两个平面的 DriverEntry 形状不同，不是风格问题：
+ *
+ *  - WFP 平面：先建控制设备（IoCreateDeviceSecure），扩展就是设备扩展，
+ *    再注册过滤器（不带设备也能注册，但控制面就没地方放状态了）。
+ *  - NDIS 平面：控制设备必须由 NdisRegisterDeviceEx 在注册**之后**建 ——
+ *    NdisMRegisterMiniportDriver 要求调用时 DriverObject 是干净的，客体
+ *    实测已挂自己的设备对象就回 NDIS_STATUS_BAD_CHARACTERISTICS
+ *    (0xC0010005)。扩展因此要自己分配，而且它比控制设备活得久：小型端口
+ *    上下文在 MiniportInitializeEx 就要用，控制设备那时可能还没建。
+ */
 NTSTATUS
 DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registry_path)
 {
-	UNICODE_STRING dev_name, dos_name, sddl;
-	PDEVICE_OBJECT devobj = NULL;
 	IWAN_WIN_DEVICE_EXTENSION *ext;
 	NTSTATUS st;
+
+#ifdef IWAN_WIN_PLANE_MP
+	ext = (IWAN_WIN_DEVICE_EXTENSION *)IWAN_ALLOC(sizeof(*ext),
+						      IWAN_TAG_SESS);
+	if (ext == NULL) {
+		MP_TRACE(3, STATUS_INSUFFICIENT_RESOURCES);
+		return STATUS_INSUFFICIENT_RESOURCES;
+	}
+	RtlZeroMemory(ext, sizeof(*ext));
+	iwan_win_ctrl_init(ext);
+
+	/* DriverUnload 仍然设置：卸载走 NDIS 的 UnloadHandler，那条路会把
+	 * driver->DeviceObject 置空，于是这个函数变成空操作（双保险）。 */
+	driver->DriverUnload = iwan_win_unload;
+
+	st = iwan_win_mp_init(driver, ext, registry_path);
+	if (!NT_SUCCESS(st))
+		goto fail;
+
+	st = iwan_win_mp_open_control(ext);
+	if (!NT_SUCCESS(st)) {
+		/* 控制设备建不出来 = 用户态打不开 = 装了也没用：整体回滚。 */
+		iwan_win_mp_fini(ext);
+		goto fail;
+	}
+
+	MP_TRACE(4, STATUS_SUCCESS);
+	DbgPrint("iwan-win: loaded, %ws\n", IWAN_DRV_VERSION_STR);
+	return STATUS_SUCCESS;
+
+fail:
+	driver->DriverUnload = NULL;
+	iwan_win_ctrl_fini(ext);
+	ExFreePoolWithTag(ext, IWAN_TAG_SESS);
+	MP_TRACE(3, st);
+	return st;
+#else
+	UNICODE_STRING dev_name, dos_name, sddl;
+	PDEVICE_OBJECT devobj = NULL;
 
 	/* 默认 SDDL：只有 System 与 Administrators 能打开设备。用户态客户端
 	 * 需要管理员权限（对应 Linux 侧需要 root），这与 Linux 一致。
@@ -228,16 +282,10 @@ DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registry_path)
 	driver->MajorFunction[IRP_MJ_DEVICE_CONTROL] = iwan_win_dispatch_ioctl;
 	driver->DriverUnload = iwan_win_unload;
 
-	/* 数据面：WFP 平面在这里注册 callout/过滤器；NDIS 平面在这里注册
-	 * 小型端口与协议驱动。没有数据面设备就没有意义，所以失败即整体回滚。 */
-#ifdef IWAN_WIN_PLANE_MP
-	st = iwan_win_mp_init(driver, devobj, ext, registry_path);
-#else
 	/* WFP 平面用不到注册表路径（NDIS 平面要把它转交给
 	 * NdisMRegisterMiniportDriver）。不写这一行在 /W4 /WX 下是 C4100 硬错误。 */
 	UNREFERENCED_PARAMETER(registry_path);
 	st = iwan_win_wfp_init(devobj, ext);
-#endif
 	if (!NT_SUCCESS(st)) {
 		MP_TRACE(3, st);
 		driver->DriverUnload = NULL;
@@ -251,4 +299,5 @@ DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registry_path)
 	MP_TRACE(4, STATUS_SUCCESS);
 	DbgPrint("iwan-win: loaded, %ws\n", IWAN_DRV_VERSION_STR);
 	return STATUS_SUCCESS;
+#endif
 }
