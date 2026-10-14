@@ -175,6 +175,60 @@ jobs:
           PA 'ndis.h 里对 NDIS_*_DRIVER 宏的条件使用' '#if.*NDIS_(MINIPORT|PROTOCOL|FILTER)_DRIVER' 2 6
           PA 'NDIS_WDM 宏的使用' 'defined\(NDIS_WDM\)' 2 3
 
+          # 第二轮：宏闸门、handler 原型、OID 与路由头（第一轮在 km 下没找到的，
+          # 这一轮搜整个 Include 树）。ndis.h 里 NDIS_MINIPORT_DRIVER 撞上了一行
+          # "#error ... macro is reserved"，必须看清它是被什么条件包住的，
+          # 否则工程该定义哪几个宏就是瞎猜。
+          $root = Split-Path $env:WDKINC -Parent
+          function P2($title, $pattern, $ctx, $max) {
+            "`n=== $title ===" | Tee-Object -FilePath $log -Append
+            Get-ChildItem $root -Recurse -Filter '*.h' -ErrorAction SilentlyContinue |
+              Select-String -Pattern $pattern -ErrorAction SilentlyContinue |
+              Select-Object -First $max | ForEach-Object {
+                "$($_.Path):$($_.LineNumber): $($_.Line)"
+                if ($ctx -gt 0) {
+                  Get-Content $_.Path | Select-Object -Skip $_.LineNumber -First $ctx
+                }
+              } | Out-String -Width 240 | Tee-Object -FilePath $log -Append
+          }
+          function R2($title, $file, $start, $count) {
+            "`n=== $title ($file : $start +$count) ===" | Tee-Object -FilePath $log -Append
+            $p = Join-Path $h $file
+            if (Test-Path $p) {
+              Get-Content $p | Select-Object -Skip ($start - 1) -First $count |
+                Out-String -Width 200 | Tee-Object -FilePath $log -Append
+            } else { "no such file $p" | Tee-Object -FilePath $log -Append }
+          }
+          R2 'ndis.h 宏闸门（版本宏与保留宏）' 'ndis.h' 150 210
+          R2 'ndis.h 协议版本宏推断' 'ndis.h' 750 60
+          R2 'ndis.h 微型端口版本宏推断' 'ndis.h' 900 70
+          P2 'RECEIVE_NET_BUFFER_LISTS_HANDLER 原型' 'RECEIVE_NET_BUFFER_LISTS_HANDLER\)' 14 1
+          P2 'SEND_NET_BUFFER_LISTS_COMPLETE_HANDLER 原型' 'SEND_NET_BUFFER_LISTS_COMPLETE_HANDLER\)' 12 1
+          P2 'BIND_HANDLER_EX 原型' 'BIND_HANDLER_EX\)' 14 1
+          P2 'UNBIND_HANDLER_EX 原型' 'UNBIND_HANDLER_EX\)' 10 1
+          P2 'OPEN_ADAPTER_COMPLETE_HANDLER_EX 原型' 'OPEN_ADAPTER_COMPLETE_HANDLER_EX\)' 10 1
+          P2 'CLOSE_ADAPTER_COMPLETE_HANDLER_EX 原型' 'CLOSE_ADAPTER_COMPLETE_HANDLER_EX\)' 10 1
+          P2 'NDIS_BIND_PARAMETERS 结构' 'typedef struct _NDIS_BIND_PARAMETERS' 40 1
+          P2 'NDIS_OPEN_PARAMETERS 结构' 'typedef struct _NDIS_OPEN_PARAMETERS' 18 1
+          P2 'NdisOidRequest 原型' 'NdisOidRequest\(' 8 1
+          P2 'NDIS_OID_REQUEST 结构' 'typedef struct _NDIS_OID_REQUEST' 40 1
+          P2 'NDIS_INTERFACE_INFORMATION 结构' 'typedef struct _NDIS_INTERFACE_INFORMATION' 30 1
+          P2 'OID_GEN_INTERFACE_INFO 定义' 'define OID_GEN_INTERFACE_INFO' 1 1
+          P2 'OID_GEN_MAXIMUM_TOTAL_SIZE 定义' 'define OID_GEN_MAXIMUM_TOTAL_SIZE' 1 1
+          P2 'OID_GEN_CURRENT_PACKET_FILTER 定义' 'define OID_GEN_CURRENT_PACKET_FILTER' 1 1
+          P2 'OID_GEN_STATISTICS 定义' 'define OID_GEN_STATISTICS' 1 1
+          P2 'OID_802_3_CURRENT_ADDRESS 定义' 'define OID_802_3_CURRENT_ADDRESS' 1 1
+          P2 'NDIS_STATISTICS_INFO 结构' 'typedef struct _NDIS_STATISTICS_INFO' 26 1
+          P2 'NDIS_LINK_STATE 结构' 'typedef struct _NDIS_LINK_STATE' 16 1
+          P2 'NdisMIndicateStatusEx 原型' 'NdisMIndicateStatusEx\(' 6 1
+          P2 'GetBestRoute2 声明' 'GetBestRoute2\(' 10 1
+          P2 'MIB_IPFORWARD_ROW2 结构' 'typedef struct _MIB_IPFORWARD_ROW2' 26 1
+          P2 'ConvertInterfaceLuidToIndex 声明' 'ConvertInterfaceLuidToIndex\(' 6 1
+          P2 'NET_LUID 结构' 'typedef struct _NET_LUID' 10 1
+          P2 'ExInitializeDriverRuntime 原型' 'ExInitializeDriverRuntime\(' 4 1
+          P2 'NdisAllocateNetBufferAndNetBufferList 原型' 'NdisAllocateNetBufferAndNetBufferList\(' 8 1
+          P2 'NdisMQueryAdapterInstanceName/接口辅助' 'NdisMQueryAdapterInstanceName\(' 6 1
+
       # 先只编译：/t:ClCompile 不链接、不校验 INF，即使后面两步有问题也能拿到
       # 完整的 C 侧诊断（上一轮就是被 InfVerif 挡在编译之前，白等一轮）。
       - name: msbuild 只编译（不链接）

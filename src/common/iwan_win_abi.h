@@ -1,4 +1,4 @@
-﻿/* SPDX-License-Identifier: GPL-2.0 */
+/* SPDX-License-Identifier: GPL-2.0 */
 /*
  * iwan_win_abi.h — Windows 内核数据面（WFP callout）与用户态客户端之间的 ABI。
  *
@@ -80,7 +80,14 @@ typedef unsigned long long uint64_t;
 #define IWAN_WIN_DEVICE_NAME      L"\\Device\\iwan"
 #define IWAN_WIN_DOS_NAME         L"\\DosDevices\\iwan"
 #define IWAN_WIN_USER_PATH        L"\\\\.\\iwan"
-/* 只读映射给用户态的命名节对象（对应 Linux 的 /dev/iwan mmap） */
+/* 第二个平面（小型端口 + 协议驱动，iwanmp.sys）用另一套设备名：两个平面可以
+ * 同时装在一台机器上，用户态按 --data-plane 选一个打开，便于对照测量。 */
+#define IWAN_WIN_DEVICE_NAME_MP   L"\\Device\\iwanmp"
+#define IWAN_WIN_DOS_NAME_MP      L"\\DosDevices\\iwanmp"
+#define IWAN_WIN_USER_PATH_MP     L"\\\\.\\iwanmp"
+/* 只读映射给用户态的命名节对象（对应 Linux 的 /dev/iwan mmap）。
+ * 注意两个平面共用同一个节名：一个时刻只该有一个会话在跑，否则用户态读到的
+ * 时间戳会分不清是谁写的（Linux 侧同样是全局一份）。 */
 #define IWAN_WIN_SHM_NAME         L"\\BaseNamedObjects\\iwan_shm"
 
 /* ---- IOCTL ------------------------------------------------------------ */

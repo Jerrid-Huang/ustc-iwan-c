@@ -114,6 +114,51 @@ typedef struct _IWAN_WIN_SESSION {
 	IWAN_WIN_STATS		stats;
 } IWAN_WIN_SESSION;
 
+/* ---- 第二个平面：小型端口 + 协议驱动 ---------------------------------- */
+
+/*
+ * 与 WFP 平面的关系：会话控制面（IWAN_WIN_SESSION 与 iwan_win_session.c）与
+ * 线上逻辑（iwan_win_frame.c）完全共用，换掉的只是"报文怎么进出"：
+ *
+ *   WFP 平面（iwan.sys）              本平面（iwanmp.sys，--data-plane ndis）
+ *   出向 OUTBOUND_IPPACKET 处拦截      小型端口收到协议栈交下来的内层数据报
+ *   出向 FwpsInjectNetworkSendAsync    协议驱动把外层 UDP 直接交给承载网卡
+ *   入向 INBOUND_TRANSPORT 处拦截      协议驱动从承载网卡收外层 UDP
+ *   入向 FwpsInjectNetworkReceiveAsync 小型端口把内层数据报指示向上
+ *
+ * 三处实质差别：① 收发都在自己该在的位置，不需要注入 API，因而没有"在途
+ * NBL 占着非分页池、必须限流"的问题，发送是同步的（完成回调只负责归还）；
+ * ② 入向不再重新入栈，而是像 Linux 的 netif_rx 那样直接指示向上，少一次
+ * 全载荷拷贝；③ 出向只处理"路由指向本适配器"的报文（内层选路由路由表决定），
+ * 不再需要目标集合匹配。
+ *
+ * 承载选择沿用 Linux 侧定下的语义：显式绑定就绑那一张，未绑定则按外层目的
+ * 地址查 FIB 决定；选定后这条会话的收发都只走那一张网卡。
+ */
+struct _IWAN_MP_BINDING;
+
+typedef struct _IWAN_MP_PLANE {
+	/* 小型端口侧 */
+	NDIS_HANDLE		mp_handle;	/* MiniportAdapterHandle */
+	NDIS_HANDLE		recv_pool;	/* 向上指示用的 NBL 池 */
+	volatile LONG		mp_running;	/* Pause/Restart 闸门（1=可收可发） */
+
+	/* 协议边 */
+	NDIS_HANDLE		proto_handle;	/* NdisRegisterProtocolDriver 句柄 */
+	LIST_ENTRY		bindings;	/* 全部以太承载的绑定，见 iwan_win_proto.c */
+	KSPIN_LOCK		lock;		/* 保护 bindings 与 active */
+	struct _IWAN_MP_BINDING	*active;	/* 会话选定的承载；NULL=未选定 */
+	UINT32			active_ifindex;
+	UINT32			next_hop_be;	/* 外层下一跳（v4，网络序） */
+	UINT8			peer_mac[6];	/* 下一跳的 MAC */
+	volatile LONG		peer_mac_valid;
+	volatile LONG		peer_mac_pending;	/* 已发 ARP 请求、等回复 */
+
+	/* 承载发送的进度：外层 NBL 已交给 NDIS 但还没完成的数量。
+	 * 统计一律写在 sess.stats 里（与 WFP 平面同名同义），装具与用户态不用改。 */
+	volatile LONG		outer_outstanding;
+} IWAN_MP_PLANE;
+
 /* ---- 设备扩展 --------------------------------------------------------- */
 
 typedef struct _IWAN_WIN_DEVICE_EXTENSION {
@@ -130,6 +175,10 @@ typedef struct _IWAN_WIN_DEVICE_EXTENSION {
 	 * 释放前必须注销 callout 并排空在途注入） */
 	NDIS_HANDLE		nbl_pool;
 	volatile LONG		inject_outstanding;
+
+	/* 第二个平面（iwanmp.sys）的数据面状态。WFP 平面用不到它，但摆在同一个
+	 * 设备扩展里：两个平面共用会话控制面，扩展结构共用能省掉一层指针。 */
+	IWAN_MP_PLANE		mp;
 
 	/* WFP：引擎句柄、callout id、注入句柄 */
 	HANDLE			engine;
@@ -199,5 +248,61 @@ NTSTATUS iwan_win_wfp_init(_In_ PDEVICE_OBJECT devobj,
 NTSTATUS iwan_win_wfp_start(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext);
 VOID iwan_win_wfp_stop(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext);
 VOID iwan_win_wfp_fini(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext);
+
+/* ---- 小型端口 + 协议驱动平面（iwan_win_mp.c / iwan_win_proto.c） -------
+ *
+ * 这个平面由 iwanmp.vcxproj 定义 IWAN_WIN_PLANE_MP 编出来，与 WFP 平面不共存
+ * 于一个二进制：两边都要接管全部收发，装在一个驱动里既没有意义，也会让
+ * PnP/非 PnP 两套生命周期纠缠在一起。用户态按设备名选平面。
+ */
+
+/* 注册小型端口与协议驱动（iwan_win_mp.c）。DriverEntry 调用一次。 */
+NTSTATUS iwan_win_mp_init(_In_ PDRIVER_OBJECT driver,
+			  _In_ PDEVICE_OBJECT devobj,
+			  _Inout_ IWAN_WIN_DEVICE_EXTENSION *ext);
+/* 注销（iwan_win_unload 调用）。会先停适配器再解绑协议边。 */
+VOID iwan_win_mp_fini(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext);
+
+/* 会话选定承载：由 IOCTL_OPEN 在会话建立之后调用，选定失败即整个 OPEN 失败
+ * （fail-closed：宁可建不成会话，也不能把明文放到承载网上）。
+ * 判据依次为 显式 oif_index → bind_ip 所在网卡 → 外层目的地址的 FIB 路由。 */
+NTSTATUS iwan_win_mp_select_carrier(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext);
+/* IOCTL_CLOSE 调用：清掉 active 与下一跳 MAC 缓存，会话间不残留状态。 */
+VOID iwan_win_mp_release_carrier(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext);
+
+/* ---- 引擎（iwan_win_mpdata.c）：内层 ↔ 外层，只碰字节与统计 ---------- */
+
+/* 出向：把一个内层 IP 数据报封装成外层帧交给承载。缓冲由本函数分配，
+ * 成功时所有权转给承载（由发送完成回调释放），失败时本函数自己释放并按
+ * 原因计数（tx_bad_state / tx_bad_inner / tx_err，细节写进共享页诊断区）。 */
+BOOLEAN iwan_win_mp_encap_send(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
+			       _In_reads_bytes_(len) const UINT8 *inner,
+			       _In_ ULONG len, _In_ BOOLEAN l4_offloaded);
+/* 入向：从承载收到的一个外层 IP 数据报（从 IP 头开始）→ 解封 → 指示向上。
+ * 缓冲由本函数分配，成功指示后归小型端口（NBL 归还时释放）。 */
+VOID iwan_win_mp_outer_recv(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
+			    _In_reads_bytes_(len) const UINT8 *ip,
+			    _In_ ULONG len);
+
+/* ---- 协议边与小型端口提供给引擎的出口（实现分别在 proto/ mp.c） ------- */
+
+/* 把整帧外层数据报（含以太头，buf 由 IWAN_ALLOC 分配）交给承载网卡。
+ * TRUE = 已交给 NDIS，所有权转移（完成回调里释放）；FALSE = 未发出，
+ * 所有权仍在调用者手里，且本函数自己释放。下一跳 MAC 未知时会发 ARP 并
+ * 返回 FALSE。
+ * 对 v4 与 v6 各有一份：外层族由会话决定，与内层族无关。 */
+BOOLEAN iwan_win_proto_send_outer4(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
+				   _In_reads_bytes_(len) UINT8 *eth,
+				   _In_ ULONG len);
+BOOLEAN iwan_win_proto_send_outer6(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
+				   _In_reads_bytes_(len) UINT8 *eth,
+				   _In_ ULONG len);
+
+/* 把解封出来的内层数据报指示向上（buf 由 IWAN_ALLOC 分配）。
+ * TRUE = 已指示，所有权转移（NBL 归还时释放）；FALSE = 失败，所有权仍在
+ * 调用者手里且本函数不动它。 */
+BOOLEAN iwan_win_mp_indicate_inner(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
+				   _In_reads_bytes_(len) UINT8 *inner,
+				   _In_ ULONG len);
 
 #endif /* IWAN_WIN_H */
