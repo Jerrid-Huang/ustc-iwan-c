@@ -102,8 +102,10 @@ fi
 sleep 0.5
 
 # ---- client: TUN proxy with v4 + v6 policy routes --------------------
+# --data-plane tun 显式指定：本用例验的是 TUN 用户态数据面（默认的 auto 在
+# Linux 上会先试内核面，模块在的时候会走到另一条路径上去）
 "$BIN/iwan-client" proxy --server 127.0.0.1 --port "$PORT" \
-    --user alice --pass 's3cret-pass' --tun "$CLI_TUN" \
+    --user alice --pass 's3cret-pass' --tun "$CLI_TUN" --data-plane tun \
     --proxy-ip 198.18.0.1 --proxy-cidr6 2001:db8::1 \
     > /tmp/iwan-tun-cli.log 2>&1 &
 CLI=$!

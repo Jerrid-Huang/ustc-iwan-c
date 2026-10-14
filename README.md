@@ -37,7 +37,8 @@ Usage: iwan-client-oidc [OPTIONS] --fetch | --list | --connect | --all
 | `-a, --all` | 一次完成 fetch → list → connect |
 | `--server <NAME\|HOST:PORT>` | 跳过线路选择，直接连接指定线路（配置名或地址） |
 | `--config-dir <DIR>` | 配置目录（默认 `~/.config/iwan`；Windows：`%USERPROFILE%\.config\iwan`） |
-| `--tun <TUN>` | TUN 设备名（默认 `iwan0`） |
+| `--tun <TUN>` | TUN 设备名（默认 `iwan0`）；`--data-plane kernel` 下固定为 `iwan0`（内核模块决定设备名） |
+| `--data-plane <tun\|kernel>` | 数据面选择：`tun` = TUN 用户态数据面（默认）；`kernel` = 内核模块 `iwan` 数据面，不再需要 TUN，仅 Linux 可用（见 [docs/kernel-data-plane.md](docs/kernel-data-plane.md)） |
 | `--socks` | 改用纯 SOCKS5 模式（免 root，无需 TUN 设备） |
 | `--socks-listen <ADDR:PORT>` | SOCKS 模式默认监听 `127.0.0.1:1080`；**TUN 模式默认关闭 SOCKS 代理**（纯 TUN 网卡），仅在显式指定该选项时启动随 TUN 路由转发的附加 SOCKS5+HTTP 侧车代理。该端口若已被占用，TUN 连接**不会失败**：侧车代理以一条错误日志跳过（继续无本地代理运行，隧道不受影响） |
 | `--socks-mtu <MTU>` | SOCKS 模式下内层 TCP 的 MSS/MTU（默认 `1380`） |
@@ -87,19 +88,20 @@ sudo ./iwan-client-oidc --all
 | `--ct-pass <PASS>` / `--ct-pass-file <FILE>` | 校内统一认证的"密保口令"（USTC 场景） |
 | `--mtu <MTU>` | 内层 TCP 的 MSS/MTU。默认按模式而异：`auth` / `proxy` 为 `1400`（`IWAN_DEFAULT_MTU`），`socks` 为 `1380`；`proxy` 模式还会把它应用到 TUN 设备 MTU |
 
-### proxy（TUN 模式，需要 root）
+### proxy（TUN 模式或内核数据面，需要 root）
 
 ```
 Usage: iwan-client proxy [OPTIONS] --server <SERVER>
 ```
 
-**默认：纯 TUN 隧道**（本机路由走隧道的流量被转发，不提供任何本地代理端口）。仅当指定 `--listen` 时才**附加**一个 SOCKS5+HTTP 代理。
+**默认：纯 TUN 隧道**（本机路由走隧道的流量被转发，不提供任何本地代理端口）。`--data-plane kernel` 则把数据面整体交给内核模块 `iwan`：客户端不再创建 TUN，握手（OPEN/OPEN_ACK/验签/密钥派生）仍在用户态完成，**keepalive 发送**与**存活判定**由用户态承担（后者靠 1 秒一次轮询 `/dev/iwan` 的时间戳）。仅当指定 `--listen` 时才**附加**一个 SOCKS5+HTTP 代理。
 
 公共认证参数 +：
 
 | 参数 | 说明 |
 |------|------|
-| `--tun <TUN>` | TUN 设备名（默认 `iwan0`） |
+| `--tun <TUN>` | TUN 设备名（默认 `iwan0`）；`--data-plane kernel` 下固定为 `iwan0`（由内核模块决定），显式给别的名字只告警并忽略 |
+| `--data-plane <tun\|kernel>` | 数据面选择：`tun` = 用户态 TUN 泵（默认，行为逐位不变）；`kernel` = 内核模块 `iwan`（**不再需要 TUN**，仅 Linux，需先 `sudo insmod kernel/iwan.ko`，模块与客户端必须同批构建）。传 `kernel` 时与 `--listen` / `--socks-token` / `--socks-no-token` / `--allow-remote` 互斥（两条路径会在同一条外层套接字上抢包），非 Linux 上传 `kernel` 是用法错误。详见 [docs/kernel-data-plane.md](docs/kernel-data-plane.md) |
 | `--proxy-cidr <CIDR>` | 走隧道的 IPv4 CIDR（可重复；如 `0.0.0.0/0` 全量） |
 | `--proxy-ip <IP>` | 走隧道的 IPv4 地址（可重复） |
 | `--proxy-domain <DOMAIN>` | 走隧道的域名（可重复，含子域） |
@@ -193,6 +195,7 @@ sudo ./iwan-server --port 6001 --tun iwan-srv \
 |------|------|
 | `-p, --port <PORT>` | UDP 端口（默认 `6001`） |
 | `-t, --tun <TUN>` | TUN 设备名 |
+| `--data-plane <tun>` | 数据面选择：v1 **只接受 `tun`**（默认）；显式传 `kernel` 是用法错误（exit 2）。原因：内核模块是"每 netns 单会话"且设备名固定 `iwan0`，而服务端要在同一 netns 同时服务最多 256 个客户端会话；且服务端状态机（OPEN 验签、会话表、`PT_*` 分发、写 TUN）全在 `handle_udp()` 里，没有可下移的"每会话数据面"切分点 |
 | `-s, --server-ip <IP>` | 服务器内网 IP（隧道网关地址） |
 | `-S, --subnet <CIDR>` | 分配给客户端的子网（如 `198.18.0.0/16`） |
 | `-d, --dns <DNS>` | 下发给客户端的 DNS 服务器 |
@@ -227,6 +230,7 @@ sudo ./iwan-server --port 6001 --tun iwan-srv \
 | `IWAN_PROFILE` | 关 | 退出时打印分阶段吞吐计数（`IWAN_DEBUG_STRIP` 构建忽略） |
 | `IWAN_SRV_THREADS` | `4` | 上行 UDP 收包线程数，`1..16`；非法值告警后保持 4 |
 | `IWAN_SRV_TUN_SINGLE` | 关 | 只用一个 TUN 队列，替代多队列 fan-out（A/B 基准开关） |
+| `IWAN_SRV_SINK` | 关 | 仅计量接收端点：不建 TUN，数据帧只计数（不解密、不解析内层、不写 TUN、不应答），控制面（OPEN/OPEN_ACK、keepalive、CLOSE、会话超时）不变。`bytes` 是**外层 UDP 净荷**（8B iwan 首部 + 载荷），不是内层字节数；每 5 秒打印一行 `SINK pkts=.. bytes=.. pps=.. gbps=..`，每个活跃会话再一行，SIGINT/SIGTERM 退出时打最终行。非空即开，`0`/`false`/`no`/`off`（不分大小写）为关；其他无法识别的写法告警后按**开**处理 |
 | `IWAN_ALLOW_INSECURE_USERS` | 关 | 允许组/其他可读的用户文件继续启动；仅 `1`/`true`/`yes`/`on` 放行 |
 | `IWAN_RATE_OPEN_MAX` | `20` | 每源每秒 OPEN 帧上限，`1..65535` |
 | `IWAN_RATE_ECHO_MAX` | `60` | 每源每秒 PING、ECHO 各自上限，`1..65535` |
@@ -245,7 +249,7 @@ sudo ./iwan-server --port 6001 --tun iwan-srv \
 |------|------|----------|------|
 | `IWAN_DEBUG` | 关 | 全部 | 调试日志（`IWAN_DEBUG_STRIP` 构建忽略） |
 | `IWAN_PROFILE` | 关 | 全部 | 退出时打印分阶段吞吐（`IWAN_DEBUG_STRIP` 构建忽略） |
-| `IWAN_RX_STALE_MS` | `120000` | proxy / socks | 下行静默超过该毫秒数即重新认证；`0` 关闭；`30000..86400000` |
+| `IWAN_RX_STALE_MS` | `120000` | proxy / socks / proxy --data-plane kernel | 下行静默超过该毫秒数即重新认证；`0` 关闭；`30000..86400000` |
 | `IWAN_SEND_PACING_PPS` | `0` | proxy / socks | 聚合发送限速（包/秒），`0` 关闭；有效范围 `1..10000000`，越界/非法告警后关闭 |
 | `IWAN_RXDBG` | 关 | socks | 打印每个收到的 VPN 数据报 |
 | `IWAN_FLOWDBG` | 关 | socks | 打印 SOCKS 流状态变化与关闭原因 |
@@ -266,7 +270,7 @@ sudo ./iwan-server --port 6001 --tun iwan-srv \
 | 变量 | 默认 | 适用模式 | 说明 |
 |------|------|----------|------|
 | `IWAN_DEBUG` | 关 | 全部 | 调试日志（`IWAN_DEBUG_STRIP` 构建忽略） |
-| `IWAN_RX_STALE_MS` | `120000` | TUN / socks | 下行静默超过该毫秒数即重新认证；`0` 关闭；`30000..86400000` |
+| `IWAN_RX_STALE_MS` | `120000` | TUN / socks / --data-plane kernel | 下行静默超过该毫秒数即重新认证；`0` 关闭；`30000..86400000` |
 | `IWAN_SEND_PACING_PPS` | `0` | TUN / socks | 聚合发送限速（包/秒），`0` 关闭；有效范围 `1..10000000`，越界/非法告警后关闭 |
 | `IWAN_RXDBG` | 关 | socks | 打印每个收到的 VPN 数据报 |
 | `IWAN_FLOWDBG` | 关 | socks | 打印 SOCKS 流状态变化与关闭原因 |

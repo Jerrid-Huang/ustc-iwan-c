@@ -688,7 +688,7 @@ iwan_win_mp_init(_In_ PDRIVER_OBJECT driver,
 		 _Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		 _In_ PUNICODE_STRING registry_path)
 {
-	NDIS_STATUS st;
+	NDIS_STATUS st, stp;
 
 	/* 让后续的池分配走 NX（不执行）内存：内核态指针被改写利用的门槛
 	 * 更高，这条更接近"默认安全"。 */
@@ -704,27 +704,22 @@ iwan_win_mp_init(_In_ PDRIVER_OBJECT driver,
 	 * 比驱动声明的版本还旧"，这一条是唯一的判据。 */
 	iwan_win_mp_trace(30, (LONG)NdisGetVersion());
 
-	/* 第三个参数是小型端口驱动上下文，会原样传给 MiniportInitializeEx
-	 * （就是那份扩展）。 */
+	/* 两半的注册顺序本身也是待验证的事实：先协议边，再小型端口。协议边
+	 * 一注册就会开始收帧，那时小型端口还没起来也不要紧——收帧回调只往
+	 * 引擎里递一个内层数据报，引擎在会话未建立时什么都不做。
+	 * 两份结果分开落键：协议边 60+（版本阶梯）、小型端口 40+（版本/修订
+	 * 阶梯），总账落 12/13。 */
+	stp = iwan_win_proto_init(ext);
 	st = iwan_win_mp_register(driver, registry_path, ext);
-	if (st != NDIS_STATUS_SUCCESS) {
+	iwan_win_mp_trace(12, (LONG)(stp == NDIS_STATUS_SUCCESS ? st : stp));
+	if (stp != NDIS_STATUS_SUCCESS || st != NDIS_STATUS_SUCCESS) {
 		iwan_win_mp_trace(10, (LONG)st);
 		g_mp_ext = NULL;
-		DbgPrint("iwanmp: NdisMRegisterMiniportDriver 失败 0x%08lx\n",
-			 (unsigned long)st);
+		DbgPrint("iwanmp: 注册失败（协议边 0x%08lx，小型端口 0x%08lx）\n",
+			 (unsigned long)stp, (unsigned long)st);
 		return STATUS_UNSUCCESSFUL;
 	}
-
-	/* 协议边随后注册：它一注册就会开始收帧，那时小型端口已经在了。 */
-	st = iwan_win_proto_init(ext);
-	if (st != STATUS_SUCCESS) {
-		iwan_win_mp_trace(11, st);
-		NdisMDeregisterMiniportDriver(ext->mp.mp_handle);
-		ext->mp.mp_handle = NULL;
-		g_mp_ext = NULL;
-		return st;
-	}
-	iwan_win_mp_trace(12, STATUS_SUCCESS);
+	iwan_win_mp_trace(13, STATUS_SUCCESS);
 	DbgPrint("iwanmp: 已装载，%ws\n", IWAN_WIN_DRV_VERSION_STR_MP);
 	return STATUS_SUCCESS;
 }

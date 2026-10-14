@@ -87,7 +87,6 @@ VOID
 iwan_win_mp_trace(_In_ ULONG stage, _In_ LONG status)
 {
 	UNICODE_STRING path, vn;
-	PCWSTR name;
 	OBJECT_ATTRIBUTES oa;
 	HANDLE key = NULL;
 
@@ -106,23 +105,22 @@ iwan_win_mp_trace(_In_ ULONG stage, _In_ LONG status)
 	RtlInitUnicodeString(&vn, L"Status");
 	(void)ZwSetValueKey(key, &vn, 0, REG_DWORD, &status, sizeof(status));
 
-	/* 每个阶段再各写一个不会互相覆盖的键：Stage/Status 只留最后一次，
-	 * 而"哪一步失败"往往要靠更早的那一次才能判读（后写的会盖掉先写的）。 */
-	switch (stage) {
-	case 1:  name = L"T1";  break;
-	case 2:  name = L"T2";  break;
-	case 3:  name = L"T3";  break;
-	case 4:  name = L"T4";  break;
-	case 10: name = L"T10"; break;
-	case 11: name = L"T11"; break;
-	case 12: name = L"T12"; break;
-	case 20: name = L"T20"; break;
-	case 21: name = L"T21"; break;
-	case 22: name = L"T22"; break;
-	case 30: name = L"T30"; break;
-	default: name = NULL;   break;
-	}
-	if (name != NULL) {
+	/* 每个阶段再各写一个不会互相覆盖的键（T<十进制阶段号>）：Stage/Status
+	 * 只留最后一次，而"哪一步失败"往往要靠更早的那一次才能判读。键名现拼
+	 * 而不是写死 switch——阶梯实验会一次写下十几个阶段，写死的表只会让没
+	 * 列进去的阶段静默消失，那一轮装机读数就白跑了（踩过）。 */
+	{
+		WCHAR name[16], digits[12];
+		ULONG n = stage, i = 0, t = 0;
+
+		name[i++] = L'T';
+		do {
+			digits[t++] = (WCHAR)(L'0' + (n % 10u));
+			n /= 10u;
+		} while (n != 0 && t < RTL_NUMBER_OF(digits));
+		while (t > 0)
+			name[i++] = digits[--t];
+		name[i] = L'\0';
 		RtlInitUnicodeString(&vn, name);
 		(void)ZwSetValueKey(key, &vn, 0, REG_DWORD, &status,
 				    sizeof(status));

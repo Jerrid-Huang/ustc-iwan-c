@@ -43,3 +43,12 @@ dist/
 
 # stress harness output (tests/stress_socks*.sh write here by default)
 stress-out/
+
+# kernel module build artifacts (kernel/)
+*.ko
+*.mod
+*.mod.c
+.*.cmd
+.tmp_versions/
+modules.order
+Module.symvers

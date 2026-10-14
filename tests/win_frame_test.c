@@ -103,14 +103,23 @@ test_xor(void)
 	for (i = 0; i < sizeof(lens) / sizeof(lens[0]); i++) {
 		for (j = 0; j < sizeof(offs) / sizeof(offs[0]); j++) {
 			size_t n = lens[i];
+			uint8_t ref[1024];
 			size_t k;
 
 			for (k = 0; k < n; k++)
 				a[k] = b[k] = (uint8_t)(k * 31 + 7);
+			/* 逐字节参考：分块（每轮 64 位字）写法必须与它逐位一致。
+			 * 只做往返自检对"相位算错"是盲的——错相位照样能还原。 */
+			for (k = 0; k < n; k++)
+				ref[k] = (uint8_t)((uint8_t)(k * 31 + 7) ^
+						   key[(offs[j] + k) & 7]);
 
 			/* 驱动的实现只在 off 为 0 时对整包使用，但函数本身
 			 * 支持 off（与内核 iwan_xor 的语义一致），这里一并验 */
 			iwan_win_xor(a, (ULONG)n, key, (ULONG)offs[j]);
+			CHECK(memcmp(a, ref, n) == 0,
+			      "XOR 与逐字节参考不一致（len=%zu off=%u）",
+			      n, offs[j]);
 			if (offs[j] == 0) {
 				xor_crypt(b, n, key, sizeof(key));
 				CHECK(memcmp(a, b, n) == 0,
@@ -609,6 +618,59 @@ test_inbound(void)
 	}
 }
 
+/* ---- 5b. 解封按长度分块：每个长度都要与"逐字节拷贝再异或"等价 ------- */
+
+static void
+test_decap_lengths(void)
+{
+	const uint8_t key[8] = { 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+				 0x88 };
+	size_t lens[] = { 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65,
+			  127, 128, 129, 1000 };
+	uint8_t plain[1200], enc[1200], outer[1400], out[1200];
+	uint16_t sid = 0x030c;
+	uint32_t tok = 0xdeadbeef;
+	size_t i, k;
+
+	for (k = 0; k < sizeof(plain); k++)
+		plain[k] = (uint8_t)(k * 7 + 3);
+
+	for (i = 0; i < sizeof(lens) / sizeof(lens[0]); i++) {
+		size_t n = lens[i];
+		IWAN_WIN_OUTER o;
+		size_t total, got;
+
+		/* 加密帧：解封必须还原出明文 */
+		memcpy(enc, plain, n);
+		xor_crypt(enc, n, key, sizeof(key));
+		total = build_outer(outer, n, 40000, 6001, PT_DATA_ENC, 1, sid,
+				    tok, 0);
+		memcpy(outer + 36, enc, n);
+		CHECK(iwan_win_outer_parse4(outer, total, &o),
+		      "加密帧解析失败（len=%zu）", n);
+		got = iwan_win_decap(outer, total, &o, key, out, sizeof(out));
+		CHECK(got == n, "解封长度错误（len=%zu got=%zu）", n, got);
+		CHECK(memcmp(out, plain, n) == 0, "解封结果不符（len=%zu）", n);
+
+		/* 明文帧：解封必须原样拷贝 */
+		total = build_outer(outer, n, 40000, 6001, PT_DATA, 0, sid, tok,
+				    0);
+		memcpy(outer + 36, plain, n);
+		CHECK(iwan_win_outer_parse4(outer, total, &o),
+		      "明文帧解析失败（len=%zu）", n);
+		memset(out, 0xA5, sizeof(out));
+		got = iwan_win_decap(outer, total, &o, key, out, sizeof(out));
+		CHECK(got == n, "明文解封长度错误（len=%zu got=%zu）", n, got);
+		CHECK(memcmp(out, plain, n) == 0, "明文解封结果不符（len=%zu）",
+		      n);
+
+		/* 输出缓冲不足：必须拒绝而不是截断写入 */
+		CHECK(iwan_win_decap(outer, total, &o, key, out,
+				     (ULONG)(n - 1)) == 0,
+		      "输出缓冲不足应拒绝（len=%zu）", n);
+	}
+}
+
 /* ---- 6. 与用户态发送侧对拍：拿 pkt_hdr()/xor_crypt() 造的帧喂驱动解析 --- */
 
 static void
@@ -1010,6 +1072,7 @@ main(void)
 	test_targets();
 	test_wire_constants();
 	test_inbound();
+	test_decap_lengths();
 	test_dgram_parse();
 	test_inbound_crosscheck();
 	test_outer_build4();

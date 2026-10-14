@@ -672,8 +672,15 @@ iwan_win_mp_release_carrier(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 NTSTATUS
 iwan_win_proto_init(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 {
+	/* 声明的 NDIS 次版本必须被这台机器的 NDIS 接受：客体实测小型端口侧
+	 * 声明 6.30 被拒（0xC0010005），改成运行时版本才通过，协议侧很可能
+	 * 是同一条规矩（0 = 运行时版本）。逐个候选试，每个候选的结果各落一个
+	 * 键（阶段 60 起），一次装机就能看清是哪一档被接受。 */
+	static const UCHAR minors[] = { 0u, 85u, 80u, 60u, 30u };
 	NDIS_PROTOCOL_DRIVER_CHARACTERISTICS ch;
-	NDIS_STATUS st;
+	NDIS_STATUS st = NDIS_STATUS_NOT_SUPPORTED;
+	UCHAR runtime = (UCHAR)(NdisGetVersion() & 0xFFu);
+	ULONG mi;
 
 	if (InterlockedExchange(&g_proto_started, 1) != 0)
 		return STATUS_SUCCESS;
@@ -681,12 +688,15 @@ iwan_win_proto_init(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 	InitializeListHead(&g_bindings);
 	KeInitializeSpinLock(&g_bind_lock);
 
+	for (mi = 0; mi < RTL_NUMBER_OF(minors); mi++) {
+		UCHAR minor = (mi == 0) ? runtime : minors[mi];
+
 	RtlZeroMemory(&ch, sizeof(ch));
 	ch.Header.Type = NDIS_OBJECT_TYPE_PROTOCOL_DRIVER_CHARACTERISTICS;
 	ch.Header.Revision = NDIS_PROTOCOL_DRIVER_CHARACTERISTICS_REVISION_1;
 	ch.Header.Size = NDIS_SIZEOF_PROTOCOL_DRIVER_CHARACTERISTICS_REVISION_1;
 	ch.MajorNdisVersion = 6;
-	ch.MinorNdisVersion = 30;
+	ch.MinorNdisVersion = minor;
 	ch.MajorDriverVersion = 1;
 	ch.MinorDriverVersion = 0;
 	ch.Flags = 0;
@@ -704,14 +714,20 @@ iwan_win_proto_init(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 	 * 所以不需要 OidRequestCompleteHandler / DirectOidRequestCompleteHandler */
 
 	st = NdisRegisterProtocolDriver(ext, &ch, &ext->mp.proto_handle);
-	if (st != NDIS_STATUS_SUCCESS) {
-		DbgPrint("iwanmp: NdisRegisterProtocolDriver 失败 0x%08lx\n",
-			 (unsigned long)st);
-		InterlockedExchange(&g_proto_started, 0);
-		return STATUS_UNSUCCESSFUL;
+	iwan_win_mp_trace(60u + mi, (LONG)st);
+	if (st == NDIS_STATUS_SUCCESS) {
+		/* 69 = 命中：低 8 位是声明的次版本 */
+		iwan_win_mp_trace(69, (LONG)minor);
+		DbgPrint("iwanmp: 协议边已注册（NDIS 6.%u）\n",
+			 (unsigned)minor);
+		return STATUS_SUCCESS;
 	}
-	DbgPrint("iwanmp: 协议边已注册（NDIS 6.30）\n");
-	return STATUS_SUCCESS;
+	DbgPrint("iwanmp: NdisRegisterProtocolDriver 6.%u 失败 0x%08lx\n",
+		 (unsigned)minor, (unsigned long)st);
+	}	/* for (mi) */
+
+	InterlockedExchange(&g_proto_started, 0);
+	return st;
 }
 
 VOID

@@ -280,6 +280,7 @@ iptables -I INPUT -i veth0 -j ACCEPT 2>/dev/null && INPUT_RULE_VETH=1
 
 ip netns exec "$TUN_NS" stdbuf -oL -eL ./bin/iwan-client proxy \
     --server "$VETH_IP" --port "$PORT" --user test --pass s3cret \
+    --data-plane tun \
     --tun "$TUN_NAME" --proxy-cidr "$SUBNET" &
 PROXY_PID=$!
 # wait for the tunnel route: the proxy's auth can transiently lag (the
