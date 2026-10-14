@@ -805,6 +805,15 @@ static const wchar_t *win_device_path(const char *plane)
 {
     return data_plane_is_kernel_mp(plane) ? IWAN_WIN_USER_PATH_MP : NULL;
 }
+
+/* 内层地址挂在哪张适配器上：WFP 平面的报文由内核注入、需要一个承载内层
+ * 地址的现成适配器（KM-TEST 回环，装好后改名 iWAN）；NDIS 平面的适配器是
+ * 驱动自己那张（INF 的 DeviceDesc 命名，安装时装成 iwanmp），所以名字跟着
+ * 平面走。返回 NULL 表示用 kdp_win.c 的默认名。 */
+static const char *win_inner_dev(const char *plane)
+{
+    return data_plane_is_kernel_mp(plane) ? IWAN_WIN_DEF_DEV_MP : NULL;
+}
 #endif
 
 /* TUN 面的资源准备：开设备（非阻塞）+ 可选的 SOCKS5/HTTP side-car（共享
@@ -1317,7 +1326,7 @@ static int cmd_proxy(int argc, char **argv, int start)
 #elif defined(_WIN32)
         if (kernel_plane)
             rc = kdp_win_run(sockfd, sk, res.sid, res.tok,
-                             res.enc, o.server, NULL,
+                             res.enc, o.server, win_inner_dev(plane),
                              win_device_path(plane), &routes,
                              &routes6, res.tun, res.mtu,
                              &kdp_busy);
