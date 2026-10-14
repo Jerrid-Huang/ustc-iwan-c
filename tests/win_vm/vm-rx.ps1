@@ -12,10 +12,12 @@
 #   .\vm-rx.ps1 -Inject -PeerIp 10.0.2.15 -PingCount 0
 #
 # 偏移来自 tests/win_abi_layout.c 的实际输出，不是手算的：
-#   SESSION_OPEN 136 字节：sid@8 tok@12 enc@16 key@17 outer_src@28 outer_dst@32
+#   SESSION_OPEN 144 字节（ABI 2）：sid@8 tok@12 enc@16 key@17 outer_src@28 outer_dst@32
 #     sport@36 dport@38 outer_src6@40 outer_dst6@56 flags@72 oif_index@76
 #     bind_ip@80 bind_ip6@84 inner_ip@100 inner_ip6@104 inner_mtu@120
-#     carrier_mtu@124 target_offset@128 target_count@132
+#     carrier_mtu@124 target_offset@128 target_count@132 outer_hop@136
+#   outer_hop 是外层下一跳（0 = 对端就在链路上）。内核不发路由查询，这一格由
+#   控制面在开会话前用 GetBestRoute2 算好；NDIS 平面没有它就发不出外层帧。
 #   SESSION_INFO 200 字节：enabled@16 effective_mtu@20 carrier_index@24 dev_owned@28
 #     last_rx_ms@40 shm_section_size@48 shm_user_va@56 stats@64（17 个 INT64）
 #   TARGET 24 字节：family@0 prefix_len@4 addr@8
@@ -33,6 +35,13 @@ param(
     [long]  $Tok      = 0x12345678,
     [int]   $InnerMtu = 1400,
     [int]   $CarrierMtu = 1500,
+    # NDIS 平面（iwanmp.sys）必须显式指定承载网卡索引（不指定就开会话失败），
+    # 外层设备名也不同；WFP 平面用默认值。
+    [string]$Device   = '\\.\iwan',
+    # 两个平面各有自己的服务键（进度标记 RunStage/RunWhat 写在这里）。
+    [string]$Service  = 'iwan',
+    [int]   $OifIndex = 0,
+    [int]   $OuterHop = 0,
     [int]   $PingCount = 3,
     [switch]$BindInner,
     [switch]$KeepOpen,
@@ -78,7 +87,7 @@ $STAT_NAMES = @('rx_pkts','rx_outer','rx_reasm','rx_frames','rx_delivered','rx_b
 
 # 进度标记：写进服务注册表键（重启后还在），万一整机卡死，重启后读 RunStage
 # 就知道脚本走到哪一步了 —— stdout 会被缓冲，卡死时看不到最后几行。
-$RUNKEY = 'HKLM:\SYSTEM\CurrentControlSet\Services\iwan'
+$RUNKEY = "HKLM:\SYSTEM\CurrentControlSet\Services\$Service"
 function Ser([string]$t) {
     # 串口是唯一不经过网络、也不经过本驱动的通道：网络被打死之后，
     # 宿主仍能从串口日志文件看到脚本走到哪一步。任何异常都不许影响主流程。
@@ -292,9 +301,9 @@ function Invoke-InjectTest([string]$SrcIp, [int]$SrcPort, [string]$DstIp, [int]$
 # ---------- 0. 前置检查 ----------
 Write-Host "IOCTL: OPEN=$('0x{0:X8}' -f $IOCTL_OPEN) CLOSE=$('0x{0:X8}' -f $IOCTL_CLOSE) GET=$('0x{0:X8}' -f $IOCTL_GET)"
 
-$svc = Get-Service -Name iwan -ErrorAction SilentlyContinue
-if (-not $svc) { throw "服务 iwan 不存在：先用 vm-load.ps1 装载驱动" }
-Write-Host ("服务 iwan: {0}，驱动文件 {1}" -f $svc.Status, (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\iwan' -Name ImagePath -ErrorAction SilentlyContinue).ImagePath)
+$svc = Get-Service -Name $Service -ErrorAction SilentlyContinue
+if (-not $svc) { throw "服务 $Service 不存在：先装载它对应的驱动" }
+Write-Host ("服务 {0}: {1}，驱动文件 {2}" -f $Service, $svc.Status, (Get-ItemProperty $RUNKEY -Name ImagePath -ErrorAction SilentlyContinue).ImagePath)
 
 $nic = Get-NetAdapter -Name $Adapter -ErrorAction SilentlyContinue
 if (-not $nic) { throw "找不到承载/内层网卡 $Adapter：先跑 vm-net.ps1" }
@@ -326,9 +335,9 @@ Put-U32Host $targets 0 $TargetFamily
 Put-U32Host $targets 4 32
 Put-Ip4Net  $targets 8 $Target
 
-$req = New-Object byte[] 136
-Put-U32Host $req 0  1
-Put-U32Host $req 4  136
+$req = New-Object byte[] 144
+Put-U32Host $req 0  2        # abi_version（ABI 2 起带 outer_hop）
+Put-U32Host $req 4  144
 Put-U16Host $req 8  $Sid    # sid/tok 是主机序字段（地址与端口才是网络序）
 Put-U32Host $req 12 $Tok
 $req[16] = if ($Plaintext) { 0 } else { 1 }   # enc
@@ -341,29 +350,30 @@ Put-U16     $req 38 $PeerPort                 # dport
 $flags = 0
 if ($BindInner) { $flags = $flags -bor $FLAG_BIND_INNER }
 Put-U32Host $req 72 $flags
-Put-U32Host $req 76 0
+Put-U32Host $req 76 $OifIndex        # oif_index（NDIS 平面必须非 0）
 Put-Ip4Net  $req 80 $localIp                  # bind_ip
 if ($NoInnerIp) { Write-Host 'inner_ip 留 0（复刻真实客户端内核面：kdp_win 从不填这个字段）' }
 else { Put-Ip4Net  $req 100 $InnerIp }          # inner_ip
 Put-U32Host $req 120 $InnerMtu
 Put-U32Host $req 124 $CarrierMtu
-Put-U32Host $req 128 136                      # target_offset
+Put-U32Host $req 128 144                      # target_offset
 Put-U32Host $req 132 1                        # target_count
+Put-U32Host $req 136 $OuterHop                # outer_hop（0 = 对端在链路上）
 
 $inBuf = New-Object byte[] ($req.Length + $targets.Length)
 [Array]::Copy($req, 0, $inBuf, 0, $req.Length)
 [Array]::Copy($targets, 0, $inBuf, $req.Length, $targets.Length)
-Write-Host ("请求：{0} 字节（结构 136 + 目标 1×24），sid={1} tok={2} 目标 {3}/{4} 外层 {5}:{6}->{7}" -f `
+Write-Host ("请求：{0} 字节（结构 144 + 目标 1×24），sid={1} tok={2} 目标 {3}/{4} 外层 {5}:{6}->{7}" -f `
     $inBuf.Length, $Sid, $Tok, $Target, $TargetFamily, $localIp, $sportValue, $PeerPort)
 
 # ---------- 2. 开设备、开会话 ----------
-$h = [IWAN.Native]::CreateFileW("\\.\iwan", [uint32]3221225472, 3, [IntPtr]::Zero, 3, 0, [IntPtr]::Zero)
+$h = [IWAN.Native]::CreateFileW($Device, [uint32]3221225472, 3, [IntPtr]::Zero, 3, 0, [IntPtr]::Zero)
 if ($h -eq [IntPtr]::new(-1)) {
     $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
-    throw ("打开 \\.\iwan 失败：Win32 错误 {0}（{1}）—— 用管理员身份运行了吗？" -f $err,
-           (New-Object System.ComponentModel.Win32Exception($err)).Message)
+    throw ("打开 {2} 失败：Win32 错误 {0}（{1}）—— 用管理员身份运行了吗？" -f $err,
+           (New-Object System.ComponentModel.Win32Exception($err)).Message, $Device)
 }
-Write-Host "`n已打开 \\.\iwan"
+Write-Host "`n已打开 $Device"
 
 if ($GetOnly) {
     # 只开设备 + 一个无害 IOCTL（GET），绝不走 IOCTL_OPEN：

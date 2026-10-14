@@ -713,6 +713,16 @@ iwan_win_mp_init(_In_ PDRIVER_OBJECT driver,
 	st = iwan_win_mp_register(driver, registry_path, ext);
 	iwan_win_mp_trace(12, (LONG)(stp == NDIS_STATUS_SUCCESS ? st : stp));
 	if (stp != NDIS_STATUS_SUCCESS || st != NDIS_STATUS_SUCCESS) {
+		/* 失败路径必须把已经成功的那一半注销掉。留一个"已注册但
+		 * DriverEntry 失败"的半个驱动，NDIS 会一直认为它还在：客体实测
+		 * 这种状态下后续的 devcon remove / pnputil /delete-driver 会永久
+		 * 挂住（整机失去响应）。 */
+		if (st == NDIS_STATUS_SUCCESS) {
+			NdisMDeregisterMiniportDriver(ext->mp.mp_handle);
+			ext->mp.mp_handle = NULL;
+		}
+		if (stp == NDIS_STATUS_SUCCESS)
+			iwan_win_proto_fini(ext);
 		iwan_win_mp_trace(10, (LONG)st);
 		g_mp_ext = NULL;
 		DbgPrint("iwanmp: 注册失败（协议边 0x%08lx，小型端口 0x%08lx）\n",
