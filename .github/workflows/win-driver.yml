@@ -121,6 +121,60 @@ jobs:
             if (Select-String -Path $_.FullName -Pattern 'KeStackAttachProcess' -Quiet) { $_.Name }
           } | Tee-Object -FilePath $log -Append
 
+      # 写 NDIS 微型端口 + 协议驱动前，把契约从 WDK 头里逐条打出来。上一轮的教训
+      # 是"猜签名"：FwpsInjectNetworkReceiveAsync0 我按猜的方向"修"过一轮，白等一次
+      # CI。这里一次把需要的原型/结构/宏全取回来。
+      - name: 查 WDK 里的 NDIS 微型端口与协议驱动契约
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $h = "$env:WDKINC\km"
+          $log = "$env:GITHUB_WORKSPACE\ndis-probe.log"
+          function PA($title, $pattern, $ctx, $max) {
+            "`n=== $title ===" | Tee-Object -FilePath $log -Append
+            Get-ChildItem $h -Recurse -Filter '*.h' -ErrorAction SilentlyContinue |
+              Select-String -Pattern $pattern -ErrorAction SilentlyContinue |
+              Select-Object -First $max | ForEach-Object {
+                "$($_.Filename):$($_.LineNumber): $($_.Line)"
+                if ($ctx -gt 0) {
+                  Get-Content $_.Path | Select-Object -Skip $_.LineNumber -First $ctx
+                }
+              } | Out-String -Width 240 | Tee-Object -FilePath $log -Append
+          }
+          PA 'NdisRegisterProtocolDriver 原型' 'NdisRegisterProtocolDriver\(' 8 1
+          PA 'NDIS_PROTOCOL_DRIVER_CHARACTERISTICS 结构' 'typedef struct _NDIS_PROTOCOL_DRIVER_CHARACTERISTICS' 52 1
+          PA 'PROTOCOL_DRIVER_CHARACTERISTICS 的 Revision/Size 宏' 'NDIS_SIZEOF_PROTOCOL_DRIVER_CHARACTERISTICS_REVISION' 1 6
+          PA 'NdisSendNetBufferLists 原型' 'NdisSendNetBufferLists\(' 8 1
+          PA 'NdisOpenAdapterEx 原型' 'NdisOpenAdapterEx\(' 10 1
+          PA 'NDIS_MINIPORT_DRIVER_CHARACTERISTICS 结构' 'typedef struct _NDIS_MINIPORT_DRIVER_CHARACTERISTICS' 52 1
+          PA 'MINIPORT_DRIVER_CHARACTERISTICS 的 Revision/Size 宏' 'NDIS_SIZEOF_MINIPORT_DRIVER_CHARACTERISTICS_REVISION' 1 6
+          PA 'NdisMRegisterMiniportDriver 原型' 'NdisMRegisterMiniportDriver\(' 8 1
+          PA 'NdisMDeregisterMiniportDriver 原型' 'NdisMDeregisterMiniportDriver\(' 4 1
+          PA 'NdisMIndicateReceiveNetBufferLists 原型' 'NdisMIndicateReceiveNetBufferLists\(' 10 1
+          PA 'NdisMSendNetBufferListsComplete 原型' 'NdisMSendNetBufferListsComplete\(' 6 1
+          PA 'NDIS_MINIPORT_ADAPTER_GENERAL_ATTRIBUTES 结构' 'typedef struct _NDIS_MINIPORT_ADAPTER_GENERAL_ATTRIBUTES' 45 1
+          PA 'NDIS_MINIPORT_ADAPTER_REGISTRATION_ATTRIBUTES 结构' 'typedef struct _NDIS_MINIPORT_ADAPTER_REGISTRATION_ATTRIBUTES' 16 1
+          PA 'NdisMSetMiniportAttributes 原型' 'NdisMSetMiniportAttributes\(' 6 1
+          PA 'NET_BUFFER_LIST_POOL_PARAMETERS 结构' 'typedef struct _NET_BUFFER_LIST_POOL_PARAMETERS' 18 1
+          PA 'ProtocolReceiveNetBufferLists 原型' 'ProtocolReceiveNetBufferLists\(' 12 1
+          PA 'ProtocolSendNetBufferListsComplete 原型' 'ProtocolSendNetBufferListsComplete\(' 12 1
+          PA 'NdisReturnNetBufferLists 原型' 'NdisReturnNetBufferLists\(' 6 1
+          PA 'NdisAllocateNetBuffer 原型' 'NdisAllocateNetBuffer\(' 6 1
+          PA 'NdisAllocateNetBufferList 原型' 'NdisAllocateNetBufferList\(' 6 1
+          PA 'NET_BUFFER_FIRST_MDL 宏' 'define NET_BUFFER_FIRST_MDL' 1 1
+          PA 'NDIS_RECEIVE_FLAGS 常量' 'define NDIS_RECEIVE_FLAGS_' 1 6
+          PA 'NDIS_INTERFACE_INFORMATION 结构' 'typedef struct _NDIS_INTERFACE_INFORMATION' 30 1
+          PA 'OID_GEN_INTERFACE_INFO 定义' 'define OID_GEN_INTERFACE_INFO' 1 1
+          PA 'OID_GEN_MAXIMUM_FRAME_SIZE/TOTAL_SIZE 定义' 'define OID_GEN_MAXIMUM_(FRAME_SIZE|TOTAL_SIZE)' 1 2
+          PA 'GetBestRoute2 声明' 'GetBestRoute2' 8 1
+          PA 'MIB_IPFORWARD_ROW2 结构' 'typedef struct _MIB_IPFORWARD_ROW2' 26 1
+          PA 'ConvertInterfaceIndexToLuid 声明' 'ConvertInterfaceIndexToLuid\(' 6 1
+          PA 'ConvertInterfaceLuidToIndex 声明' 'ConvertInterfaceLuidToIndex\(' 6 1
+          PA 'NdisIfGetNetLuid 系列' 'NdisIfGetNetLuid' 4 2
+          PA 'NdisMNetPnPEvent 原型' 'NdisMNetPnPEvent\(' 6 1
+          PA 'ndis.h 里对 NDIS_*_DRIVER 宏的条件使用' '#if.*NDIS_(MINIPORT|PROTOCOL|FILTER)_DRIVER' 2 6
+          PA 'NDIS_WDM 宏的使用' 'defined\(NDIS_WDM\)' 2 3
+
       # 先只编译：/t:ClCompile 不链接、不校验 INF，即使后面两步有问题也能拿到
       # 完整的 C 侧诊断（上一轮就是被 InfVerif 挡在编译之前，白等一轮）。
       - name: msbuild 只编译（不链接）
