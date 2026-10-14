@@ -115,8 +115,11 @@ iwan_win_mp_initialize(_In_ NDIS_HANDLE MiniportAdapterHandle,
 
 	UNREFERENCED_PARAMETER(MiniportInitParameters);
 
+	iwan_win_mp_trace(20, 0);
+
 	if (g_mp_ext != NULL) {
 		DbgPrint("iwanmp: 已经有一个隧道适配器，不再接受第二个\n");
+		iwan_win_mp_trace(21, NDIS_STATUS_NOT_SUPPORTED);
 		return NDIS_STATUS_NOT_SUPPORTED;
 	}
 
@@ -132,6 +135,7 @@ iwan_win_mp_initialize(_In_ NDIS_HANDLE MiniportAdapterHandle,
 	pp.PoolTag = IWAN_TAG_PKT;
 	ext->mp.nbl_pool = NdisAllocateNetBufferListPool(MiniportAdapterHandle, &pp);
 	if (ext->mp.nbl_pool == NULL) {
+		iwan_win_mp_trace(21, NDIS_STATUS_RESOURCES);
 		DbgPrint("iwanmp: NBL 池分配失败\n");
 		return NDIS_STATUS_RESOURCES;
 	}
@@ -197,11 +201,13 @@ iwan_win_mp_initialize(_In_ NDIS_HANDLE MiniportAdapterHandle,
 	ext->mp.mp_handle = MiniportAdapterHandle;
 	g_mp_ext = ext;
 	InterlockedExchange(&ext->mp.mp_running, 1);
+	iwan_win_mp_trace(22, 0);
 	DbgPrint("iwanmp: 内层适配器已就绪（NdisMediumIP，MTU %lu）\n",
 		 (unsigned long)IWAN_MP_INNER_MTU);
 	return NDIS_STATUS_SUCCESS;
 
 fail:
+	iwan_win_mp_trace(21, (LONG)st);
 	NdisFreeNetBufferListPool(ext->mp.nbl_pool);
 	ext->mp.nbl_pool = NULL;
 	return st;
@@ -589,6 +595,7 @@ iwan_win_mp_init(_In_ PDRIVER_OBJECT driver, _In_ PDEVICE_OBJECT devobj,
 	st = NdisMRegisterMiniportDriver(driver, registry_path, ext, &ch,
 					 &ext->mp.mp_handle);
 	if (st != NDIS_STATUS_SUCCESS) {
+		iwan_win_mp_trace(10, (LONG)st);
 		DbgPrint("iwanmp: NdisMRegisterMiniportDriver 失败 0x%08lx\n",
 			 (unsigned long)st);
 		return STATUS_UNSUCCESSFUL;
@@ -608,11 +615,13 @@ iwan_win_mp_init(_In_ PDRIVER_OBJECT driver, _In_ PDEVICE_OBJECT devobj,
 	/* 协议边最后注册：它一注册就会开始收帧，那时小型端口已经在了 */
 	st = iwan_win_proto_init(ext);
 	if (st != STATUS_SUCCESS) {
+		iwan_win_mp_trace(11, st);
 		NdisMDeregisterMiniportDriver(ext->mp.mp_handle);
 		ext->mp.mp_handle = NULL;
 		return st;
 	}
 	g_mp_devobj = devobj;
+	iwan_win_mp_trace(12, STATUS_SUCCESS);
 	DbgPrint("iwanmp: 已装载，%ws\n", IWAN_WIN_DRV_VERSION_STR_MP);
 	return STATUS_SUCCESS;
 }

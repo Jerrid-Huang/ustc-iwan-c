@@ -15,6 +15,15 @@
  */
 #include "iwan_win.h"
 
+/* 加载期失败的阶段追踪：NDIS 平面把阶段号写进服务键，WFP 平面编译成空操作。
+ * 驱动起不来时用户态没有任何通道（控制设备都没建），这是唯一能一眼看到的
+ * 现场 —— 见 iwan_win_mp_trace 的说明。 */
+#ifdef IWAN_WIN_PLANE_MP
+#define MP_TRACE(stage, status)	iwan_win_mp_trace((stage), (status))
+#else
+#define MP_TRACE(stage, status)	((void)0)
+#endif
+
 #ifdef IWAN_WIN_PLANE_MP
 #define IWAN_DRV_DEV_NAME	IWAN_WIN_DEVICE_NAME_MP
 #define IWAN_DRV_DOS_NAME	IWAN_WIN_DOS_NAME_MP
@@ -197,12 +206,15 @@ DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registry_path)
 				  &dev_name, IWAN_WIN_DEVICE_TYPE,
 				  FILE_DEVICE_SECURE_OPEN, FALSE, &sddl,
 				  &iwan_win_devclass_guid, &devobj);
-	if (!NT_SUCCESS(st))
+	if (!NT_SUCCESS(st)) {
+		MP_TRACE(1, st);
 		return st;
+	}
 
 	RtlInitUnicodeString(&dos_name, IWAN_DRV_DOS_NAME);
 	st = IoCreateSymbolicLink(&dos_name, &dev_name);
 	if (!NT_SUCCESS(st)) {
+		MP_TRACE(2, st);
 		IoDeleteDevice(devobj);
 		return st;
 	}
@@ -227,6 +239,7 @@ DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registry_path)
 	st = iwan_win_wfp_init(devobj, ext);
 #endif
 	if (!NT_SUCCESS(st)) {
+		MP_TRACE(3, st);
 		driver->DriverUnload = NULL;
 		IoDeleteSymbolicLink(&dos_name);
 		IoDeleteDevice(devobj);
@@ -235,6 +248,7 @@ DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registry_path)
 
 	devobj->Flags &= ~DO_DEVICE_INITIALIZING;
 
+	MP_TRACE(4, STATUS_SUCCESS);
 	DbgPrint("iwan-win: loaded, %ws\n", IWAN_DRV_VERSION_STR);
 	return STATUS_SUCCESS;
 }

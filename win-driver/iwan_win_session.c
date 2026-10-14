@@ -72,6 +72,42 @@ iwan_win_diag_tx(_Inout_ IWAN_WIN_SESSION *s, _In_ UINT32 reason,
 
 /* ---- 控制面基础设施 --------------------------------------------------- */
 
+#ifdef IWAN_WIN_PLANE_MP
+/*
+ * DriverEntry 阶段的失败诊断。
+ *
+ * 驱动加载失败时没有任何用户态通道可用：控制设备还没建起来，事件日志要走
+ * IoAllocateErrorLogEntry，客体上也没有内核调试器。退而求其次，把"走到第几步、
+ * 这一步的状态码"写进服务键的 Parameters 子键（两个 REG_DWORD），客体上一条
+ * reg query 就能读到，重启也不丢。
+ *
+ * 只在注册与初始化路径上调用，数据面不碰它。
+ */
+VOID
+iwan_win_mp_trace(_In_ ULONG stage, _In_ LONG status)
+{
+	UNICODE_STRING path, vn;
+	OBJECT_ATTRIBUTES oa;
+	HANDLE key = NULL;
+
+	RtlInitUnicodeString(&path,
+			     L"\\Registry\\Machine\\System\\CurrentControlSet"
+			     L"\\Services\\iwanmp\\Parameters");
+	InitializeObjectAttributes(&oa, &path,
+				   OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+				   NULL, NULL);
+	if (!NT_SUCCESS(ZwCreateKey(&key, KEY_SET_VALUE, &oa, 0, NULL,
+				    REG_OPTION_NON_VOLATILE, NULL)))
+		return;
+
+	RtlInitUnicodeString(&vn, L"Stage");
+	(void)ZwSetValueKey(key, &vn, 0, REG_DWORD, &stage, sizeof(stage));
+	RtlInitUnicodeString(&vn, L"Status");
+	(void)ZwSetValueKey(key, &vn, 0, REG_DWORD, &status, sizeof(status));
+	ZwClose(key);
+}
+#endif /* IWAN_WIN_PLANE_MP */
+
 VOID
 iwan_win_ctrl_init(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 {

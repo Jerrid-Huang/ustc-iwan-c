@@ -309,6 +309,14 @@ NTSTATUS iwan_win_mp_init(_In_ PDRIVER_OBJECT driver,
 			  _Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 			  _In_ PUNICODE_STRING registry_path);
 
+/* 加载期失败诊断（实现在 iwan_win_session.c，只在 IWAN_WIN_PLANE_MP 下编入）：
+ * 把阶段号与状态码写进服务键的 Parameters 子键。驱动加载失败时没有别的通道
+ * 可看 —— 控制设备还没建、客体上没有内核调试器。stage 约定：
+ *   1-4   DriverEntry（1 控制设备、2 符号链接、3 数据面注册、4 完成）
+ *   10-12 iwan_win_mp_init（10 小型端口注册失败、11 协议边注册失败、12 完成）
+ *   20-22 MiniportInitializeEx（20 进入、21 失败、22 完成） */
+VOID iwan_win_mp_trace(_In_ ULONG stage, _In_ LONG status);
+
 /* 协议边（iwan_win_proto.c）：注册/注销 NdisRegisterProtocolDriver。
  * init 由 iwan_win_mp_init 调用，fini 由 iwan_win_mp_fini 调用（两者都不在
  * 数据面，PASSIVE_LEVEL）。 */
