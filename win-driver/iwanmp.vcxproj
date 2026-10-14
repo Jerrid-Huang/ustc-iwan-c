@@ -107,9 +107,14 @@
     <ClCompile Include="iwan_win_frame.c" />
     <ClCompile Include="iwan_win_mpdata.c" />
     <ClCompile Include="iwan_win_proto.c" />
-    <!-- 小型端口这一半单独用小型端口宏：ndis.h 两族宏不能同时要 -->
+    <!-- 小型端口这一半单独用小型端口宏，而且不继承工程级的 NDIS630：
+         两族宏（NDISnnn 与 NDISnnn_MINIPORT）不能同时出现在一个翻译单元
+         里。这里用 683 这一档（与参考实现 Wintun 相同），是因为
+         NDIS_SUPPORT_NDIS680 只在声明到 6.80 以上时才置位，而特性表的
+         REVISION_3 与 SynchronousOidRequestHandler 都在那个门后面——注册
+         时要能按运行时版本挑最新 revision，编译期就得先有它。 -->
     <ClCompile Include="iwan_win_mp.c">
-      <PreprocessorDefinitions>NDIS_MINIPORT_DRIVER;NDIS630_MINIPORT;NDIS_WDM;IWAN_WIN_PLANE_MP;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>NDIS_MINIPORT_DRIVER;NDIS620_MINIPORT;NDIS683_MINIPORT;NDIS_WDM;IWAN_WIN_PLANE_MP</PreprocessorDefinitions>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>

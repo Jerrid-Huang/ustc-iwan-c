@@ -22,13 +22,17 @@
  *      不是 DriverUnload —— 注册小型端口之后那个字段归 NDIS 管。因此
  *      iwan_win_mp_unload_hook() 要自己做完整套清理（数据面 + 会话 +
  *      控制设备 + 扩展内存）。
- *   ② 控制设备不能用 IoCreateDevice 建在 DriverEntry 里。客体实测：
- *      DriverObject 上已经挂着自己的设备对象（或 MajorFunction 已被换过）
- *      时，NdisMRegisterMiniportDriver 直接回 NDIS_STATUS_BAD_CHARACTERISTICS
- *      (0xC0010005)。所以顺序是"先注册（DriverObject 干净）→ 再用 NDIS 的
- *      NdisRegisterDeviceEx 建控制设备 → 最后才换四个 MajorFunction"。
- *      判别哪个设备是自己的用指针比较（NDIS 的设备对象上 Reserved 也非空，
- *      用 Reserved 判别会认错）。
+ *   ② 控制设备不能用 IoCreateDevice 建在 DriverEntry 里：那会给驱动对象
+ *      挂上自己的设备对象、并换掉 MajorFunction，而 NdisMRegisterMiniport
+ *      Driver 要求调用时驱动对象是"干净"的。正确顺序是"先注册小型端口
+ *      （驱动对象干净）→ 再用 NDIS 的 NdisRegisterDeviceEx 建控制设备 →
+ *      最后才换那四个 MajorFunction"。判别哪个设备是自己的用指针比较
+ *      （NDIS 的设备对象上 Reserved 也非空，用 Reserved 判别会认错）。
+ *   ③ 客体上注册这一步曾直接回 NDIS_STATUS_BAD_CHARACTERISTICS
+ *      (0xC0010005)——驱动对象已经干净、特性表除版本号外与参考实现逐字段
+ *      同形，因此把"声明的 NDIS 版本 / 特性表 revision"做成一张候选表逐个
+ *      试（见 iwan_win_mp_register），每次尝试的状态写进注册表，一次装机
+ *      就能读出到底哪一项不合规。
  *
  * 并发：发送路径与指示路径都可能处于 DISPATCH_LEVEL；本文件不等待、不加
  * 互斥、不碰可分页内存。整个平面只支持一个隧道适配器（与"一条会话绑一张
@@ -94,7 +98,9 @@ iwan_win_mp_initialize(_In_ NDIS_HANDLE MiniportAdapterHandle,
 
 	iwan_win_mp_trace(20, 0);
 
-	if (g_mp_ext != NULL) {
+	/* 一份扩展只服务一个适配器。判据是 mp_handle 而不是 g_mp_ext：后者
+	 * 在 Halt 之后仍然存在（控制设备还要用它），只有卸载才清。 */
+	if (ext->mp.mp_handle != NULL) {
 		DbgPrint("iwanmp: 已经有一个隧道适配器，不再接受第二个\n");
 		iwan_win_mp_trace(21, NDIS_STATUS_NOT_SUPPORTED);
 		return NDIS_STATUS_NOT_SUPPORTED;
@@ -204,7 +210,10 @@ iwan_win_mp_halt(_In_ NDIS_HANDLE MiniportAdapterHandle,
 	/* 先关门再放承载：数据面两条路径都以 mp_running 为闸门 */
 	InterlockedExchange(&ext->mp.mp_running, 0);
 	ext->mp.mp_handle = NULL;
-	g_mp_ext = NULL;
+	/* 注意：这里**不能**清 g_mp_ext。Halt 只表示适配器停了，扩展内存还
+	 * 归控制设备用（它要到 UnloadHandler 才释放）；清掉的话，适配器停掉
+	 * 之后任何一个 IOCTL 都会解引用空指针。会话是否还活着由 sess.valid
+	 * 表示，控制面按它拒绝即可。 */
 	iwan_win_mp_release_carrier(ext);
 	if (ext->mp.nbl_pool != NULL) {
 		NdisFreeNetBufferListPool(ext->mp.nbl_pool);
@@ -542,12 +551,143 @@ iwan_win_mp_device_ext(VOID)
 	return g_mp_ext;
 }
 
+/* ---- 注册：按 NDIS 的最小版本要求试探 -------------------------------- */
+
+/* DirectOid / SynchronousOid 三个 handler：本平面一个 OID 都不主动发，
+ * 一律回"不支持"。它们只在 REVISION_2/3 的特性表里出现（选老 revision
+ * 时字段根本不存在），写在这里是为了让候选配置能覆盖三种 revision。 */
+static NDIS_STATUS
+iwan_win_mp_direct_oid(_In_ NDIS_HANDLE MiniportAdapterHandle,
+		       _In_ PNDIS_OID_REQUEST OidRequest)
+{
+	UNREFERENCED_PARAMETER(MiniportAdapterHandle);
+	UNREFERENCED_PARAMETER(OidRequest);
+	return NDIS_STATUS_NOT_SUPPORTED;
+}
+
+static VOID
+iwan_win_mp_cancel_direct_oid(_In_ NDIS_HANDLE MiniportAdapterHandle,
+			      _In_ PVOID RequestId)
+{
+	UNREFERENCED_PARAMETER(MiniportAdapterHandle);
+	UNREFERENCED_PARAMETER(RequestId);
+}
+
+static NDIS_STATUS
+iwan_win_mp_sync_oid(_In_ NDIS_HANDLE MiniportAdapterHandle,
+		     _In_ PNDIS_OID_REQUEST OidRequest)
+{
+	UNREFERENCED_PARAMETER(MiniportAdapterHandle);
+	UNREFERENCED_PARAMETER(OidRequest);
+	return NDIS_STATUS_NOT_SUPPORTED;
+}
+
+/* 按（声明的 NDIS 次版本、特性表 revision）填一张特性表。handler 集合
+ * 与 revision 严格对应：选了高 revision 就必须给齐那一档的字段。 */
+static VOID
+iwan_win_mp_fill_ch(_Out_ PNDIS_MINIPORT_DRIVER_CHARACTERISTICS ch,
+		    _In_ UINT16 minor, _In_ UCHAR revision)
+{
+	RtlZeroMemory(ch, sizeof(*ch));
+	ch->Header.Type = NDIS_OBJECT_TYPE_MINIPORT_DRIVER_CHARACTERISTICS;
+	ch->Header.Revision = revision;
+	switch (revision) {
+	case NDIS_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_3:
+		ch->Header.Size =
+			NDIS_SIZEOF_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_3;
+		ch->DirectOidRequestHandler = iwan_win_mp_direct_oid;
+		ch->CancelDirectOidRequestHandler = iwan_win_mp_cancel_direct_oid;
+		ch->SynchronousOidRequestHandler = iwan_win_mp_sync_oid;
+		break;
+	case NDIS_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_2:
+		ch->Header.Size =
+			NDIS_SIZEOF_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_2;
+		ch->DirectOidRequestHandler = iwan_win_mp_direct_oid;
+		ch->CancelDirectOidRequestHandler = iwan_win_mp_cancel_direct_oid;
+		break;
+	default:
+		ch->Header.Size =
+			NDIS_SIZEOF_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_1;
+		break;
+	}
+	ch->MajorNdisVersion = 6;
+	ch->MinorNdisVersion = minor;
+	ch->MajorDriverVersion = 1;
+	ch->MinorDriverVersion = 0;
+	ch->Flags = 0;
+	ch->InitializeHandlerEx = iwan_win_mp_initialize;
+	ch->HaltHandlerEx = iwan_win_mp_halt;
+	ch->UnloadHandler = iwan_win_mp_unload_hook;
+	ch->PauseHandler = iwan_win_mp_pause;
+	ch->RestartHandler = iwan_win_mp_restart;
+	ch->OidRequestHandler = iwan_win_mp_oid_request;
+	ch->SendNetBufferListsHandler = iwan_win_mp_send_nbls;
+	ch->ReturnNetBufferListsHandler = iwan_win_mp_return_nbls;
+	ch->CancelSendHandler = iwan_win_mp_cancel_send;
+	ch->DevicePnPEventNotifyHandler = iwan_win_mp_pnp_event;
+	ch->ShutdownHandlerEx = iwan_win_mp_shutdown;
+	ch->CancelOidRequestHandler = iwan_win_mp_cancel_oid;
+}
+
+/* 候选表：先照参考实现（Wintun）的形状声明"本机运行时的 NDIS 次版本 +
+ * 最新 revision"，再逐个降级。每次尝试的状态写进 T40 起的键，命中即用
+ * 那一张配置完成注册。这样一次装机就能把"哪一项不合规"钉死，不必一轮
+ * 改一个值（每一轮都是十分钟的构建 + 换包 + 重启设备）。
+ *
+ * 为什么怀疑是版本而不是别的字段：客体（Windows 11 24H2 一档，NDIS
+ * 6.89）回的是 NDIS_STATUS_BAD_CHARACTERISTICS，而这份特性表除版本号
+ * 外与参考实现逐字段同形。新版 Windows 对微型端口声明的最低 NDIS 版本
+ * 有下限，旧驱动被拒就是这个码。 */
+static const UINT16 iwan_win_mp_minors[] = {
+	0u,	/* 占位：用运行时的次版本 */
+	85u,
+	80u,
+	60u,
+	50u,
+	30u
+};
+
+static NDIS_STATUS
+iwan_win_mp_register(_In_ PDRIVER_OBJECT driver,
+		     _In_ PUNICODE_STRING registry_path,
+		     _Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
+{
+	UINT16 runtime = (UINT16)(NdisGetVersion() & 0xFFFFu);
+	ULONG i, k, stage = 40;
+	NDIS_STATUS last = NDIS_STATUS_BAD_CHARACTERISTICS;
+
+	for (i = 0; i < RTL_NUMBER_OF(iwan_win_mp_minors); i++) {
+		UINT16 minor = (i == 0) ? runtime : iwan_win_mp_minors[i];
+
+		for (k = 0; k < 2; k++) {
+			NDIS_MINIPORT_DRIVER_CHARACTERISTICS ch;
+			UCHAR rev = (k == 0) ?
+				NDIS_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_1 :
+				NDIS_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_3;
+			NDIS_STATUS st;
+
+			iwan_win_mp_fill_ch(&ch, minor, rev);
+			st = NdisMRegisterMiniportDriver(driver, registry_path,
+							 ext, &ch,
+							 &ext->mp.mp_handle);
+			iwan_win_mp_trace(stage++, (LONG)st);
+			last = st;
+			if (st == NDIS_STATUS_SUCCESS) {
+				/* 39 = 命中：低 8 位是 revision，次 8 位是
+				 * 声明的次版本 */
+				iwan_win_mp_trace(39, (LONG)((minor << 8) | rev));
+				return NDIS_STATUS_SUCCESS;
+			}
+		}
+	}
+	return last;
+}
+
 NTSTATUS
 iwan_win_mp_init(_In_ PDRIVER_OBJECT driver,
 		 _Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		 _In_ PUNICODE_STRING registry_path)
 {
-	NDIS_MINIPORT_DRIVER_CHARACTERISTICS ch;
 	NDIS_STATUS st;
 
 	/* 让后续的池分配走 NX（不执行）内存：内核态指针被改写利用的门槛
@@ -559,37 +699,14 @@ iwan_win_mp_init(_In_ PDRIVER_OBJECT driver,
 	 * 而且控制设备的 IRP 只有在这之后才可能出现。 */
 	g_mp_ext = ext;
 
-	/* 阶段 30 记的是"环境"：T30 = NdisGetVersion()（形如 0x00060055 表示
-	 * NDIS 6.85）。注册失败时要能区分"驱动写错了"与"这台机器的 NDIS
+	/* 阶段 30 记的是"环境"：T30 = NdisGetVersion()（形如 0x00060059 表示
+	 * NDIS 6.89）。注册失败时要能区分"驱动写错了"与"这台机器的 NDIS
 	 * 比驱动声明的版本还旧"，这一条是唯一的判据。 */
 	iwan_win_mp_trace(30, (LONG)NdisGetVersion());
 
-	RtlZeroMemory(&ch, sizeof(ch));
-	ch.Header.Type = NDIS_OBJECT_TYPE_MINIPORT_DRIVER_CHARACTERISTICS;
-	ch.Header.Revision = NDIS_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_1;
-	ch.Header.Size = NDIS_SIZEOF_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_1;
-	ch.MajorNdisVersion = 6;
-	ch.MinorNdisVersion = 30;
-	ch.MajorDriverVersion = 1;
-	ch.MinorDriverVersion = 0;
-	ch.Flags = 0;
-	ch.InitializeHandlerEx = iwan_win_mp_initialize;
-	ch.HaltHandlerEx = iwan_win_mp_halt;
-	ch.UnloadHandler = iwan_win_mp_unload_hook;
-	ch.PauseHandler = iwan_win_mp_pause;
-	ch.RestartHandler = iwan_win_mp_restart;
-	ch.OidRequestHandler = iwan_win_mp_oid_request;
-	ch.SendNetBufferListsHandler = iwan_win_mp_send_nbls;
-	ch.ReturnNetBufferListsHandler = iwan_win_mp_return_nbls;
-	ch.CancelSendHandler = iwan_win_mp_cancel_send;
-	ch.DevicePnPEventNotifyHandler = iwan_win_mp_pnp_event;
-	ch.ShutdownHandlerEx = iwan_win_mp_shutdown;
-	ch.CancelOidRequestHandler = iwan_win_mp_cancel_oid;
-
 	/* 第三个参数是小型端口驱动上下文，会原样传给 MiniportInitializeEx
 	 * （就是那份扩展）。 */
-	st = NdisMRegisterMiniportDriver(driver, registry_path, ext, &ch,
-					 &ext->mp.mp_handle);
+	st = iwan_win_mp_register(driver, registry_path, ext);
 	if (st != NDIS_STATUS_SUCCESS) {
 		iwan_win_mp_trace(10, (LONG)st);
 		g_mp_ext = NULL;

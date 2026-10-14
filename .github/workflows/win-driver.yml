@@ -102,7 +102,8 @@ jobs:
                     'win-driver\iwan_win_frame.c')
           & $cl.FullName @mpArgs 2>&1 | Tee-Object -FilePath cl-mp.log
           "cl mp 退出码=$LASTEXITCODE"
-          $mpoArgs = $common + @('/DNDIS_MINIPORT_DRIVER', '/DNDIS630_MINIPORT',
+          $mpoArgs = $common + @('/DNDIS_MINIPORT_DRIVER', '/DNDIS620_MINIPORT',
+                                 '/DNDIS683_MINIPORT',
                                  '/DNDIS_WDM', '/DIWAN_WIN_PLANE_MP') +
                   @('win-driver\iwan_win_mp.c')
           & $cl.FullName @mpoArgs 2>&1 | Tee-Object -FilePath cl-mp-miniport.log
