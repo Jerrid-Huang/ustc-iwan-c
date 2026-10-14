@@ -229,6 +229,109 @@ jobs:
           P2 'NdisAllocateNetBufferAndNetBufferList 原型' 'NdisAllocateNetBufferAndNetBufferList\(' 8 1
           P2 'NdisMQueryAdapterInstanceName/接口辅助' 'NdisMQueryAdapterInstanceName\(' 6 1
 
+      # 第三轮：两个编译期问题只能让编译器回答。
+      #   · iwanmp 同时是微型端口与协议驱动，工程该定义哪几个版本宏？
+      #     ndis.h 里 NDIS_MINIPORT_DRIVER 撞上了"reserved"，但那段被
+      #     #ifdef NETCX_ADAPTER_2 包着；不试编译就是在猜。
+      #   · 内核态还有没有可取路由的 API（GetBestRoute2 那一族）？这决定
+      #     下一跳是由驱动自己查路由，还是由控制面在建会话时算好传进来。
+      - name: 核对 iwanmp 的 NDIS 版本宏与路由 API 可用性
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $msvc = Get-ChildItem "$env:VSDIR\VC\Tools\MSVC" -Directory |
+                  Sort-Object Name | Select-Object -Last 1
+          $cl = Get-ChildItem $msvc.FullName -Recurse -Filter cl.exe |
+                Where-Object { $_.FullName -match 'Hostx64\\x64' } | Select-Object -First 1
+          $incs = @("$env:WDKINC\km", "$env:WDKINC\km\crt", "$env:WDKINC\shared",
+                    "$env:WDKINC\ucrt", "$($msvc.FullName)\include") |
+                  Where-Object { Test-Path $_ } | ForEach-Object { "/I$_" }
+          $log = "$env:GITHUB_WORKSPACE\mp-macro.log"
+
+          # 只打印宏解析结果，不参与链接
+          @'
+          #include <ndis.h>
+          #define IWAN_S(x) #x
+          #define IWAN_T(x) IWAN_S(x)
+          #pragma message("IWANMP miniport_ver=" IWAN_T(NDIS_MINIPORT_MAJOR_VERSION) "." IWAN_T(NDIS_MINIPORT_MINOR_VERSION))
+          #pragma message("IWANMP protocol_ver=" IWAN_T(NDIS_PROTOCOL_MAJOR_VERSION) "." IWAN_T(NDIS_PROTOCOL_MINOR_VERSION))
+          #pragma message("IWANMP legacy_miniport=" IWAN_T(NDIS_LEGACY_MINIPORT) " legacy_protocol=" IWAN_T(NDIS_LEGACY_PROTOCOL))
+          #pragma message("IWANMP support630=" IWAN_T(NDIS_SUPPORT_NDIS630) " support683=" IWAN_T(NDIS_SUPPORT_NDIS683))
+          #pragma message("IWANMP ndis_wdm=" IWAN_T(NDIS_WDM) " miniport_driver=" IWAN_T(NDIS_MINIPORT_DRIVER))
+          int iwan_mp_probe_anchor(void);
+          int iwan_mp_probe_anchor(void) { return 0; }
+          '@ | Set-Content -Encoding ascii win-driver\mp_probe.c
+
+          # 内核态能不能取路由：直接编译一段真调用，报错即答案
+          @'
+          #include <ndis.h>
+          #include <netioapi.h>
+          NTSTATUS iwan_mp_probe_route(void)
+          {
+              MIB_IPFORWARD_ROW2 row;
+              SOCKADDR_INET src, dst;
+              NET_LUID luid;
+              NET_IFINDEX idx;
+
+              RtlZeroMemory(&row, sizeof(row));
+              RtlZeroMemory(&src, sizeof(src));
+              RtlZeroMemory(&dst, sizeof(dst));
+              RtlZeroMemory(&luid, sizeof(luid));
+              idx = ConvertInterfaceLuidToIndex(&luid);
+              ConvertInterfaceIndexToLuid(idx, &luid);
+              return GetBestRoute2(NULL, idx, NULL, &dst, 0, &row, &src);
+          }
+          '@ | Set-Content -Encoding ascii win-driver\mp_probe_netio.c
+
+          $sets = @(
+            @{ n = 'A: NDIS630 + NDIS630_MINIPORT'; d = @('/DNDIS630', '/DNDIS630_MINIPORT', '/DNDIS_WDM') },
+            @{ n = 'B: NDIS_MINIPORT_DRIVER + 620/683_MINIPORT'; d = @('/DNDIS_MINIPORT_DRIVER', '/DNDIS620_MINIPORT', '/DNDIS683_MINIPORT', '/DNDIS_WDM') },
+            @{ n = 'C: 只有 NDIS630'; d = @('/DNDIS630') }
+          )
+          foreach ($s in $sets) {
+            "`n=== 宏解析 $($s.n) ===" | Tee-Object -FilePath $log -Append
+            $cargs = @('/nologo', '/kernel', '/c', '/Zs', '/std:c11', '/W4', '/WX-',
+                       '/Iwin-driver', '/Isrc\common') + $incs + $s.d +
+                     @('/D_AMD64_', 'win-driver\mp_probe.c')
+            & $cl.FullName @cargs 2>&1 | Tee-Object -FilePath $log -Append
+          }
+          "`n=== 内核态路由 API（netioapi.h） ===" | Tee-Object -FilePath $log -Append
+          $rargs = @('/nologo', '/kernel', '/c', '/Zs', '/std:c11', '/W4', '/WX-',
+                     '/Iwin-driver', '/Isrc\common') + $incs +
+                   @('/DNDIS630', '/DNDIS630_MINIPORT', '/DNDIS_WDM', '/D_AMD64_',
+                     'win-driver\mp_probe_netio.c')
+          & $cl.FullName @rargs 2>&1 | Tee-Object -FilePath $log -Append
+
+          $root = Split-Path $env:WDKINC -Parent
+          function P3($title, $pattern, $ctx, $max) {
+            "`n=== $title ===" | Tee-Object -FilePath $log -Append
+            Get-ChildItem $root -Recurse -Filter '*.h' -ErrorAction SilentlyContinue |
+              Select-String -Pattern $pattern -ErrorAction SilentlyContinue |
+              Select-Object -First $max | ForEach-Object {
+                "$($_.Filename):$($_.LineNumber): $($_.Line)"
+                if ($ctx -gt 0) { Get-Content $_.Path | Select-Object -Skip $_.LineNumber -First $ctx }
+              } | Out-String -Width 240 | Tee-Object -FilePath $log -Append
+          }
+          P3 'PROTOCOL_RECEIVE_NET_BUFFER_LISTS 原型' 'PROTOCOL_RECEIVE_NET_BUFFER_LISTS\)' 10 1
+          P3 'PROTOCOL_BIND_ADAPTER_EX 原型' 'PROTOCOL_BIND_ADAPTER_EX\)' 10 1
+          P3 'PROTOCOL_SEND_NET_BUFFER_LISTS_COMPLETE 原型' 'PROTOCOL_SEND_NET_BUFFER_LISTS_COMPLETE\)' 8 1
+          P3 'NDIS_STATISTICS_INFO 结构' '_NDIS_STATISTICS_INFO$' 30 1
+          P3 'NDIS_LINK_STATE 结构' '_NDIS_LINK_STATE$' 18 1
+          P3 '对象类型 GUID：注册属性' 'NDIS_OBJECT_TYPE_MINIPORT_ADAPTER_REGISTRATION_ATTRIBUTES' 2 3
+          P3 '对象类型 GUID：一般属性' 'NDIS_OBJECT_TYPE_MINIPORT_ADAPTER_GENERAL_ATTRIBUTES' 2 3
+          P3 '对象类型 GUID：微型端口驱动特征' 'NDIS_OBJECT_TYPE_MINIPORT_DRIVER_CHARACTERISTICS' 2 3
+          P3 '对象类型 GUID：协议驱动特征' 'NDIS_OBJECT_TYPE_PROTOCOL_DRIVER_CHARACTERISTICS' 2 3
+          P3 '对象类型 GUID：NBL 池参数' 'NDIS_OBJECT_TYPE_NET_BUFFER_LIST_POOL_PARAMETERS' 2 3
+          P3 '统计支持的位' 'NDIS_STATISTICS_XMIT_OK_SUPPORTED' 2 3
+          P3 'MacOptions 位' 'define NDIS_MAC_OPTION_' 2 12
+          P3 'NdisMediumIP 与物理介质' 'NdisMediumIP$|NdisPhysicalMediumUnspecified' 2 4
+          P3 'IF_TYPE_PROP_VIRTUAL' 'define IF_TYPE_PROP_VIRTUAL' 2 2
+          P3 '以太类型常量' 'define ETHERTYPE_IP$|define ETHERTYPE_ARP$|define ETHERTYPE_IPV6$' 2 4
+          P3 'ExInitializeDriverRuntime' 'ExInitializeDriverRuntime\(' 8 1
+          P3 'NdisGetVersion 原型' 'NdisGetVersion\(' 6 1
+          P3 'NdisAllocateNetBufferListPool/NdisFreeNetBufferList' 'NdisAllocateNetBufferListPool\(|NdisFreeNetBufferList\(' 8 2
+          P3 'NDIS_DEFAULT_PORT_NUMBER' 'define NDIS_DEFAULT_PORT_NUMBER' 2 2
+
       # 先只编译：/t:ClCompile 不链接、不校验 INF，即使后面两步有问题也能拿到
       # 完整的 C 侧诊断（上一轮就是被 InfVerif 挡在编译之前，白等一轮）。
       - name: msbuild 只编译（不链接）
