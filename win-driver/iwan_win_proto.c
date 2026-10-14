@@ -427,14 +427,14 @@ iwan_win_proto_recv_one(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		return TRUE;
 	}
 	{
-		ULONG need = IWAN_MP_ETH_HDR_LEN + iplen;
-		UINT8 *tmp = (UINT8 *)IWAN_ALLOC(need, IWAN_TAG_PKT);
+		ULONG pktlen = IWAN_MP_ETH_HDR_LEN + iplen;
+		UINT8 *tmp = (UINT8 *)IWAN_ALLOC(pktlen, IWAN_TAG_PKT);
 
 		if (tmp == NULL) {
 			IWAN_MP_STAT_INC(ext, rx_nomem);
 			return TRUE;	/* 命中但放不下：吃掉，不重复投递 */
 		}
-		p = iwan_win_proto_view(nb, need, tmp, need);
+		p = iwan_win_proto_view(nb, pktlen, tmp, pktlen);
 		if (p != NULL)
 			iwan_win_mp_outer_recv(ext, p + IWAN_MP_ETH_HDR_LEN, iplen);
 		ExFreePoolWithTag(tmp, IWAN_TAG_PKT);

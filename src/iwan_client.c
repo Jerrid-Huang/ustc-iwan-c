@@ -7,6 +7,7 @@
 
 #ifndef _WIN32
 #include <arpa/inet.h>
+#include <net/if.h>   /* if_nametoindex：--bind-dev 的名字 -> ifindex */
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -24,6 +25,12 @@
 #include "cli_common.h"
 #include "common.h"
 #include "crypto.h"
+#ifdef __linux__
+#include "kdp.h"      /* 内核数据面（Linux only）：与 kdp.c 同处条件编译 */
+#endif
+#if defined(_WIN32)
+#include "kdp_win.h"   /* Windows 内核数据面（WFP 驱动）：与 kdp_win.c 同处条件编译 */
+#endif
 #include "profile.h"
 #include "protocol.h"
 #include "proxy.h"
@@ -59,6 +66,9 @@ typedef struct {
     const char *ct_pass_file;
     uint16_t    mtu;
     const char *tun;
+    /* "tun"（默认，TUN 用户态数据面）或 "kernel"（内核数据面，仅 Linux；
+     * 见 cli_common.h 的 IWAN_DATA_PLANE_*） */
+    const char *data_plane;
     slist_t     proxy_cidr;
     slist_t     proxy_ip;
     slist_t     proxy_domain;
@@ -68,6 +78,21 @@ typedef struct {
     bool        socks_no_token;
     bool        allow_remote;
     bool        socks_ipv6;     /* assume the server relays IPv6 (opt-in) */
+    /* 承载网卡绑定（仅 --data-plane kernel 有意义，见 kdp.h 的 kdp_bind）：
+     *   --bind-dev <NIC>  绑网卡：严格用这张接口
+     *   --bind-ip  <IP>   绑出口 IP：内核按地址表把它解析成所属接口，
+     *                     该地址同时是外层 IP 头的源地址
+     * 都不给 = 什么都不绑（内核按 FIB 解析一次后钉住）。 */
+    const char *bind_dev;
+    /* 回程路由（conntrack，仅内核面）：让"从隧道进来的连接"的回包按来路回去。
+     * 见 docs/reply-routing.md。 */
+    bool        reply_via_tunnel;
+    const char *bind_ip;
+    uint32_t    bind_ip_host;   /* --bind-ip 解析结果（v4，主机序） */
+    /* --bind-ip 若按 v6 字面量解析成功，则族与地址在这里；与
+     * bind_ip_host 互斥（同一个选项按字面量判族，不给族开关） */
+    int         bind_ip_family; /* AF_UNSPEC = 未给/未解析 */
+    struct in6_addr bind_ip6;
 } CmdOpts;
 
 /* ---- help/usage text ---- */
@@ -163,7 +188,7 @@ static void print_help_footer(FILE *out)
         "                                        off; ignored by IWAN_DEBUG_STRIP builds) [all]\n"
         "      IWAN_RX_STALE_MS=<ms>             re-authenticate after this long without\n"
         "                                        downlink, 0 disables, 30000..86400000\n"
-        "                                        (default: 120000) [proxy, socks]\n"
+        "                                        (default: 120000) [proxy, socks, proxy --data-plane kernel]\n"
         "      IWAN_SEND_PACING_PPS=<n>          aggregate send pacing in packets/s,\n"
         "                                        0 disables; range 1..10000000\n"
         "                                        (default: 0) [proxy, socks]\n"
@@ -234,8 +259,9 @@ static void print_sub_help(const char *sub)
             "      --pass-file <PASS_FILE>      \n"
             "      --ct-pass <CT_PASS>  \n"
             "      --ct-pass-file <CT_PASS_FILE>\n"
-            "      --mtu <MTU>          [default: 1400]\n"
-            "  -h, --help               Print help\n");
+            "      --mtu <MTU>          [default: %d]\n"
+            "  -h, --help               Print help\n",
+            IWAN_DEFAULT_MTU);
     } else if (strcmp(sub, "proxy") == 0) {
         printf(
             "Open a TUN tunnel and proxy traffic through the VPN server\n"
@@ -250,17 +276,33 @@ static void print_sub_help(const char *sub)
             "      --pass-file <PASS_FILE>        \n"
             "      --ct-pass <CT_PASS>            \n"
             "      --ct-pass-file <CT_PASS_FILE>  \n"
-            "      --mtu <MTU>                    [default: 1400]\n"
+            "      --mtu <MTU>                    [default: %d]\n"
             "      --tun <TUN>                    [default: iwan0]\n"
+            "      --data-plane <auto|tun|kernel>  auto = 默认：Linux 上先试内核模块 iwan，"
+            "本机起不来自动回退 tun，两边都不行才退出；tun = 只用 TUN 用户态数据面；"
+            "kernel = 只用内核数据面（仅 Linux）。显式指定 tun/kernel 不回退\n"
+            "      --reply-via-tunnel              让\"从隧道进来的连接\"的回包按来路回去（仅 --data-plane "
+            "kernel）：被服务地址集合来自 --proxy-cidr*/--proxy-ip/--proxy-domain，对端地址不需要预知；"
+            "用 conntrack（CONNMARK）把入接口记在连接表项上，回包按 fwmark 选隧道专用路由表。"
+            "模块钩子必须在 conntrack 之前解封（默认 hooknum=0/hookprio=-300，或 reinject=1），"
+            "否则拒绝启动而不是静默不生效；见 docs/reply-routing.md\n"
+            "      --bind-dev <NIC>               绑定的承载网卡（仅 --data-plane kernel）：一条会话只用这张"
+            "下游网卡；不给 = 由 FIB 解析一次后钉住\n"
+            "      --bind-ip <IP>                 绑定的出口 IP（仅 --data-plane kernel）：内核按本机地址表"
+            "解析出持有该地址的网卡并钉住，该地址同时是外层 IP 头的源地址；"
+            "v4 点分地址或 v6 字面量都行（族要与会话外层一致：外层族由 --server 的地址族决定）\n"
             "      --proxy-cidr <PROXY_CIDR>      \n"
             "      --proxy-ip <PROXY_IP>          \n"
             "      --proxy-domain <PROXY_DOMAIN>  \n"
-            "      --proxy-cidr6 <PROXY_CIDR6>    \n"
+            "      --proxy-cidr6 <PROXY_CIDR6>    内层 IPv6 路由：内核面与 TUN 面都支持\n"
+            "                                      （模块按版本校验内层头）。内层 MTU 必须\n"
+            "                                      ≥ 1280（RFC 8200 §5），否则警告\n"
             "      --listen <LISTEN>              SOCKS5+HTTP proxy sharing the TUN routes (optional)\n"
             "      --socks-token <TOKEN>          RFC1929 password for the proxy\n"
             "      --socks-no-token               Explicit proxy password opt-out with --allow-remote\n"
             "      --allow-remote                 Allow non-loopback --listen\n"
-            "  -h, --help                         Print help\n");
+            "  -h, --help                         Print help\n",
+            IWAN_DEFAULT_MTU);
     } else if (strcmp(sub, "socks") == 0) {
         printf(
             "Run a rootless SOCKS5 proxy using a userspace TCP/IP stack\n"
@@ -755,6 +797,71 @@ static int cmd_auth(int argc, char **argv, int start)
     return 0;
 }
 
+/* Windows 上 --data-plane 选定的是哪个内核设备：kernel 走 WFP callout 驱动
+ * （iwan.sys，设备 \\.\iwan），kernel-mp 走 NDIS 微型端口 + 协议驱动
+ * （iwanmp.sys，设备 \\.\iwanmp）。返回 NULL 表示用默认设备。 */
+#if defined(_WIN32)
+static const wchar_t *win_device_path(const char *plane)
+{
+    return data_plane_is_kernel_mp(plane) ? IWAN_WIN_USER_PATH_MP : NULL;
+}
+#endif
+
+/* TUN 面的资源准备：开设备（非阻塞）+ 可选的 SOCKS5/HTTP side-car（共享
+ * TUN 路由的内核栈转发）。抽出来是因为 TUN 设备现在是**按需打开**的：
+ * 默认的 auto 先试内核面，只有内核面起不来回退 TUN 时（或本来就选 TUN 时）
+ * 才开设备。内核面下不能预先开着 iwan0 —— 那会让模块的 SESSION_UP 报
+ * -EBUSY（设备被别人占了），内核面反而起不来。
+ *
+ * 成功返回 fd（>=0，rp 由 relay_proxy_start 填，失败时保持 NULL）；
+ * 失败返回 -1，原因已经按 errno 分类打印（EBUSY = 名字被占是最常见的一种，
+ * 旧文本统一说成 "must be root" 会把人带偏）。 */
+static int proxy_tun_prepare(const CmdOpts *o, struct RelayProxy **rp)
+{
+    int fd;
+    int e;
+
+    *rp = NULL;
+    errno = 0;
+    fd = open_tun(o->tun);
+    if (fd < 0) {
+        e = errno;
+#ifdef _WIN32
+        log_err("Error: open tun failed (see earlier log; wintun.dll must "
+                "sit next to the executable and the wintun driver must be "
+                "installed)");
+#else
+        if (e == EBUSY || e == EEXIST || e == EINVAL)
+            log_err("Error: 打开 TUN 设备 %s 失败：内核拒绝了这个名字（%s）\n"
+                    "  同一个 netns 里同一时刻只能有一个虚拟网卡客户端持有"
+                    "这个设备名。占用者可能是另一个客户端（停掉它，Ctrl-C），"
+                    "也可能是内核模块建的 %s（--data-plane kernel 的会话残留，"
+                    "用 sudo iwan_ctl session-down 清掉）。\n"
+                    "  先停掉占用者再重试；也可以用 --tun <别的名字>"
+                    "（注意路由会互相覆盖）",
+                    o->tun, strerror(e), o->tun);
+        else if (e == EACCES || e == EPERM)
+            log_err("Error: 打开 TUN 设备 %s 失败：权限不足（%s）—— TUN "
+                    "数据面需要 root（或 CAP_NET_ADMIN）", o->tun,
+                    strerror(e));
+        else if (e != 0)
+            log_err("Error: 打开 TUN 设备 %s 失败: %s", o->tun, strerror(e));
+        else
+            log_err("Error: 打开 TUN 设备 %s 失败", o->tun);
+#endif
+        return -1;
+    }
+    set_nonblock(fd);
+    log_info("tun %s fd=%d", o->tun, fd);
+    if (o->listen_str &&
+        relay_proxy_start(o->listen_str, o->socks_token, o->socks_no_token,
+                          o->allow_remote, rp) != 0) {
+        tun_close(fd);
+        return -1;
+    }
+    return fd;
+}
+
 static int cmd_proxy(int argc, char **argv, int start)
 {
     CmdOpts o;
@@ -763,7 +870,8 @@ static int cmd_proxy(int argc, char **argv, int start)
     o.user = "_rev_m_1";
     o.mtu = IWAN_DEFAULT_MTU;
     o.tun = "iwan0";
-    cli_opt opts[17];
+    o.data_plane = IWAN_DATA_PLANE_AUTO;   /* 默认：内核面，起不来则回退 TUN */
+    cli_opt opts[21];
 
     add_auth_opts(opts, &o);
     opts[8] = (cli_opt){ "tun",          CLI_OPT_STR, &o.tun,
@@ -784,7 +892,53 @@ static int cmd_proxy(int argc, char **argv, int start)
                           NULL, NULL };
     opts[16] = (cli_opt){ "allow-remote", CLI_OPT_BOOL, &o.allow_remote,
                           NULL, NULL };
+    opts[17] = (cli_opt){ "data-plane",  CLI_OPT_STR, &o.data_plane,
+                          "<auto|tun|kernel>", validate_data_plane };
+    opts[20] = (cli_opt){ "reply-via-tunnel", CLI_OPT_BOOL, &o.reply_via_tunnel,
+                          NULL, NULL };
+    opts[18] = (cli_opt){ "bind-dev",    CLI_OPT_STR, &o.bind_dev,
+                          "<NIC>", NULL };
+    opts[19] = (cli_opt){ "bind-ip",     CLI_OPT_STR, &o.bind_ip,
+                          "<IP>", NULL };
     parse_cmd(argc, argv, start, "proxy", opts, sizeof opts / sizeof opts[0]);
+
+    /* 数据面选面（--data-plane auto = 默认）：
+     *   · auto ⇒ Linux 选内核面、其余平台选 TUN，并允许"内核面起不来就回退
+     *     TUN"（两边都起不来才退出）；
+     *   · 绑网卡/绑出口 IP 只有内核面能实现（TUN 路径没有等价绑定）⇒ auto
+     *     直接选内核面并**关掉回退**：回退过去也满足不了绑定，宁可明确报错；
+     *   · --listen/--socks-* 是 TUN 面的用户态代理特性，与内核面互斥 ⇒ auto
+     *     直接选 TUN（下面的互斥检查因此只对显式 --data-plane kernel 生效）。
+     * 显式指定 tun/kernel 时不回退（见 cli_common.h 的契约）。 */
+    bool plane_auto = false;
+    const char *plane = data_plane_resolve(o.data_plane, &plane_auto);
+    /* 内层 IPv4/IPv6 两个面都支持（切片 1 起内核模块同样解封内层 v6），
+     * --proxy-cidr6 因此不再影响选面：
+     *   · 内核面：模块按版本校验内层头，v6 in v4 走 netif_rx 重新入栈；
+     *   · TUN 面：用户态泵本来就把内层分组当载荷透传。
+     * 两个面的**策略**不同（这是刻意的，见 docs/kernel-data-plane.md）：
+     * TUN 面按会话内层 IP 与派生 ULA 做准入过滤，内核面只做头部自洽
+     * （策略要进内核得先给 ABI 加内层地址项）。唯一要拦的是内层 MTU：
+     * IPv6 要求链路 MTU ≥ 1280（RFC 8200 §5），小于它 v6 必然不通 ——
+     * 拿到生效 MTU 后检查，见下面的 want_v6 警告。 */
+    const bool want_v6 = o.proxy_cidr6.n > 0;
+    const bool need_bind = (o.bind_dev != NULL || o.bind_ip != NULL);
+    if (plane_auto && need_bind) {
+        plane = IWAN_DATA_PLANE_KERNEL;
+        plane_auto = false;
+        log_info("数据面: --bind-dev/--bind-ip 只有内核面能实现，"
+                 "选定 --data-plane kernel（不自动回退）");
+    }
+    if (plane_auto && (o.listen_str || o.socks_token || o.socks_no_token ||
+                       o.allow_remote)) {
+        plane = IWAN_DATA_PLANE_TUN;
+        plane_auto = false;
+        log_info("数据面: --listen/--socks-* 是 TUN 面的用户态代理特性，"
+                 "选定 --data-plane tun");
+    }
+    bool kernel_plane = data_plane_is_kernel(plane);
+    if (plane_auto)
+        log_info("数据面: 默认 %s（内核面不可用时自动回退 TUN）", plane);
     if (!o.server)
         err_required("proxy");
     resolve_credentials(&o, "proxy");
@@ -806,6 +960,144 @@ static int cmd_proxy(int argc, char **argv, int start)
     if (o.allow_remote && (!o.socks_token || !*o.socks_token) &&
         !o.socks_no_token && o.listen_str)
         err_remote_token("proxy");
+
+    /* --data-plane kernel 与 --listen/--socks* 互斥：--listen 起的是用户态
+     * SOCKS5+HTTP 代理（lwIP 终结 TCP，自己造内层包），而内核数据面的钩子
+     * 会在同一个外层套接字上抢包/吞包 —— 两者组合是坏配置，按用法错误拒绝
+     * 而不是让它半死不活。 */
+    if (kernel_plane &&
+        (o.listen_str || o.socks_token || o.socks_no_token ||
+         o.allow_remote)) {
+        fprintf(stderr,
+                "error: --data-plane kernel 与 --listen/--socks-token/"
+                "--socks-no-token/--allow-remote 互斥\n"
+                "  原因: 用户态 SOCKS 代理与内核数据面会在同一条外层套接字上"
+                "抢包；\n"
+                "  内核数据面本身走内核栈，不需要用户态代理");
+        err_usage_exit(usage_required("proxy"));
+    }
+#if !defined(__linux__) && !defined(_WIN32)
+    /* 其余平台（macOS 等）validate_data_plane 已经按取值错误拒过 kernel，
+     * 这里只是兜底。Windows 有 WFP callout 驱动 iwan.sys，与 Linux 的内核
+     * 模块同义，不在兜底之列 —— 它由 kdp_win_run 接管。 */
+    if (kernel_plane) {
+        fprintf(stderr,
+                "error: --data-plane kernel 只在 Linux 与 Windows 上可用"
+                "（当前平台没有内核数据面）");
+        err_usage_exit(usage_required("proxy"));
+    }
+#endif
+    if (kernel_plane && strcmp(o.tun, "iwan0") != 0)
+        log_err("--data-plane kernel 固定使用 iwan0（内核模块决定设备名），"
+                "忽略 --tun %s", o.tun);
+
+#ifdef __linux__
+    /* 承载网卡绑定的三种模式（不绑 / 绑网卡 / 绑出口 IP）：这里只做启动
+     * 校验与解析，值随 kdp_run 交给内核（SESSION_UP 的 OIF/IP 属性）。
+     * TUN 路径的外层是应用自己的 UDP socket，绑网卡要靠 SO_BINDTODEVICE，
+     * 目前没有实现 —— 直接报错，不静默忽略。 */
+    kdp_bind kbind;
+    memset(&kbind, 0, sizeof(kbind));
+    kbind.reply_via_tunnel = o.reply_via_tunnel;
+    if (o.reply_via_tunnel && !kernel_plane) {
+        fprintf(stderr,
+                "error: --reply-via-tunnel 目前只接在内核数据面上"
+                "\n  原因: 两个数据面的入接口口径不同 —— 内核面解封后"
+                "skb->dev 仍是承载网卡（回包从 iwan0 出去），TUN 面的内层包"
+                "由 iwan0 重新入栈；TUN 面尚未接线，不静默忽略\n");
+        err_usage_exit(usage_required("proxy"));
+    }
+    if ((o.bind_dev || o.bind_ip) && !kernel_plane) {
+        fprintf(stderr,
+                "error: --bind-dev/--bind-ip 只在 --data-plane kernel 下有效"
+                "\n  原因: 绑定由内核模块在 SESSION_UP 里执行（一条会话只用"
+                "一张下游网卡）；TUN 路径的外层套接字由用户态持有，"
+                "尚未实现等价绑定\n");
+        err_usage_exit(usage_required("proxy"));
+    }
+    if (o.bind_dev) {
+        kbind.oif = if_nametoindex(o.bind_dev);
+        kbind.dev = o.bind_dev;
+        if (kbind.oif == 0) {
+            fprintf(stderr, "error: --bind-dev %s: 没有这张网卡\n",
+                    o.bind_dev);
+            cleanse_str(o.pass);
+            cleanse_str(o.ct_pass);
+            free_route_opts(&o);
+            return 1;
+        }
+    }
+    if (o.bind_ip) {
+        /* 按字面量判族：v4 点分 -> 绑 v4 出口 IP；v6 -> 绑 v6 出口 IP
+         * （外层版本由会话套接字的族决定，内核侧要求"绑的 IP == 外层源
+         * 地址"，所以给错族会在握手后被内核 -EINVAL 拒掉 —— 这里只要
+         * 能解析成任一族就行，具体一致性交给 kdp_socket_params）。 */
+        struct in_addr a4;
+        struct in6_addr a6;
+
+        if (inet_pton(AF_INET, o.bind_ip, &a4) == 1) {
+            o.bind_ip_family = AF_INET;
+            o.bind_ip_host = ntohl(a4.s_addr);
+            kbind.bind_ip = o.bind_ip_host;
+        } else if (inet_pton(AF_INET6, o.bind_ip, &a6) == 1) {
+            o.bind_ip_family = AF_INET6;
+            o.bind_ip6 = a6;
+            kbind.bind_v6 = true;
+            kbind.bind_ip6 = a6;
+        } else {
+            fprintf(stderr,
+                    "error: --bind-ip %s: 不是 IPv4 点分地址，也不是 IPv6 "
+                    "字面量\n  （链路本地地址不支持：内核外层 v6 属性不带 "
+                    "scope_id）\n",
+                    o.bind_ip);
+            err_usage_exit(usage_required("proxy"));
+        }
+    }
+    if (kbind.oif != 0 || kbind.bind_ip != 0 || kbind.bind_v6) {
+        char why[256];
+
+        /* 启动即校验：网卡存在且 UP 有载波；出口 IP 属于本机某张接口，
+         * 且与 --bind-dev（若同时给了）必须是同一张。地址与链路状态一律
+         * 现读（getifaddrs），不缓存。 */
+        if (!kdp_bind_ok(&kbind, why, sizeof(why))) {
+            fprintf(stderr, "error: 绑定不可用: %s\n", why);
+            cleanse_str(o.pass);
+            cleanse_str(o.ct_pass);
+            free_route_opts(&o);
+            return 1;
+        }
+        char bdesc[128] = "";
+
+        if (kbind.bind_ip != 0 || kbind.bind_v6)
+            snprintf(bdesc, sizeof(bdesc), "绑出口 IP %s", o.bind_ip);
+        if (kbind.oif != 0) {
+            size_t n = strlen(bdesc);
+
+            snprintf(bdesc + n, sizeof(bdesc) - n, "%s绑网卡 %s(ifindex=%u)",
+                     n != 0 ? " + " : "", o.bind_dev,
+                     (unsigned)kbind.oif);
+        }
+        log_info("内核数据面: 绑定方式=%s（一条会话只用一张下游网卡）", bdesc);
+    }
+#else
+    /* 非 Linux 的内核面（Windows 的 kdp_win_run）还没接这三个开关：
+     * SESSION_OPEN 里虽然留了 oif_index/bind_ip/bind_ip6 与 BIND_* 标志位，
+     * 但客户端侧一个都没填，内核面按路由选出口。显式拒绝，不静默忽略
+     * （与 Linux 的 TUN 路径同规矩）。 */
+    if (o.bind_dev || o.bind_ip) {
+        fprintf(stderr,
+                "error: --bind-dev/--bind-ip 只在 Linux 内核面上可用"
+                "\n  原因: 本平台内核面还没接绑定属性（Windows 的 SESSION_OPEN"
+                "未填 oif_index/bind_ip），TUN 路径也没有等价绑定\n");
+        err_usage_exit(usage_required("proxy"));
+    }
+    if (o.reply_via_tunnel) {
+        fprintf(stderr,
+                "error: --reply-via-tunnel 只在 Linux 内核面上可用"
+                "\n  原因: 本平台内核面的回包走隧道尚未接线\n");
+        err_usage_exit(usage_required("proxy"));
+    }
+#endif /* __linux__ */
 
 #ifdef _WIN32
     /* TUN mode requires an administrator (wintun driver + routing):
@@ -867,44 +1159,91 @@ static int cmd_proxy(int argc, char **argv, int start)
     }
 #endif
 
-    int tun_fd = open_tun(o.tun);
-    if (tun_fd < 0) {
-#ifdef _WIN32
-        log_err("Error: open tun failed (see earlier log; wintun.dll must "
-                "sit next to the executable and the wintun driver must be "
-                "installed)");
-#else
-        log_err("Error: open tun (must be root)");
-#endif
-        slist_free(&routes);
-        free_route_opts(&o);
-        cleanse_str(o.pass);
-        cleanse_str(o.ct_pass);
-        return 1;
-    }
-    set_nonblock(tun_fd);
-    log_info("tun %s fd=%d", o.tun, tun_fd);
-
-    /* optional SOCKS5+HTTP proxy sharing the TUN routes (kernel-stack
-     * forwarding): started once, independent of session reconnects */
+    /* --data-plane kernel 下不建 TUN：设备（固定 iwan0）由内核模块在
+     * SESSION_UP 时按需创建/UP/设 MTU，地址与路由仍由用户态按回执里的
+     * DEVNAME 配置（kdp_run 内部做，与 route_setup 同一套代码）。
+     * tun_fd 保持 -1，下面的所有使用点都按 >= 0 判定。
+     *
+     * 默认的 auto 选到内核面时这里**不开设备**：设备按需打开（内核面起不
+     * 来时在回退处调 proxy_tun_prepare），预先开着会让 SESSION_UP -EBUSY。 */
+    int tun_fd = -1;
     struct RelayProxy *rp = NULL;
-    if (o.listen_str &&
-        relay_proxy_start(o.listen_str, o.socks_token, o.socks_no_token,
-                          o.allow_remote, &rp) != 0) {
-        tun_close(tun_fd);
-        slist_free(&routes);
-        free_route_opts(&o);
-        cleanse_str(o.pass);
-        cleanse_str(o.ct_pass);
-        return 1;
+    if (!kernel_plane) {
+        tun_fd = proxy_tun_prepare(&o, &rp);
+        if (tun_fd < 0) {
+            slist_free(&routes);
+            free_route_opts(&o);
+            cleanse_str(o.pass);
+            cleanse_str(o.ct_pass);
+            return 1;
+        }
     }
 
     /* keep the plaintext pass until the session ends: reconnects need
      * it to re-derive the session key (server re-OPEN keeps the IP) */
     int rc = 0;
     bool reconnecting = false;
+    /* kdp_run 的启动失败分类：true = 本 netns 已有内核会话/设备被占，
+     * 这种失败**不回退** TUN（回退会用同一账号把那条会话顶掉）。 */
+    bool kdp_busy = false;
     for (;;) {
         AuthResult res;
+
+#ifdef __linux__
+        /* 绑定失效期间不握手：内核部分已被停用（kdp_run 的 1s 节拍发现失效
+         * 即 teardown），经 iwan0 的那条路由也随设备失效，内层流量改由路由
+         * 表的下一条目承担。等绑定的网卡/出口 IP 回来再重新握手、重新打开数据
+         * —— 与"绑 IP 时 IP 回来则重新握手"的语义一致。
+         * Windows 内核面不做绑定，没有"等绑定回来"这一态。 */
+        if (reconnecting)
+            kdp_bind_wait(&kbind);
+#endif
+
+        /* 握手前的内核面预检（只在首次握手之前跑）：本机内核面是否可用、
+         * 本 netns 是否已有活会话。放在这里是为了**不先跟服务器握手**——
+         * 否则一次"本机没模块"的失败会白占一条服务端会话，更糟的是"本 netns
+         * 已有活会话"时会把那条会话顶掉（服务端对同源 IP 的第二次 OPEN 按
+         * 合法重连处理）。重连时不能跑：本进程自己的会话可能还在。 */
+        if (!reconnecting && kernel_plane) {
+            char perr[512];
+            bool busy = false;
+
+#if defined(_WIN32)
+            if (!kdp_win_plane_precheck(win_device_path(plane),
+                                        perr, sizeof(perr), &busy)) {
+#else
+            if (!kdp_plane_precheck(perr, sizeof(perr), &busy)) {
+#endif
+                log_err("内核数据面: %s", perr);
+                if (plane_auto && !busy) {
+                    log_err("内核数据面在本机不可用，自动回退到 TUN 数据面");
+                    plane_auto = false;   /* 只回退一次 */
+                    kernel_plane = false;
+                    tun_fd = proxy_tun_prepare(&o, &rp);
+                    if (tun_fd < 0) {
+                        log_err("TUN 数据面也不可用，退出"
+                                "（内核面原因见上）");
+                        rc = -1;
+                        break;
+                    }
+                    continue;   /* 重新走一轮：这次是 TUN 面 */
+                }
+                /* busy：本 netns 已有活会话/设备被占。这一类的唯一出路是
+                 * 先停掉占用者 —— 回退 TUN 不是出路：服务端对同源 IP 的
+                 * 第二次 OPEN 按合法重连处理，于是 TUN 面会把那条活会话
+                 * 顶掉（就是用同一个账号把别人踢下线）。 */
+                if (busy)
+                    log_err("内核数据面: 本 netns 已有内核会话/设备被占，"
+                            "不回退 TUN（回退会拿同一账号把那条会话顶掉）；"
+                            "先停掉它再试");
+                else if (!plane_auto)
+                    log_err("内核数据面: 本次运行不接受自动回退"
+                            "（显式指定了 --data-plane，或用了只有内核面"
+                            "支持的绑定），直接退出");
+                rc = -1;
+                break;
+            }
+        }
         int sockfd = authenticate(&o, DO_AUTH_PUMP, &res);
         if (sockfd < 0) {
             if (!reconnecting) {
@@ -938,6 +1277,15 @@ static int cmd_proxy(int argc, char **argv, int start)
                 break;
             }
         }
+        /* 内层 IPv6 需要链路 MTU ≥ 1280（RFC 8200 §5）：IPv6 路由器不做
+         * 分片，链路小于 1280 时 v6 必然不通（表现为"路由装上了但不通"，
+         * 正是要避免的静默黑洞）。生效 MTU 现在才知道（服务端可能下调），
+         * 所以检查放在这里，两期数据面共用。 */
+        if (want_v6 && res.mtu < 1280)
+            log_err("警告: --proxy-cidr6（内层 IPv6）要求内层 MTU ≥ 1280"
+                    "（RFC 8200 §5），本次生效 MTU=%u：IPv6 分组会被对端"
+                    "或中间设备丢弃，请调大 --mtu 或去掉 --proxy-cidr6",
+                    (unsigned)res.mtu);
 
 #ifdef _WIN32
         /* Windows sockets default to blocking; the pump paths expect a
@@ -954,9 +1302,30 @@ static int cmd_proxy(int argc, char **argv, int start)
         slist_t routes6;
         slist_init(&routes6);
         collect_routes6(&routes6, &o.proxy_cidr6);
-        rc = run_pump(tun_fd, o.tun, sockfd, sk, res.sid, res.tok,
-                      res.enc, o.server, &routes, &routes6,
-                      res.tun, res.mtu);
+#ifdef __linux__
+        if (kernel_plane)
+            /* 内核数据面：握手（OPEN/OPEN_ACK/验签/密钥派生）已经在上面的
+             * authenticate() 里完成 —— 那一刻还没有内核会话，钩子不拦，
+             * 所以应用自己的 UDP socket 正常收到了 OPEN_ACK。这里才把数据面
+             * 交给内核：数据帧、keepalive 接收、断开接收都归模块，keepalive
+             * 发送与存活判定仍在用户态（kdp_run）。返回值与 run_pump 同义，
+             * 下面的重连循环零改动。 */
+            rc = kdp_run(sockfd, sk, res.sid, res.tok, res.enc, o.server,
+                         &routes, &routes6, res.tun, res.mtu, &kbind,
+                         &kdp_busy);
+        else
+#elif defined(_WIN32)
+        if (kernel_plane)
+            rc = kdp_win_run(sockfd, sk, res.sid, res.tok,
+                             res.enc, o.server, NULL,
+                             win_device_path(plane), &routes,
+                             &routes6, res.tun, res.mtu,
+                             &kdp_busy);
+        else
+#endif
+            rc = run_pump(tun_fd, o.tun, sockfd, sk, res.sid, res.tok,
+                          res.enc, o.server, &routes, &routes6,
+                          res.tun, res.mtu);
         slist_free(&routes6);
         wipe(sk, sizeof sk);
         port_close(sockfd);
@@ -968,6 +1337,25 @@ static int cmd_proxy(int argc, char **argv, int start)
         if (rc == 0)
             break;
         if (rc < 0) {
+            /* 内核面启动失败且这是默认选的面 ⇒ 回退 TUN 再试一次（"再失败就
+             * 退出"）。kdp_busy 时例外：本 netns 已有内核会话/设备被占，回退
+             * 过去会用同一账号把那条会话顶掉（服务端对同源 IP 的第二次 OPEN
+             * 按合法重连处理），比直接失败更糟。 */
+            if (kernel_plane && plane_auto && !kdp_busy) {
+                log_err("内核数据面启动失败，自动回退到 TUN 数据面");
+                plane_auto = false;   /* 只回退一次 */
+                kernel_plane = false;
+                if (tun_fd < 0)
+                    tun_fd = proxy_tun_prepare(&o, &rp);
+                if (tun_fd < 0) {
+                    log_err("TUN 数据面也不可用，退出（内核面原因见上）");
+                    break;
+                }
+                continue;
+            }
+            if (kernel_plane && kdp_busy)
+                log_err("本 netns 已有内核会话/设备被占，不回退 TUN"
+                        "（回退会把那条会话顶掉）；先停掉它再试");
             log_err("tunnel setup failed; giving up");
             break;
         }
@@ -980,7 +1368,8 @@ static int cmd_proxy(int argc, char **argv, int start)
     cleanse_str(o.pass);
     cleanse_str(o.ct_pass);
     relay_proxy_stop(rp);
-    tun_close(tun_fd);
+    if (tun_fd >= 0)
+        tun_close(tun_fd);   /* --data-plane kernel: 没有 TUN fd */
     log_info("done.");
 
     slist_free(&routes);

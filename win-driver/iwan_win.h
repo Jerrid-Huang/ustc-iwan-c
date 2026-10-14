@@ -151,6 +151,14 @@ struct _IWAN_MP_BINDING;
 #define IWAN_MP_ETH_TYPE_ARP	0x0806u
 #define IWAN_MP_ETH_TYPE_IP6	0x86DDu
 
+/* 在途外层 NBL 的上限，两个文件都要用同一个数：
+ *   · iwan_win_mpdata.c（引擎）在封装前把关，超限即丢并计 tx_bad_state；
+ *   · iwan_win_proto.c（协议边）在交给 NDIS 前再兜一次。
+ * 每个在途 NBL 占着非分页池（缓冲 + MDL + NBL）直到发送完成回调，内层可能
+ * 远比承载快，没有上限就会以 GB/s 量级净增长、秒级耗尽非分页池 —— WFP 平面
+ * 的硬挂就是这个机制，同一个坑不踩第二次。 */
+#define IWAN_MP_MAX_OUTER_INFLIGHT 4096u
+
 typedef struct _IWAN_MP_PLANE {
 	/* 小型端口侧 */
 	NDIS_HANDLE		mp_handle;	/* MiniportAdapterHandle */

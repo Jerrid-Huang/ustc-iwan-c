@@ -221,6 +221,9 @@ DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registry_path)
 #ifdef IWAN_WIN_PLANE_MP
 	st = iwan_win_mp_init(driver, devobj, ext, registry_path);
 #else
+	/* WFP 平面用不到注册表路径（NDIS 平面要把它转交给
+	 * NdisMRegisterMiniportDriver）。不写这一行在 /W4 /WX 下是 C4100 硬错误。 */
+	UNREFERENCED_PARAMETER(registry_path);
 	st = iwan_win_wfp_init(devobj, ext);
 #endif
 	if (!NT_SUCCESS(st)) {

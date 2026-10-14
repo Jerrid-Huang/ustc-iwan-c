@@ -94,11 +94,13 @@ static bool kdp_win_outer_tuple(int fd, IWAN_WIN_SESSION_OPEN *req,
     return false;
 }
 
-/* 到服务器那一跳的承载路由：给出承载接口 MTU（驱动用它算内层可用 MTU）
- * 与下一跳地址（驱动用它解析承载网卡的邻居地址）。
- * 取不到就退回 1500 / 0：宁可保守，也不要让驱动按 0 算出荒谬的 MTU，
+/* 到服务器那一跳的承载路由：给出承载接口 MTU（驱动用它算内层可用 MTU）、
+ * 下一跳地址（驱动用它解析承载网卡的邻居地址）与承载接口索引（NDIS 平面
+ * 用它把会话钉在"恰好一张下游网卡"上）。
+ * 取不到就退回 1500 / 0 / 0：宁可保守，也不要让驱动按 0 算出荒谬的 MTU，
  * 更不要让它按一个编出来的下一跳去 ARP。 */
-static uint32_t kdp_win_carrier_route(uint32_t dst_be, uint32_t *hop_be)
+static uint32_t kdp_win_carrier_route(uint32_t dst_be, uint32_t *hop_be,
+                                      uint32_t *oif_out)
 {
     MIB_IPFORWARD_ROW2 route;
     MIB_IPINTERFACE_ROW ifrow;
@@ -107,6 +109,7 @@ static uint32_t kdp_win_carrier_route(uint32_t dst_be, uint32_t *hop_be)
     DWORD best;
 
     *hop_be = 0;
+    *oif_out = 0;
 
     memset(&route, 0, sizeof(route));
     memset(&dst, 0, sizeof(dst));
@@ -116,6 +119,9 @@ static uint32_t kdp_win_carrier_route(uint32_t dst_be, uint32_t *hop_be)
     if (GetBestRoute2(NULL, 0, NULL, &dst, 0, &route, NULL) != NO_ERROR)
         return 1500;
     luid = route.InterfaceLuid;
+    /* InterfaceIndex 就是 NDIS 的 ifIndex：协议驱动绑定回调里拿到的
+     * NDIS_BIND_PARAMETERS.BoundIfIndex 用的是同一个索引空间。 */
+    *oif_out = (uint32_t)route.InterfaceIndex;
 
     /* 下一跳：直连路由的 NextHop 是全零，此时对端就在链路上，用对端地址
      * 本身当下一跳（驱动侧的约定：outer_hop == 0 表示"按对端在链路上处理"，
@@ -243,7 +249,8 @@ static int kdp_win_targets_build(const slist_t *v4, const slist_t *v6,
 
 /* ---- 启动预检 --------------------------------------------------------- */
 
-bool kdp_win_plane_precheck(char *err, size_t errsz, bool *busy)
+bool kdp_win_plane_precheck(const wchar_t *device_path, char *err, size_t errsz,
+                            bool *busy)
 {
     windev_t *d = NULL;
     IWAN_WIN_SESSION_INFO info;
@@ -252,7 +259,7 @@ bool kdp_win_plane_precheck(char *err, size_t errsz, bool *busy)
     if (busy != NULL)
         *busy = false;
 
-    rc = windev_open(&d, err, errsz);
+    rc = windev_open_named(&d, device_path, err, errsz);
     if (rc != WINDEV_OK) {
         /* 驱动没装 → 调用者可以回退 TUN 面；其余（版本不符、权限）由
          * windev 的中文原因说明，同样不回退。 */
@@ -288,6 +295,7 @@ bool kdp_win_plane_precheck(char *err, size_t errsz, bool *busy)
 
 int kdp_win_run(int sockfd, const uint8_t xor_key[8], uint16_t sid, uint32_t tok,
                 uint8_t enc, const char *server, const char *dev,
+                const wchar_t *device_path,
                 const slist_t *route_targets, const slist_t *route_targets6,
                 const char *auth_tun_ip, uint16_t auth_mtu, bool *ns_busy)
 {
@@ -336,7 +344,7 @@ int kdp_win_run(int sockfd, const uint8_t xor_key[8], uint16_t sid, uint32_t tok
     }
 
     /* 1) 打开驱动设备。这一步失败 = 本机内核面起不来，允许调用者回退 TUN。 */
-    if (windev_open(&d, err, sizeof(err)) != WINDEV_OK) {
+    if (windev_open_named(&d, device_path, err, sizeof(err)) != WINDEV_OK) {
         log_err("Windows 内核数据面: %s", err);
         rc = -1;
         goto out;
@@ -349,7 +357,8 @@ int kdp_win_run(int sockfd, const uint8_t xor_key[8], uint16_t sid, uint32_t tok
         rc = -1;
         goto out;
     }
-    req.carrier_mtu = kdp_win_carrier_route(req.outer_dst, &req.outer_hop);
+    req.carrier_mtu = kdp_win_carrier_route(req.outer_dst, &req.outer_hop,
+                                            &req.oif_index);
     req.inner_mtu = auth_mtu;
     memcpy(req.key, xor_key, sizeof(req.key));
     req.sid = sid;

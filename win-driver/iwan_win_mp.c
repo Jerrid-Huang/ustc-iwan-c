@@ -117,7 +117,7 @@ iwan_win_mp_initialize(_In_ NDIS_HANDLE MiniportAdapterHandle,
 
 	if (g_mp_ext != NULL) {
 		DbgPrint("iwanmp: 已经有一个隧道适配器，不再接受第二个\n");
-		return NDIS_STATUS_NOT_AVAILABLE;
+		return NDIS_STATUS_NOT_SUPPORTED;
 	}
 
 	/* NBL 池在适配器启动时建、停止时销毁：NdisAllocateNetBufferListPool
@@ -469,7 +469,7 @@ iwan_win_mp_oid_request(_In_ NDIS_HANDLE MiniportAdapterHandle,
 	UNREFERENCED_PARAMETER(MiniportAdapterHandle);
 
 	if (OidRequest->RequestType == NdisRequestSetInformation) {
-		switch (OidRequest->Oid) {
+		switch (OidRequest->DATA.SET_INFORMATION.Oid) {
 		case OID_GEN_CURRENT_PACKET_FILTER:
 		case OID_GEN_CURRENT_LOOKAHEAD:
 		case OID_PNP_SET_POWER:
@@ -482,7 +482,7 @@ iwan_win_mp_oid_request(_In_ NDIS_HANDLE MiniportAdapterHandle,
 	if (OidRequest->RequestType != NdisRequestQueryInformation)
 		return NDIS_STATUS_NOT_SUPPORTED;
 
-	switch (OidRequest->Oid) {
+	switch (OidRequest->DATA.QUERY_INFORMATION.Oid) {
 	case OID_GEN_MAXIMUM_TOTAL_SIZE:
 	case OID_GEN_MAXIMUM_FRAME_SIZE:
 	case OID_GEN_TRANSMIT_BLOCK_SIZE:

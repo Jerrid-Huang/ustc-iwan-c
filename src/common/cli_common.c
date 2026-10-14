@@ -161,3 +161,80 @@ int auth_result_addrs(const AuthResult *res, uint32_t *inner_ip,
     *gateway = ip4_u32(b);
     return 1;
 }
+
+/* ---- --data-plane （见 cli_common.h 的契约） ---- */
+
+bool validate_data_plane(const char *val, char *err, size_t errsz)
+{
+    if (strcmp(val, IWAN_DATA_PLANE_TUN) == 0)
+        return true;
+    if (strcmp(val, IWAN_DATA_PLANE_AUTO) == 0)
+        return true;
+    if (strcmp(val, IWAN_DATA_PLANE_KERNEL) == 0) {
+#if defined(__linux__) || defined(_WIN32)
+        /* Linux = 内核模块 iwan；Windows = WFP callout 驱动 iwan.sys。
+         * 两者语义相同（内核态数据面、报文不进用户态），所以共用同一个取值。
+         * 驱动没装时由运行期决定：auto 会回退 TUN，显式 kernel 报错退出。 */
+        return true;
+#else
+        /* 其余平台（macOS 等）显式传 kernel 必须是用法错误，不能静默降级：
+         * 那台机器上根本不存在这条路径 */
+        snprintf(err, errsz,
+                 "内核数据面（--data-plane kernel）只在 Linux 与 Windows 上可用："
+                 "当前平台没有内核数据面，请用 --data-plane tun（默认的 auto 在本平台就是 tun）");
+        return false;
+#endif
+    }
+    if (strcmp(val, IWAN_DATA_PLANE_KERNEL_MP) == 0) {
+#if defined(_WIN32)
+        /* 第二个内核数据面（NDIS 微型端口 + 协议驱动 iwanmp.sys）。它不是
+         * 默认选择，只在显式点名时使用 —— 新平面还在验证阶段。 */
+        return true;
+#else
+        snprintf(err, errsz,
+                 "内核数据面（--data-plane kernel-mp）只在 Windows 上可用："
+                 "它是 NDIS 微型端口 + 协议驱动那一版（iwanmp.sys），"
+                 "Linux 侧的内核面就叫 kernel");
+        return false;
+#endif
+    }
+    snprintf(err, errsz,
+             "只能是 auto、tun、kernel 或 kernel-mp"
+             "（auto = 默认，Linux 与 Windows 上先试内核面、不可用则回退 tun；"
+             "kernel = 内核数据面，仅 Linux 与 Windows 可用；"
+             "kernel-mp = Windows 的 NDIS 内核数据面），实际是 \"%s\"", val);
+    return false;
+}
+
+bool data_plane_is_kernel(const char *val)
+{
+    return val != NULL &&
+           (strcmp(val, IWAN_DATA_PLANE_KERNEL) == 0 ||
+            strcmp(val, IWAN_DATA_PLANE_KERNEL_MP) == 0);
+}
+
+bool data_plane_is_kernel_mp(const char *val)
+{
+    return val != NULL && strcmp(val, IWAN_DATA_PLANE_KERNEL_MP) == 0;
+}
+
+bool data_plane_is_auto(const char *val)
+{
+    return val == NULL || strcmp(val, IWAN_DATA_PLANE_AUTO) == 0;
+}
+
+const char *data_plane_resolve(const char *val, bool *out_auto)
+{
+    if (val == NULL || strcmp(val, IWAN_DATA_PLANE_AUTO) == 0) {
+        if (out_auto != NULL)
+            *out_auto = true;
+#if defined(__linux__) || defined(_WIN32)
+        return IWAN_DATA_PLANE_KERNEL;
+#else
+        return IWAN_DATA_PLANE_TUN;
+#endif
+    }
+    if (out_auto != NULL)
+        *out_auto = false;
+    return val;
+}

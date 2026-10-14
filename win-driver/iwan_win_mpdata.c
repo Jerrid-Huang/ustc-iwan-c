@@ -35,7 +35,6 @@
  * 没有上限就会以 GB/s 量级净增长、秒级耗尽非分页池 —— 这正是 WFP 平面
  * 硬挂的机制（Kernel-Power 41 + 6008），同一个坑不能踩第二次。
  * 超限丢当前包并计 tx_bad_state，把背压交还给内层协议栈。 */
-#define IWAN_MP_MAX_OUTER_INFLIGHT 4096u
 
 /* "这帧是本会话的什么"，与 WFP 平面 iwan_win_inbound_kind 同义 */
 #define IWAN_MP_IN_NONE		0u	/* 不是本会话的帧（端口不成对） */
