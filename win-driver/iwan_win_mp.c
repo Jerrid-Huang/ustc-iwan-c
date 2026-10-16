@@ -756,31 +756,60 @@ iwan_win_mp_param_get(_In_ PCWSTR name, _In_ ULONG dflt)
 	return out;
 }
 
-/* 小型端口注册：**单次调用**，声明"本机运行时的 NDIS 次版本 + REVISION_1"。
- * 这里曾经放一张 {运行时, 85, 80, 60, 50, 30} × {REVISION_1, REVISION_3} 的
- * 阶梯表逐档试注册。阶梯已经完成使命（客体 Windows 11 24H2 一档、NDIS 6.89，
- * 第一档就命中 ⇒ 卡点从来不是版本），留着它只会让失败路径更难收敛：一次
- * DriverEntry 里试十几次注册，任何一次"成功后又失败"都会留下半个驱动。 */
+/* 小型端口注册：候选表逐档试，命中即用，每一档结果落一个 T4x 键。
+ *
+ * 为什么又回到候选表：上一轮把它改成单次调用（运行时次版本 + REVISION_1），
+ * 客体实测回 **0xC0010005（NDIS_STATUS_BAD_CHARACTERISTICS）**；而当初"阶梯第
+ * 一档就命中"的结论是读到了上一次装机的陈旧键（该轮的键没删干净），
+ * 不成立。一轮只能改一个值的话，每轮是十分钟构建 + 换包 + 重启设备，
+ * 所以这里一次性把候选试完：每档的 NTSTATUS 落 T40+i，命中落 T39（低 8 位
+ * 是 revision，次 8 位是声明的次版本），全部失败落 T38 = 尝试次数。
+ * 失败后不留任何句柄：这一步一个注册都没成功，返回失败是干净的。 */
+typedef struct {
+	UCHAR minor;	/* 0xFF = 用运行时次版本 */
+	UCHAR rev;
+} IWAN_MP_CH_CAND;
+
+static const IWAN_MP_CH_CAND iwan_win_mp_ch_cands[] = {
+	{ 0xFF, NDIS_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_3 },
+	{ 0xFF, NDIS_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_2 },
+	{ 0xFF, NDIS_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_1 },
+	{ 0,    NDIS_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_3 },
+	{ 0,    NDIS_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_1 },
+	{ 80,   NDIS_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_1 },
+	{ 60,   NDIS_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_1 },
+	{ 30,   NDIS_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_1 },
+	{ 20,   NDIS_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_1 }
+};
 static NDIS_STATUS
 iwan_win_mp_register(_In_ PDRIVER_OBJECT driver,
 		     _In_ PUNICODE_STRING registry_path,
 		     _Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 {
 	UINT16 runtime = (UINT16)(NdisGetVersion() & 0xFFFFu);
-	NDIS_MINIPORT_DRIVER_CHARACTERISTICS ch;
-	NDIS_STATUS st;
+	ULONG i;
+	NDIS_STATUS last = NDIS_STATUS_BAD_CHARACTERISTICS;
 
-	iwan_win_mp_fill_ch(&ch, (UCHAR)runtime,
-			    NDIS_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_1);
-	st = NdisMRegisterMiniportDriver(driver, registry_path, ext, &ch,
-					 &ext->mp.mp_driver_handle);
-	iwan_win_mp_trace(40, (LONG)st);
-	if (st == NDIS_STATUS_SUCCESS) {
-		/* 39 = 命中的配置：低 8 位是 revision，次 8 位是声明的次版本 */
-		iwan_win_mp_trace(39, (LONG)((runtime << 8) |
-				NDIS_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_1));
+	for (i = 0; i < RTL_NUMBER_OF(iwan_win_mp_ch_cands); i++) {
+		NDIS_MINIPORT_DRIVER_CHARACTERISTICS ch;
+		UCHAR rev = iwan_win_mp_ch_cands[i].rev;
+		UCHAR minor = iwan_win_mp_ch_cands[i].minor;
+		NDIS_STATUS st;
+
+		if (minor == 0xFF)
+			minor = (UCHAR)runtime;
+		iwan_win_mp_fill_ch(&ch, minor, rev);
+		st = NdisMRegisterMiniportDriver(driver, registry_path, ext, &ch,
+						 &ext->mp.mp_driver_handle);
+		iwan_win_mp_trace(40 + i, (LONG)st);
+		last = st;
+		if (st == NDIS_STATUS_SUCCESS) {
+			iwan_win_mp_trace(39, (LONG)(((ULONG)minor << 8) | rev));
+			return NDIS_STATUS_SUCCESS;
+		}
 	}
-	return st;
+	iwan_win_mp_trace(38, (LONG)RTL_NUMBER_OF(iwan_win_mp_ch_cands));
+	return last;
 }
 
 /* DriverEntry 的装载路径。这里的顺序与失败策略是被一次蓝屏事故定死的：
@@ -825,6 +854,17 @@ iwan_win_mp_init(_In_ PDRIVER_OBJECT driver,
 			DbgPrint("iwanmp: 保险丝已合上（Disarm=1），不注册任何东西\n");
 			return STATUS_UNSUCCESSFUL;
 		}
+	}
+
+	/* DriverObject 是否"干净"是两次装机都回 0xC0010005 之后的头号怀疑：
+	 * 小型端口的卸载入口是特性表里的 UnloadHandler，而 DriverUnload 是
+	 * 普通 WDM 驱动的字段；已经被占用的它可能就是"不是合法的
+	 * 小型端口驱动"的判据。先如实记下再清掉（T7）。 */
+	if (driver->DriverUnload != NULL) {
+		iwan_win_mp_trace(7, 1);
+		driver->DriverUnload = NULL;
+	} else {
+		iwan_win_mp_trace(7, 0);
 	}
 
 	st = iwan_win_mp_register(driver, registry_path, ext);

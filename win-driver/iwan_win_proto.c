@@ -711,15 +711,26 @@ iwan_win_mp_release_carrier(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 NTSTATUS
 iwan_win_proto_init(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 {
-	/* 声明"本机运行时的 NDIS 次版本 + REVISION_1"，**单次调用**。这里也
-	 * 曾经放一张 {运行时, 85, 80, 60, 30} 的候选表逐档试注册；小型端口侧
-	 * 的实测已经说明卡点不是版本号（运行时次版本第一档就命中），而一次
-	 * DriverEntry 里试十几次注册，任何一次"成功后又失败"都会留下半个驱动
-	 * —— 那正是整机无法启动那次事故的机理。失败就如实返回，由装载路径
-	 * 决定"协议边缺席也能继续"。 */
+	/* 单次注册被客体实测拒绝（小型端口侧 0xC0010005 = NDIS_STATUS_BAD_
+	 * CHARACTERISTICS，见 mp.c 的说明），而且旧实验里"版本第一档就命中"是读到了
+	 * 陈旧键。这里因此恢复候选表：每档落 T60+i，命中落 T69（值是声明
+	 * 的次版本），全部失败落 T58 = 尝试次数。第一档没成功就继续试的前提是
+	 * "没成功就不留句柄"：只有成功那一档会写 proto_handle。 */
 	NDIS_PROTOCOL_DRIVER_CHARACTERISTICS ch;
-	NDIS_STATUS st;
+	NDIS_STATUS last = NDIS_STATUS_BAD_CHARACTERISTICS;
 	UCHAR runtime = (UCHAR)(NdisGetVersion() & 0xFFu);
+	/* 0xFF = 用运行时次版本；后面几档是保守声明 */
+	static const UCHAR cand_minor[] = { 0xFF, 0xFF, 0, 0, 80, 60, 30 };
+	static const UCHAR cand_rev[] = {
+		NDIS_PROTOCOL_DRIVER_CHARACTERISTICS_REVISION_1,
+		NDIS_PROTOCOL_DRIVER_CHARACTERISTICS_REVISION_2,
+		NDIS_PROTOCOL_DRIVER_CHARACTERISTICS_REVISION_1,
+		NDIS_PROTOCOL_DRIVER_CHARACTERISTICS_REVISION_2,
+		NDIS_PROTOCOL_DRIVER_CHARACTERISTICS_REVISION_1,
+		NDIS_PROTOCOL_DRIVER_CHARACTERISTICS_REVISION_1,
+		NDIS_PROTOCOL_DRIVER_CHARACTERISTICS_REVISION_1
+	};
+	ULONG ci;
 
 	if (InterlockedExchange(&g_proto_started, 1) != 0)
 		return STATUS_SUCCESS;
@@ -727,38 +738,51 @@ iwan_win_proto_init(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 	InitializeListHead(&g_bindings);
 	KeInitializeSpinLock(&g_bind_lock);
 
-	RtlZeroMemory(&ch, sizeof(ch));
-	ch.Header.Type = NDIS_OBJECT_TYPE_PROTOCOL_DRIVER_CHARACTERISTICS;
-	ch.Header.Revision = NDIS_PROTOCOL_DRIVER_CHARACTERISTICS_REVISION_1;
-	ch.Header.Size = NDIS_SIZEOF_PROTOCOL_DRIVER_CHARACTERISTICS_REVISION_1;
-	ch.MajorNdisVersion = 6;
-	ch.MinorNdisVersion = runtime;
-	ch.MajorDriverVersion = 1;
-	ch.MinorDriverVersion = 0;
-	ch.Flags = 0;
-	NdisInitUnicodeString(&ch.Name, L"IWANMP");
-	ch.SetOptionsHandler = iwan_win_proto_set_options;
-	ch.BindAdapterHandlerEx = iwan_win_proto_bind;
-	ch.UnbindAdapterHandlerEx = iwan_win_proto_unbind;
-	ch.OpenAdapterCompleteHandlerEx = iwan_win_proto_open_complete;
-	ch.CloseAdapterCompleteHandlerEx = iwan_win_proto_close_complete;
-	ch.NetPnPEventHandler = iwan_win_proto_pnp_event;
-	ch.StatusHandlerEx = iwan_win_proto_status;
-	ch.ReceiveNetBufferListsHandler = iwan_win_proto_recv_nbls;
-	ch.SendNetBufferListsCompleteHandler = iwan_win_proto_send_complete;
+	for (ci = 0; ci < RTL_NUMBER_OF(cand_minor); ci++) {
+		UCHAR minor = cand_minor[ci] == 0xFF ? runtime : cand_minor[ci];
+		NDIS_STATUS st;
 
-	st = NdisRegisterProtocolDriver(ext, &ch, &ext->mp.proto_handle);
-	iwan_win_mp_trace(60, (LONG)st);
-	if (st != NDIS_STATUS_SUCCESS) {
-		ext->mp.proto_handle = NULL;	/* 不留半个句柄 */
-		InterlockedExchange(&g_proto_started, 0);
-		DbgPrint("iwanmp: NdisRegisterProtocolDriver（NDIS 6.%u）失败 0x%08lx\n",
-			 (unsigned)runtime, (unsigned long)st);
-		return st;
+		RtlZeroMemory(&ch, sizeof(ch));
+		ch.Header.Type = NDIS_OBJECT_TYPE_PROTOCOL_DRIVER_CHARACTERISTICS;
+		ch.Header.Revision = cand_rev[ci];
+		ch.Header.Size = (cand_rev[ci] ==
+				  NDIS_PROTOCOL_DRIVER_CHARACTERISTICS_REVISION_2) ?
+			NDIS_SIZEOF_PROTOCOL_DRIVER_CHARACTERISTICS_REVISION_2 :
+			NDIS_SIZEOF_PROTOCOL_DRIVER_CHARACTERISTICS_REVISION_1;
+		ch.MajorNdisVersion = 6;
+		ch.MinorNdisVersion = minor;
+		ch.MajorDriverVersion = 1;
+		ch.MinorDriverVersion = 0;
+		ch.Flags = 0;
+		NdisInitUnicodeString(&ch.Name, L"IWANMP");
+		ch.SetOptionsHandler = iwan_win_proto_set_options;
+		ch.BindAdapterHandlerEx = iwan_win_proto_bind;
+		ch.UnbindAdapterHandlerEx = iwan_win_proto_unbind;
+		ch.OpenAdapterCompleteHandlerEx = iwan_win_proto_open_complete;
+		ch.CloseAdapterCompleteHandlerEx = iwan_win_proto_close_complete;
+		ch.NetPnPEventHandler = iwan_win_proto_pnp_event;
+		ch.StatusHandlerEx = iwan_win_proto_status;
+		ch.ReceiveNetBufferListsHandler = iwan_win_proto_recv_nbls;
+		ch.SendNetBufferListsCompleteHandler = iwan_win_proto_send_complete;
+
+		st = NdisRegisterProtocolDriver(ext, &ch,
+						&ext->mp.proto_handle);
+		iwan_win_mp_trace(60 + ci, (LONG)st);
+		last = st;
+		if (st == NDIS_STATUS_SUCCESS) {
+			iwan_win_mp_trace(69, (LONG)minor);
+			DbgPrint("iwanmp: 协议边已注册（NDIS 6.%u, rev %u）\n",
+				 (unsigned)minor, (unsigned)cand_rev[ci]);
+			return STATUS_SUCCESS;
+		}
 	}
-	iwan_win_mp_trace(69, (LONG)runtime);
-	DbgPrint("iwanmp: 协议边已注册（NDIS 6.%u）\n", (unsigned)runtime);
-	return STATUS_SUCCESS;
+	/* 一档都没成功：不留半个句柄 */
+	ext->mp.proto_handle = NULL;
+	InterlockedExchange(&g_proto_started, 0);
+	iwan_win_mp_trace(58, (LONG)RTL_NUMBER_OF(cand_minor));
+	DbgPrint("iwanmp: NdisRegisterProtocolDriver 全部候选失败 0x%08lx\n",
+		 (unsigned long)last);
+	return last;
 }
 
 VOID
