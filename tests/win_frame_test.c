@@ -516,6 +516,30 @@ test_inbound(void)
 		      IWAN_WIN_FRAME_DATA, "数据帧分类不应受会话闸门影响");
 	}
 
+	/* --- 类型与帧头 enc 必须自洽：否则加密会话可被降级成明文直通 ---
+	 * 解封那一侧（iwan_win_decap）是按帧里的 o->enc 决定要不要解密的，
+	 * 分类只看类型就留下了缺口：会话是加密的，攻击者发 type=PT_DATA_ENC
+	 * 但 enc=0（sid/tok 在帧头明文，照抄即可），decap 走明文分支，
+	 * 任意内层包直通。下面两组是"闸门必须拦住、而 decap 本身拦不住"的证据。 */
+	{
+		total = build_outer(outer, 32, 40000, 6001, PT_DATA_ENC, 0, sid, tok, 0);
+		memcpy(outer + 36, inner, 32);
+		CHECK(iwan_win_outer_parse4(outer, total, &o), "解析失败");
+		CHECK(o.type == PT_DATA_ENC && o.enc == 0, "帧头字段解析错位");
+		CHECK(iwan_win_frame_classify(&o, sid, tok, TRUE, TRUE) ==
+		      IWAN_WIN_FRAME_BAD, "加密会话里 enc=0 的数据帧必须丢弃");
+		CHECK(iwan_win_decap(outer, total, &o, key, out, sizeof(out)) == 32 &&
+		      memcmp(out, inner, 32) == 0,
+		      "对照：decap 确实按帧里的 enc 走明文分支，闸门只能在分类处");
+
+		total = build_outer(outer, 32, 40000, 6001, PT_DATA, 1, sid, tok, 0);
+		memcpy(outer + 36, inner, 32);
+		CHECK(iwan_win_outer_parse4(outer, total, &o), "解析失败");
+		CHECK(o.enc == 1, "帧头 enc 解析错位");
+		CHECK(iwan_win_frame_classify(&o, sid, tok, FALSE, TRUE) ==
+		      IWAN_WIN_FRAME_BAD, "明文会话里 enc=1 的数据帧必须丢弃");
+	}
+
 	/* --- 控制帧：ECHO/CLOSE 要凭据，握手帧一律转交；ping 接受固定凭据 --- */
 	{
 		static const struct { uint8_t type; uint16_t sid; uint32_t tok;

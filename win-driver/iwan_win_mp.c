@@ -512,24 +512,46 @@ iwan_win_mp_return_nbls(_In_ NDIS_HANDLE MiniportAdapterHandle,
 
 /* ---- 小型端口：OID --------------------------------------------------- */
 
-/* 按请求缓冲的长度写 4 或 8 字节（NDIS 6 里两者都合法） */
+/* 按 OID 的**定义宽度**写。原先一律"缓冲够 8 就写 8"：对 4 字节的 OID
+ * （LINK_SPEED、MTU、MEDIA_* 等）值虽然恰好落在低 4 字节，但 BytesWritten
+ * 撒谎；对 2 字节的 OID_GEN_DRIVER_VERSION 更糟 —— 上层只读低 2 字节，
+ * 报出去的 NDIS 版本号是错的。 */
+static NDIS_STATUS
+iwan_win_mp_oid_put_width(_Inout_ PNDIS_OID_REQUEST oid, _In_ UINT64 v,
+			  _In_ ULONG width)
+{
+	PUCHAR buf = (PUCHAR)oid->DATA.QUERY_INFORMATION.InformationBuffer;
+
+	if (oid->DATA.QUERY_INFORMATION.InformationBufferLength < width) {
+		oid->DATA.QUERY_INFORMATION.BytesNeeded = width;
+		return NDIS_STATUS_BUFFER_TOO_SHORT;
+	}
+	if (width == 8)
+		*(UINT64 UNALIGNED *)buf = v;
+	else if (width == 4)
+		*(UINT32 UNALIGNED *)buf = (UINT32)v;
+	else
+		*(UINT16 UNALIGNED *)buf = (UINT16)v;
+	oid->DATA.QUERY_INFORMATION.BytesWritten = width;
+	return NDIS_STATUS_SUCCESS;
+}
+
 static NDIS_STATUS
 iwan_win_mp_oid_put_u64(_Inout_ PNDIS_OID_REQUEST oid, _In_ UINT64 v)
 {
-	ULONG need = (oid->DATA.QUERY_INFORMATION.InformationBufferLength >= 8) ?
-		     8u : 4u;
-	PUCHAR buf = (PUCHAR)oid->DATA.QUERY_INFORMATION.InformationBuffer;
+	return iwan_win_mp_oid_put_width(oid, v, 8);
+}
 
-	if (oid->DATA.QUERY_INFORMATION.InformationBufferLength < need) {
-		oid->DATA.QUERY_INFORMATION.BytesNeeded = need;
-		return NDIS_STATUS_BUFFER_TOO_SHORT;
-	}
-	if (need == 8)
-		*(UINT64 UNALIGNED *)buf = v;
-	else
-		*(UINT32 UNALIGNED *)buf = (UINT32)v;
-	oid->DATA.QUERY_INFORMATION.BytesWritten = need;
-	return NDIS_STATUS_SUCCESS;
+static NDIS_STATUS
+iwan_win_mp_oid_put_u32(_Inout_ PNDIS_OID_REQUEST oid, _In_ UINT32 v)
+{
+	return iwan_win_mp_oid_put_width(oid, v, 4);
+}
+
+static NDIS_STATUS
+iwan_win_mp_oid_put_u16(_Inout_ PNDIS_OID_REQUEST oid, _In_ UINT16 v)
+{
+	return iwan_win_mp_oid_put_width(oid, v, 2);
 }
 
 static NDIS_STATUS
@@ -589,40 +611,43 @@ iwan_win_mp_oid_request(_In_ NDIS_HANDLE MiniportAdapterHandle,
 		return NDIS_STATUS_SUCCESS;
 	}
 	case OID_GEN_HARDWARE_STATUS:
-		return iwan_win_mp_oid_put_u64(OidRequest, NdisHardwareStatusReady);
+		return iwan_win_mp_oid_put_u32(OidRequest, (UINT32)NdisHardwareStatusReady);
 	case OID_GEN_MEDIA_SUPPORTED:
 	case OID_GEN_MEDIA_IN_USE:
 		/* 裸 IP 介质：没有以太头、没有 ARP/ND，地址与 MTU 由控制面设 */
-		return iwan_win_mp_oid_put_u64(OidRequest, NdisMediumIP);
+		return iwan_win_mp_oid_put_u32(OidRequest, (UINT32)NdisMediumIP);
 	case OID_GEN_PHYSICAL_MEDIUM:
-		return iwan_win_mp_oid_put_u64(OidRequest,
-					       NdisPhysicalMediumUnspecified);
+		return iwan_win_mp_oid_put_u32(OidRequest,
+					       (UINT32)NdisPhysicalMediumUnspecified);
 	case OID_GEN_MAC_OPTIONS:
-		return iwan_win_mp_oid_put_u64(OidRequest, 0u);
+		return iwan_win_mp_oid_put_u32(OidRequest, 0u);
 	case OID_GEN_LINK_SPEED:
 		/* 这是 OID 语义要求的"名义链路速率"，单位 100 bps：
 		 * 1 Gbps ⇒ 10,000,000。真实吞吐只能由测量给出，不在这里报。 */
-		return iwan_win_mp_oid_put_u64(OidRequest, 10000000u);
+		return iwan_win_mp_oid_put_u32(OidRequest, 10000000u);
 	case OID_GEN_MAXIMUM_LOOKAHEAD:
 	case OID_GEN_MAXIMUM_TOTAL_SIZE:
 	case OID_GEN_MAXIMUM_FRAME_SIZE:
 	case OID_GEN_TRANSMIT_BLOCK_SIZE:
 	case OID_GEN_RECEIVE_BLOCK_SIZE:
 	case OID_GEN_CURRENT_LOOKAHEAD:
-		return iwan_win_mp_oid_put_u64(OidRequest, IWAN_MP_INNER_MTU);
+		return iwan_win_mp_oid_put_u32(OidRequest, IWAN_MP_INNER_MTU);
 	case OID_GEN_TRANSMIT_BUFFER_SPACE:
 	case OID_GEN_RECEIVE_BUFFER_SPACE:
-		return iwan_win_mp_oid_put_u64(OidRequest, 0x400000u);
+		return iwan_win_mp_oid_put_u32(OidRequest, 0x400000u);
 	case OID_GEN_VENDOR_ID:
-		return iwan_win_mp_oid_put_u64(OidRequest, 0xFFFFFF00u);
+		return iwan_win_mp_oid_put_u32(OidRequest, 0xFFFFFF00u);
 	case OID_GEN_VENDOR_DESCRIPTION:
 		return iwan_win_mp_oid_string(OidRequest, "iWAN tunnel");
 	case OID_GEN_DRIVER_VERSION:
-		return iwan_win_mp_oid_put_u64(OidRequest, 0x0100u);
+		/* 语义是"本驱动符合的 NDIS 版本"：高字节主版本、低字节次版本。
+		 * 运行时 6.89 → 0x0659；原先写 0x0100 等于对外宣称 1.0。 */
+		return iwan_win_mp_oid_put_u16(OidRequest,
+			(UINT16)(NdisGetVersion() & 0xFFFFu));
 	case OID_GEN_MEDIA_CONNECT_STATUS:
-		return iwan_win_mp_oid_put_u64(OidRequest, NdisMediaStateConnected);
+		return iwan_win_mp_oid_put_u32(OidRequest, (UINT32)NdisMediaStateConnected);
 	case OID_GEN_CURRENT_PACKET_FILTER:
-		return iwan_win_mp_oid_put_u64(OidRequest,
+		return iwan_win_mp_oid_put_u32(OidRequest,
 			NDIS_PACKET_TYPE_DIRECTED | NDIS_PACKET_TYPE_BROADCAST |
 			NDIS_PACKET_TYPE_ALL_MULTICAST);
 	case OID_GEN_XMIT_OK:

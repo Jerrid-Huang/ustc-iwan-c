@@ -96,14 +96,25 @@ iwan_win_mp_trace(_In_ ULONG stage, _In_ LONG status)
 	InitializeObjectAttributes(&oa, &path,
 				   OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
 				   NULL, NULL);
-	if (!NT_SUCCESS(ZwCreateKey(&key, KEY_SET_VALUE, &oa, 0, NULL,
-				    REG_OPTION_NON_VOLATILE, NULL)))
-		return;
+	{
+		NTSTATUS ks = ZwCreateKey(&key, KEY_SET_VALUE, &oa, 0, NULL,
+					  REG_OPTION_NON_VOLATILE, NULL);
+
+		/* 静默的诊断通道等于没有诊断：键建不出来（路径/权限）时至少让
+		 * DbgPrint 留一句，否则现场看起来"什么都没发生"。 */
+		if (!NT_SUCCESS(ks)) {
+			DbgPrint("iwanmp: trace 键打不开 0x%08lx（stage=%ld）\n",
+				 (unsigned long)ks, (long)stage);
+			return;
+		}
+	}
 
 	RtlInitUnicodeString(&vn, L"Stage");
 	(void)ZwSetValueKey(key, &vn, 0, REG_DWORD, &stage, sizeof(stage));
 	RtlInitUnicodeString(&vn, L"Status");
-	(void)ZwSetValueKey(key, &vn, 0, REG_DWORD, &status, sizeof(status));
+	if (!NT_SUCCESS(ZwSetValueKey(key, &vn, 0, REG_DWORD, &status,
+				      sizeof(status))))
+		DbgPrint("iwanmp: trace 写失败（stage=%ld）\n", (long)stage);
 
 	/* 每个阶段再各写一个不会互相覆盖的键（T<十进制阶段号>）：Stage/Status
 	 * 只留最后一次，而"哪一步失败"往往要靠更早的那一次才能判读。键名现拼
