@@ -435,6 +435,60 @@ jobs:
           }
           if ($bad -ne 0) { exit 1 }
 
+      # MSVC 静态分析（PREfast /analyze）。刻意用 cl.exe 直接跑而不是 msbuild 的
+      # 属性：属性名写错会被静默忽略，而 /analyze:log 只有真的分析了才会写出 XML,
+      # 所以"XML 是否存在"本身就是阳性对照（不能只看有没有告警）。
+      - name: cl 静态分析（/analyze）
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $msvc = Get-ChildItem "$env:VSDIR\VC\Tools\MSVC" -Directory |
+                  Sort-Object Name | Select-Object -Last 1
+          $cl = Get-ChildItem $msvc.FullName -Recurse -Filter cl.exe |
+                Where-Object { $_.FullName -match 'Hostx64\\x64' } | Select-Object -First 1
+          "CL=$($cl.FullName)"
+          $incs = @("$env:WDKINC\km", "$env:WDKINC\km\crt", "$env:WDKINC\shared",
+                    "$env:WDKINC\ucrt", "$($msvc.FullName)\include") |
+                  Where-Object { Test-Path $_ } | ForEach-Object { "/I$_" }
+          New-Item -ItemType Directory -Force -Path analyze-obj | Out-Null
+          $common = @('/nologo', '/kernel', '/c', '/std:c11', '/W4', '/WX-',
+                      '/analyze', "/Fo$env:GITHUB_WORKSPACE\analyze-obj\",
+                      '/Iwin-driver', '/Isrc\common') + $incs + @('/D_AMD64_')
+          $sets = @(
+            @{ log = 'analysis-wfp.xml'; defs = @('/DNDIS630');
+               src = @('win-driver\iwan_win_drv.c', 'win-driver\iwan_win_session.c',
+                       'win-driver\iwan_win_wfp.c', 'win-driver\iwan_win_frame.c') },
+            @{ log = 'analysis-mp.xml'; defs = @('/DNDIS630', '/DNDIS_WDM', '/DIWAN_WIN_PLANE_MP');
+               src = @('win-driver\iwan_win_proto.c', 'win-driver\iwan_win_mpdata.c',
+                       'win-driver\iwan_win_drv.c', 'win-driver\iwan_win_session.c',
+                       'win-driver\iwan_win_frame.c') },
+            @{ log = 'analysis-mp-miniport.xml';
+               defs = @('/DNDIS_MINIPORT_DRIVER', '/DNDIS620_MINIPORT', '/DNDIS683_MINIPORT',
+                        '/DNDIS_WDM', '/DIWAN_WIN_PLANE_MP');
+               src = @('win-driver\iwan_win_mp.c') })
+          foreach ($s in $sets) {
+            $a = $common + $s.defs + @("/analyze:log", $s.log) + $s.src
+            & $cl.FullName @a 2>&1 | Tee-Object -FilePath ($s.log -replace '\.xml$', '.log')
+            "analyze $($s.log) 退出码=$LASTEXITCODE"
+          }
+
+      # 阳性对照：XML 不存在就说明 /analyze 根本没跑（或者提前失败），此时"0 告警"
+      # 毫无意义。这一步刻意不 continue-on-error，让它在工作流结论上显形。
+      - name: 断言静态分析真的跑了
+        if: always()
+        shell: pwsh
+        run: |
+          $bad = 0
+          foreach ($f in @('analysis-wfp.xml', 'analysis-mp.xml', 'analysis-mp-miniport.xml')) {
+            if (Test-Path $f) {
+              "$f 存在：$((Get-Item $f).Length) 字节"
+            } else {
+              "$f 不存在 —— 静态分析没跑成，本次结果不可信"
+              $bad = 1
+            }
+          }
+          if ($bad -ne 0) { exit 1 }
+
       - name: 回传产物与日志
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -448,5 +502,6 @@ jobs:
             win-driver/iwanmp.inf
             wdk-src/**
             out/devcon.exe
+            analysis-*.xml
             **/*.log
           if-no-files-found: warn
