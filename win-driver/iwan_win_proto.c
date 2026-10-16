@@ -53,6 +53,7 @@ typedef struct _IWAN_MP_BINDING {
 	UINT8			mac[6];
 	ULONG			mac_len;
 	volatile LONG		opened;		/* 1=打开成功，可收发 */
+	volatile LONG		closed;		/* 1=已关闭，不可再选作出向承载 */
 	volatile LONG		outstanding;	/* 已发出、未完成的 NBL 数 */
 } IWAN_MP_BINDING;
 
@@ -81,26 +82,43 @@ iwan_win_proto_lookup_locked(_In_ UINT32 ifindex)
 	for (e = g_bindings.Flink; e != &g_bindings; e = e->Flink) {
 		IWAN_MP_BINDING *b = CONTAINING_RECORD(e, IWAN_MP_BINDING, link);
 
-		if (b->ifindex == ifindex && b->opened)
+		if (b->ifindex == ifindex && b->opened && !b->closed)
 			return b;
 	}
 	return NULL;
 }
 
-/* 从绑定表摘除并释放。调用者不得持有 g_bind_lock。 */
+/* 关闭一条绑定：只打标记 + 撤掉"会话正选着它"的引用，**绝不释放**。
+ *
+ * 绑定对象同时被三条异步路径引用：bind 的完成（open_complete）、unbind 的
+ * 完成（close_complete）、以及已经交给 NDIS、还没回调的发送（send_complete
+ * 要减在途数）。早期版本在 bind/unbind 返回 NDIS_STATUS_PENDING 时就
+ * ExFreePoolWithTag，完成回调再来就是释放后使用 —— 蓝屏的经典形状。
+ * 现在 g_bindings 挂着"曾经分配过的全部绑定"，关闭只是打 closed 标记，
+ * 真正的释放推迟到 iwan_win_proto_fini：那时 NdisDeregisterProtocolDriver
+ * 已经返回，NDIS 保证不会再有任何回调进来。 */
 static VOID
-iwan_win_proto_binding_unlink(_Inout_ IWAN_MP_BINDING *b)
+iwan_win_proto_binding_close(_Inout_ IWAN_MP_BINDING *b)
 {
+	IWAN_MP_PLANE *mp = &b->ext->mp;
 	KIRQL old;
 
-	KeAcquireSpinLock(&g_bind_lock, &old);
-	if (b->link.Flink != NULL) {
-		RemoveEntryList(&b->link);
-		b->link.Flink = NULL;
-		b->link.Blink = NULL;
+	InterlockedExchange(&b->opened, 0);
+	InterlockedExchange(&b->closed, 1);
+
+	/* 会话若正选着这张卡，立刻放掉：否则出向会继续往一个已经关闭的
+	 * 绑定上发（NdisSendNetBufferLists 拿一个关掉的句柄没有好下场）。 */
+	KeAcquireSpinLock(&mp->lock, &old);
+	if (mp->active == b) {
+		mp->active = NULL;
+		mp->active_ifindex = 0;
+		mp->next_hop_be = 0;
+		InterlockedExchange(&mp->peer_mac_valid, 0);
+		InterlockedExchange(&mp->peer_mac_pending, 0);
+		mp->arp_ts_ms = 0;
+		mp->arp_last_ms = 0;
 	}
-	KeReleaseSpinLock(&g_bind_lock, old);
-	ExFreePoolWithTag(b, IWAN_TAG_PKT);
+	KeReleaseSpinLock(&mp->lock, old);
 }
 
 /* ---- 邻居（ARP） ------------------------------------------------------- */
@@ -459,10 +477,6 @@ iwan_win_proto_recv_nbls(_In_ NDIS_HANDLE ProtocolBindingContext,
 
 	UNREFERENCED_PARAMETER(PortNumber);
 	UNREFERENCED_PARAMETER(NumberOfNetBufferLists);
-	/* 带 RESOURCES 表示数据只在本次调用期间有效，不带时我们同样立刻归还
-	 * （本边不留 NBL）。两种情况都不需要看 DISPATCH_LEVEL 位 —— 本文件
-	 * 全部代码都能在 DISPATCH_LEVEL 跑。 */
-	UNREFERENCED_PARAMETER(ReceiveFlags);
 
 	for (nbl = NetBufferLists; nbl != NULL;
 	     nbl = NET_BUFFER_LIST_NEXT_NBL(nbl)) {
@@ -475,9 +489,14 @@ iwan_win_proto_recv_nbls(_In_ NDIS_HANDLE ProtocolBindingContext,
 			iwan_win_proto_recv_one(ext, nb);
 		}
 	}
-	NdisReturnNetBufferLists(b->binding, NetBufferLists,
-				 (KeGetCurrentIrql() == DISPATCH_LEVEL) ?
-					NDIS_RETURN_FLAGS_DISPATCH_LEVEL : 0);
+	/* 带 RESOURCES 时这批 NBL 只是**借用**，所有权还在下层：既不能保留，
+	 * 更不能归还（归还一个不属于自己的 NBL 是蓝屏的经典入口）。本边本来
+	 * 就不留 NBL，所以这里只是跳过归还。 */
+	if ((ReceiveFlags & NDIS_RECEIVE_FLAGS_RESOURCES) == 0) {
+		NdisReturnNetBufferLists(b->binding, NetBufferLists,
+					 (KeGetCurrentIrql() == DISPATCH_LEVEL) ?
+						NDIS_RETURN_FLAGS_DISPATCH_LEVEL : 0);
+	}
 }
 
 /* ---- 绑定生命周期 ----------------------------------------------------- */
@@ -488,8 +507,13 @@ iwan_win_proto_open_complete(_In_ NDIS_HANDLE ProtocolBindingContext,
 {
 	IWAN_MP_BINDING *b = (IWAN_MP_BINDING *)ProtocolBindingContext;
 
-	if (Status == NDIS_STATUS_SUCCESS)
+	if (Status == NDIS_STATUS_SUCCESS) {
 		InterlockedExchange(&b->opened, 1);
+	} else {
+		/* 打开失败：这条绑定不能用，打关闭标记（不释放 —— bind 的
+		 * 返回路径可能还在用它，而且 NDIS 可能已经在往上指示/发送）。 */
+		iwan_win_proto_binding_close(b);
+	}
 	/* bind 的完成回执：BindAdapterEx 返回 PENDING 时由这里收尾 */
 	NdisCompleteBindAdapterEx(b->bind_context, Status);
 }
@@ -499,9 +523,8 @@ iwan_win_proto_close_complete(_In_ NDIS_HANDLE ProtocolBindingContext)
 {
 	IWAN_MP_BINDING *b = (IWAN_MP_BINDING *)ProtocolBindingContext;
 
-	InterlockedExchange(&b->opened, 0);
+	iwan_win_proto_binding_close(b);
 	NdisCompleteUnbindAdapterEx(b->bind_context);
-	iwan_win_proto_binding_unlink(b);
 }
 
 static NDIS_STATUS
@@ -556,7 +579,13 @@ iwan_win_proto_bind(_In_ NDIS_HANDLE ProtocolDriverContext,
 		 * NdisCompleteBindAdapterEx，直接回 SUCCESS 即完成绑定。 */
 		return NDIS_STATUS_SUCCESS;
 	}
-	iwan_win_proto_binding_unlink(b);
+	if (st == NDIS_STATUS_PENDING) {
+		/* 异步打开：完成由 open_complete 收尾。这里**不能**动这条绑定
+		 * （曾经在这里释放，等 open_complete 回来就是释放后使用）。 */
+		return NDIS_STATUS_PENDING;
+	}
+	/* 硬失败：打关闭标记即可，内存留到 fini 统一释放 */
+	iwan_win_proto_binding_close(b);
 	return st;
 }
 
@@ -568,17 +597,17 @@ iwan_win_proto_unbind(_In_ NDIS_HANDLE UnbindContext,
 	NDIS_STATUS st;
 
 	b->bind_context = UnbindContext;
-	InterlockedExchange(&b->opened, 0);
 	st = NdisCloseAdapterEx(b->binding);
-	if (st == NDIS_STATUS_SUCCESS) {
-		/* close 同步完成：CloseAdapterComplete 不会再来，自己收尾 */
-		NdisCompleteUnbindAdapterEx(UnbindContext);
-		iwan_win_proto_binding_unlink(b);
-		return NDIS_STATUS_SUCCESS;
+	if (st == NDIS_STATUS_PENDING) {
+		/* 异步关闭：close_complete 收尾（同样不能在这里释放绑定） */
+		return NDIS_STATUS_PENDING;
 	}
-	if (st != NDIS_STATUS_PENDING)
-		iwan_win_proto_binding_unlink(b);	/* 关不掉也得把表清干净 */
-	return st;
+	/* 成功或失败都到这里：绑定已经（或注定）不能用，打关闭标记。
+	 * 关闭失败也要完成 unbind —— 留着一条永远不会完成的 unbind 会让
+	 * NDIS 的绑定状态机卡住（整机失去响应那次的形状）。 */
+	iwan_win_proto_binding_close(b);
+	NdisCompleteUnbindAdapterEx(UnbindContext);
+	return NDIS_STATUS_SUCCESS;
 }
 
 static NDIS_STATUS
@@ -676,15 +705,15 @@ iwan_win_mp_release_carrier(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 NTSTATUS
 iwan_win_proto_init(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 {
-	/* 声明的 NDIS 次版本必须被这台机器的 NDIS 接受：客体实测小型端口侧
-	 * 声明 6.30 被拒（0xC0010005），改成运行时版本才通过，协议侧很可能
-	 * 是同一条规矩（0 = 运行时版本）。逐个候选试，每个候选的结果各落一个
-	 * 键（阶段 60 起），一次装机就能看清是哪一档被接受。 */
-	static const UCHAR minors[] = { 0u, 85u, 80u, 60u, 30u };
+	/* 声明"本机运行时的 NDIS 次版本 + REVISION_1"，**单次调用**。这里也
+	 * 曾经放一张 {运行时, 85, 80, 60, 30} 的候选表逐档试注册；小型端口侧
+	 * 的实测已经说明卡点不是版本号（运行时次版本第一档就命中），而一次
+	 * DriverEntry 里试十几次注册，任何一次"成功后又失败"都会留下半个驱动
+	 * —— 那正是整机无法启动那次事故的机理。失败就如实返回，由装载路径
+	 * 决定"协议边缺席也能继续"。 */
 	NDIS_PROTOCOL_DRIVER_CHARACTERISTICS ch;
-	NDIS_STATUS st = NDIS_STATUS_NOT_SUPPORTED;
+	NDIS_STATUS st;
 	UCHAR runtime = (UCHAR)(NdisGetVersion() & 0xFFu);
-	ULONG mi;
 
 	if (InterlockedExchange(&g_proto_started, 1) != 0)
 		return STATUS_SUCCESS;
@@ -692,15 +721,12 @@ iwan_win_proto_init(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 	InitializeListHead(&g_bindings);
 	KeInitializeSpinLock(&g_bind_lock);
 
-	for (mi = 0; mi < RTL_NUMBER_OF(minors); mi++) {
-		UCHAR minor = (mi == 0) ? runtime : minors[mi];
-
 	RtlZeroMemory(&ch, sizeof(ch));
 	ch.Header.Type = NDIS_OBJECT_TYPE_PROTOCOL_DRIVER_CHARACTERISTICS;
 	ch.Header.Revision = NDIS_PROTOCOL_DRIVER_CHARACTERISTICS_REVISION_1;
 	ch.Header.Size = NDIS_SIZEOF_PROTOCOL_DRIVER_CHARACTERISTICS_REVISION_1;
 	ch.MajorNdisVersion = 6;
-	ch.MinorNdisVersion = minor;
+	ch.MinorNdisVersion = runtime;
 	ch.MajorDriverVersion = 1;
 	ch.MinorDriverVersion = 0;
 	ch.Flags = 0;
@@ -714,24 +740,19 @@ iwan_win_proto_init(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 	ch.StatusHandlerEx = iwan_win_proto_status;
 	ch.ReceiveNetBufferListsHandler = iwan_win_proto_recv_nbls;
 	ch.SendNetBufferListsCompleteHandler = iwan_win_proto_send_complete;
-	/* 不发 OID：MAC 与接口索引都从 BindParameters 里取（协议驱动特有），
-	 * 所以不需要 OidRequestCompleteHandler / DirectOidRequestCompleteHandler */
 
 	st = NdisRegisterProtocolDriver(ext, &ch, &ext->mp.proto_handle);
-	iwan_win_mp_trace(60u + mi, (LONG)st);
-	if (st == NDIS_STATUS_SUCCESS) {
-		/* 69 = 命中：低 8 位是声明的次版本 */
-		iwan_win_mp_trace(69, (LONG)minor);
-		DbgPrint("iwanmp: 协议边已注册（NDIS 6.%u）\n",
-			 (unsigned)minor);
-		return STATUS_SUCCESS;
+	iwan_win_mp_trace(60, (LONG)st);
+	if (st != NDIS_STATUS_SUCCESS) {
+		ext->mp.proto_handle = NULL;	/* 不留半个句柄 */
+		InterlockedExchange(&g_proto_started, 0);
+		DbgPrint("iwanmp: NdisRegisterProtocolDriver（NDIS 6.%u）失败 0x%08lx\n",
+			 (unsigned)runtime, (unsigned long)st);
+		return st;
 	}
-	DbgPrint("iwanmp: NdisRegisterProtocolDriver 6.%u 失败 0x%08lx\n",
-		 (unsigned)minor, (unsigned long)st);
-	}	/* for (mi) */
-
-	InterlockedExchange(&g_proto_started, 0);
-	return st;
+	iwan_win_mp_trace(69, (LONG)runtime);
+	DbgPrint("iwanmp: 协议边已注册（NDIS 6.%u）\n", (unsigned)runtime);
+	return STATUS_SUCCESS;
 }
 
 VOID
@@ -741,17 +762,22 @@ iwan_win_proto_fini(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 
 	if (ext->mp.proto_handle == NULL)
 		return;
-	/* NdisDeregisterProtocolDriver 会等所有回调返回，之后绑定表不再变化 */
+	/* NdisDeregisterProtocolDriver 会等所有回调返回，之后绑定表不再变化，
+	 * 也不会再有人（发送完成、收帧）碰这些绑定对象 —— 这是唯一安全的
+	 * 释放点，见 iwan_win_proto_binding_close 的说明。 */
 	NdisDeregisterProtocolDriver(ext->mp.proto_handle);
 	ext->mp.proto_handle = NULL;
 	InterlockedExchange(&g_proto_started, 0);
+	iwan_win_mp_release_carrier(ext);
+	InterlockedExchange(&ext->mp.outer_outstanding, 0);
 
-	/* 正常情况下 unbind 回调已经清空了表；这里只兜底（例如注册后立刻
-	 * 注销、NDIS 还没走完 unbind）。 */
 	for (e = g_bindings.Flink; e != &g_bindings; e = n) {
 		IWAN_MP_BINDING *b = CONTAINING_RECORD(e, IWAN_MP_BINDING, link);
 
 		n = e->Flink;
-		iwan_win_proto_binding_unlink(b);
+		b->link.Flink = NULL;
+		b->link.Blink = NULL;
+		ExFreePoolWithTag(b, IWAN_TAG_PKT);
 	}
+	InitializeListHead(&g_bindings);
 }

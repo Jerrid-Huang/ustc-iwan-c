@@ -78,8 +78,17 @@ iwan_win_mp_encap_send(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	if (!ExAcquireRundownProtection(&ext->rundown))
 		return FALSE;		/* 会话正在拆除：本包丢弃 */
 
-	if (s->valid == 0 || s->inner_ip == 0) {
-		/* 无会话：放行给上层（小型端口那侧会照常发出去） */
+	if (s->valid == 0) {
+		/* 没有会话：本适配器唯一的存在理由就是隧道，报文到此为止。
+		 * 明确失败（小型端口把状态回给协议栈）并计数 —— 静默丢弃是
+		 * WFP 平面吃过亏的地方。
+		 *
+		 * 这里**刻意不看** s->inner_ip：WFP 平面用它做"哪些报文该进
+		 * 隧道"的判据，本平面的判据是路由（报文能到本适配器就说明
+		 * 该进隧道），内层身份由控制面用 netsh 设在适配器上。真实的
+		 * 控制面（kdp_win.c）从不填 SESSION_OPEN 里的 inner_ip，若在这里
+		 * 也要求它非零，结果会是"会话建立了、一个字节都出不去"。 */
+		IWAN_MP_STAT_INC(ext, tx_bad_state);
 		ExReleaseRundownProtection(&ext->rundown);
 		return FALSE;
 	}

@@ -160,13 +160,21 @@ struct _IWAN_MP_BINDING;
 #define IWAN_MP_MAX_OUTER_INFLIGHT 4096u
 
 typedef struct _IWAN_MP_PLANE {
-	/* 小型端口侧 */
-	NDIS_HANDLE		mp_handle;	/* MiniportAdapterHandle */
+	/* 小型端口侧。这两个句柄的**生命周期完全不同**，绝不能共用一个字段：
+	 *   mp_driver_handle：NdisMRegisterMiniportDriver 的输出，从 DriverEntry
+	 *     活到 UnloadHandler，注销与 NdisRegisterDeviceEx 都用它；
+	 *   adapter_handle：MiniportInitializeEx 的入参（MiniportAdapterHandle），
+	 *     只在 InitializeEx 与 Halt 之间有效，指示/完成都用它。
+	 * 曾经共用一个字段，结果是 MiniportInitializeEx 里的"只服务一个适配器"
+	 * 判据在第一次启动时就为真（注册早就把字段填上了），适配器直接 Code 10。 */
+	NDIS_HANDLE		mp_driver_handle;
+	NDIS_HANDLE		adapter_handle;	/* MiniportAdapterHandle */
 	/* NBL 池：两侧共用。出向要挂一个 IWAN_MP_TX_CTX（缓冲与 MDL 的
 	 * 地址，完成回调据此归还），所以建池时就把 context 区留够；
 	 * 入向指示用的 NBL 不关心里程碑里的内容，白拿这 16 字节。 */
 	NDIS_HANDLE		nbl_pool;
 	volatile LONG		mp_running;	/* Pause/Restart 闸门（1=可收可发） */
+	volatile LONG		proto_registered;	/* 协议边注册成功过 */
 
 	/* 控制设备（\Device\iwanmp）：由 NdisRegisterDeviceEx 建，所以它是
 	 * NDIS 的设备、共享 NDIS 的 DriverObject；注销要用同一个句柄。 */

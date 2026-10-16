@@ -238,9 +238,14 @@ DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registry_path)
 
 	st = iwan_win_mp_open_control(ext);
 	if (!NT_SUCCESS(st)) {
-		/* 控制设备建不出来 = 用户态打不开 = 装了也没用：整体回滚。 */
-		iwan_win_mp_fini(ext);
-		goto fail;
+		/* 控制设备建不出来 = 用户态打不开 = 装了也没用，但**绝不能在这里
+		 * 回滚**：小型端口（也许还有协议边）已经注册成功，回头去注销再让
+		 * DriverEntry 失败，正是整机无法启动那次事故的机理 —— 半个注册
+		 * 状态下 NDIS 认为驱动还在，卸载路径永远等不到，重启就卡在引导。
+		 * 这里只让它留在 T5 键里（iwan_win_mp_open_control 已写），照常
+		 * 返回成功：适配器会出现、IOCTL 以 STATUS_DEVICE_NOT_READY 失败，
+		 * 原因一眼可见，卸载与重装都还是干净的。 */
+		DbgPrint("iwan-win: 控制设备未就绪（见 T5），装载继续\n");
 	}
 
 	MP_TRACE(4, STATUS_SUCCESS);
