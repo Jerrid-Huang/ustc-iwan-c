@@ -314,6 +314,20 @@ IWAN_WIN_STATIC_ASSERT(sizeof(IWAN_WIN_SHM) == IWAN_WIN_SHM_HDR_SIZE,
  */
 IWAN_WIN_STATIC_ASSERT(sizeof(IWAN_WIN_TARGET) == 24, "IWAN_WIN_TARGET 必须是 24 字节");
 IWAN_WIN_STATIC_ASSERT(sizeof(IWAN_WIN_STATS) == 17 * 8, "IWAN_WIN_STATS 必须是 17 个 u64");
+/* 只钉 sizeof 与最后一个字段是不够的：把 rx_outer 与 rx_reasm 换个位置，
+ * 这两个断言照样通过，而用户态解析器会整体错位。下面把三段边界各钉一个。 */
+IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_STATS, rx_outer) == 8,
+		       "IWAN_WIN_STATS.rx_outer 偏移");
+IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_STATS, rx_frames) == 24,
+		       "IWAN_WIN_STATS.rx_frames 偏移");
+IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_STATS, rx_nomem) == 72,
+		       "IWAN_WIN_STATS.rx_nomem 偏移");
+IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_STATS, tx_pkts) == 88,
+		       "IWAN_WIN_STATS.tx_pkts 偏移");
+IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_STATS, tx_bad_state) == 104,
+		       "IWAN_WIN_STATS.tx_bad_state 偏移");
+IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_STATS, tx_err) == 120,
+		       "IWAN_WIN_STATS.tx_err 偏移");
 IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_STATS, ev_dropped) == 128,
 		       "IWAN_WIN_STATS.ev_dropped 偏移");
 IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_SESSION_OPEN, outer_src6) == 40,

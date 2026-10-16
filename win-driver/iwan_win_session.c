@@ -135,6 +135,12 @@ iwan_win_ctrl_init(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 	KeInitializeMutex(&ext->ctrl_mutex, 0);
 	/* 初始为"已放行"状态：数据面会取得保护、看到 valid == 0、立刻放回 */
 	ExInitializeRundownProtection(&ext->rundown);
+	/* 控制设备的在途 IRP 排空：分发入口 IoAcquireRemoveLock、卸载路径
+	 * IoReleaseRemoveLockAndWait。没有它，扩展可能在某个 IOCTL 正用着
+	 * &ext->ctrl_mutex / session_open 的时候被 ExFreePoolWithTag 掉
+	 * —— IoDeleteDevice/NdisDeregisterDeviceEx 都**不等待**在途 IRP。 */
+	IoInitializeRemoveLock(&ext->ctrl_remove_lock, IWAN_TAG_SESS, 0, 0);
+	InterlockedExchange(&ext->ctrl_remove_init, 1);
 }
 
 VOID
@@ -525,12 +531,20 @@ iwan_win_session_info(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 {
 	IWAN_WIN_SESSION *s = &ext->sess;
 
+	/* 调用者可能已经持锁（query_shm 就在锁内调本函数）：KMUTEX 可递归，
+	 * 多取一次多放一次即可。不取锁就会与 CLOSE 的
+	 * iwan_win_session_reset → iwan_win_shm_destroy → ExFreePoolWithTag(s->shm)
+	 * 竞态，读到已释放的共享页（shm 是普通非分页池，普通池页仍映射，所以
+	 * 平时不立刻崩，开 Driver Verifier 或特殊池就直接蓝屏）。 */
+	KeWaitForSingleObject(&ext->ctrl_mutex, Executive, KernelMode, FALSE, NULL);
 	RtlZeroMemory(info, sizeof(*info));
 	info->abi_version = IWAN_WIN_ABI_VERSION;
 	info->size = sizeof(*info);
 
-	if (!s->valid)
+	if (!s->valid) {
+		KeReleaseMutex(&ext->ctrl_mutex, FALSE);
 		return;
+	}
 
 	info->sid = s->sid;
 	info->peer_state = s->shm != NULL ? s->shm->peer_state : IWAN_WIN_PEER_UNKNOWN;
@@ -542,6 +556,7 @@ iwan_win_session_info(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	info->shm_section_size = s->shm != NULL ? PAGE_SIZE : 0;
 	info->shm_user_va = (UINT64)(ULONG_PTR)s->shm_user_va;
 	info->stats = s->stats;		/* 快照语义：可能落后一个报文，与 Linux 一致 */
+	KeReleaseMutex(&ext->ctrl_mutex, FALSE);
 }
 
 NTSTATUS

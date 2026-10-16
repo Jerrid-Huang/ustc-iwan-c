@@ -360,6 +360,13 @@ iwan_win_frame_classify(_In_ const IWAN_WIN_OUTER *o, _In_ UINT16 sess_sid,
 	default:
 		return IWAN_WIN_FRAME_BAD;
 	}
+	/* 走得到这里的只有 PT_DATA / PT_DATA_ENC。两者都必须与帧头的 enc 字节
+	 * 一致：解封是按帧里的 o->enc 决定要不要解密的（iwan_win_decap），
+	 * 只看类型就能被降级 —— 会话是加密的，攻击者发 type=PT_DATA_ENC 但
+	 * enc=0（sid/tok 在帧头明文，照抄即可），decap 走明文分支，任意内层包
+	 * 直通。判据必须与解密那一侧同源。 */
+	if (o->enc != (sess_enc ? 1u : 0u))
+		return IWAN_WIN_FRAME_BAD;
 	return cred_ok ? IWAN_WIN_FRAME_DATA : IWAN_WIN_FRAME_BAD;
 }
 

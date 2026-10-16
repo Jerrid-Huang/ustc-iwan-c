@@ -111,6 +111,17 @@ iwan_win_mp_encap_send(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		return FALSE;
 	}
 
+	/* 先判再加：无符号回绕会让超长 len（如 0xFFFFFFF0）算出的 total 变小，
+	 * 0xFFFF、承载 MTU、在途上限三道理就全部放行，而拷贝仍按 len 抄。
+	 * 调用者今天给不出这种长度（NET_BUFFER_DATA_LENGTH 到不了 4G），
+	 * 但数据面的长度闸门不该建立在调用者的善意上。 */
+	if (overhead > 0xFFFFu || len > 0xFFFFu - overhead) {
+		iwan_win_diag_tx(s, IWAN_WIN_DIAG_TX_LEN_BAD, len, len,
+				 (ULONG)inner[0], inner);
+		IWAN_MP_STAT_INC(ext, tx_bad_inner);
+		ExReleaseRundownProtection(&ext->rundown);
+		return FALSE;
+	}
 	total = overhead + len;
 	flen = IWAN_FRAME_HDR_LEN + len;
 	if (total > 0xFFFFu) {
@@ -164,7 +175,11 @@ iwan_win_mp_encap_send(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		ExFreePoolWithTag(buf, IWAN_TAG_PKT);
 		return FALSE;
 	}
-	ExReleaseRundownProtection(&ext->rundown);
+	/* rundown 一直持到本函数结束：诊断（iwan_win_diag_tx 会解引用 s->shm
+	 * 并写 40 字节）必须落在 rundown 内。否则并发的 IOCTL_CLOSE 走
+	 * session_reset → shm_destroy → ExFreePoolWithTag 之后，数据面还在
+	 * DISPATCH_LEVEL 往已释放的非分页池里写。WFP 平面同一口径：取 rundown
+	 * 之后所有 diag 都在释放之前。 */
 
 	/* 以太头：源 = 选定承载的 MAC，目的 = 下一跳 MAC。下一跳还没解析出来
 	 * 时本函数发 ARP 并返回 FALSE（本包丢，计 tx_bad_state + 诊断）。 */
@@ -172,6 +187,7 @@ iwan_win_mp_encap_send(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		iwan_win_diag_tx(s, IWAN_WIN_DIAG_TX_NO_NEIGHBOR, len, total,
 				 (ULONG)inner[0], inner);
 		IWAN_MP_STAT_INC(ext, tx_bad_state);
+		ExReleaseRundownProtection(&ext->rundown);
 		ExFreePoolWithTag(buf, IWAN_TAG_PKT);
 		return FALSE;
 	}
@@ -187,6 +203,7 @@ iwan_win_mp_encap_send(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 				 (ULONG)inner[0], inner);
 		IWAN_MP_STAT_INC(ext, tx_bad_state);
 	}
+	ExReleaseRundownProtection(&ext->rundown);
 	return sent;
 }
 

@@ -145,6 +145,15 @@ struct _IWAN_MP_BINDING;
  * IWAN_MP_TX_CTX 的实际大小在 iwan_win_proto.c 里用 C_ASSERT 对齐。 */
 #define IWAN_MP_NBL_CTX_SIZE	16u
 
+/* NBL context 的布局：出向（协议边）与入向指示（小型端口）共用同一条池、
+ * 同一块 context，所以结构必须只有一份定义 —— 两边各写一份 layout 迟早会分叉。
+ * 归还时从它取缓冲与 MDL，不从 MDL 反推地址（上层协议驱动可以 advance 过 NB
+ * 再还回来，那时 MDL 里的地址是缓冲内部地址，ExFreePoolWithTag 会踩坏池）。 */
+typedef struct _IWAN_MP_TX_CTX {
+	UINT8			*buf;		/* IWAN_ALLOC 的整帧（含以太头） */
+	PMDL			mdl;
+} IWAN_MP_TX_CTX;
+
 /* 承载侧的链路层常量（小型端口那侧是 NdisMediumIP，裸 IP，没有以太头） */
 #define IWAN_MP_ETH_HDR_LEN	14u
 #define IWAN_MP_ETH_TYPE_IP4	0x0800u
@@ -169,10 +178,18 @@ typedef struct _IWAN_MP_PLANE {
 	 * 判据在第一次启动时就为真（注册早就把字段填上了），适配器直接 Code 10。 */
 	NDIS_HANDLE		mp_driver_handle;
 	NDIS_HANDLE		adapter_handle;	/* MiniportAdapterHandle */
-	/* NBL 池：两侧共用。出向要挂一个 IWAN_MP_TX_CTX（缓冲与 MDL 的
-	 * 地址，完成回调据此归还），所以建池时就把 context 区留够；
-	 * 入向指示用的 NBL 不关心里程碑里的内容，白拿这 16 字节。 */
+	/* NBL 池有两条，生命周期必须分开。曾经共用一条，MiniportHaltEx 一销毁
+	 * 就把协议边还在途的外层 NBL 连池一起废掉 —— NDIS 的硬规则是
+	 * "释放池之前必须先释放池里所有 NBL"，违反它就是 0x1E 引用计数失衡
+	 * 与 0xD1（迟到的归还走进已释放的池）：
+	 *   nbl_pool：入向指示用，小型端口所有，InitializeEx 建、Halt 排空后销毁；
+	 *   tx_pool ：出向发外层用，协议边所有，proto_init 建、proto_fini 排空后销毁。
+	 * 两条池都要留 16 字节 context（IWAN_MP_TX_CTX = 缓冲 + MDL）。 */
 	NDIS_HANDLE		nbl_pool;
+	NDIS_HANDLE		tx_pool;
+	/* 已指示向上、尚未归还的入向 NBL 数：Halt 靠它判断池里还有没有在途
+	 * NBL，等不到就不放池（泄漏一条池远好过让归还没进已释放的池）。 */
+	volatile LONG		rx_inflight;
 	volatile LONG		mp_running;	/* Pause/Restart 闸门（1=可收可发） */
 	volatile LONG		proto_registered;	/* 协议边注册成功过 */
 
@@ -219,6 +236,9 @@ typedef struct _IWAN_WIN_DEVICE_EXTENSION {
 
 	KMUTEX			ctrl_mutex;	/* 控制面串行化（PASSIVE_LEVEL） */
 	EX_RUNDOWN_REF		rundown;	/* 数据面读者保护 */
+	IO_REMOVE_LOCK		ctrl_remove_lock;	/* 在途控制 IRP 的排空 */
+	volatile LONG		ctrl_remove_init;	/* 1 = 已初始化 */
+	volatile LONG		ctrl_remove_waited;	/* 1 = 卸载路径已进入移除态 */
 
 	/* NBL 池：注入用（NdisAllocateNetBufferListPool 建，wfp_fini 释放；
 	 * 释放前必须注销 callout 并排空在途注入） */

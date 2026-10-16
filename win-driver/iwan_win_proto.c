@@ -48,7 +48,11 @@ typedef struct _IWAN_MP_BINDING {
 	LIST_ENTRY		link;
 	IWAN_WIN_DEVICE_EXTENSION *ext;	/* 控制设备扩展（协议驱动上下文） */
 	NDIS_HANDLE		binding;	/* NdisBindingHandle */
-	NDIS_HANDLE		bind_context;	/* 完成 bind/unbind 时要回传的句柄 */
+	NDIS_HANDLE		bind_context;	/* BindAdapterEx 的完成句柄 */
+	NDIS_HANDLE		unbind_context;	/* UnbindAdapterEx 的完成句柄 */
+	/* 两种完成句柄必须分开存：bind 返回 PENDING 之后设备被拔掉时 NDIS 会先
+	 * 调 unbind，一个字段被覆写后 open_complete 就会把 unbind 的句柄交给
+	 * NdisCompleteBindAdapterEx（绑定状态机/引用计数错乱）。 */
 	UINT32			ifindex;
 	UINT8			mac[6];
 	ULONG			mac_len;
@@ -63,12 +67,7 @@ static LIST_ENTRY	g_bindings;
 static KSPIN_LOCK	g_bind_lock;
 static volatile LONG	g_proto_started;	/* g_bindings/g_bind_lock 已初始化 */
 
-/* 发送在途上下文：挂在 NBL 的 context 区，完成回调据此归还缓冲与 MDL */
-typedef struct _IWAN_MP_TX_CTX {
-	UINT8			*buf;		/* IWAN_ALLOC 的整帧（含以太头） */
-	PMDL			mdl;
-} IWAN_MP_TX_CTX;
-
+/* 发送在途上下文（IWAN_MP_TX_CTX）定义在 iwan_win.h：入向指示也用它。 */
 /* 池的 context 区必须放得下它（池在 iwan_win_mp.c 里按 IWAN_MP_NBL_CTX_SIZE
  * 建；这个断言是两侧唯一的耦合点）。 */
 C_ASSERT(sizeof(IWAN_MP_TX_CTX) <= IWAN_MP_NBL_CTX_SIZE);
@@ -177,7 +176,7 @@ iwan_win_proto_learn_arp4(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		return FALSE;
 	if (a[6] != 0x00)		/* 以太网/IPv4 */
 		return FALSE;
-	if (a[7] != 0x01 && a[7] != 0x02)	/* 只认请求与回复 */
+	if (a[7] != 0x02)		/* 只从回复学：请求的 spa 谁都能伪造 */
 		return FALSE;
 
 	spa = ((UINT32)a[14] << 24) | ((UINT32)a[15] << 16) |
@@ -239,8 +238,14 @@ iwan_win_proto_fill_eth4(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext, _Inout_ UINT8 *
 		InterlockedExchange(&mp->peer_mac_valid, 0);	/* 老化 */
 		valid = FALSE;
 	}
-	if (!valid && mp->active != NULL && mp->peer_mac_pending == 0 &&
-	    (mp->arp_last_ms == 0 || now - mp->arp_last_ms >= IWAN_MP_ARP_RETRY_MS)) {
+	/* pending 只表示"已发过一次、还没学到"，不是"永不再发"：应答丢了、
+	 * 或对方的 spa 与本会话下一跳不一致（代理 ARP、下一跳选错）时，必须能
+	 * 重发，否则出向每个包都在这里被丢、会话永久不通，重试逻辑成了死代码。
+	 * 限速仍由 arp_last_ms 负责。 */
+	if (!valid && mp->active != NULL &&
+	    (mp->peer_mac_pending == 0 ||
+	     (mp->arp_last_ms != 0 &&
+	      now - mp->arp_last_ms >= IWAN_MP_ARP_RETRY_MS))) {
 		InterlockedExchange(&mp->peer_mac_pending, 1);
 		mp->arp_last_ms = now;
 		fire = TRUE;
@@ -300,7 +305,7 @@ iwan_win_proto_send_outer4(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	if (mdl != NULL)
 		MmBuildMdlForNonPagedPool(mdl);
 	nbl = mdl != NULL ?
-		NdisAllocateNetBufferAndNetBufferList(mp->nbl_pool,
+		NdisAllocateNetBufferAndNetBufferList(mp->tx_pool,
 						      sizeof(IWAN_MP_TX_CTX), 0,
 						      mdl, 0, len) : NULL;
 	if (nbl == NULL) {
@@ -361,7 +366,11 @@ static const UINT8 *
 iwan_win_proto_view(_In_ NET_BUFFER *nb, _In_ ULONG need,
 		    _Inout_opt_ UINT8 *stor, _In_ ULONG stor_sz)
 {
-	if (need == 0 || need > IWAN_MP_RECV_MAX)
+	/* 与 NB 的实际长度比一次：NdisGetDataBuffer 对超长请求的行为不写进
+	 * 契约，ARP 分支按 42 字节取、帧却可能只有 34..41 字节（下限由调用者
+	 * 保证），靠"它会返回 NULL"是运气而不是设计。 */
+	if (need == 0 || need > IWAN_MP_RECV_MAX ||
+	    need > NET_BUFFER_DATA_LENGTH(nb))
 		return NULL;
 	if (stor != NULL && stor_sz >= need)
 		return (const UINT8 *)NdisGetDataBuffer(nb, need, stor, 1, 0);
@@ -530,7 +539,7 @@ iwan_win_proto_close_complete(_In_ NDIS_HANDLE ProtocolBindingContext)
 	IWAN_MP_BINDING *b = (IWAN_MP_BINDING *)ProtocolBindingContext;
 
 	iwan_win_proto_binding_close(b);
-	NdisCompleteUnbindAdapterEx(b->bind_context);
+	NdisCompleteUnbindAdapterEx(b->unbind_context);
 }
 
 static NDIS_STATUS
@@ -601,18 +610,32 @@ iwan_win_proto_unbind(_In_ NDIS_HANDLE UnbindContext,
 {
 	IWAN_MP_BINDING *b = (IWAN_MP_BINDING *)ProtocolBindingContext;
 	NDIS_STATUS st;
+	ULONG i;
 
-	b->bind_context = UnbindContext;
+	b->unbind_context = UnbindContext;
+	/* 顺序是"摘绑定 → 等在途归零 → 关句柄"，三步都不能换：
+	 * ① 先摘：binding_close 在 mp->lock 里置 closed、清 mp->active，新的发送
+	 *    从此拿不到它（出向在锁内复核 opened/closed）；
+	 * ② 再等：已经拿到引用的发送在锁外分配 MDL/池之后才调
+	 *    NdisSendNetBufferLists，只有等 b->outstanding 归零，才能保证没人还
+	 *    攥着这个绑定句柄（窗口里有两次分配，不是几条指令）；
+	 * ③ 最后关：NdisCloseAdapterEx 返回后句柄即失效，此时已无人可用它。
+	 * 反过来（先关再等）会在关闭期间允许对失效句柄发送 —— DISPATCH 上的
+	 * 0xD1，或绑定引用计数失衡。 */
+	iwan_win_proto_binding_close(b);
+	for (i = 0; i < 1000 && b->outstanding > 0; i++)
+		KeStallExecutionProcessor(1000);
+	if (b->outstanding > 0)
+		DbgPrint("iwanmp: unbind 时仍有 %ld 条发送未完成，仍继续关闭\n",
+			 (long)b->outstanding);
 	st = NdisCloseAdapterEx(b->binding);
 	if (st == NDIS_STATUS_PENDING) {
-		/* 异步关闭：close_complete 收尾（同样不能在这里释放绑定） */
+		/* 异步关闭：close_complete 收尾（同步路径不能替它完成 unbind） */
 		return NDIS_STATUS_PENDING;
 	}
-	/* 成功或失败都到这里：绑定已经（或注定）不能用，打关闭标记。
-	 * 关闭失败也要完成 unbind —— 留着一条永远不会完成的 unbind 会让
-	 * NDIS 的绑定状态机卡住（整机失去响应那次的形状）。 */
-	iwan_win_proto_binding_close(b);
-	NdisCompleteUnbindAdapterEx(UnbindContext);
+	/* 同步关闭（成功或失败）：unbind 不返回 PENDING，NDIS 认为它已经完成，
+	 * **不得**再调 NdisCompleteUnbindAdapterEx —— 那个 API 只用于给返回过
+	 * PENDING 的 unbind 收尾，多调一次就是 unbind 记账失衡。 */
 	return NDIS_STATUS_SUCCESS;
 }
 
@@ -669,6 +692,16 @@ iwan_win_mp_select_carrier(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 	}
 
 	KeAcquireSpinLock(&mp->lock, &old);
+	/* 查表（g_bind_lock）与这里赋值之间有窗口：若该绑定正好被 unbind，
+	 * binding_close 的清理判据 `mp->active == b` 当时还不成立，于是 active
+	 * 会停在一条已关闭的绑定上 —— 发包虽然会被 opened 复核挡住，但会话看
+	 * 起来建立成功却一个字节都出不去。这里在同一个锁内复核一次。 */
+	if (b->opened == 0 || b->closed != 0) {
+		KeReleaseSpinLock(&mp->lock, old);
+		DbgPrint("iwanmp: 承载接口 %lu 在选中瞬间被解绑，拒绝建立会话\n",
+			 (unsigned long)s->oif_index);
+		return STATUS_DEVICE_NOT_READY;
+	}
 	mp->active = b;
 	mp->active_ifindex = b->ifindex;
 	mp->next_hop_be = s->outer_hop != 0 ? s->outer_hop : s->outer_dst;
@@ -773,6 +806,33 @@ iwan_win_proto_init(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 			iwan_win_mp_trace(69, (LONG)minor);
 			DbgPrint("iwanmp: 协议边已注册（NDIS 6.%u, rev %u）\n",
 				 (unsigned)minor, (unsigned)cand_rev[ci]);
+			/* 出向 NBL 池归协议边所有：生命周期必须包住所有在途外层
+			 * 发送（完成回调里 NdisFreeNetBufferList），所以不能建在小型
+			 * 端口里 —— 那条池会被 MiniportHaltEx 在设备重启时销毁。 */
+			{
+				NET_BUFFER_LIST_POOL_PARAMETERS pp;
+
+				RtlZeroMemory(&pp, sizeof(pp));
+				pp.Header.Type = NDIS_OBJECT_TYPE_DEFAULT;
+				pp.Header.Revision =
+					NET_BUFFER_LIST_POOL_PARAMETERS_REVISION_1;
+				pp.Header.Size =
+					NDIS_SIZEOF_NET_BUFFER_LIST_POOL_PARAMETERS_REVISION_1;
+				pp.ProtocolId = NDIS_PROTOCOL_ID_DEFAULT;
+				pp.fAllocateNetBuffer = TRUE;
+				pp.ContextSize = IWAN_MP_NBL_CTX_SIZE;
+				pp.PoolTag = IWAN_TAG_PKT;
+				ext->mp.tx_pool = NdisAllocateNetBufferListPool(
+					ext->mp.proto_handle, &pp);
+			}
+			if (ext->mp.tx_pool == NULL) {
+				/* 池建不出来就地注销：小型端口还没注册，失败是干净的。 */
+				iwan_win_mp_trace(57, NDIS_STATUS_RESOURCES);
+				NdisDeregisterProtocolDriver(ext->mp.proto_handle);
+				ext->mp.proto_handle = NULL;
+				InterlockedExchange(&g_proto_started, 0);
+				return STATUS_INSUFFICIENT_RESOURCES;
+			}
 			return STATUS_SUCCESS;
 		}
 	}
@@ -789,17 +849,30 @@ VOID
 iwan_win_proto_fini(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 {
 	PLIST_ENTRY e, n;
+	ULONG i;
 
 	if (ext->mp.proto_handle == NULL)
 		return;
-	/* NdisDeregisterProtocolDriver 会等所有回调返回，之后绑定表不再变化，
-	 * 也不会再有人（发送完成、收帧）碰这些绑定对象 —— 这是唯一安全的
-	 * 释放点，见 iwan_win_proto_binding_close 的说明。 */
+	/* NdisDeregisterProtocolDriver 是 VOID（ndis.h:7975-7978），没有返回值
+	 * 可查。真正兜住"回调已停"的是下面的在途计数排空：排不空就不放内存。
+	 * 它会等所有回调返回，之后绑定表不再变化 —— 这是唯一安全的释放点。 */
 	NdisDeregisterProtocolDriver(ext->mp.proto_handle);
 	ext->mp.proto_handle = NULL;
 	InterlockedExchange(&g_proto_started, 0);
 	iwan_win_mp_release_carrier(ext);
-	InterlockedExchange(&ext->mp.outer_outstanding, 0);
+	/* 在途外层发送归零之后才动内存：完成回调会解引用 b->ext/b->outstanding
+	 * 并 NdisFreeNetBufferList。排不空就整体泄漏（驱动马上卸载）。 */
+	for (i = 0; i < 1000 && ext->mp.outer_outstanding > 0; i++)
+		KeStallExecutionProcessor(1000);
+	if (ext->mp.outer_outstanding > 0) {
+		DbgPrint("iwanmp: 注销时仍有 %ld 条外层发送未完成，绑定与池都不释放\n",
+			 (long)ext->mp.outer_outstanding);
+		return;
+	}
+	if (ext->mp.tx_pool != NULL) {
+		NdisFreeNetBufferListPool(ext->mp.tx_pool);
+		ext->mp.tx_pool = NULL;
+	}
 
 	for (e = g_bindings.Flink; e != &g_bindings; e = n) {
 		IWAN_MP_BINDING *b = CONTAINING_RECORD(e, IWAN_MP_BINDING, link);

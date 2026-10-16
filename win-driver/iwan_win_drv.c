@@ -75,6 +75,16 @@ iwan_win_dispatch_ioctl(_In_ PDEVICE_OBJECT devobj, _Inout_ PIRP irp)
 		return STATUS_DEVICE_NOT_READY;
 	}
 
+	/* 在途 IOCTL 计数：卸载路径会 IoReleaseRemoveLockAndWait，保证扩展
+	 * 不会在还有人用它的时候被释放。取不到（已进入移除态）就明确失败。 */
+	if (ext->ctrl_remove_init != 0 &&
+	    !NT_SUCCESS(IoAcquireRemoveLock(&ext->ctrl_remove_lock, irp))) {
+		irp->IoStatus.Status = STATUS_DEVICE_NOT_READY;
+		irp->IoStatus.Information = 0;
+		IoCompleteRequest(irp, IO_NO_INCREMENT);
+		return STATUS_DEVICE_NOT_READY;
+	}
+
 	switch (sp->Parameters.DeviceIoControl.IoControlCode) {
 	case IOCTL_IWAN_SESSION_OPEN:
 		/* 请求与回复共用同一块 METHOD_BUFFERED 缓冲：先按请求解释，
@@ -133,11 +143,15 @@ iwan_win_dispatch_ioctl(_In_ PDEVICE_OBJECT devobj, _Inout_ PIRP irp)
 			st = STATUS_BUFFER_TOO_SMALL;
 			break;
 		}
+		/* 有效性与快照必须在同一把锁里取：否则 CLOSE 可以插在中间，
+		 * 让我们以 SUCCESS 返回一份全零的"会话信息"。 */
+		KeWaitForSingleObject(&ext->ctrl_mutex, Executive, KernelMode, FALSE, NULL);
 		st = ext->sess.valid ? STATUS_SUCCESS : STATUS_INVALID_DEVICE_STATE;
 		if (NT_SUCCESS(st)) {
 			iwan_win_session_info(ext, (IWAN_WIN_SESSION_INFO *)buf);
 			info = sizeof(IWAN_WIN_SESSION_INFO);
 		}
+		KeReleaseMutex(&ext->ctrl_mutex, FALSE);
 		break;
 
 	case IOCTL_IWAN_SHM_QUERY:
@@ -155,6 +169,8 @@ iwan_win_dispatch_ioctl(_In_ PDEVICE_OBJECT devobj, _Inout_ PIRP irp)
 		break;
 	}
 
+	if (ext->ctrl_remove_init != 0)
+		IoReleaseRemoveLock(&ext->ctrl_remove_lock, irp);
 	irp->IoStatus.Status = st;
 	irp->IoStatus.Information = info;
 	IoCompleteRequest(irp, IO_NO_INCREMENT);
@@ -169,6 +185,13 @@ iwan_win_unload(_In_ PDRIVER_OBJECT driver)
 
 	if (devobj != NULL) {
 		IWAN_WIN_DEVICE_EXTENSION *ext = IWAN_DEVEXT(devobj);
+
+		/* 先进移除态、再等在途 IOCTL 做完，然后才拆数据面/删设备。
+		 * 守卫保证两条卸载路径（DriverUnload 与 NDIS UnloadHandler）
+		 * 只会等待一次。 */
+		if (ext->ctrl_remove_init != 0 &&
+		    InterlockedExchange(&ext->ctrl_remove_waited, 1) == 0)
+			IoReleaseRemoveLockAndWait(&ext->ctrl_remove_lock, ext);
 
 #ifdef IWAN_WIN_PLANE_MP
 		iwan_win_mp_fini(ext);		/* 先注销小型端口与协议边 */

@@ -85,6 +85,9 @@ iwan_win_mp_fill_major(VOID)
 	RtlZeroMemory(g_mp_major, sizeof(g_mp_major));
 	g_mp_major[IRP_MJ_CREATE] = iwan_win_dispatch_create;
 	g_mp_major[IRP_MJ_CLOSE] = iwan_win_dispatch_create;
+	/* 用户态每关一次句柄，I/O 管理器就发 IRP_MJ_CLEANUP。这张表是独立
+	 * 驱动对象的整表（先 RtlZeroMemory），不补就是往 NULL 槽分发。 */
+	g_mp_major[IRP_MJ_CLEANUP] = iwan_win_dispatch_create;
 	g_mp_major[IRP_MJ_DEVICE_CONTROL] = iwan_win_dispatch_ioctl;
 }
 
@@ -256,9 +259,22 @@ iwan_win_mp_halt(_In_ NDIS_HANDLE MiniportAdapterHandle,
 	 * 之后任何一个 IOCTL 都会解引用空指针。会话是否还活着由 sess.valid
 	 * 表示，控制面按它拒绝即可。 */
 	iwan_win_mp_release_carrier(ext);
+	/* 只销毁入向池（tx_pool 归协议边，见 iwan_win.h 的说明），而且必须先
+	 * 等"已指示向上、还没归还"的 NBL 归零：NdisFreeNetBufferListPool 的
+	 * 硬规则是池里不能还有在途 NBL，而什么时候归还由 NDIS/协议栈决定。
+	 * 等不到就不放池 —— 泄漏一条池，好过让迟到的归还没进已释放的池。 */
 	if (ext->mp.nbl_pool != NULL) {
-		NdisFreeNetBufferListPool(ext->mp.nbl_pool);
-		ext->mp.nbl_pool = NULL;
+		ULONG i;
+
+		for (i = 0; i < 1000 && ext->mp.rx_inflight > 0; i++)
+			KeStallExecutionProcessor(1000);	/* 最多约 1 秒 */
+		if (ext->mp.rx_inflight > 0) {
+			DbgPrint("iwanmp: 停止时仍有 %ld 条入向 NBL 未归还，池不释放\n",
+				 (long)ext->mp.rx_inflight);
+		} else {
+			NdisFreeNetBufferListPool(ext->mp.nbl_pool);
+			ext->mp.nbl_pool = NULL;
+		}
 	}
 	DbgPrint("iwanmp: 内层适配器已停止\n");
 }
@@ -296,25 +312,36 @@ iwan_win_mp_restart(_In_ NDIS_HANDLE MiniportAdapterHandle,
 /* 把一个 NBL 链当一包处理：逐 NB 交给引擎，最后整条链一次完成。
  * 按平台约定，发送路径不得改写 NBL 链的 NEXT_NBL（那会拆散分片的 NBL）。 */
 static VOID
-iwan_win_mp_send_nbls(_In_ NDIS_HANDLE MiniportAdapterHandle,
+iwan_win_mp_send_nbls(_In_ NDIS_HANDLE MiniportAdapterContext,
 		      _In_ PNET_BUFFER_LIST NetBufferLists,
 		      _In_ NDIS_PORT_NUMBER PortNumber,
 		      _In_ ULONG SendFlags)
 {
-	IWAN_WIN_DEVICE_EXTENSION *ext = g_mp_ext;
+	/* 第一个形参是 MiniportAdapterContext（注册时填的是 ext），**不是**
+	 * miniport 句柄。完成发送要的是 ext->mp.adapter_handle —— 历史上这里
+	 * 把形参原样交给 NdisMSendNetBufferListsComplete，等于让 NDIS 拿扩展
+	 * 内存当 miniport block 解引用：设备一起来、只要有一个内层包（新适配器
+	 * 的 DAD/ARP/NCSI 探测都算）就在 DISPATCH_LEVEL 上炸。 */
+	IWAN_WIN_DEVICE_EXTENSION *ext =
+		(IWAN_WIN_DEVICE_EXTENSION *)MiniportAdapterContext;
 	PNET_BUFFER_LIST nbl;
 	BOOLEAN l4_offloaded;
+	ULONG complete_flags;
 
 	UNREFERENCED_PARAMETER(PortNumber);
+	/* SendFlags 里的 DISPATCH 位不当作完成标志用：完成标志必须与调用点的
+	 * 真实 IRQL 一致，用 KeGetCurrentIrql() 判最不会撒谎。 */
 	UNREFERENCED_PARAMETER(SendFlags);
 
-	if (ext == NULL) {
-		/* 小型端口的发送处理函数恒在 DISPATCH_LEVEL */
-		NdisMSendNetBufferListsComplete(MiniportAdapterHandle,
-						NetBufferLists,
-						NDIS_SEND_COMPLETE_FLAGS_DISPATCH_LEVEL);
+	if (ext == NULL || ext->mp.adapter_handle == NULL) {
+		/* 正常不可达（NDIS 在 Halt 之后不再调发送处理函数）。此时没有任何
+		 * 合法句柄可以完成，宁可不完成、交给 NDIS 的停止流程，也不能把上下文
+		 * 或 NULL 当句柄交回去 —— 那必炸。 */
+		DbgPrint("iwanmp: 发送处理函数在无句柄状态下被调用，NBL 未完成\n");
 		return;
 	}
+	complete_flags = (KeGetCurrentIrql() == DISPATCH_LEVEL) ?
+			 NDIS_SEND_COMPLETE_FLAGS_DISPATCH_LEVEL : 0;
 
 	for (nbl = NetBufferLists; nbl != NULL; nbl = NET_BUFFER_LIST_NEXT_NBL(nbl)) {
 		NDIS_TCP_IP_CHECKSUM_NET_BUFFER_LIST_INFO ci;
@@ -373,8 +400,8 @@ iwan_win_mp_send_nbls(_In_ NDIS_HANDLE MiniportAdapterHandle,
 		}
 		NET_BUFFER_LIST_STATUS(nbl) = st;
 	}
-	NdisMSendNetBufferListsComplete(MiniportAdapterHandle, NetBufferLists,
-					NDIS_SEND_COMPLETE_FLAGS_DISPATCH_LEVEL);
+	NdisMSendNetBufferListsComplete(ext->mp.adapter_handle, NetBufferLists,
+					complete_flags);
 }
 
 static VOID
@@ -422,8 +449,19 @@ iwan_win_mp_indicate_inner(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		ExFreePoolWithTag(inner, IWAN_TAG_PKT);
 		return FALSE;
 	}
+	{
+		/* context 区不保证清零，两个字段都要显式写（归还时按它释放）。 */
+		IWAN_MP_TX_CTX *ctx =
+			(IWAN_MP_TX_CTX *)NET_BUFFER_LIST_CONTEXT_DATA_START(nbl);
+
+		ctx->buf = inner;
+		ctx->mdl = mdl;
+	}
 	nbl->SourceHandle = ext->mp.adapter_handle;
 	nbl->NblFlags |= (ver == 4) ? NDIS_NBL_FLAGS_IS_IPV4 : NDIS_NBL_FLAGS_IS_IPV6;
+	/* 计数在指示之前加：归还只可能发生在指示之后，先加才不会让 Halt 在
+	 * "已经指示上去、计数还是 0"的窗口里把池放掉。 */
+	InterlockedIncrement(&ext->mp.rx_inflight);
 
 	/* 不带 RESOURCES：所有权交给 NDIS，归还时释放缓冲。IRQL 位必须如实
 	 * 上报 —— 本函数从协议边的接收路径调用，通常就在 DISPATCH_LEVEL。 */
@@ -445,20 +483,30 @@ iwan_win_mp_return_nbls(_In_ NDIS_HANDLE MiniportAdapterHandle,
 	UNREFERENCED_PARAMETER(MiniportAdapterHandle);
 	UNREFERENCED_PARAMETER(ReturnFlags);
 
-	for (nbl = NetBufferLists; nbl != NULL; nbl = NET_BUFFER_LIST_NEXT_NBL(nbl)) {
-		PNET_BUFFER nb;
+	for (nbl = NetBufferLists; nbl != NULL; ) {
+		/* 先取 NEXT 再释放：NdisFreeNetBufferList 会把这块内存交回池的空闲
+		 * 链，之后循环增量再读 nbl->Next 读到的是复用后的垃圾（轻则同一个
+		 * NBL 被二次释放、引用计数失衡，重则顺着野指针走到非法地址）。 */
+		PNET_BUFFER_LIST next = NET_BUFFER_LIST_NEXT_NBL(nbl);
+		InterlockedDecrement(&ext->mp.rx_inflight);
+		IWAN_MP_TX_CTX *ctx =
+			(IWAN_MP_TX_CTX *)NET_BUFFER_LIST_CONTEXT_DATA_START(nbl);
 
-		for (nb = NET_BUFFER_LIST_FIRST_NB(nbl); nb != NULL;
-		     nb = NET_BUFFER_NEXT_NB(nb)) {
-			PMDL mdl = NET_BUFFER_FIRST_MDL(nb);
-			PVOID va = MmGetMdlVirtualAddress(mdl);
-
-			/* 指示时缓冲与 MDL 一一对应（offset 0、整包），
-			 * 所以直接反推即可，不需要另存映射。 */
-			IoFreeMdl(mdl);
-			ExFreePoolWithTag(va, IWAN_TAG_PKT);
+		/* 归还的只可能是本驱动指示上去的 NBL：每条 NBL 恰好一个 NB、
+		 * 一个缓冲、一个 MDL（netvmini 同构）。多 NB 的 NBL 出现在这里
+		 * 说明有人把别人的 NBL 还给了我们 —— 说出来，别静默漏掉缓冲。 */
+		if (NET_BUFFER_NEXT_NB(NET_BUFFER_LIST_FIRST_NB(nbl)) != NULL)
+			DbgPrint("iwanmp: 归还的 NBL 不止一个 NB，后续 NB 的缓冲会漏\n");
+		if (ctx->mdl != NULL) {
+			IoFreeMdl(ctx->mdl);
+			ctx->mdl = NULL;
+		}
+		if (ctx->buf != NULL) {
+			ExFreePoolWithTag(ctx->buf, IWAN_TAG_PKT);
+			ctx->buf = NULL;
 		}
 		NdisFreeNetBufferList(nbl);
+		nbl = next;
 	}
 }
 
@@ -774,7 +822,6 @@ static const IWAN_MP_CH_CAND iwan_win_mp_ch_cands[] = {
 	{ 0xFF, NDIS_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_3 },
 	{ 0xFF, NDIS_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_2 },
 	{ 0xFF, NDIS_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_1 },
-	{ 0,    NDIS_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_3 },
 	{ 0,    NDIS_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_1 },
 	{ 80,   NDIS_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_1 },
 	{ 60,   NDIS_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_1 },
@@ -975,6 +1022,11 @@ iwan_win_mp_unload_hook(_In_ PDRIVER_OBJECT driver)
 	UNREFERENCED_PARAMETER(driver);
 
 	if (ext != NULL) {
+		/* 与 iwan_win_unload 同一道守卫：控制设备的在途 IRP 先排空，
+		 * 之后才注销设备与释放扩展。 */
+		if (ext->ctrl_remove_init != 0 &&
+		    InterlockedExchange(&ext->ctrl_remove_waited, 1) == 0)
+			IoReleaseRemoveLockAndWait(&ext->ctrl_remove_lock, ext);
 		iwan_win_mp_fini(ext);
 		iwan_win_session_teardown(ext);
 		iwan_win_ctrl_fini(ext);
