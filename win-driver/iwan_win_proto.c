@@ -441,8 +441,12 @@ iwan_win_proto_recv_one(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	if (iplen <= sizeof(hdr) - IWAN_MP_ETH_HDR_LEN) {
 		p = iwan_win_proto_view(nb, IWAN_MP_ETH_HDR_LEN + iplen, hdr,
 					sizeof(hdr));
-		if (p == NULL)
+		if (p == NULL) {
+			/* 已判为本会话的帧却取不到连续首部：吃掉，但必须计数
+			 * —— 数据面不许有静默的丢弃通道。 */
+			IWAN_MP_STAT_INC(ext, rx_bad_hdr);
 			return TRUE;
+		}
 		iwan_win_mp_outer_recv(ext, p + IWAN_MP_ETH_HDR_LEN, iplen);
 		return TRUE;
 	}
@@ -457,6 +461,8 @@ iwan_win_proto_recv_one(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		p = iwan_win_proto_view(nb, pktlen, tmp, pktlen);
 		if (p != NULL)
 			iwan_win_mp_outer_recv(ext, p + IWAN_MP_ETH_HDR_LEN, iplen);
+		else
+			IWAN_MP_STAT_INC(ext, rx_bad_hdr);
 		ExFreePoolWithTag(tmp, IWAN_TAG_PKT);
 		return TRUE;
 	}
