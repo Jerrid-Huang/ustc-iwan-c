@@ -479,6 +479,11 @@ iwan_win_mp_return_nbls(_In_ NDIS_HANDLE MiniportAdapterHandle,
 			_In_ ULONG ReturnFlags)
 {
 	PNET_BUFFER_LIST nbl;
+	/* 本处理函数拿到的是 MiniportAdapterHandle，不是 MiniportAdapterContext，
+	 * 所以取不到 ext：这里用单例取回（本小型端口按构造只服务一个适配器，
+	 * InitializeEx 对第二个适配器直接拒绝）。rx_inflight 必须在销毁 NBL 池
+	 * 之前减到零，Halt 靠它判断"还有没有已经指示上去、尚未归还的 NBL"。 */
+	IWAN_WIN_DEVICE_EXTENSION *ext = iwan_win_mp_device_ext();
 
 	UNREFERENCED_PARAMETER(MiniportAdapterHandle);
 	UNREFERENCED_PARAMETER(ReturnFlags);
@@ -488,9 +493,11 @@ iwan_win_mp_return_nbls(_In_ NDIS_HANDLE MiniportAdapterHandle,
 		 * 链，之后循环增量再读 nbl->Next 读到的是复用后的垃圾（轻则同一个
 		 * NBL 被二次释放、引用计数失衡，重则顺着野指针走到非法地址）。 */
 		PNET_BUFFER_LIST next = NET_BUFFER_LIST_NEXT_NBL(nbl);
-		InterlockedDecrement(&ext->mp.rx_inflight);
 		IWAN_MP_TX_CTX *ctx =
 			(IWAN_MP_TX_CTX *)NET_BUFFER_LIST_CONTEXT_DATA_START(nbl);
+
+		if (ext != NULL)
+			InterlockedDecrement(&ext->mp.rx_inflight);
 
 		/* 归还的只可能是本驱动指示上去的 NBL：每条 NBL 恰好一个 NB、
 		 * 一个缓冲、一个 MDL（netvmini 同构）。多 NB 的 NBL 出现在这里
