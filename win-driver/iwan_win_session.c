@@ -347,7 +347,7 @@ iwan_win_targets_import(_In_reads_bytes_(in_len) const IWAN_WIN_SESSION_OPEN *re
 			_In_ ULONG in_len, _Out_ IWAN_WIN_TARGET **out, _Out_ ULONG *out_count)
 {
 	IWAN_WIN_TARGET *targets;
-	ULONG need, bytes, cnt, i;
+	ULONG need, bytes, cnt, off;
 
 	*out = NULL;
 	*out_count = 0;
@@ -373,20 +373,26 @@ iwan_win_targets_import(_In_reads_bytes_(in_len) const IWAN_WIN_SESSION_OPEN *re
 
 	RtlCopyMemory(targets, (const UINT8 *)req + req->target_offset, bytes);
 
-	/* 循环用局部量 cnt 而不是回读 req->target_count：条数只解析一次，
-	 * “分配 bytes / 拷 bytes / 走 cnt 条”三处同一来源，静态分析能一路
-	 * 跟到底（C6385 报的就是它以为循环上界与分配大小无关）。 */
-	for (i = 0; i < cnt; i++) {
-		if (targets[i].family == IWAN_WIN_AF_V4) {
-			if (targets[i].prefix_len > 32) {
+	/* 按字节偏移走，而不是按条数下标走：循环条件直接就是
+	 *   off + 一条 <= bytes
+	 * 与下面每次读写的上界是同一个表达式，静态分析不必再自己把
+	 * "cnt 条 × 每条的字节数" 乘回去（C6385 报的就是它乘不动）。
+	 * off 每次加 sizeof(IWAN_WIN_TARGET)（24 字节），池分配 16 字节对齐，
+	 * 所以每个 t 都是对齐的。 */
+	for (off = 0; off + sizeof(IWAN_WIN_TARGET) <= bytes;
+	     off += sizeof(IWAN_WIN_TARGET)) {
+		IWAN_WIN_TARGET *t = (IWAN_WIN_TARGET *)((UINT8 *)targets + off);
+
+		if (t->family == IWAN_WIN_AF_V4) {
+			if (t->prefix_len > 32) {
 				ExFreePoolWithTag(targets, IWAN_TAG_TARGET);
 				return STATUS_INVALID_PARAMETER;
 			}
 			/* v4 条目只允许用前 4 字节，其余清零：避免同一前缀
 			 * 因为垃圾字节被当成两条。 */
-			RtlZeroMemory(targets[i].addr + 4, 12);
-		} else if (targets[i].family == IWAN_WIN_AF_V6) {
-			if (targets[i].prefix_len > 128) {
+			RtlZeroMemory(t->addr + 4, 12);
+		} else if (t->family == IWAN_WIN_AF_V6) {
+			if (t->prefix_len > 128) {
 				ExFreePoolWithTag(targets, IWAN_TAG_TARGET);
 				return STATUS_INVALID_PARAMETER;
 			}

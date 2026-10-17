@@ -186,21 +186,18 @@ iwan_win_inner_fix_csum(_Inout_updates_bytes_(len) UINT8 *pkt, _In_ ULONG len,
 	sum += l4len;
 
 	if (proto == IWAN_IPPROTO_TCP) {
-		/* 两条都要判：l4len 够长（数据报里有完整的 TCP 首部），以及
-		 * pkt 本身够长（写 ihl + 16 不越界）。第二条由第一条与
-		 * l4len <= len - ihl 推出，但静态分析不会替我们做这条推导，
-		 * 于是显式写出来 —— 一次比较换掉一条“可能越界写”的告警，
-		 * 而且真值上也更稳（万一 l4len 的夹取逻辑将来被改坏）。 */
-		if (l4len < IWAN_INNER_TCP_HDR_LEN ||
-		    ihl + IWAN_INNER_TCP_HDR_LEN > len)
+		/* 上界判据直接照抄下面要写的下标（ihl + 17 是 TCP 首部第 18 个
+		 * 字节，校验和字段的第二个字节）。写成"和下标同一个表达式"不是
+		 * 为了好看：静态分析按字面下标推上界，换成 ihl + 首部长度那种
+		 * 间接关系它就推不动，会报"可能写 77 字节"（C6386）。 */
+		if (l4len < IWAN_INNER_TCP_HDR_LEN || ihl + 17u >= len)
 			return;
 		pkt[ihl + 16] = 0;
 		pkt[ihl + 17] = 0;
 		sum = iwan_win_csum_add(sum, pkt + ihl, l4len, 0);
 		iwan_win_wr16(pkt + ihl + 16, iwan_win_csum_finish(sum));
 	} else {
-		if (l4len < IWAN_INNER_UDP_HDR_LEN ||
-		    ihl + IWAN_INNER_UDP_HDR_LEN > len)
+		if (l4len < IWAN_INNER_UDP_HDR_LEN || ihl + 7u >= len)
 			return;
 		pkt[ihl + 6] = 0;
 		pkt[ihl + 7] = 0;

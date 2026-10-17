@@ -1103,6 +1103,11 @@ iwan_win_classify_out6(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 							 IWAN_WIN_DIAG_TX_COALESCE,
 							 nblen, tot, 0xFFFFu, NULL);
 					ExFreePoolWithTag(stor, IWAN_TAG_PKT);
+					/* 必须置空：stor 声明在循环体内，不置空就是
+					 * 下一轮仍持有已释放指针 —— 那条路径若走零
+					 * 拷贝成功，末尾的 `if (stor != NULL)`
+					 * 会把同一块缓冲再释放一次（池损坏）。 */
+					stor = NULL;
 					IWAN_STAT_INC(ext, tx_bad_inner);
 					continue;
 				}
