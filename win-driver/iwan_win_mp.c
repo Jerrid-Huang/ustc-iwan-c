@@ -58,7 +58,9 @@ static IWAN_WIN_DEVICE_EXTENSION *g_mp_ext;	/* 隧道适配器上下文（单例
 
 /* 卸载钩子：既是 MiniportUnloadHandler，也承担 WFP 平面里 DriverUnload
  * 的那部分清理（注册小型端口之后 DriverUnload 归 NDIS 管，不会调我们）。 */
-static VOID iwan_win_mp_unload_hook(_In_ PDRIVER_OBJECT driver);
+static
+_Function_class_(MINIPORT_UNLOAD)
+VOID iwan_win_mp_unload_hook(_In_ PDRIVER_OBJECT driver);
 
 /* ---- 控制设备分发 ------------------------------------------------
  *
@@ -79,6 +81,8 @@ static DRIVER_DISPATCH *g_mp_major[IRP_MJ_MAXIMUM_FUNCTION + 1];
 #define NDIS_OBJECT_TYPE_DEVICE_OBJECT_ATTRIBUTES NDIS_OBJECT_TYPE_DEFAULT
 #endif
 
+/* 表里填的是 iwan_win.h 中带 _Function_class_(DRIVER_DISPATCH) 的两个分发
+ * 函数：声明、定义、赋值三处注解齐了，静态分析才认这条契约（C28023）。 */
 static VOID
 iwan_win_mp_fill_major(VOID)
 {
@@ -430,7 +434,7 @@ iwan_win_mp_cancel_send(_In_ NDIS_HANDLE MiniportAdapterHandle,
 
 BOOLEAN
 iwan_win_mp_indicate_inner(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
-			   _In_reads_bytes_(len) UINT8 *inner, _In_ ULONG len)
+			   __drv_freesMem(_Out_) UINT8 *inner, _In_ ULONG len)
 {
 	NET_BUFFER_LIST *nbl;
 	PMDL mdl;
@@ -453,6 +457,10 @@ iwan_win_mp_indicate_inner(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	}
 	MmBuildMdlForNonPagedPool(mdl);
 
+	/* 池是“NBL + NB + MDL 链接”的工厂，分配出来的 NBL 在指示之前
+	 * 归本函数，指示之后归 NDIS。静态分析看不到这个池的所有权约定，
+	 * 于是把“本该交给 NDIS”读成泄漏（C6014）；用 __drv_aliasesMem
+	 * 说明它就是那条要被搬走的资产。 */
 	nbl = NdisAllocateNetBufferAndNetBufferList(ext->mp.nbl_pool,
 						    IWAN_MP_NBL_CTX_SIZE, 0,
 						    mdl, 0, len);

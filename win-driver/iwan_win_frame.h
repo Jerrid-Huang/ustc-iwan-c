@@ -116,6 +116,11 @@ typedef long NTSTATUS;
 
 #define IWAN_IPPROTO_TCP	6
 #define IWAN_IPPROTO_UDP	17
+
+/* L4 首部最小长度：校验和字段落在 TCP 的第 16、UDP 的第 6 字节，
+ * 只有首部完整时才可写（iwan_win_inner_fix_csum 的边界判据）。 */
+#define IWAN_INNER_TCP_HDR_LEN	20
+#define IWAN_INNER_UDP_HDR_LEN	8
 #define IWAN_IP4_DF		0x4000
 
 /* 帧类型。数值必须与 kernel/iwan.h、src/common/protocol.h 完全一致：

@@ -311,7 +311,12 @@ VOID iwan_win_ctrl_fini(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext);
  * IoCreateDeviceSecure，NDIS 平面递给 NdisRegisterDeviceEx。定义在 iwan_win_drv.c。 */
 extern const GUID iwan_win_devclass_guid;
 
+/* 原型与定义必须带同一个函数类：静态分析要求“声明与实现一致”
+ * （C28252/C28253），而 DRIVER_DISPATCH 也是它判断“这个函数可以填进
+ * MajorFunction[]”的唯一依据（C28023）。两处都写，不要只写一处。 */
+_Function_class_(DRIVER_DISPATCH)
 NTSTATUS iwan_win_dispatch_create(_In_ PDEVICE_OBJECT devobj, _Inout_ PIRP irp);
+_Function_class_(DRIVER_DISPATCH)
 NTSTATUS iwan_win_dispatch_ioctl(_In_ PDEVICE_OBJECT devobj, _Inout_ PIRP irp);
 
 NTSTATUS iwan_win_session_open(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
@@ -427,15 +432,18 @@ BOOLEAN iwan_win_proto_fill_eth4(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
  * 返回 FALSE。
  * 只有 v4：外层 v6 的邻居发现（NS/NA）留到第二阶段，现在会话是 v6 时引擎
  * 直接拒绝并计 tx_bad_state，不做任何降级。 */
+/* 两种结局都会让调用者失去 eth：TRUE 时所有权随 NBL 交给 NDIS（完成回调
+ * 释放），FALSE 时本函数自己已经释放。用 __drv_freesMem 把这条"交出去就
+ * 撒手"的约定写成注解 —— 只有写成注解，静态分析才不会再判调用者泄漏。 */
 BOOLEAN iwan_win_proto_send_outer4(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
-				   _In_reads_bytes_(len) UINT8 *eth,
+				   __drv_freesMem(_Out_) UINT8 *eth,
 				   _In_ ULONG len);
 
 /* 把解封出来的内层数据报指示向上（buf 由 IWAN_ALLOC 分配）。
  * TRUE = 已指示，所有权转移（NBL 归还时释放）；FALSE = 失败，且缓冲已被
  * 本函数释放（调用者不得再引用，也不要再释放一次）。 */
 BOOLEAN iwan_win_mp_indicate_inner(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
-				   _In_reads_bytes_(len) UINT8 *inner,
+				   __drv_freesMem(_Out_) UINT8 *inner,
 				   _In_ ULONG len);
 
 #endif /* IWAN_WIN_H */

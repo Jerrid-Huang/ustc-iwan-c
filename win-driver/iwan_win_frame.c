@@ -188,6 +188,10 @@ iwan_win_inner_fix_csum(_Inout_updates_bytes_(len) UINT8 *pkt, _In_ ULONG len,
 	if (proto == IWAN_IPPROTO_TCP) {
 		if (l4len < 20)
 			return;
+		/* 写 L4 校验和位置的静态上界：l4len = tot - ihl 且 l4len >= 20
+		 * ⇒ ihl + 20 <= tot <= len。分析器不会自己推出这条链，于是按
+		 * ihl 最大 60 报“可能写 77 字节”（C6386）。这里把它写死。 */
+		__analysis_assume(ihl + IWAN_INNER_TCP_HDR_LEN <= len);
 		pkt[ihl + 16] = 0;
 		pkt[ihl + 17] = 0;
 		sum = iwan_win_csum_add(sum, pkt + ihl, l4len, 0);
@@ -195,6 +199,7 @@ iwan_win_inner_fix_csum(_Inout_updates_bytes_(len) UINT8 *pkt, _In_ ULONG len,
 	} else {
 		if (l4len < 8)
 			return;
+		__analysis_assume(ihl + IWAN_INNER_UDP_HDR_LEN <= len);
 		pkt[ihl + 6] = 0;
 		pkt[ihl + 7] = 0;
 		sum = iwan_win_csum_add(sum, pkt + ihl, l4len, 0);

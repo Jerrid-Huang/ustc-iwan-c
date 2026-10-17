@@ -256,7 +256,11 @@ iwan_win_shm_map_user(_Inout_ IWAN_WIN_SESSION *s)
 						  FALSE,
 						  NormalPagePriority |
 						  MdlMappingNoExecute);
-	} __except (EXCEPTION_EXECUTE_HANDLER) {
+	} __except (GetExceptionCode() == STATUS_ACCESS_VIOLATION ||
+		    GetExceptionCode() == STATUS_INVALID_PARAMETER
+		    ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+		/* 只吞这两族：它们是“这一个用户 VA 不可用”的确定答复，别的异常
+		 * （栈溢出、页错误链断掉等）属于本函数不该承担的故障，往上抛。 */
 		va = NULL;
 	}
 	if (va == NULL) {
@@ -368,6 +372,10 @@ iwan_win_targets_import(_In_reads_bytes_(in_len) const IWAN_WIN_SESSION_OPEN *re
 
 	RtlCopyMemory(targets, (const UINT8 *)req + req->target_offset, bytes);
 
+	/* targets 里恰好 bytes = count * sizeof(IWAN_WIN_TARGET) 字节，下面
+	 * 只按 [0, count) 索引。分析器不把“分配用的是 bytes”与“循环上界用的
+	 * 是 target_count”联系起来（C6385），这一句把两者钉死。 */
+	__analysis_assume(bytes >= req->target_count * sizeof(IWAN_WIN_TARGET));
 	for (i = 0; i < req->target_count; i++) {
 		if (targets[i].family == IWAN_WIN_AF_V4) {
 			if (targets[i].prefix_len > 32) {

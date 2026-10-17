@@ -282,7 +282,7 @@ iwan_win_proto_fill_eth4(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext, _Inout_ UINT8 *
  * FALSE = 未发出且缓冲已被本函数释放。 */
 BOOLEAN
 iwan_win_proto_send_outer4(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
-			   _In_reads_bytes_(len) UINT8 *eth, _In_ ULONG len)
+			   __drv_freesMem(_Out_) UINT8 *eth, _In_ ULONG len)
 {
 	IWAN_MP_PLANE *mp = &ext->mp;
 	IWAN_MP_BINDING *b;
