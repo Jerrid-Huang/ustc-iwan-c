@@ -457,10 +457,11 @@ iwan_win_mp_indicate_inner(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	}
 	MmBuildMdlForNonPagedPool(mdl);
 
-	/* 池是“NBL + NB + MDL 链接”的工厂，分配出来的 NBL 在指示之前
-	 * 归本函数，指示之后归 NDIS。静态分析看不到这个池的所有权约定，
-	 * 于是把“本该交给 NDIS”读成泄漏（C6014）；用 __drv_aliasesMem
-	 * 说明它就是那条要被搬走的资产。 */
+	/* 池是“NBL + NB + MDL 链接”的工厂：分配出来的 NBL 在指示之前归
+	 * 本函数，NdisMIndicateReceiveNetBufferLists 之后归 NDIS，归还时由
+	 * MiniportReturnNetBufferLists 释放。静态分析看不到这条 NDIS 的池
+	 * 所有权约定，把“本该交出去”读成泄漏（C6014）—— 已逐条核对过：
+	 * 指示成功恰好一次转交、失败路径各自释放，是误报。 */
 	nbl = NdisAllocateNetBufferAndNetBufferList(ext->mp.nbl_pool,
 						    IWAN_MP_NBL_CTX_SIZE, 0,
 						    mdl, 0, len);

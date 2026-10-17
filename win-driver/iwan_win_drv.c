@@ -244,6 +244,12 @@ DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registry_path)
 	IWAN_WIN_DEVICE_EXTENSION *ext;
 	NTSTATUS st;
 
+	/* 静态分析在这里报两条 C6014（ext / devobj "泄漏"）：两者都是驱动生命
+	 * 周期资产 —— ext 跟着卸载路径走（UnloadHandler / iwan_win_unload），
+	 * devobj 跟着 IoDeleteDevice 走，都不随 DriverEntry 返回而释放。
+	 * 每条失败路径都已各自回滚（见下面两处 fail: 标签），所以是误报；
+	 * 不为它改结构，只把判读结论留在这里。 */
+
 #ifdef IWAN_WIN_PLANE_MP
 	ext = (IWAN_WIN_DEVICE_EXTENSION *)IWAN_ALLOC(sizeof(*ext),
 						      IWAN_TAG_SESS);
