@@ -186,21 +186,22 @@ iwan_win_inner_fix_csum(_Inout_updates_bytes_(len) UINT8 *pkt, _In_ ULONG len,
 	sum += l4len;
 
 	if (proto == IWAN_IPPROTO_TCP) {
-		/* 上界判据直接照抄下面要写的下标（ihl + 17 是 TCP 首部第 18 个
-		 * 字节，校验和字段的第二个字节）。写成"和下标同一个表达式"不是
-		 * 为了好看：静态分析按字面下标推上界，换成 ihl + 首部长度那种
-		 * 间接关系它就推不动，会报"可能写 77 字节"（C6386）。 */
-		if (l4len < IWAN_INNER_TCP_HDR_LEN || ihl + 17u >= len)
+		/* 两道闸门都要，且都用"正方向"写：报文的 L4 长度够不够
+		 * （l4len >= 20），缓冲本身够不够（len >= ihl + 18）。
+		 * 第二道是静态分析能接受的写法 —— 它按字面下标 ihl + 17 推上界，
+		 * 写成反向形式或"首部长度"这种间接关系它就推不动，会报
+		 * "可能写 77 字节"（C6386）。 */
+		if (l4len < IWAN_INNER_TCP_HDR_LEN || len < ihl + 18u)
 			return;
-		pkt[ihl + 16] = 0;
-		pkt[ihl + 17] = 0;
+		/* 清零两个校验和字节用一次 2 字节写：与后面的回写同一个辅助
+		 * 函数，边界判据也就只有一处。 */
+		iwan_win_wr16(pkt + ihl + 16, 0);
 		sum = iwan_win_csum_add(sum, pkt + ihl, l4len, 0);
 		iwan_win_wr16(pkt + ihl + 16, iwan_win_csum_finish(sum));
 	} else {
-		if (l4len < IWAN_INNER_UDP_HDR_LEN || ihl + 7u >= len)
+		if (l4len < IWAN_INNER_UDP_HDR_LEN || len < ihl + 8u)
 			return;
-		pkt[ihl + 6] = 0;
-		pkt[ihl + 7] = 0;
+		iwan_win_wr16(pkt + ihl + 6, 0);
 		sum = iwan_win_csum_add(sum, pkt + ihl, l4len, 0);
 		csum = iwan_win_csum_finish(sum);
 		if (csum == 0)
