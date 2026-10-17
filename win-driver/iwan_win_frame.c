@@ -186,20 +186,22 @@ iwan_win_inner_fix_csum(_Inout_updates_bytes_(len) UINT8 *pkt, _In_ ULONG len,
 	sum += l4len;
 
 	if (proto == IWAN_IPPROTO_TCP) {
-		if (l4len < 20)
+		/* 两条都要判：l4len 够长（数据报里有完整的 TCP 首部），以及
+		 * pkt 本身够长（写 ihl + 16 不越界）。第二条由第一条与
+		 * l4len <= len - ihl 推出，但静态分析不会替我们做这条推导，
+		 * 于是显式写出来 —— 一次比较换掉一条“可能越界写”的告警，
+		 * 而且真值上也更稳（万一 l4len 的夹取逻辑将来被改坏）。 */
+		if (l4len < IWAN_INNER_TCP_HDR_LEN ||
+		    ihl + IWAN_INNER_TCP_HDR_LEN > len)
 			return;
-		/* 写 L4 校验和位置的静态上界：l4len = tot - ihl 且 l4len >= 20
-		 * ⇒ ihl + 20 <= tot <= len。分析器不会自己推出这条链，于是按
-		 * ihl 最大 60 报“可能写 77 字节”（C6386）。这里把它写死。 */
-		__analysis_assume(ihl + IWAN_INNER_TCP_HDR_LEN <= len);
 		pkt[ihl + 16] = 0;
 		pkt[ihl + 17] = 0;
 		sum = iwan_win_csum_add(sum, pkt + ihl, l4len, 0);
 		iwan_win_wr16(pkt + ihl + 16, iwan_win_csum_finish(sum));
 	} else {
-		if (l4len < 8)
+		if (l4len < IWAN_INNER_UDP_HDR_LEN ||
+		    ihl + IWAN_INNER_UDP_HDR_LEN > len)
 			return;
-		__analysis_assume(ihl + IWAN_INNER_UDP_HDR_LEN <= len);
 		pkt[ihl + 6] = 0;
 		pkt[ihl + 7] = 0;
 		sum = iwan_win_csum_add(sum, pkt + ihl, l4len, 0);
@@ -213,7 +215,8 @@ iwan_win_inner_fix_csum(_Inout_updates_bytes_(len) UINT8 *pkt, _In_ ULONG len,
 BOOLEAN
 iwan_win_target_match(_In_reads_(count) const IWAN_WIN_TARGET *targets,
 		      _In_ UINT32 count, _In_ UINT32 family,
-		      _In_reads_bytes_(16) const UINT8 *addr)
+		      _In_reads_bytes_((family == IWAN_WIN_AF_V4) ? 4 : 16)
+		      const UINT8 *addr)
 {
 	ULONG best = 0;
 	BOOLEAN hit = FALSE;
@@ -252,6 +255,7 @@ iwan_win_target_match(_In_reads_(count) const IWAN_WIN_TARGET *targets,
 	return hit;
 }
 
+_Success_(return != FALSE)
 BOOLEAN
 iwan_win_should_tunnel4(_In_reads_(count) const IWAN_WIN_TARGET *targets,
 			_In_ UINT32 count,
@@ -286,6 +290,7 @@ iwan_win_frame_hdr_read(_In_ const UINT8 *pkt, _Inout_ IWAN_WIN_OUTER *out)
 		   (UINT32)pkt[out->frame_off + 7];
 }
 
+_Success_(return != FALSE)
 BOOLEAN
 iwan_win_outer_parse4(_In_reads_bytes_(len) const UINT8 *pkt, _In_ ULONG len,
 		      _Out_ IWAN_WIN_OUTER *out)
@@ -389,6 +394,7 @@ iwan_win_frame_classify(_In_ const IWAN_WIN_OUTER *o, _In_ UINT16 sess_sid,
 	return cred_ok ? IWAN_WIN_FRAME_DATA : IWAN_WIN_FRAME_BAD;
 }
 
+_Success_(return != 0)
 ULONG
 iwan_win_decap(_In_reads_bytes_(len) const UINT8 *pkt, _In_ ULONG len,
 	       _In_ const IWAN_WIN_OUTER *o,
@@ -577,6 +583,7 @@ iwan_win_outer_hdr6(_Out_writes_bytes_(bufsz) UINT8 *buf, _In_ ULONG bufsz,
 	return total;
 }
 
+_Success_(return != FALSE)
 BOOLEAN
 iwan_win_outer_parse6(_In_reads_bytes_(len) const UINT8 *pkt, _In_ ULONG len,
 		      _Out_ IWAN_WIN_OUTER *out)
@@ -616,6 +623,7 @@ iwan_win_outer_parse6(_In_reads_bytes_(len) const UINT8 *pkt, _In_ ULONG len,
 	return TRUE;
 }
 
+_Success_(return != FALSE)
 BOOLEAN
 iwan_win_dgram_parse(_In_reads_bytes_(len) const UINT8 *pkt, _In_ ULONG len,
 		     _Out_ IWAN_WIN_OUTER *out)

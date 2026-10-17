@@ -237,6 +237,9 @@ iwan_win_encap_inject(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 
 	/* 在途注入计数：注销/卸载时必须等它归零，才谈得上销毁注入句柄与池 */
 	InterlockedIncrement(&ext->inject_outstanding);
+	/* 注入句柄可能同步失败，也可能异步失败（完成回调里报 NTSTATUS）。
+	 * 两种失败都由完成回调统一释放 ctx->buf / ctx->mdl / ctx，
+	 * 也就是"交出去之后本函数不再拥有它们"。 */
 	st = FwpsInjectNetworkSendAsync(outer_v6 ? ext->inj_send6 : ext->inj_send4,
 					NULL, 0, compartment, nbl,
 					iwan_win_inject_complete, ctx);

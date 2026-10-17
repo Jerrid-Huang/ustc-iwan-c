@@ -347,7 +347,7 @@ iwan_win_targets_import(_In_reads_bytes_(in_len) const IWAN_WIN_SESSION_OPEN *re
 			_In_ ULONG in_len, _Out_ IWAN_WIN_TARGET **out, _Out_ ULONG *out_count)
 {
 	IWAN_WIN_TARGET *targets;
-	ULONG need, bytes, i;
+	ULONG need, bytes, cnt, i;
 
 	*out = NULL;
 	*out_count = 0;
@@ -357,10 +357,11 @@ iwan_win_targets_import(_In_reads_bytes_(in_len) const IWAN_WIN_SESSION_OPEN *re
 	if (req->target_count > IWAN_WIN_MAX_TARGETS)
 		return STATUS_INVALID_PARAMETER;
 
-	/* 逐条 24 字节、最多 32 条（IWAN_WIN_MAX_TARGETS），两块算术都先落到
-	 * ULONG 局部变量里再各自校验：这样“分配了多少”与“拷了多少”在源码上
-	 * 就是同一个数，静态分析也不会把二者当成互不相关的表达式（C6385）。 */
-	bytes = req->target_count * (ULONG)sizeof(IWAN_WIN_TARGET);
+	/* 逐条 sizeof(IWAN_WIN_TARGET) 字节、条数上限 IWAN_WIN_MAX_TARGETS。
+	 * 分配与拷贝都只用同一个局部量 bytes：这样“分配了多少”与“拷了多少”
+	 * 在源码上就是同一个数（C6385 的成因正是二者被当成两个表达式）。 */
+	cnt = req->target_count;
+	bytes = cnt * (ULONG)sizeof(IWAN_WIN_TARGET);
 	need = req->target_offset + bytes;
 	if (req->target_offset < sizeof(IWAN_WIN_SESSION_OPEN) ||
 	    need < req->target_offset || need > in_len)
@@ -372,11 +373,10 @@ iwan_win_targets_import(_In_reads_bytes_(in_len) const IWAN_WIN_SESSION_OPEN *re
 
 	RtlCopyMemory(targets, (const UINT8 *)req + req->target_offset, bytes);
 
-	/* targets 里恰好 bytes = count * sizeof(IWAN_WIN_TARGET) 字节，下面
-	 * 只按 [0, count) 索引。分析器不把“分配用的是 bytes”与“循环上界用的
-	 * 是 target_count”联系起来（C6385），这一句把两者钉死。 */
-	__analysis_assume(bytes >= req->target_count * sizeof(IWAN_WIN_TARGET));
-	for (i = 0; i < req->target_count; i++) {
+	/* 循环用局部量 cnt 而不是回读 req->target_count：条数只解析一次，
+	 * “分配 bytes / 拷 bytes / 走 cnt 条”三处同一来源，静态分析能一路
+	 * 跟到底（C6385 报的就是它以为循环上界与分配大小无关）。 */
+	for (i = 0; i < cnt; i++) {
 		if (targets[i].family == IWAN_WIN_AF_V4) {
 			if (targets[i].prefix_len > 32) {
 				ExFreePoolWithTag(targets, IWAN_TAG_TARGET);
@@ -397,7 +397,7 @@ iwan_win_targets_import(_In_reads_bytes_(in_len) const IWAN_WIN_SESSION_OPEN *re
 	}
 
 	*out = targets;
-	*out_count = req->target_count;
+	*out_count = cnt;
 	return STATUS_SUCCESS;
 }
 
