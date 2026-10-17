@@ -192,7 +192,11 @@ iwan_win_mp_encap_send(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		return FALSE;
 	}
 
+	/* send_outer4 的两种结局都不留 buf 给我们：TRUE = 所有权随 NBL 转移
+	 * （完成回调 ExFreePoolWithTag），FALSE = 它已经在内部释放。这里是
+	 * 唯一一处“交出即撒手”的缓冲，所以显式置空，别让后面的人以为还能用。 */
 	sent = iwan_win_proto_send_outer4(ext, buf, IWAN_MP_ETH_HDR_LEN + total);
+	buf = NULL;
 	if (sent) {
 		/* 与 WFP 平面同一口径：tx_bytes 记外层字节（含外层 IP+UDP），
 		 * 不含以太头 —— 那是承载的链路层开销，不属隧道开销。 */
@@ -277,6 +281,8 @@ iwan_win_mp_outer_recv(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		return;
 	}
 
+	/* 与出向同一约定：indicate_inner 要么把内层缓冲连 NBL 一起交给 NDIS
+	 * （TRUE），要么自己释放后回 FALSE。两种结局这里都不再持有。 */
 	if (iwan_win_mp_indicate_inner(ext, inner, ilen))
 		IWAN_MP_STAT_INC(ext, rx_delivered);
 	else

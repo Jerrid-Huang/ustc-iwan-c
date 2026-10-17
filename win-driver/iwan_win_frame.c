@@ -150,6 +150,11 @@ iwan_win_inner_fix_csum(_Inout_updates_bytes_(len) UINT8 *pkt, _In_ ULONG len,
 	tot = iwan_win_rd16(pkt + 2);
 	if (tot == 0 || tot > len)
 		tot = len;
+	/* 下面所有写入都限制在 [ihl, tot) 内，而 tot <= len 刚刚钉死过。
+	 * 显式夹一次是给静态分析看的：iwan_win_csum_add() 用 ULONG 做下标，
+	 * PREfast 推不出 l4len 与 tot 的关系，会把 L4 头的写当成越界（C6386）。 */
+	__analysis_assume(tot <= len);
+	__analysis_assume(ihl <= tot);
 
 	/* IPv4 头校验和：清零后重算。
 	 * 偏移是 10，不是 12 —— 12 是**源地址**的头两个字节。写错了两件事同时发生：
@@ -174,6 +179,8 @@ iwan_win_inner_fix_csum(_Inout_updates_bytes_(len) UINT8 *pkt, _In_ ULONG len,
 
 	/* 伪首部：源/目的地址 + 协议号 + L4 长度 */
 	l4len = tot - ihl;
+	if (l4len > len - ihl)
+		l4len = len - ihl;	/* tot <= len 已保证，这行让上界对分析器可见 */
 	sum = iwan_win_csum_add(0, pkt + 12, 8, 0);
 	sum += (ULONG)proto;
 	sum += l4len;
@@ -259,8 +266,11 @@ iwan_win_should_tunnel4(_In_reads_(count) const IWAN_WIN_TARGET *targets,
 /* ---- 入向（M2）：外层解析、帧分类、解封 ------------------------------- */
 
 /* 从帧头取 type/enc/sid/tok：三种外层形态共用一份，改一处不会漏两处 */
+/* 只写 out 的 type/enc/sid/tok 四个字段（frame_off 必须已被调用者填好），
+ * 所以这里用 _Inout_ 而不是 _Out_：_Out_ 会让分析器认为 out 被整体重写，
+ * 而它先前填的 frame_off/frame_len 恰恰是这里要读的。 */
 static VOID
-iwan_win_frame_hdr_read(_In_ const UINT8 *pkt, _Out_ IWAN_WIN_OUTER *out)
+iwan_win_frame_hdr_read(_In_ const UINT8 *pkt, _Inout_ IWAN_WIN_OUTER *out)
 {
 	out->type = pkt[out->frame_off + 0];
 	out->enc = pkt[out->frame_off + 1];
@@ -278,6 +288,10 @@ iwan_win_outer_parse4(_In_reads_bytes_(len) const UINT8 *pkt, _In_ ULONG len,
 	ULONG ihl, ulen, need, avail;
 	UINT8 proto;
 
+	/* 失败路径不填 out 是契约，但“不填”与“未初始化”在静态分析眼里
+	 * 没法区分（C6101）。先清零再填：失败时调用者顶多读到全零，不会
+	 * 从栈上捡到上一个包留下的偏移量。 */
+	RtlZeroMemory(out, sizeof(*out));
 	if (len < IWAN_OUTER_IP4_LEN || (pkt[0] >> 4) != 4)
 		return FALSE;
 	ihl = (ULONG)(pkt[0] & 0x0F) * 4;
@@ -564,6 +578,7 @@ iwan_win_outer_parse6(_In_reads_bytes_(len) const UINT8 *pkt, _In_ ULONG len,
 {
 	ULONG ulen, avail, need;
 
+	RtlZeroMemory(out, sizeof(*out));
 	if (len < IWAN_OUTER6_TOTAL || (pkt[0] >> 4) != 6)
 		return FALSE;
 	/* 外层 v6 由 iwan_tx_outer6 构造：nexthdr 直接是 UDP，不带扩展头；
@@ -602,6 +617,7 @@ iwan_win_dgram_parse(_In_reads_bytes_(len) const UINT8 *pkt, _In_ ULONG len,
 {
 	ULONG off = 0, ulen, avail;
 
+	RtlZeroMemory(out, sizeof(*out));
 	if (len < IWAN_OUTER_UDP_LEN)
 		return FALSE;
 

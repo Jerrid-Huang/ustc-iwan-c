@@ -86,6 +86,14 @@ typedef long NTSTATUS;
 #  define _Outptr_
 #  define _Outptr_opt_
 #  define _Inout_updates_(x)
+#  define _Success_(x)
+/* 内存归属的注解：驱动边界上“谁分配、谁释放”是两条不同的契约，写清楚
+ * 才能让静态分析不再把“所有权已转移”当成泄漏（C6014）。主机侧（金标）
+ * 没有 WDK 的 sal.h，这里按空宏兜底。 */
+#  define __drv_allocatesMem(x)
+#  define __drv_freesMem(x)
+#  define __drv_aliasesMem
+#  define __analysis_assume(x)
 #endif
 
 #include "iwan_win_abi.h"
@@ -187,6 +195,7 @@ ULONG iwan_win_outer_build6(_Out_writes_bytes_(bufsz) UINT8 *buf, _In_ ULONG buf
 			    _In_ USHORT sport, _In_ USHORT dport);
 
 /* 解析外层 IPv6 + UDP + iWAN 帧头（字段语义同 IWAN_WIN_OUTER）。 */
+_Success_(return != FALSE)
 BOOLEAN iwan_win_outer_parse6(_In_reads_bytes_(len) const UINT8 *pkt,
 			      _In_ ULONG len, _Out_ IWAN_WIN_OUTER *out);
 
@@ -201,6 +210,7 @@ BOOLEAN iwan_win_should_tunnel6(_In_reads_(count) const IWAN_WIN_TARGET *targets
 
 /* 解析外层 IPv4 + UDP + iWAN 帧头。FALSE = 结构不合法（版本/协议/长度）。
  * 不做凭据判断（那是 iwan_win_frame_classify 的事）。 */
+_Success_(return != FALSE)
 BOOLEAN iwan_win_outer_parse4(_In_reads_bytes_(len) const UINT8 *pkt,
 			      _In_ ULONG len, _Out_ IWAN_WIN_OUTER *out);
 
@@ -214,6 +224,7 @@ BOOLEAN iwan_win_outer_parse4(_In_reads_bytes_(len) const UINT8 *pkt,
  * 而误判也进不来：裸数据报偏移 9 那个字节是帧头的 enc 字段（只可能是 0/1），
  * 永远不可能等于 17。
  */
+_Success_(return != FALSE)
 BOOLEAN iwan_win_dgram_parse(_In_reads_bytes_(len) const UINT8 *pkt,
 			     _In_ ULONG len, _Out_ IWAN_WIN_OUTER *out);
 
@@ -232,6 +243,7 @@ UINT32 iwan_win_frame_classify(_In_ const IWAN_WIN_OUTER *o,
 /* 解封：把内层包复制到 out 并在 enc 时 XOR 还原。返回写出的字节数，
  * 0 = 参数不合法。返回的明文包其校验和是有效的（发送侧在 XOR 之前算好的，
  * 与 kernel/iwan_core.c 的同一约定），所以这里不需要重算校验和。 */
+_Success_(return != 0)
 ULONG iwan_win_decap(_In_reads_bytes_(len) const UINT8 *pkt, _In_ ULONG len,
 		     _In_ const IWAN_WIN_OUTER *o,
 		     _In_reads_bytes_(IWAN_KEY_LEN) const UINT8 *key,
@@ -263,12 +275,17 @@ VOID iwan_win_inner_fix_csum(_Inout_updates_bytes_(len) UINT8 *pkt, _In_ ULONG l
 
 /* 目标集合最长前缀匹配（纯函数，便于对拍）。family 用 IWAN_WIN_AF_V4/V6，
  * addr 指向 4 或 16 字节网络序地址。 */
+/* addr 的长度由 family 决定（v4 = 4 字节、v6 = 16 字节）：如实写成 16 会让
+ * v4 调用点（只交出 IP 头里那 4 字节）被静态分析判成越界读（C6385），
+ * 而多读 12 字节这件事实现里从来不做 —— 前缀匹配按 prefix_len/8 逐字节走。 */
 BOOLEAN iwan_win_target_match(_In_reads_(count) const IWAN_WIN_TARGET *targets,
 			      _In_ UINT32 count, _In_ UINT32 family,
-			      _In_reads_bytes_(16) const UINT8 *addr);
+			      _In_reads_bytes_((family == IWAN_WIN_AF_V4) ? 4 : 16)
+			      const UINT8 *addr);
 
 /* 该不该进隧道：命中目标集合，且目的地址不是外层服务器自己
  * （对应 Linux 侧"服务器 /32 钉在物理网卡"，避免隧道外层包反过来进隧道）。 */
+_Success_(return != FALSE)
 BOOLEAN iwan_win_should_tunnel4(_In_reads_(count) const IWAN_WIN_TARGET *targets,
 				_In_ UINT32 count,
 				_In_reads_bytes_(4) const UINT8 *outer_dst_be,

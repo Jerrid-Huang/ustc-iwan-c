@@ -39,6 +39,7 @@
 static HANDLE g_engine = NULL;
 #endif
 
+_Function_class_(DRIVER_DISPATCH)
 NTSTATUS
 iwan_win_dispatch_create(_In_ PDEVICE_OBJECT devobj, _Inout_ PIRP irp)
 {
@@ -49,6 +50,7 @@ iwan_win_dispatch_create(_In_ PDEVICE_OBJECT devobj, _Inout_ PIRP irp)
 	return STATUS_SUCCESS;
 }
 
+_Function_class_(DRIVER_DISPATCH)
 NTSTATUS
 iwan_win_dispatch_ioctl(_In_ PDEVICE_OBJECT devobj, _Inout_ PIRP irp)
 {
@@ -177,7 +179,8 @@ iwan_win_dispatch_ioctl(_In_ PDEVICE_OBJECT devobj, _Inout_ PIRP irp)
 	return st;
 }
 
-static VOID
+static _Function_class_(DRIVER_UNLOAD)
+VOID
 iwan_win_unload(_In_ PDRIVER_OBJECT driver)
 {
 	PDEVICE_OBJECT devobj = driver->DeviceObject;

@@ -125,7 +125,9 @@ static const NDIS_OID iwan_win_mp_oids[] = {
 	OID_PNP_SET_POWER
 };
 
-static NDIS_STATUS
+static
+_Function_class_(MINIPORT_INITIALIZE)
+NDIS_STATUS
 iwan_win_mp_initialize(_In_ NDIS_HANDLE MiniportAdapterHandle,
 		       _In_ NDIS_HANDLE MiniportDriverContext,
 		       _In_ PNDIS_MINIPORT_INIT_PARAMETERS MiniportInitParameters)
@@ -240,7 +242,9 @@ fail:
 	return st;
 }
 
-static VOID
+static
+_Function_class_(MINIPORT_HALT)
+VOID
 iwan_win_mp_halt(_In_ NDIS_HANDLE MiniportAdapterHandle,
 		 _In_ NDIS_HALT_ACTION HaltAction)
 {
@@ -279,7 +283,9 @@ iwan_win_mp_halt(_In_ NDIS_HANDLE MiniportAdapterHandle,
 	DbgPrint("iwanmp: 内层适配器已停止\n");
 }
 
-static NDIS_STATUS
+static
+_Function_class_(MINIPORT_PAUSE)
+NDIS_STATUS
 iwan_win_mp_pause(_In_ NDIS_HANDLE MiniportAdapterHandle,
 		  _In_ PNDIS_MINIPORT_PAUSE_PARAMETERS PauseParameters)
 {
@@ -293,7 +299,9 @@ iwan_win_mp_pause(_In_ NDIS_HANDLE MiniportAdapterHandle,
 	return NDIS_STATUS_SUCCESS;
 }
 
-static NDIS_STATUS
+static
+_Function_class_(MINIPORT_RESTART)
+NDIS_STATUS
 iwan_win_mp_restart(_In_ NDIS_HANDLE MiniportAdapterHandle,
 		    _In_ PNDIS_MINIPORT_RESTART_PARAMETERS RestartParameters)
 {
@@ -311,7 +319,9 @@ iwan_win_mp_restart(_In_ NDIS_HANDLE MiniportAdapterHandle,
 
 /* 把一个 NBL 链当一包处理：逐 NB 交给引擎，最后整条链一次完成。
  * 按平台约定，发送路径不得改写 NBL 链的 NEXT_NBL（那会拆散分片的 NBL）。 */
-static VOID
+static
+_Function_class_(MINIPORT_SEND_NET_BUFFER_LISTS)
+VOID
 iwan_win_mp_send_nbls(_In_ NDIS_HANDLE MiniportAdapterContext,
 		      _In_ PNET_BUFFER_LIST NetBufferLists,
 		      _In_ NDIS_PORT_NUMBER PortNumber,
@@ -404,7 +414,9 @@ iwan_win_mp_send_nbls(_In_ NDIS_HANDLE MiniportAdapterContext,
 					complete_flags);
 }
 
-static VOID
+static
+_Function_class_(MINIPORT_CANCEL_SEND)
+VOID
 iwan_win_mp_cancel_send(_In_ NDIS_HANDLE MiniportAdapterHandle,
 			_In_ PVOID CancelId)
 {
@@ -470,10 +482,16 @@ iwan_win_mp_indicate_inner(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 					   NDIS_RECEIVE_FLAGS_SINGLE_ETHER_TYPE |
 					   ((KeGetCurrentIrql() == DISPATCH_LEVEL) ?
 					    NDIS_RECEIVE_FLAGS_DISPATCH_LEVEL : 0));
+	/* 从这里起 NBL 归 NDIS：归还请求会走 iwan_win_mp_return_nbls，缓冲与
+	 * MDL 也在那里释放。本函数的局部指针必须就地作废 —— 置空是这条
+	 * 所有权转移的唯一记号（也顺手消掉静态分析的“泄漏”误报）。 */
+	nbl = NULL;
 	return TRUE;
 }
 
-static VOID
+static
+_Function_class_(MINIPORT_RETURN_NET_BUFFER_LISTS)
+VOID
 iwan_win_mp_return_nbls(_In_ NDIS_HANDLE MiniportAdapterHandle,
 			_In_ PNET_BUFFER_LIST NetBufferLists,
 			_In_ ULONG ReturnFlags)
@@ -482,7 +500,9 @@ iwan_win_mp_return_nbls(_In_ NDIS_HANDLE MiniportAdapterHandle,
 	/* 本处理函数拿到的是 MiniportAdapterHandle，不是 MiniportAdapterContext，
 	 * 所以取不到 ext：这里用单例取回（本小型端口按构造只服务一个适配器，
 	 * InitializeEx 对第二个适配器直接拒绝）。rx_inflight 必须在销毁 NBL 池
-	 * 之前减到零，Halt 靠它判断"还有没有已经指示上去、尚未归还的 NBL"。 */
+	 * 之前减到零，Halt 靠它判断"还有没有已经指示上去、尚未归还的 NBL"。
+	 * UnloadHandler 之后单例会被清空，此时归还仍必须完成（NBL 与缓冲是池
+	 * 资产，漏掉就是泄漏），只有计数无处可减。 */
 	IWAN_WIN_DEVICE_EXTENSION *ext = iwan_win_mp_device_ext();
 
 	UNREFERENCED_PARAMETER(MiniportAdapterHandle);
@@ -579,7 +599,9 @@ iwan_win_mp_oid_string(_Inout_ PNDIS_OID_REQUEST oid, _In_ const char *s)
 	return NDIS_STATUS_SUCCESS;
 }
 
-static NDIS_STATUS
+static
+_Function_class_(MINIPORT_OID_REQUEST)
+NDIS_STATUS
 iwan_win_mp_oid_request(_In_ NDIS_HANDLE MiniportAdapterHandle,
 			_In_ PNDIS_OID_REQUEST OidRequest)
 {
@@ -681,7 +703,9 @@ iwan_win_mp_oid_request(_In_ NDIS_HANDLE MiniportAdapterHandle,
 	}
 }
 
-static VOID
+static
+_Function_class_(MINIPORT_CANCEL_OID_REQUEST)
+VOID
 iwan_win_mp_cancel_oid(_In_ NDIS_HANDLE MiniportAdapterHandle,
 		       _In_ PVOID RequestId)
 {
@@ -690,7 +714,9 @@ iwan_win_mp_cancel_oid(_In_ NDIS_HANDLE MiniportAdapterHandle,
 	UNREFERENCED_PARAMETER(RequestId);
 }
 
-static VOID
+static
+_Function_class_(MINIPORT_DEVICE_PNP_EVENT_NOTIFY)
+VOID
 iwan_win_mp_pnp_event(_In_ NDIS_HANDLE MiniportAdapterContext,
 		      _In_ PNET_DEVICE_PNP_EVENT NetDevicePnPEvent)
 {
@@ -698,7 +724,9 @@ iwan_win_mp_pnp_event(_In_ NDIS_HANDLE MiniportAdapterContext,
 	UNREFERENCED_PARAMETER(NetDevicePnPEvent);
 }
 
-static VOID
+static
+_Function_class_(MINIPORT_SHUTDOWN)
+VOID
 iwan_win_mp_shutdown(_In_ NDIS_HANDLE MiniportAdapterContext,
 		     _In_ NDIS_SHUTDOWN_ACTION ShutdownAction)
 {
@@ -726,7 +754,9 @@ iwan_win_mp_device_ext(VOID)
 /* DirectOid / SynchronousOid 三个 handler：本平面一个 OID 都不主动发，
  * 一律回"不支持"。它们只在 REVISION_2/3 的特性表里出现（选老 revision
  * 时字段根本不存在），写在这里是为了让候选配置能覆盖三种 revision。 */
-static NDIS_STATUS
+static
+_Function_class_(MINIPORT_DIRECT_OID_REQUEST)
+NDIS_STATUS
 iwan_win_mp_direct_oid(_In_ NDIS_HANDLE MiniportAdapterHandle,
 		       _In_ PNDIS_OID_REQUEST OidRequest)
 {
@@ -735,7 +765,9 @@ iwan_win_mp_direct_oid(_In_ NDIS_HANDLE MiniportAdapterHandle,
 	return NDIS_STATUS_NOT_SUPPORTED;
 }
 
-static VOID
+static
+_Function_class_(MINIPORT_CANCEL_DIRECT_OID_REQUEST)
+VOID
 iwan_win_mp_cancel_direct_oid(_In_ NDIS_HANDLE MiniportAdapterHandle,
 			      _In_ PVOID RequestId)
 {
@@ -743,7 +775,9 @@ iwan_win_mp_cancel_direct_oid(_In_ NDIS_HANDLE MiniportAdapterHandle,
 	UNREFERENCED_PARAMETER(RequestId);
 }
 
-static NDIS_STATUS
+static
+_Function_class_(MINIPORT_SYNCHRONOUS_OID_REQUEST)
+NDIS_STATUS
 iwan_win_mp_sync_oid(_In_ NDIS_HANDLE MiniportAdapterHandle,
 		     _In_ PNDIS_OID_REQUEST OidRequest)
 {
@@ -812,8 +846,13 @@ iwan_win_mp_param_get(_In_ PCWSTR name, _In_ ULONG dflt)
 	UNICODE_STRING path, vn;
 	OBJECT_ATTRIBUTES oa;
 	HANDLE key = NULL;
+	/* 这块缓冲只被 ZwQueryValueKey 填前 len 字节，剩下的仍是未初始化内存；
+	 * 显式清零既让分析器闭嘴（C28199），也避免把栈内容当成 Type/DataLength
+	 * 去判（查不到值时那两个字段根本不存在）。 */
 	UCHAR buf[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(ULONG)];
 	ULONG len = 0, out = dflt;
+
+	RtlZeroMemory(buf, sizeof(buf));
 
 	RtlInitUnicodeString(&path,
 			     L"\\Registry\\Machine\\System\\CurrentControlSet"
@@ -826,11 +865,17 @@ iwan_win_mp_param_get(_In_ PCWSTR name, _In_ ULONG dflt)
 	RtlInitUnicodeString(&vn, name);
 	if (NT_SUCCESS(ZwQueryValueKey(key, &vn, KeyValuePartialInformation,
 				       buf, sizeof(buf), &len))) {
-		PKEY_VALUE_PARTIAL_INFORMATION kv =
-			(PKEY_VALUE_PARTIAL_INFORMATION)buf;
+		/* 逐字段拷到局部结构里再判：kvv 的内存是我们自己的、已清零，
+		 * 分析器能一路跟到底（C28199）；直接给 buf 起别名它就只能
+		 * 认定“可能未初始化”。字段语义完全相同。 */
+		KEY_VALUE_PARTIAL_INFORMATION kv;
 
-		if (kv->Type == REG_DWORD && kv->DataLength >= sizeof(ULONG))
-			RtlCopyMemory(&out, kv->Data, sizeof(ULONG));
+		RtlZeroMemory(&kv, sizeof(kv));
+		RtlCopyMemory(&kv, buf,
+			      len < sizeof(kv) ? len : (ULONG)sizeof(kv));
+		if (kv.Type == REG_DWORD && kv.DataLength >= sizeof(ULONG) &&
+		    kv.DataLength <= sizeof(ULONG) * 4u)
+			RtlCopyMemory(&out, kv.Data, sizeof(ULONG));
 	}
 	ZwClose(key);
 	return out;
@@ -1046,7 +1091,9 @@ iwan_win_mp_fini(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
  * 小型端口之后归 NDIS 管）。这里要做完整套退出：数据面 → 会话 → 扩展内存。
  * 控制设备由 NdisDeregisterDeviceEx 注销（符号链接它自己会删），扩展是我们
  * 分配的，也要在这里还掉。 */
-static VOID
+static
+_Function_class_(MINIPORT_UNLOAD)
+VOID
 iwan_win_mp_unload_hook(_In_ PDRIVER_OBJECT driver)
 {
 	IWAN_WIN_DEVICE_EXTENSION *ext = g_mp_ext;

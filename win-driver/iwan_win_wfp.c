@@ -250,6 +250,11 @@ iwan_win_encap_inject(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		nbl = NULL;
 		goto fail;
 	}
+	/* 注入成功：ctx 与 buf 的所有权已随 NBL 交给 WFP，完成回调
+	 * （iwan_win_inject_complete）里释放。两个局部指针就地作废 —— 这是
+	 * "所有权已转移"的唯一记号，也免得静态分析把它读成泄漏（C6014）。 */
+	ctx = NULL;
+	buf = NULL;
 	return STATUS_SUCCESS;
 
 fail:
@@ -604,7 +609,11 @@ iwan_win_inject_net_recv(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		IoFreeMdl(ctx->mdl);
 		ExFreePoolWithTag(ctx->buf, IWAN_TAG_PKT);
 		ExFreePoolWithTag(ctx, IWAN_TAG_PKT);
+		return st;
 	}
+	/* 注入成功：ctx（连 buf/mdl）由 iwan_win_inject_complete 释放，
+	 * 本函数一个都不再持有。 */
+	ctx = NULL;
 	return st;
 }
 
@@ -1114,8 +1123,14 @@ iwan_win_classify_out6(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 				iwan_win_diag_tx(s, IWAN_WIN_DIAG_TX_MTU, nblen,
 						 tot, pkt[0], pkt);
 				IWAN_STAT_INC(ext, tx_bad_state);
-				if (stor != NULL)
+				if (stor != NULL) {
 					ExFreePoolWithTag(stor, IWAN_TAG_PKT);
+					/* 必须置空：stor 声明在循环体内，但分析器
+					 * 按"循环回边仍持有已释放指针"报 C6014；更
+					 * 要紧的是真语义 —— 置空是"本轮这块缓冲已
+					 * 归还"的唯一记号，下一轮重新分配。 */
+					stor = NULL;
+				}
 				continue;
 			}
 

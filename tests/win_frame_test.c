@@ -695,6 +695,99 @@ test_decap_lengths(void)
 	}
 }
 
+/* ---- 5c. 失败路径的 out 参数必须被写成确定值 -------------------------
+ *
+ * 四个解析函数（outer_parse4 / outer_parse6 / dgram_parse / decap）在返回
+ * 失败时都不承诺填 out —— 调用者本不该读它。但“不承诺”与“栈上残留”在
+ * 静态分析里无法区分，而真实的隐患是：调用者若在失败后仍然读了 out 的
+ * 某个字段（比如拿 inner_len 去算长度），就会用到上一个包的数据。
+ * 这里把 out 预先填成 0xCD，再喂各种坏包，要求函数**要么返回失败且
+ * 不动 out 的语义字段，要么返回失败并把它们清成 0** —— 现在是后者。
+ */
+static void
+test_parse_failure_clears_out(void)
+{
+	uint8_t shortpkt[8];
+	uint8_t badver[60];
+	IWAN_WIN_OUTER o;
+	uint8_t out[64];
+	const uint8_t key[8] = { 0 };
+
+	memset(shortpkt, 0x00, sizeof(shortpkt));
+	memset(badver, 0x00, sizeof(badver));
+	badver[0] = 0x65;	/* 版本 6 的包喂给 v4 解析器 */
+
+	/* v4 解析：长度不足 / 版本不符 */
+	memset(&o, 0xCD, sizeof(o));
+	CHECK(!iwan_win_outer_parse4(shortpkt, sizeof(shortpkt), &o),
+	      "8 字节包不应被当成合法外层 v4");
+	CHECK(o.inner_len == 0 && o.inner_off == 0 && o.frame_len == 0,
+	      "失败后 out 的偏移字段应清零（inner_len=%u frame_len=%u）",
+	      o.inner_len, o.frame_len);
+
+	memset(&o, 0xCD, sizeof(o));
+	CHECK(!iwan_win_outer_parse4(badver, sizeof(badver), &o),
+	      "版本号 6 的包不应被 v4 解析器接受");
+	CHECK(o.inner_len == 0 && o.type == 0 && o.enc == 0,
+	      "失败后 out 的类型字段应清零");
+
+	/* 裸数据报解析：过短 */
+	memset(&o, 0xCD, sizeof(o));
+	CHECK(!iwan_win_dgram_parse(shortpkt, sizeof(shortpkt), &o),
+	      "8 字节裸包不应被接受");
+	CHECK(o.inner_len == 0 && o.frame_off == 0,
+	      "失败后裸包解析的偏移字段应清零");
+
+	/* 解封：输出缓冲不足 / 上下文非法 */
+	memset(out, 0xCD, sizeof(out));
+	o.inner_len = 4;
+	o.inner_off = 0;
+	o.enc = 0;
+	CHECK(iwan_win_decap(shortpkt, sizeof(shortpkt), &o, key, out, 3) == 0,
+	      "outsz 小于 inner_len 必须拒绝");
+	CHECK(out[0] == 0xCD, "被拒绝的解封不应写输出缓冲");
+
+	memset(&o, 0, sizeof(o));
+	CHECK(iwan_win_decap(shortpkt, sizeof(shortpkt), &o, key, out,
+			     sizeof(out)) == 0,
+	      "inner_len 为 0 必须拒绝");
+}
+
+/* ---- 5d. 两个解析器对同一条流必须给出一致的字段 ----------------------- */
+
+static void
+test_parse4_vs_dgram_agree(void)
+{
+	uint8_t outer[600];
+	uint8_t payload[100];
+	IWAN_WIN_OUTER a, b;
+	size_t total, i;
+
+	for (i = 0; i < sizeof(payload); i++)
+		payload[i] = (uint8_t)(i ^ 0x5A);
+
+	/* build_outer 造的是完整的 IPv4+UDP 外层；dgram_parse 对"仍带 IP 头"
+	 * 的输入应当解析出与 outer_parse4 完全相同的字段。两条入向路径
+	 * （协议边 / WFP 平面）各用一个，字段必须逐项相等，否则同一份报文
+	 * 在两条路径上会解出不同的内层边界。 */
+	total = build_outer(outer, sizeof(payload), 40000, 6001, PT_DATA, 0,
+			    0x1234, 0x12345678, 0);
+	memcpy(outer + 36, payload, sizeof(payload));
+
+	CHECK(iwan_win_outer_parse4(outer, total, &a), "v4 解析失败");
+	CHECK(iwan_win_dgram_parse(outer, total, &b), "dgram 解析失败");
+	CHECK(a.frame_off == b.frame_off && a.frame_len == b.frame_len &&
+	      a.inner_off == b.inner_off && a.inner_len == b.inner_len,
+	      "两个解析器的偏移不一致（%u/%u/%u/%u vs %u/%u/%u/%u）",
+	      a.frame_off, a.frame_len, a.inner_off, a.inner_len,
+	      b.frame_off, b.frame_len, b.inner_off, b.inner_len);
+	CHECK(a.type == b.type && a.enc == b.enc && a.sid == b.sid &&
+	      a.tok == b.tok,
+	      "两个解析器的帧头字段不一致");
+	CHECK(a.inner_len == sizeof(payload), "内层长度应为 %zu（实得 %u）",
+	      sizeof(payload), a.inner_len);
+}
+
 /* ---- 6. 与用户态发送侧对拍：拿 pkt_hdr()/xor_crypt() 造的帧喂驱动解析 --- */
 
 static void
@@ -1103,6 +1196,8 @@ main(void)
 	test_outer_build6();
 	test_should_tunnel6();
 	test_wire_harness_golden();
+	test_parse_failure_clears_out();
+	test_parse4_vs_dgram_agree();
 
 	printf("win_frame_test: 通过 %d 项，失败 %d 项\n", g_pass, g_fail);
 	return g_fail == 0 ? 0 : 1;

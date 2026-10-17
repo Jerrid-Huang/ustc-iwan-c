@@ -245,9 +245,20 @@ iwan_win_shm_map_user(_Inout_ IWAN_WIN_SESSION *s)
 	mdl->MdlFlags |= MDL_MAPPING_CAN_FAIL;
 
 	/* UserMode 映射是只读的（对应 Linux 侧 mmap 只给 PROT_READ）：
-	 * 用户态能轮询时间戳，但改不了内核写的任何字段。 */
-	va = MmMapLockedPagesSpecifyCache(mdl, UserMode, MmCached, NULL, FALSE,
-					  NormalPagePriority | MdlMappingNoExecute);
+	 * 用户态能轮询时间戳，但改不了内核写的任何字段。
+	 *
+	 * MmMapLockedPagesSpecifyCache 的 UserMode 变体在映射失败时可以抛异常
+	 * （KE 文档与 PREfast C28125 都要求放在 try/except 里）。异常里把 MDL
+	 * 收回来：异常路径不能继续持有它，否则每次失败都漏一个 MDL。 */
+	va = NULL;
+	__try {
+		va = MmMapLockedPagesSpecifyCache(mdl, UserMode, MmCached, NULL,
+						  FALSE,
+						  NormalPagePriority |
+						  MdlMappingNoExecute);
+	} __except (EXCEPTION_EXECUTE_HANDLER) {
+		va = NULL;
+	}
 	if (va == NULL) {
 		IoFreeMdl(mdl);
 		return STATUS_INSUFFICIENT_RESOURCES;
@@ -332,7 +343,7 @@ iwan_win_targets_import(_In_reads_bytes_(in_len) const IWAN_WIN_SESSION_OPEN *re
 			_In_ ULONG in_len, _Out_ IWAN_WIN_TARGET **out, _Out_ ULONG *out_count)
 {
 	IWAN_WIN_TARGET *targets;
-	ULONG need, i;
+	ULONG need, bytes, i;
 
 	*out = NULL;
 	*out_count = 0;
@@ -342,18 +353,20 @@ iwan_win_targets_import(_In_reads_bytes_(in_len) const IWAN_WIN_SESSION_OPEN *re
 	if (req->target_count > IWAN_WIN_MAX_TARGETS)
 		return STATUS_INVALID_PARAMETER;
 
-	need = req->target_offset + req->target_count * sizeof(IWAN_WIN_TARGET);
+	/* 逐条 24 字节、最多 32 条（IWAN_WIN_MAX_TARGETS），两块算术都先落到
+	 * ULONG 局部变量里再各自校验：这样“分配了多少”与“拷了多少”在源码上
+	 * 就是同一个数，静态分析也不会把二者当成互不相关的表达式（C6385）。 */
+	bytes = req->target_count * (ULONG)sizeof(IWAN_WIN_TARGET);
+	need = req->target_offset + bytes;
 	if (req->target_offset < sizeof(IWAN_WIN_SESSION_OPEN) ||
 	    need < req->target_offset || need > in_len)
 		return STATUS_INVALID_PARAMETER;
 
-	targets = (IWAN_WIN_TARGET *)IWAN_ALLOC(
-		req->target_count * sizeof(IWAN_WIN_TARGET), IWAN_TAG_TARGET);
+	targets = (IWAN_WIN_TARGET *)IWAN_ALLOC(bytes, IWAN_TAG_TARGET);
 	if (targets == NULL)
 		return STATUS_INSUFFICIENT_RESOURCES;
 
-	RtlCopyMemory(targets, (const UINT8 *)req + req->target_offset,
-		      req->target_count * sizeof(IWAN_WIN_TARGET));
+	RtlCopyMemory(targets, (const UINT8 *)req + req->target_offset, bytes);
 
 	for (i = 0; i < req->target_count; i++) {
 		if (targets[i].family == IWAN_WIN_AF_V4) {

@@ -122,17 +122,30 @@ iwan_win_proto_binding_close(_Inout_ IWAN_MP_BINDING *b)
 
 /* ---- 邻居（ARP） ------------------------------------------------------- */
 
+/* ARP 报文净长（不带以太头）：硬件类型 2 + 协议类型 2 + 长度 2 + 操作 2
+ * + 发送方 MAC 6 + 发送方 IP 4 + 目标 MAC 6 + 目标 IP 4。 */
+#define IWAN_MP_ARP_LEN 28u
+
 /* 组一个 ARP 请求：who-has next_hop tell local_mac。返回帧长（以太+ARP）。 */
+/* bufsz 先判后写：以太头 14 + ARP 28 全在下面逐字节写。注解里的
+ * _Out_writes_bytes_(bufsz) 是这条约定的书面形式（原来只写 _Out_，
+ * 分析器就只能按 1 字节算，报的是注解缺口不是越界）。 */
+_Success_(return != 0)
 static ULONG
-iwan_win_proto_build_arp4(_In_ IWAN_WIN_DEVICE_EXTENSION *ext, _Out_ UINT8 *eth,
+iwan_win_proto_build_arp4(_In_ IWAN_WIN_DEVICE_EXTENSION *ext,
+			  _Out_writes_bytes_(bufsz) UINT8 *eth,
 			  _In_ ULONG bufsz)
 {
 	IWAN_MP_PLANE *mp = &ext->mp;
 	UINT8 *a;
 	ULONG i;
 
-	if (bufsz < IWAN_MP_ETH_HDR_LEN + 28u)
+	if (bufsz < IWAN_MP_ETH_HDR_LEN + IWAN_MP_ARP_LEN)
 		return 0;
+	/* 下面两个下标的静态上界：eth 的写入落在 [0,14)、a 的写入落在
+	 * [14, 14+28)。两者相加正好是上面这条闸门，分析器需要这一句才
+	 * 知道 a[27] 不是越界写（C6386）。 */
+	__analysis_assume(bufsz >= IWAN_MP_ETH_HDR_LEN + IWAN_MP_ARP_LEN);
 
 	/* 以太头：广播 */
 	for (i = 0; i < 6; i++)
@@ -158,7 +171,7 @@ iwan_win_proto_build_arp4(_In_ IWAN_WIN_DEVICE_EXTENSION *ext, _Out_ UINT8 *eth,
 	a[26] = (UINT8)(mp->next_hop_be >> 8);
 	a[27] = (UINT8)(mp->next_hop_be);
 
-	return IWAN_MP_ETH_HDR_LEN + 28u;
+	return IWAN_MP_ETH_HDR_LEN + IWAN_MP_ARP_LEN;
 }
 
 /* 收到 ARP：把"发送方协议地址 = 下一跳"的回复记下来。 */
@@ -213,7 +226,9 @@ iwan_win_proto_send_arp4(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 		ExFreePoolWithTag(buf, IWAN_TAG_PKT);
 		return;
 	}
-	/* 走同一条发送路径：send_outer4 只管把帧交给网卡，不看以太类型 */
+	/* 走同一条发送路径：send_outer4 只管把帧交给网卡，不看以太类型。
+	 * 它 TRUE 时所有权已随 NBL 转移（完成回调释放）、FALSE 时已经自己
+	 * 释放 —— 两种结局都不该在这里再动 buf，所以这里没有 else 释放。 */
 	if (!iwan_win_proto_send_outer4(ext, buf, len))
 		IWAN_MP_STAT_INC(ext, tx_err);
 }
@@ -327,7 +342,9 @@ iwan_win_proto_send_outer4(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 }
 
 /* 发送完成：归还缓冲、清在途。可能在 DISPATCH_LEVEL。 */
-static VOID
+static
+_Function_class_(PROTOCOL_SEND_NET_BUFFER_LISTS_COMPLETE)
+VOID
 iwan_win_proto_send_complete(_In_ NDIS_HANDLE ProtocolBindingContext,
 			     _In_ PNET_BUFFER_LIST NetBufferLists,
 			     _In_ ULONG SendCompleteFlags)
@@ -362,6 +379,7 @@ iwan_win_proto_send_complete(_In_ NDIS_HANDLE ProtocolBindingContext,
 
 /* 取一个 NB 的连续视图。need 字节；stor/stor_sz 非空时优先用调用者的缓冲
  * （NDIS 会按需拷进去）。返回 NULL = 取不到或超长。调用期间数据有效。 */
+_Success_(return != NULL)
 static const UINT8 *
 iwan_win_proto_view(_In_ NET_BUFFER *nb, _In_ ULONG need,
 		    _Inout_opt_ UINT8 *stor, _In_ ULONG stor_sz)
@@ -379,6 +397,7 @@ iwan_win_proto_view(_In_ NET_BUFFER *nb, _In_ ULONG need,
 
 /* 命中判定：帧内 IPv4 目的地址 = 会话外层源地址、UDP 目的端口 = 会话源端口。
  * 与 WFP 平面入向闸门同一口径（那边地址取自固定字段，这边从帧里读）。 */
+_Success_(return != FALSE)
 static BOOLEAN
 iwan_win_proto_is_ours(_In_ const IWAN_WIN_SESSION *s,
 		       _In_reads_bytes_(len) const UINT8 *ip, _In_ ULONG len,
@@ -413,6 +432,9 @@ iwan_win_proto_recv_one(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	ULONG len, iplen, need;
 	UINT16 eth_type;
 
+	/* hdr 只在“NdisGetDataBuffer 把数据拷进来”之后才被读（iwan_win_proto_view
+	 * 的契约）。清零是给静态分析的确定值，也让任何契约破坏读到零而不是栈残留。 */
+	RtlZeroMemory(hdr, sizeof(hdr));
 	len = NET_BUFFER_DATA_LENGTH(nb);
 	if (len < IWAN_MP_ETH_HDR_LEN + 20u)
 		return FALSE;
@@ -479,7 +501,9 @@ iwan_win_proto_recv_one(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 
 /* 收到一批 NBL。本边一枚都不向上指示：同一条链路上的常规 TCP/IP 绑定是
  * 另一个协议驱动，它自己会收；我们只挑走本会话的外层帧，其余原样归还。 */
-static VOID
+static
+_Function_class_(PROTOCOL_RECEIVE_NET_BUFFER_LISTS)
+VOID
 iwan_win_proto_recv_nbls(_In_ NDIS_HANDLE ProtocolBindingContext,
 			 _In_ PNET_BUFFER_LIST NetBufferLists,
 			 _In_ NDIS_PORT_NUMBER PortNumber,
@@ -516,7 +540,9 @@ iwan_win_proto_recv_nbls(_In_ NDIS_HANDLE ProtocolBindingContext,
 
 /* ---- 绑定生命周期 ----------------------------------------------------- */
 
-static VOID
+static
+_Function_class_(PROTOCOL_OPEN_ADAPTER_COMPLETE_EX)
+VOID
 iwan_win_proto_open_complete(_In_ NDIS_HANDLE ProtocolBindingContext,
 			     _In_ NDIS_STATUS Status)
 {
@@ -533,7 +559,9 @@ iwan_win_proto_open_complete(_In_ NDIS_HANDLE ProtocolBindingContext,
 	NdisCompleteBindAdapterEx(b->bind_context, Status);
 }
 
-static VOID
+static
+_Function_class_(PROTOCOL_CLOSE_ADAPTER_COMPLETE_EX)
+VOID
 iwan_win_proto_close_complete(_In_ NDIS_HANDLE ProtocolBindingContext)
 {
 	IWAN_MP_BINDING *b = (IWAN_MP_BINDING *)ProtocolBindingContext;
@@ -542,7 +570,9 @@ iwan_win_proto_close_complete(_In_ NDIS_HANDLE ProtocolBindingContext)
 	NdisCompleteUnbindAdapterEx(b->unbind_context);
 }
 
-static NDIS_STATUS
+static
+_Function_class_(PROTOCOL_BIND_ADAPTER_EX)
+NDIS_STATUS
 iwan_win_proto_bind(_In_ NDIS_HANDLE ProtocolDriverContext,
 		    _In_ NDIS_HANDLE BindContext,
 		    _In_ PNDIS_BIND_PARAMETERS BindParameters)
@@ -604,7 +634,9 @@ iwan_win_proto_bind(_In_ NDIS_HANDLE ProtocolDriverContext,
 	return st;
 }
 
-static NDIS_STATUS
+static
+_Function_class_(PROTOCOL_UNBIND_ADAPTER_EX)
+NDIS_STATUS
 iwan_win_proto_unbind(_In_ NDIS_HANDLE UnbindContext,
 		      _In_ NDIS_HANDLE ProtocolBindingContext)
 {
@@ -639,7 +671,9 @@ iwan_win_proto_unbind(_In_ NDIS_HANDLE UnbindContext,
 	return NDIS_STATUS_SUCCESS;
 }
 
-static NDIS_STATUS
+static
+_Function_class_(SET_OPTIONS)
+NDIS_STATUS
 iwan_win_proto_set_options(_In_ NDIS_HANDLE NdisDriverHandle,
 			   _In_ NDIS_HANDLE DriverContext)
 {
@@ -648,7 +682,9 @@ iwan_win_proto_set_options(_In_ NDIS_HANDLE NdisDriverHandle,
 	return NDIS_STATUS_SUCCESS;
 }
 
-static VOID
+static
+_Function_class_(PROTOCOL_STATUS_EX)
+VOID
 iwan_win_proto_status(_In_ NDIS_HANDLE ProtocolBindingContext,
 		      _In_ PNDIS_STATUS_INDICATION StatusIndication)
 {
@@ -656,7 +692,9 @@ iwan_win_proto_status(_In_ NDIS_HANDLE ProtocolBindingContext,
 	UNREFERENCED_PARAMETER(StatusIndication);
 }
 
-static NDIS_STATUS
+static
+_Function_class_(PROTOCOL_NET_PNP_EVENT)
+NDIS_STATUS
 iwan_win_proto_pnp_event(_In_ NDIS_HANDLE ProtocolBindingContext,
 			 _In_ PNET_PNP_EVENT_NOTIFICATION NetPnPEventNotification)
 {
