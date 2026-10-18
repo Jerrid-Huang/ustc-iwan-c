@@ -265,6 +265,14 @@ jobs:
             $p = Join-Path "$env:WDKINC\shared" $f
             if (Test-Path $p) { Copy-Item $p "$env:GITHUB_WORKSPACE\wdk-src\" -Force }
           }
+          # NDIS_OID_REQUEST 的结构体体也不在 ntddndis.h（那里只有前向声明），
+          # 而在 ndis/oidrequest.h —— ndis.h:4441 就是 include 它。协议边要下发
+          # OID_GEN_CURRENT_PACKET_FILTER，必须先拿到这个结构。
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\wdk-src\ndis" | Out-Null
+          foreach ($f in @('oidrequest.h', 'types.h', 'status.h')) {
+            $p = Join-Path "$env:WDKINC\shared\ndis" $f
+            if (Test-Path $p) { Copy-Item $p "$env:GITHUB_WORKSPACE\wdk-src\ndis\" -Force }
+          }
           Copy-Item "$env:WDKINC\shared\ndis\version.h" "$env:GITHUB_WORKSPACE\wdk-src\ndis-version.h" -Force -ErrorAction SilentlyContinue
           Get-ChildItem "$env:GITHUB_WORKSPACE\wdk-src" -ErrorAction SilentlyContinue |
             Select-Object Name, Length | Out-String | Tee-Object -FilePath $log -Append
