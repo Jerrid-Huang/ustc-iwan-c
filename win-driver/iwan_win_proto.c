@@ -599,6 +599,11 @@ iwan_win_proto_set_packet_filter(_Inout_ IWAN_MP_BINDING *b)
 	IWAN_MP_OID_SET *o;
 	NDIS_STATUS st;
 
+	/* 两条结束路径各释放一次：同步返回（下面 if 的另一半）与 NDIS 的
+	 * OidRequestCompleteHandler 回调（PENDING 时才会来）。分析器看不到
+	 * NdisOidRequest 会持有指针、更看不到回调，按"分配后没有在本函数里
+	 * 每条路径都释放"报 C6014 —— 与 WFP 注入的 ctx/buf 同一类误报。 */
+#pragma warning(suppress: 6014)
 	o = (IWAN_MP_OID_SET *)IWAN_ALLOC(sizeof(*o), IWAN_TAG_PKT);
 	if (o == NULL) {
 		DbgPrint("iwanmp: 过滤器请求分配失败（if%u）\n",
