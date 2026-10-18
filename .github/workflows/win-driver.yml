@@ -254,9 +254,15 @@ jobs:
           P2 'NDIS_OBJECT_TYPE_DEVICE_OBJECT_ATTRIBUTES 定义' 'define +NDIS_OBJECT_TYPE_DEVICE_OBJECT_ATTRIBUTES' 1 6
           P2 'NDIS_OBJECT_TYPE_DEFAULT 定义' 'define +NDIS_OBJECT_TYPE_DEFAULT' 1 6
           New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\wdk-src" | Out-Null
-          foreach ($f in @('ndis.h', 'nblapi.h', 'miniportgeneralattributes.h', 'netioapi.h',
-                           'ntddndis.h')) {
+          # 注意 ntddndis.h 不在 km\ 而在 shared\：NDIS_OID_REQUEST 的结构体体、
+          # NDIS_SIZEOF_OID_REQUEST_REVISION_1、NdisRequestSetInformation 枚举都在
+          # 那里，ndis.h 只给出前向声明。第一次只从 km\ 取，结果一个都没带回来。
+          foreach ($f in @('ndis.h', 'nblapi.h', 'miniportgeneralattributes.h', 'netioapi.h')) {
             $p = Join-Path $h $f
+            if (Test-Path $p) { Copy-Item $p "$env:GITHUB_WORKSPACE\wdk-src\" -Force }
+          }
+          foreach ($f in @('ntddndis.h', 'ndis.h')) {
+            $p = Join-Path "$env:WDKINC\shared" $f
             if (Test-Path $p) { Copy-Item $p "$env:GITHUB_WORKSPACE\wdk-src\" -Force }
           }
           Copy-Item "$env:WDKINC\shared\ndis\version.h" "$env:GITHUB_WORKSPACE\wdk-src\ndis-version.h" -Force -ErrorAction SilentlyContinue
