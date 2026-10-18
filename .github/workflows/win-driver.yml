@@ -273,19 +273,20 @@ jobs:
             $p = Join-Path "$env:WDKINC\shared\ndis" $f
             if (Test-Path $p) { Copy-Item $p "$env:GITHUB_WORKSPACE\wdk-src\ndis\" -Force }
           }
-          # 上一轮只带回 status.h/types.h，oidrequest.h 不在 shared\ndis\。
-          # 不再猜目录：在整个 Include 树里按文件名递归找，找到几份就带几份，
-          # 并把完整路径打进日志 —— 下一轮读日志就知道它到底在哪。
-          {
-            $root = Split-Path $env:WDKINC -Parent
-            $n = 0
-            foreach ($p in (Get-ChildItem -Path $root -Recurse -Filter 'oidrequest.h' -ErrorAction SilentlyContinue)) {
-              $n = $n + 1
-              "oidrequest.h[$n] = $($p.FullName) ($($p.Length) B)" |
-                Tee-Object -FilePath $log -Append
-              Copy-Item $p.FullName "$env:GITHUB_WORKSPACE\wdk-src\ndis\oidrequest_$n.h" -Force
+          # 上一轮那段递归查找一行输出都没有：PowerShell 里裸的 { ... } 只是脚本块
+          # 字面量，求值完就丢，根本没执行 —— 必须写成 & { ... }。
+          # 这一轮不猜目录：ndis.h 就在 km\ 下，它自己 #include <ndis/xxx.h>，
+          # 所以 <ndis/oidrequest.h> 必然解析到 km\ndis\。整个目录搬回来。
+          "`n=== km\ndis 目录 ===" | Tee-Object -FilePath $log -Append
+          $ndis_sub = Join-Path $h 'ndis'
+          if (Test-Path $ndis_sub) {
+            Get-ChildItem $ndis_sub -Filter '*.h' -ErrorAction SilentlyContinue | ForEach-Object {
+              "$($_.Name) = $($_.Length) B" | Tee-Object -FilePath $log -Append
+              Copy-Item $_.FullName "$env:GITHUB_WORKSPACE\wdk-src\ndis\" -Force
             }
-            if ($n -eq 0) { 'oidrequest.h 在 Include 树里没找到' | Tee-Object -FilePath $log -Append }
+          } else { 'km\ndis 不存在' | Tee-Object -FilePath $log -Append }
+          if (-not (Test-Path "$env:GITHUB_WORKSPACE\wdk-src\ndis\oidrequest.h")) {
+            'oidrequest.h 仍未到手' | Tee-Object -FilePath $log -Append
           }
           Copy-Item "$env:WDKINC\shared\ndis\version.h" "$env:GITHUB_WORKSPACE\wdk-src\ndis-version.h" -Force -ErrorAction SilentlyContinue
           Get-ChildItem "$env:GITHUB_WORKSPACE\wdk-src" -ErrorAction SilentlyContinue |
