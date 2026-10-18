@@ -1005,6 +1005,24 @@ iwan_win_mp_init(_In_ PDRIVER_OBJECT driver,
 		iwan_win_mp_trace(7, 0);
 	}
 
+	/* NoMp=1：只注册协议边，不要小型端口。这是**诊断模式**，不是产品配置：
+	 * 小型端口注册被拒（0xC0010005）之后，剩下的唯一问题是"协议边的
+	 * 0xC0000001 是它自己的毛病，还是被小型端口那半边拖累的"。两者都是
+	 * NdisRegisterXxxDriver 读同一个服务键，一次只留一半就能把责任分开：
+	 *   · NoMp=1 下协议边注册成功（T69 有值）⇒ 小型端口那半边才是干扰源；
+	 *   · 仍然 0xC0000001 ⇒ 服务键的 Ndi\Interfaces 形状不对，与谁先谁后无关。
+	 * 跳过小型端口时 DriverEntry 的失败不变式照旧（一个注册都没做，返回
+	 * 失败是干净的），只是这里的 switch 让"跳过"与"被拒"在 T 表上可辨。 */
+	{
+		ULONG nomp = iwan_win_mp_param_get(L"NoMp", 0);
+
+		iwan_win_mp_trace(14, (LONG)nomp);
+		if (nomp != 0) {
+			DbgPrint("iwanmp: NoMp=1，跳过小型端口，只注册协议边\n");
+			goto proto_edge;
+		}
+	}
+
 	st = iwan_win_mp_register(driver, registry_path, ext);
 	if (st != NDIS_STATUS_SUCCESS) {
 		iwan_win_mp_trace(10, (LONG)st);
@@ -1013,6 +1031,8 @@ iwan_win_mp_init(_In_ PDRIVER_OBJECT driver,
 		return STATUS_UNSUCCESSFUL;
 	}
 	iwan_win_mp_trace(11, (LONG)NDIS_STATUS_SUCCESS);
+
+proto_edge:
 
 	/* 协议边（外层承载收发）。失败不致命，理由见上面的第 4 条。 */
 	if (iwan_win_mp_param_get(L"NoProto", 0) != 0) {

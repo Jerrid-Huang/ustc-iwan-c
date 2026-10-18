@@ -47,6 +47,9 @@ AddReg             = iwanmp_Reg
 AddService = iwanmp, 0x00000002, iwanmp_Service
 
 [iwanmp_Reg]
+; HKR here is the device instance key (Enum\ROOT\NET\NNNN). These two values
+; describe the miniport edge only: we present ndis5 upward and bind nothing
+; below, because the adapter is fabric, not a child of another adapter.
 HKR, Ndi,            Service,    0, "iwanmp"
 HKR, Ndi\Interfaces, UpperRange, 0, "ndis5"
 HKR, Ndi\Interfaces, LowerRange, 0, "nolower"
@@ -65,6 +68,24 @@ ServiceType   = 1
 StartType     = 3
 ErrorControl  = 1
 ServiceBinary = %12%\iwanmp.sys
+AddReg        = iwanmp_ServiceReg
+
+; In a [service]-install AddReg section HKR is the SERVICE key
+; (HKLM\SYSTEM\CurrentControlSet\Services\iwanmp), not the device key.
+;
+; This is what NdisRegisterProtocolDriver reads to decide which miniports the
+; protocol edge binds to. Without it the call fails with NDIS_STATUS_UNSUCCESSFUL
+; (0xC0000001) -- which is exactly what every candidate NDIS version returned on
+; the guest (T60..T64), and why no NDIS version ever "worked": the version was
+; never the problem, the registry shape was.
+;
+; LowerRange "ethernet" is the lower edge of the WDK intermediate-driver
+; pattern (ndis5 above, 802.3 below). Our own miniport is NdisMediumIP, so this
+; cannot bind to itself.
+[iwanmp_ServiceReg]
+HKR, Ndi,            Service,    0, "iwanmp"
+HKR, Ndi\Interfaces, UpperRange, 0, "ndis5"
+HKR, Ndi\Interfaces, LowerRange, 0, "ethernet"
 
 [Strings]
 ProviderName     = "iWAN"
