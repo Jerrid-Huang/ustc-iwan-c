@@ -538,6 +538,101 @@ iwan_win_proto_recv_nbls(_In_ NDIS_HANDLE ProtocolBindingContext,
 	}
 }
 
+/* ---- 接收过滤器 ------------------------------------------------------- */
+
+/* 协议驱动收帧之前必须先把 OID_GEN_CURRENT_PACKET_FILTER 设到绑定上 ——
+ * 不设就是 0（一个包都不收）。这是"外层帧到底有没有进来"的分水岭：同一张
+ * 承载网卡上的常规 TCP/IP 绑定是**另一个**协议驱动，它自己会设自己的；
+ * 我们这一份必须自己设，否则用户态 socket 能完成 OPEN/OPEN_ACK（那是它自己
+ * 的绑定收的包），而驱动侧 rx_* 恒为零、每包死在 DIAG_TX_NO_NEIGHBOR。
+ *
+ * 请求必须活到 NDIS 回调为止（可能回 PENDING），所以请求与 4 字节信息缓冲
+ * 一起从非分页池分配，缓冲紧跟结构体后面。done 字段让两条路径（同步返回、
+ * 完成回调）恰好释放一次 —— 两种结束方式都要能安全落地，才不用去赌
+ * "非 PENDING 时回调到底来不来"。 */
+#define IWAN_MP_FILTER_FLAGS						\
+	(NDIS_PACKET_TYPE_DIRECTED | NDIS_PACKET_TYPE_MULTICAST |	\
+	 NDIS_PACKET_TYPE_ALL_MULTICAST | NDIS_PACKET_TYPE_BROADCAST)
+
+/* 26100 的 ntddndis.h 里只剩 deprecated 的 NDIS_OBJECT_TYPE_REQUEST_EX(0x96)，
+ * 而 ndis/oidrequest.h 的示例注释用的仍是 NDIS_OBJECT_TYPE_OID_REQUEST ——
+ * 同一个值，NDIS 5 以来没变。带上兜底，免得为一个整数常量白跑一轮 CI。 */
+#ifndef NDIS_OBJECT_TYPE_OID_REQUEST
+#define NDIS_OBJECT_TYPE_OID_REQUEST 0x96
+#endif
+
+typedef struct _IWAN_MP_OID_SET {
+	NDIS_OID_REQUEST	req;
+	ULONG			value;		/* 过滤器位图（请求的信息缓冲） */
+	volatile LONG		done;		/* 1=已释放，防两条路径二次释放 */
+} IWAN_MP_OID_SET;
+
+static volatile LONG	g_oid_pending;	/* 已交给 NDIS、未收尾的请求数 */
+
+/* 完成回调：只记账 + 归还那块池内存。 */
+static
+_Function_class_(PROTOCOL_OID_REQUEST_COMPLETE)
+VOID
+iwan_win_proto_oid_complete(_In_ NDIS_HANDLE ProtocolBindingContext,
+			    _In_ PNDIS_OID_REQUEST OidRequest,
+			    _In_ NDIS_STATUS Status)
+{
+	UNREFERENCED_PARAMETER(ProtocolBindingContext);
+	UNREFERENCED_PARAMETER(Status);
+	if (OidRequest == NULL)
+		return;
+	{
+		IWAN_MP_OID_SET *o =
+			CONTAINING_RECORD(OidRequest, IWAN_MP_OID_SET, req);
+
+		InterlockedDecrement(&g_oid_pending);
+		if (InterlockedExchange(&o->done, 1) == 0)
+			ExFreePoolWithTag(o, IWAN_TAG_PKT);
+	}
+}
+
+/* 设接收过滤器。失败只记账不致命：收不到外层帧时会话只能发不能收，
+ * 症状可辨（rx_outer 恒 0）；承载重启后 open_complete 会再设一次。 */
+static VOID
+iwan_win_proto_set_packet_filter(_Inout_ IWAN_MP_BINDING *b)
+{
+	IWAN_MP_OID_SET *o;
+	NDIS_STATUS st;
+
+	o = (IWAN_MP_OID_SET *)IWAN_ALLOC(sizeof(*o), IWAN_TAG_PKT);
+	if (o == NULL) {
+		DbgPrint("iwanmp: 过滤器请求分配失败（if%u）\n",
+			 (unsigned)b->ifindex);
+		return;
+	}
+	RtlZeroMemory(o, sizeof(*o));
+	o->value = IWAN_MP_FILTER_FLAGS;
+
+	o->req.Header.Type = NDIS_OBJECT_TYPE_OID_REQUEST;
+	o->req.Header.Revision = NDIS_OID_REQUEST_REVISION_1;
+	o->req.Header.Size = (USHORT)NDIS_SIZEOF_OID_REQUEST_REVISION_1;
+	o->req.RequestType = NdisRequestSetInformation;
+	o->req.Timeout = NDIS_OID_REQUEST_TIMEOUT_INFINITE;
+	o->req.DATA.SET_INFORMATION.Oid = OID_GEN_CURRENT_PACKET_FILTER;
+	o->req.DATA.SET_INFORMATION.InformationBuffer = &o->value;
+	o->req.DATA.SET_INFORMATION.InformationBufferLength = sizeof(o->value);
+
+	InterlockedIncrement(&g_oid_pending);
+	st = NdisOidRequest(b->binding, &o->req);
+	if (st != NDIS_STATUS_PENDING) {
+		/* 同步结束：请求没被 NDIS 接管，自己收尾 */
+		InterlockedDecrement(&g_oid_pending);
+		if (InterlockedExchange(&o->done, 1) == 0)
+			ExFreePoolWithTag(o, IWAN_TAG_PKT);
+		DbgPrint("iwanmp: 绑定 if%u 接收过滤器 0x%08x -> 0x%08lx\n",
+			 (unsigned)b->ifindex, (unsigned)IWAN_MP_FILTER_FLAGS,
+			 (unsigned long)st);
+	} else {
+		DbgPrint("iwanmp: 绑定 if%u 接收过滤器 0x%08x（PENDING）\n",
+			 (unsigned)b->ifindex, (unsigned)IWAN_MP_FILTER_FLAGS);
+	}
+}
+
 /* ---- 绑定生命周期 ----------------------------------------------------- */
 
 static
@@ -550,6 +645,10 @@ iwan_win_proto_open_complete(_In_ NDIS_HANDLE ProtocolBindingContext,
 
 	if (Status == NDIS_STATUS_SUCCESS) {
 		InterlockedExchange(&b->opened, 1);
+		/* 先把过滤器设上再算"可用"：opened 只表示句柄打开成功，
+		 * 收不收得到帧由过滤器决定。这一句放这里是因为 open_complete
+		 * 是唯一保证 b->binding 已经可用的时刻。 */
+		iwan_win_proto_set_packet_filter(b);
 	} else {
 		/* 打开失败：这条绑定不能用，打关闭标记（不释放 —— bind 的
 		 * 返回路径可能还在用它，而且 NDIS 可能已经在往上指示/发送）。 */
@@ -836,6 +935,7 @@ iwan_win_proto_init(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 		ch.OpenAdapterCompleteHandlerEx = iwan_win_proto_open_complete;
 		ch.CloseAdapterCompleteHandlerEx = iwan_win_proto_close_complete;
 		ch.NetPnPEventHandler = iwan_win_proto_pnp_event;
+		ch.OidRequestCompleteHandler = iwan_win_proto_oid_complete;
 		ch.StatusHandlerEx = iwan_win_proto_status;
 		ch.ReceiveNetBufferListsHandler = iwan_win_proto_recv_nbls;
 		ch.SendNetBufferListsCompleteHandler = iwan_win_proto_send_complete;
@@ -904,11 +1004,13 @@ iwan_win_proto_fini(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 	iwan_win_mp_release_carrier(ext);
 	/* 在途外层发送归零之后才动内存：完成回调会解引用 b->ext/b->outstanding
 	 * 并 NdisFreeNetBufferList。排不空就整体泄漏（驱动马上卸载）。 */
-	for (i = 0; i < 1000 && ext->mp.outer_outstanding > 0; i++)
+	for (i = 0; i < 1000 &&
+	     (ext->mp.outer_outstanding > 0 || g_oid_pending > 0); i++)
 		KeStallExecutionProcessor(1000);
-	if (ext->mp.outer_outstanding > 0) {
-		DbgPrint("iwanmp: 注销时仍有 %ld 条外层发送未完成，绑定与池都不释放\n",
-			 (long)ext->mp.outer_outstanding);
+	if (ext->mp.outer_outstanding > 0 || g_oid_pending > 0) {
+		DbgPrint("iwanmp: 注销时仍有 %ld 条外层发送、%ld 个 OID 未完成，"
+			 "绑定与池都不释放\n",
+			 (long)ext->mp.outer_outstanding, (long)g_oid_pending);
 		return;
 	}
 	if (ext->mp.tx_pool != NULL) {

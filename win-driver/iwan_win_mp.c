@@ -853,7 +853,8 @@ iwan_win_mp_fill_ch(_Out_ PNDIS_MINIPORT_DRIVER_CHARACTERISTICS ch,
  *   由装具显式清掉，测完再打上。
  * NoProto=1：只注册小型端口，不注册协议边（外层承载收发缺席，内层网卡仍可
  *   单独验证：适配器出现、地址与 MTU 可设、SendNetBufferLists 被调用）。
- * 两者都只在**装载之前**读一次，运行期不可改 —— 它们是安全闸门，不是配置。 */
+ * 两者都只在**装载之前**读一次，运行期不可改 —— 它们是安全闸门，不是配置。
+ * Disarm 的缺省值是 1（不是 0）：键不存在时必须落在"不合闸"这一侧。 */
 static ULONG
 iwan_win_mp_param_get(_In_ PCWSTR name, _In_ ULONG dflt)
 {
@@ -983,7 +984,11 @@ iwan_win_mp_init(_In_ PDRIVER_OBJECT driver,
 	iwan_win_mp_trace(30, (LONG)NdisGetVersion());
 
 	{
-		ULONG disarm = iwan_win_mp_param_get(L"Disarm", 0);
+		/* 缺省值刻意是 1（保险丝合上）：键被删掉、装机写键失败、
+		 * 或者镜像被别的路径装上时，驱动什么都不注册，停在 Code 37。
+		 * 要它工作必须由装具显式写 Disarm=0 —— "默认不安全"在这里
+		 * 是不可接受的，因为一次错误的注册会让整机起不来。 */
+		ULONG disarm = iwan_win_mp_param_get(L"Disarm", 1);
 
 		iwan_win_mp_trace(8, (LONG)disarm);
 		if (disarm != 0) {
