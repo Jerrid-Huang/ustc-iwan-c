@@ -254,7 +254,8 @@ jobs:
           P2 'NDIS_OBJECT_TYPE_DEVICE_OBJECT_ATTRIBUTES 定义' 'define +NDIS_OBJECT_TYPE_DEVICE_OBJECT_ATTRIBUTES' 1 6
           P2 'NDIS_OBJECT_TYPE_DEFAULT 定义' 'define +NDIS_OBJECT_TYPE_DEFAULT' 1 6
           New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\wdk-src" | Out-Null
-          foreach ($f in @('ndis.h', 'nblapi.h', 'miniportgeneralattributes.h', 'netioapi.h')) {
+          foreach ($f in @('ndis.h', 'nblapi.h', 'miniportgeneralattributes.h', 'netioapi.h',
+                           'ntddndis.h')) {
             $p = Join-Path $h $f
             if (Test-Path $p) { Copy-Item $p "$env:GITHUB_WORKSPACE\wdk-src\" -Force }
           }
