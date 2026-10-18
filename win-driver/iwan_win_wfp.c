@@ -85,6 +85,12 @@ static const GUID IWAN_CALLOUT_IN6 = {
  *
  * 判据：只要"分配点"与"释放点"在同一个函数的两条互斥路径上，且每条路径
  * 恰好释放一次，这条告警就是误报。上面四类都逐条核对过。
+ *
+ * 处置：分析与构建都带 /FI shared\warning.h，但 C6014 是分析器对"所有权
+ * 转移不在它能读懂的契约里"的判断，不随头部告警一起消失，因此在每个分配点
+ * 上方放一行 `#pragma warning(suppress: 6014)`，并就地写明判据。这么做不是
+ * 为了把日志刷干净 —— 只有把已知误报逐个压掉，下一次新出现的 C6014 才有
+ * 可能被看见。改这些抑制时请先读对应注释，再读那段代码。
  */
 
 typedef struct _IWAN_INJECT_CTX {
@@ -211,11 +217,18 @@ iwan_win_encap_inject(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		return STATUS_DEVICE_BUSY;
 	}
 
+	/* C6014 误报：ctx 与 buf 的所有权随 NBL 一起交给
+	 * FwpsInjectNetworkSendAsync0，由完成回调 iwan_win_inject_complete
+	 * 释放。WFP 的注入接口没有"所有权转移"的 SAL 注解，分析器只看得见
+	 * "分配了、返回前没释放"，此处的抑制是判读结论而非免责。 */
+#pragma warning(suppress: 6014)
 	ctx = (IWAN_INJECT_CTX *)IWAN_ALLOC(sizeof(*ctx), IWAN_TAG_PKT);
 	if (ctx == NULL) {
 		return STATUS_INSUFFICIENT_RESOURCES;
 	}
 
+	/* 同上：buf 由完成回调释放。 */
+#pragma warning(suppress: 6014)
 	buf = (UINT8 *)IWAN_ALLOC(total, IWAN_TAG_PKT);
 	if (buf == NULL) {
 		ExFreePoolWithTag(ctx, IWAN_TAG_PKT);
@@ -598,9 +611,14 @@ iwan_win_inject_net_recv(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 
 	handle = (family == 6) ? ext->inj_recv6 : ext->inj_recv4;
 
+	/* C6014 误报：ctx/ctx->buf 交给 FwpsInjectNetworkReceiveAsync0，
+	 * 由同一个完成回调释放。 */
+#pragma warning(suppress: 6014)
 	ctx = (IWAN_INJECT_CTX *)IWAN_ALLOC(sizeof(*ctx), IWAN_TAG_PKT);
 	if (ctx == NULL)
 		return STATUS_INSUFFICIENT_RESOURCES;
+	/* 同上。 */
+#pragma warning(suppress: 6014)
 	ctx->buf = IWAN_ALLOC(len, IWAN_TAG_PKT);
 	ctx->ext = ext;
 	ctx->mdl = NULL;		/* 池分配不清零，见 encap 侧同样处理 */
@@ -1114,6 +1132,10 @@ iwan_win_classify_out6(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 			}
 			pkt = (UINT8 *)NdisGetDataBuffer(nb, tot, NULL, 1, 0);
 			if (pkt == NULL) {
+			/* C6014 误报：stor 是本轮拼接缓冲，下面每条出口
+			 * （取缓冲失败、MTU 装不下、封装后即用即还）都已释放并
+			 * 置空；分析器按循环回边把已释放路径也算进去。 */
+#pragma warning(suppress: 6014)
 				stor = (UINT8 *)IWAN_ALLOC(tot, IWAN_TAG_PKT);
 				if (stor == NULL) {
 					/* 池压力下不能默默放明文出去 */

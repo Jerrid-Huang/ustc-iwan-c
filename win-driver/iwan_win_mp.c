@@ -462,6 +462,11 @@ iwan_win_mp_indicate_inner(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	 * MiniportReturnNetBufferLists 释放。静态分析看不到这条 NDIS 的池
 	 * 所有权约定，把“本该交出去”读成泄漏（C6014）—— 已逐条核对过：
 	 * 指示成功恰好一次转交、失败路径各自释放，是误报。 */
+	/* C6014 误报（分配点 nbl = NdisAllocate...）：nbl 的所有权在
+	 * NdisMIndicateReceiveNetBufferLists 之后归 NDIS，归还时由
+	 * MiniportReturnNetBufferLists 释放，这是 NDIS 的池约定，分析器看不到
+	 * 这条转移。失败路径各自释放（见下面的 IoFreeMdl / ExFreePoolWithTag）。 */
+#pragma warning(suppress: 6014)
 	nbl = NdisAllocateNetBufferAndNetBufferList(ext->mp.nbl_pool,
 						    IWAN_MP_NBL_CTX_SIZE, 0,
 						    mdl, 0, len);

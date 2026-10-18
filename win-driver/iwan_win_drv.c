@@ -244,13 +244,17 @@ DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registry_path)
 	IWAN_WIN_DEVICE_EXTENSION *ext;
 	NTSTATUS st;
 
-	/* 静态分析在这里报两条 C6014（ext / devobj "泄漏"）：两者都是驱动生命
-	 * 周期资产 —— ext 跟着卸载路径走（UnloadHandler / iwan_win_unload），
-	 * devobj 跟着 IoDeleteDevice 走，都不随 DriverEntry 返回而释放。
-	 * 每条失败路径都已各自回滚（见下面两处 fail: 标签），所以是误报；
-	 * 不为它改结构，只把判读结论留在这里。 */
+	/* 静态分析在本函数报两条 C6014（ext / devobj "泄漏"）：两者都是驱动
+	 * 生命周期资产 —— ext 跟着卸载路径走（UnloadHandler / iwan_win_unload），
+	 * devobj 跟着 IoDeleteDevice 走，都不随 DriverEntry 返回而释放，两条
+	 * 失败路径也各自回滚过。逐条核对后判定为误报，抑制点写在各自的分配处
+	 * （见下面的 #pragma）。 */
 
 #ifdef IWAN_WIN_PLANE_MP
+	/* C6014 误报（分配点 ext = IWAN_ALLOC）：ext 是驱动生命周期资产，
+	 * 只在卸载路径（UnloadHandler / iwan_win_unload）释放，fail 标签里也
+	 * 回滚。分析器只看见"分配了、DriverEntry 成功返回前没释放"。 */
+#pragma warning(suppress: 6014)
 	ext = (IWAN_WIN_DEVICE_EXTENSION *)IWAN_ALLOC(sizeof(*ext),
 						      IWAN_TAG_SESS);
 	if (ext == NULL) {
@@ -303,10 +307,16 @@ fail:
 	 * UNICODE_STRING，C4024/C2440）。自己建一个最不含糊。 */
 	RtlInitUnicodeString(&sddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
 	RtlInitUnicodeString(&dev_name, IWAN_DRV_DEV_NAME);
+	/* C6014 误报（devobj）：设备对象是驱动生命周期资产，随
+	 * IoDeleteDevice（卸载与两条失败路径）释放。缺陷报在本调用的最后一行
+	 * （&devobj 那一行），单行 suppress 贴不上，故只对这一条语句禁用。 */
+#pragma warning(push)
+#pragma warning(disable: 6014)
 	st = IoCreateDeviceSecure(driver, sizeof(IWAN_WIN_DEVICE_EXTENSION),
 				  &dev_name, IWAN_WIN_DEVICE_TYPE,
 				  FILE_DEVICE_SECURE_OPEN, FALSE, &sddl,
 				  &iwan_win_devclass_guid, &devobj);
+#pragma warning(pop)
 	if (!NT_SUCCESS(st)) {
 		MP_TRACE(1, st);
 		return st;

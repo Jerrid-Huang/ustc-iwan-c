@@ -447,13 +447,33 @@ jobs:
           $cl = Get-ChildItem $msvc.FullName -Recurse -Filter cl.exe |
                 Where-Object { $_.FullName -match 'Hostx64\\x64' } | Select-Object -First 1
           "CL=$($cl.FullName)"
+          # WDK 与 STL 一律标成外部头：只做这一件事的 /external:I /external:W0
+          # 见下面的 $common。注意 /Zs 语法检查那两步仍用 /I（它要的是同一批
+          # 头能找到即可，不必区分内外）。
           $incs = @("$env:WDKINC\km", "$env:WDKINC\km\crt", "$env:WDKINC\shared",
                     "$env:WDKINC\ucrt", "$($msvc.FullName)\include") |
-                  Where-Object { Test-Path $_ } | ForEach-Object { "/I$_" }
+                  Where-Object { Test-Path $_ } | ForEach-Object { "/external:I$_" }
           New-Item -ItemType Directory -Force -Path analyze-obj | Out-Null
+          # /external:W0 让上面标成外部头的 WDK/STL 头不再贡献告警：
+          # 实测 700 余条全部出自头部自身（C4324 结构对齐填充、C28160 必成功
+          # 池分配的注解自检、C6387 ExAllocatePoolZero 可能返回 0、C28301
+          # POOL_FLAGS 首声明无注解、C28252/C28253 MmGetSystemRoutineAddress
+          # 注解不一致、C28230/C28285 ntddk.h 的 WHEA 注解表达式引用不存在
+          # 的成员、C6553 注解用在值类型上）。真实构建里这批头部被
+          # /FI shared\warning.h 压住，手写分析命令行没有那一步，所以必须
+          # 显式标外部，否则我们自己的缺陷永远淹在噪声里。
+          # 真实构建（iwan.vcxproj）用 /FI shared\warning.h 压住 WDK 头自身的
+          # 告警，这里照抄同一步，免得"分析口径"与"构建口径"分叉。
+          $wdkhdr = @()
+          if (Test-Path "$env:WDKINC\shared\warning.h") {
+            $wdkhdr = @("/FI$env:WDKINC\shared\warning.h")
+          } else {
+            "WDK warning.h 不存在，跳过 /FI"
+          }
           $common = @('/nologo', '/kernel', '/c', '/std:c11', '/W4', '/WX-',
-                      '/analyze', "/Fo$env:GITHUB_WORKSPACE\analyze-obj\",
-                      '/Iwin-driver', '/Isrc\common') + $incs + @('/D_AMD64_')
+                      '/analyze', '/external:W0',
+                      "/Fo$env:GITHUB_WORKSPACE\analyze-obj\",
+                      '/Iwin-driver', '/Isrc\common') + $incs + $wdkhdr + @('/D_AMD64_')
           $sets = @(
             @{ log = 'analysis-wfp.xml'; defs = @('/DNDIS630');
                src = @('win-driver\iwan_win_drv.c', 'win-driver\iwan_win_session.c',
