@@ -582,6 +582,7 @@ iwan_win_proto_bind(_In_ NDIS_HANDLE ProtocolDriverContext,
 	IWAN_MP_BINDING *b;
 	NDIS_OPEN_PARAMETERS op;
 	NDIS_MEDIUM medium = NdisMedium802_3;
+	UINT sel_medium = 0;
 	NDIS_STATUS st;
 	KIRQL old;
 
@@ -608,7 +609,10 @@ iwan_win_proto_bind(_In_ NDIS_HANDLE ProtocolDriverContext,
 	op.AdapterName = BindParameters->AdapterName;
 	op.MediumArray = &medium;
 	op.MediumArraySize = 1;
-	op.SelectedMediumIndex = 0;
+	/* SelectedMediumIndex 的类型是 PUINT（出参指针），不是索引值本身。
+	 * 原来写 0 等于给 NULL：只有 MediumArraySize == 1 时 NDIS 才容忍省略，
+	 * 一旦将来数组里多一种介质就会解引用空指针。这里给一个真实变量。 */
+	op.SelectedMediumIndex = &sel_medium;
 	op.FrameTypeArray = NULL;
 	op.FrameTypeArraySize = 0;
 
