@@ -509,6 +509,48 @@ jobs:
           }
           if ($bad -ne 0) { exit 1 }
 
+      # 把"我们自己的源码零缺陷"从口号变成闸门：XML 里凡 FILEPATH 带 Windows Kits
+      # 的，都是 WDK 头自身的注解自检（C28160 必成功池分配、C6387 分配器可能返回 0、
+      # C28301 POOL_FLAGS 首声明无注解、C28252/C28253 MmGetSystemRoutineAddress 的
+      # IRQL 注解前后不一致、C28230/C28285 WHEA 注解引用不存在的成员、C6553 注解用
+      # 在值类型上）—— 那是微软的头，我们既不能也不该改；能保证的是它一条都不来自
+      # win-driver/。实测 /external:W0 能压住编译器级告警（C4324 已归零），但压不住
+      # 代码分析级的注解自检，所以这道闸门按来源文件而不是按告警码来判。
+      - name: 断言我们自己的源码零缺陷
+        if: always()
+        shell: pwsh
+        run: |
+          $hdrCodes = @{}
+          $ours = @()
+          foreach ($f in @('analysis-wfp.xml', 'analysis-mp.xml', 'analysis-mp-miniport.xml')) {
+            if (-not (Test-Path $f)) { "跳过不存在的 $f"; continue }
+            [xml]$x = Get-Content -Raw $f
+            foreach ($d in $x.SelectNodes('/DEFECTS/DEFECT')) {
+              $file = $d.SelectSingleNode('SFA/FILEPATH').InnerText
+              $name = $d.SelectSingleNode('SFA/FILENAME').InnerText
+              $line = $d.SelectSingleNode('SFA/LINE').InnerText
+              $code = $d.SelectSingleNode('DEFECTCODE').InnerText.Trim()
+              if ($file -match 'Windows Kits') {
+                $k = "$code $name`:$line"
+                if (-not $hdrCodes.ContainsKey($k)) { $hdrCodes[$k] = 0 }
+                $hdrCodes[$k] = $hdrCodes[$k] + 1
+              } else {
+                $ours += "$file$name`:$line C$code $($d.SelectSingleNode('DESCRIPTION').InnerText.Trim())"
+              }
+            }
+          }
+          "WDK 头自身的注解自检（不是我们的代码，只能记录）："
+          if ($hdrCodes.Count -eq 0) { "  无" }
+          foreach ($k in ($hdrCodes.Keys | Sort-Object)) {
+            "  {0,-30} x{1}" -f $k, $hdrCodes[$k]
+          }
+          if ($ours.Count -gt 0) {
+            "我们自己的源码有 $($ours.Count) 条缺陷："
+            $ours | ForEach-Object { "  $_" }
+            exit 1
+          }
+          "我们自己的源码：0 条缺陷"
+
       - name: 回传产物与日志
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
