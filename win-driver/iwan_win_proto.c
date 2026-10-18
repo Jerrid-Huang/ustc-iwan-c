@@ -66,11 +66,33 @@ typedef struct _IWAN_MP_BINDING {
 static LIST_ENTRY	g_bindings;
 static KSPIN_LOCK	g_bind_lock;
 static volatile LONG	g_proto_started;	/* g_bindings/g_bind_lock 已初始化 */
+static volatile LONG	g_bind_table_broken;	/* 表头读到 NULL（只诊断用） */
 
 /* 发送在途上下文（IWAN_MP_TX_CTX）定义在 iwan_win.h：入向指示也用它。 */
 /* 池的 context 区必须放得下它（池在 iwan_win_mp.c 里按 IWAN_MP_NBL_CTX_SIZE
  * 建；这个断言是两侧唯一的耦合点）。 */
 C_ASSERT(sizeof(IWAN_MP_TX_CTX) <= IWAN_MP_NBL_CTX_SIZE);
+
+/* 链上节点数（含已关闭的），只给诊断用。自己取锁：绑定可以被 bind/unbind
+ * 随时插拔，不持锁遍历读到半个指针就是自己制造的那类崩溃。 */
+static LONG
+iwan_win_proto_binding_count(VOID)
+{
+	PLIST_ENTRY e;
+	LONG n = 0;
+	KIRQL old;
+
+	KeAcquireSpinLock(&g_bind_lock, &old);
+	if (g_bindings.Flink != NULL) {
+		for (e = g_bindings.Flink;
+		     e != NULL && e != &g_bindings; e = e->Flink)
+			n++;
+	} else {
+		n = -1;
+	}
+	KeReleaseSpinLock(&g_bind_lock, old);
+	return n;
+}
 
 /* 绑定表查找：按接口索引找一张已打开的承载。调用者需持有 g_bind_lock。 */
 static IWAN_MP_BINDING *
@@ -78,7 +100,25 @@ iwan_win_proto_lookup_locked(_In_ UINT32 ifindex)
 {
 	PLIST_ENTRY e;
 
-	for (e = g_bindings.Flink; e != &g_bindings; e = e->Flink) {
+	/* 旗子先查，再碰链表：两者在同一把锁内读到，才叫"表可用"。 */
+	if (InterlockedCompareExchange(&g_proto_started, 1, 1) == 0)
+		return NULL;
+
+	/* 表头必须指向自己（空表）或某个真节点。Flink 为 NULL 说明这张表
+	 * 从来没被 InitializeListHead 初始化过 —— 客体上真实发生过：0xD1，
+	 * 出错指令正是这里内联出来的 `cmpl %ecx,0x30(%r14)`，r14=0 而 0x30
+	 * 是 IWAN_MP_BINDING.ifindex，访问地址恰好 0x30，IRQL=DISPATCH。
+	 * 查表是最不该崩的一步：找不到就返回 NULL，调用者回
+	 * STATUS_DEVICE_NOT_READY，数据面 fail-closed。 */
+	if (g_bindings.Flink == NULL || g_bindings.Blink == NULL) {
+		DbgPrint("iwanmp: 绑定表未初始化（Flink=%p），拒绝查表\n",
+			 (void *)g_bindings.Flink);
+		/* 只置一个内存旗子：本函数在自旋锁内被调用，而写注册表要在
+		 * PASSIVE_LEVEL。调用者放锁之后再落 T70。 */
+		InterlockedExchange(&g_bind_table_broken, 1);
+		return NULL;
+	}
+	for (e = g_bindings.Flink; e != NULL && e != &g_bindings; e = e->Flink) {
 		IWAN_MP_BINDING *b = CONTAINING_RECORD(e, IWAN_MP_BINDING, link);
 
 		if (b->ifindex == ifindex && b->opened && !b->closed)
@@ -828,9 +868,24 @@ iwan_win_mp_select_carrier(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 		return STATUS_INVALID_PARAMETER;
 	}
 
+	/* 旗子（g_proto_started）只在"表与锁都已初始化"之后才立起来，所以
+	 * 它为 0 就等价于"这张表不可读"。NoProto=1、协议边注册全败、或者
+	 * 卸载后再开会话，都会走到这里 —— 必须在这里拒绝，而不是让查表去
+	 * 解引用一张全零的表。 */
+	if (InterlockedCompareExchange(&g_proto_started, 1, 1) == 0) {
+		DbgPrint("iwanmp: 协议边未启动（g_proto_started=0），拒绝建立\n");
+		return STATUS_DEVICE_NOT_READY;
+	}
+
 	KeAcquireSpinLock(&g_bind_lock, &old);
 	b = iwan_win_proto_lookup_locked(s->oif_index);
 	KeReleaseSpinLock(&g_bind_lock, old);
+	/* 放锁之后才落诊断：T70=1 ⇒ 表从来没被 InitializeListHead 过；
+	 * T71=链上节点数，T70 不出现而 T71=0 ⇒ 表是好的但 NDIS 一条绑定都没
+	 * 给过（协议边绑不上承载）。两种病因的处置完全不同。 */
+	iwan_win_mp_trace(70,
+			  InterlockedCompareExchange(&g_bind_table_broken, 1, 1));
+	iwan_win_mp_trace(71, (LONG)iwan_win_proto_binding_count());
 	if (b == NULL) {
 		DbgPrint("iwanmp: 接口 %lu 上没有可用的以太承载，拒绝建立\n",
 			 (unsigned long)s->oif_index);
@@ -911,9 +966,14 @@ iwan_win_proto_init(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 	};
 	ULONG ci;
 
-	if (InterlockedExchange(&g_proto_started, 1) != 0)
+	/* 旗子 = "绑定表可读、出向池可用"，所以它必须最后由成功路径立起来。
+	 * 反过来（先立旗、后初始化）就是客体上那次 0xD1：任何看到旗子的读者
+	 * 都可能读到一张全零的表 —— BSS 里的 LIST_ENTRY 是 16 个零字节，不是
+	 * 指向自己的空表，遍历到它就是把 0x30 当 ifindex 读。 */
+	if (InterlockedCompareExchange(&g_proto_started, 0, 0) != 0)
 		return STATUS_SUCCESS;
 
+	InterlockedExchange(&g_bind_table_broken, 0);
 	InitializeListHead(&g_bindings);
 	KeInitializeSpinLock(&g_bind_lock);
 
@@ -980,6 +1040,9 @@ iwan_win_proto_init(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 				InterlockedExchange(&g_proto_started, 0);
 				return STATUS_INSUFFICIENT_RESOURCES;
 			}
+			/* 到这里"表可读、池可用"才同时成立，旗子此刻立起来。
+			 * 在此之前到达的会话请求都会被 select_carrier 挡掉。 */
+			InterlockedExchange(&g_proto_started, 1);
 			return STATUS_SUCCESS;
 		}
 	}
@@ -997,6 +1060,7 @@ iwan_win_proto_fini(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 {
 	PLIST_ENTRY e, n;
 	ULONG i;
+	KIRQL old;
 
 	if (ext->mp.proto_handle == NULL)
 		return;
@@ -1023,13 +1087,26 @@ iwan_win_proto_fini(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 		ext->mp.tx_pool = NULL;
 	}
 
-	for (e = g_bindings.Flink; e != &g_bindings; e = n) {
+	/* 只摘链，不释放：节点一旦 ExFreePoolWithTag，任何还在用 b 的路径
+	 * （select_carrier 取到 b 之后放掉 g_bind_lock、再在 mp->lock 里复核
+	 * b->opened/b->closed）就变成读已释放内存。驱动正在卸载，几个几十字节
+	 * 的绑定泄漏远便宜于一次 bugcheck；而节点留着，链表指针永远指向有效
+	 * 内存，即便有人拿着过期指针也只会走到表头自然终止。
+	 * 曾经这里先置 b->link.Flink=NULL 再释放 —— 那正是 0xD1 的另一个触发
+	 * 形态：遍历读到 Flink=NULL，随后 cmpl 0x30(%r14) 打在 0x30 上。 */
+	KeAcquireSpinLock(&g_bind_lock, &old);
+	/* 表头也要当不可信数据：卸载路径上这张表的值可能来自一次没走完的
+	 * 初始化（Flink=NULL）。摘链前先确认它指向自己或一个真节点。 */
+	if (g_bindings.Flink == NULL)
+		InitializeListHead(&g_bindings);
+	for (e = g_bindings.Flink; e != NULL && e != &g_bindings; e = n) {
 		IWAN_MP_BINDING *b = CONTAINING_RECORD(e, IWAN_MP_BINDING, link);
 
 		n = e->Flink;
-		b->link.Flink = NULL;
-		b->link.Blink = NULL;
-		ExFreePoolWithTag(b, IWAN_TAG_PKT);
+		RemoveEntryList(e);
+		b->opened = 0;
+		b->closed = 1;
 	}
 	InitializeListHead(&g_bindings);
+	KeReleaseSpinLock(&g_bind_lock, old);
 }
