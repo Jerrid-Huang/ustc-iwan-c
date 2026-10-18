@@ -273,6 +273,20 @@ jobs:
             $p = Join-Path "$env:WDKINC\shared\ndis" $f
             if (Test-Path $p) { Copy-Item $p "$env:GITHUB_WORKSPACE\wdk-src\ndis\" -Force }
           }
+          # 上一轮只带回 status.h/types.h，oidrequest.h 不在 shared\ndis\。
+          # 不再猜目录：在整个 Include 树里按文件名递归找，找到几份就带几份，
+          # 并把完整路径打进日志 —— 下一轮读日志就知道它到底在哪。
+          {
+            $root = Split-Path $env:WDKINC -Parent
+            $n = 0
+            foreach ($p in (Get-ChildItem -Path $root -Recurse -Filter 'oidrequest.h' -ErrorAction SilentlyContinue)) {
+              $n = $n + 1
+              "oidrequest.h[$n] = $($p.FullName) ($($p.Length) B)" |
+                Tee-Object -FilePath $log -Append
+              Copy-Item $p.FullName "$env:GITHUB_WORKSPACE\wdk-src\ndis\oidrequest_$n.h" -Force
+            }
+            if ($n -eq 0) { 'oidrequest.h 在 Include 树里没找到' | Tee-Object -FilePath $log -Append }
+          }
           Copy-Item "$env:WDKINC\shared\ndis\version.h" "$env:GITHUB_WORKSPACE\wdk-src\ndis-version.h" -Force -ErrorAction SilentlyContinue
           Get-ChildItem "$env:GITHUB_WORKSPACE\wdk-src" -ErrorAction SilentlyContinue |
             Select-Object Name, Length | Out-String | Tee-Object -FilePath $log -Append
