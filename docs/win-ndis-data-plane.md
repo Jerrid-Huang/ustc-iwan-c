@@ -169,6 +169,7 @@ powershell -NoProfile -File C:\iwan\vm-mp-disarm.ps1
   | T70 / T71 | 建会话时查绑定表：70 = 1 表示表头指针是 NULL（表没初始化）、71 = 链上节点数（-1 = 表头为空） |
   | T72 / T73 | open_complete 的成败次数：72 = 成功、73 = 失败（绑进表里却打不开的条数） |
   | T74 / T75 | 链上前两个绑定压成的位图：bit0..13 = ifindex（0x3FFF = 没有该节点）、bit14 = opened、bit15 = closed |
+  | T76 / T77 | 76 = open_complete 报的 NTSTATUS 原值、77 = bind 里 NdisOpenAdapterEx 当场返回值（都为 0 而 opened 位为 0 ⇒ 打开还在飞） |
 
   两条不变式（都由 0xD1 换来）：
 

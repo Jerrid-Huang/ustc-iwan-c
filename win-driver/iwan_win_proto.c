@@ -71,6 +71,10 @@ static volatile LONG	g_bind_table_broken;	/* 表头读到 NULL（只诊断用）
  * 就是"NDIS 到底有没有回调我们"的唯一证据。 */
 static volatile LONG	g_open_ok;
 static volatile LONG	g_open_fail;
+/* 最近一次打开失败的 NTSTATUS 原值（T76）与 bind 里 NdisOpenAdapterEx 当场
+ * 返回的错误（T77）。只有次数看不出"为什么打不开"，而这一条决定了改哪里。 */
+static volatile LONG	g_open_status;
+static volatile LONG	g_bind_status;
 
 
 /* 发送在途上下文（IWAN_MP_TX_CTX）定义在 iwan_win.h：入向指示也用它。 */
@@ -743,6 +747,7 @@ iwan_win_proto_open_complete(_In_ NDIS_HANDLE ProtocolBindingContext,
 		/* 打开失败：这条绑定不能用，打关闭标记（不释放 —— bind 的
 		 * 返回路径可能还在用它，而且 NDIS 可能已经在往上指示/发送）。 */
 		InterlockedIncrement(&g_open_fail);
+		InterlockedExchange(&g_open_status, (LONG)Status);
 		DbgPrint("iwanmp: 绑定 if%u 打开失败 0x%08lx\n",
 			 (unsigned)b->ifindex, (unsigned long)Status);
 		iwan_win_proto_binding_close(b);
@@ -814,6 +819,7 @@ iwan_win_proto_bind(_In_ NDIS_HANDLE ProtocolDriverContext,
 
 	st = NdisOpenAdapterEx(ext->mp.proto_handle, b, &op, BindContext,
 			       &b->binding);
+	InterlockedExchange(&g_bind_status, (LONG)st);
 	if (st == NDIS_STATUS_SUCCESS) {
 		InterlockedExchange(&b->opened, 1);
 		/* 同步打开成功 ⇒ bind 不返回 PENDING ⇒ 不需要
@@ -942,6 +948,11 @@ iwan_win_mp_select_carrier(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 	iwan_win_mp_trace(73, InterlockedCompareExchange(&g_open_fail, 0, 0));
 	iwan_win_mp_trace(74, iwan_win_proto_bind_info(0));
 	iwan_win_mp_trace(75, iwan_win_proto_bind_info(1));
+	/* T76 = open_complete 报的 NTSTATUS 原值、T77 = NdisOpenAdapterEx 当场
+	 * 返回的错误。两者都是 0 而 T74/T75 的 opened 位为 0 ⇒ 打开还在飞
+	 *（PENDING 迟迟不回），而不是失败。 */
+	iwan_win_mp_trace(76, InterlockedCompareExchange(&g_open_status, 0, 0));
+	iwan_win_mp_trace(77, InterlockedCompareExchange(&g_bind_status, 0, 0));
 	if (b == NULL) {
 		DbgPrint("iwanmp: 接口 %lu 上没有可用的以太承载，拒绝建立\n",
 			 (unsigned long)s->oif_index);
