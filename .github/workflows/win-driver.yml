@@ -533,7 +533,7 @@ jobs:
         run: |
           $h = Join-Path $env:WDKINC 'km\ndis.h'
           if (-not (Test-Path $h)) { "缺少 $h"; exit 0 }
-          $m = Select-String -Path $h -Pattern '_NDIS_MINIPORT_ADAPTER_GENERAL_ATTRIBUTES$' |
+          $m = Select-String -Path $h -Pattern 'typedef\s+struct\s+_NDIS_MINIPORT_ADAPTER_GENERAL_ATTRIBUTES' |
                Select-Object -First 1
           if (-not $m) { '没找到结构定义'; exit 0 }
           Get-Content $h | Select-Object -Skip ($m.LineNumber - 1) -First 60

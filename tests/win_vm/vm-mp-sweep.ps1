@@ -37,6 +37,15 @@ function Get-TunnelAdapter {
         Select-Object -First 1
 }
 
+function Ensure-Name($ad) {
+    # 每次 restart-device 后迷你端口可能以新实例回来，别名变成
+    # "本地连接* N"；名字不是 iwanmp 时后续 netsh/Get-NetIPAddress 全落空。
+    if ($ad -and $ad.Name -ne 'iwanmp') {
+        & netsh.exe interface set interface name="$($ad.Name)" newname="iwanmp" 2>&1 | Out-Null
+        Start-Sleep -Seconds 2
+    }
+}
+
 function Ensure-InnerIp {
     $have = @(Get-NetIPAddress -InterfaceAlias 'iwanmp' -AddressFamily IPv4 -ErrorAction SilentlyContinue |
               Where-Object { $_.IPAddress -eq '10.99.0.1' })
@@ -74,6 +83,8 @@ foreach ($sh in $Shapes) {
 
     $ad = Get-TunnelAdapter
     if (-not $ad) { $rows += "SWEEP shape=$sh adapter=NONE"; continue }
+    Ensure-Name $ad
+    $ad = Get-TunnelAdapter
     Ensure-InnerIp
     $mac = $ad.MacAddress
     if (-not $mac) { $mac = '-' }

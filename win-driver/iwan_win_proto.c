@@ -230,6 +230,7 @@ iwan_win_proto_parse_guid(_In_opt_ const NDIS_STRING *name,
 	static const int dash_at[] = { 8, 13, 18, 23 };
 	WCHAR digits[32];
 	UINT8 t[16];
+	UINT8 g[16];
 	ULONG i;
 	ULONG d = 0;
 	ULONG k = 0;
@@ -268,12 +269,16 @@ iwan_win_proto_parse_guid(_In_opt_ const NDIS_STRING *name,
 
 		t[i] = (UINT8)((hi << 4) | lo);
 	}
-	/* 字符串里的顺序是大端书写，内存里的 GUID 前三个字段是小端。 */
-	out[0] = t[3]; out[1] = t[2]; out[2] = t[1]; out[3] = t[0];
-	out[4] = t[5]; out[5] = t[4];
-	out[6] = t[7]; out[7] = t[6];
-	for (i = 8; i < 16; i++)
-		out[i] = t[i];
+	/* 字符串里的顺序是大端书写，内存里的 GUID 前三个字段是小端。
+	 * 先整体写满局部数组，再一次性交给出参：PREfast 只认"所有成功路径
+	 * 都完整写出 _Out_ 参数"，逐下标写 + 尾循环会被判 C6101（未初始化
+	 * 返回），而这里每一次 return TRUE 之前确实必须写满 16 字节。 */
+	g[0] = t[3]; g[1] = t[2]; g[2] = t[1]; g[3] = t[0];
+	g[4] = t[5]; g[5] = t[4];
+	g[6] = t[7]; g[7] = t[6];
+	g[8] = t[8]; g[9] = t[9]; g[10] = t[10]; g[11] = t[11];
+	g[12] = t[12]; g[13] = t[13]; g[14] = t[14]; g[15] = t[15];
+	RtlCopyMemory(out, g, sizeof(g));
 	return TRUE;
 }
 
