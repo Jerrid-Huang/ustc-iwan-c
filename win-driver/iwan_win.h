@@ -213,6 +213,12 @@ typedef struct _IWAN_MP_PLANE {
 	volatile LONG		peer_mac_pending;	/* 已发 ARP 请求、等回复 */
 	UINT64			arp_ts_ms;	/* 解析出 peer_mac 的时刻（老化用） */
 	UINT64			arp_last_ms;	/* 上次发 ARP 的时刻（限速，防请求风暴） */
+	/* ARP 诊断：出向发不出包时，必须先分清"请求没发出去""请求发了没回""
+	 * "回了但 spa 对不上"。这三个计数只在 IOCTL_GET（PASSIVE）时落到
+	 * T93/T94/T95，数据面里只做原子加。 */
+	volatile LONG		arp_sent;
+	volatile LONG		arp_rx;
+	volatile LONG		arp_learn;
 
 	/* 承载发送的进度：外层 NBL 已交给 NDIS 但还没完成的数量。
 	 * 统计一律写在 sess.stats 里（与 WFP 平面同名同义），装具与用户态不用改。 */
@@ -402,6 +408,7 @@ VOID iwan_win_mp_fini(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext);
  * （fail-closed：宁可建不成会话，也不能把明文放到承载网上）。
  * 判据依次为 显式 oif_index → bind_ip 所在网卡 → 外层目的地址的 FIB 路由。 */
 NTSTATUS iwan_win_mp_select_carrier(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext);
+VOID iwan_win_mp_trace_arp(_In_ IWAN_WIN_DEVICE_EXTENSION *ext);
 /* IOCTL_CLOSE 调用：清掉 active 与下一跳 MAC 缓存，会话间不残留状态。 */
 VOID iwan_win_mp_release_carrier(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext);
 

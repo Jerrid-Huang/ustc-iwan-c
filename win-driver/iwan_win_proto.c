@@ -449,6 +449,7 @@ iwan_win_proto_build_arp4(_In_ IWAN_WIN_DEVICE_EXTENSION *ext,
 {
 	IWAN_MP_PLANE *mp = &ext->mp;
 	UINT8 *a;
+	UINT32 spa;
 	ULONG i;
 
 	if (bufsz < IWAN_MP_ETH_HDR_LEN + IWAN_MP_ARP_LEN)
@@ -472,9 +473,15 @@ iwan_win_proto_build_arp4(_In_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	a[5] = 4;			/* 协议地址长度 */
 	a[6] = 0x00; a[7] = 0x01;	/* 请求 */
 	RtlCopyMemory(a + 8, mp->local_mac, 6);
-	/* 发送方协议地址留 0：本平面在承载网上没有 IP 身份，填 0 不会让对端
-	 * 记错（对端只从以太头学源 MAC）。 */
-	a[14] = a[15] = a[16] = a[17] = 0;
+	/* 发送方协议地址必须是本机在承载网上的 IPv4 地址。填 0 会被 QEMU 的
+	 * slirp 直接丢掉（它要求 ar_sip 落在客户端网段内），于是永远收不到
+	 * 应答 —— 现场表现是每个出向包都以 NO_NEIGHBOR 丢弃，而 ARP 请求
+	 * 看上去"发了"。地址取会话的 outer_src，与封装外层头用的是同一个值。 */
+	spa = ext->sess.outer_src;
+	a[14] = (UINT8)(spa >> 24);
+	a[15] = (UINT8)(spa >> 16);
+	a[16] = (UINT8)(spa >> 8);
+	a[17] = (UINT8)(spa);
 	/* 目标硬件地址未知：填 0（与以太头广播一致） */
 	a[18] = a[19] = a[20] = a[21] = a[22] = a[23] = 0;
 	a[24] = (UINT8)(mp->next_hop_be >> 24);
@@ -514,6 +521,7 @@ iwan_win_proto_learn_arp4(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		InterlockedExchange(&mp->peer_mac_valid, 1);
 		InterlockedExchange(&mp->peer_mac_pending, 0);
 		mp->arp_ts_ms = iwan_win_now_ms();
+		InterlockedIncrement(&mp->arp_learn);
 		ok = TRUE;
 	}
 	KeReleaseSpinLock(&mp->lock, old);
@@ -542,6 +550,8 @@ iwan_win_proto_send_arp4(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 	 * 释放 —— 两种结局都不该在这里再动 buf，所以这里没有 else 释放。 */
 	if (!iwan_win_proto_send_outer4(ext, buf, len))
 		IWAN_MP_STAT_INC(ext, tx_err);
+	else
+		InterlockedIncrement(&ext->mp.arp_sent);
 }
 
 /* ---- 引擎的出口 ------------------------------------------------------- */
@@ -755,6 +765,7 @@ iwan_win_proto_recv_one(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 
 	eth_type = (UINT16)(((UINT16)p[12] << 8) | p[13]);
 	if (eth_type == IWAN_MP_ETH_TYPE_ARP) {
+		InterlockedIncrement(&ext->mp.arp_rx);
 		p = iwan_win_proto_view(nb, IWAN_MP_ETH_HDR_LEN + 28u, hdr,
 					sizeof(hdr));
 		if (p == NULL)
@@ -1177,6 +1188,20 @@ iwan_win_proto_pnp_event(_In_ NDIS_HANDLE ProtocolBindingContext,
 
 /* 由 IOCTL_OPEN 在会话建立后调用。判据：会话里的 oif_index 必须命中一张
  * 已打开的以太承载；下一跳取会话里的 outer_hop，为 0 就是"对端在链路上"。 */
+/* 把 ARP 诊断计数落到注册表（只能 PASSIVE 调：控制设备 GET 路径）。
+ * T93 已发请求 / T94 收到 ARP 帧 / T95 学到邻居 / T96 peer_mac_valid。
+ * 三个数一起看才分得清"没发出去""发了没回""回了但没认"。 */
+VOID
+iwan_win_mp_trace_arp(_In_ IWAN_WIN_DEVICE_EXTENSION *ext)
+{
+	IWAN_MP_PLANE *mp = &ext->mp;
+
+	iwan_win_mp_trace(93, mp->arp_sent);
+	iwan_win_mp_trace(94, mp->arp_rx);
+	iwan_win_mp_trace(95, mp->arp_learn);
+	iwan_win_mp_trace(96, mp->peer_mac_valid);
+}
+
 NTSTATUS
 iwan_win_mp_select_carrier(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 {

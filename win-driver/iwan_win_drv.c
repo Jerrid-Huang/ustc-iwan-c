@@ -126,6 +126,10 @@ iwan_win_dispatch_ioctl(_In_ PDEVICE_OBJECT devobj, _Inout_ PIRP irp)
 		}
 #endif
 		iwan_win_session_info(ext, (IWAN_WIN_SESSION_INFO *)buf);
+#ifdef IWAN_WIN_PLANE_MP
+		/* ARP 诊断计数在这里落盘：数据面在 DISPATCH 上，不能碰 Zw*。 */
+		iwan_win_mp_trace_arp(ext);
+#endif
 		info = sizeof(IWAN_WIN_SESSION_INFO);
 		break;
 
@@ -151,6 +155,9 @@ iwan_win_dispatch_ioctl(_In_ PDEVICE_OBJECT devobj, _Inout_ PIRP irp)
 		st = ext->sess.valid ? STATUS_SUCCESS : STATUS_INVALID_DEVICE_STATE;
 		if (NT_SUCCESS(st)) {
 			iwan_win_session_info(ext, (IWAN_WIN_SESSION_INFO *)buf);
+#ifdef IWAN_WIN_PLANE_MP
+			iwan_win_mp_trace_arp(ext);
+#endif
 			info = sizeof(IWAN_WIN_SESSION_INFO);
 		}
 		KeReleaseMutex(&ext->ctrl_mutex, FALSE);
