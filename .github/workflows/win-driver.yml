@@ -524,6 +524,20 @@ jobs:
 
       # 阳性对照：XML 不存在就说明 /analyze 根本没跑（或者提前失败），此时"0 告警"
       # 毫无意义。这一步刻意不 continue-on-error，让它在工作流结论上显形。
+      - name: 打印 NDIS 小型端口通用属性结构（实验用）
+        # 本仓库能拿到的 ndis.h 快照截断在 15076 行，正好缺这个结构；而
+        # MAC 数组的字段名各版本不同，写错就是 C2039。用它换掉 mp.c 里
+        # 按偏移定位 MAC 的临时写法。
+        if: always()
+        shell: pwsh
+        run: |
+          $h = Join-Path $env:WDKINC 'km\ndis.h'
+          if (-not (Test-Path $h)) { "缺少 $h"; exit 0 }
+          $m = Select-String -Path $h -Pattern '_NDIS_MINIPORT_ADAPTER_GENERAL_ATTRIBUTES$' |
+               Select-Object -First 1
+          if (-not $m) { '没找到结构定义'; exit 0 }
+          Get-Content $h | Select-Object -Skip ($m.LineNumber - 1) -First 60
+
       - name: 断言静态分析真的跑了
         if: always()
         shell: pwsh

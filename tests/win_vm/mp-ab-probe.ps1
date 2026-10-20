@@ -7,7 +7,10 @@ param(
     [switch]$GetOnly,
     [int]$HoldSeconds = 0,
     [int]$OifIndex = 0,
-    [string]$OuterIfGuid = ''
+    [string]$OuterIfGuid = '',
+    # 内层 ping 次数。扫媒介形状时它是"这个形状能不能发出去"的唯一判据：
+    # 能发时 tx_pkts 才会动（会话已开、包已进封装）。
+    [int]$PingCount = 0
 )
 $ErrorActionPreference = 'Continue'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -29,7 +32,7 @@ $rxArgs = @{
     InnerIp = '10.99.0.1'; Target = '10.99.0.2'; InnerMtu = 1400
     CarrierMtu = 1500; OifIndex = $oif; OuterHop = 0
     OuterIfGuid = $OuterIfGuid
-    PeerIp = '10.0.2.2'; PeerPort = 45678; PingCount = 0
+    PeerIp = '10.0.2.2'; PeerPort = 45678; PingCount = $PingCount
     Inject = (-not $GetOnly); SkipSelfTest = $true; ShmDump = $true
     HoldSeconds = $HoldSeconds
 }

@@ -243,13 +243,25 @@ iwan_win_mp_initialize(_In_ NDIS_HANDLE MiniportAdapterHandle,
 			gen.AccessType = NET_IF_ACCESS_BROADCAST;
 		}
 		if (mp_maclen == 6) {
+			/* MAC 数组紧跟 MacAddressLength，但**它的字段名在 WDK 各版本里
+			 * 不同**（本仓库能拿到的 ndis.h 快照截断在 15076 行，正好缺这个
+			 * 结构），写错名字就是 C2039。这个数组是 UCHAR[32]、对齐 1，
+			 * 按"长度字段之后"定位不会踩到别的东西；写歪的代价只是这一档
+			 * 实验无效，不会影响别的档位。等拿到确定的名字再换回来。 */
+			UCHAR fake[6];
+			PUCHAR mac;
+
+			fake[0] = 0x02;
+			fake[1] = 0x00;
+			fake[2] = 0x00;
+			fake[3] = 0x00;
+			fake[4] = 0x00;
+			fake[5] = 0x01;
+			mac = (PUCHAR)&gen +
+			      offsetof(NDIS_MINIPORT_ADAPTER_GENERAL_ATTRIBUTES,
+				       MacAddressLength) + sizeof(USHORT);
+			RtlCopyMemory(mac, fake, sizeof(fake));
 			gen.MacAddressLength = 6;
-			gen.MacAddress[0] = 0x02;
-			gen.MacAddress[1] = 0x00;
-			gen.MacAddress[2] = 0x00;
-			gen.MacAddress[3] = 0x00;
-			gen.MacAddress[4] = 0x00;
-			gen.MacAddress[5] = 0x01;
 		} else {
 			gen.MacAddressLength = 0;
 		}
