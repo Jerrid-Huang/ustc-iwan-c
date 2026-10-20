@@ -34,7 +34,9 @@
  * 才归还。内层可能远比承载快（10 Gbps 的内层灌一条 100 Mbps 的承载），
  * 没有上限就会以 GB/s 量级净增长、秒级耗尽非分页池 —— 这正是 WFP 平面
  * 硬挂的机制（Kernel-Power 41 + 6008），同一个坑不能踩第二次。
- * 超限丢当前包并计 tx_bad_state，把背压交还给内层协议栈。 */
+ * 超限丢当前包并计 ev_dropped（队列溢出丢弃），但**对协议栈报成功**：
+ * 报失败会被翻成 sendto() 的 WSAEINVAL，把"承载来不及取"伪装成"应用参数
+ * 非法"。丢包是 UDP 的正常结局，计数才是唯一的诊断通道。 */
 
 /* "这帧是本会话的什么"，与 WFP 平面 iwan_win_inbound_kind 同义 */
 #define IWAN_MP_IN_NONE		0u	/* 不是本会话的帧（端口不成对） */
@@ -64,7 +66,7 @@ iwan_win_mp_outer_kind(_In_ const IWAN_WIN_SESSION *s,
 
 /* ---- 出向：内层数据报 → 外层帧 ---------------------------------------- */
 
-BOOLEAN
+UINT32
 iwan_win_mp_encap_send(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		       _In_reads_bytes_(len) const UINT8 *inner,
 		       _In_ ULONG len, _In_ BOOLEAN l4_offloaded)
@@ -76,7 +78,7 @@ iwan_win_mp_encap_send(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	BOOLEAN sent;
 
 	if (!ExAcquireRundownProtection(&ext->rundown))
-		return FALSE;		/* 会话正在拆除：本包丢弃 */
+		return IWAN_MP_TX_DROP;	/* 会话正在拆除：本包丢弃，不报错 */
 
 	if (s->valid == 0) {
 		/* 没有会话：本适配器唯一的存在理由就是隧道，报文到此为止。
@@ -90,7 +92,7 @@ iwan_win_mp_encap_send(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		 * 也要求它非零，结果会是"会话建立了、一个字节都出不去"。 */
 		IWAN_MP_STAT_INC(ext, tx_bad_state);
 		ExReleaseRundownProtection(&ext->rundown);
-		return FALSE;
+		return IWAN_MP_TX_DROP;
 	}
 	/* 外层 v6 的邻居发现（NS/NA）留到第二阶段：现在直接拒绝，绝不降级成
 	 * 明文或"猜一个网关 MAC"。 */
@@ -99,7 +101,7 @@ iwan_win_mp_encap_send(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 				 len > 0 ? (ULONG)inner[0] : 0xFFFFu, inner);
 		IWAN_MP_STAT_INC(ext, tx_bad_state);
 		ExReleaseRundownProtection(&ext->rundown);
-		return FALSE;
+		return IWAN_MP_TX_DROP;
 	}
 	/* 内层自洽：调用者（小型端口）已经从首部读出总长，这里独立复核一次 */
 	if (len < IWAN_INNER_IP4_LEN || (inner[0] >> 4) != 4 ||
@@ -108,7 +110,7 @@ iwan_win_mp_encap_send(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 				 len > 0 ? (ULONG)inner[0] : 0xFFFFu, inner);
 		IWAN_MP_STAT_INC(ext, tx_bad_inner);
 		ExReleaseRundownProtection(&ext->rundown);
-		return FALSE;
+		return IWAN_MP_TX_FAIL;
 	}
 
 	/* 先判再加：无符号回绕会让超长 len（如 0xFFFFFFF0）算出的 total 变小，
@@ -120,7 +122,7 @@ iwan_win_mp_encap_send(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 				 (ULONG)inner[0], inner);
 		IWAN_MP_STAT_INC(ext, tx_bad_inner);
 		ExReleaseRundownProtection(&ext->rundown);
-		return FALSE;
+		return IWAN_MP_TX_FAIL;
 	}
 	total = overhead + len;
 	flen = IWAN_FRAME_HDR_LEN + len;
@@ -129,7 +131,7 @@ iwan_win_mp_encap_send(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 				 (ULONG)inner[0], inner);
 		IWAN_MP_STAT_INC(ext, tx_bad_inner);
 		ExReleaseRundownProtection(&ext->rundown);
-		return FALSE;
+		return IWAN_MP_TX_FAIL;
 	}
 	/* 承载网卡 MTU：外层 IP 数据报不能超过它（外层不分片，装不下就是丢）。
 	 * 与 WFP 平面同一判据、同一计数器。 */
@@ -138,14 +140,17 @@ iwan_win_mp_encap_send(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 				 (ULONG)inner[0], inner);
 		IWAN_MP_STAT_INC(ext, tx_bad_state);
 		ExReleaseRundownProtection(&ext->rundown);
-		return FALSE;
+		return IWAN_MP_TX_DROP;
 	}
+	/* 在途上限就是"发送队列溢出"：语义上属于 ev_dropped（队列溢出丢弃），
+	 * 不是 tx_bad_state（状态坏了）。两者混用会让"驱动坏了"和"承载跟不上"
+	 * 在计数里长得一样。 */
 	if ((ULONG)ext->mp.outer_outstanding >= IWAN_MP_MAX_OUTER_INFLIGHT) {
 		iwan_win_diag_tx(s, IWAN_WIN_DIAG_TX_INFLIGHT, len, total,
 				 (ULONG)inner[0], inner);
-		IWAN_MP_STAT_INC(ext, tx_bad_state);
+		IWAN_MP_STAT_INC(ext, ev_dropped);
 		ExReleaseRundownProtection(&ext->rundown);
-		return FALSE;
+		return IWAN_MP_TX_DROP;
 	}
 
 	/* 缓冲一次分配到位：以太头(14) + 外层 IP+UDP(28) + 帧头(8) + 载荷 */
@@ -153,7 +158,7 @@ iwan_win_mp_encap_send(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	if (buf == NULL) {
 		IWAN_MP_STAT_INC(ext, tx_err);
 		ExReleaseRundownProtection(&ext->rundown);
-		return FALSE;
+		return IWAN_MP_TX_DROP;
 	}
 	ip = buf + IWAN_MP_ETH_HDR_LEN;
 	fh = ip + overhead - IWAN_FRAME_HDR_LEN;
@@ -173,7 +178,7 @@ iwan_win_mp_encap_send(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		IWAN_MP_STAT_INC(ext, tx_bad_state);
 		ExReleaseRundownProtection(&ext->rundown);
 		ExFreePoolWithTag(buf, IWAN_TAG_PKT);
-		return FALSE;
+		return IWAN_MP_TX_DROP;
 	}
 	/* rundown 一直持到本函数结束：诊断（iwan_win_diag_tx 会解引用 s->shm
 	 * 并写 40 字节）必须落在 rundown 内。否则并发的 IOCTL_CLOSE 走
@@ -189,7 +194,7 @@ iwan_win_mp_encap_send(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		IWAN_MP_STAT_INC(ext, tx_bad_state);
 		ExReleaseRundownProtection(&ext->rundown);
 		ExFreePoolWithTag(buf, IWAN_TAG_PKT);
-		return FALSE;
+		return IWAN_MP_TX_DROP;
 	}
 
 	/* send_outer4 的两种结局都不留 buf 给我们：TRUE = 所有权随 NBL 转移
@@ -208,7 +213,7 @@ iwan_win_mp_encap_send(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		IWAN_MP_STAT_INC(ext, tx_bad_state);
 	}
 	ExReleaseRundownProtection(&ext->rundown);
-	return sent;
+	return sent ? IWAN_MP_TX_OK : IWAN_MP_TX_DROP;
 }
 
 /* ---- 入向：外层帧 → 内层数据报 ---------------------------------------- */

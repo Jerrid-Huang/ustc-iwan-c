@@ -430,7 +430,7 @@ iwan_win_mp_send_nbls(_In_ NDIS_HANDLE MiniportAdapterContext,
 			UINT8 hdr[IWAN_INNER_IP4_LEN];
 			const UINT8 *p;
 			ULONG len = NET_BUFFER_DATA_LENGTH(nb);
-			BOOLEAN ok;
+			UINT32 tx;
 
 			if (len < IWAN_INNER_IP4_LEN) {
 				st = NDIS_STATUS_FAILURE;
@@ -452,23 +452,27 @@ iwan_win_mp_send_nbls(_In_ NDIS_HANDLE MiniportAdapterContext,
 			 * 而且白白多走一遍 MDL 链 —— 这里取一次就够。 */
 			p = (const UINT8 *)NdisGetDataBuffer(nb, len, NULL, 1, 0);
 			if (p != NULL) {
-				ok = iwan_win_mp_encap_send(ext, p, len, l4_offloaded);
+				tx = iwan_win_mp_encap_send(ext, p, len, l4_offloaded);
 			} else {
 				UINT8 *tmp = (UINT8 *)IWAN_ALLOC(len, IWAN_TAG_PKT);
 
 				if (tmp == NULL) {
 					IWAN_MP_STAT_INC(ext, tx_err);
-					ok = FALSE;
+					tx = IWAN_MP_TX_DROP;
 				} else {
 					p = (const UINT8 *)NdisGetDataBuffer(nb, len,
 									     tmp, 1, 0);
-					ok = p != NULL &&
+					tx = (p != NULL) ?
 					     iwan_win_mp_encap_send(ext, p, len,
-								    l4_offloaded);
+								    l4_offloaded) :
+					     IWAN_MP_TX_FAIL;
 					ExFreePoolWithTag(tmp, IWAN_TAG_PKT);
 				}
 			}
-			if (!ok)
+			/* 丢包（背压、MTU、未解析邻居）对协议栈报成功：
+			 * 报失败会让内层 sendto() 拿到 WSAEINVAL，应用以为是
+			 * 自己的参数错了。只有报文本身不合法才真报失败。 */
+			if (tx == IWAN_MP_TX_FAIL)
 				st = NDIS_STATUS_FAILURE;
 		}
 		NET_BUFFER_LIST_STATUS(nbl) = st;

@@ -414,10 +414,21 @@ VOID iwan_win_mp_release_carrier(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext);
 
 /* ---- 引擎（iwan_win_mpdata.c）：内层 ↔ 外层，只碰字节与统计 ---------- */
 
-/* 出向：把一个内层 IP 数据报封装成外层帧交给承载。缓冲由本函数分配，
- * 成功时所有权转给承载（由发送完成回调释放），失败时本函数自己释放并按
- * 原因计数（tx_bad_state / tx_bad_inner / tx_err，细节写进共享页诊断区）。 */
-BOOLEAN iwan_win_mp_encap_send(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
+/* 出向封装的三态：丢包不是失败。
+ *
+ * 背压与超限必须"假装成功"（IWAN_MP_TX_DROP）。理由不是审美：小型端口把
+ * NDIS_STATUS_FAILURE 写回 NBL，内层协议栈会把它翻成 sendto() 的
+ * WSAEINVAL(10022) —— 实测 4 线程不限速打流时 77% 的 sendto 被这样顶回来，
+ * 应用看到的是"参数非法"，而真实原因只是承载来不及取：丢包在 UDP 上本来
+ * 就是正常结局，不该伪装成编程错误。
+ *
+ * 只有"这个包本身不合法"（不是 IPv4）才回 IWAN_MP_TX_FAIL，
+ * 其余一律 DROP 并计数（tx_bad_state / ev_dropped / tx_err）。 */
+#define IWAN_MP_TX_OK   0u	/* 已交给承载 */
+#define IWAN_MP_TX_DROP 1u	/* 主动丢弃，对协议栈报成功 */
+#define IWAN_MP_TX_FAIL 2u	/* 报文不合法，对协议栈报失败 */
+
+UINT32 iwan_win_mp_encap_send(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 			       _In_reads_bytes_(len) const UINT8 *inner,
 			       _In_ ULONG len, _In_ BOOLEAN l4_offloaded);
 /* 入向：从承载收到的一个外层 IP 数据报（从 IP 头开始）→ 解封 → 指示向上。
