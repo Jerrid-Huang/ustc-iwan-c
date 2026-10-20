@@ -59,6 +59,13 @@ typedef struct _IWAN_MP_BINDING {
 	volatile LONG		opened;		/* 1=打开成功，可收发 */
 	volatile LONG		closed;		/* 1=已关闭，不可再选作出向承载 */
 	volatile LONG		outstanding;	/* 已发出、未完成的 NBL 数 */
+	/* 同一个承载有两种"接口索引"：NDIS_BIND_PARAMETERS.BoundIfIndex 是
+	 * NDIS 给的口径，用户态（GetBestRoute2 / Get-NetAdapter）用的是
+	 * NET_LUID 换算出来的 netio 口径。二者在客体上实测并不总是同一个数
+	 * （同一张 82574L：miniport Index=0，netio InterfaceIndex=7），所以
+	 * 两个都留着，查表时任一命中即算命中 —— 凭一个口径拒绝建会话，症状
+	 * 是"绑定明明有、OPEN 一律 DEVICE_NOT_READY"，最难查。 */
+	UINT32			ifindex_net;	/* BoundIfNetluid 换算出的 netio 索引 */
 } IWAN_MP_BINDING;
 
 /* 绑定表是驱动级的：协议驱动在 DriverEntry 注册，早于小型端口（PnP）出现，
@@ -147,6 +154,37 @@ iwan_win_proto_bind_info(_In_ ULONG nth)
 	return v;
 }
 
+/* 同 bind_info，但报 netio 口径的索引：T74/T75 与 T84/T85 一起看，就能
+ * 分辨"会话的 oif_index 与 NDIS 口径对不上"还是"压根没有这条绑定"。 */
+static LONG
+iwan_win_proto_bind_info_net(_In_ ULONG nth)
+{
+	PLIST_ENTRY e;
+	LONG v = IWAN_MP_BIND_INFO_NONE;
+	ULONG i = 0;
+	KIRQL old;
+
+	KeAcquireSpinLock(&g_bind_lock, &old);
+	if (g_bindings.Flink != NULL) {
+		for (e = g_bindings.Flink;
+		     e != NULL && e != &g_bindings; e = e->Flink) {
+			IWAN_MP_BINDING *b;
+
+			if (i++ != nth)
+				continue;
+			b = CONTAINING_RECORD(e, IWAN_MP_BINDING, link);
+			v = (LONG)(b->ifindex_net & 0x3FFFu);
+			if (b->opened)
+				v |= 0x4000;
+			if (b->closed)
+				v |= 0x8000;
+			break;
+		}
+	}
+	KeReleaseSpinLock(&g_bind_lock, old);
+	return v;
+}
+
 /* 该接口上是否有一条"已在表里但还没打开完"的绑定。NdisOpenAdapterEx 返回
  * PENDING 时 open_complete 是异步回来的；控制面在建会话的瞬间恰好处在这个
  * 窗口里，就会看到 T71>0 却查不到可用绑定，OPEN 直接失败。判据必须窄：
@@ -165,8 +203,9 @@ iwan_win_proto_binding_pending(_In_ UINT32 ifindex)
 			IWAN_MP_BINDING *b =
 				CONTAINING_RECORD(e, IWAN_MP_BINDING, link);
 
-			if (b->ifindex == ifindex && b->closed == 0 &&
-			    b->opened == 0) {
+			if ((b->ifindex == ifindex ||
+			     b->ifindex_net == ifindex) &&
+			    b->closed == 0 && b->opened == 0) {
 				found = 1;
 				break;
 			}
@@ -203,7 +242,8 @@ iwan_win_proto_lookup_locked(_In_ UINT32 ifindex)
 	for (e = g_bindings.Flink; e != NULL && e != &g_bindings; e = e->Flink) {
 		IWAN_MP_BINDING *b = CONTAINING_RECORD(e, IWAN_MP_BINDING, link);
 
-		if (b->ifindex == ifindex && b->opened && !b->closed)
+		if ((b->ifindex == ifindex || b->ifindex_net == ifindex) &&
+		    b->opened && !b->closed)
 			return b;
 	}
 	return NULL;
@@ -849,6 +889,17 @@ iwan_win_proto_bind(_In_ NDIS_HANDLE ProtocolDriverContext,
 	b->ext = ext;
 	b->bind_context = BindContext;
 	b->ifindex = BindParameters->BoundIfIndex;
+	/* BoundIfIndex 的口径与用户态 oif_index 不一定相同，这里再用
+	 * BoundIfNetluid 换算一次（PASSIVE，bind 回调正是 PASSIVE）。换算
+	 * 失败就把 net 域留 0，查表只按 BoundIfIndex 匹配，退化成旧行为。 */
+	{
+		NET_IFINDEX nidx = 0;
+
+		if (NdisIfGetInterfaceIndexFromNetLuid(
+			    BindParameters->BoundIfNetluid, &nidx) ==
+		    NDIS_STATUS_SUCCESS)
+			b->ifindex_net = (UINT32)nidx;
+	}
 	b->mac_len = 6;
 	RtlCopyMemory(b->mac, BindParameters->CurrentMacAddress, 6);
 
@@ -1047,6 +1098,11 @@ iwan_win_mp_select_carrier(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 	iwan_win_mp_trace(77, InterlockedCompareExchange(&g_bind_status, 0, 0));
 	iwan_win_mp_trace(78, InterlockedCompareExchange(&g_bind_calls, 0, 0));
 	iwan_win_mp_trace(79, InterlockedCompareExchange(&g_bind_rejected, 0, 0));
+	/* T84/T85 = 前两个绑定在 netio 口径下的 ifindex（含 opened/closed 位）：
+	 * BoundIfIndex 与用户态 oif_index 是两套编号，客体现成反例
+	 * （miniport Index=0 vs netio InterfaceIndex=7）。 */
+	iwan_win_mp_trace(84, iwan_win_proto_bind_info_net(0));
+	iwan_win_mp_trace(85, iwan_win_proto_bind_info_net(1));
 	if (b == NULL) {
 		/* 三种结局各留一个键：Stage/Status 只能记最后一次调用，而这里
 		 * 有两条都返回 DEVICE_NOT_READY 的路径，靠 Stage 分辨不出来。 */
