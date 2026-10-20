@@ -164,6 +164,7 @@ powershell -NoProfile -File C:\iwan\vm-mp-disarm.ps1
   | T12 / T13 | 总账：12 = 协议边结果（`NoProto=1` 时为 `0xC0000001`）、13 = 成功 |
   | T20 / T21 / T22 | `MiniportInitializeEx`：20 = 进入、21 = 失败值（或 0）、22 = 完成 |
   | T30 | 环境：值即 `NdisGetVersion()`（6.89 → `0x00060059`） |
+  | T31 | 运行中映像的 PE `TimeDateStamp`：与 CI 工件里 `iwanmp.sys` 的时间戳对照，判定客体上跑的到底是哪一版（读不到时写 0 并 DbgPrint） |
   | T38 / T39 / T40+i | 小型端口候选表：38 = 尝试次数、39 = 命中档（次版本<<8\|revision）、40+i = 第 i 档的 NTSTATUS |
   | T58 / T60+i / T69 | 协议边候选表：58 = 尝试次数、60+i = 第 i 档结果、69 = 命中（值为声明的次版本） |
   | T70 / T71 | 建会话时查绑定表：70 = 1 表示表头指针是 NULL（表没初始化）、71 = 链上节点数（-1 = 表头为空） |
