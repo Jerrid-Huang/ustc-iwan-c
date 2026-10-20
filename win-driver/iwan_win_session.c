@@ -449,6 +449,7 @@ iwan_win_session_same(_In_ const IWAN_WIN_SESSION *s,
 	       RtlCompareMemory(s->outer_src6, req->outer_src6, 16) == 16 &&
 	       RtlCompareMemory(s->outer_dst6, req->outer_dst6, 16) == 16 &&
 	       s->flags == req->flags && s->oif_index == req->oif_index &&
+	       RtlCompareMemory(s->outer_if_guid, req->outer_if_guid, 16) == 16 &&
 	       s->bind_ip == req->bind_ip &&
 	       s->inner_ip == req->inner_ip && s->inner_mtu == req->inner_mtu &&
 	       s->carrier_mtu == req->carrier_mtu &&
@@ -534,6 +535,7 @@ iwan_win_session_open(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	RtlCopyMemory(s->outer_dst6, req->outer_dst6, 16);
 	s->flags = req->flags;
 	s->oif_index = req->oif_index;
+	RtlCopyMemory(s->outer_if_guid, req->outer_if_guid, 16);
 	s->bind_ip = req->bind_ip;
 	RtlCopyMemory(s->bind_ip6, req->bind_ip6, 16);
 	s->carrier_index = req->oif_index;

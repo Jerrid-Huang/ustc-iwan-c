@@ -97,6 +97,11 @@ iwan_win_mp_fill_major(VOID)
 
 /* ---- 小型端口：初始化 / 停止 / 暂停 / 恢复 ---------------------------- */
 
+/* 读一个 Parameters 下的 DWORD（定义在文件后段：初始化路径要先用）。 */
+static ULONG
+iwan_win_mp_param_get(_In_ PCWSTR name, _In_ ULONG dflt);
+
+
 /* 支持的 OID 清单：既回答 OID_GEN_SUPPORTED_LIST，也填进适配器通用属性
  * （gen.SupportedOidList）。两处必须与本文件的 OID 处理函数一一对应：
  * 清单里有、处理函数里没有（返回 NDIS_STATUS_NOT_SUPPORTED）才是真正的坑。 */
@@ -212,11 +217,53 @@ iwan_win_mp_initialize(_In_ NDIS_HANDLE MiniportAdapterHandle,
 				     NDIS_PACKET_TYPE_ALL_MULTICAST |
 				     NDIS_PACKET_TYPE_BROADCAST;
 	gen.MaxMulticastListSize = 32;
-	gen.MacAddressLength = 0;	/* NdisMediumIP：没有链路层地址 */
-	gen.AccessType = NET_IF_ACCESS_BROADCAST;
+	/* 内层适配器的"介质形状"是客体上唯一说不清的一块：NdisMediumIP +
+	 * AccessType=BROADCAST + 无链路地址时，TCP/IP 仍然会为对端建邻居项
+	 * 并要一个 6 字节链路地址，拿不到就 send 直接失败（ping 报
+	 * \"General failure\"、UDP 报 WSAEINVAL），连 NDIS 都到不了 ——
+	 * 计数上表现为 tx_pkts 恒 0。三种形状哪一种是 Windows 认的，改代码
+	 * 猜不出来，所以做成注册表开关：改 Parameters 里的 DWORD 再
+	 * pnputil /restart-device 就能试下一档，不必重启整机换映像。
+	 *   MpAccess 0=广播（默认） 1=点对点
+	 *   MpMacLen 0=无链路地址（默认） 6=给一个假 MAC
+	 *   MpIfType 0=PROP_VIRTUAL（默认） 6=ETHERNET_CSMACD 131=TUNNEL */
+	{
+		ULONG mp_access = iwan_win_mp_param_get(L"MpAccess", 0);
+		ULONG mp_maclen = iwan_win_mp_param_get(L"MpMacLen", 0);
+		ULONG mp_iftype = iwan_win_mp_param_get(L"MpIfType", 0);
+
+		iwan_win_mp_trace(90, (LONG)mp_access);
+		iwan_win_mp_trace(91, (LONG)mp_maclen);
+		iwan_win_mp_trace(92, (LONG)mp_iftype);
+		if (mp_access == 1) {
+			gen.AccessType = NET_IF_ACCESS_POINT_TO_POINT;
+		} else if (mp_access == 2) {
+			gen.AccessType = NET_IF_ACCESS_LOOPBACK;
+		} else {
+			gen.AccessType = NET_IF_ACCESS_BROADCAST;
+		}
+		if (mp_maclen == 6) {
+			gen.MacAddressLength = 6;
+			gen.MacAddress[0] = 0x02;
+			gen.MacAddress[1] = 0x00;
+			gen.MacAddress[2] = 0x00;
+			gen.MacAddress[3] = 0x00;
+			gen.MacAddress[4] = 0x00;
+			gen.MacAddress[5] = 0x01;
+		} else {
+			gen.MacAddressLength = 0;
+		}
+		if (mp_iftype == 6) {
+			gen.IfType = IF_TYPE_ETHERNET_CSMACD;
+		} else if (mp_iftype == 131) {
+			gen.IfType = IF_TYPE_TUNNEL;
+		} else {
+			gen.IfType = IF_TYPE_PROP_VIRTUAL;
+		}
+	}
+
 	gen.DirectionType = NET_IF_DIRECTION_SENDRECEIVE;
 	gen.ConnectionType = NET_IF_CONNECTION_DEDICATED;
-	gen.IfType = IF_TYPE_PROP_VIRTUAL;
 	gen.IfConnectorPresent = FALSE;
 	gen.SupportedStatistics = NDIS_STATISTICS_XMIT_OK_SUPPORTED |
 				  NDIS_STATISTICS_RCV_OK_SUPPORTED;

@@ -91,6 +91,7 @@ typedef struct _IWAN_WIN_SESSION {
 	/* 绑定（对应 IWAN_A_OIF/IP/IP6/CARRIER） */
 	UINT32			flags;
 	UINT32			oif_index;
+	UINT8			outer_if_guid[16];	/* 承载网卡接口 GUID（全 0 = 未提供） */
 	UINT32			bind_ip;
 	UINT8			bind_ip6[16];
 	UINT32			carrier_index;	/* 只读回执：当前实际承载网卡 */

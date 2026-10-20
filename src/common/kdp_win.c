@@ -101,7 +101,7 @@ static bool kdp_win_outer_tuple(int fd, IWAN_WIN_SESSION_OPEN *req,
  * 取不到就退回 1500 / 0 / 0：宁可保守，也不要让驱动按 0 算出荒谬的 MTU，
  * 更不要让它按一个编出来的下一跳去 ARP。 */
 static uint32_t kdp_win_carrier_route(uint32_t dst_be, uint32_t *hop_be,
-                                      uint32_t *oif_out)
+                                      uint32_t *oif_out, uint8_t *guid_out)
 {
     MIB_IPFORWARD_ROW2 route;
     MIB_IPINTERFACE_ROW ifrow;
@@ -111,6 +111,7 @@ static uint32_t kdp_win_carrier_route(uint32_t dst_be, uint32_t *hop_be,
 
     *hop_be = 0;
     *oif_out = 0;
+    memset(guid_out, 0, 16);
 
     memset(&route, 0, sizeof(route));
     memset(&dst, 0, sizeof(dst));
@@ -120,9 +121,20 @@ static uint32_t kdp_win_carrier_route(uint32_t dst_be, uint32_t *hop_be,
     if (GetBestRoute2(NULL, 0, NULL, &dst, 0, &route, NULL) != NO_ERROR)
         return 1500;
     luid = route.InterfaceLuid;
-    /* InterfaceIndex 就是 NDIS 的 ifIndex：协议驱动绑定回调里拿到的
-     * NDIS_BIND_PARAMETERS.BoundIfIndex 用的是同一个索引空间。 */
     *oif_out = (uint32_t)route.InterfaceIndex;
+    /* 接口 GUID 是唯一能跨两种索引口径对上号的东西。客体实测：以太网的
+     * netio 索引是 7，而协议驱动绑定回调报的 BoundIfIndex 是 23/26 ——
+     * 两套编号并不一致，按索引挑承载等于猜（猜错的症状就是"绑定明明有、
+     * OPEN 一律 DEVICE_NOT_READY"，从计数上完全看不出来）。
+     * 协议边把 NDIS_BIND_PARAMETERS.AdapterName 里的同一个 GUID 解析出来，
+     * 驱动按 GUID 匹配。取不到 GUID 才退回索引口径。 */
+    {
+        GUID g;
+
+        memset(&g, 0, sizeof(g));
+        if (ConvertInterfaceLuidToGuid(&luid, &g) == NO_ERROR)
+            memcpy(guid_out, &g, 16);
+    }
 
     /* 下一跳：直连路由的 NextHop 是全零，此时对端就在链路上，用对端地址
      * 本身当下一跳（驱动侧的约定：outer_hop == 0 表示"按对端在链路上处理"，
@@ -359,7 +371,8 @@ int kdp_win_run(int sockfd, const uint8_t xor_key[8], uint16_t sid, uint32_t tok
         goto out;
     }
     req.carrier_mtu = kdp_win_carrier_route(req.outer_dst, &req.outer_hop,
-                                            &req.oif_index);
+                                            &req.oif_index,
+                                            req.outer_if_guid);
     req.inner_mtu = auth_mtu;
     memcpy(req.key, xor_key, sizeof(req.key));
     req.sid = sid;

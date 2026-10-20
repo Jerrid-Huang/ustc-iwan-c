@@ -12,10 +12,11 @@
 #   .\vm-rx.ps1 -Inject -PeerIp 10.0.2.15 -PingCount 0
 #
 # 偏移来自 tests/win_abi_layout.c 的实际输出，不是手算的：
-#   SESSION_OPEN 144 字节（ABI 2）：sid@8 tok@12 enc@16 key@17 outer_src@28 outer_dst@32
+#   SESSION_OPEN 160 字节（ABI 3）：sid@8 tok@12 enc@16 key@17 outer_src@28 outer_dst@32
 #     sport@36 dport@38 outer_src6@40 outer_dst6@56 flags@72 oif_index@76
 #     bind_ip@80 bind_ip6@84 inner_ip@100 inner_ip6@104 inner_mtu@120
 #     carrier_mtu@124 target_offset@128 target_count@132 outer_hop@136
+#     outer_if_guid@144（16 字节，全 0 = 按索引挑承载）
 #   outer_hop 是外层下一跳（0 = 对端就在链路上）。内核不发路由查询，这一格由
 #   控制面在开会话前用 GetBestRoute2 算好；NDIS 平面没有它就发不出外层帧。
 #   SESSION_INFO 200 字节：enabled@16 effective_mtu@20 carrier_index@24 dev_owned@28
@@ -42,6 +43,10 @@ param(
     [string]$Service  = 'iwan',
     [int]   $OifIndex = 0,
     [int]   $OuterHop = 0,
+    # 承载网卡接口 GUID（如 414E4D50-4957-0000-A456-F83916FBFC14）。
+    # 客体实测两套接口索引口径不一致（以太网 netio=7，协议边绑定报 23/26），
+    # 按索引挑承载等于猜；给了 GUID 驱动就只按 GUID 匹配。空串 = 退回索引。
+    [string]$OuterIfGuid = '',
     [int]   $PingCount = 3,
     [switch]$BindInner,
     [switch]$KeepOpen,
@@ -335,9 +340,9 @@ Put-U32Host $targets 0 $TargetFamily
 Put-U32Host $targets 4 32
 Put-Ip4Net  $targets 8 $Target
 
-$req = New-Object byte[] 144
-Put-U32Host $req 0  2        # abi_version（ABI 2 起带 outer_hop）
-Put-U32Host $req 4  144
+$req = New-Object byte[] 160
+Put-U32Host $req 0  3        # abi_version（ABI 3 起带 outer_if_guid）
+Put-U32Host $req 4  160
 Put-U16Host $req 8  $Sid    # sid/tok 是主机序字段（地址与端口才是网络序）
 Put-U32Host $req 12 $Tok
 $req[16] = if ($Plaintext) { 0 } else { 1 }   # enc
@@ -356,14 +361,21 @@ if ($NoInnerIp) { Write-Host 'inner_ip 留 0（复刻真实客户端内核面：
 else { Put-Ip4Net  $req 100 $InnerIp }          # inner_ip
 Put-U32Host $req 120 $InnerMtu
 Put-U32Host $req 124 $CarrierMtu
-Put-U32Host $req 128 144                      # target_offset
+Put-U32Host $req 128 160                      # target_offset
 Put-U32Host $req 132 1                        # target_count
 Put-U32Host $req 136 $OuterHop                # outer_hop（0 = 对端在链路上）
+if ($OuterIfGuid) {
+    # .NET 的 Guid.ToByteArray() 就是 Windows 内存里的 GUID 布局
+    #（前三段小端、第四段原序），与 ConvertInterfaceLuidToGuid 一致。
+    $gb = ([System.Guid]::Parse($OuterIfGuid)).ToByteArray()
+    [Array]::Copy($gb, 0, $req, 144, 16)
+    Write-Host ("承载 GUID：{0}" -f $OuterIfGuid)
+}
 
 $inBuf = New-Object byte[] ($req.Length + $targets.Length)
 [Array]::Copy($req, 0, $inBuf, 0, $req.Length)
 [Array]::Copy($targets, 0, $inBuf, $req.Length, $targets.Length)
-Write-Host ("请求：{0} 字节（结构 144 + 目标 1×24），sid={1} tok={2} 目标 {3}/{4} 外层 {5}:{6}->{7}" -f `
+Write-Host ("请求：{0} 字节（结构 160 + 目标 1×24），sid={1} tok={2} 目标 {3}/{4} 外层 {5}:{6}->{7}" -f `
     $inBuf.Length, $Sid, $Tok, $Target, $TargetFamily, $localIp, $sportValue, $PeerPort)
 
 # ---------- 2. 开设备、开会话 ----------

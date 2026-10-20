@@ -67,6 +67,13 @@ typedef struct _IWAN_MP_BINDING {
 	 * 命中即算命中；两个数各落一个键（T74/T75 与 T84/T85），一次装机就能
 	 * 看出它们到底是否相同，不用再猜。 */
 	UINT32			ifindex_net;	/* BoundIfNetluid 换算出的 netio 索引 */
+	/* 承载网卡的接口 GUID：从 NDIS_BIND_PARAMETERS.AdapterName（形如
+	 * "\DEVICE\{GUID}"）解析出来。控制面用 ConvertInterfaceLuidToGuid
+	 * 从 GetBestRoute2 的 InterfaceLuid 取同一份 GUID 送下来。
+	 * 两套接口索引口径在客体上实测并不一致（以太网 netio=7、绑定报
+	 * 23/26），按索引挑承载等于猜；GUID 没有这个问题。 */
+	UINT8			guid[16];	/* 全 0 = 没解析出来 */
+	ULONG			guid_valid;	/* 1 = guid 可信 */
 } IWAN_MP_BINDING;
 
 /* 绑定表是驱动级的：协议驱动在 DriverEntry 注册，早于小型端口（PnP）出现，
@@ -186,12 +193,97 @@ iwan_win_proto_bind_info_net(_In_ ULONG nth)
 	return v;
 }
 
+/* 会话里没有 GUID 时用全零表示"按索引查"。 */
+static BOOLEAN
+iwan_win_proto_guid_zero(_In_reads_(16) const UINT8 *guid)
+{
+	ULONG i;
+
+	for (i = 0; i < 16; i++) {
+		if (guid[i] != 0)
+			return FALSE;
+	}
+	return TRUE;
+}
+
+static int
+iwan_win_proto_hexval(WCHAR c)
+{
+	if (c >= L'0' && c <= L'9')
+		return (int)(c - L'0');
+	if (c >= L'a' && c <= L'f')
+		return (int)(c - L'a') + 10;
+	if (c >= L'A' && c <= L'F')
+		return (int)(c - L'A') + 10;
+	return -1;
+}
+
+/* 从 "\DEVICE\{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}" 解析 GUID。
+ *
+ * 为什么不用 RtlStringFromGUID 的反向：内核没有 UuidFromString。手工解析
+ * 只有二十行，而且解析失败必须返回 FALSE —— 猜错 GUID 就等于把会话钉到
+ * 错误的网卡上，那是最难从计数上看出来的一种错。 */
+static BOOLEAN
+iwan_win_proto_parse_guid(_In_opt_ const NDIS_STRING *name,
+			  _Out_writes_(16) UINT8 *out)
+{
+	static const int dash_at[] = { 8, 13, 18, 23 };
+	WCHAR digits[32];
+	UINT8 t[16];
+	ULONG i;
+	ULONG d = 0;
+	ULONG k = 0;
+
+	if (name == NULL || name->Buffer == NULL || name->Length < 38 * 2)
+		return FALSE;
+	/* 跳过 \DEVICE\ 找到 '{'：名字里只有一处 '{'。 */
+	while (k < (ULONG)(name->Length / sizeof(WCHAR)) &&
+	       name->Buffer[k] != L'{')
+		k++;
+	if (k >= (ULONG)(name->Length / sizeof(WCHAR)))
+		return FALSE;
+	k++;
+	for (i = 0; i < 36; i++) {
+		WCHAR c;
+
+		if (k + i >= (ULONG)(name->Length / sizeof(WCHAR)))
+			return FALSE;
+		c = name->Buffer[k + i];
+		if (d < 4 && i == (ULONG)dash_at[d]) {
+			if (c != L'-')
+				return FALSE;
+			d++;
+			continue;
+		}
+		if (iwan_win_proto_hexval(c) < 0)
+			return FALSE;
+		/* 下标的减 d 就是"扣掉已经跳过的连字符"。 */
+		digits[i - d] = c;
+	}
+	if (d != 4)
+		return FALSE;
+	for (i = 0; i < 16; i++) {
+		int hi = iwan_win_proto_hexval(digits[i * 2]);
+		int lo = iwan_win_proto_hexval(digits[i * 2 + 1]);
+
+		t[i] = (UINT8)((hi << 4) | lo);
+	}
+	/* 字符串里的顺序是大端书写，内存里的 GUID 前三个字段是小端。 */
+	out[0] = t[3]; out[1] = t[2]; out[2] = t[1]; out[3] = t[0];
+	out[4] = t[5]; out[5] = t[4];
+	out[6] = t[7]; out[7] = t[6];
+	for (i = 8; i < 16; i++)
+		out[i] = t[i];
+	return TRUE;
+}
+
 /* 该接口上是否有一条"已在表里但还没打开完"的绑定。NdisOpenAdapterEx 返回
  * PENDING 时 open_complete 是异步回来的；控制面在建会话的瞬间恰好处在这个
  * 窗口里，就会看到 T71>0 却查不到可用绑定，OPEN 直接失败。判据必须窄：
  * 只对"同一个 ifindex、没关闭、还没打开"的节点等，别的失败一概不掩饰。 */
 static LONG
-iwan_win_proto_binding_pending(_In_ UINT32 ifindex)
+iwan_win_proto_binding_pending(_In_reads_(16) const UINT8 *guid,
+			       _In_ UINT32 ifindex)
 {
 	PLIST_ENTRY e;
 	LONG found = 0;
@@ -204,21 +296,67 @@ iwan_win_proto_binding_pending(_In_ UINT32 ifindex)
 			IWAN_MP_BINDING *b =
 				CONTAINING_RECORD(e, IWAN_MP_BINDING, link);
 
-			if ((b->ifindex == ifindex ||
-			     b->ifindex_net == ifindex) &&
-			    b->closed == 0 && b->opened == 0) {
+			if (b->closed != 0 || b->opened != 0)
+				continue;
+			/* 判据必须与 lookup 逐字一致，否则会出现"在等一个
+			 * 永远查不到的节点"这种两秒空转。 */
+			if (iwan_win_proto_guid_zero(guid)) {
+				if (b->ifindex == ifindex ||
+				    b->ifindex_net == ifindex)
+					found = 1;
+			} else if (b->guid_valid &&
+				   RtlCompareMemory(b->guid, guid, 16) == 16) {
 				found = 1;
-				break;
 			}
+			if (found)
+				break;
 		}
 	}
 	KeReleaseSpinLock(&g_bind_lock, old);
 	return found;
 }
 
-/* 绑定表查找：按接口索引找一张已打开的承载。调用者需持有 g_bind_lock。 */
+/* 诊断：链上 guid 解析成功的节点数（低 8 位）与 equal 命中数（高 8 位）。
+ * T87=1（会话给了 GUID）而命中数为 0 时，只有两种可能：解析没成功，或者
+ * 控制面算错了 GUID —— 这两个数正好把它们分开。 */
+static LONG
+iwan_win_proto_binding_guid_stat(_In_reads_(16) const UINT8 *want)
+{
+	PLIST_ENTRY e;
+	LONG valid = 0;
+	LONG hits = 0;
+	KIRQL old;
+
+	KeAcquireSpinLock(&g_bind_lock, &old);
+	if (g_bindings.Flink != NULL) {
+		for (e = g_bindings.Flink;
+		     e != NULL && e != &g_bindings; e = e->Flink) {
+			IWAN_MP_BINDING *b =
+				CONTAINING_RECORD(e, IWAN_MP_BINDING, link);
+
+			if (!b->guid_valid)
+				continue;
+			valid++;
+			if (RtlCompareMemory(b->guid, want, 16) == 16)
+				hits++;
+		}
+	}
+	KeReleaseSpinLock(&g_bind_lock, old);
+	if (valid > 127)
+		valid = 127;
+	if (hits > 127)
+		hits = 127;
+	return (hits << 8) | valid;
+}
+
+/* 绑定表查找：按接口 GUID 或接口索引找一张已打开的承载。
+ *
+ * GUID 优先：只要会话给了 GUID 就只按 GUID 匹配，索引完全不参与 ——
+ * "两种索引都试试"在索引口径确实不同的时候会把会话钉到错误的网卡上，
+ * 而且从计数上完全看不出来。调用者需持有 g_bind_lock。 */
 static IWAN_MP_BINDING *
-iwan_win_proto_lookup_locked(_In_ UINT32 ifindex)
+iwan_win_proto_lookup_locked(_In_reads_(16) const UINT8 *guid,
+			     _In_ UINT32 ifindex)
 {
 	PLIST_ENTRY e;
 
@@ -243,9 +381,15 @@ iwan_win_proto_lookup_locked(_In_ UINT32 ifindex)
 	for (e = g_bindings.Flink; e != NULL && e != &g_bindings; e = e->Flink) {
 		IWAN_MP_BINDING *b = CONTAINING_RECORD(e, IWAN_MP_BINDING, link);
 
-		if ((b->ifindex == ifindex || b->ifindex_net == ifindex) &&
-		    b->opened && !b->closed)
+		if (!b->opened || b->closed)
+			continue;
+		if (iwan_win_proto_guid_zero(guid)) {
+			if (b->ifindex == ifindex || b->ifindex_net == ifindex)
+				return b;
+		} else if (b->guid_valid &&
+			   RtlCompareMemory(b->guid, guid, 16) == 16) {
 			return b;
+		}
 	}
 	return NULL;
 }
@@ -903,6 +1047,13 @@ iwan_win_proto_bind(_In_ NDIS_HANDLE ProtocolDriverContext,
 	}
 	b->mac_len = 6;
 	RtlCopyMemory(b->mac, BindParameters->CurrentMacAddress, 6);
+	/* AdapterName 是设备路径加 GUID，形如 反斜杠 DEVICE 反斜杠 {GUID}。
+	 * 查表退回索引口径（旧行为），但 T88 会把"没解析出来"显式暴露。 */
+	if (iwan_win_proto_parse_guid(BindParameters->AdapterName, b->guid))
+		b->guid_valid = 1;
+	else
+		DbgPrint("iwanmp: 绑定 %lu 的 AdapterName 解析不出 GUID\n",
+			 (unsigned long)b->ifindex);
 
 	RtlZeroMemory(&op, sizeof(op));
 	op.Header.Type = NDIS_OBJECT_TYPE_OPEN_PARAMETERS;
@@ -1047,9 +1198,19 @@ iwan_win_mp_select_carrier(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 	/* T86 = 会话点名要的接口索引。没有这个键，T74/T84 里的绑定索引就没有
 	 * 对照物 —— "查不到"和"索引不一样"在日志里长得一模一样。 */
 	iwan_win_mp_trace(86, (LONG)s->oif_index);
+	/* T87 = 控制面有没有送 GUID 下来（1 = 有，只按 GUID 查表）。
+	 * T88 = (命中数 << 8) | 解析成功的节点数。T87=1 而命中数为 0，
+	 * 说明要么 AdapterName 没解析出来，要么控制面算错了 GUID。 */
+	if (!iwan_win_proto_guid_zero(s->outer_if_guid)) {
+		iwan_win_mp_trace(87, 1);
+		iwan_win_mp_trace(88,
+			iwan_win_proto_binding_guid_stat(s->outer_if_guid));
+	} else {
+		iwan_win_mp_trace(87, 0);
+	}
 
 	KeAcquireSpinLock(&g_bind_lock, &old);
-	b = iwan_win_proto_lookup_locked(s->oif_index);
+	b = iwan_win_proto_lookup_locked(s->outer_if_guid, s->oif_index);
 	KeReleaseSpinLock(&g_bind_lock, old);
 	/* 打开还在飞就先等一会儿：控制面（kdp_win）建会话只发一次 OPEN，NDIS
 	 * 的 open_complete 若晚到几十毫秒，会话就整条建立失败。只在这一种情况
@@ -1059,7 +1220,9 @@ iwan_win_mp_select_carrier(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 	{
 		ULONG spins = 0;
 
-		while (b == NULL && iwan_win_proto_binding_pending(s->oif_index) &&
+		while (b == NULL &&
+		       iwan_win_proto_binding_pending(s->outer_if_guid,
+						      s->oif_index) &&
 		       spins < 200) {
 			/* 在 PASSIVE 上就让出 CPU：这是控制面 IRP 线程，忙等
 			 * 两秒会白烧一个核。KeDelayExecutionThread 不创建任何
@@ -1075,7 +1238,8 @@ iwan_win_mp_select_carrier(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 			}
 			spins++;
 			KeAcquireSpinLock(&g_bind_lock, &old);
-			b = iwan_win_proto_lookup_locked(s->oif_index);
+			b = iwan_win_proto_lookup_locked(s->outer_if_guid,
+							 s->oif_index);
 			KeReleaseSpinLock(&g_bind_lock, old);
 		}
 		iwan_win_mp_trace(83, (LONG)spins);

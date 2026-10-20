@@ -67,10 +67,15 @@ typedef unsigned long long uint64_t;
 /* ---- 版本 ------------------------------------------------------------- */
 
 /* 设备与 IOCTL 的 ABI 版本：驱动与客户端不一致时拒绝开会话。
+ * 3：SESSION_OPEN 末尾追加 outer_if_guid（承载网卡接口 GUID，16 字节）。
+ *    起因：NDIS 的绑定索引与用户态 GetBestRoute2 给的接口索引实测不是同一套
+ *    编号（同一张以太网卡：netio 报 7，NDIS 绑定参数报 23），按索引选承载必然
+ *    选不中，而症状与"根本没绑上承载"完全相同。GUID 在两套编号里都有，是唯一
+ *    稳定的同一性判据。
  * 2：SESSION_OPEN 末尾追加 outer_hop（外层下一跳）。旧客户端送 136 字节的
  *    请求会被 size 校验挡下，这是有意的 —— 缺了下一跳就没法在承载网上把外
  *    层帧发出去，静默降级比当面拒绝更糟。 */
-#define IWAN_WIN_ABI_VERSION      2u
+#define IWAN_WIN_ABI_VERSION      3u
 
 /* 存活共享内存页的布局版本：与 Linux 的 IWAN_SHM_VERSION 同步（同一套
  * 用户态读取代码吃两边的页，所以版本号必须一起动） */
@@ -199,6 +204,11 @@ typedef struct _IWAN_WIN_SESSION_OPEN {
 	 * 0 = 未提供：按"对端在链路上"处理（对端与承载网卡同网段时这就是正确值）。 */
 	uint32_t outer_hop;
 	uint32_t reserved1;	/* 保持 8 字节对齐；必须为 0 */
+
+	/* 承载网卡接口 GUID（16 字节，与 GetAdaptersAddresses 的 AdapterName /
+	 * ConvertInterfaceLuidToGuid 同一字节序）。全 0 = 未提供，驱动退回按
+	 * oif_index 匹配（两套编号都试），只为过渡期兼容。 */
+	uint8_t  outer_if_guid[16];
 } IWAN_WIN_SESSION_OPEN, *PIWAN_WIN_SESSION_OPEN;
 
 /* ---- 统计（计数器名称与顺序对应 enum iwan_stats_attr） ---------------- */
@@ -342,8 +352,10 @@ IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_SESSION_OPEN, target_count) == 132,
 		       "SESSION_OPEN.target_count 偏移");
 IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_SESSION_OPEN, outer_hop) == 136,
 		       "SESSION_OPEN.outer_hop 偏移");
-IWAN_WIN_STATIC_ASSERT(sizeof(IWAN_WIN_SESSION_OPEN) == 144,
-		       "IWAN_WIN_SESSION_OPEN 必须是 144 字节");
+IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_SESSION_OPEN, outer_if_guid) == 144,
+		       "SESSION_OPEN.outer_if_guid 偏移");
+IWAN_WIN_STATIC_ASSERT(sizeof(IWAN_WIN_SESSION_OPEN) == 160,
+		       "IWAN_WIN_SESSION_OPEN 必须是 160 字节");
 IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_SESSION_INFO, last_rx_ms) == 40,
 		       "SESSION_INFO.last_rx_ms 偏移");
 IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_SESSION_INFO, shm_user_va) == 56,
