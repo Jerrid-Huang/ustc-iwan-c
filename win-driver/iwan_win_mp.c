@@ -855,6 +855,36 @@ iwan_win_mp_fill_ch(_Out_ PNDIS_MINIPORT_DRIVER_CHARACTERISTICS ch,
  *   单独验证：适配器出现、地址与 MTU 可设、SendNetBufferLists 被调用）。
  * 两者都只在**装载之前**读一次，运行期不可改 —— 它们是安全闸门，不是配置。
  * Disarm 的缺省值是 1（不是 0）：键不存在时必须落在"不合闸"这一侧。 */
+/* 运行中映像的 PE TimeDateStamp：这是"客体上到底跑的哪一版"的唯一硬证据。
+ * 客体上换映像的路径全被堵死（加载中的 .sys 覆盖会 Access denied，sc delete
+ * 只是标记删除，delete-driver 要求重启），而文件 mtime/大小都可能属于被替换
+ * 掉的旧文件。驱动映像本身非分页常驻，DriverEntry 处在 PASSIVE，直接读
+ * DOS/NT 头是安全的；任何一步不成立都返回 0（0 表示"读不到"，不是"很旧的
+ * 构建"）。 */
+static ULONG
+iwan_win_mp_build_stamp(_In_opt_ PDRIVER_OBJECT driver)
+{
+	const UCHAR *base;
+	LONG lfanew;
+	ULONG stamp = 0;
+
+	if (driver == NULL || driver->DriverStart == NULL)
+		return 0;
+	base = (const UCHAR *)driver->DriverStart;
+
+	/* e_magic 不是 MZ 时不要顺着 e_lfanew 乱读 —— 这里的指针来自内核，
+	 * 读错位置就是一次 bugcheck，不值得为一行诊断冒这个险。 */
+	if (base[0] != 'M' || base[1] != 'Z')
+		return 0;
+	RtlCopyMemory(&lfanew, base + 0x3C, sizeof(lfanew));
+	if (lfanew <= 0 || lfanew > 0x1000)
+		return 0;
+	/* IMAGE_NT_HEADERS32/64 的 FileHeader 都在 Signature 之后 4 字节，
+	 * TimeDateStamp 是 FileHeader 的第 2 个字段（+4）⇒ 合计 +8。 */
+	RtlCopyMemory(&stamp, base + lfanew + 8, sizeof(stamp));
+	return stamp;
+}
+
 static ULONG
 iwan_win_mp_param_get(_In_ PCWSTR name, _In_ ULONG dflt)
 {
@@ -982,6 +1012,16 @@ iwan_win_mp_init(_In_ PDRIVER_OBJECT driver,
 	 * NDIS 6.89）。注册失败时要能区分"驱动写错了"与"这台机器的 NDIS
 	 * 比驱动声明的版本还旧"，这一条是唯一的判据。 */
 	iwan_win_mp_trace(30, (LONG)NdisGetVersion());
+	/* 阶段 31 = 运行中映像的 PE TimeDateStamp。装完机先读这一条，与 CI 工件
+	 * 里 iwanmp.sys 的时间戳对照，就能判定"盘上这份到底是不是刚构建的那版"，
+	 * 不必再靠反汇编猜。 */
+	{
+		ULONG stamp = iwan_win_mp_build_stamp(driver);
+		iwan_win_mp_trace(31, (LONG)stamp);
+		if (stamp == 0)
+			DbgPrint("iwanmp: 读不到映像时间戳（DriverStart=%p）\n",
+				 driver != NULL ? driver->DriverStart : NULL);
+	}
 
 	{
 		/* 缺省值刻意是 1（保险丝合上）：键被删掉、装机写键失败、
