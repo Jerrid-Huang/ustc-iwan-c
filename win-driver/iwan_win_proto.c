@@ -147,6 +147,35 @@ iwan_win_proto_bind_info(_In_ ULONG nth)
 	return v;
 }
 
+/* 该接口上是否有一条"已在表里但还没打开完"的绑定。NdisOpenAdapterEx 返回
+ * PENDING 时 open_complete 是异步回来的；控制面在建会话的瞬间恰好处在这个
+ * 窗口里，就会看到 T71>0 却查不到可用绑定，OPEN 直接失败。判据必须窄：
+ * 只对"同一个 ifindex、没关闭、还没打开"的节点等，别的失败一概不掩饰。 */
+static LONG
+iwan_win_proto_binding_pending(_In_ UINT32 ifindex)
+{
+	PLIST_ENTRY e;
+	LONG found = 0;
+	KIRQL old;
+
+	KeAcquireSpinLock(&g_bind_lock, &old);
+	if (g_bindings.Flink != NULL) {
+		for (e = g_bindings.Flink;
+		     e != NULL && e != &g_bindings; e = e->Flink) {
+			IWAN_MP_BINDING *b =
+				CONTAINING_RECORD(e, IWAN_MP_BINDING, link);
+
+			if (b->ifindex == ifindex && b->closed == 0 &&
+			    b->opened == 0) {
+				found = 1;
+				break;
+			}
+		}
+	}
+	KeReleaseSpinLock(&g_bind_lock, old);
+	return found;
+}
+
 /* 绑定表查找：按接口索引找一张已打开的承载。调用者需持有 g_bind_lock。 */
 static IWAN_MP_BINDING *
 iwan_win_proto_lookup_locked(_In_ UINT32 ifindex)
@@ -953,6 +982,24 @@ iwan_win_mp_select_carrier(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 	KeAcquireSpinLock(&g_bind_lock, &old);
 	b = iwan_win_proto_lookup_locked(s->oif_index);
 	KeReleaseSpinLock(&g_bind_lock, old);
+	/* 打开还在飞就先等一会儿：控制面（kdp_win）建会话只发一次 OPEN，NDIS
+	 * 的 open_complete 若晚到几十毫秒，会话就整条建立失败。只在这一种情况
+	 * 下等 —— 表里有该接口的节点、没关闭、还没 opened。最多 2 秒，超时照
+	 * 旧返回 DEVICE_NOT_READY。KeStallExecutionProcessor 在 PASSIVE（IOCTL
+	 * 路径）下可用，也刻意不去用定时器等内核对象。 */
+	{
+		ULONG spins = 0;
+
+		while (b == NULL && iwan_win_proto_binding_pending(s->oif_index) &&
+		       spins < 200) {
+			KeStallExecutionProcessor(10000);	/* 10 ms */
+			spins++;
+			KeAcquireSpinLock(&g_bind_lock, &old);
+			b = iwan_win_proto_lookup_locked(s->oif_index);
+			KeReleaseSpinLock(&g_bind_lock, old);
+		}
+		iwan_win_mp_trace(83, (LONG)spins);
+	}
 	/* 放锁之后才落诊断：T70=1 ⇒ 表从来没被 InitializeListHead 过；
 	 * T71=链上节点数，T70 不出现而 T71=0 ⇒ 表是好的但 NDIS 一条绑定都没
 	 * 给过（协议边绑不上承载）。两种病因的处置完全不同。 */

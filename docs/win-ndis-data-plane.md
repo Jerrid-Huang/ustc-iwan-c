@@ -172,6 +172,7 @@ powershell -NoProfile -File C:\iwan\vm-mp-disarm.ps1
   | T76 / T77 | 76 = open_complete 报的 NTSTATUS 原值、77 = bind 里 NdisOpenAdapterEx 当场返回值（都为 0 而 opened 位为 0 ⇒ 打开还在飞） |
   | T78 / T79 | 78 = NDIS 调过几次 BindAdapterEx、79 = 其中被我们按介质/MAC 长度拒掉几次（71=0 时：78=0 ⇒ NDIS 没叫过我们；78>0 且 79=78 ⇒ 叫了全拒） |
   | T80 / T81 / T82 | 建会话的三种结局各写一个键：80 = 按 oif_index 查不到可用绑定、81 = 选中瞬间被解绑、82 = 成功（值为选中绑定的 ifindex） |
+  | T83 | 建会话时为"打开还在飞"等了几个 10 ms（0 = 没等；200 = 等满 2 秒仍没等到） |
 
   两条不变式（都由 0xD1 换来）：
 
