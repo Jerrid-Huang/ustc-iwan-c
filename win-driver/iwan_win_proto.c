@@ -223,6 +223,7 @@ iwan_win_proto_hexval(WCHAR c)
  * 为什么不用 RtlStringFromGUID 的反向：内核没有 UuidFromString。手工解析
  * 只有二十行，而且解析失败必须返回 FALSE —— 猜错 GUID 就等于把会话钉到
  * 错误的网卡上，那是最难从计数上看出来的一种错。 */
+_Success_(return != 0)
 static BOOLEAN
 iwan_win_proto_parse_guid(_In_opt_ const NDIS_STRING *name,
 			  _Out_writes_(16) UINT8 *out)
@@ -230,7 +231,6 @@ iwan_win_proto_parse_guid(_In_opt_ const NDIS_STRING *name,
 	static const int dash_at[] = { 8, 13, 18, 23 };
 	WCHAR digits[32];
 	UINT8 t[16];
-	UINT8 g[16];
 	ULONG i;
 	ULONG d = 0;
 	ULONG k = 0;
@@ -270,15 +270,14 @@ iwan_win_proto_parse_guid(_In_opt_ const NDIS_STRING *name,
 		t[i] = (UINT8)((hi << 4) | lo);
 	}
 	/* 字符串里的顺序是大端书写，内存里的 GUID 前三个字段是小端。
-	 * 先整体写满局部数组，再一次性交给出参：PREfast 只认"所有成功路径
-	 * 都完整写出 _Out_ 参数"，逐下标写 + 尾循环会被判 C6101（未初始化
-	 * 返回），而这里每一次 return TRUE 之前确实必须写满 16 字节。 */
-	g[0] = t[3]; g[1] = t[2]; g[2] = t[1]; g[3] = t[0];
-	g[4] = t[5]; g[5] = t[4];
-	g[6] = t[7]; g[7] = t[6];
-	g[8] = t[8]; g[9] = t[9]; g[10] = t[10]; g[11] = t[11];
-	g[12] = t[12]; g[13] = t[13]; g[14] = t[14]; g[15] = t[15];
-	RtlCopyMemory(out, g, sizeof(g));
+	 * 16 个字节全部逐下标写满、不用尾循环也不用 RtlCopyMemory：PREfast
+	 * 只认"所有成功路径都完整写出 _Out_ 参数"，尾循环与 memcpy 都会被
+	 * 判 C6101（未初始化返回），而这里每次 return TRUE 前确实必须写满。 */
+	out[0] = t[3]; out[1] = t[2]; out[2] = t[1]; out[3] = t[0];
+	out[4] = t[5]; out[5] = t[4];
+	out[6] = t[7]; out[7] = t[6];
+	out[8] = t[8]; out[9] = t[9]; out[10] = t[10]; out[11] = t[11];
+	out[12] = t[12]; out[13] = t[13]; out[14] = t[14]; out[15] = t[15];
 	return TRUE;
 }
 
