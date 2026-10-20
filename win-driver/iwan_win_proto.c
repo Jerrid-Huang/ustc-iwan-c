@@ -110,15 +110,14 @@ iwan_win_proto_first_ifindex(VOID)
 	KIRQL old;
 
 	KeAcquireSpinLock(&g_bind_lock, &old);
-	if (g_bindings.Flink != NULL) {
-		for (e = g_bindings.Flink;
-		     e != NULL && e != &g_bindings; e = e->Flink) {
-			IWAN_MP_BINDING *b =
-				CONTAINING_RECORD(e, IWAN_MP_BINDING, link);
+	/* 只取表头那一个，所以是 if 不是 for：写成 for + 无条件 break 会让循环
+	 * 增量表达式永远执行不到，/WX 下直接 C4702 unreachable code。 */
+	e = g_bindings.Flink;
+	if (e != NULL && e != &g_bindings) {
+		IWAN_MP_BINDING *b =
+			CONTAINING_RECORD(e, IWAN_MP_BINDING, link);
 
-			v = (LONG)b->ifindex;
-			break;
-		}
+		v = (LONG)b->ifindex;
 	}
 	KeReleaseSpinLock(&g_bind_lock, old);
 	return v;
