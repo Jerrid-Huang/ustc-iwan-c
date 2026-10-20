@@ -1,0 +1,45 @@
+; iwanmp-proto.inf -- 给 iwanmp 的协议边上"网络组件"户口
+;
+; 为什么需要这个文件：NdisRegisterProtocolDriver 只把驱动登记成协议驱动，
+; 真正让 NDIS 去调 BindAdapterHandlerEx 的，是"协议组件实例"与每张网卡的
+; 组件实例 Linkage\UpperBind 名单。参考实现 C:\Windows\INF\netlldp.inf：
+;   Class=NetTrans + ClassGUID={4d36e975-...}
+;   [Install] Characteristics=0 / AddReg=Inst_Ndi
+;   [Inst_Ndi] HKR,Ndi,Service,,"MsLldp"
+;              HKR,Ndi\Interfaces, UpperRange,, noupper
+;              HKR,Ndi\Interfaces, LowerRange,, ndis5
+; 我们把同一形状照抄到 iwanmp：组件 id 与 UpperBind 里的名字必须一致（都是
+; "iwanmp"），LowerRange=ndis5 与内层微型端口实例的 UpperRange=ndis5 对接。
+;
+; 装法：netcfg -l C:\iwan\iwanmp-proto.inf -c p -i iwanmp
+; 卸法：netcfg -u iwanmp  （必要时再删 Control\Network\... 下的组件实例键）
+;
+; 本文件必须全 ASCII：setupapi 按 ANSI/UTF-16LE 解析 INF。
+
+[Version]
+    Signature   = "$Windows NT$"
+    Class       = NetTrans
+    ClassGUID   = {4d36e975-e325-11ce-bfc1-08002be10318}
+    Provider    = %Iwan%
+    PnpLockdown = 1
+    DriverVer   = 10/20/2026,1.0.0.0
+
+[Manufacturer]
+    %Iwan% = Iwan, NTamd64
+
+[Iwan.NTamd64]
+    %IwanmpProtoDesc% = IwanmpProto.Install, iwanmp
+
+[IwanmpProto.Install]
+    Characteristics = 0
+    AddReg          = Inst_Ndi
+
+[Inst_Ndi]
+    HKR, Ndi, Service, 0, "iwanmp"
+    HKR, Ndi, BindForm, 0, "Iwanmp"
+    HKR, Ndi\Interfaces, UpperRange, 0, "noupper"
+    HKR, Ndi\Interfaces, LowerRange, 0, "ndis5"
+
+[Strings]
+    Iwan = "iwan"
+    IwanmpProtoDesc = "iWAN Carrier Protocol"

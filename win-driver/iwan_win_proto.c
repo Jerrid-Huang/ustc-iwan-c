@@ -67,6 +67,11 @@ static LIST_ENTRY	g_bindings;
 static KSPIN_LOCK	g_bind_lock;
 static volatile LONG	g_proto_started;	/* g_bindings/g_bind_lock 已初始化 */
 static volatile LONG	g_bind_table_broken;	/* 表头读到 NULL（只诊断用） */
+/* open_complete 的成败次数：T72/T73。绑定进了表却打不开时，这两个数
+ * 就是"NDIS 到底有没有回调我们"的唯一证据。 */
+static volatile LONG	g_open_ok;
+static volatile LONG	g_open_fail;
+
 
 /* 发送在途上下文（IWAN_MP_TX_CTX）定义在 iwan_win.h：入向指示也用它。 */
 /* 池的 context 区必须放得下它（池在 iwan_win_mp.c 里按 IWAN_MP_NBL_CTX_SIZE
@@ -92,6 +97,31 @@ iwan_win_proto_binding_count(VOID)
 	}
 	KeReleaseSpinLock(&g_bind_lock, old);
 	return n;
+}
+
+/* 诊断用：把链上第一条绑定的 (ifindex, opened, closed) 报出去。会话里的
+ * oif_index 是用户态从"内层适配器"那侧挑的承载，一旦挑错，查表必然落空；
+ * 有这三个数就能直接看出"表里有绑定，只是索引不对"。 */
+static LONG
+iwan_win_proto_first_ifindex(VOID)
+{
+	PLIST_ENTRY e;
+	LONG v = -1;
+	KIRQL old;
+
+	KeAcquireSpinLock(&g_bind_lock, &old);
+	if (g_bindings.Flink != NULL) {
+		for (e = g_bindings.Flink;
+		     e != NULL && e != &g_bindings; e = e->Flink) {
+			IWAN_MP_BINDING *b =
+				CONTAINING_RECORD(e, IWAN_MP_BINDING, link);
+
+			v = (LONG)b->ifindex;
+			break;
+		}
+	}
+	KeReleaseSpinLock(&g_bind_lock, old);
+	return v;
 }
 
 /* 绑定表查找：按接口索引找一张已打开的承载。调用者需持有 g_bind_lock。 */
@@ -689,6 +719,7 @@ iwan_win_proto_open_complete(_In_ NDIS_HANDLE ProtocolBindingContext,
 	IWAN_MP_BINDING *b = (IWAN_MP_BINDING *)ProtocolBindingContext;
 
 	if (Status == NDIS_STATUS_SUCCESS) {
+		InterlockedIncrement(&g_open_ok);
 		InterlockedExchange(&b->opened, 1);
 		/* 先把过滤器设上再算"可用"：opened 只表示句柄打开成功，
 		 * 收不收得到帧由过滤器决定。这一句放这里是因为 open_complete
@@ -697,6 +728,9 @@ iwan_win_proto_open_complete(_In_ NDIS_HANDLE ProtocolBindingContext,
 	} else {
 		/* 打开失败：这条绑定不能用，打关闭标记（不释放 —— bind 的
 		 * 返回路径可能还在用它，而且 NDIS 可能已经在往上指示/发送）。 */
+		InterlockedIncrement(&g_open_fail);
+		DbgPrint("iwanmp: 绑定 if%u 打开失败 0x%08lx\n",
+			 (unsigned)b->ifindex, (unsigned long)Status);
 		iwan_win_proto_binding_close(b);
 	}
 	/* bind 的完成回执：BindAdapterEx 返回 PENDING 时由这里收尾 */
@@ -886,6 +920,12 @@ iwan_win_mp_select_carrier(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 	iwan_win_mp_trace(70,
 			  InterlockedCompareExchange(&g_bind_table_broken, 1, 1));
 	iwan_win_mp_trace(71, (LONG)iwan_win_proto_binding_count());
+	/* T72/T73：open_complete 的成败次数。绑定在表里却打不开（T73>0）与
+	 * NDIS 根本没回调（两者皆 0）是两回事，处置完全不同。T74：链上第一条
+	 * 绑定的 ifindex —— 与 T71 一起就能判断"索引挑错了"而不是"没有绑定"。 */
+	iwan_win_mp_trace(72, InterlockedCompareExchange(&g_open_ok, 0, 0));
+	iwan_win_mp_trace(73, InterlockedCompareExchange(&g_open_fail, 0, 0));
+	iwan_win_mp_trace(74, iwan_win_proto_first_ifindex());
 	if (b == NULL) {
 		DbgPrint("iwanmp: 接口 %lu 上没有可用的以太承载，拒绝建立\n",
 			 (unsigned long)s->oif_index);
