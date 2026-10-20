@@ -99,25 +99,40 @@ iwan_win_proto_binding_count(VOID)
 	return n;
 }
 
-/* 诊断用：把链上第一条绑定的 (ifindex, opened, closed) 报出去。会话里的
- * oif_index 是用户态从"内层适配器"那侧挑的承载，一旦挑错，查表必然落空；
- * 有这三个数就能直接看出"表里有绑定，只是索引不对"。 */
+/* 诊断用：把链上第 n 个绑定的 (ifindex, opened, closed) 压进一个 LONG：
+ *   bit0..13 = ifindex（-1 = 没有这个节点）
+ *   bit14    = opened
+ *   bit15    = closed
+ * 会话里的 oif_index 是用户态挑的承载，一旦挑错查表必然落空；而"表里有节点
+ * 但 opened=0"说明 NdisOpenAdapterEx 还是 PENDING、open_complete 没回来 ——
+ * 两种病因处置完全不同，所以把三个数一起带出去。自己取锁：绑定随时被插拔，
+ * 不持锁遍历读到半个指针就是自己制造的那类崩溃。 */
+#define IWAN_MP_BIND_INFO_NONE	(0x3FFF)
+
 static LONG
-iwan_win_proto_first_ifindex(VOID)
+iwan_win_proto_bind_info(_In_ ULONG nth)
 {
 	PLIST_ENTRY e;
-	LONG v = -1;
+	LONG v = IWAN_MP_BIND_INFO_NONE;
+	ULONG i = 0;
 	KIRQL old;
 
 	KeAcquireSpinLock(&g_bind_lock, &old);
-	/* 只取表头那一个，所以是 if 不是 for：写成 for + 无条件 break 会让循环
-	 * 增量表达式永远执行不到，/WX 下直接 C4702 unreachable code。 */
-	e = g_bindings.Flink;
-	if (e != NULL && e != &g_bindings) {
-		IWAN_MP_BINDING *b =
-			CONTAINING_RECORD(e, IWAN_MP_BINDING, link);
+	if (g_bindings.Flink != NULL) {
+		for (e = g_bindings.Flink;
+		     e != NULL && e != &g_bindings; e = e->Flink) {
+			IWAN_MP_BINDING *b;
 
-		v = (LONG)b->ifindex;
+			if (i++ != nth)
+				continue;
+			b = CONTAINING_RECORD(e, IWAN_MP_BINDING, link);
+			v = (LONG)(b->ifindex & 0x3FFFu);
+			if (b->opened)
+				v |= 0x4000;
+			if (b->closed)
+				v |= 0x8000;
+			break;
+		}
 	}
 	KeReleaseSpinLock(&g_bind_lock, old);
 	return v;
@@ -920,11 +935,13 @@ iwan_win_mp_select_carrier(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 			  InterlockedCompareExchange(&g_bind_table_broken, 1, 1));
 	iwan_win_mp_trace(71, (LONG)iwan_win_proto_binding_count());
 	/* T72/T73：open_complete 的成败次数。绑定在表里却打不开（T73>0）与
-	 * NDIS 根本没回调（两者皆 0）是两回事，处置完全不同。T74：链上第一条
-	 * 绑定的 ifindex —— 与 T71 一起就能判断"索引挑错了"而不是"没有绑定"。 */
+	 * NDIS 根本没回调（两者皆 0）是两回事，处置完全不同。T74/T75：链上前
+	 * 两个绑定压成 ifindex|opened<<14|closed<<15，与 T71 一起就能分辨
+	 * "索引挑错了"与"绑上了但没打开"。 */
 	iwan_win_mp_trace(72, InterlockedCompareExchange(&g_open_ok, 0, 0));
 	iwan_win_mp_trace(73, InterlockedCompareExchange(&g_open_fail, 0, 0));
-	iwan_win_mp_trace(74, iwan_win_proto_first_ifindex());
+	iwan_win_mp_trace(74, iwan_win_proto_bind_info(0));
+	iwan_win_mp_trace(75, iwan_win_proto_bind_info(1));
 	if (b == NULL) {
 		DbgPrint("iwanmp: 接口 %lu 上没有可用的以太承载，拒绝建立\n",
 			 (unsigned long)s->oif_index);
