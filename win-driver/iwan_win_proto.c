@@ -771,6 +771,19 @@ iwan_win_proto_open_complete(_In_ NDIS_HANDLE ProtocolBindingContext,
 	IWAN_MP_BINDING *b = (IWAN_MP_BINDING *)ProtocolBindingContext;
 
 	if (Status == NDIS_STATUS_SUCCESS) {
+		/* 打开完成时可能已经解绑（拔卡/禁用网卡的时序）：此时绑定句柄
+		 * 正在被 NdisCloseAdapterEx 收走，再去下发过滤器就是对一个正在
+		 * 关闭的句柄发 OID。只判 closed 就够 —— unbind 是先置 closed
+		 * 再等中继归零、最后才关句柄。 */
+		if (InterlockedCompareExchange(&b->closed, 1, 1) != 0) {
+			InterlockedIncrement(&g_open_fail);
+			InterlockedExchange(&g_open_status,
+					    (LONG)STATUS_INVALID_DEVICE_STATE);
+			DbgPrint("iwanmp: 绑定 if%u 打开完成时已解绑，不再设过滤器\n",
+				 (unsigned)b->ifindex);
+			NdisCompleteBindAdapterEx(b->bind_context, Status);
+			return;
+		}
 		InterlockedIncrement(&g_open_ok);
 		InterlockedExchange(&b->opened, 1);
 		/* 先把过滤器设上再算"可用"：opened 只表示句柄打开成功，
