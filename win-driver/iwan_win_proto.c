@@ -992,7 +992,18 @@ iwan_win_mp_select_carrier(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 
 		while (b == NULL && iwan_win_proto_binding_pending(s->oif_index) &&
 		       spins < 200) {
-			KeStallExecutionProcessor(10000);	/* 10 ms */
+			/* 在 PASSIVE 上就让出 CPU：这是控制面 IRP 线程，忙等
+			 * 两秒会白烧一个核。KeDelayExecutionThread 不创建任何
+			 * 内核对象，与"驱动里没有定时器/线程"的约束不冲突。
+			 * 万一被抬到 DISPATCH（不该发生）则退回停顿等待。 */
+			if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
+				LARGE_INTEGER iv;
+
+				iv.QuadPart = -10 * 10000;	/* 10 ms，相对 */
+				KeDelayExecutionThread(KernelMode, FALSE, &iv);
+			} else {
+				KeStallExecutionProcessor(10000);
+			}
 			spins++;
 			KeAcquireSpinLock(&g_bind_lock, &old);
 			b = iwan_win_proto_lookup_locked(s->oif_index);
