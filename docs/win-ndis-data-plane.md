@@ -174,7 +174,8 @@ powershell -NoProfile -File C:\iwan\vm-mp-disarm.ps1
   | T78 / T79 | 78 = NDIS 调过几次 BindAdapterEx、79 = 其中被我们按介质/MAC 长度拒掉几次（71=0 时：78=0 ⇒ NDIS 没叫过我们；78>0 且 79=78 ⇒ 叫了全拒） |
   | T80 / T81 / T82 | 建会话的三种结局各写一个键：80 = 按 oif_index 查不到可用绑定、81 = 选中瞬间被解绑、82 = 成功（值为选中绑定的 ifindex） |
   | T83 | 建会话时为"打开还在飞"等了几个 10 ms（0 = 没等；200 = 等满 2 秒仍没等到） |
-  | T84 / T85 | 链上前两个绑定在 **netio 口径**下的 ifindex（`BoundIfNetluid` 换算，含 opened/closed 位）。与 T74/T75 的 NDIS 口径并列：两套编号在客体上实测不同（同一张 82574L：miniport `Index=0` vs netio `InterfaceIndex=7`），查表时任一命中即算命中 |
+  | T84 / T85 | 链上前两个绑定按 `BoundIfNetluid`（`NdisIfGetInterfaceIndexFromNetLuid`）换算出的第二个接口索引，含 opened/closed 位。与 T74/T75 的 `BoundIfIndex` 并排读：两者相等说明两套编号一致（问题在别处），不等说明查表口径选错。查表时任一口径命中即算命中 |
+  | T86 | 会话点名要的接口索引（`s->oif_index`，即控制面 `GetBestRoute2` 给的 netio 口径）。必须与 T74/T84 并排读：没有这个键时"查不到"与"索引不一样"在日志里长得一模一样 |
 
   两条不变式（都由 0xD1 换来）：
 

@@ -59,12 +59,13 @@ typedef struct _IWAN_MP_BINDING {
 	volatile LONG		opened;		/* 1=打开成功，可收发 */
 	volatile LONG		closed;		/* 1=已关闭，不可再选作出向承载 */
 	volatile LONG		outstanding;	/* 已发出、未完成的 NBL 数 */
-	/* 同一个承载有两种"接口索引"：NDIS_BIND_PARAMETERS.BoundIfIndex 是
-	 * NDIS 给的口径，用户态（GetBestRoute2 / Get-NetAdapter）用的是
-	 * NET_LUID 换算出来的 netio 口径。二者在客体上实测并不总是同一个数
-	 * （同一张 82574L：miniport Index=0，netio InterfaceIndex=7），所以
-	 * 两个都留着，查表时任一命中即算命中 —— 凭一个口径拒绝建会话，症状
-	 * 是"绑定明明有、OPEN 一律 DEVICE_NOT_READY"，最难查。 */
+	/* 同一个承载可能有两种"接口索引"：NDIS_BIND_PARAMETERS.BoundIfIndex
+	 * 与用户态（GetBestRoute2 的 MIB_IPFORWARD_ROW2.InterfaceIndex）理论上
+	 * 同属 NDIS 接口索引空间，但控制面拿到的那个数没有在客体上被独立验证
+	 * 过，而"绑定明明有、OPEN 一律 DEVICE_NOT_READY"恰恰是最难查的症状。
+	 * 所以这里把 BoundIfNetluid 再换算一次留作第二判据，查表时任一口径
+	 * 命中即算命中；两个数各落一个键（T74/T75 与 T84/T85），一次装机就能
+	 * 看出它们到底是否相同，不用再猜。 */
 	UINT32			ifindex_net;	/* BoundIfNetluid 换算出的 netio 索引 */
 } IWAN_MP_BINDING;
 
@@ -1043,6 +1044,10 @@ iwan_win_mp_select_carrier(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 		return STATUS_DEVICE_NOT_READY;
 	}
 
+	/* T86 = 会话点名要的接口索引。没有这个键，T74/T84 里的绑定索引就没有
+	 * 对照物 —— "查不到"和"索引不一样"在日志里长得一模一样。 */
+	iwan_win_mp_trace(86, (LONG)s->oif_index);
+
 	KeAcquireSpinLock(&g_bind_lock, &old);
 	b = iwan_win_proto_lookup_locked(s->oif_index);
 	KeReleaseSpinLock(&g_bind_lock, old);
@@ -1098,9 +1103,9 @@ iwan_win_mp_select_carrier(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 	iwan_win_mp_trace(77, InterlockedCompareExchange(&g_bind_status, 0, 0));
 	iwan_win_mp_trace(78, InterlockedCompareExchange(&g_bind_calls, 0, 0));
 	iwan_win_mp_trace(79, InterlockedCompareExchange(&g_bind_rejected, 0, 0));
-	/* T84/T85 = 前两个绑定在 netio 口径下的 ifindex（含 opened/closed 位）：
-	 * BoundIfIndex 与用户态 oif_index 是两套编号，客体现成反例
-	 * （miniport Index=0 vs netio InterfaceIndex=7）。 */
+	/* T84/T85 = 前两个绑定按 BoundIfNetluid 换算出的第二个索引（含
+	 * opened/closed 位）。与 T74/T75 的 BoundIfIndex 并排看：两个键相等
+	 * 说明两套编号一致（那就该查别处），不等说明查表口径选错了。 */
 	iwan_win_mp_trace(84, iwan_win_proto_bind_info_net(0));
 	iwan_win_mp_trace(85, iwan_win_proto_bind_info_net(1));
 	if (b == NULL) {
