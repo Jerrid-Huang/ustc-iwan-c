@@ -75,6 +75,11 @@ static volatile LONG	g_open_fail;
  * 返回的错误（T77）。只有次数看不出"为什么打不开"，而这一条决定了改哪里。 */
 static volatile LONG	g_open_status;
 static volatile LONG	g_bind_status;
+/* NDIS 到底给我们调过几次 BindAdapterEx、其中几次因为介质/MAC 长度被拒。
+ * T71 只数"进了表的节点"，分不清"NDIS 没叫我们"与"叫了但被我们拒了"——这
+ * 一条正是客体上一直判不出来的那个岔口。 */
+static volatile LONG	g_bind_calls;
+static volatile LONG	g_bind_rejected;
 
 
 /* 发送在途上下文（IWAN_MP_TX_CTX）定义在 iwan_win.h：入向指示也用它。 */
@@ -783,11 +788,17 @@ iwan_win_proto_bind(_In_ NDIS_HANDLE ProtocolDriverContext,
 	NDIS_STATUS st;
 	KIRQL old;
 
+	InterlockedIncrement(&g_bind_calls);
 	/* 只关心以太承载。别的介质（回环、隧道伪接口等）本平面不管。 */
-	if (BindParameters->MediaType != NdisMedium802_3)
+	if (BindParameters->MediaType != NdisMedium802_3 ||
+	    BindParameters->MacAddressLength != 6) {
+		InterlockedIncrement(&g_bind_rejected);
+		DbgPrint("iwanmp: 拒绝绑定介质 %u / MAC 长度 %u（if%u）\n",
+			 (unsigned)BindParameters->MediaType,
+			 (unsigned)BindParameters->MacAddressLength,
+			 (unsigned)BindParameters->BoundIfIndex);
 		return NDIS_STATUS_NOT_SUPPORTED;
-	if (BindParameters->MacAddressLength != 6)
-		return NDIS_STATUS_NOT_SUPPORTED;
+	}
 
 	b = (IWAN_MP_BINDING *)IWAN_ALLOC(sizeof(*b), IWAN_TAG_PKT);
 	if (b == NULL)
@@ -821,7 +832,15 @@ iwan_win_proto_bind(_In_ NDIS_HANDLE ProtocolDriverContext,
 			       &b->binding);
 	InterlockedExchange(&g_bind_status, (LONG)st);
 	if (st == NDIS_STATUS_SUCCESS) {
+		/* 同步打开成功也要设接收过滤器，而且要在 opened=1 之后：
+		 * open_complete 走的是同一条路（那里有 set_packet_filter），
+		 * 但同步返回时**根本没有 open_complete 回调** —— 曾经只在
+		 * 异步分支设过滤器，于是"绑定在表里、opened=1、一个外层帧都
+		 * 收不到"，症状与会话没绑承载一模一样（rx_outer 恒 0）。
+		 * 打开成功即设，两条路径用同一句，别再分成两份。 */
+		InterlockedIncrement(&g_open_ok);
 		InterlockedExchange(&b->opened, 1);
+		iwan_win_proto_set_packet_filter(b);
 		/* 同步打开成功 ⇒ bind 不返回 PENDING ⇒ 不需要
 		 * NdisCompleteBindAdapterEx，直接回 SUCCESS 即完成绑定。 */
 		return NDIS_STATUS_SUCCESS;
@@ -948,12 +967,19 @@ iwan_win_mp_select_carrier(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 	iwan_win_mp_trace(73, InterlockedCompareExchange(&g_open_fail, 0, 0));
 	iwan_win_mp_trace(74, iwan_win_proto_bind_info(0));
 	iwan_win_mp_trace(75, iwan_win_proto_bind_info(1));
-	/* T76 = open_complete 报的 NTSTATUS 原值、T77 = NdisOpenAdapterEx 当场
-	 * 返回的错误。两者都是 0 而 T74/T75 的 opened 位为 0 ⇒ 打开还在飞
-	 *（PENDING 迟迟不回），而不是失败。 */
+	/* T76 = open_complete 报的 NTSTATUS 原值、T77 = bind 里 NdisOpenAdapterEx
+	 * 当场返回的错误。两者都是 0 而 T74/T75 的 opened 位为 0 ⇒ 打开还在飞
+	 *（PENDING 迟迟不回），而不是失败。T78 = NDIS 调过几次 BindAdapterEx、
+	 * T79 = 其中被我们按介质/MAC 拒掉几次：T71=0 时，78=0 是"NDIS 根本没
+	 * 叫我们"，78>0 而 79=78 是"叫了全拒了"，两条病因的修法完全不同。 */
 	iwan_win_mp_trace(76, InterlockedCompareExchange(&g_open_status, 0, 0));
 	iwan_win_mp_trace(77, InterlockedCompareExchange(&g_bind_status, 0, 0));
+	iwan_win_mp_trace(78, InterlockedCompareExchange(&g_bind_calls, 0, 0));
+	iwan_win_mp_trace(79, InterlockedCompareExchange(&g_bind_rejected, 0, 0));
 	if (b == NULL) {
+		/* 三种结局各留一个键：Stage/Status 只能记最后一次调用，而这里
+		 * 有两条都返回 DEVICE_NOT_READY 的路径，靠 Stage 分辨不出来。 */
+		iwan_win_mp_trace(80, 1);
 		DbgPrint("iwanmp: 接口 %lu 上没有可用的以太承载，拒绝建立\n",
 			 (unsigned long)s->oif_index);
 		return STATUS_DEVICE_NOT_READY;
@@ -966,6 +992,7 @@ iwan_win_mp_select_carrier(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 	 * 起来建立成功却一个字节都出不去。这里在同一个锁内复核一次。 */
 	if (b->opened == 0 || b->closed != 0) {
 		KeReleaseSpinLock(&mp->lock, old);
+		iwan_win_mp_trace(81, 1);
 		DbgPrint("iwanmp: 承载接口 %lu 在选中瞬间被解绑，拒绝建立会话\n",
 			 (unsigned long)s->oif_index);
 		return STATUS_DEVICE_NOT_READY;
@@ -987,6 +1014,7 @@ iwan_win_mp_select_carrier(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 		 (unsigned long)((mp->next_hop_be >> 16) & 0xFFu),
 		 (unsigned long)((mp->next_hop_be >> 8) & 0xFFu),
 		 (unsigned long)(mp->next_hop_be & 0xFFu));
+	iwan_win_mp_trace(82, (LONG)b->ifindex);
 	return STATUS_SUCCESS;
 }
 
@@ -1041,6 +1069,15 @@ iwan_win_proto_init(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 		return STATUS_SUCCESS;
 
 	InterlockedExchange(&g_bind_table_broken, 0);
+	/* 计数器只在"驱动级首次初始化"时清零：注册成功后 NDIS 会陆续回调
+	 * bind，若这些数在别处被重置，T72..T79 就会把"没回调"读成"回调了"。
+	 * 这里与旗子取值在同一段、同一线程，不会再被走到第二次。 */
+	g_open_ok = 0;
+	g_open_fail = 0;
+	g_open_status = 0;
+	g_bind_status = 0;
+	g_bind_calls = 0;
+	g_bind_rejected = 0;
 	InitializeListHead(&g_bindings);
 	KeInitializeSpinLock(&g_bind_lock);
 
