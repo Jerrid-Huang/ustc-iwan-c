@@ -167,13 +167,22 @@ _Success_(return != 0)
 static ULONG
 iwan_win_reg_read_mac(_Out_writes_(6) UINT8 *out)
 {
+	/* 缓冲必须放进结构体里：KEY_VALUE_PARTIAL_INFORMATION 的 Data 是
+	 * UCHAR[1]，结构体自身只容得下 12+1 字节，而内核会把 12+DataLength
+	 * 都写进调用者的缓冲；用裸 UINT8[] 再强转既不安全（边界靠 sizeof
+	 * 撑着）又让分析器认为读的是未初始化内存（C28199）。 */
+	typedef struct {
+		KEY_VALUE_PARTIAL_INFORMATION hdr;
+		UINT8 tail[16];
+	} IWAN_WIN_KV_MAC;
 	UNICODE_STRING path, vn;
 	OBJECT_ATTRIBUTES oa;
 	HANDLE key = NULL;
-	UINT8 buf[32];
+	IWAN_WIN_KV_MAC kv;
 	ULONG len = 0;
 	NTSTATUS st;
 
+	RtlZeroMemory(&kv, sizeof(kv));
 	RtlInitUnicodeString(&path,
 			     L"\\Registry\\Machine\\System\\CurrentControlSet"
 			     L"\\Services\\iwanmp\\Parameters");
@@ -183,19 +192,14 @@ iwan_win_reg_read_mac(_Out_writes_(6) UINT8 *out)
 	if (!NT_SUCCESS(ZwOpenKey(&key, KEY_READ, &oa)))
 		return 0;
 	RtlInitUnicodeString(&vn, L"MpPeerMac");
-	st = ZwQueryValueKey(key, &vn, KeyValuePartialInformation, buf,
-			     sizeof(buf), &len);
+	st = ZwQueryValueKey(key, &vn, KeyValuePartialInformation, &kv,
+			     sizeof(kv), &len);
 	ZwClose(key);
 	if (!NT_SUCCESS(st))
 		return 0;
-	{
-		PKEY_VALUE_PARTIAL_INFORMATION pi =
-			(PKEY_VALUE_PARTIAL_INFORMATION)(PVOID)buf;
-
-		if (pi->Type != REG_BINARY || pi->DataLength != 6)
-			return 0;
-		RtlCopyMemory(out, pi->Data, 6);
-	}
+	if (kv.hdr.Type != REG_BINARY || kv.hdr.DataLength != 6)
+		return 0;
+	RtlCopyMemory(out, kv.hdr.Data, 6);
 	return 6;
 }
 
