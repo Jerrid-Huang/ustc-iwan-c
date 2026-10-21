@@ -161,6 +161,44 @@ iwan_win_ctrl_fini(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 	ExWaitForRundownProtectionRelease(&ext->rundown);
 }
 
+/* 读服务键下的下一跳 MAC 固化值（REG_BINARY 6 字节）。返回 6 = 读到，
+ * 其余 = 未设置/形状不对。只在 IOCTL_SESSION_OPEN（PASSIVE）调用。 */
+_Success_(return != 0)
+static ULONG
+iwan_win_reg_read_mac(_Out_writes_(6) UINT8 *out)
+{
+	UNICODE_STRING path, vn;
+	OBJECT_ATTRIBUTES oa;
+	HANDLE key = NULL;
+	UINT8 buf[32];
+	ULONG len = 0;
+	NTSTATUS st;
+
+	RtlInitUnicodeString(&path,
+			     L"\\Registry\\Machine\\System\\CurrentControlSet"
+			     L"\\Services\\iwanmp\\Parameters");
+	InitializeObjectAttributes(&oa, &path,
+				   OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+				   NULL, NULL);
+	if (!NT_SUCCESS(ZwOpenKey(&key, KEY_READ, &oa)))
+		return 0;
+	RtlInitUnicodeString(&vn, L"MpPeerMac");
+	st = ZwQueryValueKey(key, &vn, KeyValuePartialInformation, buf,
+			     sizeof(buf), &len);
+	ZwClose(key);
+	if (!NT_SUCCESS(st))
+		return 0;
+	{
+		PKEY_VALUE_PARTIAL_INFORMATION pi =
+			(PKEY_VALUE_PARTIAL_INFORMATION)(PVOID)buf;
+
+		if (pi->Type != REG_BINARY || pi->DataLength != 6)
+			return 0;
+		RtlCopyMemory(out, pi->Data, 6);
+	}
+	return 6;
+}
+
 /* ---- 共享内存页（对应 /dev/iwan mmap 的那一页） ----------------------- */
 
 static NTSTATUS
@@ -536,6 +574,20 @@ iwan_win_session_open(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	s->flags = req->flags;
 	s->oif_index = req->oif_index;
 	RtlCopyMemory(s->outer_if_guid, req->outer_if_guid, 16);
+	/* 测试旋钮：Parameters\MpPeerMac（REG_BINARY 6 字节）给死下一跳 MAC。
+	 * 存在理由：某些承载（KM-TEST 回环）根本不回 ARP，而有回包的链路又
+	 * 会把报文送出虚拟网卡，二者都无法在没有邻居的情况下跑通数据面；
+	 * 给死 MAC 才能把"数据面本身能跑多快"与"ARP 能不能解析"解耦。
+	 * 生产路径不设这个键时行为完全不变（照常 ARP）。 */
+	{
+		UINT8 mac[6];
+
+		s->peer_mac_fixed_valid = 0;
+		if (iwan_win_reg_read_mac(mac) == 6) {
+			RtlCopyMemory(s->peer_mac_fixed, mac, 6);
+			s->peer_mac_fixed_valid = 1;
+		}
+	}
 	s->bind_ip = req->bind_ip;
 	RtlCopyMemory(s->bind_ip6, req->bind_ip6, 16);
 	s->carrier_index = req->oif_index;

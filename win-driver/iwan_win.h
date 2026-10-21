@@ -92,6 +92,8 @@ typedef struct _IWAN_WIN_SESSION {
 	UINT32			flags;
 	UINT32			oif_index;
 	UINT8			outer_if_guid[16];	/* 承载网卡接口 GUID（全 0 = 未提供） */
+	UINT8			peer_mac_fixed[6];	/* 测试旋钮：下一跳 MAC 固化 */
+	UINT32			peer_mac_fixed_valid;	/* 0 = 照常发 ARP 解析 */
 	UINT32			bind_ip;
 	UINT8			bind_ip6[16];
 	UINT32			carrier_index;	/* 只读回执：当前实际承载网卡 */

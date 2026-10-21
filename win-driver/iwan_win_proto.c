@@ -567,6 +567,16 @@ iwan_win_proto_fill_eth4(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext, _Inout_ UINT8 *
 	KIRQL old;
 
 	now = iwan_win_now_ms();
+	/* 测试旋钮优先：会话带了固化 MAC 就不再解析邻居，也不需要老化
+	 * （arp_ts_ms 置 0 = 永不过期）。生产路径不带这个键，行为不变。 */
+	if (ext->sess.peer_mac_fixed_valid != 0) {
+		KeAcquireSpinLock(&mp->lock, &old);
+		RtlCopyMemory(mp->peer_mac, ext->sess.peer_mac_fixed, 6);
+		mp->arp_ts_ms = 0;
+		InterlockedExchange(&mp->peer_mac_valid, 1);
+		InterlockedExchange(&mp->peer_mac_pending, 0);
+		KeReleaseSpinLock(&mp->lock, old);
+	}
 	KeAcquireSpinLock(&mp->lock, &old);
 	valid = mp->peer_mac_valid != 0;
 	if (valid && mp->arp_ts_ms != 0 &&
