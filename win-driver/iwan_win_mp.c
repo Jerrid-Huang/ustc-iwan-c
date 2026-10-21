@@ -513,8 +513,20 @@ iwan_win_mp_indicate_inner(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		return FALSE;
 	}
 
+	/* 在途上限（见 IWAN_MP_MAX_INNER_INFLIGHT 的长注释）：先加后判，
+	 * 判不过就地回退，任何时刻计数都等于"已指示且尚未归还"的真实值。
+	 * 计数必须在 IoAllocateMdl 之前立起来 —— 之后每一块池都要靠它被
+	 * Halt 看见。 */
+	if ((ULONG)InterlockedIncrement(&ext->mp.rx_inflight) >
+	    IWAN_MP_MAX_INNER_INFLIGHT) {
+		InterlockedDecrement(&ext->mp.rx_inflight);
+		ExFreePoolWithTag(inner, IWAN_TAG_PKT);
+		return FALSE;
+	}
+
 	mdl = IoAllocateMdl(inner, len, FALSE, FALSE, NULL);
 	if (mdl == NULL) {
+		InterlockedDecrement(&ext->mp.rx_inflight);
 		ExFreePoolWithTag(inner, IWAN_TAG_PKT);
 		return FALSE;
 	}
@@ -536,6 +548,7 @@ iwan_win_mp_indicate_inner(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	if (nbl == NULL) {
 		IoFreeMdl(mdl);
 		ExFreePoolWithTag(inner, IWAN_TAG_PKT);
+		InterlockedDecrement(&ext->mp.rx_inflight);
 		return FALSE;
 	}
 	{
@@ -548,9 +561,8 @@ iwan_win_mp_indicate_inner(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	}
 	nbl->SourceHandle = ext->mp.adapter_handle;
 	nbl->NblFlags |= (ver == 4) ? NDIS_NBL_FLAGS_IS_IPV4 : NDIS_NBL_FLAGS_IS_IPV6;
-	/* 计数在指示之前加：归还只可能发生在指示之后，先加才不会让 Halt 在
-	 * "已经指示上去、计数还是 0"的窗口里把池放掉。 */
-	InterlockedIncrement(&ext->mp.rx_inflight);
+	/* 计数已在入口取定（见上）：这里不再加，否则归还侧只减一次，
+	 * 计数会永久偏大并把 Halt 卡在"永远不归零"的忙等里。 */
 
 	/* 不带 RESOURCES：所有权交给 NDIS，归还时释放缓冲。IRQL 位必须如实
 	 * 上报 —— 本函数从协议边的接收路径调用，通常就在 DISPATCH_LEVEL。 */

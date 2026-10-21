@@ -17,7 +17,7 @@ WFP callout 数据面在客体上实测到的每包成本是它的结构决定�
 | 入向交回内层报文 | `FwpsInjectNetworkReceiveAsync0` 重新入栈 | `NdisMIndicateReceiveNetBufferLists` 指示向上 |
 | 每包协议栈往返 | 2 次（吸收 + 注入 × 两个方向） | 0 次（两侧都是驱动自己的出入口） |
 | 每包池分配 | 出向 2 次 + 入向 3 次 | 出向 2 次（缓冲 + MDL/NBL）+ 入向 2 次 |
-| 在途缓冲 | 有（注入完成前不归还，必须限流） | 出向有上限（`IWAN_MP_MAX_OUTER_INFLIGHT`），入向无 |
+| 在途缓冲 | 有（注入完成前不归还，必须限流） | 出向 `IWAN_MP_MAX_OUTER_INFLIGHT`、入向 `IWAN_MP_MAX_INNER_INFLIGHT`，都 4096 |
 | 内层全量拷贝 | 出向 1 次、入向 2 次 | 出向 1 次、入向 1 次 |
 | 目标匹配 | 必须（用目标集合代替路由判定） | 不需要（只看路由是否指向本适配器） |
 
@@ -198,7 +198,12 @@ powershell -NoProfile -File C:\iwan\vm-mp-disarm.ps1
   客户端控制循环会忽略它们，只是噪声；要彻底消除需要设备通道而不是套接字。
 * `--bind-dev` / `--bind-ip` 未在 Windows 侧接线（两个平面都是）：承载由 FIB 决定。
 * 不引入定时器、DPC、工作项、线程：ARP 重试与老化都用时间戳比对。
-* 入向在途无上限（只有出向有 `IWAN_MP_MAX_OUTER_INFLIGHT`）。
+* 入向与出向都有在途上限（`IWAN_MP_MAX_INNER_INFLIGHT` / `IWAN_MP_MAX_OUTER_INFLIGHT`，
+  都是 4096）。入向曾**没有**上限：每个指示上去的包占内层缓冲 + MDL + 池 NBL，约
+  1.6–2 KB 非分页池，不带 `NDIS_RECEIVE_FLAGS_RESOURCES`，归还只等协议栈回调；发送
+  路径占满 DISPATCH 时归还被饿住，池线性净增长。2026-10-21 的两次整机冻结就是这个
+  机制（承载把外层帧折回本机时入向满速、出向同时占满 DISPATCH）：`tx_pkts=1,638,310`
+  × 1.5–2 KB ≈ 客体物理内存，且来不及写 BugCheck（Kernel-Power 41 + 6008）。
 
 ## 七、验证步骤
 

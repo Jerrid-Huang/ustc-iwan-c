@@ -171,6 +171,16 @@ typedef struct _IWAN_MP_TX_CTX {
  * 的硬挂就是这个机制，同一个坑不踩第二次。 */
 #define IWAN_MP_MAX_OUTER_INFLIGHT 4096u
 
+/* 在途内层指示的上限。出向有闸门而入向原先没有，这是全数据面唯一的无界非
+ * 分页池分配：每个指示上去的包固定占内层缓冲（IWAN_ALLOC）+ IoAllocateMdl +
+ * 池 NBL，约 1.6–2 KB，不带 NDIS_RECEIVE_FLAGS_RESOURCES，所以归还只能等上层
+ * 协议栈回调 MiniportReturnNetBufferLists。发送路径长期占满 DISPATCH 时归还侧
+ * 被饿住，池按入向速率线性净增长，几分钟内耗尽非分页池 —— 表现是整机冻结、
+ * 来不及写 BugCheck（Kernel-Power 41 + 6008），与 WFP 平面的硬挂同族。
+ * 4096 × 2 KB ≈ 8 MB，是"允许排队但不许吃穿内存"的量级；超限丢包并计
+ * rx_nomem（与分配失败同一条外报通道，读侧不必区分）。 */
+#define IWAN_MP_MAX_INNER_INFLIGHT 4096u
+
 typedef struct _IWAN_MP_PLANE {
 	/* 小型端口侧。这两个句柄的**生命周期完全不同**，绝不能共用一个字段：
 	 *   mp_driver_handle：NdisMRegisterMiniportDriver 的输出，从 DriverEntry
