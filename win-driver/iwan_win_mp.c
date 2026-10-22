@@ -508,7 +508,9 @@ iwan_win_mp_indicate_inner(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		return FALSE;
 	}
 	ver = (UINT8)(inner[0] >> 4);
-	if (ver != 4 && ver != 6) {
+	/* 长度闸门按版本给：v4 最短 20、v6 最短 40。短于此的帧交给协议栈只会
+	 * 被它再丢一次，还可能让上层解析越界。 */
+	if ((ver == 4 && len < 20u) || (ver == 6 && len < 40u)) {
 		ExFreePoolWithTag(inner, IWAN_TAG_PKT);
 		return FALSE;
 	}
@@ -561,21 +563,30 @@ iwan_win_mp_indicate_inner(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	}
 	nbl->SourceHandle = ext->mp.adapter_handle;
 	nbl->NblFlags |= (ver == 4) ? NDIS_NBL_FLAGS_IS_IPV4 : NDIS_NBL_FLAGS_IS_IPV6;
+	/* 帧类型必须显式写进 NBL 的 info 槽，且是**网络字节序**（内存里就是
+	 * 08 00 / 86 DD），与 Wintun 的 HTONS(NDIS_ETH_TYPE_IPV4) 同口径。
+	 * 不写的后果：NDIS 在小型端口接收边界按"帧类型不受支持"丢弃 —— pktmon
+	 * 记 DropReason Unsupported EtherType、DropLocation 0xE0001007，归属
+	 * 就是本驱动；现场症状是隧道两头都在通（外层帧一来一回、rx_delivered
+	 * 在涨），内层 ping 却 100% 丢包。 */
+	NET_BUFFER_LIST_INFO(nbl, NetBufferListFrameType) =
+		(PVOID)(ULONG_PTR)((ver == 4) ? 0x0008u : 0xDD86u);
 	/* 计数已在入口取定（见上）：这里不再加，否则归还侧只减一次，
 	 * 计数会永久偏大并把 Halt 卡在"永远不归零"的忙等里。 */
 
 	/* 不带 RESOURCES：所有权交给 NDIS，归还时释放缓冲。IRQL 位必须如实
 	 * 上报 —— 本函数从协议边的接收路径调用，通常就在 DISPATCH_LEVEL。
 	 *
-	 * 这里**不能**带 NDIS_RECEIVE_FLAGS_SINGLE_ETHER_TYPE。该位告诉协议栈
-	 * "这条 NBL 的二层类型有效、按以太网类型解释"，而本适配器的介质是
-	 * NdisMediumIP（裸 IP、没有以太头），我们从没往 NBL 里填过
-	 * NetBufferListFrameType。带上它的后果是 tcpip 把内层 IP 头当成以太头、
-	 * 去读偏移 12 的两字节，于是每个回包都以 "Unsupported EtherType" 被
-	 * 丢掉 —— 现场症状是隧道两头都在通（驱动 rx_delivered 在涨、外层帧
-	 * 一来一回），内层 ping 却 100% 丢包。 */
+	 * SINGLE_ETHER_TYPE 必须带：它和上面写的 NetBufferListFrameType 是一
+	 * 对 —— 该位声明"本次指示的 NBL 共用同一帧类型"，NDIS 才会去 info 槽
+	 * 取类型；两者缺一，NDIS 就在小型端口接收边界以
+	 * "Unsupported EtherType"（DropLocation 0xE0001007）丢弃。
+	 * 介质是 NdisMediumIP（裸 IP、无以太头）并不免除这一步：参考实现
+	 * Wintun 的 TunReceive 也是 NetBufferListFrameType 与
+	 * NDIS_RECEIVE_FLAGS_SINGLE_ETHER_TYPE 两者都填。 */
 	NdisMIndicateReceiveNetBufferLists(ext->mp.adapter_handle, nbl,
 					   NDIS_DEFAULT_PORT_NUMBER, 1,
+					   NDIS_RECEIVE_FLAGS_SINGLE_ETHER_TYPE |
 					   ((KeGetCurrentIrql() == DISPATCH_LEVEL) ?
 					    NDIS_RECEIVE_FLAGS_DISPATCH_LEVEL : 0));
 	/* 从这里起 NBL 归 NDIS：归还请求会走 iwan_win_mp_return_nbls，缓冲与
