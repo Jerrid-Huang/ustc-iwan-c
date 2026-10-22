@@ -1160,8 +1160,11 @@ static int cmd_proxy(int argc, char **argv, int start)
 
 #ifdef _WIN32
     /* wintun.dll missing? ask (interactive) and auto-download the latest
-     * wintun build before open_tun so the first run just works */
-    if (wintun_ensure() != 0) {
+     * wintun build before open_tun so the first run just works。
+     * 内核面不建 TUN 设备（设备与地址都由驱动和 kdp 路径负责），也就不需要
+     * wintun.dll：早先这里无条件要求它，结果是"数据面完全由驱动承担、却因为
+     * 缺一个用户态 DLL 而根本起不来"。 */
+    if (!kernel_plane && wintun_ensure() != 0) {
         slist_free(&routes);
         free_route_opts(&o);
         cleanse_str(o.pass);

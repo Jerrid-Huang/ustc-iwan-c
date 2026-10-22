@@ -327,6 +327,24 @@ int oidc_server_port(const Json *srv, uint16_t *out, double *raw)
  * 一关内核就删；名字被别人的接口占着时 TUNSETIFF 失败，这里按 errno 分类
  * 报错（EBUSY = 名字被占，不再笼统说成 "must be root"），绝不去动别人的
  * 设备。 */
+#if defined(_WIN32)
+/* --data-plane 选定的是哪个内核设备、内层地址挂在哪张适配器上：与
+ * iwan-client 同一套判据（见 src/iwan_client.c 的 win_device_path /
+ * win_inner_dev）。kernel 走 WFP callout 驱动（iwan.sys，设备 \\.\iwan，
+ * 返回 NULL 即用默认），kernel-mp 走 NDIS 微型端口 + 协议驱动
+ * （iwanmp.sys，设备 \\.\iwanmp）。两个返回值必须成对下传：设备名与
+ * 适配器名分属不同平面时，内核面会在错的适配器上配地址。 */
+static const wchar_t *oidc_win_device_path(const char *plane)
+{
+    return data_plane_is_kernel_mp(plane) ? IWAN_WIN_USER_PATH_MP : NULL;
+}
+
+static const char *oidc_win_inner_dev(const char *plane)
+{
+    return data_plane_is_kernel_mp(plane) ? IWAN_WIN_DEF_DEV_MP : NULL;
+}
+#endif
+
 static int oidc_tun_prepare(const Opts *o, struct RelayProxy **rp)
 {
     int fd, e;
@@ -536,7 +554,8 @@ void oidc_connect_server(const Opts *o, const Config *cf)
             bool busy = false;
 
 #if defined(_WIN32)
-            if (!kdp_win_plane_precheck(perr, sizeof(perr), &busy)) {
+            if (!kdp_win_plane_precheck(oidc_win_device_path(plane), perr,
+                                        sizeof(perr), &busy)) {
 #else
             if (!kdp_plane_precheck(perr, sizeof(perr), &busy)) {
 #endif
@@ -648,7 +667,9 @@ void oidc_connect_server(const Opts *o, const Config *cf)
 #elif defined(_WIN32)
             if (kernel_plane)
                 rc = kdp_win_run(fd, sk, res.sid, res.tok,
-                                 res.enc, host, NULL, &routes,
+                                 res.enc, host,
+                                 oidc_win_inner_dev(plane),
+                                 oidc_win_device_path(plane), &routes,
                                  &routes6, res.tun, res.mtu,
                                  &kdp_busy);
             else

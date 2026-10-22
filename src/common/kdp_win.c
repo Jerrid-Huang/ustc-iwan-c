@@ -100,34 +100,94 @@ static bool kdp_win_outer_tuple(int fd, IWAN_WIN_SESSION_OPEN *req,
  * 用它把会话钉在"恰好一张下游网卡"上）。
  * 取不到就退回 1500 / 0 / 0：宁可保守，也不要让驱动按 0 算出荒谬的 MTU，
  * 更不要让它按一个编出来的下一跳去 ARP。 */
+/* 到服务器那一跳的承载路由：给出承载接口 MTU（驱动用它算内层可用 MTU）、
+ * 下一跳地址（驱动用它解析承载网卡的邻居地址）与承载接口索引（NDIS 平面
+ * 用它把会话钉在"恰好一张下游网卡"上）。
+ *
+ * 实现上刻意不用 GetBestRoute2：本机（mingw 交叉编译的客户端，客体 Windows
+ * 11 24H2）上它稳定返回 87 ERROR_INVALID_PARAMETER（同一份代码里
+ * GetIpForwardTable2 与 ConvertInterfaceLuids 都正常），两参数源地址写法都
+ * 一样失败 —— 与其赌结构布局，不如只用一张表自己挑。
+ *
+ * 判据与内核的 FIB 查找同序：**前缀最长者胜**，平手看 metric 最小，再平手
+ * 看接口索引最小。直连路由的 NextHop 是全零，此时对端就在链路上，按驱动的
+ * 约定写 0（表示"对端在链路上"），不要编一个下一跳出来。
+ *
+ * 返回 0 表示"查不到可用承载"，调用方必须让会话建立失败：静默给 0 索引会
+ * 被驱动按"没指定承载"拒掉，但报出来的是 Win32 87，看不出是路由问题。 */
 static uint32_t kdp_win_carrier_route(uint32_t dst_be, uint32_t *hop_be,
                                       uint32_t *oif_out, uint8_t *guid_out)
 {
-    MIB_IPFORWARD_ROW2 route;
+    MIB_IPFORWARD_TABLE2 *ft = NULL;
+    MIB_IPFORWARD_ROW2 *best = NULL;
     MIB_IPINTERFACE_ROW ifrow;
-    SOCKADDR_INET dst;
     NET_LUID luid;
-    DWORD best;
+    ULONG i, best_plen = 0;
+    ULONG best_metric = 0;
+    ULONG mtu = 0;
 
     *hop_be = 0;
     *oif_out = 0;
     memset(guid_out, 0, 16);
 
-    memset(&route, 0, sizeof(route));
-    memset(&dst, 0, sizeof(dst));
-    dst.si_family = AF_INET;
-    dst.Ipv4.sin_addr.s_addr = dst_be;
+    if (GetIpForwardTable2(AF_INET, &ft) != NO_ERROR || ft == NULL)
+        return 0;
 
-    if (GetBestRoute2(NULL, 0, NULL, &dst, 0, &route, NULL) != NO_ERROR)
-        return 1500;
-    luid = route.InterfaceLuid;
-    *oif_out = (uint32_t)route.InterfaceIndex;
+    for (i = 0; i < ft->NumEntries; i++) {
+        MIB_IPFORWARD_ROW2 *r = &ft->Table[i];
+        const uint8_t *pfx;
+        uint8_t d[4];
+        ULONG plen, bit;
+        BOOLEAN hit = TRUE;
+
+        if (r->DestinationPrefix.Prefix.si_family != AF_INET)
+            continue;
+        plen = r->DestinationPrefix.PrefixLength;
+        if (plen > 32)
+            continue;
+        pfx = (const uint8_t *)&r->DestinationPrefix.Prefix.Ipv4.sin_addr;
+        d[0] = (uint8_t)(dst_be >> 24);
+        d[1] = (uint8_t)(dst_be >> 16);
+        d[2] = (uint8_t)(dst_be >> 8);
+        d[3] = (uint8_t)dst_be;
+        for (bit = 0; bit < plen; bit++) {
+            uint8_t mask = (uint8_t)(0x80u >> (bit & 7u));
+
+            if ((pfx[bit >> 3] & mask) != (d[bit >> 3] & mask)) {
+                hit = FALSE;
+                break;
+            }
+        }
+        if (!hit)
+            continue;
+        if (best == NULL || plen > best_plen ||
+            (plen == best_plen && r->Metric < best_metric) ||
+            (plen == best_plen && r->Metric == best_metric &&
+             r->InterfaceIndex < best->InterfaceIndex)) {
+            best = r;
+            best_plen = plen;
+            best_metric = r->Metric;
+        }
+    }
+    if (best == NULL) {
+        FreeMibTable(ft);
+        return 0;
+    }
+    *oif_out = (uint32_t)best->InterfaceIndex;
+    if (best->NextHop.si_family == AF_INET)
+        *hop_be = best->NextHop.Ipv4.sin_addr.s_addr;
+    luid = best->InterfaceLuid;
+    FreeMibTable(ft);
+
+    if (*oif_out == 0)
+        return 0;
+
     /* 接口 GUID 是唯一能跨两种索引口径对上号的东西。客体实测：以太网的
      * netio 索引是 7，而协议驱动绑定回调报的 BoundIfIndex 是 23/26 ——
      * 两套编号并不一致，按索引挑承载等于猜（猜错的症状就是"绑定明明有、
-     * OPEN 一律 DEVICE_NOT_READY"，从计数上完全看不出来）。
-     * 协议边把 NDIS_BIND_PARAMETERS.AdapterName 里的同一个 GUID 解析出来，
-     * 驱动按 GUID 匹配。取不到 GUID 才退回索引口径。 */
+     * OPEN 一律 DEVICE_NOT_READY"，从计数上完全看不出来）。协议边把
+     * NDIS_BIND_PARAMETERS.AdapterName 里的同一个 GUID 解析出来，驱动按
+     * GUID 匹配；取不到 GUID 才退回索引口径。 */
     {
         GUID g;
 
@@ -136,22 +196,15 @@ static uint32_t kdp_win_carrier_route(uint32_t dst_be, uint32_t *hop_be,
             memcpy(guid_out, &g, 16);
     }
 
-    /* 下一跳：直连路由的 NextHop 是全零，此时对端就在链路上，用对端地址
-     * 本身当下一跳（驱动侧的约定：outer_hop == 0 表示"按对端在链路上处理"，
-     * 这里两处都写清楚，免得日后有人以为漏填了）。 */
-    if (route.NextHop.si_family == AF_INET &&
-        route.NextHop.Ipv4.sin_addr.s_addr != 0)
-        *hop_be = route.NextHop.Ipv4.sin_addr.s_addr;
-
     memset(&ifrow, 0, sizeof(ifrow));
     ifrow.Family = AF_INET;
     ifrow.InterfaceLuid = luid;
     if (GetIpInterfaceEntry(&ifrow) != NO_ERROR)
-        return 1500;
-    best = ifrow.NlMtu;
-    if (best < 576 || best > 65535)
-        return 1500;
-    return (uint32_t)best;
+        return 0;
+    mtu = ifrow.NlMtu;
+    if (mtu < 576 || mtu > 65535)
+        return 0;
+    return (uint32_t)mtu;
 }
 
 /* ---- 目标集合 --------------------------------------------------------- */
@@ -373,6 +426,14 @@ int kdp_win_run(int sockfd, const uint8_t xor_key[8], uint16_t sid, uint32_t tok
     req.carrier_mtu = kdp_win_carrier_route(req.outer_dst, &req.outer_hop,
                                             &req.oif_index,
                                             req.outer_if_guid);
+    if (req.carrier_mtu == 0) {
+        /* 查不到承载就等于没有外层出口：NDIS 平面按 oif_index=0 拒会话，
+         * WFP 平面会建立一条发不出包的会话。两种都不许静默发生。 */
+        log_err("Windows 内核数据面: 找不到到 %s 的承载路由（无默认路由？）",
+                server);
+        rc = -1;
+        goto out;
+    }
     req.inner_mtu = auth_mtu;
     memcpy(req.key, xor_key, sizeof(req.key));
     req.sid = sid;

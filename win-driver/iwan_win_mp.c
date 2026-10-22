@@ -565,10 +565,17 @@ iwan_win_mp_indicate_inner(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	 * 计数会永久偏大并把 Halt 卡在"永远不归零"的忙等里。 */
 
 	/* 不带 RESOURCES：所有权交给 NDIS，归还时释放缓冲。IRQL 位必须如实
-	 * 上报 —— 本函数从协议边的接收路径调用，通常就在 DISPATCH_LEVEL。 */
+	 * 上报 —— 本函数从协议边的接收路径调用，通常就在 DISPATCH_LEVEL。
+	 *
+	 * 这里**不能**带 NDIS_RECEIVE_FLAGS_SINGLE_ETHER_TYPE。该位告诉协议栈
+	 * "这条 NBL 的二层类型有效、按以太网类型解释"，而本适配器的介质是
+	 * NdisMediumIP（裸 IP、没有以太头），我们从没往 NBL 里填过
+	 * NetBufferListFrameType。带上它的后果是 tcpip 把内层 IP 头当成以太头、
+	 * 去读偏移 12 的两字节，于是每个回包都以 "Unsupported EtherType" 被
+	 * 丢掉 —— 现场症状是隧道两头都在通（驱动 rx_delivered 在涨、外层帧
+	 * 一来一回），内层 ping 却 100% 丢包。 */
 	NdisMIndicateReceiveNetBufferLists(ext->mp.adapter_handle, nbl,
 					   NDIS_DEFAULT_PORT_NUMBER, 1,
-					   NDIS_RECEIVE_FLAGS_SINGLE_ETHER_TYPE |
 					   ((KeGetCurrentIrql() == DISPATCH_LEVEL) ?
 					    NDIS_RECEIVE_FLAGS_DISPATCH_LEVEL : 0));
 	/* 从这里起 NBL 归 NDIS：归还请求会走 iwan_win_mp_return_nbls，缓冲与

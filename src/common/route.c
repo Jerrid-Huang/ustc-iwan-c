@@ -287,8 +287,19 @@ bool route_iface_up(const char *tun, const char *tun_ip, uint16_t mtu)
     snprintf(mtuarg, sizeof mtuarg, "mtu=%s", mtu_s);
     char *a1[] = { "netsh", "interface", "ipv4", "set", "address", namea,
                    "static", (char *)tun_ip, "255.255.255.0", NULL };
-    if (!netsh_run(a1, "iface up: set address"))
-        return false;
+    if (!netsh_run(a1, "iface up: set address")) {
+        /* 地址已经在这张网卡上时 netsh 报 "The object already exists." 并且
+         * **不生效**（既不改正前缀长度也不改地址属性），于是整个 route_setup
+         * 回滚：会话建好了、驱动也收到了参数，用户态却配不上地址。上一次
+         * 会话异常退出（进程被 kill、网卡被改名）都会留下这种残留，所以先
+         * 摘掉再重设一次 —— 这条路径的语义是"把网卡配成这个样子"，不是
+         * "新增一个地址"。 */
+        char *ad[] = { "netsh", "interface", "ipv4", "delete", "address",
+                       namea, "address", (char *)tun_ip, NULL };
+        (void)netsh_run(ad, "iface up: delete stale address");
+        if (!netsh_run(a1, "iface up: set address (retry)"))
+            return false;
+    }
     /* set subinterface takes "interface=" (unlike set address, which
      * takes "name="); "name=" here is rejected by netsh and silently
      * leaves the MTU at its default (65535 on wintun) */
