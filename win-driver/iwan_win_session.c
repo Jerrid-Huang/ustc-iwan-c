@@ -12,13 +12,9 @@
  */
 #include "iwan_win.h"
 
-/* 封装开销：与 kernel/iwan_genl.h 的 IWAN_OVERHEAD / IWAN_OVERHEAD_V6 一致 */
-#define IWAN_WIN_OVERHEAD_V4		36u
-#define IWAN_WIN_OVERHEAD_V6		56u
-/* 内层 MTU 的上下界：与 kernel 侧 IWAN_MIN_MTU / IWAN_MTU_HARD_MAX* 一致 */
-#define IWAN_WIN_MTU_MIN		68u
-#define IWAN_WIN_MTU_HARD_MAX_V4	65499u
-#define IWAN_WIN_MTU_HARD_MAX_V6	65479u
+/* 封装开销与内层 MTU 上下界：常量已上移到 src/common/iwan_win_abi.h，客户端与
+ * 驱动只需一套定义 —— 两处各写一份的结果是"客户端按 36 算、驱动按 38 校验"，
+ * 最后表现为偶发的会话建立失败或大包黑洞，而不是一眼可见的编译错误。 */
 
 static __inline BOOLEAN
 iwan_win_is_zero16(_In_reads_bytes_(16) const UINT8 *p)

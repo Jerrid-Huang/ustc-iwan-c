@@ -278,6 +278,23 @@ VOID iwan_win_xor(_Inout_updates_bytes_(len) UINT8 *p, _In_ ULONG len,
 VOID iwan_win_inner_fix_csum(_Inout_updates_bytes_(len) UINT8 *pkt, _In_ ULONG len,
 			     _In_ BOOLEAN l4_offloaded);
 
+/* 内层 IPv4 分片：返回需要的分片数，0 表示"不需要分片"（不是 v4、长度不超
+ * mtu、或 mtu 连 8 字节载荷都放不下）。与 Linux 的协议栈分片对齐：超长数据
+ * 报按 mtu 切成 8 字节对齐的片，每片各自封装成一个外层帧。
+ * 返回值 >= 2 时，调用者用 iwan_win_frag4_build(idx=0..count-1) 逐片构造。 */
+ULONG iwan_win_frag4_count(_In_reads_bytes_(len) const UINT8 *pkt, _In_ ULONG len,
+			   _In_ ULONG mtu);
+
+/* 构造第 idx 片（含重算的 IP 头校验和、置 MF/片偏移、清 DF）。out_cap 不够
+ * 或参数非法返回 FALSE。分片必须在修好 L4 校验和之后做——否则每片携带的
+ * L4 校验和都是错的。 */
+_Success_(return != FALSE)
+BOOLEAN iwan_win_frag4_build(_Out_writes_bytes_(out_cap) UINT8 *out,
+			     _In_ ULONG out_cap,
+			     _In_reads_bytes_(len) const UINT8 *pkt, _In_ ULONG len,
+			     _In_ ULONG mtu, _In_ ULONG idx,
+			     _Out_ ULONG *out_len);
+
 /* 目标集合最长前缀匹配（纯函数，便于对拍）。family 用 IWAN_WIN_AF_V4/V6，
  * addr 指向 4 或 16 字节网络序地址。 */
 /* addr 的长度由 family 决定（v4 = 4 字节、v6 = 16 字节）：如实写成 16 会让

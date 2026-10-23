@@ -216,6 +216,65 @@ iwan_win_mp_encap_send(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	return sent ? IWAN_MP_TX_OK : IWAN_MP_TX_DROP;
 }
 
+/*
+ * 出向入口：超长内层报文先按声明的内层 MTU 分片，再逐片封装。
+ *
+ * 与 Linux 对齐的口径：Linux 侧由协议栈在 ndo_start_xmit 之前按设备 MTU 分好片、
+ * 驱动只逐片封装。本平面拦截在小小型端口的发送入口（同样是发之前），所以补上
+ * 这一步。阈值取 s->inner_mtu（= min(服务器协商值, 承载 MTU - 开销)），每片因此
+ * 必然装得进承载，外层仍 DF=1。
+ *
+ * 只要有一片发不出去就整体放弃（半条数据报到不了对端，等价于丢一个报文）；
+ * 已注入的片各自计过 tx_pkts，不需要在这里补账。
+ */
+UINT32
+iwan_win_mp_encap_send_pkt(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
+			   _In_reads_bytes_(len) const UINT8 *inner,
+			   _In_ ULONG len, _In_ BOOLEAN l4_offloaded)
+{
+	IWAN_WIN_SESSION *s = &ext->sess;
+	UINT8 *copy = NULL, *frag = NULL;
+	ULONG mtu, n, i, flen = 0;
+	UINT32 rc;
+
+	/* 没有会话时不要读 inner_mtu：交给封装层去报失败并计数 */
+	if (s->valid == 0)
+		return iwan_win_mp_encap_send(ext, inner, len, l4_offloaded);
+	mtu = s->inner_mtu;
+	n = (mtu > IWAN_WIN_MTU_MIN) ? iwan_win_frag4_count(inner, len, mtu) : 0;
+	if (n == 0)
+		return iwan_win_mp_encap_send(ext, inner, len, l4_offloaded);
+
+	copy = (UINT8 *)IWAN_ALLOC(len, IWAN_TAG_PKT);
+	frag = (UINT8 *)IWAN_ALLOC(mtu, IWAN_TAG_PKT);
+	if (copy == NULL || frag == NULL) {
+		if (copy != NULL)
+			ExFreePoolWithTag(copy, IWAN_TAG_PKT);
+		if (frag != NULL)
+			ExFreePoolWithTag(frag, IWAN_TAG_PKT);
+		IWAN_MP_STAT_INC(ext, tx_err);
+		return IWAN_MP_TX_DROP;
+	}
+	RtlCopyMemory(copy, inner, len);
+	/* L4 校验和必须在切之前修好：只有首片带 L4 头 */
+	iwan_win_inner_fix_csum(copy, len, l4_offloaded);
+
+	rc = IWAN_MP_TX_OK;
+	for (i = 0; i < n; i++) {
+		if (!iwan_win_frag4_build(frag, mtu, copy, len, mtu, i, &flen)) {
+			IWAN_MP_STAT_INC(ext, tx_bad_state);
+			rc = IWAN_MP_TX_DROP;
+			break;
+		}
+		rc = iwan_win_mp_encap_send(ext, frag, flen, FALSE);
+		if (rc != IWAN_MP_TX_OK)
+			break;
+	}
+	ExFreePoolWithTag(frag, IWAN_TAG_PKT);
+	ExFreePoolWithTag(copy, IWAN_TAG_PKT);
+	return rc;
+}
+
 /* ---- 入向：外层帧 → 内层数据报 ---------------------------------------- */
 
 VOID

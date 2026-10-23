@@ -210,6 +210,89 @@ iwan_win_inner_fix_csum(_Inout_updates_bytes_(len) UINT8 *pkt, _In_ ULONG len,
 	}
 }
 
+/*
+ * 内层 IPv4 分片。
+ *
+ * 为什么由驱动分片：拦截点在 OUTBOUND_IPPACKET（IP 层已经组好头、还没分片），
+ * 而 Linux 版是协议栈在 ndo_start_xmit 之前按外层设备 MTU 分好片、驱动只负责
+ * 逐片封装。要"与 Linux 对齐"，就得在驱动里把超长数据报按声明的内层 MTU 切开，
+ * 每片各自封装成一个外层帧 —— 接收侧看到的是一条完整的内层分片流，重组由对端
+ * 的 IP 层做。
+ *
+ * 只处理 v4：v6 的中间节点分片违反 RFC 8200，超长 v6 报文只能靠源端 PMTU
+ * （NDIS 平面有适配器 MTU 可用；WFP 平面无接口可声明，仍是已知缺口）。
+ */
+ULONG
+iwan_win_frag4_count(_In_reads_bytes_(len) const UINT8 *pkt, _In_ ULONG len,
+		     _In_ ULONG mtu)
+{
+	ULONG ihl, chunk, payload;
+
+	if (len < IWAN_OUTER_IP4_LEN || (pkt[0] >> 4) != 4)
+		return 0;
+	ihl = (ULONG)(pkt[0] & 0x0F) * 4;
+	if (ihl < IWAN_OUTER_IP4_LEN || ihl > len || mtu <= ihl)
+		return 0;
+	/* 片偏移以 8 字节为单位：每片的载荷必须是 8 的倍数 */
+	chunk = (mtu - ihl) & ~7UL;
+	if (chunk < 8)
+		return 0;
+	payload = len - ihl;
+	if (payload <= chunk)
+		return 0;		/* 不需要分片 */
+	return (payload + chunk - 1) / chunk;
+}
+
+BOOLEAN
+iwan_win_frag4_build(_Out_writes_bytes_(out_cap) UINT8 *out, _In_ ULONG out_cap,
+		     _In_reads_bytes_(len) const UINT8 *pkt, _In_ ULONG len,
+		     _In_ ULONG mtu, _In_ ULONG idx, _Out_ ULONG *out_len)
+{
+	ULONG ihl, chunk, payload, off, this_len, sum;
+	USHORT fo;
+
+	if (out_len == NULL)
+		return FALSE;
+	*out_len = 0;
+	if (len < IWAN_OUTER_IP4_LEN || (pkt[0] >> 4) != 4)
+		return FALSE;
+	ihl = (ULONG)(pkt[0] & 0x0F) * 4;
+	if (ihl < IWAN_OUTER_IP4_LEN || ihl > len || mtu <= ihl)
+		return FALSE;
+	chunk = (mtu - ihl) & ~7UL;
+	if (chunk < 8)
+		return FALSE;
+	payload = len - ihl;
+	/* 片偏移字段只有 13 位：超过 8191 片就是畸形输入，不做乘法溢出兜底 */
+	if (idx >= 0x2000UL)
+		return FALSE;
+	off = idx * chunk;
+	if (off >= payload)
+		return FALSE;
+	this_len = payload - off;
+	if (this_len > chunk)
+		this_len = chunk;
+	if (ihl + this_len > out_cap)
+		return FALSE;
+
+	RtlCopyMemory(out, pkt, ihl);
+	RtlCopyMemory(out + ihl, pkt + ihl + off, this_len);
+	iwan_win_wr16(out + 2, (UINT16)(ihl + this_len));
+	/* MF + 13 位片偏移。DF 必须清掉：源端置了 DF 的大包要由本函数代劳分片，
+	 * 保留 DF 会让接收侧把中间片当非法（v4 规范里 DF 只该由源端设置）。 */
+	fo = (USHORT)((off / 8) & 0x1FFF);
+	if (off + this_len < payload)
+		fo |= 0x2000;
+	iwan_win_wr16(out + 6, fo);
+	/* 每片都是独立的 IP 报文：头校验和必须重算（载荷不参与） */
+	out[10] = 0;
+	out[11] = 0;
+	sum = iwan_win_csum_add(0, out, ihl, 0);
+	iwan_win_wr16(out + 10, (USHORT)iwan_win_csum_finish(sum));
+	*out_len = ihl + this_len;
+	return TRUE;
+}
+
 BOOLEAN
 iwan_win_target_match(_In_reads_(count) const IWAN_WIN_TARGET *targets,
 		      _In_ UINT32 count, _In_ UINT32 family,

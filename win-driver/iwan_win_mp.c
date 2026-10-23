@@ -452,7 +452,7 @@ iwan_win_mp_send_nbls(_In_ NDIS_HANDLE MiniportAdapterContext,
 			 * 而且白白多走一遍 MDL 链 —— 这里取一次就够。 */
 			p = (const UINT8 *)NdisGetDataBuffer(nb, len, NULL, 1, 0);
 			if (p != NULL) {
-				tx = iwan_win_mp_encap_send(ext, p, len, l4_offloaded);
+				tx = iwan_win_mp_encap_send_pkt(ext, p, len, l4_offloaded);
 			} else {
 				UINT8 *tmp = (UINT8 *)IWAN_ALLOC(len, IWAN_TAG_PKT);
 
@@ -463,8 +463,9 @@ iwan_win_mp_send_nbls(_In_ NDIS_HANDLE MiniportAdapterContext,
 					p = (const UINT8 *)NdisGetDataBuffer(nb, len,
 									     tmp, 1, 0);
 					tx = (p != NULL) ?
-					     iwan_win_mp_encap_send(ext, p, len,
-								    l4_offloaded) :
+					     iwan_win_mp_encap_send_pkt(ext, p,
+									len,
+									l4_offloaded) :
 					     IWAN_MP_TX_FAIL;
 					ExFreePoolWithTag(tmp, IWAN_TAG_PKT);
 				}

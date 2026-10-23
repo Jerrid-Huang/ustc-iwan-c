@@ -335,6 +335,79 @@ iwan_win_nbl_from_self(_In_ HANDLE handle, _In_ const NET_BUFFER_LIST *nbl)
 	       st == FWPS_PACKET_PREVIOUSLY_INJECTED_BY_SELF;
 }
 
+/*
+ * 出向入口：超长内层报文先按声明的内层 MTU 分片，再逐片封装。
+ *
+ * 口径与 Linux 对齐：Linux 侧是协议栈在 ndo_start_xmit 之前按外层设备 MTU 分好
+ * 片、驱动只逐片封装；我们在 OUTBOUND_IPPACKET 拦截（那时还没分片），所以要
+ * 自己补这一步。分片阈值取声明的内层 MTU（= min(服务器协商值, 承载 MTU - 开销)），
+ * 因此每一片必然装得进承载，外层仍然 DF=1、永不分片。
+ *
+ * frames/bytes 回填"真正注入了几个外层帧、多少外层字节"：计数器必须按帧记，
+ * 按原始报文记会让 tx_pkts 在分片场景下与网卡计数对不上。
+ */
+static NTSTATUS
+iwan_win_encap_send_pkt(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
+			_In_reads_bytes_(len) const UINT8 *inner,
+			_In_ ULONG len, _In_ BOOLEAN l4_offloaded,
+			_In_ UINT16 compartment, _In_ BOOLEAN outer_v6,
+			_Out_ ULONG *frames, _Out_ ULONG *bytes)
+{
+	IWAN_WIN_SESSION *s = &ext->sess;
+	UINT8 *copy = NULL, *frag = NULL;
+	ULONG mtu = s->inner_mtu;
+	ULONG n, i, flen = 0;
+	NTSTATUS st;
+
+	*frames = 1;
+	*bytes = len + (outer_v6 ? IWAN_OUTER6_TOTAL : IWAN_OUTER4_TOTAL);
+	if (outer_v6)
+		return iwan_win_encap_inject(ext, inner, len, l4_offloaded,
+					     compartment, TRUE);
+
+	n = (mtu > IWAN_WIN_MTU_MIN) ? iwan_win_frag4_count(inner, len, mtu) : 0;
+	if (n == 0)
+		return iwan_win_encap_inject(ext, inner, len, l4_offloaded,
+					     compartment, FALSE);
+
+	copy = (UINT8 *)IWAN_ALLOC(len, IWAN_TAG_PKT);
+	frag = (UINT8 *)IWAN_ALLOC(mtu, IWAN_TAG_PKT);
+	if (copy == NULL || frag == NULL) {
+		if (copy != NULL)
+			ExFreePoolWithTag(copy, IWAN_TAG_PKT);
+		if (frag != NULL)
+			ExFreePoolWithTag(frag, IWAN_TAG_PKT);
+		*frames = 0;
+		*bytes = 0;
+		IWAN_STAT_INC(ext, tx_bad_state);
+		return STATUS_INSUFFICIENT_RESOURCES;
+	}
+	RtlCopyMemory(copy, inner, len);
+	/* L4 校验和必须在切之前修好：只有首片带 L4 头，切完再逐片修是不可能的。
+	 * 修好之后每片都按"校验和已正确"封装（l4_offloaded = FALSE）。 */
+	iwan_win_inner_fix_csum(copy, len, l4_offloaded);
+
+	st = STATUS_SUCCESS;
+	*frames = 0;
+	*bytes = 0;
+	for (i = 0; i < n; i++) {
+		if (!iwan_win_frag4_build(frag, mtu, copy, len, mtu, i, &flen)) {
+			IWAN_STAT_INC(ext, tx_bad_state);
+			st = STATUS_INVALID_BUFFER_SIZE;
+			break;
+		}
+		st = iwan_win_encap_inject(ext, frag, flen, FALSE, compartment,
+					   FALSE);
+		if (!NT_SUCCESS(st))
+			break;
+		(*frames)++;
+		*bytes += flen + IWAN_OUTER4_TOTAL;
+	}
+	ExFreePoolWithTag(frag, IWAN_TAG_PKT);
+	ExFreePoolWithTag(copy, IWAN_TAG_PKT);
+	return st;
+}
+
 static VOID NTAPI
 iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 		       _In_ const FWPS_INCOMING_METADATA_VALUES *inMetaValues,
@@ -446,10 +519,11 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 			all_hit = FALSE;
 			break;
 		}
-		/* 装不下就丢（fail-closed）：绝不透传明文，也不让网卡去分。
-		 * Linux 参考实现遇到 GSO/巨帧同样是丢（记 tx_bad_state），
-		 * 不做软件分段 —— 这里保持两侧一致，不实现 M1.1 的软件切分。 */
-		if (tot + IWAN_OUTER4_TOTAL > s->carrier_mtu) {
+		/* 超长不再直接丢：v4 交给分片层（与 Linux 协议栈在 ndo_start_xmit
+		 * 之前按设备 MTU 分片同口径）。只有在"连 8 字节片载荷都放不下"
+		 * 的畸形阈值下才 fail-closed —— 绝不透传明文，也不让网卡去分。 */
+		if (tot + IWAN_OUTER4_TOTAL > s->carrier_mtu &&
+		    iwan_win_frag4_count(pkt, tot, s->inner_mtu) == 0) {
 			iwan_win_diag_tx(s, IWAN_WIN_DIAG_TX_MTU, len, tot, pkt[0], pkt);
 			IWAN_STAT_INC(ext, tx_bad_state);
 			classifyOut->actionType = FWP_ACTION_BLOCK;
@@ -468,7 +542,7 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 		UINT8 hdr[IWAN_OUTER_IP4_LEN];
 		UINT8 *stor = NULL;
 		UINT8 *pkt;
-		ULONG nblen, tot;
+		ULONG nblen, tot, frames, fbytes;
 
 		nblen = NET_BUFFER_DATA_LENGTH(nb);
 		/* 判定只需要前 20 字节连续，封装却需要**整包**连续：大包一跨 MDL，
@@ -515,8 +589,9 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 		if (ci.Transmit.TcpChecksum || ci.Transmit.UdpChecksum)
 			l4_offloaded = TRUE;
 
-		st = iwan_win_encap_inject(ext, pkt, tot, l4_offloaded, compartment,
-					   iwan_win_session_is_v6(s));
+		st = iwan_win_encap_send_pkt(ext, pkt, tot, l4_offloaded, compartment,
+					     iwan_win_session_is_v6(s),
+					     &frames, &fbytes);
 		if (stor != NULL) {
 			/* 封装层已整块拷走，这里即用即还 */
 			ExFreePoolWithTag(stor, IWAN_TAG_PKT);
@@ -538,11 +613,12 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 			classifyOut->flags |= FWPS_CLASSIFY_OUT_FLAG_ABSORB;
 			goto done;
 		}
-		IWAN_STAT_INC(ext, tx_pkts);
+		/* 按帧记账：一个内层报文被分成 N 片时，网卡上看到的是 N 个外层
+		 * 帧，tx_pkts/tx_bytes 必须与它逐帧对得上。 */
+		IWAN_STAT_ADD(ext, tx_pkts, (LONG64)frames);
 		/* tx_bytes 记的是送出承载网卡的外层字节（含封装开销），
 		 * 便于与网卡计数直接对照 —— 与 Linux 侧口径注释一致。 */
-		InterlockedAdd64((volatile LONG64 *)&s->stats.tx_bytes,
-				 (LONG64)(tot + IWAN_OUTER4_TOTAL));
+		IWAN_STAT_ADD(ext, tx_bytes, (LONG64)fbytes);
 	}
 
 	/* 全部封装完成：吸收原报文，让它不再走正常出向路径 */

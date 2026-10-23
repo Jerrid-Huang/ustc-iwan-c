@@ -81,6 +81,18 @@ typedef unsigned long long uint64_t;
  * 用户态读取代码吃两边的页，所以版本号必须一起动） */
 #define IWAN_WIN_SHM_VERSION      1u
 
+/* 封装开销与内层 MTU 边界（客户端与驱动共用一套，避免两边算出的值分叉）：
+ *   外层 IPv4 = 20 + 8(UDP) + 8(帧头) = 36
+ *   外层 IPv6 = 40 + 8(UDP) + 8(帧头) = 56
+ * 内层 MTU 的声明值是 min(服务器协商值, 承载网卡 MTU - 开销)：承载 MTU 是
+ * 网卡给的硬上限，协商值是服务端愿意收的大小，只有取小者才既封得下又不会
+ * 被对端丢。 */
+#define IWAN_WIN_OVERHEAD_V4      36u
+#define IWAN_WIN_OVERHEAD_V6      56u
+#define IWAN_WIN_MTU_MIN          68u
+#define IWAN_WIN_MTU_HARD_MAX_V4  65499u
+#define IWAN_WIN_MTU_HARD_MAX_V6  65479u
+
 /* ---- 设备名（裸模式不需要） ------------------------------------------- */
 
 #if !defined(IWAN_WIN_ABI_BARE)

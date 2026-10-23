@@ -440,6 +440,12 @@ VOID iwan_win_mp_release_carrier(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext);
 #define IWAN_MP_TX_DROP 1u	/* 主动丢弃，对协议栈报成功 */
 #define IWAN_MP_TX_FAIL 2u	/* 报文不合法，对协议栈报失败 */
 
+/* 分片入口：超长 v4 报文按声明的内层 MTU 切片后逐片封装（Linux 侧由协议栈
+ * 分片，这里由驱动代劳）。返回值语义与 iwan_win_mp_encap_send 相同。 */
+UINT32 iwan_win_mp_encap_send_pkt(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
+				  _In_reads_bytes_(len) const UINT8 *inner,
+				  _In_ ULONG len, _In_ BOOLEAN l4_offloaded);
+
 UINT32 iwan_win_mp_encap_send(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 			       _In_reads_bytes_(len) const UINT8 *inner,
 			       _In_ ULONG len, _In_ BOOLEAN l4_offloaded);

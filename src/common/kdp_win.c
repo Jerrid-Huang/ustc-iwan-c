@@ -434,7 +434,35 @@ int kdp_win_run(int sockfd, const uint8_t xor_key[8], uint16_t sid, uint32_t tok
         rc = -1;
         goto out;
     }
-    req.inner_mtu = auth_mtu;
+    {
+        /* 内层 MTU = min(服务器协商值, 承载网卡 MTU - 封装开销)。承载 MTU 是
+         * 硬上限（封不下就一个字节都发不出去），协商值是服务端的接收能力；
+         * 只信协商值会在承载小于 1500 的链路上封出超长外层帧，只信网卡会在
+         * 服务端更保守时被对端丢。声明给驱动的值、netsh 写进适配器的值必须是
+         * 同一个 —— 否则就是"上层以为能发、驱动静默丢"的 PMTU 黑洞。 */
+        uint32_t overhead = (req.outer_dst != 0) ? IWAN_WIN_OVERHEAD_V4
+                                                 : IWAN_WIN_OVERHEAD_V6;
+        uint32_t cap, mtu;
+
+        if (req.carrier_mtu <= overhead + IWAN_WIN_MTU_MIN) {
+            log_err("Windows 内核数据面: 承载 MTU %u 装不下隧道"
+                    "（封装开销 %u，内层最少 %u）",
+                    (unsigned)req.carrier_mtu, (unsigned)overhead,
+                    (unsigned)IWAN_WIN_MTU_MIN);
+            rc = -1;
+            goto out;
+        }
+        cap = req.carrier_mtu - overhead;
+        mtu = (auth_mtu == 0 || (uint32_t)auth_mtu > cap) ? cap
+                                                         : (uint32_t)auth_mtu;
+        req.inner_mtu = (uint16_t)mtu;
+        if (mtu != (uint32_t)auth_mtu)
+            log_info("Windows 内核数据面: 内层 MTU 由 %u 下调到 %u"
+                     "（承载 MTU %u，封装开销 %u）",
+                     (unsigned)auth_mtu, (unsigned)mtu,
+                     (unsigned)req.carrier_mtu, (unsigned)overhead);
+        auth_mtu = (uint16_t)mtu;
+    }
     memcpy(req.key, xor_key, sizeof(req.key));
     req.sid = sid;
     req.tok = tok;

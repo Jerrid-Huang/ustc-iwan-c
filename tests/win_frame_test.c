@@ -1179,6 +1179,125 @@ test_wire_harness_golden(void)
 	      IWAN_WIN_FRAME_BAD, "令牌不匹配的帧必须判为 BAD");
 }
 
+/* ---- 16. 内层 IPv4 分片：与 Linux 协议栈分片对齐 ----------------------- */
+
+static uint16_t
+mk_pkt4(uint8_t *pkt, size_t len, uint8_t ihl_words, uint16_t frag_off)
+{
+	size_t ihl = (size_t)ihl_words * 4;
+	size_t i;
+
+	memset(pkt, 0, len);
+	pkt[0] = (uint8_t)(0x40 | ihl_words);
+	pkt[2] = (uint8_t)(len >> 8);
+	pkt[3] = (uint8_t)len;
+	pkt[4] = 0x12;
+	pkt[5] = 0x34;
+	pkt[6] = (uint8_t)(frag_off >> 8);
+	pkt[7] = (uint8_t)frag_off;
+	pkt[8] = 64;
+	pkt[9] = 17;
+	pkt[12] = 10;
+	pkt[15] = 1;
+	pkt[16] = 10;
+	pkt[19] = 2;
+	for (i = ihl; i < len; i++)
+		pkt[i] = (uint8_t)(i * 7u + 3u);
+	return (uint16_t)ihl;
+}
+
+static void
+test_frag4(void)
+{
+	uint8_t pkt[3000], frag[3000], joined[3000];
+	ULONG out_len, n, i, off, total;
+	uint16_t ihl;
+	int ok;
+
+	/* 短报文不分片 */
+	ihl = mk_pkt4(pkt, 1200, 5, 0);
+	CHECK(iwan_win_frag4_count(pkt, 1200, 1380) == 0,
+	      "1200 字节装得进 1380，不该分片（ihl=%u）", (unsigned)ihl);
+	CHECK(iwan_win_frag4_build(frag, sizeof(frag), pkt, 1200, 1380, 0,
+				   &out_len) == TRUE &&
+	      out_len == 1200, "不分片时 idx=0 也应能原样构造");
+	/* build 总会重算头校验和并规范 flags/offset（合成样本的校验和原本是 0），
+	 * 所以"不分片"只保证载荷逐字节相同、头变得自洽。 */
+	CHECK(memcmp(frag + 20, pkt + 20, 1180) == 0,
+	      "不分片时载荷必须逐字节相同");
+	CHECK(sum16(frag, 20) == 0xFFFF, "不分片时头校验和也必须自洽");
+
+	/* 3000 字节 / mtu 1380：载荷 2980，片载荷 1360 ⇒ 3 片 */
+	ihl = mk_pkt4(pkt, 3000, 5, 0);
+	n = iwan_win_frag4_count(pkt, 3000, 1380);
+	CHECK(n == 3, "3000/mtu1380 应为 3 片（实得 %u）", (unsigned)n);
+
+	total = 0;
+	for (i = 0; i < n; i++) {
+		uint32_t want;
+		uint16_t fo;
+
+		ok = iwan_win_frag4_build(frag, sizeof(frag), pkt, 3000, 1380,
+					  i, &out_len);
+		CHECK(ok == TRUE, "第 %u 片构造失败", (unsigned)i);
+		if (!ok)
+			return;
+		off = i * 1360u;
+		want = (2980u - off > 1360u) ? 1380u : (20u + (2980u - off));
+		CHECK(out_len == want, "第 %u 片长度应为 %u（实得 %u）",
+		      (unsigned)i, (unsigned)want, (unsigned)out_len);
+		CHECK(sum16(frag, 20) == 0xFFFF,
+		      "第 %u 片的 IP 头校验和无效（sum=%04x）", (unsigned)i,
+		      (unsigned)sum16(frag, 20));
+		fo = iwan_win_rd16(frag + 6);
+		CHECK((fo & 0x4000) == 0, "第 %u 片的 DF 必须清掉", (unsigned)i);
+		CHECK((fo & 0x1FFF) == (off / 8),
+		      "第 %u 片的偏移字段应为 %u（实得 %u）", (unsigned)i,
+		      (unsigned)(off / 8), (unsigned)(fo & 0x1FFF));
+		CHECK(((fo & 0x2000) != 0) == (off + 1360u < 2980u),
+		      "第 %u 片的 MF 与是否还有后续不一致", (unsigned)i);
+		CHECK(iwan_win_rd16(frag + 2) == out_len,
+		      "第 %u 片的 IP 总长字段与实际长度不一致", (unsigned)i);
+		memcpy(joined + total, frag + 20, out_len - 20);
+		total += out_len - 20;
+	}
+	CHECK(total == 2980, "分片载荷累计应为 2980（实得 %u）", (unsigned)total);
+	CHECK(memcmp(joined, pkt + 20, 2980) == 0,
+	      "分片载荷拼回去必须与原报文逐字节相同");
+
+	/* 边界与非法输入 */
+	CHECK(iwan_win_frag4_count(pkt, 3000, 24) == 0,
+	      "mtu=24 连 8 字节载荷都放不下，应拒绝分片");
+	pkt[0] = 0x65;
+	CHECK(iwan_win_frag4_count(pkt, 3000, 1380) == 0, "非 v4 不分片");
+	pkt[0] = 0x45;
+	CHECK(iwan_win_frag4_build(frag, sizeof(frag), pkt, 3000, 1380, 3,
+				   &out_len) == FALSE, "越界片号必须拒绝");
+	CHECK(iwan_win_frag4_build(frag, 40, pkt, 3000, 1380, 0, &out_len) ==
+	      FALSE, "缓冲不足必须拒绝");
+
+	/* ihl=24（带选项）：片载荷必须是 8 的倍数 ⇒ (1380-24)&~7 = 1352 */
+	ihl = mk_pkt4(pkt, 1400, 6, 0);
+	CHECK(ihl == 24, "构造的 ihl 应为 24");
+	n = iwan_win_frag4_count(pkt, 1400, 1380);
+	CHECK(n == 2, "ihl=24、1400 字节应为 2 片（实得 %u）", (unsigned)n);
+	ok = iwan_win_frag4_build(frag, sizeof(frag), pkt, 1400, 1380, 0,
+				  &out_len);
+	CHECK(ok == TRUE && out_len == 24 + 1352,
+	      "ihl=24 的首片长度应为 1376（实得 %u）", (unsigned)out_len);
+	CHECK(sum16(frag, 24) == 0xFFFF, "ihl=24 的首片校验和无效");
+
+	/* 源端置了 DF 的大包：驱动代劳分片后 DF 必须清掉，否则接收侧拒中间片 */
+	mk_pkt4(pkt, 2000, 5, 0x4000);
+	CHECK((iwan_win_rd16(pkt + 6) & 0x4000) != 0, "构造样本应带 DF");
+	ok = iwan_win_frag4_build(frag, sizeof(frag), pkt, 2000, 1380, 0,
+				  &out_len);
+	CHECK(ok == TRUE, "带 DF 的大包也应当能分片");
+	CHECK((iwan_win_rd16(frag + 6) & 0x4000) == 0, "分片后必须清掉 DF");
+	CHECK((iwan_win_rd16(frag + 6) & 0x2000) != 0, "首片必须置 MF");
+	CHECK(iwan_win_rd16(frag + 4) == 0x1234, "IP ID 必须保留");
+}
+
 int
 main(void)
 {
@@ -1186,6 +1305,7 @@ main(void)
 	test_xor();
 	test_csum();
 	test_inner_fix_csum_keeps_addrs();
+	test_frag4();
 	test_targets();
 	test_wire_constants();
 	test_inbound();
