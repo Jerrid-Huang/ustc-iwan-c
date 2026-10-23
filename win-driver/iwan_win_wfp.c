@@ -629,10 +629,16 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 		if (!all_hit) {
 			/* 混链：这一包不是本会话的就丢掉（整链已被吸收）。
 			 * 计数落在 ev_dropped，别借用 tx_*：那些是隧道自己的
-			 * 收发账，混进来就再也对不上网卡计数。 */
+			 * 收发账，混进来就再也对不上网卡计数。
+			 * od 在这里现填：第一遍遇到不合法报文会提前跳出，那时 od
+			 * 可能还没写过（C6001）；stor 也必须先归还，continue 会跳过
+			 * 循环末尾那次释放（C6014，真实泄漏）。 */
+			iwan_win_wr32(od, s->outer_dst);
 			if (!iwan_win_should_tunnel4(s->targets, s->target_count,
 						     od, pkt + 16)) {
 				IWAN_STAT_INC(ext, ev_dropped);
+				if (stor != NULL)
+					ExFreePoolWithTag(stor, IWAN_TAG_PKT);
 				continue;
 			}
 		}

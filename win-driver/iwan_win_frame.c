@@ -327,6 +327,11 @@ iwan_win_frag_input(_Inout_ IWAN_WIN_FRAG_SLOT *slots,
 	if (slots == NULL || nslots == 0 || pkt == NULL ||
 	    out_idx == NULL || out_len == NULL)
 		return IWAN_WIN_FRAG_DROP;
+	/* 两个 _Out_ 参数在所有返回路径上都必须有确定值：调用方拿到 DROP 时也会
+	 * 读它们（有的把它当诊断），留未初始化就是 UB，静态分析 C6101 抓的正是
+	 * 这个。 */
+	*out_idx = 0;
+	*out_len = 0;
 	/* 不是 IPv4 或头部都不完整：不是分片，交给普通路径去判 */
 	if (len < IWAN_OUTER_IP4_LEN || (pkt[0] >> 4) != 4)
 		return IWAN_WIN_FRAG_PASS;
