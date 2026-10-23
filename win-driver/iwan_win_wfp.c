@@ -106,19 +106,16 @@ iwan_win_inject_complete(_In_ VOID *context, _Inout_ NET_BUFFER_LIST *nbl,
 	IWAN_INJECT_CTX *ctx = (IWAN_INJECT_CTX *)context;
 
 	UNREFERENCED_PARAMETER(dispatch_level);
-	/* 临时诊断：入向注入"排队成功"不等于"上栈成功"，完成回调里的
-	 * NET_BUFFER_LIST_STATUS 才是 WFP 的最终裁决。成功/失败各占一个
-	 * 空闲计数器，失败时把状态码原值累加进 rx_reasm（同码多次 -> 可除）。 */
+	/* "排队成功"不等于"送出去成功"：完成回调里的 NET_BUFFER_LIST_STATUS
+	 * 才是 WFP 的最终裁决。失败必须落到一个名字对得上的计数器上
+	 * （tx_err = 封装/注入失败），不能借用入向的 rx_* —— 借来的计数器会让
+	 * 两个平面共用同一份 STATS 时读数没法解释。 */
 	if (ctx != NULL && ctx->ext != NULL) {
 		ULONG ist = nbl != NULL ? NET_BUFFER_LIST_STATUS(nbl)
 					: (ULONG)0xC0000001L;
 
-		if (ist == STATUS_SUCCESS)
-			IWAN_STAT_INC(ctx->ext, rx_batch_skip);
-		else {
-			IWAN_STAT_INC(ctx->ext, rx_batch);
-			IWAN_STAT_ADD(ctx->ext, rx_reasm, (LONG64)ist);
-		}
+		if (ist != STATUS_SUCCESS)
+			IWAN_STAT_INC(ctx->ext, tx_err);
 	}
 	if (nbl != NULL)
 		FwpsFreeNetBufferList(nbl);

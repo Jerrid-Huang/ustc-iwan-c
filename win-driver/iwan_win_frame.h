@@ -295,6 +295,47 @@ BOOLEAN iwan_win_frag4_build(_Out_writes_bytes_(out_cap) UINT8 *out,
 			     _In_ ULONG mtu, _In_ ULONG idx,
 			     _Out_ ULONG *out_len);
 
+/* ---- 外层分片重组（MP 平面；WFP 平面由 tcpip 的 ip_defrag 代劳） ------ */
+
+/* 同时在拼的报文数上限。这不是吞吐参数，是"一个对端同时能有多少个未拼齐的
+ * 数据报"的上限：正常对端（我们两端都是）外层固定 DF=1，根本不会走到这里，
+ * 所以宁可小。 */
+#define IWAN_WIN_FRAG_SLOTS	4u
+
+/* 单个报文可拼的上限（含外层 UDP 头）。外层数据报本来不会超过承载 MTU，
+ * 这里给 9 KB 是给"对端把外层 DF 关掉"这种非常规配置留的余量；超了直接丢，
+ * 不做无界增长（历史上非分页池被灌满直接把整机挂死过）。 */
+#define IWAN_WIN_FRAG_BUF_SIZE	9216u
+
+/* 一片分片拼到什么程度。used/total/have 之外全是内部状态，调用方不要碰。 */
+typedef struct _IWAN_WIN_FRAG_SLOT {
+	BOOLEAN	used;		/* 这个槽正在拼一个数据报 */
+	UINT32	src;		/* 外层源地址，大端原始字节 */
+	UINT32	dst;		/* 外层目的地址 */
+	UINT16	id;		/* 外层 IPv4 标识 */
+	UINT32	start_ms;	/* 首片到达时刻，用于过期回收 */
+	UINT32	total;		/* 末片到达前为 0 */
+	UINT32	end;		/* 已收到的最高字节偏移（判"总长是否与已收内容矛盾"） */
+	UINT32	have;		/* 已收到的 8 字节块数 */
+	UINT8	buf[IWAN_WIN_FRAG_BUF_SIZE];
+	UINT8	bits[IWAN_WIN_FRAG_BUF_SIZE / 64u];	/* 块位图 */
+} IWAN_WIN_FRAG_SLOT;
+
+/* 结果码：PASS 表示"这不是分片"，调用方按普通报文继续处理。 */
+#define IWAN_WIN_FRAG_PASS	0
+#define IWAN_WIN_FRAG_STORED	1	/* 收下了，还没拼齐 */
+#define IWAN_WIN_FRAG_DONE	2	/* 拼齐：完整数据报在 slot->buf[0..out_len) */
+#define IWAN_WIN_FRAG_DROP	3	/* 拼不成：无空槽/超上限/长度矛盾 */
+
+/* 喂一片分片。out_idx 在 STORED/DONE 时给出槽号；DONE 的语义是"内容已经就绪，
+ * 但槽仍归调用方所有"——调用方解析完必须把 slots[*out_idx].used 置 FALSE，
+ * 否则这个槽永不回收（这是刻意的：重组逻辑不替调用方决定什么时候用完）。 */
+int iwan_win_frag_input(_Inout_ IWAN_WIN_FRAG_SLOT *slots,
+			_In_ ULONG nslots,
+			_In_reads_bytes_(len) const UINT8 *pkt, _In_ ULONG len,
+			_In_ ULONG now_ms, _In_ ULONG ttl_ms,
+			_Out_ ULONG *out_idx, _Out_ ULONG *out_len);
+
 /* 目标集合最长前缀匹配（纯函数，便于对拍）。family 用 IWAN_WIN_AF_V4/V6，
  * addr 指向 4 或 16 字节网络序地址。 */
 /* addr 的长度由 family 决定（v4 = 4 字节、v6 = 16 字节）：如实写成 16 会让

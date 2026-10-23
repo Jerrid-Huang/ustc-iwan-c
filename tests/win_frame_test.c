@@ -1298,6 +1298,143 @@ test_frag4(void)
 	CHECK(iwan_win_rd16(frag + 4) == 0x1234, "IP ID 必须保留");
 }
 
+/* ---- 17. 外层分片重组：与 Linux 的 ip_defrag 对齐 ---------------------- */
+
+static size_t
+mk_ofrag4(uint8_t *pkt, uint32_t src, uint32_t dst, uint16_t id,
+	  size_t byte_off, int more, const uint8_t *pl, size_t plen)
+{
+	uint16_t fr = (uint16_t)((byte_off / 8u) & 0x1FFFu);
+
+	if (more)
+		fr |= 0x2000u;
+	memset(pkt, 0, 20 + plen);
+	pkt[0] = 0x45;
+	pkt[2] = (uint8_t)((20 + plen) >> 8);
+	pkt[3] = (uint8_t)(20 + plen);
+	pkt[4] = (uint8_t)(id >> 8);
+	pkt[5] = (uint8_t)id;
+	pkt[6] = (uint8_t)(fr >> 8);
+	pkt[7] = (uint8_t)fr;
+	pkt[8] = 64;
+	pkt[9] = 17;
+	pkt[12] = (uint8_t)(src >> 24);
+	pkt[13] = (uint8_t)(src >> 16);
+	pkt[14] = (uint8_t)(src >> 8);
+	pkt[15] = (uint8_t)src;
+	pkt[16] = (uint8_t)(dst >> 24);
+	pkt[17] = (uint8_t)(dst >> 16);
+	pkt[18] = (uint8_t)(dst >> 8);
+	pkt[19] = (uint8_t)dst;
+	if (plen != 0)
+		memcpy(pkt + 20, pl, plen);
+	return 20 + plen;
+}
+
+static void
+test_frag_reasm(void)
+{
+	static IWAN_WIN_FRAG_SLOT slots[IWAN_WIN_FRAG_SLOTS];
+	const uint32_t SRC = 0x0a000202u, DST = 0x0a00020fu;
+	uint8_t dat[3000], pkt[4096];
+	size_t i, len;
+	ULONG idx = 0, out_len = 0;
+	int r;
+
+	/* 分片偏移以 8 字节为单位，所以片长必须是 8 的倍数（末片除外）：
+	 * 3000 = 1384 + 1384 + 232。 */
+	for (i = 0; i < sizeof(dat); i++)
+		dat[i] = (uint8_t)(i * 11u + 5u);
+	memset(slots, 0, sizeof(slots));
+
+	/* 非分片：PASS，不占槽 */
+	len = mk_ofrag4(pkt, SRC, DST, 7, 0, 0, dat, 200);
+	r = iwan_win_frag_input(slots, IWAN_WIN_FRAG_SLOTS, pkt, (ULONG)len,
+				1000, 2000, &idx, &out_len);
+	CHECK(r == IWAN_WIN_FRAG_PASS, "非分片应 PASS（实得 %d）", r);
+
+	/* 乱序到达：末片、首片、中间片 */
+	len = mk_ofrag4(pkt, SRC, DST, 0x4242, 2768, 0, dat + 2768, 232);
+	r = iwan_win_frag_input(slots, IWAN_WIN_FRAG_SLOTS, pkt, (ULONG)len,
+				1000, 2000, &idx, &out_len);
+	CHECK(r == IWAN_WIN_FRAG_STORED, "末片先到应暂存（实得 %d）", r);
+	len = mk_ofrag4(pkt, SRC, DST, 0x4242, 0, 1, dat, 1384);
+	r = iwan_win_frag_input(slots, IWAN_WIN_FRAG_SLOTS, pkt, (ULONG)len,
+				1001, 2000, &idx, &out_len);
+	CHECK(r == IWAN_WIN_FRAG_STORED, "还缺中间片时应暂存（实得 %d）", r);
+	len = mk_ofrag4(pkt, SRC, DST, 0x4242, 1384, 1, dat + 1384, 1384);
+	r = iwan_win_frag_input(slots, IWAN_WIN_FRAG_SLOTS, pkt, (ULONG)len,
+				1002, 2000, &idx, &out_len);
+	CHECK(r == IWAN_WIN_FRAG_DONE, "三片齐了应完成（实得 %d）", r);
+	CHECK(out_len == 3000, "拼出的长度应为 3000（实得 %u）", (unsigned)out_len);
+	CHECK(idx < IWAN_WIN_FRAG_SLOTS &&
+	      memcmp(slots[idx].buf, dat, 3000) == 0,
+	      "拼出的内容必须与原数据报逐字节相同");
+	slots[idx].used = FALSE;
+
+	/* 重叠片：同一段重复到达只算一次，不影响拼齐 */
+	memset(slots, 0, sizeof(slots));
+	len = mk_ofrag4(pkt, SRC, DST, 0x5151, 0, 1, dat, 1384);
+	(void)iwan_win_frag_input(slots, IWAN_WIN_FRAG_SLOTS, pkt, (ULONG)len,
+				  2000, 2000, &idx, &out_len);
+	(void)iwan_win_frag_input(slots, IWAN_WIN_FRAG_SLOTS, pkt, (ULONG)len,
+				  2001, 2000, &idx, &out_len);
+	CHECK(slots[0].have == 1384u / 8u,
+	      "重叠片不能重复计数（实得 %u 块）", (unsigned)slots[0].have);
+	len = mk_ofrag4(pkt, SRC, DST, 0x5151, 1384, 0, dat + 1384, 1616);
+	r = iwan_win_frag_input(slots, IWAN_WIN_FRAG_SLOTS, pkt, (ULONG)len,
+				2002, 2000, &idx, &out_len);
+	CHECK(r == IWAN_WIN_FRAG_DONE && out_len == 3000,
+	      "两片齐了应完成（r=%d len=%u）", r, (unsigned)out_len);
+	slots[idx].used = FALSE;
+
+	/* 长度矛盾：末片给出的总长比"已收到的内容"还短 ⇒ 作废 */
+	memset(slots, 0, sizeof(slots));
+	len = mk_ofrag4(pkt, SRC, DST, 0x6161, 0, 1, dat, 1384);
+	(void)iwan_win_frag_input(slots, IWAN_WIN_FRAG_SLOTS, pkt, (ULONG)len,
+				  3000, 2000, &idx, &out_len);
+	len = mk_ofrag4(pkt, SRC, DST, 0x6161, 800, 0, dat + 800, 400);
+	r = iwan_win_frag_input(slots, IWAN_WIN_FRAG_SLOTS, pkt, (ULONG)len,
+				3001, 2000, &idx, &out_len);
+	CHECK(r == IWAN_WIN_FRAG_DROP, "总长矛盾应丢弃（实得 %d）", r);
+	CHECK(slots[0].used == FALSE, "丢弃后槽必须释放");
+
+	/* 超上限：单报文最多 9216 字节 */
+	memset(slots, 0, sizeof(slots));
+	len = mk_ofrag4(pkt, SRC, DST, 0x7171, 8192, 1, dat, 2000);
+	r = iwan_win_frag_input(slots, IWAN_WIN_FRAG_SLOTS, pkt, (ULONG)len,
+				4000, 2000, &idx, &out_len);
+	CHECK(r == IWAN_WIN_FRAG_DROP, "超过单报文上限应丢弃（实得 %d）", r);
+
+	/* 过期：同一标识的下一次分片必须从头开始（旧内容作废） */
+	memset(slots, 0, sizeof(slots));
+	len = mk_ofrag4(pkt, SRC, DST, 0x8181, 0, 1, dat, 1384);
+	(void)iwan_win_frag_input(slots, IWAN_WIN_FRAG_SLOTS, pkt, (ULONG)len,
+				  5000, 1000, &idx, &out_len);
+	len = mk_ofrag4(pkt, SRC, DST, 0x8181, 1384, 0, dat + 1384, 1616);
+	r = iwan_win_frag_input(slots, IWAN_WIN_FRAG_SLOTS, pkt, (ULONG)len,
+				7000, 1000, &idx, &out_len);
+	CHECK(r == IWAN_WIN_FRAG_STORED, "过期后应重新开始（实得 %d）", r);
+	CHECK(slots[idx].have == 1616u / 8u,
+	      "过期重开后只应有末片那些块（实得 %u）", (unsigned)slots[idx].have);
+
+	/* 槽满：4 个未拼齐的数据报占满后，新标识要能抢到最老的那个 */
+	memset(slots, 0, sizeof(slots));
+	for (i = 0; i < IWAN_WIN_FRAG_SLOTS; i++) {
+		len = mk_ofrag4(pkt, SRC, DST, (uint16_t)(0x9000u + i), 0, 1,
+				dat, 1384);
+		r = iwan_win_frag_input(slots, IWAN_WIN_FRAG_SLOTS, pkt,
+					(ULONG)len, 8000 + (ULONG)i, 100000,
+					&idx, &out_len);
+		CHECK(r == IWAN_WIN_FRAG_STORED, "第 %u 个应暂存（实得 %d）",
+		      (unsigned)i, r);
+	}
+	len = mk_ofrag4(pkt, SRC, DST, 0xA0A0, 0, 1, dat, 1384);
+	r = iwan_win_frag_input(slots, IWAN_WIN_FRAG_SLOTS, pkt, (ULONG)len,
+				8100, 100000, &idx, &out_len);
+	CHECK(r == IWAN_WIN_FRAG_STORED, "槽满时应抢最老的一个（实得 %d）", r);
+}
+
 int
 main(void)
 {
@@ -1306,6 +1443,7 @@ main(void)
 	test_csum();
 	test_inner_fix_csum_keeps_addrs();
 	test_frag4();
+	test_frag_reasm();
 	test_targets();
 	test_wire_constants();
 	test_inbound();

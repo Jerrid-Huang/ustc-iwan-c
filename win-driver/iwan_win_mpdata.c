@@ -277,9 +277,48 @@ iwan_win_mp_encap_send_pkt(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 
 /* ---- 入向：外层帧 → 内层数据报 ---------------------------------------- */
 
+/*
+ * 入向入口：先做外层分片重组，再把完整数据报交给解析体。
+ *
+ * 口径三面对齐：Linux 侧外层走 ip_defrag()（kernel/iwan.mod.c 导入 ip_defrag，
+ * hookprio 默认 -300 就在 defrag 之后），WFP 平面收到的是 INBOUND_TRANSPORT
+ * （tcpip 已经重组过），只有 MP 平面在协议边拿到的还是分片。两端默认 DF=1，
+ * 平时走不到这里；但"内外层都被分片的流也要能收"是能力要求，不能靠对端守规矩。
+ */
 VOID
 iwan_win_mp_outer_recv(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		       _In_reads_bytes_(len) const UINT8 *ip, _In_ ULONG len)
+{
+	ULONG idx = 0, flen = 0;
+	int fr;
+
+	fr = iwan_win_frag_input(ext->mp.frag, IWAN_WIN_FRAG_SLOTS, ip, len,
+				 (ULONG)iwan_win_now_ms(), IWAN_WIN_FRAG_TTL_MS,
+				 &idx, &flen);
+	if (fr == IWAN_WIN_FRAG_PASS) {
+		iwan_win_mp_outer_frame(ext, ip, len);
+		return;
+	}
+	if (fr == IWAN_WIN_FRAG_STORED) {
+		IWAN_MP_STAT_INC(ext, rx_reasm);
+		return;
+	}
+	if (fr != IWAN_WIN_FRAG_DONE || idx >= IWAN_WIN_FRAG_SLOTS) {
+		/* 拼不成（超上限/长度矛盾/参数非法）：当作坏头吃掉并计数，
+		 * 数据面不许有静默的丢弃通道。 */
+		IWAN_MP_STAT_INC(ext, rx_bad_hdr);
+		return;
+	}
+	IWAN_MP_STAT_INC(ext, rx_reasm);
+	iwan_win_mp_outer_frame(ext, ext->mp.frag[idx].buf, flen);
+	/* DONE 的槽归调用方所有：解析完必须还回去，否则永不回收 */
+	ext->mp.frag[idx].used = FALSE;
+}
+
+/* 一个完整外层数据报（或重组完成后的整包）的解析与投递。 */
+static VOID
+iwan_win_mp_outer_frame(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
+			_In_reads_bytes_(len) const UINT8 *ip, _In_ ULONG len)
 {
 	IWAN_WIN_SESSION *s = &ext->sess;
 	IWAN_WIN_OUTER o;

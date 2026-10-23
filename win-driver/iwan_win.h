@@ -171,6 +171,11 @@ typedef struct _IWAN_MP_TX_CTX {
  * 的硬挂就是这个机制，同一个坑不踩第二次。 */
 #define IWAN_MP_MAX_OUTER_INFLIGHT 4096u
 
+/* 外层分片重组的过期时间：一个数据报的分片必须在这个窗口内到齐，否则新片
+ * 从头开始（对端重发时不会带着旧状态）。Linux 侧 ip_defrag 也是同量级的
+ * 30 秒级超时，但这里的槽少、单报文上限小，短一点更安全。 */
+#define IWAN_WIN_FRAG_TTL_MS	2000u
+
 /* 在途内层指示的上限。出向有闸门而入向原先没有，这是全数据面唯一的无界非
  * 分页池分配：每个指示上去的包固定占内层缓冲（IWAN_ALLOC）+ IoAllocateMdl +
  * 池 NBL，约 1.6–2 KB，不带 NDIS_RECEIVE_FLAGS_RESOURCES，所以归还只能等上层
@@ -228,6 +233,11 @@ typedef struct _IWAN_MP_PLANE {
 	/* ARP 诊断：出向发不出包时，必须先分清"请求没发出去""请求发了没回""
 	 * "回了但 spa 对不上"。这三个计数只在 IOCTL_GET（PASSIVE）时落到
 	 * T93/T94/T95，数据面里只做原子加。 */
+	/* 外层分片重组槽：Linux 侧在外层走 ip_defrag()，WFP 平面靠 tcpip 的
+	 * INBOUND_TRANSPORT（重组之后）—— 只有本平面要自己拼。槽数与单报文
+	 * 上限都是写死的（见 iwan_win_frame.h），平时根本用不到这条路径。 */
+	IWAN_WIN_FRAG_SLOT	frag[IWAN_WIN_FRAG_SLOTS];
+
 	volatile LONG		arp_sent;
 	volatile LONG		arp_rx;
 	volatile LONG		arp_learn;

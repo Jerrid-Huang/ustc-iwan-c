@@ -243,6 +243,8 @@ iwan_win_frag4_count(_In_reads_bytes_(len) const UINT8 *pkt, _In_ ULONG len,
 	return (payload + chunk - 1) / chunk;
 }
 
+/* 注解必须与头文件逐字一致（C28252）：声明处写了 _Success_，定义处也要写。 */
+_Success_(return != FALSE)
 BOOLEAN
 iwan_win_frag4_build(_Out_writes_bytes_(out_cap) UINT8 *out, _In_ ULONG out_cap,
 		     _In_reads_bytes_(len) const UINT8 *pkt, _In_ ULONG len,
@@ -291,6 +293,154 @@ iwan_win_frag4_build(_Out_writes_bytes_(out_cap) UINT8 *out, _In_ ULONG out_cap,
 	iwan_win_wr16(out + 10, (USHORT)iwan_win_csum_finish(sum));
 	*out_len = ihl + this_len;
 	return TRUE;
+}
+
+/*
+ * 外层分片重组：把一个数据报的各片按"外层 IPv4 标识 + 地址"归并到同一个槽。
+ *
+ * 为什么要有它：Linux 侧在外层走 ip_defrag()（kernel/iwan.mod.c 导入 ip_defrag，
+ * hookprio 默认 -300 = defrag 之后），所以对端一旦把外层 DF 关掉，Linux 能收；
+ * Windows 侧过去是"MF 或片偏移非 0 一律拒"，同样一条流在 Windows 上整条丢光。
+ * 这条路径平时不走（两端默认 DF=1），但"能接受内外层都被分片的流"是能力要求。
+ *
+ * 三处硬约束，都是被历史事故逼出来的：
+ *  - 槽数与单报文上限都写死：非分页池曾被无界灌满，整机直接挂死；
+ *  - 位图按 8 字节块记：收到的片可以乱序、可以重叠，重叠块只算一次；
+ *  - 过期用调用方传进来的 now_ms，不在数据面里读时钟、更不起定时器。
+ */
+int
+iwan_win_frag_input(_Inout_ IWAN_WIN_FRAG_SLOT *slots,
+		    _In_ ULONG nslots,
+		    _In_reads_bytes_(len) const UINT8 *pkt, _In_ ULONG len,
+		    _In_ ULONG now_ms, _In_ ULONG ttl_ms,
+		    _Out_ ULONG *out_idx, _Out_ ULONG *out_len)
+{
+	IWAN_WIN_FRAG_SLOT *s = NULL;
+	IWAN_WIN_FRAG_SLOT *victim = NULL;
+	ULONG ihl, tot, flen, off, i, first_blk, last_blk, need, age;
+	ULONG best_age = 0;
+	USHORT frag;
+	UINT32 src, dst;
+	UINT16 id;
+	BOOLEAN more;
+
+	if (slots == NULL || nslots == 0 || pkt == NULL ||
+	    out_idx == NULL || out_len == NULL)
+		return IWAN_WIN_FRAG_DROP;
+	/* 不是 IPv4 或头部都不完整：不是分片，交给普通路径去判 */
+	if (len < IWAN_OUTER_IP4_LEN || (pkt[0] >> 4) != 4)
+		return IWAN_WIN_FRAG_PASS;
+	ihl = (ULONG)(pkt[0] & 0x0Fu) * 4u;
+	if (ihl < IWAN_OUTER_IP4_LEN || ihl > len)
+		return IWAN_WIN_FRAG_PASS;
+	tot = (ULONG)iwan_win_rd16(pkt + 2);
+	if (tot < ihl || tot > len)
+		return IWAN_WIN_FRAG_PASS;
+	frag = iwan_win_rd16(pkt + 6);
+	more = (frag & 0x2000u) != 0;
+	off = (ULONG)(frag & 0x1FFFu) * 8u;
+	if (!more && off == 0)
+		return IWAN_WIN_FRAG_PASS;	/* 不是分片 */
+	flen = tot - ihl;
+	if (flen == 0)
+		return IWAN_WIN_FRAG_DROP;
+	if (off + flen > IWAN_WIN_FRAG_BUF_SIZE)
+		return IWAN_WIN_FRAG_DROP;
+
+	src = iwan_win_rd32(pkt + 12);
+	dst = iwan_win_rd32(pkt + 16);
+	id = iwan_win_rd16(pkt + 4);
+
+	/* 1) 已有同源同标识的槽接着用；过期的当空槽处理 */
+	for (i = 0; i < nslots; i++) {
+		if (!slots[i].used)
+			continue;
+		if (slots[i].src != src || slots[i].dst != dst ||
+		    slots[i].id != id)
+			continue;
+		if (now_ms - slots[i].start_ms > ttl_ms) {
+			slots[i].used = FALSE;
+			break;
+		}
+		s = &slots[i];
+		break;
+	}
+
+	/* 2) 没有就找一个空槽；一个空槽都没有就抢最老的那个（有界，不阻塞） */
+	if (s == NULL) {
+		for (i = 0; i < nslots; i++) {
+			if (!slots[i].used) {
+				s = &slots[i];
+				break;
+			}
+		}
+	}
+	if (s == NULL) {
+		for (i = 0; i < nslots; i++) {
+			age = now_ms - slots[i].start_ms;
+			if (age >= best_age) {
+				best_age = age;
+				victim = &slots[i];
+			}
+		}
+		s = victim;
+		if (s == NULL)
+			return IWAN_WIN_FRAG_DROP;
+	}
+	if (!s->used) {
+		s->used = TRUE;
+		s->src = src;
+		s->dst = dst;
+		s->id = id;
+		s->start_ms = now_ms;
+		s->total = 0;
+		s->end = 0;
+		s->have = 0;
+		RtlZeroMemory(s->bits, sizeof(s->bits));
+	}
+
+	/* 3) 末片给出总长；与已知总长矛盾就作废这个槽（对端在重排/伪造） */
+	if (!more) {
+		/* 末片给出总长。两条矛盾都要作废这个槽：与上一次给的末片不同，
+		 * 或者"已经收到的内容"越过这个总长（典型是对端重排/伪造）。 */
+		if (s->total != 0 && s->total != off + flen) {
+			s->used = FALSE;
+			return IWAN_WIN_FRAG_DROP;
+		}
+		if (s->end > off + flen) {
+			s->used = FALSE;
+			return IWAN_WIN_FRAG_DROP;
+		}
+		s->total = off + flen;
+	}
+	if (s->total != 0 && off + flen > s->total) {
+		s->used = FALSE;
+		return IWAN_WIN_FRAG_DROP;
+	}
+	if (off + flen > s->end)
+		s->end = off + flen;
+
+	/* 4) 落盘 + 记块。片可以乱序、可以重叠：重叠的块只算一次 */
+	RtlCopyMemory(s->buf + off, pkt + ihl, flen);
+	first_blk = off / 8u;
+	last_blk = (off + flen + 7u) / 8u;
+	for (i = first_blk; i < last_blk && i < IWAN_WIN_FRAG_BUF_SIZE / 8u; i++) {
+		UINT8 mask = (UINT8)(1u << (i & 7u));
+
+		if ((s->bits[i >> 3] & mask) == 0) {
+			s->bits[i >> 3] |= mask;
+			s->have++;
+		}
+	}
+
+	*out_idx = (ULONG)(s - slots);
+	if (s->total == 0)
+		return IWAN_WIN_FRAG_STORED;
+	need = (s->total + 7u) / 8u;
+	if (s->have < need)
+		return IWAN_WIN_FRAG_STORED;
+	*out_len = s->total;
+	return IWAN_WIN_FRAG_DONE;
 }
 
 BOOLEAN
@@ -391,11 +541,13 @@ iwan_win_outer_parse4(_In_reads_bytes_(len) const UINT8 *pkt, _In_ ULONG len,
 	proto = pkt[9];
 	if (proto != IWAN_IPPROTO_UDP)
 		return FALSE;
-	/* 外层分片一律不处理（MF 位与偏移都要为 0 才是完整数据报）：首片虽然
-	 * 带 UDP 与帧头，但内层是残的，解封出来会注入一个残缺内层包。Linux 侧
-	 * 在外层走 ip_defrag() 重组，Windows 侧 M2 不做重组 —— 实践中两端的外层
-	 * 包都按协商 MTU 发送（客户端 DF=1），所以这里是异常路径：调用者按
-	 * "命中五元组但处理不了" 计数并吞掉，绝不把残缺包放给本机协议栈。 */
+	/* 解析器只收完整数据报：MF 位与片偏移都必须为 0。首片虽然带 UDP 与
+	 * 帧头，内层是残的，解封出来会注入一个残缺内层包。
+	 * 分片由谁重组：Linux 侧在外层走 ip_defrag()，WFP 平面拿到的是
+	 * INBOUND_TRANSPORT（tcpip 已重组），MP 平面在 iwan_win_mp_outer_recv
+	 * 里先过 iwan_win_frag_input 再用本函数解析。所以走到这里还带分片位的，
+	 * 只可能是重组阶段就拼不成的报文：调用者按"命中五元组但处理不了"计数
+	 * 并吞掉，绝不把残缺包放给本机协议栈。 */
 	if ((iwan_win_rd16(pkt + 6) & 0x3FFF) != 0)
 		return FALSE;
 	/* 外层 UDP 长度：按它取帧长，并用包实际长度兜底 */
