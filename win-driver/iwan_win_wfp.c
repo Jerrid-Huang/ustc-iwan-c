@@ -333,6 +333,46 @@ iwan_win_nbl_from_self(_In_ HANDLE handle, _In_ const NET_BUFFER_LIST *nbl)
 }
 
 /*
+ * 整条链里有没有"本会话该进隧道"的包。
+ *
+ * 只在"整链不是全都该进隧道"时才调用：WFP 的裁决粒度是整条 NBL 链，没有
+ * "吸收一半"的选项。一个都不是就原样放行（绝大多数情况），只要有一个是，
+ * 就整链接管——放行会让本会话的明文漏到承载网，这条规矩比"顺手放走别人的
+ * 包"重要。被牵连的其他包在这里计入 ev_dropped。
+ */
+static BOOLEAN
+iwan_win_chain_has_ours(_In_ IWAN_WIN_DEVICE_EXTENSION *ext,
+			_In_ IWAN_WIN_SESSION *s,
+			_In_ NET_BUFFER_LIST *nbl)
+{
+	NET_BUFFER_LIST *cur;
+	UINT8 od[4];
+
+	iwan_win_wr32(od, s->outer_dst);
+	for (cur = nbl; cur != NULL; cur = NET_BUFFER_LIST_NEXT_NBL(cur)) {
+		NET_BUFFER *nb = NET_BUFFER_LIST_FIRST_NB(cur);
+		UINT8 hdr[IWAN_OUTER_IP4_LEN];
+		UINT8 *pkt;
+		ULONG len, ihl, tot;
+
+		if (nb == NULL)
+			continue;
+		len = NET_BUFFER_DATA_LENGTH(nb);
+		pkt = (UINT8 *)NdisGetDataBuffer(nb, IWAN_OUTER_IP4_LEN, hdr, 1, 0);
+		if (pkt == NULL || len < IWAN_OUTER_IP4_LEN || (pkt[0] >> 4) != 4)
+			continue;
+		ihl = (ULONG)(pkt[0] & 0x0F) * 4;
+		tot = iwan_win_rd16(pkt + 2);
+		if (ihl < IWAN_OUTER_IP4_LEN || tot < ihl || tot > len)
+			continue;
+		if (iwan_win_should_tunnel4(s->targets, s->target_count, od,
+					    pkt + 16))
+			return TRUE;
+	}
+	return FALSE;
+}
+
+/*
  * 出向入口：超长内层报文先按声明的内层 MTU 分片，再逐片封装。
  *
  * 口径与 Linux 对齐：Linux 侧是协议栈在 ndo_start_xmit 之前按外层设备 MTU 分好
@@ -474,8 +514,9 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 					   FWPS_METADATA_FIELD_COMPARTMENT_ID))
 		compartment = (UINT16)inMetaValues->compartmentId;
 
-	/* 先整块判定：只要有一个报文不该进隧道，就整块放行，
-	 * 绝不做"吸收一半"（半个 NBL 被吃掉会让协议栈状态错乱）。 */
+	/* 先整块判定：整链都该进隧道是常见情况（WFP 在本层通常一链一包）。
+	 * 出现混链时不做"吸收一半"这种不可能的裁决 —— 见下面的两条分支：
+	 * 有本会话的包就整链接管，一个都没有才整链放行。 */
 	for (cur = nbl; cur != NULL; cur = NET_BUFFER_LIST_NEXT_NBL(cur)) {
 		NET_BUFFER *nb = NET_BUFFER_LIST_FIRST_NB(cur);
 		UINT8 hdr[IWAN_OUTER_IP4_LEN];
@@ -529,8 +570,14 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 		}
 	}
 
-	if (!all_hit)
-		goto done;
+	if (!all_hit) {
+		/* 混链：整链不是全都该进隧道。只要链里有任意一个是本会话的，
+		 * 就整链吸收（本会话的照常封装，其余的在下面按包丢弃并计数）；
+		 * 一个都不是就原样放行。逐包回注（把别人的包重新注入
+		 * OUTBOUND_IPPACKET）需要额外的注入状态与防回环判据，留作后续。 */
+		if (!iwan_win_chain_has_ours(ext, s, nbl))
+			goto done;
+	}
 
 	for (cur = nbl; cur != NULL; cur = NET_BUFFER_LIST_NEXT_NBL(cur)) {
 		NET_BUFFER *nb = NET_BUFFER_LIST_FIRST_NB(cur);
@@ -578,6 +625,16 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 				ExFreePoolWithTag(stor, IWAN_TAG_PKT);
 				IWAN_STAT_INC(ext, tx_bad_inner);
 				goto done;
+			}
+		}
+		if (!all_hit) {
+			/* 混链：这一包不是本会话的就丢掉（整链已被吸收）。
+			 * 计数落在 ev_dropped，别借用 tx_*：那些是隧道自己的
+			 * 收发账，混进来就再也对不上网卡计数。 */
+			if (!iwan_win_should_tunnel4(s->targets, s->target_count,
+						     od, pkt + 16)) {
+				IWAN_STAT_INC(ext, ev_dropped);
+				continue;
 			}
 		}
 		/* 出向 IP 包层拿到的报文可能仍带"校验和由网卡补"的标记：
