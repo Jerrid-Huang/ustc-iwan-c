@@ -285,6 +285,11 @@ iwan_win_mp_encap_send_pkt(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
  * （tcpip 已经重组过），只有 MP 平面在协议边拿到的还是分片。两端默认 DF=1，
  * 平时走不到这里；但"内外层都被分片的流也要能收"是能力要求，不能靠对端守规矩。
  */
+/* 解析体在下面定义；重组壳先用，所以先声明。 */
+static VOID
+iwan_win_mp_outer_frame(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
+			_In_reads_bytes_(len) const UINT8 *ip, _In_ ULONG len);
+
 VOID
 iwan_win_mp_outer_recv(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		       _In_reads_bytes_(len) const UINT8 *ip, _In_ ULONG len)

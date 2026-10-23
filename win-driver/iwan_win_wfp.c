@@ -341,8 +341,7 @@ iwan_win_nbl_from_self(_In_ HANDLE handle, _In_ const NET_BUFFER_LIST *nbl)
  * 包"重要。被牵连的其他包在这里计入 ev_dropped。
  */
 static BOOLEAN
-iwan_win_chain_has_ours(_In_ IWAN_WIN_DEVICE_EXTENSION *ext,
-			_In_ IWAN_WIN_SESSION *s,
+iwan_win_chain_has_ours(_In_ IWAN_WIN_SESSION *s,
 			_In_ NET_BUFFER_LIST *nbl)
 {
 	NET_BUFFER_LIST *cur;
@@ -575,7 +574,7 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 		 * 就整链吸收（本会话的照常封装，其余的在下面按包丢弃并计数）；
 		 * 一个都不是就原样放行。逐包回注（把别人的包重新注入
 		 * OUTBOUND_IPPACKET）需要额外的注入状态与防回环判据，留作后续。 */
-		if (!iwan_win_chain_has_ours(ext, s, nbl))
+		if (!iwan_win_chain_has_ours(s, nbl))
 			goto done;
 	}
 
