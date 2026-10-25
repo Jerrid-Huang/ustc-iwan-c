@@ -53,7 +53,7 @@ typedef struct _IWAN_CNT_ADAPTER {
 	UCHAR                           mac[6];
 	LIST_ENTRY                      link;		/* 全局实例链 */
 	ULONG                           peer_ip;	/* 与帧内字节同序 */
-	ULONG                           bridge;
+	volatile LONG                   bridge;
 	volatile LONG64                 tx_frames;
 	volatile LONG64                 tx_bytes;
 	volatile LONG64                 peer_in_frames;
