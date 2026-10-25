@@ -151,11 +151,16 @@ iwan_cnt_param_u32(_In_ HANDLE key, _In_ PCWSTR name, _In_ ULONG dflt)
 	ULONG need = 0;
 	PKEY_VALUE_PARTIAL_INFORMATION pi;
 
+	/* 清零只是为了在分析器眼里"缓冲区已初始化"；真正的布局由 API 契约保证：
+	 * ZwQueryValueKey 成功时按 KEY_VALUE_PARTIAL_INFORMATION 写回。 */
+	RtlZeroMemory(buf, sizeof(buf));
 	RtlInitUnicodeString(&vn, name);
 	if (!NT_SUCCESS(ZwQueryValueKey(key, &vn, KeyValuePartialInformation,
 					buf, sizeof(buf), &need)))
 		return dflt;
 	pi = (PKEY_VALUE_PARTIAL_INFORMATION)(PVOID)buf;
+	/* C28199：分析器认为 buf 未被赋值，实际是 ZwQueryValueKey 按契约填的。 */
+#pragma warning(suppress: 28199)
 	if (pi->Type != REG_DWORD || pi->DataLength < sizeof(ULONG))
 		return dflt;
 	return *(const ULONG *)(PVOID)pi->Data;
@@ -171,6 +176,7 @@ iwan_cnt_param_str(_In_ HANDLE key, _In_ PCWSTR name,
 	PKEY_VALUE_PARTIAL_INFORMATION pi;
 	ULONG n;
 
+	RtlZeroMemory(buf, sizeof(buf));
 	if (cap == 0)
 		return FALSE;
 	out[0] = L'\0';
@@ -179,6 +185,7 @@ iwan_cnt_param_str(_In_ HANDLE key, _In_ PCWSTR name,
 					buf, sizeof(buf), &need)))
 		return FALSE;
 	pi = (PKEY_VALUE_PARTIAL_INFORMATION)(PVOID)buf;
+#pragma warning(suppress: 28199)
 	if (pi->Type != REG_SZ || pi->DataLength < sizeof(WCHAR))
 		return FALSE;
 	n = (pi->DataLength / sizeof(WCHAR)) - 1;
@@ -224,6 +231,9 @@ iwan_cnt_parse_mac(_In_ PCWSTR s, _Out_writes_(6) UCHAR *mac)
 {
 	ULONG i, nibbles = 0;
 	LONG hi = -1;
+
+	/* FALSE 时输出无意义；清零让分析器与调用方都不必猜。 */
+	RtlZeroMemory(mac, 6);
 
 	for (i = 0;; i++) {
 		WCHAR c = s[i];
@@ -416,6 +426,8 @@ iwan_cnt_indicate(_Inout_ PIWAN_CNT_ADAPTER a, _In_ UCHAR *buf, _In_ ULONG len,
 		return;
 	}
 	MmBuildMdlForNonPagedPool(mdl);
+	/* C6014 误报：下面的指示调用把 nbl 的所有权转给 NDIS，归还回调负责释放。 */
+#pragma warning(suppress: 6014)
 	nbl = NdisAllocateNetBufferAndNetBufferList(
 		a->nbl_pool, IWAN_CNT_NBL_CTX_SIZE, 0, mdl, 0, len);
 	if (nbl == NULL) {
@@ -476,6 +488,7 @@ iwan_cnt_arp_reply(_Inout_ PIWAN_CNT_ADAPTER a,
 	RtlCopyMemory(r + 38, p + 28, 4);	/* tpa */
 	InterlockedIncrement64(&a->arp_req);
 	InterlockedIncrement64(&a->arp_rep);
+#pragma warning(suppress: 6014)
 	iwan_cnt_indicate(a, r, 42, IWAN_CNT_ETH_ARP, dispatch);
 }
 
@@ -485,6 +498,7 @@ iwan_cnt_swap_ip4(_Inout_updates_bytes_(len) UCHAR *p, _In_ ULONG len,
 		  _In_ BOOLEAN swap_ports)
 {
 	ULONG ihl;
+	ULONG need;
 	UCHAR t[4];
 	UCHAR p0, p1;
 
@@ -493,10 +507,14 @@ iwan_cnt_swap_ip4(_Inout_updates_bytes_(len) UCHAR *p, _In_ ULONG len,
 	ihl = (ULONG)(p[0] & 0x0Fu) * 4;
 	if (ihl < 20 || ihl > len)
 		return;
+	/* 先把要碰的最大偏移算成一个数：交换 4 字节地址 + 可能的 8 字节 UDP 头。 */
+	need = ihl + ((swap_ports && p[9] == 17) ? 8u : 0u);
+	if (need > len)
+		return;
 	RtlCopyMemory(t, p + 12, 4);
 	RtlCopyMemory(p + 12, p + 16, 4);
 	RtlCopyMemory(p + 16, t, 4);
-	if (swap_ports && p[9] == 17 && len >= ihl + 8) {
+	if (swap_ports && p[9] == 17) {
 		p0 = p[ihl];
 		p1 = p[ihl + 1];
 		p[ihl] = p[ihl + 2];
@@ -518,6 +536,8 @@ iwan_cnt_echo(_Inout_ PIWAN_CNT_ADAPTER a,
 	UCHAR m0;
 	ULONG i;
 
+	if (len < IWAN_CNT_ETH_HDR)
+		return;
 	buf = (UCHAR *)ExAllocatePool2(POOL_FLAG_NON_PAGED, len, IWAN_CNT_TAG);
 	if (buf == NULL) {
 		InterlockedIncrement64(&a->drops);
@@ -535,6 +555,7 @@ iwan_cnt_echo(_Inout_ PIWAN_CNT_ADAPTER a,
 				  len - IWAN_CNT_ETH_HDR, TRUE);
 	if (a->inner_off != 0 && len > a->inner_off + 20)
 		iwan_cnt_swap_ip4(buf + a->inner_off, len - a->inner_off, TRUE);
+#pragma warning(suppress: 6014)
 	iwan_cnt_indicate(a, buf, len, ethertype, dispatch);
 }
 
@@ -894,6 +915,13 @@ iwan_cnt_restart(_In_ NDIS_HANDLE MiniportAdapterContext,
 
 /* ---- 小型端口：初始化 / 停止 ---------------------------------------- */
 
+/*
+ * 本函数里报的两条 C6014（适配器扩展 a、NBL 池 a->nbl_pool）都是驱动生命周期
+ * 资产：a 由 HaltHandlerEx 释放，池由 HaltHandlerEx 释放（等不到在途归还时
+ * 宁可泄漏池也不放）。分析器只看见"分配了、函数成功返回前没释放"。
+ */
+#pragma warning(push)
+#pragma warning(disable: 6014)
 static
 _Function_class_(MINIPORT_INITIALIZE)
 NDIS_STATUS
@@ -1061,6 +1089,7 @@ iwan_cnt_initialize(_In_ NDIS_HANDLE MiniportAdapterHandle,
 		 (unsigned long)a->echo_mode, (unsigned long)a->inner_off);
 	return NDIS_STATUS_SUCCESS;
 }
+#pragma warning(pop)
 
 static
 _Function_class_(MINIPORT_HALT)
