@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  iwancnt.vcxproj — 只计数、可回声的以太虚拟网卡的工程。
+
+  它不属于任何数据面：既不是 WFP 平面（iwan.sys），也不是 NDIS 平面
+  （iwanmp.sys），而是给它们当"对端"的一张网卡，让隧道在同一台机器上就能
+  跑满、并逐帧计数（不经过 QEMU slirp，也不经过用户态）。
+
+  因为不依赖任何平面代码，本工程只有一个源文件、不需要额外头文件搜索路径，
+  NDIS 版本宏也只走小型端口那一族（NDISnnn_MINIPORT）；若再混入 NDISnnn 那
+  一族，ndis.h 的宏闸门会直接 #error。
+
+  构建（装了 WDK 的 Windows 上，管理员 VS 开发者命令提示符里）：
+
+    msbuild win-driver\iwancnt.vcxproj /p:Configuration=Release /p:Platform=x64
+
+  安装（客体，测试签名已打开、自签证书已受信）：
+    devcon.exe install win-driver\iwancnt.inf iwancnt
+-->
+<Project DefaultTargets="Build" ToolsVersion="Current"
+         xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|Win32">
+      <Configuration>Debug</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|Win32">
+      <Configuration>Release</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{7E2B4C31-9D5A-4F17-8C63-2B7A1D9E4F03}</ProjectGuid>
+    <RootNamespace>iwancnt</RootNamespace>
+    <ProjectName>iwancnt</ProjectName>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Driver</ConfigurationType>
+    <DriverType>WDM</DriverType>
+    <!-- 与另两个工程同理：工具集自带的测试签名不带 /fd，会把产物删掉。
+         签名在客体侧做。 -->
+    <SignMode>Off</SignMode>
+    <DriverTargetPlatform>Desktop</DriverTargetPlatform>
+    <TargetVersion>Windows10</TargetVersion>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Debug'">true</UseDebugLibraries>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"
+            Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')"
+            Label="LocalAppDataPlatform" />
+  </ImportGroup>
+
+  <PropertyGroup>
+    <OutDir>$(SolutionDir)build\$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>$(SolutionDir)build\obj\$(Platform)\$(Configuration)\cnt\</IntDir>
+    <TargetName>iwancnt</TargetName>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <!-- 中文注释与日志：必须显式 /utf-8，否则执行字符集 1252 会把中文字符串
+           字面量报成 C4566，配合 TreatWarningAsError 变 C2220。 -->
+      <AdditionalOptions>/source-charset:utf-8 /execution-charset:utf-8 %(AdditionalOptions)</AdditionalOptions>
+      <WarningLevel>Level4</WarningLevel>
+      <TreatWarningAsError>true</TreatWarningAsError>
+      <SDLCheck>true</SDLCheck>
+      <LanguageStandard_C>stdc11</LanguageStandard_C>
+      <ExceptionHandling>false</ExceptionHandling>
+    </ClCompile>
+    <Link>
+      <!-- 只要 ndis.lib：没有 WFP、没有路由 API、没有 IoCreateDeviceSecure。 -->
+      <AdditionalDependencies>ndis.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <EntryPointSymbol>DriverEntry</EntryPointSymbol>
+    </Link>
+    <Inf>
+      <TimeStamp>1.0.0.0</TimeStamp>
+    </Inf>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <!-- 小型端口宏族：与 iwanmp 的内层小型端口同一个档位（683）。 -->
+    <ClCompile Include="iwan_cnt.c">
+      <PreprocessorDefinitions>NDIS_MINIPORT_DRIVER;NDIS620_MINIPORT;NDIS683_MINIPORT;NDIS_WDM;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemGroup>
+  <!-- iwancnt.inf 不进 <Inf>：PnP INF 需要 .cat，而 .cat 要在客体侧用
+       New-FileCatalog + Set-AuthenticodeSignature 生成。安装走 devcon install /
+       pnputil，INF 作为部署材料留在仓库里。 -->
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

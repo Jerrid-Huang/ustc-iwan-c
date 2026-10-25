@@ -108,6 +108,12 @@ jobs:
                   @('win-driver\iwan_win_mp.c')
           & $cl.FullName @mpoArgs 2>&1 | Tee-Object -FilePath cl-mp-miniport.log
           "cl mp-miniport 退出码=$LASTEXITCODE"
+          # 计数网卡（iwancnt.sys）：自包含的小型端口，只走小型端口宏族。
+          $cntArgs = $common + @('/DNDIS_MINIPORT_DRIVER', '/DNDIS620_MINIPORT',
+                                 '/DNDIS683_MINIPORT', '/DNDIS_WDM') +
+                  @('win-driver\iwan_cnt.c')
+          & $cl.FullName @cntArgs 2>&1 | Tee-Object -FilePath cl-cnt.log
+          "cl cnt 退出码=$LASTEXITCODE"
 
       # 把我不确定的 API 原型/结构成员直接从 WDK 头里打出来：猜签名是上一次
       # 反复出错的原因（FwpsInjectNetworkReceiveAsync0 我上一次"修"错了方向）。
@@ -432,6 +438,18 @@ jobs:
               Tee-Object -FilePath msbuild-mp.log
           "msbuild-mp 退出码=$LASTEXITCODE"
 
+      # 计数网卡（iwancnt.sys 的工程）。与另两个平面完全独立。
+      - name: msbuild iwancnt（计数网卡）
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & $env:MSBUILD 'win-driver\iwancnt.vcxproj' /nologo /v:normal `
+              /p:Configuration=Release /p:Platform=x64 `
+              "/p:SolutionDir=$env:GITHUB_WORKSPACE\" `
+              "/p:OutDir=$env:GITHUB_WORKSPACE\build\x64\Release\" 2>&1 |
+              Tee-Object -FilePath msbuild-cnt.log
+          "msbuild-cnt 退出码=$LASTEXITCODE"
+
       - name: 取 x64 devcon.exe（虚拟机建承载网卡用）
         if: always()
         shell: pwsh
@@ -449,12 +467,12 @@ jobs:
 
       # 上面几步都是 continue-on-error，所以"工作流成功"从来不等于"编译成功"：
       # 曾经带着一个 C2220 报 success，而工件里没有 iwan.sys。判据只能是产物。
-      - name: 断言两个 .sys 真的产出了
+      - name: 断言三个 .sys 真的产出了
         if: always()
         shell: pwsh
         run: |
           $bad = 0
-          foreach ($n in @('iwan.sys', 'iwanmp.sys')) {
+          foreach ($n in @('iwan.sys', 'iwanmp.sys', 'iwancnt.sys')) {
             $sys = "$env:GITHUB_WORKSPACE\build\x64\Release\$n"
             if (Test-Path $sys) {
               "$n 存在：$((Get-Item $sys).Length) 字节"
@@ -515,7 +533,11 @@ jobs:
             @{ log = 'analysis-mp-miniport.xml';
                defs = @('/DNDIS_MINIPORT_DRIVER', '/DNDIS620_MINIPORT', '/DNDIS683_MINIPORT',
                         '/DNDIS_WDM', '/DIWAN_WIN_PLANE_MP');
-               src = @('win-driver\iwan_win_mp.c') })
+               src = @('win-driver\iwan_win_mp.c') },
+            @{ log = 'analysis-cnt.xml';
+               defs = @('/DNDIS_MINIPORT_DRIVER', '/DNDIS620_MINIPORT', '/DNDIS683_MINIPORT',
+                        '/DNDIS_WDM');
+               src = @('win-driver\iwan_cnt.c') })
           foreach ($s in $sets) {
             $a = $common + $s.defs + @("/analyze:log", $s.log) + $s.src
             & $cl.FullName @a 2>&1 | Tee-Object -FilePath ($s.log -replace '\.xml$', '.log')
@@ -543,7 +565,7 @@ jobs:
         shell: pwsh
         run: |
           $bad = 0
-          foreach ($f in @('analysis-wfp.xml', 'analysis-mp.xml', 'analysis-mp-miniport.xml')) {
+          foreach ($f in @('analysis-wfp.xml', 'analysis-mp.xml', 'analysis-mp-miniport.xml', 'analysis-cnt.xml')) {
             if (Test-Path $f) {
               "$f 存在：$((Get-Item $f).Length) 字节"
             } else {
@@ -566,7 +588,7 @@ jobs:
         run: |
           $hdrCodes = @{}
           $ours = @()
-          foreach ($f in @('analysis-wfp.xml', 'analysis-mp.xml', 'analysis-mp-miniport.xml')) {
+          foreach ($f in @('analysis-wfp.xml', 'analysis-mp.xml', 'analysis-mp-miniport.xml', 'analysis-cnt.xml')) {
             if (-not (Test-Path $f)) { "跳过不存在的 $f"; continue }
             [xml]$x = Get-Content -Raw $f
             foreach ($d in $x.SelectNodes('/DEFECTS/DEFECT')) {
@@ -606,6 +628,9 @@ jobs:
             build/x64/Release/iwanmp.sys
             build/x64/Release/iwanmp.pdb
             win-driver/iwanmp.inf
+            build/x64/Release/iwancnt.sys
+            build/x64/Release/iwancnt.pdb
+            win-driver/iwancnt.inf
             wdk-src/**
             out/devcon.exe
             analysis-*.xml

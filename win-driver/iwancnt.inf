@@ -1,0 +1,85 @@
+; iwancnt.inf -- counting ethernet NIC (the measurement peer, iwancnt.sys).
+;
+; This INF is ASCII-only on purpose: setupapi parses INF files as ANSI or
+; UTF-16LE, so non-ASCII bytes in an UTF-8 file would be decoded as cp1252.
+;
+; Install on the guest (test signing on, self-signed cert trusted):
+;     devcon.exe install win-driver\iwancnt.inf iwancnt
+; Remove:
+;     devcon.exe remove iwancnt
+;
+; No CatalogFile directive: the .cat is generated on the guest with
+; New-FileCatalog + Set-AuthenticodeSignature. An INF that names a missing
+; catalog fails to install, and a .sys with only its own signature is not
+; enough for an INF package under test signing.
+
+[Version]
+Signature       = "$Windows NT$"
+Class           = Net
+ClassGUID       = {4D36E972-E325-11CE-BFC1-08002BE10318}
+Provider        = %ProviderName%
+DriverVer       = 10/25/2026,1.0.0.0
+PnpLockdown     = 1
+
+[ControlFlags]
+ExcludeFromSelect = iwancnt
+
+[Manufacturer]
+%ManufacturerName% = iwancnt, NTamd64
+
+[iwancnt.NTamd64]
+%DeviceDesc% = iwancnt_Install, iwancnt
+
+[iwancnt_Install]
+; NCF_VIRTUAL: no hardware behind it, the driver fabricates the adapter.
+Characteristics    = 0x1
+; 802.3 media: the counting NIC is a plain ethernet segment with one peer.
+*IfType            = 6
+*MediaType         = 0
+*PhysicalMediaType = 0
+; Address and route are set by the measurement script (netsh / route add).
+EnableDhcp         = 0
+CopyFiles          = iwancnt_CopyFiles
+AddReg             = iwancnt_Reg
+
+[iwancnt_Install.Services]
+AddService = iwancnt, 0x00000002, iwancnt_Service
+
+[iwancnt_Reg]
+; HKR is the device instance key (Enum\ROOT\NET\NNNN): present ndis5 upward,
+; bind nothing below (the adapter is fabric, not a child of another adapter).
+; LowerRange "ethernet" tells NDIS which medium this miniport's lower edge is;
+; for a real NIC INF this is the physical medium the driver speaks.
+HKR, Ndi,            Service,    0, "iwancnt"
+HKR, Ndi\Interfaces, UpperRange, 0, "ndis5"
+HKR, Ndi\Interfaces, LowerRange, 0, "ethernet"
+
+; Measurement parameters. Disarm = 1 by default: the adapter installs but
+; InitializeEx refuses to run until the fuse is released, because one bad
+; bring-up is enough to make the machine unbootable.
+HKR, Parameters, Disarm,   0x00010001, 1
+HKR, Parameters, EchoMode, 0x00010001, 1
+HKR, Parameters, InnerOff, 0x00010001, 0
+HKR, Parameters, EchoIp,   0x00000000, "10.200.0.1"
+HKR, Parameters, Mac,      0x00000000, "02-00-49-57-41-4e"
+
+[DestinationDirs]
+DefaultDestDir    = 12
+iwancnt_CopyFiles = 12
+
+[iwancnt_CopyFiles]
+iwancnt.sys
+
+[iwancnt_Service]
+DisplayName   = %ServiceDesc%
+; ServiceType 1 = kernel driver, StartType 3 = demand (PnP starts it), ErrorControl 1.
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %12%\iwancnt.sys
+
+[Strings]
+ProviderName     = "iWAN"
+ManufacturerName = "iWAN"
+DeviceDesc       = "iWAN Counting NIC"
+ServiceDesc      = "iWAN Counting NIC Driver"
