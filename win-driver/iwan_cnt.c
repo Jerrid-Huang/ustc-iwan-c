@@ -6,9 +6,10 @@
  *
  *   - 发送路径：协议栈交下来的每一帧都累加计数（分"去往对端"与"来自对端"
  *     两类），这就是隧道真正压出来的负载；
- *   - 回声：交换以太头后把帧原样指示回协议栈（相当于一根回环线），于是同一
- *     台机器上可以同时观察两个方向；
- *   - ARP：对 EchoIp 代答 —— tcpip 不认为该地址属于本机，不代答就永远解析
+ *   - 桥接：装两张本网卡（A、B），每张把"目的 IP = PeerIp"的帧复制一份、改写
+ *     以太头（源 = 本卡、目的 = 对端卡 MAC）后在对端卡上指示上去，等于一根网线；
+ *     两端各跑一个用户态端点（客户端 / 计数服务端）就能双向测量；
+ *   - ARP：对 PeerIp 代答 —— tcpip 不认为该地址属于本机，不代答就永远解析
  *     不出下一跳；
  *   - 计数只暴露在 NDIS 统计里（Get-NetAdapterStatistics 直接可读），不建
  *     控制设备、不开共享内存：越少代码越不可能把整机搞挂。
@@ -16,11 +17,9 @@
  * 参数（HKLM\SYSTEM\CurrentControlSet\Services\iwancnt\Parameters）：
  *   Disarm   DWORD 默认 1（合上保险丝）。为 1 时 InitializeEx 直接失败，驱动
  *                  装着但不工作 —— 一次错误注册就让整机起不来的教训。
- *   EchoIp   SZ    默认 "10.200.0.1"，对端地址。
- *   EchoMode DWORD 默认 1：1 = 只交换以太头（回环给本机协议栈）；2 = 再交换
- *                  外层 IPv4 的源/目的与 UDP 端口（反射模式）。
- *   InnerOff DWORD 默认 0：非 0 时在该偏移处再交换内层 IPv4（明文隧道帧才
- *                  能用；加密载荷不能动，故默认关）。
+ *   PeerIp   SZ    默认 "10.200.0.1"，对端地址：对它代答 ARP，并把去往它的
+ *                  帧桥到另一个实例。两张卡各填对方的地址即可。
+ *   Bridge   DWORD 默认 1：为 0 时只计数、不桥接（纯"只计数对端"）。
  *   Mac      SZ    默认 "02-00-49-57-41-4e"。
  *
  * 边界：iwan.sys 是 WFP 平面、iwanmp.sys 是 NDIS 平面；本驱动不属于任何平面，
@@ -52,20 +51,30 @@ typedef struct _IWAN_CNT_ADAPTER {
 	volatile LONG                   running;
 	volatile LONG                   inflight;
 	UCHAR                           mac[6];
-	ULONG                           echo_ip;	/* 与帧内字节同序 */
-	ULONG                           echo_mode;
-	ULONG                           inner_off;
+	LIST_ENTRY                      link;		/* 全局实例链 */
+	ULONG                           peer_ip;	/* 与帧内字节同序 */
+	ULONG                           bridge;
 	volatile LONG64                 tx_frames;
 	volatile LONG64                 tx_bytes;
 	volatile LONG64                 peer_in_frames;
 	volatile LONG64                 peer_out_frames;
-	volatile LONG64                 echo_frames;
-	volatile LONG64                 echo_bytes;
+	volatile LONG64                 rx_frames;	/* 桥到对端实例的帧 */
+	volatile LONG64                 rx_bytes;
 	volatile LONG64                 arp_req;
 	volatile LONG64                 arp_rep;
 	volatile LONG64                 drops;
 	volatile LONG64                 other_frames;
 } IWAN_CNT_ADAPTER, *PIWAN_CNT_ADAPTER;
+
+/*
+ * 实例表：同一驱动的多张卡互相桥接（Windows 版 veth 对）。链表与锁在
+ * DriverEntry 里初始化，之后只增删、不移动。
+ */
+#define IWAN_CNT_MAX_PEERS 8u
+
+static LIST_ENTRY g_cnt_list;
+static KSPIN_LOCK g_cnt_lock;
+static BOOLEAN g_cnt_list_ready;
 
 static VOID iwan_cnt_trace(_In_ ULONG stage, _In_ LONG status);
 
@@ -128,18 +137,33 @@ iwan_cnt_ip4_csum(_Inout_updates_bytes_(20) UCHAR *ip)
 
 /* ---- 注册表参数与阶段追踪 -------------------------------------------- */
 
+/*
+ * 打开参数键。优先打开"本设备实例的驱动键"（Class\{4D36E972..}\00NN）：
+ * 桥接要用两张卡，而每张卡必须有自己的 PeerIp 与 MAC；服务键是全局的，
+ * 两个实例读到同一份配置就永远桥不到一起。驱动键拿不到时退回服务键，
+ * 单卡（纯计数）场景仍然可用。
+ */
 static BOOLEAN
-iwan_cnt_open_params(_Out_ HANDLE *key)
+iwan_cnt_open_params(_In_ NDIS_HANDLE adapter_handle, _Out_ HANDLE *key)
 {
+	PDEVICE_OBJECT pdo = NULL;
 	UNICODE_STRING path;
 	OBJECT_ATTRIBUTES oa;
 	NTSTATUS st;
+
+	NdisMGetDeviceProperty(adapter_handle, &pdo, NULL, NULL, NULL, NULL);
+	if (pdo != NULL) {
+		st = IoOpenDeviceRegistryKey(pdo, PLUGPLAY_REGKEY_DRIVER,
+					     KEY_READ, key);
+		if (NT_SUCCESS(st))
+			return TRUE;
+	}
 
 	RtlInitUnicodeString(&path, IWAN_CNT_PARAM_PATH);
 	InitializeObjectAttributes(&oa, &path,
 				   OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
 				   NULL, NULL);
-	st = ZwOpenKey(key, KEY_READ | KEY_SET_VALUE, &oa);
+	st = ZwOpenKey(key, KEY_READ, &oa);
 	return (BOOLEAN)NT_SUCCESS(st);
 }
 
@@ -444,8 +468,8 @@ iwan_cnt_indicate(_Inout_ PIWAN_CNT_ADAPTER a, _In_ UCHAR *buf, _In_ ULONG len,
 		(PVOID)(ULONG_PTR)ethertype;
 
 	InterlockedIncrement(&a->inflight);
-	InterlockedIncrement64(&a->echo_frames);
-	InterlockedAdd64(&a->echo_bytes, (LONG64)len);
+	InterlockedIncrement64(&a->rx_frames);
+	InterlockedAdd64(&a->rx_bytes, (LONG64)len);
 	/* 所有权在此转移：后续归还由 ReturnNetBufferLists 负责。 */
 #pragma warning(suppress: 6014)
 	NdisMIndicateReceiveNetBufferLists(
@@ -454,7 +478,9 @@ iwan_cnt_indicate(_Inout_ PIWAN_CNT_ADAPTER a, _In_ UCHAR *buf, _In_ ULONG len,
 			(dispatch ? NDIS_RECEIVE_FLAGS_DISPATCH_LEVEL : 0));
 }
 
-/* 对 EchoIp 的 ARP 请求代答。 */
+/* 对 PeerIp 的 ARP 请求代答。 */
+#pragma warning(push)
+#pragma warning(disable: 6014)	/* 缓冲所有权交给 iwan_cnt_indicate */
 static VOID
 iwan_cnt_arp_reply(_Inout_ PIWAN_CNT_ADAPTER a,
 		   _In_reads_bytes_(len) const UCHAR *p, _In_ ULONG len,
@@ -466,7 +492,7 @@ iwan_cnt_arp_reply(_Inout_ PIWAN_CNT_ADAPTER a,
 		return;
 	if (iwan_cnt_rd16(p + 20) != 1)		/* op = request */
 		return;
-	if (iwan_cnt_rd32(p + 38) != a->echo_ip)	/* target = 我们 */
+	if (iwan_cnt_rd32(p + 38) != a->peer_ip)	/* target = 我们 */
 		return;
 	r = (UCHAR *)ExAllocatePool2(POOL_FLAG_NON_PAGED, 42, IWAN_CNT_TAG);
 	if (r == NULL) {
@@ -483,81 +509,73 @@ iwan_cnt_arp_reply(_Inout_ PIWAN_CNT_ADAPTER a,
 	r[19] = 4;
 	iwan_cnt_wr16(r + 20, 2);		/* op = reply */
 	RtlCopyMemory(r + 22, a->mac, 6);	/* sha */
-	iwan_cnt_wr32(r + 28, a->echo_ip);	/* spa */
+	iwan_cnt_wr32(r + 28, a->peer_ip);	/* spa */
 	RtlCopyMemory(r + 32, p + 22, 6);	/* tha */
 	RtlCopyMemory(r + 38, p + 28, 4);	/* tpa */
 	InterlockedIncrement64(&a->arp_req);
 	InterlockedIncrement64(&a->arp_rep);
-#pragma warning(suppress: 6014)
 	iwan_cnt_indicate(a, r, 42, IWAN_CNT_ETH_ARP, dispatch);
 }
+#pragma warning(pop)
 
-/* 交换一段 IPv4 头（可选交换 UDP 端口）并重算 IP 校验和。 */
+/*
+ * 把一个帧桥到其余实例：源 MAC 改成本卡，目的 MAC 改成对端卡的 MAC。
+ * 为什么要改目的 MAC：对端协议栈的接收过滤只收"发给本卡"与广播的帧，原样的帧
+ * 目的 MAC 是本卡，到了对端会被直接丢掉。
+ * 调用者已确认这是"去往 PeerIp"的帧；没有对端实例时什么都不做（纯计数模式）。
+ */
+#pragma warning(push)
+#pragma warning(disable: 6014)	/* 缓冲所有权交给 iwan_cnt_indicate */
 static VOID
-iwan_cnt_swap_ip4(_Inout_updates_bytes_(len) UCHAR *p, _In_ ULONG len,
-		  _In_ BOOLEAN swap_ports)
+iwan_cnt_bridge(_Inout_ PIWAN_CNT_ADAPTER a,
+		_In_reads_bytes_(len) const UCHAR *p, _In_ ULONG len,
+		_In_ UINT16 ethertype, _In_ BOOLEAN dispatch)
 {
-	ULONG ihl;
-	ULONG need;
-	UCHAR t[4];
-	UCHAR p0, p1;
-
-	if (len < 20 || (p[0] >> 4) != 4)
-		return;
-	ihl = (ULONG)(p[0] & 0x0Fu) * 4;
-	if (ihl < 20 || ihl > len)
-		return;
-	/* 先把要碰的最大偏移算成一个数：交换 4 字节地址 + 可能的 8 字节 UDP 头。 */
-	need = ihl + ((swap_ports && p[9] == 17) ? 8u : 0u);
-	if (need > len)
-		return;
-	RtlCopyMemory(t, p + 12, 4);
-	RtlCopyMemory(p + 12, p + 16, 4);
-	RtlCopyMemory(p + 16, t, 4);
-	if (swap_ports && p[9] == 17) {
-		p0 = p[ihl];
-		p1 = p[ihl + 1];
-		p[ihl] = p[ihl + 2];
-		p[ihl + 1] = p[ihl + 3];
-		p[ihl + 2] = p0;
-		p[ihl + 3] = p1;
-		/* IPv4 下 UDP 校验和 0 = 未计算，交换后清零最省事。 */
-		iwan_cnt_wr16(p + ihl + 6, 0);
-	}
-	iwan_cnt_ip4_csum(p);
-}
-
-static VOID
-iwan_cnt_echo(_Inout_ PIWAN_CNT_ADAPTER a,
-	      _In_reads_bytes_(len) const UCHAR *p, _In_ ULONG len,
-	      _In_ UINT16 ethertype, _In_ BOOLEAN dispatch)
-{
-	UCHAR *buf;
-	UCHAR m0;
-	ULONG i;
+	PIWAN_CNT_ADAPTER peers[IWAN_CNT_MAX_PEERS];
+	ULONG npeers = 0, i;
+	PLIST_ENTRY e;
+	KIRQL old;
 
 	if (len < IWAN_CNT_ETH_HDR)
 		return;
-	buf = (UCHAR *)ExAllocatePool2(POOL_FLAG_NON_PAGED, len, IWAN_CNT_TAG);
-	if (buf == NULL) {
-		InterlockedIncrement64(&a->drops);
+	if (InterlockedCompareExchange(&a->bridge, 1, 1) == 0)
 		return;
+	if (!g_cnt_list_ready)
+		return;
+
+	/* 先在锁内把对端指针抄出来，再在锁外做分配与指示：NDIS 调用可能重入
+	 * 本驱动的发送路径，持锁跨调用是死锁的经典配方。 */
+	KeAcquireSpinLock(&g_cnt_lock, &old);
+	for (e = g_cnt_list.Flink;
+	     e != NULL && e != &g_cnt_list && npeers < IWAN_CNT_MAX_PEERS;
+	     e = e->Flink) {
+		PIWAN_CNT_ADAPTER peer =
+			CONTAINING_RECORD(e, IWAN_CNT_ADAPTER, link);
+
+		if (peer == a)
+			continue;
+		if (InterlockedCompareExchange(&peer->running, 1, 1) == 0)
+			continue;
+		peers[npeers++] = peer;
 	}
-	RtlCopyMemory(buf, p, len);
-	/* 回环线：交换以太头。交换后目的 = 源 = 本卡 MAC，协议栈按本机接收。 */
-	for (i = 0; i < 6; i++) {
-		m0 = buf[i];
-		buf[i] = buf[6 + i];
-		buf[6 + i] = m0;
+	KeReleaseSpinLock(&g_cnt_lock, old);
+
+	for (i = 0; i < npeers; i++) {
+		PIWAN_CNT_ADAPTER peer = peers[i];
+		UCHAR *buf = (UCHAR *)ExAllocatePool2(
+			POOL_FLAG_NON_PAGED, len, IWAN_CNT_TAG);
+
+		if (buf == NULL) {
+			InterlockedIncrement64(&a->drops);
+			continue;
+		}
+		RtlCopyMemory(buf, p, len);
+		RtlCopyMemory(buf, peer->mac, 6);	/* 目的 = 对端卡 */
+		RtlCopyMemory(buf + 6, a->mac, 6);	/* 源 = 本卡 */
+		iwan_cnt_indicate(peer, buf, len, ethertype, dispatch);
 	}
-	if (a->echo_mode >= 2)
-		iwan_cnt_swap_ip4(buf + IWAN_CNT_ETH_HDR,
-				  len - IWAN_CNT_ETH_HDR, TRUE);
-	if (a->inner_off != 0 && len > a->inner_off + 20)
-		iwan_cnt_swap_ip4(buf + a->inner_off, len - a->inner_off, TRUE);
-#pragma warning(suppress: 6014)
-	iwan_cnt_indicate(a, buf, len, ethertype, dispatch);
 }
+#pragma warning(pop)
 
 /* ---- 小型端口：发送 / 归还 / 取消 ------------------------------------ */
 
@@ -634,21 +652,26 @@ iwan_cnt_send_nbls(_In_ NDIS_HANDLE MiniportAdapterContext,
 			{
 				ULONG saddr = iwan_cnt_rd32(hp + 26);
 				ULONG daddr = iwan_cnt_rd32(hp + 30);
-				PVOID full;
 
-				if (daddr == a->echo_ip)
+				if (daddr == a->peer_ip) {
+					PVOID full;
+
 					InterlockedIncrement64(
 						&a->peer_in_frames);
-				else if (saddr == a->echo_ip)
+					full = NdisGetDataBuffer(nb, len,
+								 NULL, 1, 0);
+					if (full != NULL)
+						iwan_cnt_bridge(
+							a,
+							(const UCHAR *)full,
+							len, et, dispatch);
+				} else if (saddr == a->peer_ip) {
 					InterlockedIncrement64(
 						&a->peer_out_frames);
-				else
+				} else {
 					InterlockedIncrement64(
 						&a->other_frames);
-				full = NdisGetDataBuffer(nb, len, NULL, 1, 0);
-				if (full != NULL)
-					iwan_cnt_echo(a, (const UCHAR *)full,
-						      len, et, dispatch);
+				}
 			}
 		}
 	}
@@ -807,7 +830,7 @@ iwan_cnt_oid_request(_In_ NDIS_HANDLE MiniportAdapterContext,
 		return iwan_cnt_oid_put_u64(OidRequest, (UINT64)a->tx_frames);
 	case OID_GEN_RCV_OK:
 	case OID_GEN_DIRECTED_FRAMES_RCV:
-		return iwan_cnt_oid_put_u64(OidRequest, (UINT64)a->echo_frames);
+		return iwan_cnt_oid_put_u64(OidRequest, (UINT64)a->rx_frames);
 	case OID_GEN_XMIT_ERROR:
 		return iwan_cnt_oid_put_u64(OidRequest, (UINT64)a->drops);
 	case OID_GEN_RCV_ERROR:
@@ -815,7 +838,7 @@ iwan_cnt_oid_request(_In_ NDIS_HANDLE MiniportAdapterContext,
 	case OID_GEN_BYTES_XMIT:
 		return iwan_cnt_oid_put_u64(OidRequest, (UINT64)a->tx_bytes);
 	case OID_GEN_BYTES_RCV:
-		return iwan_cnt_oid_put_u64(OidRequest, (UINT64)a->echo_bytes);
+		return iwan_cnt_oid_put_u64(OidRequest, (UINT64)a->rx_bytes);
 	case OID_GEN_STATISTICS: {
 		PNDIS_STATISTICS_INFO si = (PNDIS_STATISTICS_INFO)(PVOID)
 			OidRequest->DATA.QUERY_INFORMATION.InformationBuffer;
@@ -837,8 +860,8 @@ iwan_cnt_oid_request(_In_ NDIS_HANDLE MiniportAdapterContext,
 			NDIS_STATISTICS_XMIT_ERROR_SUPPORTED |
 			NDIS_STATISTICS_XMIT_OK_SUPPORTED |
 			NDIS_STATISTICS_RCV_OK_SUPPORTED;
-		si->ifHCInUcastPkts = (UINT64)a->echo_frames;
-		si->ifHCInOctets = (UINT64)a->echo_bytes;
+		si->ifHCInUcastPkts = (UINT64)a->rx_frames;
+		si->ifHCInOctets = (UINT64)a->rx_bytes;
 		si->ifHCOutUcastPkts = (UINT64)a->tx_frames;
 		si->ifHCOutOctets = (UINT64)a->tx_bytes;
 		si->ifOutErrors = (UINT64)a->drops;
@@ -936,7 +959,7 @@ iwan_cnt_initialize(_In_ NDIS_HANDLE MiniportAdapterHandle,
 	NDIS_MINIPORT_ADAPTER_GENERAL_ATTRIBUTES gen;
 	HANDLE key = NULL;
 	WCHAR tmp[64];
-	ULONG disarm = 1, off = 0;
+	ULONG disarm = 1;
 	BOOLEAN mac_given = FALSE;
 
 	UNREFERENCED_PARAMETER(MiniportDriverContext);
@@ -951,21 +974,21 @@ iwan_cnt_initialize(_In_ NDIS_HANDLE MiniportAdapterHandle,
 		return NDIS_STATUS_RESOURCES;
 	}
 	RtlZeroMemory(a, sizeof(*a));
+	InitializeListHead(&a->link);
 	a->adapter_handle = MiniportAdapterHandle;
 
-	if (iwan_cnt_open_params(&key)) {
+	if (iwan_cnt_open_params(MiniportAdapterHandle, &key)) {
 		disarm = iwan_cnt_param_u32(key, L"Disarm", 1);
-		a->echo_mode = iwan_cnt_param_u32(key, L"EchoMode", 1);
-		off = iwan_cnt_param_u32(key, L"InnerOff", 0);
-		if (iwan_cnt_param_str(key, L"EchoIp", tmp,
+		a->bridge = iwan_cnt_param_u32(key, L"Bridge", 1);
+		if (iwan_cnt_param_str(key, L"PeerIp", tmp,
 				       RTL_NUMBER_OF(tmp)))
-			a->echo_ip = iwan_cnt_parse_ip(tmp);
+			a->peer_ip = iwan_cnt_parse_ip(tmp);
 		if (iwan_cnt_param_str(key, L"Mac", tmp, RTL_NUMBER_OF(tmp)))
 			mac_given = iwan_cnt_parse_mac(tmp, a->mac);
 		ZwClose(key);
 	}
-	if (a->echo_ip == 0)
-		a->echo_ip = iwan_cnt_parse_ip(L"10.200.0.1");
+	if (a->peer_ip == 0)
+		a->peer_ip = iwan_cnt_parse_ip(L"10.200.0.1");
 	if (!mac_given) {
 		a->mac[0] = 0x02;
 		a->mac[1] = 0x00;
@@ -974,7 +997,6 @@ iwan_cnt_initialize(_In_ NDIS_HANDLE MiniportAdapterHandle,
 		a->mac[4] = 0x41;
 		a->mac[5] = 0x4E;
 	}
-	a->inner_off = off;
 
 	if (disarm != 0) {
 		/* 保险丝合上：装得上、不工作。写成 0 才生效。 */
@@ -1079,14 +1101,18 @@ iwan_cnt_initialize(_In_ NDIS_HANDLE MiniportAdapterHandle,
 		return st;
 	}
 
+	/* 先挂进实例表再放开 running：桥接方看到 running=1 时链表一定可遍历。 */
+	if (g_cnt_list_ready)
+		ExInterlockedInsertTailList(&g_cnt_list, &a->link,
+					    &g_cnt_lock);
 	InterlockedExchange(&a->running, 1);
-	iwan_cnt_trace(26, (LONG)a->echo_ip);
-	DbgPrint("iwancnt: up, echo %u.%u.%u.%u mode %lu inner_off %lu\n",
-		 (unsigned)((a->echo_ip >> 24) & 0xFF),
-		 (unsigned)((a->echo_ip >> 16) & 0xFF),
-		 (unsigned)((a->echo_ip >> 8) & 0xFF),
-		 (unsigned)(a->echo_ip & 0xFF),
-		 (unsigned long)a->echo_mode, (unsigned long)a->inner_off);
+	iwan_cnt_trace(26, (LONG)a->peer_ip);
+	DbgPrint("iwancnt: up, peer %u.%u.%u.%u bridge %lu\n",
+		 (unsigned)((a->peer_ip >> 24) & 0xFF),
+		 (unsigned)((a->peer_ip >> 16) & 0xFF),
+		 (unsigned)((a->peer_ip >> 8) & 0xFF),
+		 (unsigned)(a->peer_ip & 0xFF),
+		 (unsigned long)a->bridge);
 	return NDIS_STATUS_SUCCESS;
 }
 #pragma warning(pop)
@@ -1104,7 +1130,14 @@ iwan_cnt_halt(_In_ NDIS_HANDLE MiniportAdapterContext,
 	if (a == NULL)
 		return;
 	InterlockedExchange(&a->running, 0);
-	/* 等在途回声帧归还；等不到就泄漏池，绝不释放可能再被引用的池。 */
+	if (g_cnt_list_ready) {
+		KIRQL old;
+
+		KeAcquireSpinLock(&g_cnt_lock, &old);
+		RemoveEntryList(&a->link);
+		KeReleaseSpinLock(&g_cnt_lock, old);
+	}
+	/* 等在途桥接帧归还；等不到就泄漏池，绝不释放可能再被引用的池。 */
 	for (i = 0; i < 1000; i++) {
 		if (InterlockedCompareExchange(&a->inflight, 0, 0) == 0)
 			break;
@@ -1160,6 +1193,10 @@ DriverEntry(_In_ PDRIVER_OBJECT DriverObject,
 	UCHAR minor;
 
 	ExInitializeDriverRuntime(DrvRtPoolNxOptIn);
+	/* 实例表必须在任何一张卡 InitializeEx 之前就绪：桥接方遍历它。 */
+	InitializeListHead(&g_cnt_list);
+	KeInitializeSpinLock(&g_cnt_lock);
+	g_cnt_list_ready = TRUE;
 	iwan_cnt_trace(30, (LONG)NdisGetVersion());
 
 	minor = (UCHAR)(NdisGetVersion() & 0xFFu);

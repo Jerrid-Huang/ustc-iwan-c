@@ -3,10 +3,16 @@
 ; This INF is ASCII-only on purpose: setupapi parses INF files as ANSI or
 ; UTF-16LE, so non-ASCII bytes in an UTF-8 file would be decoded as cp1252.
 ;
-; Install on the guest (test signing on, self-signed cert trusted):
-;     devcon.exe install win-driver\iwancnt.inf iwancnt
+; Two device models are defined so that ONE guest can host both ends of a
+; virtual wire:
+;     devcon.exe install win-driver\iwancnt.inf iwancnt    ; side A
+;     devcon.exe install win-driver\iwancnt.inf iwancntb   ; side B
+; Each model carries its own Parameters block (PeerIp, Mac); the driver reads
+; those from its device driver key, not from the shared service key, so the
+; two instances really do disagree about who the peer is.
 ; Remove:
 ;     devcon.exe remove iwancnt
+;     devcon.exe remove iwancntb
 ;
 ; No CatalogFile directive: the .cat is generated on the guest with
 ; New-FileCatalog + Set-AuthenticodeSignature. An INF that names a missing
@@ -18,17 +24,18 @@ Signature       = "$Windows NT$"
 Class           = Net
 ClassGUID       = {4D36E972-E325-11CE-BFC1-08002BE10318}
 Provider        = %ProviderName%
-DriverVer       = 10/25/2026,1.0.0.0
+DriverVer       = 10/26/2026,1.0.0.0
 PnpLockdown     = 1
 
 [ControlFlags]
-ExcludeFromSelect = iwancnt
+ExcludeFromSelect = iwancnt, iwancntb
 
 [Manufacturer]
 %ManufacturerName% = iwancnt, NTamd64
 
 [iwancnt.NTamd64]
-%DeviceDesc% = iwancnt_Install, iwancnt
+%DeviceDesc%  = iwancnt_Install,  iwancnt
+%DeviceDescB% = iwancnt_InstallB, iwancntb
 
 [iwancnt_Install]
 ; NCF_VIRTUAL: no hardware behind it, the driver fabricates the adapter.
@@ -42,14 +49,25 @@ EnableDhcp         = 0
 CopyFiles          = iwancnt_CopyFiles
 AddReg             = iwancnt_Reg
 
+[iwancnt_InstallB]
+Characteristics    = 0x1
+*IfType            = 6
+*MediaType         = 0
+*PhysicalMediaType = 0
+EnableDhcp         = 0
+CopyFiles          = iwancnt_CopyFiles
+AddReg             = iwancnt_RegB
+
 [iwancnt_Install.Services]
+AddService = iwancnt, 0x00000002, iwancnt_Service
+
+[iwancnt_InstallB.Services]
 AddService = iwancnt, 0x00000002, iwancnt_Service
 
 [iwancnt_Reg]
 ; HKR is the device instance key (Enum\ROOT\NET\NNNN): present ndis5 upward,
 ; bind nothing below (the adapter is fabric, not a child of another adapter).
-; LowerRange "ethernet" tells NDIS which medium this miniport's lower edge is;
-; for a real NIC INF this is the physical medium the driver speaks.
+; LowerRange "ethernet" tells NDIS which medium this miniport's lower edge is.
 HKR, Ndi,            Service,    0, "iwancnt"
 HKR, Ndi\Interfaces, UpperRange, 0, "ndis5"
 HKR, Ndi\Interfaces, LowerRange, 0, "ethernet"
@@ -58,10 +76,19 @@ HKR, Ndi\Interfaces, LowerRange, 0, "ethernet"
 ; InitializeEx refuses to run until the fuse is released, because one bad
 ; bring-up is enough to make the machine unbootable.
 HKR, Parameters, Disarm,   0x00010001, 1
-HKR, Parameters, EchoMode, 0x00010001, 1
-HKR, Parameters, InnerOff, 0x00010001, 0
-HKR, Parameters, EchoIp,   0x00000000, "10.200.0.1"
+HKR, Parameters, Bridge,   0x00010001, 1
+HKR, Parameters, PeerIp,   0x00000000, "10.200.0.1"
 HKR, Parameters, Mac,      0x00000000, "02-00-49-57-41-4e"
+
+[iwancnt_RegB]
+HKR, Ndi,            Service,    0, "iwancnt"
+HKR, Ndi\Interfaces, UpperRange, 0, "ndis5"
+HKR, Ndi\Interfaces, LowerRange, 0, "ethernet"
+
+HKR, Parameters, Disarm,   0x00010001, 1
+HKR, Parameters, Bridge,   0x00010001, 1
+HKR, Parameters, PeerIp,   0x00000000, "10.200.0.2"
+HKR, Parameters, Mac,      0x00000000, "02-00-49-57-41-4f"
 
 [DestinationDirs]
 DefaultDestDir    = 12
@@ -81,5 +108,6 @@ ServiceBinary = %12%\iwancnt.sys
 [Strings]
 ProviderName     = "iWAN"
 ManufacturerName = "iWAN"
-DeviceDesc       = "iWAN Counting NIC"
+DeviceDesc       = "iWAN Counting NIC A"
+DeviceDescB      = "iWAN Counting NIC B"
 ServiceDesc      = "iWAN Counting NIC Driver"
