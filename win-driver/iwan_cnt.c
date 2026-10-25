@@ -810,8 +810,7 @@ iwan_cnt_oid_request(_In_ NDIS_HANDLE MiniportAdapterContext,
 		si->Header.Revision = NDIS_STATISTICS_INFO_REVISION_1;
 		si->Header.Size = (USHORT)need;
 		si->SupportedStatistics =
-			NDIS_STATISTICS_DIRECTED_FRAMES_RCV_SUPPORTED |
-			NDIS_STATISTICS_DIRECTED_FRAMES_XMIT_SUPPORTED |
+				NDIS_STATISTICS_DIRECTED_FRAMES_XMIT_SUPPORTED |
 			NDIS_STATISTICS_BYTES_RCV_SUPPORTED |
 			NDIS_STATISTICS_BYTES_XMIT_SUPPORTED |
 			NDIS_STATISTICS_XMIT_ERROR_SUPPORTED |
@@ -861,38 +860,6 @@ iwan_cnt_shutdown(_In_ NDIS_HANDLE MiniportAdapterContext,
 {
 	UNREFERENCED_PARAMETER(MiniportAdapterContext);
 	UNREFERENCED_PARAMETER(ShutdownAction);
-}
-
-static
-_Function_class_(MINIPORT_DIRECT_OID_REQUEST)
-NDIS_STATUS
-iwan_cnt_direct_oid(_In_ NDIS_HANDLE MiniportAdapterContext,
-		    _In_ PNDIS_OID_REQUEST OidRequest)
-{
-	UNREFERENCED_PARAMETER(MiniportAdapterContext);
-	UNREFERENCED_PARAMETER(OidRequest);
-	return NDIS_STATUS_NOT_SUPPORTED;
-}
-
-static
-_Function_class_(MINIPORT_CANCEL_DIRECT_OID_REQUEST)
-VOID
-iwan_cnt_cancel_direct_oid(_In_ NDIS_HANDLE MiniportAdapterContext,
-			   _In_ PVOID RequestId)
-{
-	UNREFERENCED_PARAMETER(MiniportAdapterContext);
-	UNREFERENCED_PARAMETER(RequestId);
-}
-
-static
-_Function_class_(MINIPORT_SYNCHRONOUS_OID_REQUEST)
-NDIS_STATUS
-iwan_cnt_sync_oid(_In_ NDIS_HANDLE MiniportAdapterContext,
-		  _In_ PNDIS_OID_REQUEST OidRequest)
-{
-	UNREFERENCED_PARAMETER(MiniportAdapterContext);
-	UNREFERENCED_PARAMETER(OidRequest);
-	return NDIS_STATUS_NOT_SUPPORTED;
 }
 
 /* ---- 小型端口：暂停 / 恢复 ------------------------------------------ */
@@ -1017,7 +984,8 @@ iwan_cnt_initialize(_In_ NDIS_HANDLE MiniportAdapterHandle,
 			     NDIS_MINIPORT_ATTRIBUTES_SURPRISE_REMOVE_OK;
 	reg.CheckForHangTimeInSeconds = 0;
 	reg.InterfaceType = NdisInterfaceInternal;
-	st = NdisMSetMiniportAttributes(MiniportAdapterHandle, &reg);
+	st = NdisMSetMiniportAttributes(MiniportAdapterHandle,
+					(PNDIS_MINIPORT_ADAPTER_ATTRIBUTES)&reg);
 	if (st != NDIS_STATUS_SUCCESS) {
 		iwan_cnt_trace(24, (LONG)st);
 		NdisFreeNetBufferListPool(a->nbl_pool);
@@ -1027,10 +995,13 @@ iwan_cnt_initialize(_In_ NDIS_HANDLE MiniportAdapterHandle,
 
 	RtlZeroMemory(&gen, sizeof(gen));
 	gen.Header.Type = NDIS_OBJECT_TYPE_MINIPORT_ADAPTER_GENERAL_ATTRIBUTES;
+	/* 与 iwanmp 同口径：REVISION_1。这份 WDK 的结构体是单一定义，尾部的
+	 * SupportedStatistics / SupportedOidList 也都能写；revision 只决定
+	 * NDIS 认到哪个长度为止，而统计我们走自己的 OID_GEN_STATISTICS 处理。 */
 	gen.Header.Revision =
-		NDIS_MINIPORT_ADAPTER_GENERAL_ATTRIBUTES_REVISION_2;
+		NDIS_MINIPORT_ADAPTER_GENERAL_ATTRIBUTES_REVISION_1;
 	gen.Header.Size =
-		NDIS_SIZEOF_MINIPORT_ADAPTER_GENERAL_ATTRIBUTES_REVISION_2;
+		NDIS_SIZEOF_MINIPORT_ADAPTER_GENERAL_ATTRIBUTES_REVISION_1;
 	gen.MediaType = NdisMedium802_3;
 	gen.PhysicalMediumType = NdisPhysicalMediumUnspecified;
 	gen.MtuSize = IWAN_CNT_MTU;
@@ -1060,7 +1031,6 @@ iwan_cnt_initialize(_In_ NDIS_HANDLE MiniportAdapterHandle,
 	gen.IfConnectorPresent = FALSE;
 	gen.SupportedStatistics =
 		NDIS_STATISTICS_DIRECTED_FRAMES_XMIT_SUPPORTED |
-		NDIS_STATISTICS_DIRECTED_FRAMES_RCV_SUPPORTED |
 		NDIS_STATISTICS_BYTES_XMIT_SUPPORTED |
 		NDIS_STATISTICS_BYTES_RCV_SUPPORTED |
 		NDIS_STATISTICS_XMIT_ERROR_SUPPORTED |
@@ -1072,7 +1042,8 @@ iwan_cnt_initialize(_In_ NDIS_HANDLE MiniportAdapterHandle,
 	gen.SupportedOidList = (PNDIS_OID)(PVOID)iwan_cnt_oids;
 	gen.SupportedOidListLength = sizeof(iwan_cnt_oids);
 	gen.AutoNegotiationFlags = 0;
-	st = NdisMSetMiniportAttributes(MiniportAdapterHandle, &gen);
+	st = NdisMSetMiniportAttributes(MiniportAdapterHandle,
+					(PNDIS_MINIPORT_ADAPTER_ATTRIBUTES)&gen);
 	if (st != NDIS_STATUS_SUCCESS) {
 		iwan_cnt_trace(25, (LONG)st);
 		NdisFreeNetBufferListPool(a->nbl_pool);
