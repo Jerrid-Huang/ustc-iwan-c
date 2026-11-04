@@ -193,7 +193,7 @@ bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
     snprintf(srv32, sizeof srv32, "%s/32", srv);
     char *fc[] = { "route", "flush", "cache", NULL };
 
-    /* B-1/B-2: start a fresh session — neither the tunnel default nor
+    /* B-1/B-2: start a fresh session -- neither the tunnel default nor
      * the server pin is installed yet, so if anything below fails before
      * we install them, the rollback (route_teardown) must not touch the
      * pre-existing routes (it only acts when the matching flag is set) */
@@ -211,7 +211,7 @@ bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
     /* the server-pinned /32 only exists in the IPv4 table; an IPv6
      * server address cannot be routed via the (IPv4) default gateway
      * and would fail every `ip route add` attempt, so skip it.
-     * M4 (SUMMARY-2): `replace` not `add` — a pin left behind by a
+     * M4 (SUMMARY-2): `replace` not `add` -- a pin left behind by a
      * crashed client would make every later connection fail with
      * EEXIST (and the stale pin blackholes server traffic) */
     if (srv_v4 && !srv_lo) {
@@ -223,7 +223,7 @@ bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
             route_iface_down(tun);
             return false;
         }
-        /* B-2: remember that WE now own this /32 — teardown may only
+        /* B-2: remember that WE now own this /32 -- teardown may only
          * remove it (and only via the same via/dev attributes) when this
          * flag is set, so a pre-existing /32 that we never replaced is
          * never deleted by us */
@@ -318,14 +318,14 @@ void route_teardown(const char *tun, const char *srv, const char *ogw,
             /* B-1: only ever remove a default that THIS process really
              * installed. route_setup sets srv_default_installed only
              * after `route replace default dev <tun>` succeeded, so when
-             * setup failed before that step (rollback path) — or there
-             * is simply no tunnel default from this session — the
+             * setup failed before that step (rollback path) -- or there
+             * is simply no tunnel default from this session -- the
              * pre-existing physical default(s) are left completely
              * untouched; the old unqualified `route del default` would
              * have deleted the real default and stranded the machine. */
             if (!srv_default_installed)
                 continue;
-            /* we did replace the default: clear the flag up front —
+            /* we did replace the default: clear the flag up front --
              * whether or not the delete below succeeds we no longer own
              * a tunnel default afterwards, so a later teardown (or a
              * fresh session) cannot act on stale state. */
@@ -348,14 +348,14 @@ void route_teardown(const char *tun, const char *srv, const char *ogw,
             }
             /* we removed it: restore the original via-gateway route,
              * keeping its metric (captured by capture_default) so route
-             * precedence matches the pre-VPN state — a metric-less
+             * precedence matches the pre-VPN state -- a metric-less
              * restore would install a priority-0 default that shadows
              * (or is shadowed by) other defaults.
              *
              * R1-C-C-1: `replace`, NOT `add`. The kernel matches route
              * aliases by (prefix, dscp, fib_priority), so setup's
              * metric-less `replace default dev <tun>` does not replace a
-             * DHCP default carrying e.g. metric 100 — both coexist and
+             * DHCP default carrying e.g. metric 100 -- both coexist and
              * the physical one is still in the table here. `add` would
              * then fail EEXIST and the device-only fallback below would
              * install a priority-0 on-link default that shadows the real
@@ -386,7 +386,7 @@ void route_teardown(const char *tun, const char *srv, const char *ogw,
                  * device-only default route so the machine is never
                  * left with NO default route at all */
                 log_err("route_teardown: restore default via %s dev %s "
-                        "failed — trying device-only default",
+                        "failed -- trying device-only default",
                         ogw, odev);
                 char *d2b[] = { "route", "replace", "default", "dev",
                                 (char *)odev, NULL };
@@ -416,7 +416,7 @@ void route_teardown(const char *tun, const char *srv, const char *ogw,
     struct in_addr s4;
     snprintf(srv32, sizeof srv32, "%s/32", srv);
     /* B-2: only remove the server /32 pin this process actually
-     * installed — srv_pin_installed is set by route_setup right after
+     * installed -- srv_pin_installed is set by route_setup right after
      * `route replace <srv>/32 via <ogw> dev <odev>` succeeds. The delete
      * mirrors setup's via/dev attributes, so a pre-existing /32 that is
      * not ours (or one pinned via another gateway/device) is never
@@ -444,7 +444,7 @@ void route_setup6(const char *tun, const slist_t *routes6)
      * host that already has a physical IPv6 default: the kernel applies
      * IP6_RT_PRIO_USER (1024) to a v6 netlink route whose RTA_PRIORITY is
      * absent (inet6_rtm_newroute), so (a) a `add ::/0` collided with an
-     * RA default at the same 1024 and rtnetlink answered EEXIST — the
+     * RA default at the same 1024 and rtnetlink answered EEXIST -- the
      * tunnel ::/0 was never installed, and (b) even when the metrics
      * differed, the 1024 tunnel default lost to any lower-metric physical
      * default. The metric below is therefore written EXPLICITLY as
@@ -454,7 +454,7 @@ void route_setup6(const char *tun, const slist_t *routes6)
      * physical default stays in the table and self-heals when the TUN
      * unregisters) is only reproducible on v6 by naming metric 0. The
      * v4/v6 replace tradeoffs are otherwise shared: replace is idempotent
-     * (a leftover from an old run — at any metric — is superseded in its
+     * (a leftover from an old run -- at any metric -- is superseded in its
      * slot if identical or re-created), and neither side ever removes the
      * physical default because independent metrics keep both entries in
      * the table; the only shared edge is a pre-existing physical route AT

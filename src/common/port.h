@@ -42,7 +42,7 @@
     *
     * NOTE for the ILP32 (i686) mingw build: intptr_t is 32-bit there, so this
     * ssize_t is `int` (32-bit) and an `unsigned int` source does not widen on
-    * assignment — it is a sign-changing narrowing. Every `ssize_t n =
+    * assignment -- it is a sign-changing narrowing. Every `ssize_t n =
     * <msg_len>` from a struct mmsghdr below therefore needs an explicit
     * (ssize_t) cast; that cast is a harmless no-op where ssize_t is already
     * 64-bit (LLP64) and keeps the site clean on both architectures. x86_64 is
@@ -177,7 +177,7 @@ struct mmsghdr {
 /* ---------------- platform-typed msg_iovlen argument --------------- */
 /* struct msghdr::msg_iovlen crosses the same boundary as the fd above, but
  * with the opposite spelling problem. "POSIX" does NOT actually pin the
- * field to size_t — the real widths are:
+ * field to size_t -- the real widths are:
  *   - glibc (every arch):        size_t;
  *   - musl (every arch, incl. i386 and x86_64): int;
  *   - Darwin/XNU:                int (struct msghdr has `int msg_iovlen`,
@@ -250,7 +250,7 @@ void port_sleep_us(unsigned us);   /* rounds up to the ms timer on win32 */
 
 long port_cpu_count(void);
 /* malloc'd home directory (USERPROFILE on Windows, passwd on POSIX).
- * Windows: only a fully-qualified path is accepted — drive-absolute
+ * Windows: only a fully-qualified path is accepted -- drive-absolute
  * (X:\ or X:/) or UNC (\\server\share) for USERPROFILE, and HOMEDRIVE
  * must be "X:" with HOMEPATH starting in a separator; a malformed
  * environment yields NULL (never a CWD- or drive-relative path, which
@@ -277,7 +277,7 @@ bool port_is_admin(void);
 /* Relaunch the current executable as administrator via a UAC prompt
  * (ShellExecuteW "runas"). argv is the original main() argv; the
  * executable path is resolved from the running image. Returns 0 when
- * the elevated instance was launched (the caller should exit — the new
+ * the elevated instance was launched (the caller should exit -- the new
  * process owns the work), -1 when elevation failed or was declined. */
 int port_elevate_self(int argc, char **argv);
 
@@ -312,7 +312,7 @@ int port_set_nonblock(int fd, bool nb);
 
 /* ---------------------- datagram / stream I/O ---------------------- */
 /* All wrappers set errno on failure and return -1 (recvmmsg with
- * nothing available also returns -1/EAGAIN, mirroring Linux — callers
+ * nothing available also returns -1/EAGAIN, mirroring Linux -- callers
  * poll on that). send/recv len is size_t; winsock's int limit is
  * irrelevant (<= 64 KiB frames). */
 
@@ -337,7 +337,7 @@ int port_shutdown(int fd, int how);
 int port_getsockopt(int fd, int level, int optname, void *optval,
                     socklen_t *optlen);
 /* SO_RCVTIMEO/SO_SNDTIMEO: struct timeval on POSIX, DWORD ms on
- * Windows — translated here. UDP_SEGMENT: translated to the Windows
+ * Windows -- translated here. UDP_SEGMENT: translated to the Windows
  * GSO ioctl. Everything else passes through. */
 int port_setsockopt(int fd, int level, int optname, const void *optval,
                     socklen_t optlen);
@@ -346,7 +346,7 @@ int port_setsockopt(int fd, int level, int optname, const void *optval,
  * ms, -1 waits forever. Negative-fd slots are ignored with revents=0 on
  * BOTH platforms (POSIX poll() already does that; the Windows wrapper
  * strips them because WSAPoll would otherwise fail the whole set with
- * WSAENOTSOCK) — indices into the caller's array stay valid. */
+ * WSAENOTSOCK) -- indices into the caller's array stay valid. */
 int port_poll(struct pollfd *fds, nfds_t nfds, int timeout_ms);
 
 /* ------------------ eventfd substitute (wakeup) -------------------- */
@@ -409,7 +409,7 @@ static inline int port_recvmmsg(int fd, struct mmsghdr *msgvec,
     /* recvmmsg emulation: same drained-shape as the winsock path
      * (EINTR/ECONNRESET with no messages is not an error). M12
      * (SUMMARY-2): an EMPTY queue must read as -1/EAGAIN like Linux
-     * recvmmsg(MSG_DONTWAIT) — callers only park on v < 0, so
+     * recvmmsg(MSG_DONTWAIT) -- callers only park on v < 0, so
      * returning 0 here made the pump loop busy-spin a full core (the
      * exact bug the winsock path already fixed). A partial batch
      * (got > 0) is still returned as messages received. */
@@ -508,7 +508,7 @@ static inline int port_evfd_wake(int fd)
 {
     uint64_t one = 1;
     /* R38 P2-5: EINTR means the write was interrupted BEFORE the eventfd
-     * counter was incremented — the 8-byte eventfd write is all-or-nothing
+     * counter was incremented -- the 8-byte eventfd write is all-or-nothing
      * (no partial write is possible) and with EFD_NONBLOCK it never sleeps,
      * so a failure that is not EAGAIN left no wake behind. The tree
      * installs every sigaction with sa_flags = 0 (no SA_RESTART), so an

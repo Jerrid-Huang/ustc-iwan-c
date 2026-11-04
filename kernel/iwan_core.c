@@ -1,22 +1,22 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * iwan_core.c — 模块入口：全局配置（模块参数）、每 netns 生命周期、
- *               /proc/net/iwan（读统计 + 写每 netns 的出站端点）。
+ * iwan_core.c -- module entry: global config (module parameters), per-netns lifecycle,
+ *               /proc/net/iwan (read stats + write the per-netns egress endpoint).
  *
- * 配置面分三层（v1 起，见 kernel/CONTROL-PLANE.md）：
- *   - 全局（模块参数）：**默认值**，只在该 netns 尚未建立 genetlink 会话时生效；
- *   - 每 netns 会话（genetlink，iwan_netlink.c 写）：会话建立后数据面只认它
- *     （iwan_dp_get 做"会话优先、参数回落"）；
- *   - 每 netns（/proc/net/iwan 可写）：无会话时的出站外层源/目的地址。一个模块
- *     实例服务所有 netns，而两个方向的出站目的地址不同，所以必须按 netns 配置
- *     —— 本机双向验证（两个 netns）正是靠这一点。
+ * The config plane has three layers (since v1, see kernel/CONTROL-PLANE.md):
+ *   - global (module parameters): **defaults**, effective only while that netns has no genetlink session;
+ *   - per-netns session (genetlink, written by iwan_netlink.c): once the session is established the data plane uses only it
+ *     (iwan_dp_get does "session first, parameters as fallback");
+ *   - per-netns (/proc/net/iwan is writable): egress outer source/destination address when there is no session. One module
+ *     instance serves all netns, and the egress destination differs in the two directions, so it must be configured per netns
+ *     -- local bidirectional verification (two netns) relies exactly on this.
  *
- * 没有 netlink 会话时，数据面取到的每个字段都与引入控制面之前逐位一致：
- * 这是既有 13 项验收（kernel/tests/tcp_echo_test.sh）不回归的前提。
+ * With no netlink session, every field the data plane reads is bit-for-bit identical to before the control plane was introduced:
+ * that is the precondition for the existing 13-item acceptance test (kernel/tests/tcp_echo_test.sh) not regressing.
  *
- * /dev/iwan（共享内存页，iwan_shm.c）：每个 netns 一页，记录"最近一次收到
- * 有效帧"的单调毫秒（以及 peer_state/计数器），mmap 给用户态只读轮询。
- * 页面在 pernet init 分配、pernet exit 释放（引用计数，见 iwan_shm.c）。
+ * /dev/iwan (shared-memory page, iwan_shm.c): one page per netns, recording the monotonic milliseconds of the
+ * "last valid frame received" (plus peer_state/counters), mmap'ed read-only for user-space polling.
+ * The page is allocated in pernet init and released in pernet exit (refcount, see iwan_shm.c).
  */
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
@@ -28,22 +28,22 @@
 #include <linux/inet.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
-#include <linux/highmem.h>	/* kmap_local_page：分页 XOR 逐页映射 */
+#include <linux/highmem.h>	/* kmap_local_page: map page by page for the paged XOR */
 #include <linux/capability.h>
 #include <linux/proc_fs.h>
 #include <linux/netdevice.h>
 #include <net/net_namespace.h>
-#include <net/ipv6.h>	/* ipv6_skip_exthdr：内层 v6 的传输层偏移 */
+#include <net/ipv6.h>	/* ipv6_skip_exthdr: transport-layer offset of the inner v6 header */
 #include <net/netns/generic.h>
 
 #include "iwan.h"
-#include "iwan_genl.h"	/* IWAN_GENL_NAME/VERSION：只用于启动日志 */
+#include "iwan_genl.h"	/* IWAN_GENL_NAME/VERSION: used only for the boot log */
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 18, 0)
-#error "iwan 需要 Linux >= 4.18"
+#error "iwan requires Linux >= 4.18"
 #endif
 
-/* ---- 全局配置（模块参数 = 会话未建立时的默认值） ---------------------- */
+/* ---- global config (module parameters = defaults when no session is established) ---------------------- */
 
 static struct iwan_cfg cfg = {
 	.enabled	= true,
@@ -61,17 +61,17 @@ static struct iwan_cfg cfg = {
 struct iwan_cfg *iwan_cfg_get(void) { return &cfg; }
 
 /*
- * 数据面取参：每 netns 会话优先，模块参数回落。
+ * Data-plane parameter lookup: per-netns session first, module parameters as fallback.
  *
- * 没有会话（sess.valid == false）时，这里给出的每个字段都与引入 genetlink
- * 控制面之前逐位一致：
- *   · RX 的外层过滤/端口/凭据 = 模块参数，开关 = cfg.enabled && pn->enabled；
- *   · TX 的外层端点 = /proc 配的 pn->tx_src/tx_dst，端口/凭据 = 模块参数。
- * 有会话时整组换成会话参数（含会话级 enabled 开关）。
- * 每包调用一次，取一份一致快照，避免同一包里读到两次不同的配置。
+ * With no session (sess.valid == false), every field provided here is bit-for-bit
+ * identical to before the genetlink control plane was introduced:
+ *   - RX outer filtering/ports/credentials = module parameters, switch = cfg.enabled && pn->enabled;
+ *   - TX outer endpoint = pn->tx_src/tx_dst set via /proc, ports/credentials = module parameters.
+ * With a session the whole set is replaced by the session parameters (including the session-level enabled switch).
+ * Called once per packet, taking one consistent snapshot so a packet never sees two different configs.
  *
- * 锁：没有锁，沿用 struct iwan_cfg 的既有约定（改配置时没有在途流量）；
- * 标量逐个 READ_ONCE，会话侧 valid 由控制面最后置位/最先清零。
+ * Locking: none, following the existing convention of struct iwan_cfg (no in-flight traffic while reconfiguring);
+ * scalars are read one at a time with READ_ONCE; on the session side the control plane sets valid last and clears it first.
  */
 void iwan_dp_get(struct iwan_net *pn, const struct iwan_cfg *c, bool tx,
 		 struct iwan_dp *dp)
@@ -80,14 +80,14 @@ void iwan_dp_get(struct iwan_net *pn, const struct iwan_cfg *c, bool tx,
 	bool up = READ_ONCE(s->valid);
 
 	dp->session = up;
-	/* inner_src 的 ABI 里没有会话级对应项，恒取模块参数 */
+	/* inner_src has no session-level counterpart in the ABI, so always take the module parameter */
 	dp->inner_src = READ_ONCE(c->inner_src);
 
 	if (up) {
-		/* any_dir 对会话恒为真：ABI 把 OUTER_SRC/DST 定义成"本端/对端"
-		 * 这一对**身份**（不是方向），TX 用 (src→dst)，而同一个会话的
-		 * 入站包恰好是反向的 (dst→src)，所以 RX 必须按无序对匹配。
-		 * 模块参数 any_dir 只对下面的回落路径有意义（旧语义不变）。 */
+		/* any_dir is always true for a session: the ABI defines OUTER_SRC/DST as the "local/peer"
+		 * pair of **identities** (not directions); TX uses (src->dst), while for the same session the
+		 * inbound packets are exactly reversed (dst->src), so RX must match as an unordered pair.
+		 * The any_dir module parameter matters only for the fallback path below (old semantics unchanged). */
 		dp->any_dir = true;
 		dp->enabled = READ_ONCE(c->enabled) && READ_ONCE(s->enabled);
 		dp->outer_src = READ_ONCE(s->outer_src);
@@ -111,15 +111,15 @@ void iwan_dp_get(struct iwan_net *pn, const struct iwan_cfg *c, bool tx,
 	dp->enabled = READ_ONCE(c->enabled) && READ_ONCE(pn->enabled);
 	dp->outer_src = tx ? READ_ONCE(pn->tx_src) : READ_ONCE(c->outer_src);
 	dp->outer_dst = tx ? READ_ONCE(pn->tx_dst) : READ_ONCE(c->outer_dst);
-	/* 外层 v6 只由会话（netlink）表达，/proc 回落路径没有对应项：显式清零。
-	 * 调用方的 struct iwan_dp 在栈上，漏掉这一步就等于让"外层头用哪个版本"
-	 * 由栈垃圾决定（TX 会走 v6 分支拿零地址发）。 */
+	/* Outer v6 is expressed only by a session (netlink); the /proc fallback path has no counterpart: clear explicitly.
+	 * The caller's struct iwan_dp is on the stack; omitting this step lets "which version the outer header uses"
+	 * be decided by stack garbage (TX would take the v6 branch and send with zero addresses). */
 	dp->outer_v6 = false;
 	memset(&dp->outer_src6, 0, sizeof(dp->outer_src6));
 	memset(&dp->outer_dst6, 0, sizeof(dp->outer_dst6));
 	memset(&dp->bind_ip6, 0, sizeof(dp->bind_ip6));
-	/* 承载网卡绑定是设备属性（不分方向）：回落路径统一取 /proc 配的
-	 * tx_oif，0 = 由 FIB 解析一次后钉住。 */
+	/* Carrier NIC binding is a device property (direction-independent): the fallback path uniformly takes the /proc-configured
+	 * tx_oif; 0 = resolve once via FIB and pin the result. */
 	dp->oif = READ_ONCE(pn->tx_oif);
 	dp->bind_ip = READ_ONCE(pn->tx_bind_ip);
 	dp->dport = READ_ONCE(c->dport);
@@ -133,35 +133,39 @@ void iwan_dp_get(struct iwan_net *pn, const struct iwan_cfg *c, bool tx,
 unsigned int iwan_net_id __read_mostly;
 
 module_param_named(enabled, cfg.enabled, bool, 0644);
-MODULE_PARM_DESC(enabled, "总开关（默认 1）");
+MODULE_PARM_DESC(enabled, "master switch (default 1)");
 module_param_named(any_dir, cfg.any_dir, bool, 0644);
-MODULE_PARM_DESC(any_dir, "外层 (src,dst) 允许反向，便于本机双向/对等测试");
+MODULE_PARM_DESC(any_dir, "outer (src,dst) may also be reversed, for local bidirectional/peer testing");
 module_param_named(batch, cfg.batch, bool, 0644);
-MODULE_PARM_DESC(batch, "处理 GRO 合并后的 GSO skb（默认 1）");
+MODULE_PARM_DESC(batch, "process GRO-merged GSO skbs (default 1)");
 module_param_named(reinject, cfg.reinject, bool, 0644);
-MODULE_PARM_DESC(reinject, "解封后 netif_rx 回到 ip_defrag 之前（LOCAL_IN 兜底）");
+MODULE_PARM_DESC(reinject, "after decapsulation, netif_rx back to before ip_defrag (LOCAL_IN fallback)");
 module_param_named(verbose, cfg.verbose, bool, 0644);
 module_param_named(hooknum, cfg.hooknum, int, 0644);
-MODULE_PARM_DESC(hooknum, "0=PRE_ROUTING（默认）, 1=LOCAL_IN（兜底）");
+MODULE_PARM_DESC(hooknum, "0=PRE_ROUTING (default), 1=LOCAL_IN (fallback)");
 module_param_named(hookprio, cfg.hookprio, int, 0644);
-MODULE_PARM_DESC(hookprio, "钩子优先级，默认 -300（defrag 之后、conntrack 之前）");
+MODULE_PARM_DESC(hookprio, "hook priority, default -300 (after defrag, before conntrack)");
 module_param_named(max_mtu, cfg.max_mtu, uint, 0644);
-MODULE_PARM_DESC(max_mtu, "内层 MTU 上限（默认 1500；规范硬上限 65499）。"
-			  "超过硬上限的值会被夹住而不是生效");
+MODULE_PARM_DESC(max_mtu, "inner MTU upper limit (default 1500; hard spec limit 65499). "
+			  "Values above the hard limit are clamped, not applied");
 module_param_named(dport, cfg.dport, ushort, 0644);
-MODULE_PARM_DESC(dport, "隧道 UDP 目的端口（RX 匹配、TX 使用）");
+MODULE_PARM_DESC(dport, "tunnel UDP destination port (matched on RX, used on TX)");
 module_param_named(sport, cfg.sport, ushort, 0644);
-MODULE_PARM_DESC(sport, "隧道 UDP 源端口（仅 TX；0 = 用 dport）");
+MODULE_PARM_DESC(sport, "tunnel UDP source port (TX only; 0 = use dport)");
 module_param_named(sid, cfg.sid, ushort, 0644);
-MODULE_PARM_DESC(sid, "会话 id（OPEN_ACK 下发）");
+MODULE_PARM_DESC(sid, "session id (delivered by OPEN_ACK)");
 module_param_named(tok, cfg.tok, uint, 0644);
-MODULE_PARM_DESC(tok, "会话 token（u32，OPEN_ACK 下发）");
+MODULE_PARM_DESC(tok, "session token (u32, delivered by OPEN_ACK)");
 module_param_named(enc, cfg.enc, byte, 0644);
-MODULE_PARM_DESC(enc, "1 = 数据面 XOR（DATA_ENC），0 = 明文（DATA）");
+MODULE_PARM_DESC(enc, "1 = data-plane XOR (DATA_ENC), 0 = plaintext (DATA)");
+module_param_named(pass_through, cfg.pass_through, uint, 0644);
+MODULE_PARM_DESC(pass_through, "diagnostic bitmask: 1 = egress pass-through drop (only passes through ndo, no encapsulation); "
+			       "2 = ingress pass-through allow (hook returns NF_ACCEPT immediately, no decapsulation). "
+			       "default 0 = normal forwarding");
 module_param_named(df, cfg.df, bool, 0644);
-MODULE_PARM_DESC(df, "外层 IP 置 DF=1（默认 1）；置 0 允许外层分片，用来验证钩子内联重组");
+MODULE_PARM_DESC(df, "set DF=1 in the outer IP header (default 1); set 0 to allow outer fragmentation, for verifying in-hook reassembly");
 
-/* ---- 字符串型参数 ---------------------------------------------------- */
+/* ---- string parameters ---------------------------------------------------- */
 
 static char key_hex[2 * IWAN_KEY_LEN + 1] = "0000000000000000";
 static char outer_src_str[16] = "0.0.0.0";
@@ -250,20 +254,20 @@ static const struct kernel_param_ops iwan_addr_ops = {
 };
 
 module_param_cb(outer_src, &iwan_addr_ops, &cfg.outer_src, 0644);
-MODULE_PARM_DESC(outer_src, "RX 过滤：外层源地址（服务端 IP）");
+MODULE_PARM_DESC(outer_src, "RX filter: outer source address (server IP)");
 module_param_cb(outer_dst, &iwan_addr_ops, &cfg.outer_dst, 0644);
-MODULE_PARM_DESC(outer_dst, "RX 过滤：外层目的地址（本机隧道地址）");
+MODULE_PARM_DESC(outer_dst, "RX filter: outer destination address (local tunnel address)");
 module_param_cb(inner_src, &iwan_addr_ops, &cfg.inner_src, 0644);
-MODULE_PARM_DESC(inner_src, "可选：内层源地址白名单，0.0.0.0 = 关闭");
+MODULE_PARM_DESC(inner_src, "optional: inner source address whitelist, 0.0.0.0 = disabled");
 module_param_cb(key, &iwan_key_ops, NULL, 0644);
-MODULE_PARM_DESC(key, "16 位十六进制数据面密钥 = MD5(user||pass)[0..8)");
+MODULE_PARM_DESC(key, "16 hex digit data-plane key = MD5(user||pass)[0..8)");
 
 /* ---- XOR ------------------------------------------------------------- */
 
 /*
- * 会话密钥是 8 字节循环密钥，作用在内层 IPv4 包的**全部字节**（含内层 IP
- * 头）——所以入站必须先解密再读内层头，出站必须在校验和算完之后再 XOR。
- * 与用户态 xor_crypt() 的 64 位字实现逐字节等价；off 供跨区续算。
+ * The session key is an 8-byte cyclic key applied to **all bytes** of the inner IPv4 packet (including the inner IP
+ * header) -- so inbound must decrypt before reading the inner header, and outbound must XOR after checksums are computed.
+ * Byte-for-byte equivalent to the 64-bit-word implementation of user-space xor_crypt(); off carries the offset across regions.
  */
 void iwan_xor(u8 *p, size_t len, const u8 *key, size_t off)
 {
@@ -286,13 +290,13 @@ void iwan_xor(u8 *p, size_t len, const u8 *key, size_t off)
 }
 
 /*
- * 对 skb 全部载荷（线性区 + 页帧 + frag_list）按 8 字节会话密钥做就地 XOR，
- * off 跨段连续递增 —— 与对"整包逻辑字节序列"的变换严格等价，但不要求物理
- * 连续，从而免去整包线性化。此前大 MTU 档（载荷超过内核分页分配阈值后，
- * 发送侧 validate_xmit_skb 线性化 + 接收侧 skb_ensure_writable 线性化）的
- * 两次全包复制是与裸 lo 基线 6 倍差距的主体。kmap_local_page 可在软中断
- * 上下文使用；frag_list 子 skb 递归处理（外层 df=0 分片重组后的形态）。
- * 调用前提：调用方已确认整包可写（见 iwan_xor_skb）。
+ * XOR all skb payload (linear area + page fragments + frag_list) in place with the 8-byte session key;
+ * off increases continuously across segments -- strictly equivalent to transforming the "whole logical byte sequence", but without requiring physically
+ * contiguous data, thus avoiding whole-packet linearization. Previously, the large-MTU profile (once the payload exceeded the kernel's paged-allocation threshold,
+ * TX-side validate_xmit_skb linearization + RX-side skb_ensure_writable linearization) cost
+ * two full-packet copies, which were the main part of the 6x gap versus the bare lo baseline. kmap_local_page can be used in softirq
+ * context; frag_list child skbs are handled recursively (the shape after outer df=0 fragment reassembly).
+ * Precondition: the caller has confirmed the whole packet is writable (see iwan_xor_skb).
  */
 static void iwan_xor_paged(struct sk_buff *skb, const u8 *key, u32 off)
 {
@@ -326,13 +330,13 @@ static void iwan_xor_paged(struct sk_buff *skb, const u8 *key, u32 off)
 }
 
 /*
- * 就地 XOR 整个 skb（含页帧）。
+ * XOR the entire skb in place (including page fragments).
  *
- * 可写性前提：就地修改要求对缓冲区的独占写权。skb 克隆（克隆双方共享
- * shinfo 与页帧，典型如 TCP 重传队列的原始 skb）与 MSG_ZEROCOPY 固定的
- * 用户页都不可写 —— 这两类回退到旧路径：skb_ensure_writable() 处理克隆
- * （必要时 pskb_expand_head）并把数据拉进线性区，skb_linearize() 兜底，
- * 再对线性区变换。独占情形走 iwan_xor_paged()，无复制。
+ * Writability precondition: in-place modification requires exclusive write access to the buffer. skb clones (both sides of a clone share
+ * shinfo and page fragments, typically the original skb in the TCP retransmit queue) and user pages pinned by MSG_ZEROCOPY
+ * are not writable -- these two cases fall back to the old path: skb_ensure_writable() handles clones
+ * (pskb_expand_head when needed) and pulls the data into the linear area, skb_linearize() is the fallback,
+ * then the linear area is transformed. The exclusive case goes through iwan_xor_paged(), with no copy.
  */
 int iwan_xor_skb(struct sk_buff *skb, const u8 *key)
 {
@@ -350,27 +354,27 @@ int iwan_xor_skb(struct sk_buff *skb, const u8 *key)
 }
 
 /*
- * 内层 IP 头校验 —— TX（iwan_tx.c）与 RX（iwan_rx.c）共用同一份判据，免得
- * 两条路径的版本支持各自漂移（v6 支持是"两处一起开"的能力）。
+ * Inner IP header validation -- TX (iwan_tx.c) and RX (iwan_rx.c) share one set of criteria so that
+ * version support in the two paths does not drift apart (v6 support is a capability enabled in both places together).
  *
- * 只判"头部自洽"，不判策略：模块是数据面，源/目的地址过滤留给用户态
- * （TUN 路径有 inner_ip 与派生 ULA 的准入过滤；内核面历史上只有模块参数
- * inner_src 这个 v4 白名单，语义见 iwan_rx.c 的调用点）。
+ * Only "header self-consistency" is checked, not policy: the module is the data plane, source/destination address filtering is left to user space
+ * (the TUN path has admission filtering on inner_ip and a derived ULA; the kernel side historically had only the module parameter
+ * inner_src, a v4 whitelist; see the call site in iwan_rx.c for semantics).
  *
- * exact_len=true（TX）：数据帧恰好承载**一个**完整内层报文，声明长度必须
- *   等于 skb->len —— 出站绝不能把残缺/多尾字节的报文封进隧道。
- * exact_len=false（RX）：保持引入 v6 之前就有的宽松口径 —— 内层头声明的
- *   长度盖不住整帧才拒，多余尾字节不拒（不改既有行为）。
+ * exact_len=true (TX): a data frame carries exactly **one** complete inner packet, and the declared length must
+ *   equal skb->len -- egress must never wrap a truncated packet or one with extra trailing bytes into the tunnel.
+ * exact_len=false (RX): keep the lenient rule that predates v6 -- reject only when the length declared by the inner header
+ *   cannot cover the whole frame; extra trailing bytes are not rejected (existing behavior unchanged).
  *
- * v4：version=4、ihl≥5、tot_len ∈ [ihl*4, skb->len]（exact_len 时取等）；
- * v6：version=6、payload_len+40 == skb->len（exact_len 时取等）、
- *     不认 payload_len=0 的逐跳巨帧形式（真实长度在逐跳选项里，本模块不做
- *     巨帧）、扩展头链必须走得通（ipv6_skip_exthdr 不返回负值）。
- *     内层分片与 v4 一样交给协议栈重组（本模块不重组内层）。
- * 出参 *net_hdr_len = 内层网络头长度（v4 = ihl*4；v6 = 40 + 扩展头），
- * 调用方据此设置传输层偏移 —— v6 不能照搬 v4 的 ihl 算法。
+ * v4: version=4, ihl>=5, tot_len in [ihl*4, skb->len] (equality required when exact_len);
+ * v6: version=6, payload_len+40 == skb->len (equality required when exact_len),
+ *     no support for the payload_len=0 hop-by-hop jumbogram form (the real length sits in hop-by-hop options; this module does no
+ *     jumbograms), and the extension header chain must be walkable (ipv6_skip_exthdr must not return a negative value).
+ *     Inner fragments, as with v4, are left to the stack for reassembly (this module does not reassemble the inner layer).
+ * Out-param *net_hdr_len = inner network header length (v4 = ihl*4; v6 = 40 + extension headers),
+ * from which the caller sets the transport-layer offset -- v6 cannot reuse the v4 ihl formula.
  *
- * 返回 0 = 合法，-EINVAL = 非法（调用方按 tx_bad_inner / rx_bad_inner 计数）。
+ * Returns 0 = valid, -EINVAL = invalid (the caller counts tx_bad_inner / rx_bad_inner).
  */
 int iwan_inner_hdr_check(struct sk_buff *skb, bool exact_len, u32 *net_hdr_len)
 {
@@ -381,7 +385,7 @@ int iwan_inner_hdr_check(struct sk_buff *skb, bool exact_len, u32 *net_hdr_len)
 	u32 tot, hdrlen;
 	int off;
 
-	/* 先保证版本字节在线性区（skb->data 可能整个在页帧里） */
+	/* first make sure the version byte is in the linear area (skb->data may lie entirely in page fragments) */
 	if (unlikely(!pskb_may_pull(skb, 1)))
 		return -EINVAL;
 	ver = skb->data[0] >> 4;
@@ -411,7 +415,7 @@ int iwan_inner_hdr_check(struct sk_buff *skb, bool exact_len, u32 *net_hdr_len)
 		tot = (u32)ntohs(ip6h->payload_len) + (u32)sizeof(*ip6h);
 		if (exact_len ? tot != skb->len : tot > skb->len)
 			return -EINVAL;
-		/* 扩展头链（含分片头）：拿到传输层偏移；坏链一律拒 */
+		/* extension header chain (including the fragment header): obtain the transport-layer offset; reject any bad chain */
 		nexthdr = ip6h->nexthdr;
 		off = ipv6_skip_exthdr(skb, (int)sizeof(*ip6h), &nexthdr,
 				       &frag_off);
@@ -424,12 +428,12 @@ int iwan_inner_hdr_check(struct sk_buff *skb, bool exact_len, u32 *net_hdr_len)
 	return -EINVAL;
 }
 
-/* ---- /proc/net/iwan：读统计、写每 netns 出站端点 --------------------- */
+/* ---- /proc/net/iwan: read stats, write the per-netns egress endpoint --------------------- */
 
 /*
- * 读路径**冻结**：格式与字段一个都不能动（既有 13 项验收按名字读计数器），
- * 所以这里显示的一直是"模块参数 + 每 netns 开关/端点"这一层；netlink 会话
- * 的状态/计数器请走 IWAN_CMD_GET_STATS（新计数器 rx_ctrl_frame 也只在那边）。
+ * The read path is **frozen**: neither the format nor any field may change (the existing 13-item acceptance test reads counters by name),
+ * so what is shown here is always the "module parameters + per-netns switches/endpoints" layer; for netlink session
+ * state/counters use IWAN_CMD_GET_STATS (the new rx_ctrl_frame counter exists only there too).
  */
 static void iwan_proc_format(struct iwan_net *pn, char *buf, size_t size)
 {
@@ -454,7 +458,7 @@ static void iwan_proc_format(struct iwan_net *pn, char *buf, size_t size)
 		READ_ONCE(cfg.sid), READ_ONCE(cfg.tok), READ_ONCE(cfg.enc),
 		READ_ONCE(cfg.df), key_hex,
 		READ_ONCE(pn->enabled), &pn->tx_src, &pn->tx_dst,
-		"-",	/* 网卡改由 rtnl_link_ops 创建，不再挂在 netns 状态里 */
+		"-",	/* the NIC is now created by rtnl_link_ops and no longer hangs off the netns state */
 		READ_ONCE(pn->tx_oif), &pn->tx_bind_ip, READ_ONCE(pn->carrier),
 		(long long)atomic64_read(&s->rx_pkts),
 		(long long)atomic64_read(&s->rx_outer),
@@ -489,36 +493,36 @@ static ssize_t iwan_proc_read(struct file *file, char __user *ubuf,
 	return ret;
 }
 
-/* 写：tx_src=A.B.C.D tx_dst=A.B.C.D enabled=0/1 oif=<ifindex> ip=A.B.C.D
+/* write: tx_src=A.B.C.D tx_dst=A.B.C.D enabled=0/1 oif=<ifindex> ip=A.B.C.D
  *
- * oif = 显式绑定的承载网卡（下游网卡）ifindex；省略或 0 表示由 FIB 解析一次后
- * 钉住。两种情况下数据面都只用一张卡，语义见 iwan_tx.c 的 iwan_carrier_pin()。
+ * oif = ifindex of the explicitly bound carrier NIC (downstream NIC); omitted or 0 means resolve once via FIB and
+ * pin it. In both cases the data plane uses only one NIC; see iwan_carrier_pin() in iwan_tx.c.
  *
- * ip = 显式绑定的**出口 IP**（"绑 IP"模式）：它同时设定 tx_src（外层头的源
- * 地址）并按本机地址表决定承载网卡——地址挂在哪张接口上就用哪张，与 oif
- * 给的网卡冲突（地址不在该卡上）则整条写入失败（-EINVAL）。地址当时不属于
- * 任何本机接口则失败（-EADDRNOTAVAIL）：绑一个不存在的地址没有意义，这里
- * 刻意与 oif 的"只校验格式"不同。ip=0.0.0.0 清除按 IP 的绑定。
+ * ip = explicitly bound **egress IP** ("bind IP" mode): it sets tx_src as well (the outer header's source
+ * address) and decides the carrier NIC from the local address table -- whichever interface holds the address is used; if it conflicts with the NIC
+ * given by oif (the address is not on that NIC), the whole write fails (-EINVAL). If the address does not belong to
+ * any local interface, it fails too (-EADDRNOTAVAIL): binding a nonexistent address is pointless, and here
+ * this deliberately differs from oif, which validates format only. ip=0.0.0.0 clears the IP binding.
  *
- * 一次 write() 是**一个配置事务**：全部令牌先解析并针对提交后的状态校验，
- * 最后一次性提交；任一处不合法则整条不生效（不会留下"半个配置"）。因此
- * `oif=2 ip=<不在该卡上的地址>` 这类写入失败后，oif 也不会被改掉。
+ * One write() is **one config transaction**: all tokens are parsed first and validated against the post-commit state,
+ * then committed all at once; if any part is invalid the whole line has no effect (no "half a config" is left behind). Hence
+ * after a write such as `oif=2 ip=<address not on that NIC>` fails, oif is not changed either.
  *
- * 已废弃（deprecated）：新功能一律加在 genetlink 控制面（iwan_netlink.c）。
- * 保留是为了既有测试脚本与排障：**没有 netlink 会话时**这里配的就是数据面
- * 实际用的每 netns 出站端点/开关；一旦该 netns 建立了会话，数据面改认会话
- * 参数（iwan_dp_get），本文件写的值只作为回落默认值存在。
+ * Deprecated: all new features go into the genetlink control plane (iwan_netlink.c).
+ * Kept for the existing test scripts and troubleshooting: **with no netlink session** what is configured here is exactly the
+ * per-netns egress endpoint/switch the data plane actually uses; once that netns establishes a session, the data plane follows the session
+ * parameters (iwan_dp_get), and values written here exist only as fallback defaults.
  */
 static ssize_t iwan_proc_write(struct file *file, const char __user *ubuf,
 			       size_t count, loff_t *ppos)
 {
 	struct iwan_net *pn = pde_data(file_inode(file));
 	char buf[128], *p, *tok;
-	/* 一次 write() 是一个配置事务：先在本地把整条写入解析并针对**提交后**
-	 * 的状态校验，最后一次性提交。逐令牌边解析边生效会留下"半个配置"
-	 * —— 前半段生效、后半段报错，那个中间态既没有对应的命令行，又会让下一
-	 * 条本应成功的写入莫名冲突（实测：`oif=2 ip=<别的网卡地址>` 失败后
-	 * oif 已经落成 2）。 */
+	/* one write() is a config transaction: parse the whole write locally and validate it against the **post-commit**
+	 * state, then commit all at once. Applying token by token as it is parsed leaves "half a config"
+	 * -- the first half takes effect and the second half errors; that intermediate state has no matching command line and would make the next
+	 * write that should succeed conflict for no reason (observed: after `oif=2 ip=<address of another NIC>` fails,
+	 * oif has already become 2). */
 	__be32 n_src = READ_ONCE(pn->tx_src);
 	__be32 n_dst = READ_ONCE(pn->tx_dst);
 	__be32 n_bind = READ_ONCE(pn->tx_bind_ip);
@@ -565,15 +569,15 @@ static ssize_t iwan_proc_write(struct file *file, const char __user *ubuf,
 			n_dst = a;
 			touch_tx = true;
 		} else if (!strcmp(tok, "oif")) {
-			/* 显式绑定承载网卡（ifindex，0 = 由 FIB 解析后钉住）。
-			 * 只校验格式不校验存在性：/proc 常在网卡/路由之前配，
-			 * 真正的解析在会话建立或首包出站时做，失败计入 tx_err。 */
+			/* explicitly bind the carrier NIC (ifindex; 0 = resolve via FIB and pin).
+			 * Only the format is validated, not existence: /proc is often configured before the NIC/route exists,
+			 * the real resolution happens at session setup or first egress packet, and failures count into tx_err. */
 			if (kstrtou32(eq, 0, &n_oif))
 				return -EINVAL;
 			touch_tx = true;
 		} else if (!strcmp(tok, "ip")) {
-			/* 出口 IP 绑定：它同时是外层头的源地址（外层头用
-			 * OUTER_SRC，所以这里一并改写 n_src）。 */
+			/* egress IP binding: it is also the outer header's source address (the outer header uses
+			 * OUTER_SRC, so n_src is rewritten here as well). */
 			if (!in4_pton(eq, -1, (u8 *)&a, -1, NULL))
 				return -EINVAL;
 			n_bind = a;
@@ -592,23 +596,23 @@ static ssize_t iwan_proc_write(struct file *file, const char __user *ubuf,
 		}
 	}
 
-	/* 事务级校验，针对提交后的状态：
-	 *   ① 出口 IP 必须属于某张本机接口（地址表），且若同时绑了网卡，就
-	 *      必须在那张卡上（地址不在本机 = -EADDRNOTAVAIL，冲突 = -EINVAL）；
-	 *   ② 出口 IP 必须就是外层源地址 —— 外层头写的是 OUTER_SRC，两者不
-	 *      一致等于"绑定"与"实际发出的源地址"不是同一个值。
-	 * 只在这次写入真的动了端点/绑定（tx_src/tx_dst/oif/ip）时才校验：
-	 * 否则一条只改 enabled 的写入会被既有的失效绑定连坐 —— 那样连
-	 * "关掉数据面"都写不进去，排障时无路可走。 */
+	/* transaction-level validation against the post-commit state:
+	 *   1) the egress IP must belong to some local interface (address table), and if a NIC is bound too, it
+	 *      must be on that NIC (address not local = -EADDRNOTAVAIL, conflict = -EINVAL);
+	 *   2) the egress IP must be exactly the outer source address -- the outer header writes OUTER_SRC, and if the two
+	 *      differ then "the binding" and "the source address actually sent" are not the same value.
+	 * Validate only when this write actually touches the endpoint/binding (tx_src/tx_dst/oif/ip):
+	 * otherwise a write that only changes enabled would be dragged down by an existing stale binding -- then not even
+	 * "turn the data plane off" could be written, leaving no way out during troubleshooting. */
 	if (touch_tx) {
 		err = iwan_bind_ip_check(pn->net, n_bind, n_oif);
 		if (err)
 			return err;
 		if (n_bind && n_bind != n_src)
 			return -EINVAL;
-		/* 同一条写入里 tx_src 与 ip 都给了却不一致：两个令牌设的是同一
-		 * 个字段，按顺序取后者会变成"谁写在后面谁赢"，直接拒绝。
-		 * ip=0.0.0.0 是"清除绑定"，不参与比较。 */
+		/* both tx_src and ip given in the same write but inconsistent: the two tokens set the same
+		 * field; taking the later one would become "last one written wins", so reject outright.
+		 * ip=0.0.0.0 is "clear the binding" and does not participate in the comparison. */
 		if (saw_src && saw_ip && v_ip != 0 && v_src != v_ip)
 			return -EINVAL;
 	}
@@ -618,7 +622,7 @@ static ssize_t iwan_proc_write(struct file *file, const char __user *ubuf,
 		WRITE_ONCE(pn->tx_dst, n_dst);
 		WRITE_ONCE(pn->tx_oif, n_oif);
 		WRITE_ONCE(pn->tx_bind_ip, n_bind);
-		/* 端点或绑定规格变了：钉住的那张卡不再代表本次配置 */
+		/* endpoint or binding spec changed: the pinned NIC no longer represents this config */
 		iwan_carrier_forget(pn);
 	}
 	if (touch_en)
@@ -631,22 +635,22 @@ static const struct proc_ops iwan_proc_ops = {
 	.proc_write	= iwan_proc_write,
 };
 
-/* ---- 每 netns 生命周期 -----------------------------------------------
+/* ---- per-netns lifecycle -----------------------------------------------
  *
- * 只用**一个 device 类** pernet 操作，做两件事：注册 netfilter 钩子、建
- * /proc/net/iwan。顺序是硬约束，这里踩过坑（insmod 正常，ip netns add 把
- * 内核打崩，随后模块永远卡在 "正在加载"，只能重启）：
+ * Use only **one device-class** pernet operation, doing two things: register the netfilter hooks and create
+ * /proc/net/iwan. The order is a hard constraint; this was hit before (insmod fine, but ip netns add
+ * crashed the kernel, after which the module stayed stuck in "loading" forever and only a reboot helped):
  *
- *  · device 类的 init 整体排在所有 subsys 类 init 之后 —— 实测依据：早先按
- *    subsys 注册时我们的 init 跑在 loopback_net_init 之前，register_netdevice()
- *    在还没建好的 netns 设备表上炸掉。
- *  · 而 netfilter 的 netns 钩子数组与 /proc/net 目录分别由
- *    netfilter_net_init、proc_net_ns_init 这两个 subsys 操作建立，必须等它们
- *    跑完再动：否则钩子会被随后初始化的数组冲掉，/proc/net 也还不存在。
+ *  - device-class init runs entirely after all subsys-class inits -- measured evidence: when we registered as
+ *    subsys, our init ran before loopback_net_init, and register_netdevice()
+ *    blew up on a not-yet-initialized netns device table.
+ *  - The netfilter netns hook array and the /proc/net directory are created by
+ *    the two subsys operations netfilter_net_init and proc_net_ns_init, so these must finish before we
+ *    touch anything: otherwise the hooks get wiped by the subsequently initialized array, and /proc/net does not exist yet either.
  *
- * 网卡一律不在这里建：pernet init 的上下文既受上面这个顺序摆布，建出来的
- * 设备还会反引用模块、让 rmmod 永远失败。改用 rtnl_link_ops，由
- * `ip link add <name> type iwan` 显式创建，生命周期完全交给内核。
+ * Never create NICs here: pernet init's context is subject to the ordering above, and any device created
+ * would also reference the module back, making rmmod fail forever. Use rtnl_link_ops instead, created explicitly by
+ * `ip link add <name> type iwan`, with the lifecycle fully owned by the kernel.
  */
 static int __net_init iwan_net_init(struct net *net)
 {
@@ -655,42 +659,42 @@ static int __net_init iwan_net_init(struct net *net)
 
 	pn->net = net;
 	pn->enabled = true;
-	/* 会话状态：net_generic 的内存本已清零，这里显式初始化以防将来改动。
-	 * valid == false ⇒ 数据面走"模块参数默认值"的回落路径，行为与引入
-	 * genetlink 控制面之前逐位一致；会话只能由 SESSION_UP 建立。 */
+	/* session state: net_generic memory is already zeroed, initialize explicitly here against future changes.
+	 * valid == false => the data plane takes the "module parameter defaults" fallback path, behaving bit-for-bit as before
+	 * the genetlink control plane was introduced; a session can only be established by SESSION_UP. */
 	memset(&pn->sess, 0, sizeof(pn->sess));
-	/* 共享内存页（/dev/iwan）：放在 RX 钩子之前分配，于是"钩子在跑"就
-	 * 意味着 pn->shm 一定非 NULL（RX 侧仍然按可空写，见 iwan.h）。
-	 * 注意 pernet init 失败时内核不会回调对应的 exit（setup_net 的
-	 * out_undo 只回滚已成功的 ops），所以返回错误前不能有任何已分配资源
-	 * —— 这也是把页面分配放在最前面的原因。 */
+	/* shared-memory page (/dev/iwan): allocated before the RX hook, so "the hook is running"
+	 * implies pn->shm is definitely non-NULL (the RX side still treats it as nullable, see iwan.h).
+	 * Note that when pernet init fails the kernel does not call the matching exit (setup_net's
+	 * out_undo rolls back only the ops that succeeded), so nothing may be allocated before returning an error
+	 * -- which is why page allocation comes first. */
 	err = iwan_shm_net_init(pn);
 	if (err) {
-		pr_err("netns %u: 共享内存页分配失败 %d\n", net->ns.inum, err);
+		pr_err("netns %u: shared-memory page allocation failed %d\n", net->ns.inum, err);
 		return err;
 	}
-	/* 出站外层路由缓存：放在 shm 之后初始化。同因（pernet init 失败不会
-	 * 回调 exit），这里不因分配失败返回错误 —— 标记不可用即可，数据面
-	 * 退化为逐包 FIB 查找，正确性不受影响。 */
+	/* egress outer route cache: initialized after shm. For the same reason (a failed pernet init does not
+	 * call exit), do not return an error on allocation failure here -- just mark it unavailable; the data plane
+	 * degrades to a per-packet FIB lookup, with correctness unaffected. */
 	if (dst_cache_init(&pn->tx_route, GFP_KERNEL)) {
-		pr_warn("netns %u: 出站路由缓存分配失败，退化为逐包 FIB 查找\n",
+		pr_warn("netns %u: egress route cache allocation failed, falling back to per-packet FIB lookup\n",
 			net->ns.inum);
 	} else {
 		pn->tx_route_ok = true;
 	}
 	/*
-	 * 返回值刻意不传播（写成 (void) 是为了让"故意丢弃"一眼可见）：
-	 * netns 创建失败的代价太大 —— 那会让整个 netns 建不起来，连排障用的
-	 * 最基本工具都跑不了。失败时 iwan_rx_net_init() 内部已经 pr_err 并让
-	 * pn->rx_hooked 保持 false，数据面在这个 netns 里等于关闭；SESSION_UP
-	 * 会检查 rx_hooked 并回 -EIO（见 iwan_netlink.c），用户态因此能看到
-	 * 明确失败，而不会拿到"会话成功但收不到包"的假象。
+	 * The return value is deliberately not propagated (the (void) cast makes the "intentional discard" obvious):
+	 * failing netns creation is too costly -- it would make the whole netns unusable, and not even the most basic
+	 * troubleshooting tools would run. On failure iwan_rx_net_init() has already pr_err'd and left
+	 * pn->rx_hooked false, so the data plane is effectively off in this netns; SESSION_UP
+	 * checks rx_hooked and returns -EIO (see iwan_netlink.c), so user space sees
+	 * a clear failure instead of the illusion of "session succeeded but no packets arrive".
 	 */
 	(void)iwan_rx_net_init(pn);
 	if (!net->proc_net) {
-		/* 正常不会走到：proc_net 由 netns 框架的 subsys 初始化建好。
-		 * 真出现也只是没有配置文件，绝不能在这里解空指针。 */
-		pr_err("netns %u: proc_net 尚未就绪，跳过 /proc/net/iwan\n",
+		/* normally unreachable: proc_net is created by the netns framework's subsys init.
+		 * If it ever happens it only means no proc file, and a NULL pointer must never be dereferenced here. */
+		pr_err("netns %u: proc_net not ready yet, skipping /proc/net/iwan\n",
 		       net->ns.inum);
 		return 0;
 	}
@@ -703,19 +707,19 @@ static void __net_exit iwan_net_exit(struct net *net)
 {
 	struct iwan_net *pn = iwan_net_of(net);
 
-	/* 会话里那张网卡：netns 销毁时由设备框架一并回收，这里不碰设备 ——
-	 * device 类的 pernet exit 跑在 rtnl 锁内，再取 rtnl 会死锁。 */
+	/* the NIC of a session: reclaimed by the device framework when the netns is destroyed; do not touch devices here --
+	 * device-class pernet exit runs under the rtnl lock, and taking rtnl again would deadlock. */
 	if (pn->proc) {
 		remove_proc_entry("iwan", net->proc_net);
 		pn->proc = NULL;
 	}
-	/* 顺序是硬约束：先摘钩子（iwan_rx_net_exit 内部 synchronize_rcu 保证
-	 * 没有在途钩子还会写共享内存页），再放页面的 pernet 引用。反过来就是
-	 * "钩子还在跑、页面已回收"的 use-after-free。 */
+	/* order is a hard constraint: remove the hooks first (iwan_rx_net_exit's synchronize_rcu guarantees that
+	 * no in-flight hook still writes the shared-memory page), then drop the page's pernet reference. The reverse order is
+	 * the "hook still running, page already reclaimed" use-after-free. */
 	iwan_rx_net_exit(pn);
 	iwan_shm_net_exit(pn);
-	/* 路由缓存最后销毁：其中 dst 引用可能指向本 netns 的外层设备，等在途
-	 * 引用（skb_dst_set 的 dst_clone）全部释放后统一 drop。 */
+	/* route cache destroyed last: its dst references may point to this netns's outer devices, so wait until all in-flight
+	 * references (dst_clone from skb_dst_set) are released and then drop them all. */
 	if (pn->tx_route_ok)
 		dst_cache_destroy(&pn->tx_route);
 }
@@ -728,13 +732,13 @@ static struct pernet_operations iwan_net_ops = {
 };
 
 /*
- * 注册顺序（退出反序）：pernet 设备类 → /dev/iwan（misc）→ netdev 的
- * rtnl_link_ops → genetlink 家族。
- *   · /dev/iwan 的 open() 要按 opener 的 netns 取 net_generic 状态，所以必须
- *     排在 register_pernet_device() 之后（先有 pernet 区域，再有设备节点）；
- *   · genetlink 放最后：控制面的 SESSION_UP 要用 rtnl_link_ops 建 iwan0，家族
- *     一旦可见就必须具备全部依赖；unregister 反序则保证命令先消失、再拆设备
- *     类型、/dev/iwan 与 pernet 状态。
+ * Registration order (teardown in reverse): pernet device class -> /dev/iwan (misc) -> netdev's
+ * rtnl_link_ops -> genetlink family.
+ *   - /dev/iwan's open() must fetch net_generic state for the opener's netns, so it must come
+ *     after register_pernet_device() (pernet area first, device node second);
+ *   - genetlink goes last: control-plane SESSION_UP needs rtnl_link_ops to create iwan0, so once the family
+ *     is visible all dependencies must be in place; unregistering in reverse ensures commands disappear first, then device
+ *     types, /dev/iwan, and pernet state are torn down.
  */
 static int __init iwan_init(void)
 {
@@ -742,7 +746,7 @@ static int __init iwan_init(void)
 	int err;
 
 	if (!memcmp(cfg.key, zero, IWAN_KEY_LEN))
-		pr_warn("key 仍为全零：只适合功能验证，生产必须用会话密钥\n");
+		pr_warn("key is still all zeros: only for functional testing; production must use a session key\n");
 
 	err = register_pernet_device(&iwan_net_ops);
 	if (err)
@@ -766,7 +770,7 @@ static int __init iwan_init(void)
 		return err;
 	}
 
-	pr_info("loaded: hooknum=%d prio=%d dport=%u sid=%u enc=%d key=%s（模块参数 = 会话未建立时的默认值；控制面 genetlink \"%s\" v%d；存活状态 /dev/%s mmap 只读一页/netns）\n",
+	pr_info("loaded: hooknum=%d prio=%d dport=%u sid=%u enc=%d key=%s (module parameters = defaults when no session is established; control plane genetlink \"%s\" v%d; liveness /dev/%s mmap read-only, one page/netns)\n",
 		cfg.hooknum, cfg.hookprio, cfg.dport, cfg.sid, cfg.enc, key_hex,
 		IWAN_GENL_NAME, IWAN_GENL_VERSION, IWAN_SHM_DEV_NAME);
 	return 0;

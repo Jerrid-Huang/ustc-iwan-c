@@ -70,7 +70,7 @@ static void skip_ws(struct P *p)
 }
 
 /* hex4 result: the three states the \uXXXX scan must distinguish (see
- * parse_string) — OK with the value, EOF when the input ends inside the
+ * parse_string) -- OK with the value, EOF when the input ends inside the
  * 4-char window, BAD for a non-hex character. EOF wins over BAD: serde
  * reports EOF when the window runs off the input even if an earlier char
  * was invalid. */
@@ -699,7 +699,7 @@ Json *json_get(const Json *root, const char *path)
             }
         if (cur->type == JSON_ARR && allnum) {
             /* L10 (bughunt): cap the digit segment like the 64-byte key
-             * cap below and guard each step — a path like
+             * cap below and guard each step -- a path like
              * a.18446744073709551616 would wrap idx around and select a
              * wrong element. 20 digits is > SIZE_MAX on 64-bit (and
              * > UINT32_MAX, an array index is never larger). */

@@ -96,14 +96,14 @@ char *decrypt_password(const char *encrypted_b64, const char *app_secret,
         goto out;
 
     ct_len = data_len - GCM_NONCE_LEN - GCM_TAG_LEN;
-    /* R37 (R1-C-1): ct_len == 0 is a LEGAL blob — nonce || <no ciphertext>
+    /* R37 (R1-C-1): ct_len == 0 is a LEGAL blob -- nonce || <no ciphertext>
      * || tag, where the tag authenticates an empty plaintext, i.e. the
      * wire form of an empty password. malloc(0) may return NULL or a
      * unique 1-byte region, and gcm_decrypt's contract promises room for
      * ct_len bytes, so ask for at least one byte: the byte is scratch
      * (plain_len still governs the copy below), and it keeps the plain
      * pointer a real object even for the empty case. The empty result is
-     * returned as "" — the same value the aad_len == 0 empty-ct case has
+     * returned as "" -- the same value the aad_len == 0 empty-ct case has
      * always produced, and the value oidc_config.c already treats as "no
      * password". */
     plain = malloc(ct_len ? ct_len : 1);

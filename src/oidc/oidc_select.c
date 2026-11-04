@@ -54,14 +54,14 @@ static int utf8_width(const char *s)
  * ESC/BEL/CR/LF/OSC sequences let a name retitle the terminal, clear the
  * screen or forge extra "server" lines in the --all selection list.
  * Replace every control byte with '?' like auth.c does for peer-supplied
- * text — but unlike that byte-wise filter, walk valid UTF-8 sequences as
+ * text - but unlike that byte-wise filter, walk valid UTF-8 sequences as
  * units: U+0080..U+009F (C1, still an 8-bit CSI on some terminals) is
  * neutralized whether it arrives raw or as a legal 2-byte sequence, while
  * ordinary multi-byte text (Chinese names included) is copied untouched.
  * Only the display path uses this; matching/storage keep the raw value.
  *
  * R37-WG-E1 (L28): promoted from a file-static helper to the shared one
- * declared in oidc.h — every remote-controlled string that can reach a
+ * declared in oidc.h - every remote-controlled string that can reach a
  * terminal must go through the same filter, not just the --list rows.
  * R37-WG-E1 (L39): the sequence walk now also rejects non-shortest forms,
  * UTF-16 surrogates and codepoints above U+10FFFF. A lenient decoder
@@ -142,7 +142,7 @@ void oidc_print_servers(Json *servers)
         const char *name = json_get_str(s, "name");
         const char *host = json_get_str(s, "host");
         Json *portj = json_get(s, "port");
-        /* L9 (bughunt, #7): never cast a raw double -> unsigned long —
+        /* L9 (bughunt, #7): never cast a raw double -> unsigned long -
          * a local servers.json "port":1e19 would be UB. Validate in the
          * numeric domain; a broken/missing value prints the default. */
         long port = OIDC_DEFAULT_PORT;

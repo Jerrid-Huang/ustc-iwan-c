@@ -14,7 +14,7 @@ void prof_init(void)
      * (profile.h says IWAN_PROFILE=1); the off spellings are decided by
      * env_bool() (util.h). The old comment here claimed parity with
      * debug_enabled() while the two lists actually differed ("no" was
-     * off here, ON there) — that claim is now true by construction. */
+     * off here, ON there) -- that claim is now true by construction. */
     if (env_bool("IWAN_PROFILE", false))
         atomic_store(&g_prof_on, 1);
 }

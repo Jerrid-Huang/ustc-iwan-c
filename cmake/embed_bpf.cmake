@@ -1,4 +1,4 @@
-# embed_bpf.cmake — turn a BPF ELF object into a C array for embedding.
+# embed_bpf.cmake -- turn a BPF ELF object into a C array for embedding.
 #
 # STANDALONE / MANUAL USE ONLY. The build no longer runs this file:
 # CMakeLists.txt bakes the two paths into <build>/embed_bpf_gen.cmake at
@@ -6,10 +6,10 @@
 # no arguments, which is the only shape that survives a path containing a space
 # on every generator.
 #
-# Do NOT call this file from add_custom_command with path arguments — both
+# Do NOT call this file from add_custom_command with path arguments -- both
 # spellings are traps there:
 #   * `-DIN="<path>"` puts the quotes inside the value, so file(READ) is handed
-#     `"…/steer_bpf.o"` (quotes included);
+#     `".../steer_bpf.o"` (quotes included);
 #   * VERBATIM escapes those quotes a second time, and a positional path is
 #     rendered by Unix Makefiles with "\ " escapes that a further quoted recipe
 #     passes to the shell verbatim, so file(READ) receives a literal backslash

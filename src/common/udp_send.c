@@ -43,7 +43,7 @@ int udp_gso_prepare(int fd, size_t mss, int *ok, size_t *gso_mss,
         /* M11: a hard failure (probe or re-arm setsockopt) is cached,
          * but its cause can be transient (temporary resource
          * exhaustion, a restored offload setting). Re-probe at most
-         * once per second — shared across all callers so the hot send
+         * once per second -- shared across all callers so the hot send
          * path never hammers setsockopt: success re-enables GSO for
          * the whole process, failure keeps the sendmmsg fallback.
          * Previously one failure disabled GSO for the process
@@ -70,7 +70,7 @@ int udp_gso_prepare(int fd, size_t mss, int *ok, size_t *gso_mss,
     }
     if (*ok && *gso_mss != mss) {
         /* C1 hysteresis: a different uniform mss does NOT re-arm the
-         * socket option immediately — mixed-MTU (A/B alternating) traffic
+         * socket option immediately -- mixed-MTU (A/B alternating) traffic
          * would flip setsockopt on every batch. This batch falls back to
          * sendmmsg; the new mss is armed only after it is seen
          * IWAN_GSO_HYST consecutive batches. send_ctrl's clear/re-arm
@@ -81,7 +81,7 @@ int udp_gso_prepare(int fd, size_t mss, int *ok, size_t *gso_mss,
             *pending_mss = mss;
             *streak = 1;
         }
-        /* M3-5: a gso_mss == 0 armed state (ok still 1) is a dead state —
+        /* M3-5: a gso_mss == 0 armed state (ok still 1) is a dead state --
          * udp_gso_clear (called on any fallback batch) and send_ctrl's
          * failed re-arm both zero gso_mss without touching ok, and the
          * `*gso_mss != 0` guard below would then never re-arm, so GSO
@@ -103,7 +103,7 @@ int udp_gso_prepare(int fd, size_t mss, int *ok, size_t *gso_mss,
         }
         /* R33-E: when a re-arm just succeeded above, the socket is now
          * armed with EXACTLY this batch's mss, so this uniform batch can
-         * and should go out via GSO — return 1 instead of 0. Before this
+         * and should go out via GSO -- return 1 instead of 0. Before this
          * fix the unconditional return 0 mapped to TX_FALLBACK in
          * send_gso, whose caller (pump_tx_send) then ran send_batch, and
          * send_batch's first action (udp_gso_clear) wiped the just-armed

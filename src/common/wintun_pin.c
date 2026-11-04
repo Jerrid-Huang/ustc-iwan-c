@@ -1,4 +1,4 @@
-/* wintun_pin.c — SHA-256 pin verification (Windows only; see .h) */
+/* wintun_pin.c -- SHA-256 pin verification (Windows only; see .h) */
 #include <string.h>   /* strlen: pin_matches() is compiled on every host */
 #include "crypto.h"   /* -> common.h -> winsock2 before windows.h */
 #include "wintun_pin.h"
@@ -7,7 +7,7 @@
  * test TU can drive the real code. Constant-time-ish: no early exit, the
  * result is a single OR-accumulated difference. A non-hex pin digit yields
  * the out-of-range value 0x100 instead of the old sscanf()-failure "0", so
- * a malformed pin can never match a real digest byte (fail-closed) — the
+ * a malformed pin can never match a real digest byte (fail-closed) -- the
  * old code made every non-hex nibble compare equal to a 0x0 hash nibble.
  * static inline: unused on non-Windows builds without -Wunused-function. */
 static inline int pin_hexval(char c)
@@ -56,7 +56,7 @@ bool wintun_pin_ok(const wchar_t *path)
     if (f == INVALID_HANDLE_VALUE)
         return false;
 
-    /* wintun.dll is a few hundred KB — read it in one shot */
+    /* wintun.dll is a few hundred KB -- read it in one shot */
     uint8_t *buf = (uint8_t *)malloc(512 * 1024);
     if (!buf) {
         CloseHandle(f);
@@ -101,7 +101,7 @@ bool wintun_pin_ok_a(const char *path)
 /* wintun.dll itself is loaded by absolute path (exe dir / System32)  */
 /* in tun_win.c, so the module never comes from CWD/PATH. But its own */
 /* import dependencies would still resolve through the standard DLL   */
-/* search order — which includes the current directory and PATH —     */
+/* search order -- which includes the current directory and PATH --     */
 /* unless the loader is told to restrict them. A hostile same-named   */
 /* dependency DLL dropped into the CWD would otherwise be loaded into */
 /* this process at the same privilege as the pinned, Authenticode-    */
@@ -113,8 +113,8 @@ bool wintun_pin_ok_a(const char *path)
 /* runtime so plain Win7/XP still work; there we fall back to         */
 /* SetDllDirectoryW(L"") around a plain LoadLibraryW, which removes   */
 /* the current directory from the DLL search order for the duration   */
-/* of the load (CWD vector closed; PATH — an env value the same user  */
-/* already controls — remains, documented trade-off).                 */
+/* of the load (CWD vector closed; PATH -- an env value the same user  */
+/* already controls -- remains, documented trade-off).                 */
 /* ------------------------------------------------------------------ */
 
 /* These loader flags are not defined by the MinGW headers this project
@@ -135,7 +135,7 @@ bool wintun_pin_ok_a(const char *path)
 #endif
 
 /* Dependency search is limited to: the directory of the module being
- * loaded (DLL_LOAD_DIR → where wintun.dll lives), System32, the
+ * loaded (DLL_LOAD_DIR -> where wintun.dll lives), System32, the
  * application directory and any AddDllDirectory-registered dirs. CWD and
  * PATH are deliberately NOT in this set. */
 #define IWAN_WINTUN_LOAD_FLAGS                                         \
@@ -161,7 +161,7 @@ static int wintun_search_flags_supported(void)
 
 HMODULE wintun_load_secure(const wchar_t *path)
 {
-    /* Preferred path: per-call LoadLibraryExW with loader flags — CWD and
+    /* Preferred path: per-call LoadLibraryExW with loader flags -- CWD and
      * PATH are excluded from the target's dependency resolution. */
     if (wintun_search_flags_supported())
         return LoadLibraryExW(path, NULL, IWAN_WINTUN_LOAD_FLAGS);

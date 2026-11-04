@@ -3,8 +3,8 @@
 
 Regression harness for R47-FIXA-I1 (the F0 / R47-FIXA-H1 fix at
 relay_proxy.c rp_handle_socks: `pr > 0` -> `pr == 1`; the pre-fix code
-treated the pr==2 verdict — a COMPLETE RFC1929 frame with a 64-byte
-username — as a valid frame and evaluated the credentials with
+treated the pr==2 verdict -- a COMPLETE RFC1929 frame with a 64-byte
+username -- as a valid frame and evaluated the credentials with
 UNINITIALIZED pass/plen, a crash/OOB that CI could not see because the
 existing socks_handshake harness drives socks_flow (lwIP) and never the
 relay's own auth loop).
@@ -29,13 +29,13 @@ peer-lockout table is file-static and must start clean per case):
             the REAL relay to the harness's own raw-TCP capture upstream;
             asserts the upstream received the head byte-for-byte
             (Connection: Upgrade preserved, no injected Connection: close
-            — the R52-B1 rewrite must exempt Upgrade/101 handshakes).
+            -- the R52-B1 rewrite must exempt Upgrade/101 handshakes).
   http_overflow_fallback
             R53-A-3: courtesy mode, a mixed-line-ending head (4000 x
             "A\n" + CRLFCRLF, 8045 B < the 8191 B handshake cap) whose
             exact rewritten size exceeds the relay's conn_head buffer;
             asserts the upstream received it byte-for-byte (no truncation,
-            no half-rewrite, no injected Connection: close — the explicit
+            no half-rewrite, no injected Connection: close -- the explicit
             need>outcap fallback).
   http_space_upgrade
             R54-WG1-1: courtesy mode, WS absolute-URI request spelled
@@ -45,7 +45,7 @@ peer-lockout table is file-static and must start clean per case):
   http_space_conn
             R54-WG1-1 (same family as R53-A-2): courtesy mode, a
             NON-Upgrade request with "Connection : keep-alive": asserts
-            the upstream got the exact rewrite — the OWS-spelled line
+            the upstream got the exact rewrite -- the OWS-spelled line
             dropped, exactly ONE canonical "Connection: close" (no
             duplicate Connection).
   http_space_both
@@ -66,7 +66,7 @@ import sys
 # default to --token seckey001)
 DEFAULT_TOKEN = "seckey001"
 
-# cases that need --token; the courtesy (no-token) cases get none — an
+# cases that need --token; the courtesy (no-token) cases get none -- an
 # HTTP case must NOT be given a token (a token-mode relay refuses plain
 # HTTP: HTTP clients cannot do RFC1929)
 TOKEN_CASES = ("tokpr2", "pr0")

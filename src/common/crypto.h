@@ -13,7 +13,7 @@
  * that is treated as fatal). Without it, one failed internal allocation
  * leaves libcrypto's pthread_once state finished-but-incomplete, so
  * initialisation never returns and the process blocks forever in futex()
- * with no output — exactly the R38 symptom. 9fef151's pre-warm did NOT fix
+ * with no output -- exactly the R38 symptom. 9fef151's pre-warm did NOT fix
  * that: the hang happens *inside* the pre-warm, so the oom_abort() after it
  * is never reached. With the wrapper installed libcrypto cannot observe an
  * allocation failure at all, and a genuine OOM turns into the project's

@@ -1,41 +1,41 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * iwan_rx.c — 入站：netfilter 钩子内解封。
+ * iwan_rx.c - RX: decapsulation inside the netfilter hook.
  *
- * 为什么在 PRE_ROUTING（默认 prio=-300）：
- *   内核的两个重组点分别在 -400（nf_defrag_ipv4，只有 conntrack/nft 之类
- *   才会去 enable）与 ip_local_deliver（LOCAL_IN 之后）。隧道的外层分片必须
- *   在**看端口之前**拼完整（非首片没有 UDP/iWAN 头），所以在 -300 自己调一次
- *   导出的 ip_defrag()：返回非 0 = 本片已入队 → NF_STOLEN（skb 归重组机制，
- *   不能再碰）；返回 0 = 数据报此刻完整，就在这一次调用里继续解封。
- *   这就是内核 nf_ct_ipv4_gather_frags() 的同一套约定，不是新语义。
+ * Why at PRE_ROUTING (default prio=-300):
+ *   The kernel's two reassembly points are at -400 (nf_defrag_ipv4, only enabled by conntrack/nft and the
+ *   like) and ip_local_deliver (after LOCAL_IN). Tunnel outer fragments must be made whole **before the port
+ *   is looked at** (non-first fragments carry no UDP/iWAN header), so at -300 we call the exported ip_defrag()
+ *   once ourselves: non-zero = this fragment was queued -> NF_STOLEN (the skb belongs to reassembly, do
+ *   not touch it again); zero = the datagram is complete right now, so decapsulation continues in this
+ *   same call. This is the same convention as the kernel's nf_ct_ipv4_gather_frags(), not new semantics.
  *
- * 内层分片：本模块**不**做内层重组。解出的内层包 NF_ACCEPT 后自然落到
- *   ip_local_deliver 的 ip_defrag（本机）或下一跳（转发）——这也正是
- *   "要不要重组内层"只有在路由之后才答得出来的原因。
+ * Inner fragments: this module does **not** reassemble the inner layer. Once NF_ACCEPTed, the decapsulated
+ *   inner packet naturally reaches ip_local_deliver's ip_defrag (local host) or the next hop (forwarding) --
+ *   which is exactly why 'whether the inner layer should be reassembled' can only be answered after routing.
  *
- * 内层版本（v4/v6）：两种都收，判据是 iwan_inner_hdr_check()（TX 与 RX 共用
- *   一份，见 iwan_core.c）。投递方式分两种：
- *     · 内层版本 == 外层版本（v4 in v4，v1 的老路径）：NF_ACCEPT，让当前协议栈
- *       路径继续走，逐位不变；
- *     · 内层版本 != 外层版本（v6 in v4）：必须 netif_rx 重新入栈 —— NF_ACCEPT
- *       是"接着走外层那条路"，而它是按外层版本进来的（v4 钩子 → ip_rcv_finish
- *       会拿内层头当 v4 解析），版本一变必然误判。重新入栈时协议类型按**内层**
- *       版本给（ETH_P_IPV6），传输层偏移也按内层版本算（v6 = 40 + 扩展头）。
- *   模块参数 reinject=true 则无论版本一律重新入栈（旧行为不变）。
+ * Inner version (v4/v6): both are accepted, judged by iwan_inner_hdr_check()
+ *   (one copy shared with TX, see iwan_core.c). Two delivery modes:
+ *     - inner version == outer version (v4 in v4, the old v1 path): NF_ACCEPT,
+ *       the current stack path continues, bit-for-bit unchanged;
+ *     - inner version != outer version (v6 in v4): must netif_rx to re-inject; NF_ACCEPT means "keep going
+ *       down the outer path", but that path came in by the outer version (a v4 hook -> ip_rcv_finish would
+ *       parse the inner header as v4), so a version change necessarily misparses. Re-injection sets the
+ *       protocol type per the **inner** version (ETH_P_IPV6) and the transport offset likewise (v6 = 40
+ *   + ext hdrs); module param reinject=true re-injects regardless of version (old behavior unchanged).
  *
- * 取参（genetlink 控制面引入后）：每包用 iwan_dp_get() 取一次快照 —— 该 netns
- *   有 netlink 会话时用会话参数，否则回落模块参数（逐位等于旧实现）。
- * 非数据帧（OPEN/OPEN_ACK/ECHO/PING/CLOSE）：不当内层包投递，改为原样转交
- *   用户态（IWAN_EV_CTRL_FRAME）—— 见 iwan_rx_ctrl()。事件多播经每 netns 的
- *   令牌桶限速（超限丢进 IWAN_S_EV_DROPPED）：限速只影响"发多少事件"，不改变
- *   共享内存记账与 PT_CLOSE 语义 —— 那两件事在进桶之前/之外完成。
+ * Params (after the genetlink control plane): one iwan_dp_get() snapshot per packet -- session params when
+ *   the netns has a netlink session, else module params (bit-for-bit equal to the old implementation).
+ * Non-data frames (OPEN/OPEN_ACK/ECHO/PING/CLOSE): not delivered as inner packets, but passed as-is to
+ *   user space (IWAN_EV_CTRL_FRAME), see iwan_rx_ctrl(). Event multicast is token-bucket rate limited
+ *   per netns (over limit -> IWAN_S_EV_DROPPED); the limit only caps how many events are sent, not
+ *   shared-memory accounting or PT_CLOSE semantics -- both of those finish before/outside the bucket.
  *
- * 存活时间戳（v1 共享内存页，布局见 kernel/iwan_shm.h）：
- *   每个**通过凭据闸门**的帧（数据帧或控制帧）都把当前单调毫秒写进该 netns
- *   的共享内存页（/dev/iwan，用户态只读 mmap），PT_CLOSE 把它置 0。写入点只有
- *   iwan_decap_one() 与 iwan_rx_ctrl() 两处，都在软中断上下文：只有普通 store
- *   （WRITE_ONCE），无锁、无分配，也不引入第二套时间基准（iwan_now_ms()）。
+ * Liveness timestamp (v1 shared-memory page, layout in kernel/iwan_shm.h):
+ *   every frame that **passes the credential gate** (data or control) writes the current monotonic
+ *   ms into that netns's shared-memory page (/dev/iwan, user-space read-only mmap); PT_CLOSE sets
+ *   it to 0. Only two write sites: iwan_decap_one() and iwan_rx_ctrl(), both in softirq context:
+ *   plain store only (WRITE_ONCE), no lock, no allocation, and no second time base (iwan_now_ms()).
  */
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
@@ -57,27 +57,27 @@
 #include "iwan_genl.h"	/* IWAN_CTRL_FRAME_MAX / IWAN_PEER_* */
 
 /*
- * 外层头的族无关视图（切片 2）。
+ * Family-agnostic view of the outer header (slice 2).
  *
- * 收包路径上"分流"只发生在两处最外层的地方：内核按 skb->protocol 选
- * ip_rcv / ipv6_rcv，netfilter 钩子表本身也分族（hooks_ipv4/hooks_ipv6）。
- * 我们不去抢那个分流之前的位置（netdev_rx_handler / NF_NETDEV_INGRESS 都是
- * **按网卡**挂钩的，而"什么都不绑"模式要求任意承载网卡都能收、且承载网卡
- * 可以在运行中由 FIB 自愈换卡 —— 按网卡挂钩会把这条语义砍掉）。取而代之：
- * 两个族各挂一个钩子，钩子体共用，族只在下面这层"怎么找到 UDP 头、怎么
- * 比地址"里出现一次，之后的端口检查、解封、投递完全同一条路径。
+ * On the RX path, "demux" happens at only the two outermost spots: the kernel picks ip_rcv / ipv6_rcv
+ * by skb->protocol, and the netfilter hook tables are per-family as well (hooks_ipv4/hooks_ipv6).
+ * We do not take the pre-demux position (netdev_rx_handler / NF_NETDEV_INGRESS hook **per NIC**,
+ * while the "bind nothing" mode requires any carrier NIC to receive and lets FIB self-heal a
+ * NIC swap at runtime -- per-NIC hooking would cut that semantics away). Instead: one hook per
+ * family, shared hook body; the family appears only once, in "how to find the UDP header / how to
+ * compare addresses"; after that the port check, decapsulation and delivery are one single path.
  *
- * src/dst 指向 skb 里的地址字段（v4 4 字节 / v6 16 字节），由 match 按族比较。
+ * src/dst point at the address fields inside the skb (v4 4 bytes / v6 16 bytes); match compares them per family.
  */
 struct iwan_outer_view {
 	const void	*src;
 	const void	*dst;
-	unsigned int	l3;	/* UDP 头偏移（含 IP 头与扩展头） */
+	unsigned int	l3;	/* UDP header offset (includes the IP header and extension headers) */
 	bool		v6;
-	bool		frag;	/* 外层分片 */
+	bool		frag;	/* outer fragment */
 };
 
-/* 外层 v4 解析：判据与切片 1 及之前逐位一致 */
+/* Outer v4 parse: the criterion is bit-for-bit as in slice 1 and before */
 static bool iwan_outer_parse4(struct sk_buff *skb, struct iwan_outer_view *o)
 {
 	const struct iphdr *iph;
@@ -98,17 +98,17 @@ static bool iwan_outer_parse4(struct sk_buff *skb, struct iwan_outer_view *o)
 }
 
 /*
- * 外层 v6 解析。与 v4 的两处结构差异：
- *   · 基本头固定 40B，传输层位置只能靠走扩展头链得到（v4 用 ihl）；
- *   · 分片包只有首片带 UDP 头，非首片连端口都看不到。
+ * Outer v6 parse. Two structural differences from v4:
+ *   - the base header is a fixed 40B, so the transport offset can only come from walking the extension header chain (v4 uses ihl);
+ *   - of a fragmented packet only the first fragment carries a UDP header; non-first fragments do not even show the port.
  *
- * 分片策略：**任何带分片头的 v6 外层包一律不当完整包处理**。本设计里外层
- * v6 不分片（v6 没有 DF 位，源端分片只会换到对端拒收，见 iwan_tx.c），
- * 内层 MTU + IWAN_OVERHEAD_V6 装不进承载网卡 MTU 的会话在控制面已被
- * -EMSGSIZE 拒绝。所以见到分片就是"对端配置与本端不一致"，计数（rx_frag6）
- * 后交给协议栈按它自己的规则处理（NF_ACCEPT：不吞、不冒充完整包）。
- * 首片也拒：它的 UDP 头虽在，载荷却是残缺的，而 RX 的内层判据是宽松口径，
- * 会把一个被截断的内层头当合法包解出来投递。
+ * Fragment policy: **any v6 outer packet carrying a fragment header is never treated as complete**. In this
+ * design outer v6 never fragments (v6 has no DF bit; source-side fragmentation only earns a peer rejection, see
+ * iwan_tx.c), and sessions whose inner MTU + IWAN_OVERHEAD_V6 does not fit the carrier NIC MTU were already
+ * rejected at the control plane with -EMSGSIZE. So a fragment means "the peer config differs from ours": count it
+ * (rx_frag6), then hand it to the stack under its own rules (NF_ACCEPT: do not swallow, do not fake completeness).
+ * First fragments are refused too: their UDP header is present but the payload is truncated, and the RX inner
+ * criterion is lenient, so it would decapsulate a truncated inner header as a valid packet and deliver it.
  */
 static bool iwan_outer_parse6(struct sk_buff *skb, struct iwan_outer_view *o)
 {
@@ -137,14 +137,14 @@ static bool iwan_outer_parse6(struct sk_buff *skb, struct iwan_outer_view *o)
 
 		if (nexthdr == NEXTHDR_FRAGMENT) {
 			o->frag = true;
-			return true;	/* 分片：调用方按策略处理 */
+			return true;	/* fragment: the caller applies the policy */
 		}
 		if (nexthdr == NEXTHDR_NONE)
 			return false;
 		if (!pskb_may_pull(skb, off + sizeof(*hp)))
 			return false;
 		hp = (const struct ipv6_opt_hdr *)(skb->data + off);
-		/* AH 的长度字段语义与其它扩展头不同（(len+2)*4 而不是 (len+1)*8） */
+		/* AH length field semantics differ from other extension headers ((len+2)*4 rather than (len+1)*8) */
 		hlen = nexthdr == NEXTHDR_AUTH ? ipv6_authlen(hp) :
 						 ipv6_optlen(hp);
 		nexthdr = hp->nexthdr;
@@ -164,10 +164,10 @@ static bool iwan_outer_parse(struct sk_buff *skb, struct iwan_outer_view *o)
 						    iwan_outer_parse4(skb, o);
 }
 
-/* 外层地址匹配（any_dir 允许反向：对等/本机双向验证用）。按族比较：v4 会话
- * 只认 v4 包、v6 会话只认 v6 包 —— 不这样卡的话，一个 v4 包的 4 字节源地址
- * 有可能"等于"某条 v6 会话地址的前 4 字节（比较长度都不一样，必须先用族
- * 把它们分开）。 */
+/* Outer address match (any_dir allows the reverse direction, used for peer/local two-way verification). Compared per family: a v4 session
+ * accepts only v4 packets, a v6 session only v6 packets -- without this restriction a v4 packet's 4-byte source address
+ * could "equal" the first 4 bytes of some v6 session address (the compared lengths differ anyway, so the family must
+ * separate them first). */
 static bool iwan_outer_match(const struct iwan_dp *dp,
 			     const struct iwan_outer_view *o)
 {
@@ -206,26 +206,26 @@ static bool iwan_outer_match(const struct iwan_dp *dp,
 
 enum iwan_frame_kind {
 	IWAN_FRAME_BAD  = -1,
-	IWAN_FRAME_DATA = 0,	/* 内层 IPv4 包，解封后交给协议栈 */
-	IWAN_FRAME_CTRL = 1,	/* 非数据帧，转交用户态 */
+	IWAN_FRAME_DATA = 0,	/* inner IPv4 packet, handed to the stack after decapsulation */
+	IWAN_FRAME_CTRL = 1,	/* non-data frame, forwarded to user space */
 };
 
 /*
- * 控制帧的内核侧凭据口径（与 src/common/protocol.h 的线上语义对齐）：
+ * Kernel-side credential rules for control frames (aligned with the on-wire semantics in src/common/protocol.h):
  *
- *   · PT_PING_REQ/RSP：keepalive 用的是**协议固定凭据** 0xFFFF/0xFFFFFFFF，
- *     不是会话凭据 —— 若按会话 sid/tok 卡，keepalive 永远不会上报；这里
- *     同时接受会话凭据，容忍"用会话凭据发 ping"的实现。
- *   · PT_ECHO_REQ/RES、PT_CLOSE：带会话 sid/tok（用户态就是这么发的）。
- *   · PT_OPEN/PT_OPEN_ACK/PT_OPEN_REJECT：握手帧。OPEN_ACK 携带的是服务端
- *     **新分配**的 sid/tok，接收侧内核不可能预先知道；OPEN/OPEN_REJECT 用
- *     0/0。所以这些帧只能靠用户态做凭据校验（IWAN_CTRL_LEN=24 的 HMAC
- *     签名，verify_sig），这正是 CONTROL-PLANE.md §4 要求内核把非数据帧
- *     原样转交的原因。
+ *   - PT_PING_REQ/RSP: keepalive uses the **protocol-fixed credentials** 0xFFFF/0xFFFFFFFF, not
+ *     session credentials -- gating on session sid/tok would never report it; session credentials
+ *     are accepted here as well, tolerating implementations that ping with session credentials.
+ *   - PT_ECHO_REQ/RES, PT_CLOSE: carry the session sid/tok (user space sends it that way).
+ *   - PT_OPEN/PT_OPEN_ACK/PT_OPEN_REJECT: handshake frames. OPEN_ACK carries the server's
+ *     **newly allocated** sid/tok, which the receiving kernel cannot know in advance;
+ *     OPEN/OPEN_REJECT use 0/0. So these frames can only be credential-checked in user
+ *     space (the HMAC signature over IWAN_CTRL_LEN=24, verify_sig), which is exactly why
+ *     CONTROL-PLANE.md section 4 requires the kernel to forward non-data frames as-is.
  *
- * 三种情形都仍然要求外层四元组 + dport 命中（钩子里已完成），注入面被压缩
- * 到"能伪造对端外层地址与隧道端口"这一档；这也与任务里"sid/tok 匹配才上报"
- * 的意图一致：能校验会话凭据的类型一律校验。
+ * All three cases still require the outer 4-tuple + dport to match (already done in the hook), which squeezes the
+ * injection surface down to "can forge the peer's outer address and tunnel port"; this also matches the intent
+ * of "report only when sid/tok match": every frame type whose session credentials can be checked is checked.
  */
 static bool iwan_ctrl_cred_ok(const struct iwan_dp *dp, u8 type, u16 sid, u32 tok)
 {
@@ -244,12 +244,12 @@ static bool iwan_ctrl_cred_ok(const struct iwan_dp *dp, u8 type, u16 sid, u32 to
 }
 
 /*
- * 帧头校验：类型 + 凭据。sid/tok 放在解密之前（伪造帧连 XOR 都不做），
- * 与旧实现同口径：数据帧的 type 必须与 enc 模式一致。
+ * Frame header check: type + credentials. sid/tok are placed before decryption (a forged frame never
+ * even gets XORed), same rule as the old implementation: a data frame's type must match the enc mode.
  *
- * 控制帧只在**已建立 netlink 会话**时才算"可转交"：没有会话时它们和以前
- * 一样走到 IWAN_FRAME_BAD（rx_bad_hdr++ 后丢弃）—— 这就是"不建会话时行为与
- * 引入控制面之前逐位一致"的保证点。
+ * Control frames count as "forwardable" only when a **netlink session is established**: with no session
+ * they reach IWAN_FRAME_BAD exactly as before (rx_bad_hdr++ then drop) -- this is the guarantee point for
+ * "with no session the behavior is bit-for-bit identical to before the control plane was introduced".
  */
 static enum iwan_frame_kind iwan_frame_check(const struct iwan_dp *dp, const u8 *h)
 {
@@ -285,10 +285,10 @@ static enum iwan_frame_kind iwan_frame_check(const struct iwan_dp *dp, const u8 
 }
 
 /*
- * 控制帧分流：计数、更新 peer 状态、按类型补发语义事件，原样转交用户态。
+ * Control frame demux: count, update peer state, emit the per-type semantic event, pass the frame through as-is to user space.
  *
- * 单独一个 noinline 函数：512B 的帧缓冲只在这一条冷路径上花栈，不进每包都
- * 走的热路径（数据帧根本不会调用它）。
+ * A separate noinline function: the 512B frame buffer only spends stack on this one
+ * cold path, not on the hot path every packet takes (data frames never call it).
  */
 static noinline void iwan_rx_ctrl(struct iwan_net *pn, struct sk_buff *skb,
 				  unsigned int off, unsigned int len, u8 type,
@@ -308,41 +308,41 @@ static noinline void iwan_rx_ctrl(struct iwan_net *pn, struct sk_buff *skb,
 	bool delivered;
 
 	atomic64_inc(&pn->st.rx_ctrl_frame);
-	iwan_shm_note_ctrl_frame(pn);	/* 共享内存页的计数镜像（普通 store） */
+	iwan_shm_note_ctrl_frame(pn);	/* counter mirror in the shared-memory page (plain store) */
 
-	/* 超过上限就截断并记日志（ABI 上限见 IWAN_CTRL_FRAME_MAX） */
+	/* Over the cap: truncate and log (ABI cap: IWAN_CTRL_FRAME_MAX) */
 	if (len > (unsigned int)IWAN_CTRL_FRAME_MAX) {
-		pr_info_ratelimited("iwan: 控制帧 %u 字节超过上限 %d，已截断转交\n",
+		pr_info_ratelimited("iwan: control frame %u bytes over the limit %d, truncated and forwarded\n",
 				    len, IWAN_CTRL_FRAME_MAX);
 		len = IWAN_CTRL_FRAME_MAX;
 	}
 	frame = skb_header_pointer(skb, off, (int)len, buf);
 	if (!frame)
-		return;		/* 已计入 rx_ctrl_frame，不投递、不再上报 */
+		return;		/* already counted in rx_ctrl_frame, no delivery, no further report */
 
 	/*
-	 * 原样帧先转交（用户态自己验签/解析），随后补语义事件。
+	 * The raw frame is forwarded first (user space verifies/parses it itself), then the semantic events follow.
 	 *
-	 * delivered == false 只表示**事件多播**被令牌桶限速丢了（见
-	 * iwan_ev_ctrl_frame），共享内存的副作用不受它影响：进桶之前
-	 * iwan_decap_one() 已经写过 last_rx_ms/peer_state，下面的 PT_CLOSE
-	 * 语义也照旧执行。否则攻击者用洪水打空令牌桶，就能让一个真实对端的
-	 * PT_CLOSE 变成"用户态看不见、时间戳还停在非 0"—— 那等于把断线检测
-	 * 关掉。限速只该限制"发多少事件"，不该改变"数据面看到了什么"。
+	 * delivered == false only means the **event multicast** was dropped by the token-bucket limiter (see
+	 * iwan_ev_ctrl_frame); the shared-memory side effects are unaffected: before entering the bucket
+	 * iwan_decap_one() already wrote last_rx_ms/peer_state, and the PT_CLOSE semantics below still run.
+	 * Otherwise an attacker could empty the bucket with a flood and turn a real peer's PT_CLOSE into
+	 * "invisible to user space, timestamp still non-zero" -- that would switch dead-link detection off.
+	 * Rate limiting should only cap "how many events are sent", never change "what the data plane saw".
 	 */
 	delivered = iwan_ev_ctrl_frame(pn, sid, &t, frame, len);
 
 	if (type == PT_PING_REQ || type == PT_PING_RSP) {
-		/* keepalive 时间戳已由 iwan_decap_one() 的通用路径写进共享内存
-		 * （每个通过凭据闸门的帧都写，PING 不特殊）；这里只补发语义事件，
-		 * 事件载荷仍用当前的同一时基 iwan_now_ms()。 */
+		/* keepalive timestamp was already written into shared memory by the generic path of iwan_decap_one()
+		 * (every frame passing the credential gate writes it; PING is not special); only the semantic
+		 * event is emitted here, and its payload still uses the same current time base, iwan_now_ms(). */
 		ts = iwan_now_ms();
 		if (delivered)
 			iwan_ev_keepalive(pn, ts);
 	} else if (type == PT_CLOSE) {
-		/* PT_CLOSE：共享内存页的时间戳置 0（用户态见到 0 即判定断线），
-		 * 同时把 peer_state 落成 IWAN_PEER_CLOSED。这两件事与限速无关，
-		 * 必须无条件做。 */
+		/* PT_CLOSE: set the shared-memory page timestamp to 0 (user space sees 0
+		 * and declares the link down), and drop peer_state to IWAN_PEER_CLOSED.
+		 * Neither depends on rate limiting; both must happen unconditionally. */
 		iwan_shm_note_close(pn);
 		if (delivered)
 			iwan_ev_peer_close(pn, sid);
@@ -350,12 +350,12 @@ static noinline void iwan_rx_ctrl(struct iwan_net *pn, struct sk_buff *skb,
 }
 
 /*
- * 把已经完整的外层数据报解封成内层明文包。
- * 返回 0 = 内层明文包已就绪（skb 已剥头/解密）；1 = 控制帧（已转交用户态，
- * skb 保持原样，由调用者决定丢弃）；<0 = 丢弃（计数器已在内部累加）。
+ * Decapsulate an already complete outer datagram into a plaintext inner packet. Returns 0 = plaintext
+ * inner packet ready (skb stripped / decrypted); 1 = control frame (already forwarded to user space,
+ * skb left as-is, the caller decides to drop); <0 = drop (the counter was already bumped inside).
  *
- * 分流点：外层重组 → 四元组 → dport → 帧头类型/凭据（iwan_frame_check）之后，
- * 也就是与数据帧**完全相同的前置校验之后**才分叉。
+ * Branch point: after outer reassembly -> 4-tuple -> dport -> frame header type/credentials
+ * (iwan_frame_check), i.e. the split happens only **after exactly the same pre-checks as data frames**.
  */
 static int iwan_decap_one(struct iwan_net *pn, struct sk_buff *skb,
 			  const struct iwan_dp *dp, unsigned int l3)
@@ -366,9 +366,9 @@ static int iwan_decap_one(struct iwan_net *pn, struct sk_buff *skb,
 	enum iwan_frame_kind kind;
 	unsigned int ulen, need;
 
-	/* 外层 IP+UDP 头必须先拉进线性区才能直接解引用。UDP 大报文发送路径
-	 * （ip_generic_getfrag → page frags）交来的 skb 线性区可能只有 IP+UDP
-	 * 头那 28 字节：外层数据报一超过 ~16KB，载荷几乎全在 frags 里。 */
+	/* the outer IP+UDP header must be pulled into the linear area before dereferencing it directly. The skb handed
+	 * over by the UDP large-datagram TX path (ip_generic_getfrag -> page frags) may hold only those 28 bytes of
+	 * IP+UDP header linearly: once an outer datagram exceeds ~16KB the payload is almost entirely in frags. */
 	if (unlikely(!pskb_may_pull(skb, l3 + sizeof(*uh)))) {
 		atomic64_inc(&pn->st.rx_nomem);
 		return -ENOMEM;
@@ -395,19 +395,19 @@ static int iwan_decap_one(struct iwan_net *pn, struct sk_buff *skb,
 		return -EINVAL;
 	}
 
-	/* 通过凭据闸门 ⇒ 对端活着：把当前单调毫秒写进共享内存页（数据帧与
-	 * 控制帧都算）。PT_CLOSE 会在 iwan_rx_ctrl() 里把它覆盖成 0。
-	 * 软中断上下文：只有普通 store，无锁、无分配。 */
+	/* passed the credential gate => the peer is alive: write the current monotonic ms into
+	 * the shared-memory page (data frames and control frames alike). PT_CLOSE overwrites it
+	 * with 0 in iwan_rx_ctrl(). Softirq context: plain store only, no lock, no allocation. */
 	iwan_shm_note_frame(pn);
 
-	/* 有效帧 ⇒ 对端活着（IWAN_PEER_UP = 收过有效帧）；
-	 * PT_CLOSE 在 iwan_rx_ctrl() 里覆盖成 IWAN_PEER_CLOSED。 */
+	/* valid frame => peer alive (IWAN_PEER_UP = a valid frame was received);
+	 * PT_CLOSE overwrites it with IWAN_PEER_CLOSED in iwan_rx_ctrl(). */
 	if (dp->session && iwan_shm_peer_state(pn) != IWAN_PEER_CLOSED)
 		iwan_shm_set_peer_state(pn, IWAN_PEER_UP);
 
 	if (kind == IWAN_FRAME_CTRL) {
-		/* UDP 载荷 = 外层 IP/UDP 头之后的原始帧字节（8B 帧头 + 载荷）。
-		 * 长度按 UDP 头的 len 取，并用 skb 实际长度兜底。 */
+		/* UDP payload = raw frame bytes after the outer IP/UDP header (8B frame
+		 * header + payload). Length taken from the UDP header len, with the real skb length as fallback. */
 		unsigned int flen = ulen - sizeof(*uh);
 		unsigned int avail = skb->len - l3 - sizeof(*uh);
 
@@ -419,15 +419,15 @@ static int iwan_decap_one(struct iwan_net *pn, struct sk_buff *skb,
 	}
 
 	atomic64_inc(&pn->st.rx_frames);
-	iwan_shm_note_data_frame(pn);	/* 共享内存页的计数镜像 */
+	iwan_shm_note_data_frame(pn);	/* counter mirror in the shared-memory page */
 
-	/* 剥掉 外层 IPv4 + UDP + iWAN 帧头 —— 必须先保证这 need 字节在线性区：
-	 * 大外层数据报（内层 > ~16KB ⇒ 外层 > ~16KB）的载荷在 page frags，
-	 * 线性区可能不足 need，直接 skb_pull 会踩 __skb_pull 的
-	 * BUG_ON(skb->len < skb->data_len)。2026-10-08 崩溃靶场 trace：
-	 * skb_pull+0x40 ← iwan_decap_one ← iwan_rx_hook（softirq panic），
-	 * 内层 20000B + s2c（服务端中继的大外层包）实测必炸；1200B 探针与
-	 * 9000B（外层 9036，尚在线性分配范围内）都不炸，所以此前漏网。 */
+	/* strip the outer IPv4 + UDP + iWAN frame header -- all need bytes must first be guaranteed
+	 * in the linear area: for a large outer datagram (inner > ~16KB => outer > ~16KB) the
+	 * payload is in page frags and the linear area may hold fewer than need bytes, so a direct
+	 * skb_pull trips __skb_pull's BUG_ON(skb->len < skb->data_len). Crash-lab trace 2026-10-08:
+	 * skb_pull+0x40 <- iwan_decap_one <- iwan_rx_hook (softirq panic); inner 20000B + s2c
+	 * (large outer packet relayed by the server) always blew up under test; a 1200B probe and
+	 * 9000B (outer 9036, still within linear allocation) did not, hence the earlier escape. */
 	if (unlikely(!pskb_may_pull(skb, need))) {
 		atomic64_inc(&pn->st.rx_nomem);
 		return -ENOMEM;
@@ -435,7 +435,7 @@ static int iwan_decap_one(struct iwan_net *pn, struct sk_buff *skb,
 	skb_pull(skb, need);
 	skb_reset_network_header(skb);
 
-	/* 解密：整段内层 IP 包（含内层 IP 头）按会话密钥 XOR 还原 */
+	/* Decrypt: XOR the whole inner IP packet (inner IP header included) back with the session key */
 	if (dp->enc) {
 		if (iwan_xor_skb(skb, dp->key)) {
 			atomic64_inc(&pn->st.rx_nomem);
@@ -443,9 +443,9 @@ static int iwan_decap_one(struct iwan_net *pn, struct sk_buff *skb,
 		}
 	}
 
-	/* 明文内层头校验（v4/v6 共用一份判据；RX 保持既有的宽松长度口径：
-	 * 内层头声明的长度盖不住整帧才拒，多余尾字节不拒）。传输层偏移按版本
-	 * 算 —— v6 是 40 + 扩展头，不能照搬 v4 的 ihl。 */
+	/* plaintext inner header check (one criterion shared by v4/v6; RX keeps the existing lenient length rule: reject only
+	 * when the length declared by the inner header does not cover the whole frame, extra trailing bytes are accepted).
+	 * The transport offset is computed per version -- v6 is 40 + extension headers, the v4 ihl cannot be reused. */
 	{
 		u32 nhlen;
 
@@ -453,12 +453,12 @@ static int iwan_decap_one(struct iwan_net *pn, struct sk_buff *skb,
 			atomic64_inc(&pn->st.rx_bad_inner);
 			return -EINVAL;
 		}
-		/* inner_src 白名单是**模块参数**（ABI 里没有会话级对应项），
-		 * 类型是 __be32，只能表达内层 v4 源地址：它只对 v4 生效。
-		 * 内层 v6 不做等价过滤 —— 静默丢弃 v6 会变成另一种黑洞，
-		 * 而 v6 的准入过滤（派生 ULA：目的必须是本会话 ULA、源不许
-		 * 是本会话 ULA）在用户态 TUN 面实现，内核面暂不复制该策略
-		 * （模块是数据面；要复制得先给 ABI 加内层地址项）。 */
+		/* inner_src allowlist is a **module parameter** (the ABI has no session-level counterpart) typed
+		 * __be32, so it can only express an inner v4 source address: it applies to v4 only. Inner v6 gets no
+		 * equivalent filter -- silently dropping v6 would be another black hole, and the v6 admission filter
+		 * (derived ULA: the destination must be this session's ULA, the source must not be) is implemented
+		 * in the user-space TUN side; the kernel side does not replicate that policy for now (this module
+		 * is the data plane; replicating it would first need an inner address item in the ABI). */
 		if (skb->data[0] >> 4 == 4 && dp->inner_src) {
 			const struct iphdr *iph = ip_hdr(skb);
 
@@ -469,35 +469,35 @@ static int iwan_decap_one(struct iwan_net *pn, struct sk_buff *skb,
 		}
 		skb_set_transport_header(skb, nhlen);
 	}
-	/* 链路上是密文校验和，XOR 已把它还原成明文校验和 → 让内核按明文校验 */
+	/* the wire carries a ciphertext checksum; XOR already restored it to the plaintext checksum -> let the kernel verify it as plaintext */
 	skb->ip_summed = CHECKSUM_NONE;
-	/* 外层 dst 在本钩子里本来还没建立，但防上游残留 */
+	/* the outer dst is not set yet in this hook anyway, but guard against upstream leftovers */
 	skb_dst_drop(skb);
 	return 0;
 }
 
-/* LOCAL_IN 兜底：解封后送回 ip_rcv，即回到 ip_defrag 之前 */
+/* LOCAL_IN fallback: after decapsulation send back to ip_rcv, i.e. back to before ip_defrag */
 static unsigned int iwan_reinject(struct sk_buff *skb,
 				  const struct nf_hook_state *state)
 {
-	/* 内层头已由 iwan_decap_one 校验过，skb->data 就是内层 IP 头 */
+	/* the inner header was already checked by iwan_decap_one, skb->data is the inner IP header */
 	u8 ver = skb->data[0] >> 4;
 
 	skb->dev = state->in;
-	/* 协议类型必须按**内层**版本给：netif_rx 之后由它选协议处理器，
-	 * 选错了（v6 包挂 ETH_P_IP）会被 ip_rcv 按版本不符丢掉。 */
+	/* the protocol type must follow the **inner** version: netif_rx selects the
+	 * protocol handler with it, and a wrong choice (a v6 packet tagged ETH_P_IP) is dropped by ip_rcv on version mismatch. */
 	skb->protocol = htons(ver == 6 ? ETH_P_IPV6 : ETH_P_IP);
 	skb->pkt_type = PACKET_HOST;
 	skb_reset_mac_header(skb);
 	skb_reset_network_header(skb);
-	/* 传输层偏移在 iwan_decap_one 里已按版本设好（v4 = ihl*4；
-	 * v6 = 40 + 扩展头），这里不再按 v4 的 ihl 覆写。 */
+	/* the transport offset was already set per version in iwan_decap_one (v4 = ihl*4;
+	 * v6 = 40 + extension headers), so do not overwrite it from the v4 ihl here. */
 	/*
-	 * netif_rx() 无条件接管 skb：成功则入 backlog，拥塞/协议栈丢弃时返回
-	 * NET_RX_DROP 且**已经自己释放**。两个分支所有权都已转移，所以只能返回
-	 * NF_STOLEN —— 返回 NF_DROP 会让 nf_hook_slow() 对同一个 skb 再释放一次
-	 * （双重释放）。netfilter.h 的约定原文：hook 若已 kfree_skb，就必须
-	 * NF_STOLEN 并自行承担后果。
+	 * netif_rx() takes over the skb unconditionally: on success it enters the backlog, on
+	 * congestion/stack drop it returns NET_RX_DROP and **has already freed it itself**. Ownership
+	 * has moved in both branches, so we may only return NF_STOLEN -- returning NF_DROP would
+	 * make nf_hook_slow() free the same skb once more (double free). netfilter.h states the rule
+	 * literally: a hook that already kfree_skb'd must return NF_STOLEN and own the consequences.
 	 */
 	netif_rx(skb);
 	return NF_STOLEN;
@@ -511,21 +511,21 @@ static unsigned int iwan_rx_single(struct iwan_net *pn, struct sk_buff *skb,
 	int ret = iwan_decap_one(pn, skb, dp, l3);
 
 	if (ret < 0) {
-		/* 四元组+端口都命中了却过不了帧校验：伪造或损坏，丢掉 */
+		/* 4-tuple + port both matched yet the frame check failed: forged or corrupt, drop */
 		return NF_DROP;
 	}
 	if (ret > 0) {
-		/* 控制帧：已转交用户态，绝不当内层包投递。
-		 * NF_DROP 由框架释放 skb（我们不持有它）。 */
+		/* control frame: already forwarded to user space, never deliver it as an inner
+		 * packet. NF_DROP makes the framework free the skb (we do not own it). */
 		return NF_DROP;
 	}
 	atomic64_inc(&pn->st.rx_delivered);
-	/* 投递方式：模块参数 reinject=true 一律 netif_rx 回协议栈；此外还有
-	 * 一种**必须**重新入栈的情形 —— 内层版本 ≠ 外层版本（v6 in v4，本片
-	 * 起支持）。NF_ACCEPT 是"让当前这条协议栈路径继续走"，而它是按外层
-	 * 版本进来的（v4 钩子 → ip_rcv_finish 会拿内层头按 v4 解析，读出来的
-	 * 地址/长度全是错的），版本一变就必然误判，只能重新入栈让 skb->protocol
-	 * 重新选处理器。同版本时保持旧行为（NF_ACCEPT），逐位不变。 */
+	/* delivery mode: module param reinject=true always sends the packet back to the stack via netif_rx; there
+	 * is also one case that **must** re-inject -- inner version != outer version (v6 in v4, supported from this
+	 * slice on). NF_ACCEPT means "let the current stack path continue", and that path came in by the outer
+	 * version (v4 hook -> ip_rcv_finish parses the inner header as v4, so the addresses/lengths it reads are all
+	 * wrong); any version change necessarily misparses, so the skb must be re-injected and let skb->protocol
+	 * pick the handler again. Same version keeps the old behavior (NF_ACCEPT), bit-for-bit unchanged. */
 	if (READ_ONCE(c->reinject) ||
 	    (skb->data[0] >> 4) != (state->pf == NFPROTO_IPV6 ? 6 : 4))
 		return iwan_reinject(skb, state);
@@ -533,13 +533,13 @@ static unsigned int iwan_rx_single(struct iwan_net *pn, struct sk_buff *skb,
 }
 
 /*
- * GSO 批处理：参考客户端用 UDP_SEGMENT 把 N 个等长帧发成一串 UDP 报文，
- * 接收侧 GRO 可能把它们合并成一个 skb（外层头 + N 段等长负载）。协议文档
- * 特意规定"等长帧"就是为了让接收侧能这样做：按 gso_size 拆回单个报文，每个
- * 报文各自剥头/解密（XOR 逐帧从偏移 0 开始），再各自送回栈。
- * 拆包会消费原 skb，而 netfilter 钩子无法替换手里的 skb 指针 ⇒ NF_STOLEN，
- * 由我们自己把解出的内层包交给 netif_receive_skb（回到 ip_rcv 之前）。
- * 混合了控制帧的合并包：控制帧照常上报（iwan_decap_one 返回 1），只是不再投递。
+ * GSO batching: the reference client uses UDP_SEGMENT to send N equal-length frames as a run of UDP datagrams, and
+ * GRO on the receiving side may merge them into a single skb (outer header + N equal-length payloads). The protocol
+ * document mandates "equal-length frames" precisely so the receiver can do this: split back into single datagrams by
+ * gso_size, strip/decrypt each one separately (XOR restarts at offset 0 per frame), and re-inject each into the stack.
+ * Splitting consumes the original skb, and a netfilter hook cannot replace the skb pointer it holds => NF_STOLEN, and
+ * we hand the decapsulated inner packets to netif_receive_skb ourselves (back to before ip_rcv). Coalesced packets with
+ * mixed control frames: control frames are reported as usual (iwan_decap_one returns 1), they are just not delivered.
  */
 static unsigned int iwan_rx_batch(struct iwan_net *pn, struct sk_buff *skb,
 				  const struct iwan_cfg *c,
@@ -556,19 +556,19 @@ static unsigned int iwan_rx_batch(struct iwan_net *pn, struct sk_buff *skb,
 		atomic64_inc(&pn->st.rx_batch_skip);
 		return NF_ACCEPT;
 	}
-	segs = skb_gso_segment(skb, 0);	/* features=0：各段校验和由软件算好 */
+	segs = skb_gso_segment(skb, 0);	/* features=0: the checksum of each segment is computed in software */
 	if (IS_ERR(segs)) {
 		/*
-		 * skb_gso_segment() 在 IS_ERR 时**不消费**原 skb（上游为"原 skb
-		 * 仍归调用者"专门修过 ownership），所以这里自己释放；既然已经
-		 * 释放，就必须 NF_STOLEN：返回 NF_DROP 会被框架再释放一次。
+		 * skb_gso_segment() does **not consume** the original skb on IS_ERR (upstream fixed ownership
+		 * specifically so the original skb still belongs to the caller), so free it here ourselves; and since
+		 * we already freed it we must return NF_STOLEN: NF_DROP would make the framework free it a second time.
 		 */
 		kfree_skb(skb);
 		atomic64_inc(&pn->st.rx_bad_hdr);
 		return NF_STOLEN;
 	}
 	if (!segs)
-		return NF_ACCEPT;	/* 没有实际分段，原 skb 仍然有效 */
+		return NF_ACCEPT;	/* no real segmentation happened, the original skb is still valid */
 	consume_skb(skb);
 
 	while ((seg = segs) != NULL) {
@@ -579,24 +579,24 @@ static unsigned int iwan_rx_batch(struct iwan_net *pn, struct sk_buff *skb,
 		segs = seg->next;
 		seg->next = NULL;
 		seg->prev = NULL;
-		/* 分段的外层头与入口那个 skb 同族同形（GSO 只切载荷，每段各带
-		 * 一份 IP+UDP 头），所以这里用与 single 路径同一套按族解析取
-		 * UDP 头偏移，不另写一份 v4/v6 判断。 */
+		/* a segment's outer header is the same family and shape as the ingress skb (GSO only cuts the
+		 * payload; each segment carries its own IP+UDP header), so reuse the family-aware parse of
+		 * the single path to get the UDP header offset instead of writing a second v4/v6 decision. */
 		if (!iwan_outer_parse(seg, &so) || so.frag)
 			goto drop;
 		l3 = so.l3;
-		/* 与 single 路径对称：iwan_decap_one() 要读 uh->len，先把 UDP 头
-		 * 拉进线性区。不要把契约建立在"分段器保证每段线性含 IP+UDP 头"
-		 * 这个实现细节上。 */
+		/* symmetric with the single path: iwan_decap_one() reads uh->len, so pull the UDP header
+		 * into the linear area first. Do not build the contract on the implementation detail
+		 * that "the segmenter guarantees every segment has the IP+UDP headers linear". */
 		if (!pskb_may_pull(seg, l3 + sizeof(struct udphdr)))
 			goto drop;
 		ret = iwan_decap_one(pn, seg, dp, l3);
 		if (ret)
-			goto drop;	/* <0 坏帧；>0 控制帧已上报，不投递 */
+			goto drop;	/* <0 bad frame; >0 control frame already reported, not delivered */
 		atomic64_inc(&pn->st.rx_delivered);
 		seg->dev = indev;
-		/* 按**内层**版本选协议（batch 路径一律 netif_receive_skb 重新
-		 * 入栈）：内层 v6 挂 ETH_P_IP 会被 ip_rcv 按版本不符丢掉。 */
+		/* pick the protocol by the **inner** version (the batch path always
+		 * re-injects through netif_receive_skb): inner v6 tagged ETH_P_IP is dropped by ip_rcv on version mismatch. */
 		seg->protocol = htons((seg->data[0] >> 4) == 6 ? ETH_P_IPV6
 							       : ETH_P_IP);
 		seg->pkt_type = PACKET_HOST;
@@ -620,17 +620,21 @@ static unsigned int iwan_rx_hook(void *priv, struct sk_buff *skb,
 	u16 lport;
 
 	(void)priv;
-	/* 会话优先、模块参数回落：没有会话时 dp 的每个字段都等于旧实现
-	 * 直接读 cfg/pn 的值（含 cfg.enabled && pn->enabled 的开关口径）。 */
+	/* diagnostic pass-through: the hook lets the packet go (NF_ACCEPT) as soon as it sees it, no parsing, no decapsulation.
+	 * The only difference from the normal path is "entering the hook" itself. */
+	if (unlikely(READ_ONCE(c->pass_through) & IWAN_PASS_RX))
+		return NF_ACCEPT;
+	/* session first, module params as fallback: with no session every field of dp
+	 * equals what the old implementation read straight from cfg/pn (including the cfg.enabled && pn->enabled gate). */
 	iwan_dp_get(pn, c, false, &dp);
 	if (!dp.enabled)
 		return NF_ACCEPT;
-	/* 承载网卡限定：一条会话只认一张下游网卡。显式绑定（dp.oif）优先，否则
-	 * 用已经钉住的那张（pn->carrier；0 = 尚未解析，此时不限制，行为与引入
-	 * 绑定之前一致）。state->in 为 NULL 的本机自生成路径（钩子配在
-	 * OUTPUT/POST_ROUTING 时）不做限定。
-	 * 这一层同时收紧伪造面：外层四元组可伪造，不限接口就等于任意接口上的
-	 * 伪包都能进解封装流程（凭据闸门在后面才做）。代价是一次 ifindex 比较。 */
+	/* carrier NIC restriction: one session accepts only one downstream NIC. An explicit binding (dp.oif) wins,
+	 * otherwise the already pinned one is used (pn->carrier; 0 = not resolved yet, no restriction then, behavior
+	 * identical to before binding was introduced). Locally generated paths with state->in == NULL (hooks
+	 * configured at OUTPUT/POST_ROUTING) are not restricted. This layer also tightens the forgery surface:
+	 * the outer 4-tuple is forgeable, so without an interface restriction a forged packet on any interface
+	 * could enter decapsulation (the credential gate runs later). The cost is one ifindex comparison. */
 	if (dp.oif || READ_ONCE(pn->carrier)) {
 		u32 want = dp.oif ? dp.oif : READ_ONCE(pn->carrier);
 
@@ -639,23 +643,23 @@ static unsigned int iwan_rx_hook(void *priv, struct sk_buff *skb,
 	}
 	if (!iwan_outer_parse(skb, &o))
 		return NF_ACCEPT;
-	/* 计数器口径（两族合计）：rx_pkts = 经过本钩子的、封装形状合法的 UDP
-	 * 外层包（地址还没比）；rx_outer = 其中外层地址属于本会话的。 */
+	/* counter semantics (both families combined): rx_pkts = well-formed UDP
+	 * outer packets that passed this hook (addresses not yet compared); rx_outer = those whose outer address belongs to this session. */
 	atomic64_inc(&pn->st.rx_pkts);
 	if (!iwan_outer_match(&dp, &o))
 		return NF_ACCEPT;
 	atomic64_inc(&pn->st.rx_outer);
 
-	/* ① 外层分片 */
+	/* 1) outer fragment */
 	if (o.frag) {
 		if (o.v6) {
-			/* 外层 v6 不分片（见 iwan_outer_parse6）：不吞、不当完整包
-			 * 处理，计数后交回协议栈。 */
+			/* outer v6 does not fragment (see iwan_outer_parse6): do not swallow it, do not
+			 * treat it as a complete packet; count it and hand it back to the stack. */
 			atomic64_inc(&pn->st.rx_frag6);
-			pr_info_ratelimited("iwan: 外层 v6 分片：本设计外层 v6 不分片（会话建立时按承载网卡 MTU 校验过），该包不按本隧道解封\n");
+			pr_info_ratelimited("iwan: outer v6 fragment: outer v6 never fragments here (MTU checked at session setup); not decapsulated by this tunnel\n");
 			return NF_ACCEPT;
 		}
-		/* v4：只在 PRE_ROUTING 需要重组（LOCAL_IN 时内核已重组过） */
+		/* v4: reassembly is needed only at PRE_ROUTING (at LOCAL_IN the kernel already did it) */
 		if (READ_ONCE(c->hooknum) != IWAN_HOOK_PRE_ROUTING)
 			return NF_ACCEPT;
 		{
@@ -665,12 +669,12 @@ static unsigned int iwan_rx_hook(void *priv, struct sk_buff *skb,
 			ret = ip_defrag(state->net, skb, IP_DEFRAG_LOCAL_DELIVER);
 			local_bh_enable();
 			if (ret) {
-				/* 已入队（或超限被丢）：skb 已被重组机制消费 */
+				/* queued (or dropped on overflow): the skb was consumed by reassembly */
 				atomic64_inc(&pn->st.rx_reasm);
 				return NF_STOLEN;
 			}
 		}
-		/* 返回 0：数据报此刻完整，就在这次调用里继续解封 */
+		/* returns 0: the datagram is complete right now, keep decapsulating in this call */
 		atomic64_inc(&pn->st.rx_reasm);
 		if (!iwan_outer_parse(skb, &o) || o.frag)
 			return NF_ACCEPT;
@@ -679,32 +683,32 @@ static unsigned int iwan_rx_hook(void *priv, struct sk_buff *skb,
 	}
 
 	/*
-	 * ② 端口只在完整数据报上可见，所以放在重组之后。
+	 * 2) ports are only visible on a complete datagram, so this comes after reassembly.
 	 *
-	 * 本端接收端口 = SPORT（显式给出时）；没给则沿用 DPORT，即"两端同端口"
-	 * 的旧口径，行为与引入 SPORT 之前逐位一致。必须这样区分：TX 用 SPORT 作
-	 * **源**端口，而真实客户端的本地端口是临时端口，与对端 DPORT 不同——
-	 * 只认 DPORT 的话，真实客户端的入站包永远不匹配，内核数据面等于死的
-	 * （此前两端都用同一个端口的测试恰好掩盖了这一点）。
-	 * 刻意不写成"两个端口都接受"：那会把发给对端端口的包也吞掉。
+	 * the local receive port = SPORT when given explicitly; otherwise DPORT is kept, i.e. the old "same port
+	 * on both ends" rule, bit-for-bit as before SPORT existed. This distinction is mandatory: TX uses SPORT
+	 * as the **source** port, while a real client's local port is ephemeral and differs from the peer's DPORT
+	 * -- with DPORT only, a real client's inbound packets would never match and the kernel data plane would
+	 * be dead (the earlier tests that used the same port on both ends had exactly hidden this). Deliberately
+	 * not written as "accept both ports": that would also swallow packets sent to the peer's port.
 	 */
 	if (!pskb_may_pull(skb, o.l3 + sizeof(*uh)))
 		return NF_ACCEPT;
 	uh = (struct udphdr *)(skb_network_header(skb) + o.l3);
 	lport = dp.sport ? dp.sport : dp.dport;
 	if (uh->dest != htons(lport)) {
-		/* 会话/参数里存主机序，包里是网络序：比较前必须转换。
-		 * 目的端口不符同样属于"封装头不是我们的"，计入 rx_bad_hdr：
-		 * 这条路径以前是静默返回，出问题时计数器上一个都看不到。
-		 * ratelimited 打印实际值：端口不匹配只能靠对数值定位。 */
-		pr_info_ratelimited("iwan: 目的端口不符: 收到 %u 期望 %u\n",
+		/* the session/params keep host byte order, the packet is network byte order: convert before comparing. A
+		 * destination port mismatch also means "the encapsulation header is not ours", so it counts into rx_bad_hdr:
+		 * this path used to return silently, leaving nothing visible in the counters when something broke. The
+		 * ratelimited print shows the actual values: a port mismatch can only be located by comparing the numbers. */
+		pr_info_ratelimited("iwan: destination port mismatch: got %u expected %u\n",
 				    ntohs(uh->dest), lport);
 		atomic64_inc(&pn->st.rx_bad_hdr);
 		return NF_ACCEPT;
 	}
 
-	/* ③ 逐帧解封（GSO 合并包另走批处理路径）；
-	 *    数据帧与控制帧在 iwan_decap_one() 里凭据校验之后分叉 */
+	/* 3) per-frame decapsulation (GSO-coalesced packets take the batch path);
+	 *    data frames and control frames split inside iwan_decap_one() after the credential check */
 	if (skb_is_gso(skb) && skb_shinfo(skb)->gso_size)
 		return iwan_rx_batch(pn, skb, c, &dp, state);
 	return iwan_rx_single(pn, skb, c, &dp, o.l3, state);
@@ -715,11 +719,11 @@ int iwan_rx_net_init(struct iwan_net *pn)
 	struct iwan_cfg *c = iwan_cfg_get();
 	int err;
 
-	/* 两个族各挂一个钩子、指向同一个钩子函数。netfilter 的钩子表本身
-	 * 分族（nf_hooks_ipv4 / nf_hooks_ipv6），没有"族无关的钩子"可用；
-	 * 而按网卡挂钩（netdev_rx_handler / NF_NETDEV_INGRESS）会破坏"什么都
-	 * 不绑"时任意承载网卡都能收、且承载网卡可自愈换卡的语义，所以走
-	 * "两族各一钩子 + 共用钩子体"这条路。 */
+	/* one hook per family, both pointing at the same hook function. netfilter's hook tables are
+	 * themselves per-family (nf_hooks_ipv4 / nf_hooks_ipv6) and there is no "family-agnostic
+	 * hook" available; hooking per NIC (netdev_rx_handler / NF_NETDEV_INGRESS) would break the
+	 * semantics that with "bind nothing" any carrier NIC can receive and the carrier NIC can
+	 * self-heal to another card, so we take the "one hook per family + shared hook body" road. */
 	pn->rx_ops4.hook = iwan_rx_hook;
 	pn->rx_ops4.pf = NFPROTO_IPV4;
 	pn->rx_ops6.hook = iwan_rx_hook;
@@ -732,15 +736,15 @@ int iwan_rx_net_init(struct iwan_net *pn)
 		ops->priority = READ_ONCE(c->hookprio);
 		err = nf_register_net_hook(pn->net, ops);
 		if (err) {
-			pr_err("netns %u: nf_register_net_hook(%s) 失败 %d\n",
+			pr_err("netns %u: nf_register_net_hook(%s) failed %d\n",
 			       pn->net->ns.inum, i ? "v6" : "v4", err);
 			if (i)
 				nf_unregister_net_hook(pn->net, &pn->rx_ops4);
 			return err;
 		}
 	}
-	/* WRITE_ONCE 与 SESSION_UP 的 READ_ONCE(pn->rx_hooked) 配对：这个标志是
-	 * "钩子闸门"的唯一依据（netns 创建与 SESSION_UP 可能在不同 CPU 上）。 */
+	/* WRITE_ONCE pairs with SESSION_UP's READ_ONCE(pn->rx_hooked): this flag is
+	 * the only basis for the 'hook gate' (netns creation and SESSION_UP may run on different CPUs). */
 	WRITE_ONCE(pn->rx_hooked, true);
 	return 0;
 }
@@ -752,14 +756,14 @@ void iwan_rx_net_exit(struct iwan_net *pn)
 		nf_unregister_net_hook(pn->net, &pn->rx_ops6);
 		WRITE_ONCE(pn->rx_hooked, false);
 		/*
-		 * 摘掉钩子之后必须再等一个 RCU 宽限期，才能认为"没有在途钩子"：
-		 * nf_unregister_net_hook() 只是把钩子从数组里摘掉、把旧数组交给
-		 * call_rcu() 释放，一次**已经开始**的遍历（NF_HOOK 全程在
-		 * rcu_read_lock() 里）仍可能调用到本钩子，而本钩子会写该 netns 的
-		 * 共享内存页。调用者紧接着就要放页面的 pernet 引用
-		 * （iwan_net_exit → iwan_shm_net_exit）：少了这道栅栏，就是
-		 * "钩子还在跑、页面已回收"的 use-after-free。
-		 * pernet exit 是进程上下文，synchronize_rcu() 可以睡眠。
+		 * after removing the hook we must wait one more RCU grace period before we may
+		 * consider that "no hook is in flight": nf_unregister_net_hook() only unlinks the hook
+		 * from the array and hands the old array to call_rcu() for freeing, while a traversal
+		 * that has **already started** (NF_HOOK runs entirely under rcu_read_lock()) may still
+		 * call this hook, and this hook writes that netns's shared-memory page. The caller is
+		 * about to drop the pernet reference to the page (iwan_net_exit -> iwan_shm_net_exit):
+		 * without this barrier it is a "hook still running, page already recycled"
+		 * use-after-free. pernet exit is process context, so synchronize_rcu() may sleep.
 		 */
 		synchronize_rcu();
 	}

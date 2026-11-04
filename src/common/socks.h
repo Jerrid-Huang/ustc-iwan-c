@@ -17,7 +17,7 @@ typedef struct SocksConfig SocksConfig;
  * re-established (downlink-silence watchdog, keepalive failures, server
  * CLOSE). The callback authenticates a NEW session and refreshes every
  * session-derived field of cfg (sid/token/inner_ip/gateway/mtu/dns; the
- * xor_key usually stays identical — it derives from the same
+ * xor_key usually stays identical -- it derives from the same
  * credentials). On success it returns 0 with *out_fd = the new UDP
  * socket (run_socks closes the old one). Returns -1 on failure:
  * run_socks keeps the old socket and retries later.
@@ -60,12 +60,15 @@ typedef struct SocksConfig {
     uint64_t last_rx;      /* last downlink datagram (stale-session clock) */
     uint64_t reauth_at;    /* next in-place re-auth retry (0 = none) */
     int      ka_fail;      /* consecutive keepalive send failures */
+    /* Panabit 60-byte ECHOREQ latency stats (cur/min/max, microseconds).
+     * The struct is in echo.h; an opaque byte array here keeps socks.h independent. */
+    unsigned char echo_stats[32];
     bool     session_lost; /* tunnel died (keepalive / no downlink) */
 } SocksConfig;
 
 /* Run SOCKS5 server (blocks). sockfd = authenticated UDP socket.
  * Ownership (A-1): run_socks takes ownership of sockfd and is
- * responsible for closing it on every return path — including the
+ * responsible for closing it on every return path -- including the
  * CURRENT value (a new fd may have been swapped in by an in-place
  * re-auth), so the caller must NOT close it afterwards.
  * Return semantics: 0 = clean user stop, 1 = session lost (caller

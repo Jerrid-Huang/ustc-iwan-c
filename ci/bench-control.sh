@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ci/bench-control.sh — rootless control-plane benchmark for CI.
+# ci/bench-control.sh -- rootless control-plane benchmark for CI.
 #
 # Starts a local iwan-server (--no-tun, no root/TUN needed) and measures
 # the control plane end to end over real UDP:
@@ -8,7 +8,7 @@
 # Results are written as a markdown table to $OUT and printed.
 #
 # The data plane (socks/TUN throughput) requires TUN devices + root and
-# therefore stays local: sudo tests/bench.sh (see README 性能基准).
+# therefore stays local: sudo tests/bench.sh (see README, performance benchmark).
 #
 # usage: ci/bench-control.sh [OUTFILE]     (default bench-results.md)
 # env:  PING_ROUNDS (50)  AUTH_ROUNDS (10)  PORT (16001)
@@ -70,7 +70,7 @@ PING_MS=""
 PING_FAIL=0
 for _ in $(seq 1 "$PING_ROUNDS"); do
     line=$(./bin/iwan-client ping --server 127.0.0.1 --port "$PORT" 2>/dev/null \
-        | grep -oE 'RTT=[0-9.]+ ?(µs|us|ms|s)' || true)
+        | grep -oE 'RTT=[0-9.]+ ?(us|ms|s)' || true)
     if [ -z "$line" ]; then
         PING_FAIL=$((PING_FAIL + 1))
         continue
@@ -78,7 +78,7 @@ for _ in $(seq 1 "$PING_ROUNDS"); do
     val=${line#RTT=}
     num=$(printf '%s' "$val" | grep -oE '^[0-9.]+')
     case "$val" in
-        *µs|*us) ms=$(awk "BEGIN{print $num/1000}") ;;
+        *us) ms=$(awk "BEGIN{print $num/1000}") ;;
         *ms)     ms=$num ;;
         *s)      ms=$(awk "BEGIN{print $num*1000}") ;;
         *)       continue ;;
@@ -112,19 +112,19 @@ printf '%b' "$AUTH_MS" > "$WORK/auth.txt"
 AUTH_STAT=$(stats "auth handshake" "$WORK/auth.txt")
 
 {
-    echo "### CI 控制面基准(本地回环, --no-tun 服务器)"
+    echo "### CI control-plane benchmark (local loopback, --no-tun server)"
     echo
-    echo "| 指标 | 结果 |"
+    echo "| Metric | Result |"
     echo "|---|---|"
     echo "| ping RTT min / avg / max | $(echo "$PING_STAT" | awk '{print $4" / "$5" / "$6" ms"}') |"
     echo "| ping RTT p50 / p95 | $(echo "$PING_STAT" | awk '{print $7" / "$8" ms"}') |"
-    echo "| ping 丢包 | ${PING_FAIL}/${PING_ROUNDS} |"
-    echo "| auth 握手 min / avg / max | $(echo "$AUTH_STAT" | awk '{print $4" / "$5" / "$6" ms"}') |"
+    echo "| ping packet loss | ${PING_FAIL}/${PING_ROUNDS} |"
+    echo "| auth handshake min / avg / max | $(echo "$AUTH_STAT" | awk '{print $4" / "$5" / "$6" ms"}') |"
     if [ -n "${GITHUB_SHA:-}" ]; then
-        echo "| 环境 | commit \`${GITHUB_SHA:0:12}\` · \`${GITHUB_RUN_ID:-?}\` · ubuntu-latest · 控制面(UDP 回环) |"
+        echo "| Environment | commit \`${GITHUB_SHA:0:12}\`, run \`${GITHUB_RUN_ID:-?}\`, ubuntu-latest, control plane (UDP loopback) |"
     fi
     echo
-    echo "> 数据面吞吐基准需要 TUN 设备 + root,CI 无法运行;本地用 \`sudo tests/bench.sh\`(见 README 性能基准)。"
+    echo "> Data-plane throughput benchmarks need a TUN device + root, so CI cannot run them; locally use \`sudo tests/bench.sh\` (see README, performance benchmark)."
 } | tee "$OUT"
 
 echo "== done: $OUT =="

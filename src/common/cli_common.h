@@ -16,7 +16,7 @@
 /* F8: cross-check the server-issued gateway against the server the client
  * actually connected to. Both are dotted-quads; when the server is a
  * hostname (or any non-IPv4 literal) the check is skipped silently. A
- * mismatch is legal in NAT setups, so this is a warning only — but an
+ * mismatch is legal in NAT setups, so this is a warning only -- but an
  * unexpected mismatch may indicate a forged OPEN_ACK. */
 void check_gw_server(const char *server, const char *gw);
 
@@ -33,42 +33,42 @@ bool validate_token_len(const char *val, char *err, size_t errsz);
 
 /* --data-plane <auto|tun|kernel> (iwan-client proxy / iwan-client-oidc).
  *
- *   auto   : **默认值**。Linux 与 Windows 上先选内核数据面：Linux 是内核模块
- *            iwan（模块未加载、/dev/iwan 缺失或布局版本不符、iwan0 被非 iwan
- *            设备占用则回退），Windows 是 WFP callout 驱动 iwan.sys（设备打不开
- *            则回退），两边都起不来才退出；其余平台直接是 tun。
- *   tun    : 现有的 TUN 用户态数据面，行为逐位不变；
- *   kernel : 把数据面交给内核（Linux 内核模块 iwan / Windows WFP 驱动
- *            iwan.sys，客户端不再需要 TUN）。这两个平台之外显式传 kernel 是
- *            用法错误（清晰的错误文本，绝不静默降级成 tun）。
+ *   auto   : **default**. On Linux and Windows, try the kernel data plane first: on Linux the kernel module
+ *            iwan (fall back if the module is not loaded, /dev/iwan is missing, the layout version does not match, or iwan0 is held by a non-iwan
+ *            device); on Windows the WFP callout driver iwan.sys (fall back if the device cannot be opened);
+ *            exit only if neither comes up; on other platforms it is tun directly.
+ *   tun    : the existing TUN userspace data plane, behavior bit-for-bit unchanged;
+ *   kernel : hand the data plane to the kernel (Linux kernel module iwan / Windows WFP driver
+ *            iwan.sys; the client no longer needs a TUN). Explicitly passing kernel outside these two platforms is
+ *            a usage error (clear error text, never a silent fallback to tun).
  *
- * 显式指定 tun/kernel 都**不回退**：那是用户点名的平面，失败即失败。
- * 回退只覆盖"内核面在本机根本起不来"这一类启动失败；命中"本 netns 已有
- * 内核会话"（kdp_plane_precheck 的 busy 出参）时不回退 —— 回退过去会用同
- * 一账号把那条会话顶掉（服务端对同源 IP 的第二次 OPEN 按合法重连处理），
- * 比直接失败更糟。
+ * Explicitly specifying tun/kernel both **do not fall back**: that is the plane the user named, failure is failure.
+ * Fallback covers only the class of startup failures where "the kernel plane cannot come up on this machine at all"; on hitting "this netns already has
+ * a kernel session" (the busy output of kdp_plane_precheck) there is no fallback -- falling back would use the same
+ * account to displace that session (the server treats a second OPEN from the same source IP as a legitimate reconnect),
+ * which is worse than failing outright.
  *
- * 校验放进 cli_opt.validate，取值错误因此由共享 CLI 解析器按用法错误处理
- * （打印 usage 并以 2 退出）。 */
+ * Validation lives in cli_opt.validate, so an invalid value is handled by the shared CLI parser as a usage error
+ * (print usage and exit with 2). */
 #define IWAN_DATA_PLANE_TUN    "tun"
 #define IWAN_DATA_PLANE_KERNEL "kernel"
-/* Windows 专有：第二个内核数据面（NDIS 小型端口 + 协议驱动 iwanmp.sys）。
- * 语义与 kernel 相同（报文不进用户态），差别只在设备与实现：kernel 是 WFP
- * callout 注入，kernel-mp 是自成一张虚拟网卡的微型端口。留着它就能在同一台
- * 机器上把两个平面做 A/B（设备名见 iwan_win_abi.h 的 IWAN_WIN_USER_PATH_MP）。
- * 只由用户显式指定：auto 在 Windows 上仍然落在 kernel。 */
+/* Windows-specific: the second kernel data plane (NDIS miniport + protocol driver iwanmp.sys).
+ * Semantics are the same as kernel (packets do not enter userspace); only the device and implementation differ: kernel is WFP
+ * callout injection, kernel-mp is a miniport that forms a virtual NIC of its own. Keeping it allows A/B comparison of the two planes
+ * on the same machine (device names: see IWAN_WIN_USER_PATH_MP in iwan_win_abi.h).
+ * Only explicitly selected by the user: auto still resolves to kernel on Windows. */
 #define IWAN_DATA_PLANE_KERNEL_MP "kernel-mp"
 #define IWAN_DATA_PLANE_AUTO   "auto"
 bool validate_data_plane(const char *val, char *err, size_t errsz);
-/* true 表示已校验通过的内核面取值（Linux 内核模块 / Windows 的两个驱动）。 */
+/* true if this is a validated kernel-plane value (Linux kernel module / the two Windows drivers). */
 bool data_plane_is_kernel(const char *val);
-/* true 表示取值是 "kernel-mp"（只有 Windows 上有这个平面）。 */
+/* true if the value is "kernel-mp" (this plane exists only on Windows). */
 bool data_plane_is_kernel_mp(const char *val);
-/* true 表示取值是 NULL 或 "auto"：调用者还没选定平面，允许自动回退。 */
+/* true if the value is NULL or "auto": the caller has not chosen a plane yet, automatic fallback is allowed. */
 bool data_plane_is_auto(const char *val);
-/* 把 --data-plane 的取值解析成实际使用的平面（返回值是上面的宏之一）。
- * *out_auto = true 表示这是"默认选择"（内核面不可用时可以回退 TUN）；显式
- * 取值时写 false。auto 在 Linux 上解析成 kernel、其余平台解析成 tun。 */
+/* Resolve the --data-plane value into the plane actually used (the return value is one of the macros above).
+ * *out_auto = true means this is the "default choice" (fallback to TUN is allowed when the kernel plane is unavailable); an explicit
+ * value writes false. auto resolves to kernel on Linux and to tun on other platforms. */
 const char *data_plane_resolve(const char *val, bool *out_auto);
 
 /* OPEN/ACK authentication sequence shared by the iwan-client and

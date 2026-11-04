@@ -1,6 +1,6 @@
-﻿# 只读：把 iwanmp 的现场一次读全（设备节点、服务、内层适配器、trace 键、PnP 事件）。
+# Read-only: dump the iwanmp state in one pass (device node, service, inner adapter, trace keys, PnP events).
 #
-# 用法：powershell -NoProfile -File vm-mp-state.ps1
+# Usage: powershell -NoProfile -File vm-mp-state.ps1
 param(
     [string]$InstanceId = '',
     [int]$EventMinutes = 10
@@ -10,8 +10,8 @@ $ErrorActionPreference = 'Continue'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 function Sec($t) { "`n=== $t ===" }
 
-# 设备实例 ID 不是固定的：devcon install 按 INF 的 Class 建节点，实际落在
-# ROOT\NET\000x（早期脚本里写死 ROOT\IWANMP\0000 是猜的，一直没生效）。
+# Device instance ID is not fixed: devcon install creates the node per the INF Class, so it lands in
+# ROOT\NET\000x (early scripts hardcoded ROOT\IWANMP\0000 as a guess, which never took effect).
 function Get-IwanmpInstanceId {
     $d = Get-PnpDevice -ErrorAction SilentlyContinue |
          Where-Object { $_.HardwareID -contains 'iwanmp' } |
@@ -21,17 +21,17 @@ function Get-IwanmpInstanceId {
 }
 if (-not $InstanceId) { $InstanceId = Get-IwanmpInstanceId }
 
-Sec '设备节点'
+Sec 'device node'
 $devs = @(Get-PnpDevice -ErrorAction SilentlyContinue |
           Where-Object { $_.HardwareID -contains 'iwanmp' })
 if ($devs.Count -gt 0) {
     $devs | Select-Object Status, Class, FriendlyName, InstanceId, Problem, ProblemDescription |
         Format-List
 } else {
-    '没有 HardwareID=iwanmp 的设备节点'
+    'no device node with HardwareID=iwanmp'
 }
 
-Sec '设备属性'
+Sec 'device properties'
 foreach ($k in 'DEVPKEY_Device_ProblemCode', 'DEVPKEY_Device_Service',
                'DEVPKEY_Device_DriverVersion', 'DEVPKEY_Device_DriverProvider') {
     if (-not $InstanceId) { break }
@@ -39,12 +39,12 @@ foreach ($k in 'DEVPKEY_Device_ProblemCode', 'DEVPKEY_Device_Service',
     if ($null -ne $v) { "  $k = $v" }
 }
 
-Sec '服务'
+Sec 'service'
 Get-Service -Name iwanmp -ErrorAction SilentlyContinue |
     Select-Object Name, Status, ServiceType, StartType | Format-List
-if (-not (Get-Service -Name iwanmp -ErrorAction SilentlyContinue)) { '没有 iwanmp 服务' }
+if (-not (Get-Service -Name iwanmp -ErrorAction SilentlyContinue)) { 'no iwanmp service' }
 
-Sec '内层适配器'
+Sec 'inner adapter'
 Get-NetAdapter -ErrorAction SilentlyContinue |
     Select-Object Name, InterfaceDescription, Status, ifIndex, LinkSpeed, MacAddress |
     Format-Table -AutoSize
@@ -55,10 +55,10 @@ foreach ($n in (Get-NetAdapter -ErrorAction SilentlyContinue).Name) {
         (Get-NetAdapter -Name $n).ifIndex, $mtu, $ips
 }
 
-Sec '磁盘'
+Sec 'disk'
 Get-PSDrive C | Select-Object @{n='FreeMB';e={[int]($_.Free/1MB)}}, @{n='UsedMB';e={[int]($_.Used/1MB)}} | Format-Table -AutoSize
 
-Sec '分阶段 trace 键'
+Sec 'staged trace keys'
 $pkey = 'HKLM:\SYSTEM\CurrentControlSet\Services\iwanmp\Parameters'
 $p = Get-ItemProperty $pkey -ErrorAction SilentlyContinue
 if ($p) {
@@ -69,17 +69,17 @@ if ($p) {
     foreach ($n in ($tkeys | Sort-Object { [int]($_.Substring(1)) })) {
         "  {0,-10} = 0x{1:X8} ({1})" -f $n, [uint32]$p.$n
     }
-    if ($tkeys.Count -eq 0) { '  （没有任何 T 键：驱动还没被装载过）' }
+    if ($tkeys.Count -eq 0) { '  (no T keys at all: the driver has never been loaded)' }
 } else {
-    "没有 $pkey"
+    "no $pkey"
 }
 
-Sec 'DriverStore 里的 iwanmp 包'
+Sec 'iwanmp package in DriverStore'
 (& pnputil.exe /enum-drivers | Out-String) -split "`r?`n`r?`n" |
     Where-Object { $_ -match 'iwanmp\.inf' } |
     ForEach-Object { ($_ -replace '\s+', ' ').Trim() }
 
-Sec "最近 $EventMinutes 分钟的 Kernel-PnP 事件"
+Sec "Kernel-PnP events of the last $EventMinutes minutes"
 Get-WinEvent -FilterHashtable @{ LogName = 'System'; StartTime = (Get-Date).AddMinutes(-$EventMinutes) } `
     -ErrorAction SilentlyContinue |
     Where-Object { $_.ProviderName -match 'Kernel-PnP' } |

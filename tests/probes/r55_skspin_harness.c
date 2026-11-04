@@ -7,9 +7,9 @@
  *         zero-wait busy spin). After the fix it converges (fd closed,
  *         removed from the poll set) and wait_events sleeps again.
  *   FIN:  the clean-FIN control (client shutdown(SHUT_WR), events=0) must
- *         keep NOT waking (never spin) — pre- and post-fix identical.
+ *         keep NOT waking (never spin) -- pre- and post-fix identical.
  *   OUT:  a half-open client (SHUT_WR, still reading) with queued output
- *         must still receive that output through service_local_outputs —
+ *         must still receive that output through service_local_outputs --
  *         the fix must not drop f->output on the clean path.
  *
  * Links against iwan_core (same object the production harnesses use), so
@@ -125,7 +125,7 @@ int main(void)
     }
     {
         /* pre-convergence: with the OLD code this returns instantly every
-         * round (1000 rounds of poll(events=0) on this fd ≈ 0.3 ms). */
+         * round (1000 rounds of poll(events=0) on this fd ~= 0.3 ms). */
         double d0 = we_latency(listener, udpfd, wait_ms);
         int inst = count_instant(listener, udpfd, wait_ms, rounds);
         char buf[160];
@@ -273,7 +273,7 @@ int main(void)
         }
         char buf[160];
         snprintf(buf, sizeof buf, "RST+output(nof)   : converged at round "
-                 "%d (spins=%d, fd=%d out=%zu) — bounded, not infinite",
+                 "%d (spins=%d, fd=%d out=%zu) -- bounded, not infinite",
                  converge_round, spins, f->fd, f->output.len);
         CHECK(converge_round >= 0 && f->fd == -1 && f->output.len == 0 &&
               spins <= 64, buf);

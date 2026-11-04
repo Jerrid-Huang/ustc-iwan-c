@@ -2472,7 +2472,7 @@ nd6_restart_netif(struct netif *netif)
   netif->rs_count = LWIP_ND6_MAX_MULTICAST_SOLICIT;
 #else /* !LWIP_IPV6_SEND_ROUTER_SOLICIT */
   /* R33-FIX-A: Router Solicitations are disabled (point-to-point tunnel
-   * with hwaddr_len 0 — see lwipopts.h), so netif is unused here. */
+   * with hwaddr_len 0 -- see lwipopts.h), so netif is unused here. */
   LWIP_UNUSED_ARG(netif);
 #endif /* LWIP_IPV6_SEND_ROUTER_SOLICIT */
 }

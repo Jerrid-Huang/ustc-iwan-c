@@ -1,14 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  iwan.vcxproj — Windows 内核数据面驱动（WFP callout）的 MSBuild 工程。
+  iwan.vcxproj -- MSBuild project for the Windows kernel data-plane driver (WFP callout).
 
-  这是 WDM 驱动（不用 KMDF：少一层框架依赖，也更容易测试签名），链接
-  fwpkclnt.lib（WFP 内核 API）+ ndis.lib（NBL 工具）+ wdmsec.lib（设备 ACL）。
-  构建（在装了 WDK 的 Windows 上，管理员 VS 开发者命令提示符里）：
+  This is a WDM driver (no KMDF: one less framework dependency, easier to test-sign); it links
+  fwpkclnt.lib (WFP kernel API) + ndis.lib (NBL helpers) + wdmsec.lib (device ACL).
+  Build (on Windows with the WDK, from an administrator VS developer prompt):
 
     msbuild win-driver\iwan.vcxproj /p:Configuration=Release /p:Platform=x64
 
-  与 Linux 侧 kernel/ 的对应：iwan.sys 就是 iwan.ko。
+  Linux counterpart in kernel/: iwan.sys is iwan.ko.
 -->
 <Project DefaultTargets="Build" ToolsVersion="Current"
          xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
@@ -42,11 +42,11 @@
   <PropertyGroup Label="Configuration">
     <ConfigurationType>Driver</ConfigurationType>
     <DriverType>WDM</DriverType>
-    <!-- 关掉工具集自带的测试签名：它调 signtool 时不带 /fd，现代 signtool 会报
-         "No file digest algorithm specified"，然后 RemoveUnsignedOutput 把刚链接
-         出来的 iwan.sys 和 iwan.pdb 一起删掉（上一轮就是这样：链接成功、产物却没有）。
-         签名是虚拟机侧的 vm-load.ps1 用 New-SelfSignedCertificate + Set-AuthenticodeSignature
-         做的，CI 只负责编译。 -->
+    <!-- Disable the toolset built-in test signing: it calls signtool without /fd, and modern
+         signtool reports "No file digest algorithm specified", after which RemoveUnsignedOutput
+         deletes the freshly linked iwan.sys and iwan.pdb (that is exactly what happened once:
+         link succeeded, artifacts were gone). Signing happens on the VM side in vm-load.ps1 with
+         New-SelfSignedCertificate + Set-AuthenticodeSignature; CI only compiles. -->
     <SignMode>Off</SignMode>
     <DriverTargetPlatform>Desktop</DriverTargetPlatform>
     <TargetVersion>Windows10</TargetVersion>
@@ -69,27 +69,27 @@
 
   <ItemDefinitionGroup>
     <ClCompile>
-      <!-- 与 Linux 模块同一取向：注释与日志用中文。
-           必须显式 /utf-8：源文件是 UTF-8，而默认执行字符集是运行器的 1252，
-           中文字符串字面量会报 C4566，配合 TreatWarningAsError 变成 C2220
-           —— 曾经带着这个错报"构建成功"，工件里却没有 iwan.sys。 -->
+      <!-- Sources are pure ASCII. /utf-8 is kept as a guard: if a non-ASCII literal ever
+           comes back, the default execution charset (1252) would raise C4566, which under
+           TreatWarningAsError becomes C2220 -- a failure that once reported build success
+           while iwan.sys was missing from the artifacts. -->
       <AdditionalOptions>/source-charset:utf-8 /execution-charset:utf-8 %(AdditionalOptions)</AdditionalOptions>
       <AdditionalIncludeDirectories>$(ProjectDir)..\src\common;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <WarningLevel>Level4</WarningLevel>
       <TreatWarningAsError>true</TreatWarningAsError>
       <SDLCheck>true</SDLCheck>
-      <!-- 只留 NDIS630：数据面用 NdisAllocateNetBufferListPool / NdisGetDataBuffer，
-           必须显式选一个 NDIS 版本宏才拿得到 6.30 的声明。
-           _KERNEL_MODE 由工具集的 /kernel 定义、POOL_NX_ALLOCATION 由 wdm.h 自己
-           定义 —— 在这里重复定义会触发 C4005，配合 TreatWarningAsError 直接变
-           C2220（第一次真编译就是这么被拦下的）。 -->
+      <!-- NDIS630 only: the data plane uses NdisAllocateNetBufferListPool / NdisGetDataBuffer,
+           whose 6.30 declarations require an explicit NDIS version macro.
+           _KERNEL_MODE comes from the toolset /kernel switch and POOL_NX_ALLOCATION from wdm.h;
+           redefining them here raises C4005, which under TreatWarningAsError becomes
+           C2220 (the first real compile was stopped exactly this way). -->
       <PreprocessorDefinitions>NDIS630;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <LanguageStandard_C>stdc11</LanguageStandard_C>
       <ExceptionHandling>false</ExceptionHandling>
     </ClCompile>
     <Link>
       <AdditionalDependencies>fwpkclnt.lib;fwpuclnt.lib;netio.lib;ndis.lib;wdmsec.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <!-- 入口与 Linux 一致：DriverEntry；INF 里的服务名是 iwan -->
+      <!-- Entry point matches Linux: DriverEntry; the service name in the INF is iwan -->
       <EntryPointSymbol>DriverEntry</EntryPointSymbol>
     </Link>
     <Inf>
@@ -109,10 +109,10 @@
     <ClInclude Include="..\src\common\iwan_win_abi.h" />
   </ItemGroup>
   <!--
-    这里**故意**没有 <Inf Include="iwan.inf" />：加进来就会触发 WDK 的 InfVerif，
-    而它按设计拒绝 [DefaultInstall] 形式的 primitive 驱动 INF（错误 1420/1421/1423），
-    这类 INF 恰恰是非 PnP 内核服务的正统写法。安装走 install.ps1 的 sc.exe 路径，
-    INF 只作为备选部署材料留在仓库里（已补齐架构装饰与 SourceDisksFiles）。
+    There is deliberately no <Inf Include="iwan.inf" />: adding one triggers the WDK InfVerif,
+    which by design rejects primitive driver INFs written as [DefaultInstall] (errors 1420/1421/1423),
+    the very form a non-PnP kernel service uses. Installation goes through the sc.exe path in
+    install.ps1; the INF stays in the tree as optional material (arch decorations and SourceDisksFiles included).
   -->
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

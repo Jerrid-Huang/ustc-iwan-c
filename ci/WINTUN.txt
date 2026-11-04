@@ -1,7 +1,7 @@
 TUN mode needs the wintun driver DLL next to the exe.
 
 The release zip already ships a wintun.dll matching this build's
-architecture — normally you do not need to do anything.
+architecture -- normally you do not need to do anything.
 
 If it is missing (or you want a newer one):
   - Just run iwan-client.exe: when wintun.dll is absent and stdin is

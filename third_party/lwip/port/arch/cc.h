@@ -12,7 +12,7 @@
  *
  *   - LWIP_RAND(): lwIP seeds its ISN (tcp_next_iss) and ephemeral ports
  *     from LWIP_RAND(). glibc rand() is a weak 31-bit LCG, and the project
- *     already has rand_u32() (full 32-bit, CSPRNG-seeded) — a predictable
+ *     already has rand_u32() (full 32-bit, CSPRNG-seeded) -- a predictable
  *     ISN would let an observer forge RST/ACK segments against a reused
  *     4-tuple, the exact issue the native netstack documents. Delegate to
  *     rand_u32(); it lives in iwan_core (util.c), which links lwip, so the

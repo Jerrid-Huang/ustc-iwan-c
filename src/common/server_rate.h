@@ -5,7 +5,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#include "server.h"   /* struct iwan_peer（族无关的外层源） */
+#include "server.h"   /* struct iwan_peer (family-agnostic outer source) */
 
 /* IWAN_RATE_* limits are read once at startup (server_rate_limits_init) */
 void server_rate_limits_init(void);
@@ -14,7 +14,7 @@ void server_rate_limits_init(void);
 unsigned server_rate_get_throttle_ms(void);
 
 /* Check rate allowance for unauthenticated control packets (PT_OPEN, PT_PING_REQ, PT_ECHO_REQ).
- * 键是族无关的源地址（v4 精确 32 位，v6 全 128 位哈希），下同。
+ * The key is the family-agnostic source address (v4 exact 32 bits, v6 full 128-bit hash); same below.
  * Returns true if allowed, false if dropped (drops increment g_rate_drops). */
 bool server_rate_allow_control(const struct iwan_peer *peer, uint8_t typ);
 

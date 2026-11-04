@@ -3,6 +3,9 @@
 目标：Windows 上也做到"报文不进用户态"。Linux 侧的内核模块（`kernel/`）已经做到
 这一点，本文件给出 Windows 侧的对应设计，并说明哪些部分能 1:1 照搬、哪一处必须换。
 
+> 第二条内核数据面（NDIS 微型端口 + 协议驱动，`iwanmp.sys`，`--data-plane kernel-mp`）
+> 见 `docs/win-ndis-data-plane.md`；本文件描述的是 WFP callout 那一版。
+
 现状：Windows 侧目前只有用户态数据面 —— `src/common/tun_win.c`（wintun.dll 的 TUN
 设备）配 `src/common/pump_win_single.c`（单队列泵），每个报文都要过一次
 DeviceIoControl 与用户态拷贝。仓库里没有任何内核态 Windows 代码。

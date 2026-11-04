@@ -54,11 +54,11 @@ static char *empty_str(void)
  * and C0/C1/DEL would let a hostile server inject terminal escape
  * sequences.  Same policy as server.c's log_escape (R3-L20): valid,
  * SHORTEST-FORM UTF-8 sequences are copied verbatim so multi-byte text
- * is not mangled (R17/R16-1: overlong encodings such as E0 80 9B — a
- * 3-byte stand-in for the C1 control U+009B — are NOT valid UTF-8 and
+ * is not mangled (R17/R16-1: overlong encodings such as E0 80 9B -- a
+ * 3-byte stand-in for the C1 control U+009B -- are NOT valid UTF-8 and
  * are rejected, so a permissive terminal cannot unfold them back into
  * 8-bit CSI/OSC); every other byte (controls, DEL, bare/mis-encoded
- * C1/lead bytes, embedded NUL — R17/R16-4/5) becomes '?', and the copy
+ * C1/lead bytes, embedded NUL -- R17/R16-4/5) becomes '?', and the copy
  * is capped at HTTPS_LOG_SAN_MAX bytes with a "..." marker so an absurd
  * value cannot flood the log.  Kept local to https.c (rather than
  * sharing server.c's static log_escape, whose C-string-only interface
@@ -80,8 +80,8 @@ static void https_ssl_err(char *buf, size_t sz)
 }
 
 /* Arm SO_RCVTIMEO / SO_SNDTIMEO for the blocking socket. Every SSL
-   read/write is capped at min(remaining budget, HTTPS_POLL_MS) — the
-   same chunking the old poll loop used — so a dead peer surfaces as a
+   read/write is capped at min(remaining budget, HTTPS_POLL_MS) -- the
+   same chunking the old poll loop used -- so a dead peer surfaces as a
    timeout after at most HTTPS_POLL_MS instead of hanging the round
    trip; the caller re-checks the deadline itself around every call.
    Returns 0 on success, -1 on failure. */
@@ -172,7 +172,7 @@ static int https_ctx_load_cas(SSL_CTX *ctx)
     if (ca && !ca[0])
         ca = NULL;
     /* R37 WG-E2 (R3-L15): SSL_CERT_FILE still wins when it loads, but a
-     * stale value must no longer discard the system trust anchors — the
+     * stale value must no longer discard the system trust anchors -- the
      * candidate bundle paths are tried next, one by one, and only when
      * every one of them failed too does this return -1 (the caller then
      * falls back to the two embedded roots).
@@ -185,7 +185,7 @@ static int https_ctx_load_cas(SSL_CTX *ctx)
      * bundle turned a pinned store into the whole public WebPKI
      * (measured: 2 -> 122 anchors). That case now fails closed. Only
      * paths that cannot denote a readable file at all (ENOENT, ENOTDIR,
-     * ENAMETOOLONG, ELOOP — and any other errno we did not model, e.g.
+     * ENAMETOOLONG, ELOOP -- and any other errno we did not model, e.g.
      * EACCES: default deny) fall back, which keeps the R3-L15 scenario
      * (an inherited SSL_CERT_FILE=/nonexistent) working. No verification
      * is relaxed anywhere. */
@@ -329,7 +329,7 @@ static const char iwan_embedded_cas[] =
     "";
 
 /* Load the bundled fallback roots into the store. Returns the number
- * added (0 only if the embedded PEM block fails to parse — a build
+ * added (0 only if the embedded PEM block fails to parse -- a build
  * bug, not a runtime condition). */
 static int https_ctx_add_embedded_cas(SSL_CTX *ctx)
 {
@@ -387,7 +387,7 @@ static SSL_CTX *https_ctx_new(bool with_fallback)
      * error 0A000126. The old pipe-based transport saw plain EOF, so
      * restore that semantics: SSL_read then returns 0 (clean end).
      * The option is OpenSSL 3.0+; 1.1.1 lacks it (and never surfaces
-     * 0A000126 — it already treats the missing close_notify as EOF),
+     * 0A000126 -- it already treats the missing close_notify as EOF),
      * so keep the fallback path below for older versions. */
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L
     SSL_CTX_set_options(ctx, SSL_OP_IGNORE_UNEXPECTED_EOF);
@@ -399,8 +399,8 @@ static SSL_CTX *https_ctx_new(bool with_fallback)
             return NULL;
         }
         /* (cache callers never see this NULL: with_fallback continues) */
-        /* no system bundle usable (the specific reason — a bad
-         * SSL_CERT_FILE, an unusable candidate, or nothing installed —
+        /* no system bundle usable (the specific reason -- a bad
+         * SSL_CERT_FILE, an unusable candidate, or nothing installed --
          * was just logged by https_ctx_load_cas): bundled roots only */
         log_err("HTTPS: no usable system CA bundle; using the bundled "
                 "fallback roots only");
@@ -492,7 +492,7 @@ static void he_lane_start(he_lane *ln, char *diag, size_t diagsz)
              * EINPROGRESS on Linux; both mean "wait for POLLOUT".
              * R37 WG-E2 (R3-L3): EINTR means the connect is still in
              * progress (POSIX resumes it asynchronously), NOT that this
-             * address failed — it must be waited for like EINPROGRESS,
+             * address failed -- it must be waited for like EINPROGRESS,
              * else a single delivered signal fails the whole host when
              * the resolver returned one address ("Interrupted system
              * call"). Anything else is an immediate failure: next
@@ -631,7 +631,7 @@ static int https_connect_tcp(const char *host, uint16_t port,
                  * budget. The old loop retried with the ORIGINAL timeout
                  * and never re-checked the deadline (that check sits
                  * outside this block), so a steady stream of signals kept
-                 * it polling forever — the documented 60s round-trip bound
+                 * it polling forever -- the documented 60s round-trip bound
                  * did not exist. Same shape as relay_proxy.c rp_poll_retry. */
                 {
                     uint64_t now = now_ms();
@@ -697,7 +697,7 @@ static int https_connect_tcp(const char *host, uint16_t port,
     }
     /* the split reuses the original chain nodes, so `res` is now the
      * head of only one of the two subchains: free both (each exactly
-     * once) — freeing only `res` leaks the other subchain
+     * once) -- freeing only `res` leaks the other subchain
      * (SUMMARY-2 M3) */
     if (v6_head)
         freeaddrinfo(v6_head);
@@ -735,11 +735,11 @@ static int https_connect_tcp(const char *host, uint16_t port,
 }
 
 /* Bind the connected socket to a new SSL session for `host`: SNI, peer
-   verification, and the hostname check — the in-process equivalent of
+   verification, and the hostname check -- the in-process equivalent of
    `openssl s_client -servername/-verify_hostname -verify_return_error`. */
 /* Verify callback: on chain/hostname verification failure, log the
    precise reason and the offending certificate immediately (this is the
-   only point where the peer certificate is still available — OpenSSL
+   only point where the peer certificate is still available -- OpenSSL
    clears it from the session once the handshake fails). The callback
    always rejects (returns 0) so the handshake fails as before. */
 static int https_verify_cb(int preverify_ok, X509_STORE_CTX *xctx)
@@ -766,14 +766,14 @@ static SSL *https_ssl_new(SSL_CTX *ctx, int fd, const char *host)
 {
     SSL *ssl = SSL_new(ctx);
     /* R54-WG4-5: SSL_set1_host matches only dNSName SAN entries (it is
-     * the X509_check_host path); an IP-literal authority — e.g. a
-     * jwks_uri or a redirect Location of the form https://x.x.x.x/… —
+     * the X509_check_host path); an IP-literal authority -- e.g. a
+     * jwks_uri or a redirect Location of the form https://x.x.x.x/... --
      * would fail the handshake even when the peer certificate's SAN
      * carries exactly that IP (verified on OpenSSL 3.5.5:
      * X509_check_host("127.0.0.1")==0 vs X509_check_ip_asc(...)==1).
      * Decision by inet_pton (strict, no octal/short forms): an IP
      * literal configures the verify param with
-     * X509_VERIFY_PARAM_set1_ip_asc (the X509_check_ip_asc path —
+     * X509_VERIFY_PARAM_set1_ip_asc (the X509_check_ip_asc path --
      * matches IP SANs only, never falls back to a wildcard); anything
      * else keeps SSL_set1_host, so the dNSName path is unchanged.
      * (There is no SSL_set1_ip_asc in OpenSSL's public SSL API; the
@@ -849,7 +849,7 @@ static int https_tls_connect(SSL *ssl, int fd, uint64_t deadline_ms,
                 /* R14 (R13-B1-L1): the peer half-closed the TCP connection
                  * during the handshake (accepted then FIN).  MEASURED on
                  * OpenSSL 3.5.5: the early close lands HERE as ZERO_RETURN
-                 * (r<0, errno==0, empty error queue) — the
+                 * (r<0, errno==0, empty error queue) -- the
                  * SYSCALL/errno==0 branch below is a defensive fallback,
                  * not reached on that version.  A close_notify
                  * mid-handshake lands here too.  Without this branch the
@@ -871,7 +871,7 @@ static int https_tls_connect(SSL *ssl, int fd, uint64_t deadline_ms,
                  * FIN/close_notify before the handshake finished (accepted
                  * then closed).  OpenSSL documents r==0 as the "unexpected
                  * EOF" return; the r<0 with errno==0 and an empty error
-                 * queue shape below is belt-and-braces — NOT observed on
+                 * queue shape below is belt-and-braces -- NOT observed on
                  * OpenSSL 3.5.5, where the early close lands in the
                  * ZERO_RETURN branch above.  Either way there is NO OS
                  * error to report, so name the real cause instead of
@@ -962,7 +962,7 @@ static int https_tls_write(SSL *ssl, int fd, const char *req,
             if (e == SSL_ERROR_ZERO_RETURN) {
                 /* R14 (R13-B1-L1): the peer closed the connection (FIN /
                  * close_notify) before the request was fully written.
-                 * R17 (R16-3): DEFENSIVE FALLBACK on the WRITE side —
+                 * R17 (R16-3): DEFENSIVE FALLBACK on the WRITE side --
                  * never observed on OpenSSL 3.5.5, where the early close
                  * surfaces as SSL_ERROR_SYSCALL (e=5) with
                  * errno=ECONNRESET/EPIPE below, or the write simply
@@ -976,7 +976,7 @@ static int https_tls_write(SSL *ssl, int fd, const char *req,
             }
             if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE)
                 /* fd is blocking (restored by C-1); WANT_* means the send
-                 * timeout fired — re-check the deadline next iteration */
+                 * timeout fired -- re-check the deadline next iteration */
                 continue;
             if (e == SSL_ERROR_SYSCALL) {
                 /* R14 (R13-B1-L1): a peer that closed (FIN/close_notify)
@@ -984,7 +984,7 @@ static int https_tls_write(SSL *ssl, int fd, const char *req,
                  * handshake/read r==0 rules: r==0 is the documented "peer
                  * went away" return, and the r<0 errno==0 empty-queue
                  * shape is belt-and-braces.  R17 (R16-3): MEASURED on
-                 * OpenSSL 3.5.5 — on the write side the early close is
+                 * OpenSSL 3.5.5 -- on the write side the early close is
                  * what lands HERE as SYSCALL with errno=ECONNRESET/EPIPE
                  * when the peer RSTs (or the write completes first);
                  * ZERO_RETURN was never observed on the write side.
@@ -1022,7 +1022,7 @@ static int https_tls_read(SSL *ssl, int fd, struct sbuf *resp,
     size_t body_start = 0;
     /* R1-B1-1: the header scan below used to restart at byte 0 after every
      * 4 KiB read, so a peer that pushes the terminator late (or never)
-     * made the read O(n^2) — 12 MiB of header cost ~10 s of CPU (CWE-407,
+     * made the read O(n^2) -- 12 MiB of header cost ~10 s of CPU (CWE-407,
      * remotely triggerable). Each needle is now scanned at most once per
      * byte: a hit is permanent (the buffer only ever grows) and a miss
      * resumes at the last offset that can still start a match. The
@@ -1059,7 +1059,7 @@ static int https_tls_read(SSL *ssl, int fd, struct sbuf *resp,
         r = SSL_read(ssl, buf, sizeof buf);
         if (r > 0) {
             sbuf_app(resp, buf, (size_t)r);
-            /* R56-201/202 FRAMING RULE — mirrors https_hdr_body() exactly,
+            /* R56-201/202 FRAMING RULE -- mirrors https_hdr_body() exactly,
              * so the raw read and the parse side can never disagree:
              *
              *   * The FIRST CRLFCRLF anywhere in the buffer is the
@@ -1067,11 +1067,11 @@ static int https_tls_read(SSL *ssl, int fd, struct sbuf *resp,
              *     Content-Length.
              *   * A bare LFLF is only a FALLBACK for a peer that never
              *     emits CRLFCRLF at all (nothing in the response so far
-             *     forms one) — i.e. plausibly an LF-only server.
+             *     forms one) -- i.e. plausibly an LF-only server.
              *   * The scan keeps running past an LFLF latch (it is NOT
              *     gated on content_len being unknown), so when a real
              *     CRLFCRLF later arrives from a mixed-EOL / non-conformant
-             *     peer, the frame is REPLACED — body_start and
+             *     peer, the frame is REPLACED -- body_start and
              *     content_len are overwritten, never frozen on the first
              *     LFLF. The upgrade is monotone (LF -> CRLF only, found
              *     at most once per response because a hit is permanent),
@@ -1111,10 +1111,10 @@ static int https_tls_read(SSL *ssl, int fd, struct sbuf *resp,
                      * from the CURRENT settled header block and only
                      * re-derived when that block itself moves (at most
                      * once, the LF->CRLF upgrade above). TE: chunked
-                     * overrides any Content-Length (RFC 7230 §3.3.3):
+                     * overrides any Content-Length (RFC 7230 section 3.3.3):
                      * keep content_len == -1 so the raw read runs to
                      * EOF/close_notify and the FULL chunk stream is
-                     * captured — CL counts decoded payload bytes, not
+                     * captured -- CL counts decoded payload bytes, not
                      * the chunk-framed wire octets, so stopping at CL
                      * would truncate the stream and chunk_decode()
                      * below would hard-fail. Only the non-chunked
@@ -1137,7 +1137,7 @@ static int https_tls_read(SSL *ssl, int fd, struct sbuf *resp,
             int e = SSL_get_error(ssl, r);
 
             if (e == SSL_ERROR_ZERO_RETURN) {
-                /* close_notify: clean end — unless a declared body is
+                /* close_notify: clean end -- unless a declared body is
                  * still short (truncated transfer) */
                 if (content_len > 0 &&
                     resp->len - body_start < (size_t)content_len) {
@@ -1151,13 +1151,13 @@ static int https_tls_read(SSL *ssl, int fd, struct sbuf *resp,
             if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE)
                 /* socket-timeout semantics hold only on a BLOCKING fd
                  * (restored by C-1); here WANT_* means SO_RCVTIMEO fired
-                 * and we re-check the deadline — on a nonblocking fd this
+                 * and we re-check the deadline -- on a nonblocking fd this
                  * returns instantly and spins until the deadline */
                 continue;
             if (e == SSL_ERROR_SYSCALL) {
                 if (r == 0) {
                     /* EOF without close_notify: the peer closed after
-                     * "Connection: close" — truncated if a declared
+                     * "Connection: close" -- truncated if a declared
                      * body is incomplete */
                     if (content_len > 0 &&
                         resp->len - body_start < (size_t)content_len) {
@@ -1193,7 +1193,7 @@ static int https_tls_read(SSL *ssl, int fd, struct sbuf *resp,
  * independently; an LF-only header block followed by a CRLF inside the
  * body made body < hdr_start, so (size_t)(body - hdr_start) underflowed
  * (pointer-overflow UB in https_hdr_value's `hdr + len` and the whole
- * header block — Transfer-Encoding, Location — became invisible). With
+ * header block -- Transfer-Encoding, Location -- became invisible). With
  * one ruler hdr_start <= body holds for every input.
  *
  * R37 R5 WG-D (R4-L1): with a terminator the two pointers are on the
@@ -1202,7 +1202,7 @@ static int https_tls_read(SSL *ssl, int fd, struct sbuf *resp,
  * collapsing to zero length: the R3-L10 rewrite set both pointers to
  * `d + len`, so hdr_len == 0 and every header line of an EOF-truncated
  * response (Content-Length, Location, Transfer-Encoding) became
- * invisible a second time — a redirect whose header block ends at EOF
+ * invisible a second time -- a redirect whose header block ends at EOF
    connect, verified handshake, write the request, read the raw response
    (deadline-bounded, 16 MiB ceiling). Returns 1 on success with *resp
    holding the raw bytes (caller parses), else 0 with a diagnostic
@@ -1214,7 +1214,7 @@ static bool https_transport(const char *host, struct sbuf *req,
 {
     /* zeroed: when both Happy-Eyeballs lanes exhaust their addresses
      * nothing writes diag, and https_connect_tcp checks diag[0]=='\0'
-     * to decide whether to fill in the errno text — a garbage
+     * to decide whether to fill in the errno text -- a garbage
      * non-empty buffer would skip that and reach the log (SUMMARY-2
      * M6) */
     char diag[512] = { 0 };
@@ -1229,7 +1229,7 @@ static bool https_transport(const char *host, struct sbuf *req,
                   host, (unsigned long long)deadline_ms);
 
     /* Attempt 1 uses the system trust store only; if the chain's anchor
-     * is missing there (trimmed Windows root stores — observed: campus
+     * is missing there (trimmed Windows root stores -- observed: campus
      * images with ~18 roots), attempt 2 retries once with the bundled
      * fallback roots added. Never retried for hostname or other
      * verification classes. */
@@ -1325,7 +1325,7 @@ out:
          * far as a completed handshake ends with a clean FIN instead of
          * an RST (a server logging close_notify warnings no longer
          * sees one per request).  Only the first SSL_shutdown phase runs
-         * — it writes close_notify; awaiting the peer's echo could stall,
+         * -- it writes close_notify; awaiting the peer's echo could stall,
          * so the socket timeouts are capped to 1 s for this write and
          * the result is discarded (close() still flushes the record). */
         if (connected) {
@@ -1363,7 +1363,7 @@ out:
    set (X-Auth-AppId/Timestamp/Nonce/Sign from oidc_ctrl_post) carries
    no credential material: AppId is a public constant, and X-Auth-Sign
    is an integrity HMAC over the canonical request keyed by a public
-   binary constant (by design "互操作约定，不提供身份保证" — no
+   binary constant (by design "interop convention, no identity guarantee" -- no
    identity guarantee), bound to this request's path/body/ts/nonce, so
    a redirect target gains no secret from it. Deliberate no-op. */
 static const char *const *https_drop_auth(const char *const *headers,
@@ -1390,7 +1390,7 @@ static const char *const *https_drop_auth(const char *const *headers,
  * Security: a redirect to a DIFFERENT host must not carry the caller's
  * Authorization header (Bearer tokens would leak to the redirect
  * target); 303 always downgrades POST to GET, and 301/302 downgrade a
- * POST to GET per RFC 7231 §6.4.2-3 (307/308 preserve the method). */
+ * POST to GET per RFC 7231 section 6.4.2-3 (307/308 preserve the method). */
 static bool https_roundtrip(const char *host, const char *path,
                             const char *body, const char *const *headers,
                             bool is_get, int *status_out, char **body_out)
@@ -1418,7 +1418,7 @@ static bool https_roundtrip(const char *host, const char *path,
             break;
         }
 
-        /* R10: a refused build (control character in path/host/header —
+        /* R10: a refused build (control character in path/host/header --
          * the token endpoint or a redirect handed us CR/LF) must never
          * reach the transport. req is still empty here, but free it
          * anyway so the ownership rule is the same on every exit. */
@@ -1476,7 +1476,7 @@ static bool https_roundtrip(const char *host, const char *path,
                 char *new_host = NULL, *new_path = NULL;
                 if (!https_url_split(loc, &new_host, &new_path)) {
                     /* R15 (B3-2): loc is remote-controlled; same log
-                     * hygiene as the Transfer-Encoding line — bounded
+                     * hygiene as the Transfer-Encoding line -- bounded
                      * printable-only copy on stderr. */
                     char san[HTTPS_LOG_SAN_MAX];
                     https_log_san(loc, loc_len, san, sizeof san);
@@ -1492,8 +1492,8 @@ static bool https_roundtrip(const char *host, const char *path,
                  * hostnames are case-insensitive (RFC 3986), compare
                  * case-insensitively. Same host requires EQUAL
                  * hostnames: a prefix match (new shorter than cur, or
-                 * vice versa) is a different host — e.g. new="a.com"
-                 * vs cur="a.com.attacker.io" — and MUST drop the
+                 * vice versa) is a different host -- e.g. new="a.com"
+                 * vs cur="a.com.attacker.io" -- and MUST drop the
                  * Authorization header (C-2). */
                 if (!(strlen(new_host) == strlen(cur_host) &&
                       port_strncasecmp(new_host, cur_host,

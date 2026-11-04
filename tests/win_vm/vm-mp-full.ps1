@@ -1,18 +1,18 @@
-﻿# iwanmp 一站式上机装具：现场 -> 清干净 -> 装 -> 放开保险丝 -> 适配器/地址/MTU -> OPEN 探针 -> 全表读数
+# iwanmp all-in-one on-machine harness: inspect -> clean -> install -> open fuse -> adapter/address/MTU -> OPEN probe -> full trace read
 #
-# 这个脚本存在的唯一理由是"跑的是哪一版"曾经要靠反汇编快照去猜：客体上
-# .sys 被已加载的驱动钉住时 Copy-Item 报 Access denied，sc delete 只是标记
-# 删除，pnputil /delete-driver 要求重启后才生效 —— 文件 mtime 完全不可信。
-# 于是一路都用 PE TimeDateStamp 串起来：
-#   源 .sys 的 stamp  ==  System32\drivers\iwanmp.sys 的 stamp（装对了）
-#   驱动自己读出来落进 T31（见 win-driver/iwan_win_mp.c 的 iwan_win_mp_build_stamp）
-# 两者不等就直接判失败，不再拿 trace 键去猜。
+# The only reason this script exists: which build is running used to be guessed from disassembly snapshots -- on the guest,
+# when the .sys is pinned by a loaded driver Copy-Item reports Access denied, sc delete only marks it
+# for deletion, and pnputil /delete-driver needs a reboot to take effect -- file mtime is completely untrustworthy.
+# So everything is chained through the PE TimeDateStamp:
+#   stamp of source .sys  ==  stamp of System32\drivers\iwanmp.sys (installed the right one)
+#   the driver reads it into T31 (see iwan_win_mp_build_stamp in win-driver/iwan_win_mp.c)
+# If they differ, fail immediately instead of guessing from trace keys.
 #
-# 用法：
+# Usage:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File C:\iwan\vm-mp-full.ps1 `
 #       -Sys C:\iwan\iwanmp.sys -Inf C:\iwan\iwanmp.inf -Carrier 7
-#   只想看现场：-InspectOnly
-#   装具已经装好、只要探针：-SkipInstall
+#   inspect only: -InspectOnly
+#   harness already installed, probe only: -SkipInstall
 param(
     [string]$Sys = 'C:\iwan\iwanmp.sys',
     [string]$Inf = 'C:\iwan\iwanmp.inf',
@@ -20,16 +20,18 @@ param(
     [int]$Carrier = 0,
     [int]$HoldSeconds = 4,
     [int]$WaitSeconds = 8,
-    # 内层适配器的"介质形状"。客体上 NdisMediumIP + 广播 + 无链路地址时，
-    # TCP/IP 仍会给对端建邻居项并索要 6 字节链路地址，拿不到就 send 直接
-    # 失败（ping 报 General failure、UDP 报 WSAEINVAL），连 NDIS 都到不了。
-    # 改注册表 + restart-device 就能换一档，不必重启整机换映像。
-    #   MpAccess 0=广播 1=点对点 2=环回
-    #   MpMacLen 0=无链路地址 6=给一个假 MAC
+    # Media shape of the inner adapter. On the guest with NdisMediumIP + broadcast + no link address,
+    # TCP/IP still creates a neighbor entry for the peer and asks for a 6-byte link address; without it send
+    # fails outright (ping reports General failure, UDP reports WSAEINVAL) and never even reaches NDIS.
+    # Registry + restart-device switches the tier without rebooting the whole machine with a new image.
+    #   MpAccess 0=broadcast 1=point-to-point 2=loopback
+    #   MpMacLen 0=no link address 6=fake MAC
     #   MpIfType 0=PROP_VIRTUAL 6=ETHERNET_CSMACD 131=TUNNEL
     [int]$MpAccess = 0,
     [int]$MpMacLen = 0,
     [int]$MpIfType = 0,
+    # Ping count inside the session: only together with MpAccess does it prove the inner side can hand packets to the driver.
+    [int]$PingCount = 0,
     [switch]$InspectOnly,
     [switch]$SkipInstall
 )
@@ -56,7 +58,7 @@ function Get-IwanmpNodes {
       Where-Object { $_.HardwareID -contains $Hwid })
 }
 function Show-Trace {
-    if (-not (Test-Path $pkey)) { '  (没有 Parameters 键)'; return }
+    if (-not (Test-Path $pkey)) { '  (no Parameters key)'; return }
     $p = Get-ItemProperty $pkey
     foreach ($n in @($p.PSObject.Properties.Name | Where-Object { $_ -match $traceKeys } | Sort-Object)) {
         "  {0,-8} = 0x{1:X8} ({1})" -f $n, [uint32]$p.$n
@@ -74,20 +76,20 @@ function Set-Param([string]$n, [int]$v) {
     New-ItemProperty -Path $pkey -Name $n -PropertyType DWord -Value $v -Force | Out-Null
 }
 
-Sec '0 现场'
+Sec '0 inspect'
 $srcStamp = PeStamp $Sys
 $dstStamp = PeStamp $drv
-"  源     $Sys  len=" + (Get-Item $Sys -ErrorAction SilentlyContinue).Length + " stamp=0x{0:X8}" -f $srcStamp
-"  已装   $drv  len=" + (Get-Item $drv -ErrorAction SilentlyContinue).Length + " stamp=0x{0:X8}" -f $dstStamp
-"  服务   " + ((Get-Service -Name 'iwanmp' -ErrorAction SilentlyContinue).Status)
-"  节点数 " + (Get-IwanmpNodes).Count
+"  src     $Sys  len=" + (Get-Item $Sys -ErrorAction SilentlyContinue).Length + " stamp=0x{0:X8}" -f $srcStamp
+"  installed $drv  len=" + (Get-Item $drv -ErrorAction SilentlyContinue).Length + " stamp=0x{0:X8}" -f $dstStamp
+"  service " + ((Get-Service -Name 'iwanmp' -ErrorAction SilentlyContinue).Status)
+"  nodes   " + (Get-IwanmpNodes).Count
 Show-Trace
 if ($InspectOnly) { return }
 
 if (-not $SkipInstall) {
-    Sec '1 清干净'
-    # 孤儿节点会一个接一个冒出来（devcon 装失败时留下的空壳没有 Service 值），
-    # 所以要循环删到没有为止，而不是删一遍就以为干净了。
+    Sec '1 clean up'
+    # Orphan nodes show up one after another (failed devcon installs leave empty shells with no Service value),
+    # so delete in a loop until none remain, not once and assume it is clean.
     for ($round = 0; $round -lt 6; $round++) {
         $nodes = Get-IwanmpNodes
         if ($nodes.Count -eq 0) { break }
@@ -96,7 +98,7 @@ if (-not $SkipInstall) {
             & pnputil.exe /remove-device $d.InstanceId 2>&1 | Out-String | ForEach-Object { "    $_" }
         }
     }
-    "  清完节点数 " + (Get-IwanmpNodes).Count
+    "  nodes after cleanup " + (Get-IwanmpNodes).Count
 
     & sc.exe query iwanmp 2>&1 | Out-String | ForEach-Object { "  $_" }
     & sc.exe delete iwanmp 2>&1 | Out-String | ForEach-Object { "  $_" }
@@ -113,92 +115,92 @@ if (-not $SkipInstall) {
     }
     if (Test-Path $drv) {
         Remove-Item $drv -Force -ErrorAction SilentlyContinue
-        "  删 $drv -> exists=" + (Test-Path $drv)
+        "  delete $drv -> exists=" + (Test-Path $drv)
     }
 
-    Sec '2 装（保险丝先合上）'
+    Sec '2 install (fuse closed first)'
     Set-Param 'Disarm' 1
     Set-Param 'NoProto' 1
     & cmd.exe /c "`"$PSHOME\powershell.exe`" -NoProfile -ExecutionPolicy Bypass -File C:\iwan\vm-mp-install.ps1 -SysPath $Sys -InfPath $Inf" 2>&1 |
         Out-String | ForEach-Object { "  $_" }
     $dstStamp = PeStamp $drv
-    "  装后 stamp=0x{0:X8}" -f $dstStamp
+    "  stamp after install=0x{0:X8}" -f $dstStamp
     if ($dstStamp -ne $srcStamp -or $srcStamp -eq 0) {
-        "  严重：装上的映像不是这一版（源 0x{0:X8} / 装 0x{1:X8}）—— 停下" -f $srcStamp, $dstStamp
+        "  FATAL: installed image is not this build (src 0x{0:X8} / installed 0x{1:X8}) -- stopping" -f $srcStamp, $dstStamp
         return
     }
 }
 
-Sec '2.5 协议组件户口（NetTrans）'
-# 协议边要有绑定，光有服务不够：NDIS 眼里它必须是一个 NetTrans 组件。
-# 第 1 步删掉了驱动包，组件注册可能指向已经不存在的服务；不补齐这一步，
-# 后面 T71 恒为 0，整轮读数白跑（曾经就是这样白跑了一轮）。
-# 位置也不能挪：装早了 DriverEntry 会被提前拉起（保险丝还是合着的，白白
-# 烧掉一次 DriverEntry），装晚了本轮读数同样作废。
+Sec '2.5 protocol component registration (NetTrans)'
+# The protocol edge needs a binding; a service alone is not enough: NDIS must see it as a NetTrans component.
+# Step 1 deleted the driver package, so the component registration may point at a service that no longer exists;
+# without this fix T71 stays 0 and the whole round of readings is wasted (this happened once).
+# Position matters too: install too early and DriverEntry is pulled up early (fuse still closed, burning
+# one DriverEntry for nothing); install too late and this round of readings is void as well.
 & cmd.exe /c "`"$PSHOME\powershell.exe`" -NoProfile -ExecutionPolicy Bypass -File C:\iwan\vm-mp-proto.ps1 -SysSrc $drv" 2>&1 |
     Out-String | ForEach-Object { "  $_" }
 $comp = @(Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Control\Network\{4D36E975-E325-11CE-BFC1-08002BE10318}' -ErrorAction SilentlyContinue |
           Where-Object { $_.PSChildName -match '^\{' } |
           Where-Object { (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).ComponentId -eq 'iwanmp' })
-"  组件实例数 " + $comp.Count
+"  component instances " + $comp.Count
 if ($comp.Count -eq 0) {
-    # 组件残留导致 netcfg -l 空转时，先拆再装；只重试一次，避免无限循环。
-    "  没装上，先 netcfg -u 再装一次"
+    # When leftover components make netcfg -l spin, uninstall first then install; retry only once to avoid an endless loop.
+    "  not installed, run netcfg -u then install again"
     & cmd.exe /c "C:\Windows\System32\netcfg.exe -u iwanmp" 2>&1 | Out-String | ForEach-Object { "  $_" }
     & cmd.exe /c "`"$PSHOME\powershell.exe`" -NoProfile -ExecutionPolicy Bypass -File C:\iwan\vm-mp-proto.ps1 -SysSrc $drv" 2>&1 |
         Out-String | ForEach-Object { "  $_" }
     $comp = @(Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Control\Network\{4D36E975-E325-11CE-BFC1-08002BE10318}' -ErrorAction SilentlyContinue |
               Where-Object { $_.PSChildName -match '^\{' } |
               Where-Object { (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).ComponentId -eq 'iwanmp' })
-    "  重试后组件实例数 " + $comp.Count
+    "  component instances after retry " + $comp.Count
 }
-if ($comp.Count -eq 0) { throw 'NetTrans 组件没装上：协议边不可能有绑定' }
-# 服务键的 Ndi\Interfaces 是两个 INF 共同写的：微型端口包与协议组件包
-# 都把值写进 Services\iwanmp\Ndi\Interfaces，后装的那个逐值覆盖先装的。
-# 实测这里被微型端口包改成了 upper=ndis5 / lower=ethernet，两种形状
-# 都能工作，但必须把当轮的真实值记下来，否则「绑定来了又打不开」时
-# 没法排除接口形状这一项。
+if ($comp.Count -eq 0) { throw 'NetTrans component not installed: the protocol edge cannot bind' }
+# Ndi\Interfaces on the service key is written by both INFs: the miniport package and the protocol component package
+# both write into Services\iwanmp\Ndi\Interfaces, and the later install overwrites value by value.
+# Measured: the miniport package changed it to upper=ndis5 / lower=ethernet; both shapes work,
+# but the real values of this round must be recorded, otherwise when a binding appears and then
+# cannot be opened, the interface shape cannot be ruled out.
 $ik = 'HKLM:\SYSTEM\CurrentControlSet\Services\iwanmp\Ndi\Interfaces'
 if (Test-Path $ik) {
     $q = Get-ItemProperty $ik
-    "  服务 Ndi: upper=" + ($q.UpperRange -join ',') + " lower=" + ($q.LowerRange -join ',')
-} else { '  服务 Ndi\Interfaces: 缺失' }
+    "  service Ndi: upper=" + ($q.UpperRange -join ',') + " lower=" + ($q.LowerRange -join ',')
+} else { '  service Ndi\Interfaces: missing' }
 
-Sec '3 放开保险丝（协议边也起）'
+Sec '3 open fuse (protocol edge starts too)'
 $node = (Get-IwanmpNodes | Select-Object -First 1).InstanceId
-if (-not $node) { throw '找不到 HardwareID=iwanmp 的设备节点' }
+if (-not $node) { throw 'no device node with HardwareID=iwanmp' }
 Clear-Trace
 Set-Param 'MpAccess' $MpAccess
 Set-Param 'MpMacLen' $MpMacLen
 Set-Param 'MpIfType' $MpIfType
 Set-Param 'Disarm' 0
 Set-Param 'NoProto' 0
-"  媒介形状：MpAccess=$MpAccess MpMacLen=$MpMacLen MpIfType=$MpIfType"
+"  media shape: MpAccess=$MpAccess MpMacLen=$MpMacLen MpIfType=$MpIfType"
 & pnputil.exe /restart-device $node 2>&1 | Out-String | ForEach-Object { "  $_" }
 Start-Sleep -Seconds $WaitSeconds
-"  设备：" + ((Get-IwanmpNodes | Select-Object -First 1).Status)
+"  device: " + ((Get-IwanmpNodes | Select-Object -First 1).Status)
 $t31 = 0
 if (Test-Path $pkey) { $t31 = [uint32](Get-ItemProperty $pkey).T31 }
-"  运行中映像 T31=0x{0:X8}（源 0x{1:X8}）" -f $t31, $srcStamp
-if ($t31 -ne $srcStamp) { "  警告：跑的不是这一版，后面的读数都不可信" }
+"  running image T31=0x{0:X8} (src 0x{1:X8})" -f $t31, $srcStamp
+if ($t31 -ne $srcStamp) { "  WARNING: not running this build, later readings are unreliable" }
 
-Sec '4 适配器 / 地址 / MTU'
+Sec '4 adapter / address / MTU'
 $ad = Get-NetAdapter -ErrorAction SilentlyContinue |
       Where-Object { $_.InterfaceDescription -like 'iWAN Tunnel Adapter*' -and $_.Status -ne 'Not Present' } |
       Select-Object -First 1
-if (-not $ad) { '  没有隧道适配器（MiniportInitializeEx 没成功，看 T20/T21/T22）'; Show-Trace; return }
-"  适配器 $($ad.Name) ifIndex=$($ad.ifIndex) status=$($ad.Status)"
+if (-not $ad) { '  no tunnel adapter (MiniportInitializeEx failed, check T20/T21/T22)'; Show-Trace; return }
+"  adapter $($ad.Name) ifIndex=$($ad.ifIndex) status=$($ad.Status)"
 if ($ad.Name -ne 'iwanmp') {
     & netsh.exe interface set interface name="$($ad.Name)" newname="iwanmp" 2>&1 | Out-String | ForEach-Object { "  $_" }
     Start-Sleep -Seconds 2
     $ad = Get-NetAdapter -Name 'iwanmp' -ErrorAction SilentlyContinue
-    "  改名后 $($ad.Name) ifIndex=$($ad.ifIndex)"
+    "  renamed $($ad.Name) ifIndex=$($ad.ifIndex)"
 }
-# netsh 的 set address 对已存在的地址报 "The object already exists." 且不生效，
-# 只有 add address 真的能把地址加上去。
-# 判据必须是"这个地址在不在"，不是"有没有任何地址"：适配器起来时自带
-# 169.254.x.x 的自动专用地址，按后一条判会静默跳过 add —— 然后 ping 打
-# 的是那个不存在的内层地址，看起来像数据面坏了（踩过）。
+# netsh set address on an existing address reports "The object already exists." and has no effect,
+# only add address actually adds it.
+# The test must be whether this address exists, not whether any address exists: the adapter comes up
+# with a 169.254.x.x autoconfig address, so the latter test silently skips add -- and then ping hits
+# that nonexistent inner address, looking like the data plane is broken (this happened).
 $have = @(Get-NetIPAddress -InterfaceAlias 'iwanmp' -AddressFamily IPv4 -ErrorAction SilentlyContinue |
           Where-Object { $_.IPAddress -eq '10.99.0.1' })
 if ($have.Count -eq 0) {
@@ -207,38 +209,39 @@ if ($have.Count -eq 0) {
 }
 $have = @(Get-NetIPAddress -InterfaceAlias 'iwanmp' -AddressFamily IPv4 -ErrorAction SilentlyContinue |
           Where-Object { $_.IPAddress -eq '10.99.0.1' })
-if ($have.Count -eq 0) { '  警告：10.99.0.1 没加上，后面的内层收发一定失败' }
+if ($have.Count -eq 0) { '  WARNING: 10.99.0.1 was not added, inner traffic will fail' }
 & netsh.exe interface ipv4 set subinterface "iwanmp" mtu=1400 store=persistent 2>&1 | Out-String | ForEach-Object { "  $_" }
 Get-NetIPAddress -InterfaceAlias 'iwanmp' -AddressFamily IPv4 -ErrorAction SilentlyContinue |
     Select-Object IPAddress, PrefixLength | Format-Table -AutoSize | Out-String -Width 200
 
-Sec '5 OPEN 探针'
+Sec '5 OPEN probe'
 if ($Carrier -le 0) { $Carrier = (Get-NetAdapter -Name 'Ethernet' -ErrorAction SilentlyContinue).ifIndex }
-"  承载 ifIndex=$Carrier 保持 ${HoldSeconds}s"
-# 两套编号并排打出来：驱动里绑定表存的是 NDIS 口径，控制面给的是 netio 口径，
-# 探针用的又是 Get-NetAdapter 的 ifIndex。三者不等时，症状与"没绑上"完全一样。
+"  carrier ifIndex=$Carrier hold ${HoldSeconds}s"
+# Two numbering schemes are printed side by side: the driver binding table stores NDIS values, the control plane uses netio values,
+# and the probe uses Get-NetAdapter ifIndex. When the three differ, symptoms are identical to not bound at all.
 foreach ($c in (Get-CimInstance Win32_NetworkAdapter | Where-Object { $_.NetConnectionID })) {
     $ni = Get-NetAdapter -Name $c.NetConnectionID -ErrorAction SilentlyContinue
-    "  索引对照 name=$($c.NetConnectionID) miniport=$($c.Index) netio=$(if ($ni) { $ni.ifIndex } else { '?' })"
+    "  index map name=$($c.NetConnectionID) miniport=$($c.Index) netio=$(if ($ni) { $ni.ifIndex } else { '?' })"
 }
 Clear-Trace
-# 承载网卡的接口 GUID：两套接口索引口径在客体上实测并不一致（以太网
-# netio=7，协议边绑定报 23/26），按索引挑承载等于猜。控制面真实路径用
-# ConvertInterfaceLuidToGuid 取同一份 GUID，这里照抄那个口径。
+# Carrier NIC interface GUID: on the guest the two interface index schemes measurably disagree (Ethernet
+# netio=7 while the protocol edge binding reports 23/26), so picking the carrier by index is a guess. The real
+# control-plane path uses ConvertInterfaceLuidToGuid for the same GUID; copy that scheme here.
 $cguid = (Get-NetAdapter -InterfaceIndex $Carrier -ErrorAction SilentlyContinue).InterfaceGuid
 if ($cguid) { $cguid = $cguid.ToString() } else { $cguid = '' }
-"  承载 GUID=$cguid"
-& cmd.exe /c "`"$PSHOME\powershell.exe`" -NoProfile -ExecutionPolicy Bypass -File C:\iwan\mp-ab-probe.ps1 -HoldSeconds $HoldSeconds -OifIndex $Carrier -OuterIfGuid $cguid" 2>&1 |
+"  carrier GUID=$cguid"
+& cmd.exe /c "`"$PSHOME\powershell.exe`" -NoProfile -ExecutionPolicy Bypass -File C:\iwan\mp-ab-probe.ps1 -HoldSeconds $HoldSeconds -OifIndex $Carrier -OuterIfGuid $cguid -PingCount $PingCount" 2>&1 |
     Out-String | ForEach-Object { "  $_" }
 
-Sec '6 trace 全表'
+Sec '6 trace table'
 Show-Trace
 ''
-'  判读：'
-'   T31 = 运行中映像时间戳（与第 3 步的源一致才说明这一版在跑）'
-'   T69 = 协议边注册命中的声明次版本；T78/T79 = NDIS 调 BindAdapterEx 次数/被拒次数'
-'   T71 = 链上绑定数；T72/T73 = open_complete 成败次数；T74/T75 = 前两个绑定 ifindex|opened|closed'
-'   T76/T77 = 打开失败的 NTSTATUS / NdisOpenAdapterEx 当场返回；T83 > 0 表示等过在飞的打开'
-'   T80 = 查不到可用绑定；T81 = 选中瞬间被解绑；T82 = 成功，值是选中的 ifindex'
-'   T87 = 会话带没带承载 GUID（1=带，只按 GUID 查表）；T88 = 命中数<<8 | 解析成功数'
-'   T90/T91/T92 = 本次小型端口用的 AccessType/MacAddressLength/IfType 档位'
+'  how to read:'
+'   T31 = running image timestamp (match with step 3 source means this build is running)'
+'   T69 = declared minor version hit by protocol edge registration; T78/T79 = NDIS BindAdapterEx calls/rejections'
+'   T71 = link bindings; T72/T73 = open_complete success/failure counts; T74/T75 = first two bindings ifindex|opened|closed'
+'   T76/T77 = NTSTATUS of failed open / NdisOpenAdapterEx immediate return; T83 > 0 means it waited for an in-flight open'
+'   T80 = no usable binding found; T81 = unbound at selection instant; T82 = success, value is selected ifindex'
+'   T87 = session carries carrier GUID (1=yes, lookup by GUID only); T88 = hits<<8 | parse_ok'
+'   T90/T91/T92 = AccessType/MacAddressLength/IfType tier used by this miniport instance'
+'   T93/T94/T95/T96 = ARP requests sent / ARP frames received / neighbors learned / peer_mac_valid'

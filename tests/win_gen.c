@@ -1,16 +1,16 @@
-/* 内层打流器：比 vm-bench.ps1 里的 C# 版强一个量级。
+/* Inner traffic generator: an order of magnitude faster than the C# version in vm-bench.ps1.
  *
- * 为什么另写一个：C# 版每包一次 UdpClient.Send，4 线程只到 63k pps，
- * 而这个数正好压在"驱动的封装上限到底在哪"的判据上 —— 发生器先饱和，
- * 就测不出隧道的能力。这里每线程独占一个 socket、纯 sendto 紧循环。
+ * Why another one: the C# version calls UdpClient.Send once per packet and only
+ * reaches 63k pps on 4 threads -- right at the "where is the driver's
+ * encapsulation ceiling" criterion; if the generator saturates first the tunnel cannot be measured. Here each thread owns a socket and runs a tight pure-sendto loop.
  *
- * 交叉编译（宿主）：
+ * Cross-compile (host):
  *   x86_64-w64-mingw32-gcc -O2 -std=c11 -Wall -Wextra -o tests/win_gen.exe tests/win_gen.c -lws2_32
  *
- * 用法（客体）：
+ * Usage (guest):
  *   win_gen.exe -d 10.99.0.2 -p 45678 -B 10.99.0.1 -b 1200 -t 4 -S 10 [-r 200000]
- *     -r 0 表示不限速；每线程的源端口 = -s + 线程序号，避免同 5 元组互相排队。
- * 输出：
+ *     -r 0 means unlimited; each thread's source port = -s + thread index, avoiding 5-tuple queueing.
+ * Output:
  *   GEN pkts=... bytes=... elapsed_ms=... rate_pps=... rate_mbps=... threads=... err=...
  */
 #define WIN32_LEAN_AND_MEAN
@@ -28,7 +28,7 @@ typedef struct {
     int sport;
     int bytes;
     int seconds;
-    long long target_pps;   /* 0 = 不限 */
+    long long target_pps;   /* 0 = unlimited */
     int index;
     long long pkts;
     long long bytes_sent;
@@ -65,8 +65,8 @@ static DWORD WINAPI gen_main(LPVOID arg)
     memset(&src, 0, sizeof(src));
     src.sin_family = AF_INET;
     src.sin_port = htons((unsigned short)(g->sport + g->index));
-    /* 显式绑到内层源地址：绑 0.0.0.0 时内核每包重选源，
-     * 在点对点媒介上会间歇返回 WSAEINVAL（10022），一半的包发不出去。 */
+    /* Explicitly bind the inner source address: with 0.0.0.0 the kernel reselects
+     * the source per packet, which intermittently returns WSAEINVAL (10022) on a point-to-point medium and half the packets never leave. */
     if (inet_pton(AF_INET, g->bindip, &src.sin_addr) != 1) src.sin_addr.s_addr = htonl(INADDR_ANY);
     if (bind(s, (struct sockaddr *)&src, sizeof(src)) == SOCKET_ERROR) { g->err = -2; closesocket(s); return 1; }
 
@@ -85,7 +85,7 @@ static DWORD WINAPI gen_main(LPVOID arg)
     while (now_us() < t_end) {
         int n = sendto(s, buf, g->bytes, 0, (struct sockaddr *)&dst, sizeof(dst));
         if (n == SOCKET_ERROR) {
-            /* 第一次错误必须打出来：不然"发不出去"和"没发"在输出里长得一模一样 */
+            /* The first error must be printed: otherwise "cannot send" and "did not send" look identical in the output */
             if (errs == 0) printf("GEN thread %d first sendto error=%d\n", g->index, WSAGetLastError());
             errs++;
             continue;

@@ -1,29 +1,29 @@
 /*
- * iwan_cnt.c —— 只计数、可回声的以太虚拟网卡（iwancnt.sys）
+ * iwan_cnt.c -- counting-only, echo-capable virtual Ethernet NIC (iwancnt.sys)
  *
- * 用途：给 Windows 数据面提供一个"不经 QEMU slirp、不过用户态"的对端，让隧道
- * 能以线速跑满并逐帧计数。它是一张 802.3 小型端口：
+ * Purpose: give the Windows data plane a peer that "does not go through QEMU slirp or user space", so the tunnel
+ * can run at line rate and be counted frame by frame. It is an 802.3 miniport:
  *
- *   - 发送路径：协议栈交下来的每一帧都累加计数（分"去往对端"与"来自对端"
- *     两类），这就是隧道真正压出来的负载；
- *   - 桥接：装两张本网卡（A、B），每张把"目的 IP = PeerIp"的帧复制一份、改写
- *     以太头（源 = 本卡、目的 = 对端卡 MAC）后在对端卡上指示上去，等于一根网线；
- *     两端各跑一个用户态端点（客户端 / 计数服务端）就能双向测量；
- *   - ARP：对 PeerIp 代答 —— tcpip 不认为该地址属于本机，不代答就永远解析
- *     不出下一跳；
- *   - 计数只暴露在 NDIS 统计里（Get-NetAdapterStatistics 直接可读），不建
- *     控制设备、不开共享内存：越少代码越不可能把整机搞挂。
+ *   - send path: every frame handed down by the stack is counted (split into "to the peer" and "from the peer"),
+ *     which is the load the tunnel actually pushes;
+ *   - bridging: install two of these NICs (A, B); each copies frames with "destination IP = PeerIp", rewrites
+ *     the Ethernet header (source = this NIC, destination = peer NIC's MAC) and indicates them on the peer NIC, which amounts to a cable;
+ *     with a user-space endpoint on each end (client / counting server) you can measure both directions;
+ *   - ARP: answer on behalf of PeerIp -- tcpip does not consider that address local, so without answering
+ *     the next hop never resolves;
+ *   - counters are exposed only through NDIS statistics (Get-NetAdapterStatistics reads them directly); no
+ *     control device is created and no shared memory is opened: less code means less chance of hanging the machine.
  *
- * 参数（HKLM\SYSTEM\CurrentControlSet\Services\iwancnt\Parameters）：
- *   Disarm   DWORD 默认 1（合上保险丝）。为 1 时 InitializeEx 直接失败，驱动
- *                  装着但不工作 —— 一次错误注册就让整机起不来的教训。
- *   PeerIp   SZ    默认 "10.200.0.1"，对端地址：对它代答 ARP，并把去往它的
- *                  帧桥到另一个实例。两张卡各填对方的地址即可。
- *   Bridge   DWORD 默认 1：为 0 时只计数、不桥接（纯"只计数对端"）。
- *   Mac      SZ    默认 "02-00-49-57-41-4e"。
+ * Parameters (HKLM\SYSTEM\CurrentControlSet\Services\iwancnt\Parameters):
+ *   Disarm   DWORD default 1 (fuse closed). When 1, InitializeEx fails outright: the driver
+ *                  is installed but does not work -- the lesson from one bad registration that kept the machine from booting.
+ *   PeerIp   SZ    default "10.200.0.1", the peer address: answer ARP for it and bridge frames
+ *                  destined for it to the other instance. Each of the two NICs just fills in the other's address.
+ *   Bridge   DWORD default 1: when 0, count only and do not bridge (pure "count the peer only").
+ *   Mac      SZ    default "02-00-49-57-41-4e".
  *
- * 边界：iwan.sys 是 WFP 平面、iwanmp.sys 是 NDIS 平面；本驱动不属于任何平面，
- * 只是它们对端的一张网卡。
+ * Scope: iwan.sys is the WFP plane and iwanmp.sys is the NDIS plane; this driver belongs to neither,
+ * it is just the NIC at their far end.
  */
 
 #include <ndis.h>
@@ -51,14 +51,14 @@ typedef struct _IWAN_CNT_ADAPTER {
 	volatile LONG                   running;
 	volatile LONG                   inflight;
 	UCHAR                           mac[6];
-	LIST_ENTRY                      link;		/* 全局实例链 */
-	ULONG                           peer_ip;	/* 与帧内字节同序 */
+	LIST_ENTRY                      link;		/* global instance list */
+	ULONG                           peer_ip;	/* same byte order as the bytes in the frame */
 	volatile LONG                   bridge;
 	volatile LONG64                 tx_frames;
 	volatile LONG64                 tx_bytes;
 	volatile LONG64                 peer_in_frames;
 	volatile LONG64                 peer_out_frames;
-	volatile LONG64                 rx_frames;	/* 桥到对端实例的帧 */
+	volatile LONG64                 rx_frames;	/* frames bridged to the peer instance */
 	volatile LONG64                 rx_bytes;
 	volatile LONG64                 arp_req;
 	volatile LONG64                 arp_rep;
@@ -67,8 +67,8 @@ typedef struct _IWAN_CNT_ADAPTER {
 } IWAN_CNT_ADAPTER, *PIWAN_CNT_ADAPTER;
 
 /*
- * 实例表：同一驱动的多张卡互相桥接（Windows 版 veth 对）。链表与锁在
- * DriverEntry 里初始化，之后只增删、不移动。
+ * Instance table: several NICs of the same driver bridge to each other (the Windows veth pair). The list and lock are
+ * initialized in DriverEntry and afterwards only inserted/removed, never moved.
  */
 #define IWAN_CNT_MAX_PEERS 8u
 
@@ -78,7 +78,7 @@ static BOOLEAN g_cnt_list_ready;
 
 static VOID iwan_cnt_trace(_In_ ULONG stage, _In_ LONG status);
 
-/* ---- 字节序小工具 ---------------------------------------------------- */
+/* ---- Byte-order helpers ---------------------------------------------------- */
 
 static UINT16
 iwan_cnt_rd16(_In_reads_bytes_(2) const UCHAR *p)
@@ -135,13 +135,13 @@ iwan_cnt_ip4_csum(_Inout_updates_bytes_(20) UCHAR *ip)
 	iwan_cnt_wr16(ip + 10, iwan_cnt_csum(ip, ihl));
 }
 
-/* ---- 注册表参数与阶段追踪 -------------------------------------------- */
+/* ---- Registry parameters and stage tracing -------------------------------------------- */
 
 /*
- * 打开参数键。优先打开"本设备实例的驱动键"（Class\{4D36E972..}\00NN）：
- * 桥接要用两张卡，而每张卡必须有自己的 PeerIp 与 MAC；服务键是全局的，
- * 两个实例读到同一份配置就永远桥不到一起。驱动键拿不到时退回服务键，
- * 单卡（纯计数）场景仍然可用。
+ * Open the parameter key. Prefer "this device instance's driver key" (Class\{4D36E972..}\00NN):
+ * bridging needs two NICs and each must have its own PeerIp and MAC; the service key is global, so
+ * two instances would read the same configuration and never bridge together. If the driver key is unavailable, fall back to the service key,
+ * and the single-NIC (counting-only) case still works.
  */
 static BOOLEAN
 iwan_cnt_open_params(_In_ NDIS_HANDLE adapter_handle, _Out_ HANDLE *key)
@@ -175,15 +175,15 @@ iwan_cnt_param_u32(_In_ HANDLE key, _In_ PCWSTR name, _In_ ULONG dflt)
 	ULONG need = 0;
 	PKEY_VALUE_PARTIAL_INFORMATION pi;
 
-	/* 清零只是为了在分析器眼里"缓冲区已初始化"；真正的布局由 API 契约保证：
-	 * ZwQueryValueKey 成功时按 KEY_VALUE_PARTIAL_INFORMATION 写回。 */
+	/* Zeroing is only so that the analyzer sees "buffer initialized"; the real layout is guaranteed by the API contract:
+	 * on success ZwQueryValueKey writes back a KEY_VALUE_PARTIAL_INFORMATION. */
 	RtlZeroMemory(buf, sizeof(buf));
 	RtlInitUnicodeString(&vn, name);
 	if (!NT_SUCCESS(ZwQueryValueKey(key, &vn, KeyValuePartialInformation,
 					buf, sizeof(buf), &need)))
 		return dflt;
 	pi = (PKEY_VALUE_PARTIAL_INFORMATION)(PVOID)buf;
-	/* C28199：分析器认为 buf 未被赋值，实际是 ZwQueryValueKey 按契约填的。 */
+	/* C28199: the analyzer thinks buf is never assigned, but ZwQueryValueKey fills it per contract. */
 #pragma warning(suppress: 28199)
 	if (pi->Type != REG_DWORD || pi->DataLength < sizeof(ULONG))
 		return dflt;
@@ -220,7 +220,7 @@ iwan_cnt_param_str(_In_ HANDLE key, _In_ PCWSTR name,
 	return TRUE;
 }
 
-/* "10.200.0.1" → 0x0AC80001（与 iwan_cnt_rd32 同序：字节流顺序）。 */
+/* "10.200.0.1" -> 0x0AC80001 (same order as iwan_cnt_rd32: byte-stream order). */
 static ULONG
 iwan_cnt_parse_ip(_In_ PCWSTR s)
 {
@@ -256,7 +256,7 @@ iwan_cnt_parse_mac(_In_ PCWSTR s, _Out_writes_(6) UCHAR *mac)
 	ULONG i, nibbles = 0;
 	LONG hi = -1;
 
-	/* FALSE 时输出无意义；清零让分析器与调用方都不必猜。 */
+	/* The output is meaningless on FALSE; zeroing keeps both the analyzer and the caller from guessing. */
 	RtlZeroMemory(mac, 6);
 
 	for (i = 0;; i++) {
@@ -316,7 +316,7 @@ iwan_cnt_trace(_In_ ULONG stage, _In_ LONG status)
 	RtlInitUnicodeString(&vn, L"Status");
 	ZwSetValueKey(key, &vn, 0, REG_DWORD, &v, sizeof(v));
 
-	/* 键名 T<十进制阶段号>：写死 switch 会让未列阶段静默消失。 */
+	/* Key name T<decimal stage number>: a hard-coded switch would silently lose unlisted stages. */
 	name[i++] = L'T';
 	if (n == 0)
 		digits[t++] = L'0';
@@ -332,7 +332,7 @@ iwan_cnt_trace(_In_ ULONG stage, _In_ LONG status)
 	ZwClose(key);
 }
 
-/* ---- 支持的 OID ------------------------------------------------------ */
+/* ---- Supported OIDs ------------------------------------------------------ */
 
 static const NDIS_OID iwan_cnt_oids[] = {
 	OID_GEN_SUPPORTED_LIST,
@@ -372,7 +372,7 @@ static const NDIS_OID iwan_cnt_oids[] = {
 	OID_PNP_SET_POWER
 };
 
-/* OID 的值一律按**主机序**写回（NDIS 的约定），宽度按 OID 定义。 */
+/* OID values are always written back in **host byte order** (the NDIS convention), with the width defined by the OID. */
 static NDIS_STATUS
 iwan_cnt_oid_put_width(_Inout_ PNDIS_OID_REQUEST oid, _In_ UINT64 v,
 		       _In_ ULONG width)
@@ -419,7 +419,7 @@ iwan_cnt_oid_string(_Inout_ PNDIS_OID_REQUEST oid, _In_ const char *s)
 
 	while (s[n] != '\0')
 		n++;
-	n++;			/* 连结尾的 NUL 一起给 */
+	n++;			/* include the terminating NUL */
 	if (oid->DATA.QUERY_INFORMATION.InformationBufferLength < n) {
 		oid->DATA.QUERY_INFORMATION.BytesNeeded = (ULONG)n;
 		return NDIS_STATUS_BUFFER_TOO_SHORT;
@@ -429,11 +429,11 @@ iwan_cnt_oid_string(_Inout_ PNDIS_OID_REQUEST oid, _In_ const char *s)
 	return NDIS_STATUS_SUCCESS;
 }
 
-/* ---- 指示、ARP 与回声 ------------------------------------------------ */
+/* ---- Indication, ARP and echo ------------------------------------------------ */
 
 /*
- * 把一帧交回协议栈：缓冲与 MDL 的所有权转给 NDIS，归还回调里释放。
- * 每个 NBL 只装一帧，故单以太类型标志与帧类型信息一致。
+ * Hand a frame back to the stack: ownership of the buffer and MDL transfers to NDIS and is released in the return callback.
+ * Each NBL carries exactly one frame, so the single-ethertype flag matches the frame type information.
  */
 static VOID
 iwan_cnt_indicate(_Inout_ PIWAN_CNT_ADAPTER a, _In_ UCHAR *buf, _In_ ULONG len,
@@ -450,7 +450,7 @@ iwan_cnt_indicate(_Inout_ PIWAN_CNT_ADAPTER a, _In_ UCHAR *buf, _In_ ULONG len,
 		return;
 	}
 	MmBuildMdlForNonPagedPool(mdl);
-	/* C6014 误报：下面的指示调用把 nbl 的所有权转给 NDIS，归还回调负责释放。 */
+	/* C6014 false positive: the indication call below transfers ownership of nbl to NDIS; the return callback frees it. */
 #pragma warning(suppress: 6014)
 	nbl = NdisAllocateNetBufferAndNetBufferList(
 		a->nbl_pool, IWAN_CNT_NBL_CTX_SIZE, 0, mdl, 0, len);
@@ -470,7 +470,7 @@ iwan_cnt_indicate(_Inout_ PIWAN_CNT_ADAPTER a, _In_ UCHAR *buf, _In_ ULONG len,
 	InterlockedIncrement(&a->inflight);
 	InterlockedIncrement64(&a->rx_frames);
 	InterlockedAdd64(&a->rx_bytes, (LONG64)len);
-	/* 所有权在此转移：后续归还由 ReturnNetBufferLists 负责。 */
+	/* Ownership transfers here: the later return is handled by ReturnNetBufferLists. */
 #pragma warning(suppress: 6014)
 	NdisMIndicateReceiveNetBufferLists(
 		a->adapter_handle, nbl, NDIS_DEFAULT_PORT_NUMBER, 1,
@@ -478,9 +478,9 @@ iwan_cnt_indicate(_Inout_ PIWAN_CNT_ADAPTER a, _In_ UCHAR *buf, _In_ ULONG len,
 			(dispatch ? NDIS_RECEIVE_FLAGS_DISPATCH_LEVEL : 0));
 }
 
-/* 对 PeerIp 的 ARP 请求代答。 */
+/* Answer ARP requests for PeerIp on its behalf. */
 #pragma warning(push)
-#pragma warning(disable: 6014)	/* 缓冲所有权交给 iwan_cnt_indicate */
+#pragma warning(disable: 6014)	/* buffer ownership is handed to iwan_cnt_indicate */
 static VOID
 iwan_cnt_arp_reply(_Inout_ PIWAN_CNT_ADAPTER a,
 		   _In_reads_bytes_(len) const UCHAR *p, _In_ ULONG len,
@@ -492,7 +492,7 @@ iwan_cnt_arp_reply(_Inout_ PIWAN_CNT_ADAPTER a,
 		return;
 	if (iwan_cnt_rd16(p + 20) != 1)		/* op = request */
 		return;
-	if (iwan_cnt_rd32(p + 38) != a->peer_ip)	/* target = 我们 */
+	if (iwan_cnt_rd32(p + 38) != a->peer_ip)	/* target = us */
 		return;
 	r = (UCHAR *)ExAllocatePool2(POOL_FLAG_NON_PAGED, 42, IWAN_CNT_TAG);
 	if (r == NULL) {
@@ -500,8 +500,8 @@ iwan_cnt_arp_reply(_Inout_ PIWAN_CNT_ADAPTER a,
 		return;
 	}
 	RtlZeroMemory(r, 42);
-	RtlCopyMemory(r, p + 6, 6);		/* 目的 MAC = 请求方 */
-	RtlCopyMemory(r + 6, a->mac, 6);	/* 源 MAC = 本卡 */
+	RtlCopyMemory(r, p + 6, 6);		/* destination MAC = requester */
+	RtlCopyMemory(r + 6, a->mac, 6);	/* source MAC = this NIC */
 	iwan_cnt_wr16(r + 12, IWAN_CNT_ETH_ARP);
 	iwan_cnt_wr16(r + 14, 1);		/* htype ethernet */
 	iwan_cnt_wr16(r + 16, IWAN_CNT_ETH_IPV4);
@@ -519,13 +519,13 @@ iwan_cnt_arp_reply(_Inout_ PIWAN_CNT_ADAPTER a,
 #pragma warning(pop)
 
 /*
- * 把一个帧桥到其余实例：源 MAC 改成本卡，目的 MAC 改成对端卡的 MAC。
- * 为什么要改目的 MAC：对端协议栈的接收过滤只收"发给本卡"与广播的帧，原样的帧
- * 目的 MAC 是本卡，到了对端会被直接丢掉。
- * 调用者已确认这是"去往 PeerIp"的帧；没有对端实例时什么都不做（纯计数模式）。
+ * Bridge a frame to the remaining instances: set the source MAC to this NIC and the destination MAC to the peer NIC's MAC.
+ * Why the destination MAC must change: the peer stack's receive filter accepts only frames "sent to this NIC" and broadcast
+ * frames; a frame left unchanged carries this NIC's MAC and is dropped immediately at the peer.
+ * The caller has already confirmed this frame is "destined for PeerIp"; with no peer instance nothing is done (counting-only mode).
  */
 #pragma warning(push)
-#pragma warning(disable: 6014)	/* 缓冲所有权交给 iwan_cnt_indicate */
+#pragma warning(disable: 6014)	/* buffer ownership is handed to iwan_cnt_indicate */
 static VOID
 iwan_cnt_bridge(_Inout_ PIWAN_CNT_ADAPTER a,
 		_In_reads_bytes_(len) const UCHAR *p, _In_ ULONG len,
@@ -543,8 +543,8 @@ iwan_cnt_bridge(_Inout_ PIWAN_CNT_ADAPTER a,
 	if (!g_cnt_list_ready)
 		return;
 
-	/* 先在锁内把对端指针抄出来，再在锁外做分配与指示：NDIS 调用可能重入
-	 * 本驱动的发送路径，持锁跨调用是死锁的经典配方。 */
+	/* Copy the peer pointers out under the lock, then allocate and indicate outside it: an NDIS call can re-enter
+	 * this driver's send path, and holding a lock across such a call is the classic deadlock recipe. */
 	KeAcquireSpinLock(&g_cnt_lock, &old);
 	for (e = g_cnt_list.Flink;
 	     e != NULL && e != &g_cnt_list && npeers < IWAN_CNT_MAX_PEERS;
@@ -570,14 +570,14 @@ iwan_cnt_bridge(_Inout_ PIWAN_CNT_ADAPTER a,
 			continue;
 		}
 		RtlCopyMemory(buf, p, len);
-		RtlCopyMemory(buf, peer->mac, 6);	/* 目的 = 对端卡 */
-		RtlCopyMemory(buf + 6, a->mac, 6);	/* 源 = 本卡 */
+		RtlCopyMemory(buf, peer->mac, 6);	/* destination = peer NIC */
+		RtlCopyMemory(buf + 6, a->mac, 6);	/* source = this NIC */
 		iwan_cnt_indicate(peer, buf, len, ethertype, dispatch);
 	}
 }
 #pragma warning(pop)
 
-/* ---- 小型端口：发送 / 归还 / 取消 ------------------------------------ */
+/* ---- Miniport: send / return / cancel ------------------------------------ */
 
 static
 _Function_class_(MINIPORT_SEND_NET_BUFFER_LISTS)
@@ -720,12 +720,12 @@ VOID
 iwan_cnt_cancel_send(_In_ NDIS_HANDLE MiniportAdapterContext,
 		     _In_ PVOID CancelId)
 {
-	/* 发送路径同步完成，没有排队中的 NBL 可取消。 */
+	/* The send path completes synchronously, so there is no queued NBL to cancel. */
 	UNREFERENCED_PARAMETER(MiniportAdapterContext);
 	UNREFERENCED_PARAMETER(CancelId);
 }
 
-/* ---- 小型端口：OID --------------------------------------------------- */
+/* ---- Miniport: OID --------------------------------------------------- */
 
 static
 _Function_class_(MINIPORT_OID_REQUEST)
@@ -780,7 +780,7 @@ iwan_cnt_oid_request(_In_ NDIS_HANDLE MiniportAdapterContext,
 		return iwan_cnt_oid_put_u32(
 			OidRequest, NDIS_MAC_OPTION_COPY_LOOKAHEAD_DATA);
 	case OID_GEN_LINK_SPEED:
-		/* 名义链路速率，单位 100 bps：10 Gbps ⇒ 100,000,000。 */
+		/* Nominal link speed in units of 100 bps: 10 Gbps => 100,000,000. */
 		return iwan_cnt_oid_put_u32(OidRequest, 100000000u);
 	case OID_GEN_MAXIMUM_LOOKAHEAD:
 	case OID_GEN_MAXIMUM_FRAME_SIZE:
@@ -906,7 +906,7 @@ iwan_cnt_shutdown(_In_ NDIS_HANDLE MiniportAdapterContext,
 	UNREFERENCED_PARAMETER(ShutdownAction);
 }
 
-/* ---- 小型端口：暂停 / 恢复 ------------------------------------------ */
+/* ---- Miniport: pause / restart ------------------------------------------ */
 
 static
 _Function_class_(MINIPORT_PAUSE)
@@ -936,12 +936,12 @@ iwan_cnt_restart(_In_ NDIS_HANDLE MiniportAdapterContext,
 	return NDIS_STATUS_SUCCESS;
 }
 
-/* ---- 小型端口：初始化 / 停止 ---------------------------------------- */
+/* ---- Miniport: initialize / halt ---------------------------------------- */
 
 /*
- * 本函数里报的两条 C6014（适配器扩展 a、NBL 池 a->nbl_pool）都是驱动生命周期
- * 资产：a 由 HaltHandlerEx 释放，池由 HaltHandlerEx 释放（等不到在途归还时
- * 宁可泄漏池也不放）。分析器只看见"分配了、函数成功返回前没释放"。
+ * Both C6014 reports in this function (adapter extension a, NBL pool a->nbl_pool) are driver-lifetime
+ * assets: a is freed by HaltHandlerEx and the pool is freed by HaltHandlerEx too (when in-flight returns
+ * do not come back, the pool is leaked rather than freed). The analyzer only sees "allocated, not released before the function returns success".
  */
 #pragma warning(push)
 #pragma warning(disable: 6014)
@@ -999,7 +999,7 @@ iwan_cnt_initialize(_In_ NDIS_HANDLE MiniportAdapterHandle,
 	}
 
 	if (disarm != 0) {
-		/* 保险丝合上：装得上、不工作。写成 0 才生效。 */
+		/* Fuse closed: it installs but does not work. Write 0 to make it effective. */
 		iwan_cnt_trace(22, 1);
 		ExFreePoolWithTag(a, IWAN_CNT_TAG);
 		return NDIS_STATUS_FAILURE;
@@ -1045,9 +1045,9 @@ iwan_cnt_initialize(_In_ NDIS_HANDLE MiniportAdapterHandle,
 
 	RtlZeroMemory(&gen, sizeof(gen));
 	gen.Header.Type = NDIS_OBJECT_TYPE_MINIPORT_ADAPTER_GENERAL_ATTRIBUTES;
-	/* 与 iwanmp 同口径：REVISION_1。这份 WDK 的结构体是单一定义，尾部的
-	 * SupportedStatistics / SupportedOidList 也都能写；revision 只决定
-	 * NDIS 认到哪个长度为止，而统计我们走自己的 OID_GEN_STATISTICS 处理。 */
+	/* Same convention as iwanmp: REVISION_1. This WDK's struct is a single definition, and the trailing
+	 * SupportedStatistics / SupportedOidList can also be written; the revision only decides
+	 * how much of it NDIS recognizes, while we handle statistics through our own OID_GEN_STATISTICS. */
 	gen.Header.Revision =
 		NDIS_MINIPORT_ADAPTER_GENERAL_ATTRIBUTES_REVISION_1;
 	gen.Header.Size =
@@ -1101,7 +1101,7 @@ iwan_cnt_initialize(_In_ NDIS_HANDLE MiniportAdapterHandle,
 		return st;
 	}
 
-	/* 先挂进实例表再放开 running：桥接方看到 running=1 时链表一定可遍历。 */
+	/* Insert into the instance table before enabling running: a bridger that sees running=1 can always walk the list. */
 	if (g_cnt_list_ready)
 		ExInterlockedInsertTailList(&g_cnt_list, &a->link,
 					    &g_cnt_lock);
@@ -1137,7 +1137,7 @@ iwan_cnt_halt(_In_ NDIS_HANDLE MiniportAdapterContext,
 		RemoveEntryList(&a->link);
 		KeReleaseSpinLock(&g_cnt_lock, old);
 	}
-	/* 等在途桥接帧归还；等不到就泄漏池，绝不释放可能再被引用的池。 */
+	/* Wait for in-flight bridged frames to be returned; if they do not come back, leak the pool rather than free a pool that may still be referenced. */
 	for (i = 0; i < 1000; i++) {
 		if (InterlockedCompareExchange(&a->inflight, 0, 0) == 0)
 			break;
@@ -1148,13 +1148,13 @@ iwan_cnt_halt(_In_ NDIS_HANDLE MiniportAdapterContext,
 		NdisFreeNetBufferListPool(a->nbl_pool);
 		a->nbl_pool = NULL;
 	} else if (a->nbl_pool != NULL) {
-		DbgPrint("iwancnt: halt 时仍有 %ld 帧未归还，池不释放\n",
+		DbgPrint("iwancnt: %ld frames still outstanding at halt, pool not freed\n",
 			 (long)InterlockedCompareExchange(&a->inflight, 0, 0));
 	}
 	ExFreePoolWithTag(a, IWAN_CNT_TAG);
 }
 
-/* ---- 驱动入口 -------------------------------------------------------- */
+/* ---- Driver entry -------------------------------------------------------- */
 
 static VOID
 iwan_cnt_fill_ch(_Out_ PNDIS_MINIPORT_DRIVER_CHARACTERISTICS ch,
@@ -1193,7 +1193,7 @@ DriverEntry(_In_ PDRIVER_OBJECT DriverObject,
 	UCHAR minor;
 
 	ExInitializeDriverRuntime(DrvRtPoolNxOptIn);
-	/* 实例表必须在任何一张卡 InitializeEx 之前就绪：桥接方遍历它。 */
+	/* The instance table must be ready before any NIC's InitializeEx runs: bridgers walk it. */
 	InitializeListHead(&g_cnt_list);
 	KeInitializeSpinLock(&g_cnt_lock);
 	g_cnt_list_ready = TRUE;
@@ -1208,11 +1208,11 @@ DriverEntry(_In_ PDRIVER_OBJECT DriverObject,
 					 &handle);
 	iwan_cnt_trace(31, (LONG)st);
 	if (st != NDIS_STATUS_SUCCESS) {
-		/* 注册失败：镜像会被卸载，返回失败是安全的。 */
+		/* Registration failed: the image will be unloaded, so returning failure is safe. */
 		return st;
 	}
-	/* 注册成功之后绝不再返回失败、绝不注销：否则 NDIS 会持有指向已卸载
-	 * 镜像的回调，开机直接起不来（iwanmp 踩过的坑）。 */
+	/* After successful registration never return failure and never unregister again: otherwise NDIS would hold callbacks
+	 * pointing into an unloaded image and the machine would not boot (a pit iwanmp already fell into). */
 	DriverObject->DriverUnload = NULL;
 	iwan_cnt_trace(32, 0);
 	return NDIS_STATUS_SUCCESS;

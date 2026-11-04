@@ -56,10 +56,10 @@ TOK = 0x12345678
 
 PEER_PORT = 45678      # host side  = session dport
 GUEST_PORT = 40660     # guest side = session sport
-# 客体脚本（C:\iwan\vm-rx.ps1:389）发的其实是 b"IWAN-HELLO"。这里按前缀
-# 匹配、两种写法都认，**以客体脚本为准**：曾经只认自己新写的
-# b"IWAN-WIRE-HELLO"，客体发来的握手包被静默丢掉（hellos=0），而金标向量
-# 测试照不出来 —— 对端与金标同源，自证循环看不见这种错位。
+# The guest script (C:\iwan\vm-rx.ps1:389) actually sends b"IWAN-HELLO". We match by
+# prefix and accept both spellings, **trusting the guest script**: earlier we only
+# accepted our own b"IWAN-WIRE-HELLO", so the guest's hello was silently dropped
+# (hellos=0) and the golden-vector test missed it -- peer and golden share one origin, so self-consistency hides this mismatch.
 HELLO_PREFIXES = (b"IWAN-HELLO", b"IWAN-WIRE-HELLO")
 GOOD_PER_HELLO = 3     # frames per round trip
 INNER = ("10.99.0.1", 40001, "10.0.2.15", 9999, b"IWAN-INNER-OK")
@@ -101,12 +101,12 @@ def build_frame(tok, src=None, payload=None):
 
 
 def describe(data):
-    """把不认识的数据报尽量解释成人话。
+    """Describe unrecognized datagrams in human terms as far as possible.
 
-    对端默认只认自己会发的握手包，别的包以前只打前 24 字节十六进制 —— 结果是
-    "收到 13 个 584 字节的未知包"这种线索没法定位是谁发的、装的是什么。这里
-    按隧道帧解析：帧头 8 字节明文，帧体（enc=1 时）用默认密钥解 XOR，再解内层
-    IPv4 头。解不出来就如实说 PLAIN。
+    The peer only recognizes the hello packets it sends by default; other packets used to print just the first 24 bytes as hex --
+    so clues like "received 13 unknown 584-byte packets" could not identify the sender or the payload. Here
+    we parse as a tunnel frame: 8-byte plaintext header, frame body (when enc=1) XOR-decrypted with the default key, then the inner
+    IPv4 header. If it cannot be parsed, report PLAIN truthfully.
     """
     if len(data) >= 8 and data[0] in (0x14, 0x18):
         ftype = data[0]
@@ -120,8 +120,8 @@ def describe(data):
         if len(body) >= 20 and (body[0] >> 4) == 4:
             tot = struct.unpack("!H", body[2:4])[0]
             proto = body[9]
-            # ICMP 再往下解一层：type/code 一眼就能区分 echo（8/0）、
-            # 端口不可达（3/3）、重定向（5/x）—— 归因全靠这几个字节。
+            # Decode ICMP one level deeper: type/code immediately distinguishes echo (8/0),
+            # port unreachable (3/3), redirect (5/x) -- attribution depends on these bytes.
             extra = ""
             if proto == 1 and len(body) >= 22:
                 extra = " icmp:type=%d code=%d" % (body[20], body[21])
@@ -137,28 +137,28 @@ def describe(data):
 def main():
     window = int(sys.argv[1]) if len(sys.argv) > 1 else 160
     alt_src = sys.argv[2] if len(sys.argv) > 2 else None
-    # 第 4 个参数：打流秒数。>0 时收到第一个握手包后就连续灌帧，不再按
-    # 握手逐轮应答 —— 用来量"入向隧道"的容量（解封 + 重组前注入）。
+    # 4th argument: blast seconds. When >0, flood frames right after the first hello
+    # instead of replying round by round -- used to measure inbound tunnel capacity (before deframe/reassembly injection).
     blast = float(sys.argv[3]) if len(sys.argv) > 3 else 0.0
-    # 可选参数 INNER_SIZE=<字节>：内层载荷长度，用来量吞吐（默认 13 B，
-    # 与帧结构验证时一致）。写成 key=value 是为了不动前面的位置参数 ——
-    # alt_src 必须保持 None 才能关掉"备选内层源地址"诊断模式。
+    # Optional INNER_SIZE=<bytes>: inner payload length, used for throughput (default 13 B,
+    # same as frame-structure validation). It is key=value so the positional arguments
+    # stay unchanged -- alt_src must remain None to disable the "alternate inner source" diagnostic mode.
     inner_size = 13
     for arg in sys.argv[1:]:
         if arg.startswith("INNER_SIZE="):
             inner_size = int(arg.split("=", 1)[1])
     if inner_size < 1 or inner_size > 1400:
-        raise SystemExit("INNER_SIZE 必须在 1..1400（外层总长不得超 1500）")
+        raise SystemExit("INNER_SIZE must be in 1..1400 (outer total length must not exceed 1500)")
     payload = b"\xa5" * inner_size
-    # 可选参数 BLAST_PPS=<包/秒>：灌帧限速。0 = 不限速。灌帧不限速时
-    # 客体的 rx_outer 恒为 0 —— 446k pps 会把 slirp 的主循环与套接字接收
-    # 队列一起压垮，包在承载通道里就没了，看着像"驱动没拦住"。
+    # Optional BLAST_PPS=<packets/s>: flood rate limit. 0 = unlimited. With unlimited flooding
+    # the guest's rx_outer stays at 0 -- 446k pps overwhelms slirp's main loop and the socket
+    # receive queue together, so packets vanish in the bearer and it looks like "the driver did not block".
     pps = 0
     for arg in sys.argv[1:]:
         if arg.startswith("BLAST_PPS="):
             pps = int(arg.split("=", 1)[1])
     def good_of(i):
-        """第 i 个正常帧：给了 ALT_INNER_SRC 就交替源地址并改载荷做标记"""
+        """i-th good frame: with ALT_INNER_SRC, alternate source addresses and mark the payload"""
         if alt_src is None:
             return good
         if i % 2 == 0:
@@ -184,17 +184,17 @@ def main():
         except socket.timeout:
             continue
         if blast > 0:
-            # 收到客体的第一个数据报就开闸：-SkipSelfTest 下客体不发
-            # IWAN-HELLO，只发 ping 的外层帧，等握手会把整轮测量变成空转
-            # （计数器全零，看起来像"驱动没拦住"）。
-            print("BLAST start: %ds 连续灌帧 -> %s:%d inner %d B"
+            # Start as soon as the guest's first datagram arrives: with -SkipSelfTest the guest sends no
+            # IWAN-HELLO, only outer frames of ping, so waiting for a hello turns the whole run into
+            # idle spinning (all counters zero, looking like "the driver did not block").
+            print("BLAST start: %ds continuous flooding -> %s:%d inner %d B"
                   % (blast, peer[0], peer[1], len(inner)), flush=True)
             sock.settimeout(0.0)
             t0 = time.time()
             tend = t0 + blast
             nqueued = 0
             while time.time() < tend:
-                for _ in range(64):     # 小批内循环，少读两次时钟
+                for _ in range(64):     # small inner batch, fewer clock reads
                     try:
                         sock.sendto(good, peer)
                     except OSError:
@@ -202,26 +202,26 @@ def main():
                     ngood += 1
                 nqueued += 64
                 if pps > 0:
-                    # 粗粒度限速：按"已发批数 × 批间隔"对齐，实际速率以实测为准
+                    # Coarse rate limiting: align by "batches sent x batch interval"; actual rate is measured
                     due = t0 + nqueued / float(pps)
                     now = time.time()
                     if due > now:
                         time.sleep(due - now)
-                try:                    # 客体还在发包，随手排空，别让缓冲堵死
+                try:                    # the guest is still sending; drain opportunistically so the buffer does not fill
                     while True:
                         sock.recvfrom(2048)
                 except (BlockingIOError, socket.timeout):
                     pass
             el = time.time() - t0
-            # 报的是内层载荷速率（不含 IP/UDP 首部），与出向测量的口径一致
+            # Report inner payload rate (excluding IP/UDP headers), consistent with the outbound measurement
             print("BLAST done: good=%d elapsed=%.3f rate_pps=%.0f rate_mbps=%.1f pps_target=%d"
                   % (ngood, el, ngood / el,
                      ngood * inner_size * 8.0 / el / 1e6, pps), flush=True)
             break
         if data.startswith(HELLO_PREFIXES):
             hellos += 1
-            # 每一轮先来一个坏凭据样本，再发正常帧：驱动的 rx_bad_hdr 应当
-            # 只增长坏样本那么多，其余全部走到解封/注入。
+            # Each round sends one bad-credential sample first, then good frames: the driver's rx_bad_hdr should
+            # grow by exactly the bad samples, everything else goes through deframe/injection.
             if hellos == 1 or hellos == 4:
                 sock.sendto(bad, peer)
                 nbad += 1
@@ -233,8 +233,8 @@ def main():
                       % (hellos, GOOD_PER_HELLO, peer[0], peer[1], len(inner)),
                       flush=True)
         else:
-            # 不认识的数据报一律留痕：静默忽略等于把"线测根本没接通"伪装成
-            # "驱动没拦住"，代价是几轮排查。
+            # Record every unknown datagram: silently ignoring it disguises "wire test not connected at all"
+            # as "the driver did not block", at the cost of several debugging rounds.
             nunknown += 1
             kind = describe(data)
             if kind.startswith("FRAME"):

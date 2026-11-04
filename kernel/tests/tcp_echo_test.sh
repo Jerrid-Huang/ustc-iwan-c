@@ -1,29 +1,29 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0
 #
-# iWAN 零用户态数据路径 —— 本机端到端验收（需要 root）
+# iWAN zero-userspace data path -- local end-to-end acceptance (needs root)
 #
 #   sudo bash kernel/tests/tcp_echo_test.sh [--keep] [--quick]
 #
-# 拓扑（两个 netns 用 veth 当网线，各自挂内核虚拟网卡 iwan0）：
+# Topology (two netns connected by veth as the cable, each with a kernel virtual NIC iwan0):
 #
 #   iwc: lo 10.9.0.1/32   veth-c 10.100.0.1/24   iwan0 mtu 1400
 #   iws: lo 10.9.0.2/32   veth-s 10.100.0.2/24   iwan0 mtu 1400
-#   iwc: ip route add 10.9.0.2/32 dev iwan0   （出站交给 iwan0 封装）
+#   iwc: ip route add 10.9.0.2/32 dev iwan0   (egress handed to iwan0 for encapsulation)
 #   iws: ip route add 10.9.0.1/32 dev iwan0
 #
-# 出站：iwan0 的 ndo_start_xmit 拿到"栈已分段、校验和已算完"的成品 IP 包 →
-#       XOR → 8B 帧头 → UDP → 外层 IP → ip_local_out 走 veth。
-# 入站：模块在 PRE_ROUTING(prio=-300) 匹配外层四元组 → 需要时钩子内联
-#       ip_defrag 重组外层 → 校验 sid/tok → 剥头 → XOR 还原 → 交给内核栈。
+# Egress: iwan0's ndo_start_xmit gets a finished IP packet that is "already segmented by the stack, checksum already computed" ->
+#       XOR -> 8B frame header -> UDP -> outer IP -> ip_local_out via veth.
+# Ingress: the module matches the outer 4-tuple at PRE_ROUTING(prio=-300) -> when needed the hook inlines
+#       ip_defrag to reassemble the outer packet -> check sid/tok -> strip header -> XOR restore -> hand to kernel stack.
 #
-# 用例：
-#   T1 TCP 小包 echo（三次握手 + 短段，非 GSO 路径）
-#   T2 TCP 4 MiB echo（GSO 分段 + 满 MTU 路径）
-#   T3 UDP 8×3000B echo（内层分片：iwan0 mtu 1400 ⇒ 内层 3 片）
-#   T4 外层分片：df=0 + veth mtu 1000 ⇒ 内外两层都分片，验证钩子内联重组
-#   T5 负向：构造帧验证凭据闸门（tok 错则帧头即被拒，tok 对才进内层校验）
-# 另外全程盯 Tcp InCsumErrors / RetransSegs 与模块计数器。
+# Test cases:
+#   T1 TCP small-packet echo (three-way handshake + short segment, non-GSO path)
+#   T2 TCP 4 MiB echo (GSO segmentation + full MTU path)
+#   T3 UDP 8x3000B echo (inner fragmentation: iwan0 mtu 1400 => 3 inner fragments)
+#   T4 outer fragmentation: df=0 + veth mtu 1000 => both layers fragmented, verify the hook's inline reassembly
+#   T5 negative: crafted frames verify the credential gate (wrong tok is rejected at the frame header, only correct tok reaches inner validation)
+# Also watch Tcp InCsumErrors / RetransSegs and the module counters throughout.
 
 set -uo pipefail
 
@@ -41,7 +41,7 @@ PORT=6100
 SID=4660
 TOK=3405691582
 KEY=0011223344556677
-MTU_INNER=1400          # iwan0 mtu：1400 + 36 = 1436 < 1500 ⇒ 外层不分片
+MTU_INNER=1400          # iwan0 mtu: 1400 + 36 = 1436 < 1500 => no outer fragmentation
 KEEP=0
 QUICK=0
 
@@ -49,7 +49,7 @@ for a in "$@"; do
 	case "$a" in
 	--keep)  KEEP=1 ;;
 	--quick) QUICK=1 ;;
-	*) echo "未知参数: $a"; exit 2 ;;
+	*) echo "unknown argument: $a"; exit 2 ;;
 	esac
 done
 
@@ -60,20 +60,20 @@ declare -a RESULTS=()
 say()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 ok()   { PASS=$((PASS + 1)); RESULTS+=("PASS  $1"); printf '  \033[32mPASS\033[0m %s\n' "$1"; }
 bad()  { FAIL=$((FAIL + 1)); RESULTS+=("FAIL  $1"); printf '  \033[31mFAIL\033[0m %s\n' "$1"; }
-info() { printf '  · %s\n' "$*"; }
-die()  { printf '\033[31m致命: %s\033[0m\n' "$*"; exit 2; }
+info() { printf '  - %s\n' "$*"; }
+die()  { printf '\033[31mfatal: %s\033[0m\n' "$*"; exit 2; }
 
 nsx() { ip netns exec "$1" "${@:2}"; }
 
-# /proc/net/iwan 里的单个计数器（读的是该 netns 的视图）
+# A single counter in /proc/net/iwan (reads the view of that netns)
 ctr() { nsx "$1" awk -v k="$2" '$1==k{print $2}' /proc/net/iwan 2>/dev/null; }
-# /proc/net/snmp Tcp: 行的字段（$13=RetransSegs, $16=InCsumErrors）
+# Fields of the /proc/net/snmp Tcp: line ($13=RetransSegs, $16=InCsumErrors)
 tcpsnmp() { nsx "$1" awk -v f="$2" '/^Tcp:/{v=$f} END{print v+0}' /proc/net/snmp; }
 
-# 只删本模块创建的 iwan0。init netns 里的 iwan0 未必是我们的：本项目的
-# iwan-client 就用 TUN iwan0 跑真实隧道，误删会直接打断活隧道。判据是
-# `ip -d link show` 的 detail 行是否为本模块的 kind（iwan），不能看设备名，
-# 也不能看 ARPHRD —— TUN 与 iwan 同为 65534。
+# Only delete the iwan0 created by this module. The iwan0 in the init netns is not necessarily ours: this project's
+# iwan-client runs a real tunnel over TUN iwan0, so deleting it by mistake would break the live tunnel. The criterion is
+# whether the detail line of `ip -d link show` shows the kind of this module (iwan); the device name does not tell,
+# and neither does ARPHRD -- TUN and iwan are both 65534.
 del_iwan0_if_ours() {
 	ip -d link show dev iwan0 2>/dev/null | grep -qE '^[[:space:]]+iwan[[:space:]]' || return 0
 	ip link del iwan0 2>/dev/null
@@ -83,8 +83,8 @@ cleanup() {
 	if [ "$KEEP" = 0 ]; then
 		ip netns del "$NS_C" 2>/dev/null
 		ip netns del "$NS_S" 2>/dev/null
-		# 模块在每个 netns 都建了 iwan0；init netns 里那一个要显式删除，
-		# 否则设备引用着模块，rmmod 会被内核拒绝（Module iwan is in use）。
+		# The module creates iwan0 in every netns; the one in the init netns must be removed explicitly,
+		# otherwise the device holds a reference to the module and the kernel refuses rmmod (Module iwan is in use).
 		del_iwan0_if_ours
 		rmmod iwan 2>/dev/null
 		[ -n "${WORK:-}" ] && rm -rf "$WORK"
@@ -92,39 +92,39 @@ cleanup() {
 }
 trap cleanup EXIT
 
-[ "$(id -u)" = 0 ] || die "需要 root：sudo bash $0"
-[ -f "$ECHO_PY" ] || die "缺少 $ECHO_PY"
-command -v ip >/dev/null || die "缺少 iproute2"
+[ "$(id -u)" = 0 ] || die "needs root: sudo bash $0"
+[ -f "$ECHO_PY" ] || die "missing $ECHO_PY"
+command -v ip >/dev/null || die "missing iproute2"
 
 WORK="$(mktemp -d /tmp/iwan-tcp-test.XXXXXX)"
-say "构建内核模块"
-make -C "$KDIR" >"$WORK/build.log" 2>&1 || { tail -20 "$WORK/build.log"; die "模块构建失败"; }
-[ -f "$KO" ] || die "没有生成 $KO"
-info "构建完成: $KO"
+say "build kernel module"
+make -C "$KDIR" >"$WORK/build.log" 2>&1 || { tail -20 "$WORK/build.log"; die "module build failed"; }
+[ -f "$KO" ] || die "$KO was not generated"
+info "build done: $KO"
 if [ -n "${SUDO_UID:-}" ] && [ "${SUDO_UID:-0}" != 0 ]; then
 	chown "${SUDO_UID}:${SUDO_GID:-$SUDO_UID}" "$KDIR"/*.o "$KO" 2>/dev/null
 	chown -R "${SUDO_UID}:${SUDO_GID:-$SUDO_UID}" "$KDIR/.tmp_versions" 2>/dev/null
 fi
 
-say "加载模块并建立拓扑"
+say "load module and build topology"
 rmmod iwan 2>/dev/null
 insmod "$KO" enabled=1 any_dir=1 outer_src="$OUTER_S" outer_dst="$OUTER_C" \
 	dport="$PORT" sid="$SID" tok="$TOK" key="$KEY" enc=1 batch=1 df=1 \
-	|| die "insmod 失败（dmesg | tail 看原因）"
-info "insmod 完成（any_dir=1：本机双向共用一份 RX 配置）"
+	|| die "insmod failed (see dmesg | tail for the reason)"
+info "insmod done (any_dir=1: both directions on this host share one RX configuration)"
 
 ip netns del "$NS_C" 2>/dev/null
 ip netns del "$NS_S" 2>/dev/null
-ip netns add "$NS_C" || die "创建 netns $NS_C 失败"
-ip netns add "$NS_S" || die "创建 netns $NS_S 失败"
+ip netns add "$NS_C" || die "failed to create netns $NS_C"
+ip netns add "$NS_S" || die "failed to create netns $NS_S"
 ip link add veth-c netns "$NS_C" type veth peer name veth-s netns "$NS_S" \
-	|| die "创建 veth 失败"
+	|| die "failed to create veth"
 
 for ns in "$NS_C" "$NS_S"; do
 	nsx "$ns" ip link set lo up
-	# 反向路径过滤：解封后的内层包源地址(10.9.0.x)的回程路由走 iwan0，
-	# 而包是从 veth 进来的，strict 模式(rp_filter=1)会直接丢掉。
-	# 新建 netns 的内核默认值本来就是 0，这里显式设置以免受宿主 sysctl 影响。
+	# Reverse path filtering: the return route for the decapsulated inner packet source (10.9.0.x) goes via iwan0,
+	# while the packet came in from veth, so strict mode (rp_filter=1) would drop it outright.
+	# The kernel default in a fresh netns is already 0; set it explicitly here so the host sysctl does not influence it.
 	nsx "$ns" sysctl -qw net.ipv4.conf.all.rp_filter=0 2>/dev/null
 	nsx "$ns" sysctl -qw net.ipv4.conf.default.rp_filter=0 2>/dev/null
 done
@@ -133,30 +133,30 @@ nsx "$NS_C" ip link set veth-c up
 nsx "$NS_S" ip addr add "$OUTER_S/24" dev veth-s
 nsx "$NS_S" ip link set veth-s up
 
-# iwan0 由 rtnl_link_ops 提供，需要显式创建（不再由 pernet init 自动建）
+# iwan0 is provided by rtnl_link_ops and must be created explicitly (no longer auto-created by pernet init)
 for ns in "$NS_C" "$NS_S"; do
-	nsx "$ns" ip link add iwan0 type iwan || die "$ns: 创建 iwan0 失败"
+	nsx "$ns" ip link add iwan0 type iwan || die "$ns: failed to create iwan0"
 done
 nsx "$NS_C" ip link set iwan0 mtu "$MTU_INNER" up
 nsx "$NS_S" ip link set iwan0 mtu "$MTU_INNER" up
 
-# 每 netns 的出站外层端点（一个模块实例服务所有 netns，方向不同只能按 netns 配）
+# Per-netns egress outer endpoint (one module instance serves all netns, so differing directions can only be configured per netns)
 nsx "$NS_C" ip addr add "$INNER_C/32" dev lo
 nsx "$NS_S" ip addr add "$INNER_S/32" dev lo
 nsx "$NS_C" sh -c "echo 'tx_src=$OUTER_C tx_dst=$OUTER_S' > /proc/net/iwan" \
-	|| die "$NS_C: 写 /proc/net/iwan 失败"
+	|| die "$NS_C: failed to write /proc/net/iwan"
 nsx "$NS_S" sh -c "echo 'tx_src=$OUTER_S tx_dst=$OUTER_C' > /proc/net/iwan" \
-	|| die "$NS_S: 写 /proc/net/iwan 失败"
+	|| die "$NS_S: failed to write /proc/net/iwan"
 
-nsx "$NS_C" ip route add "$INNER_S/32" dev iwan0 || die "$NS_C: 加内层路由失败"
-nsx "$NS_S" ip route add "$INNER_C/32" dev iwan0 || die "$NS_S: 加内层路由失败"
+nsx "$NS_C" ip route add "$INNER_S/32" dev iwan0 || die "$NS_C: failed to add inner route"
+nsx "$NS_S" ip route add "$INNER_C/32" dev iwan0 || die "$NS_S: failed to add inner route"
 
-info "拓扑就绪：$NS_C $INNER_C <-> $NS_S $INNER_S（外层 $OUTER_C/$OUTER_S 端口 $PORT）"
+info "topology ready: $NS_C $INNER_C <-> $NS_S $INNER_S (outer $OUTER_C/$OUTER_S port $PORT)"
 nsx "$NS_C" head -4 /proc/net/iwan | sed 's/^/    /'
 
-# ---------------------------------------------------------------- 用例框架
+# ---------------------------------------------------------------- test framework
 
-run_tcp() { # run_tcp <名称> <字节数> [超时]
+run_tcp() { # run_tcp <name> <bytes> [timeout]
 	local name="$1" bytes="$2" to="${3:-25}"
 	local slog="$WORK/server-$name.log" clog="$WORK/client-$name.log"
 	nsx "$NS_S" python3 "$ECHO_PY" server --bind "$INNER_S" --port "$PORT" \
@@ -172,7 +172,7 @@ run_tcp() { # run_tcp <名称> <字节数> [超时]
 	return $rc
 }
 
-run_udp() { # run_udp <名称> <size> <count>
+run_udp() { # run_udp <name> <size> <count>
 	local name="$1" size="$2" count="$3"
 	local slog="$WORK/server-$name.log" clog="$WORK/client-$name.log"
 	nsx "$NS_S" python3 "$ECHO_PY" server --udp --bind "$INNER_S" --port "$PORT" \
@@ -190,93 +190,93 @@ run_udp() { # run_udp <名称> <size> <count>
 
 # ---------------------------------------------------------------- T1/T2
 
-say "T1 TCP 小包 echo（握手 + 短段）"
+say "T1 TCP small-packet echo (handshake + short segment)"
 if run_tcp T1 65536; then
-	ok "T1 TCP 64 KiB 双向回显一致"
+	ok "T1 TCP 64 KiB bidirectional echo matches"
 else
-	bad "T1 TCP 64 KiB 回显失败"
+	bad "T1 TCP 64 KiB echo failed"
 fi
 
 if [ "$QUICK" = 0 ]; then
-	say "T2 TCP 4 MiB echo（GSO 分段 + 满 MTU）"
+	say "T2 TCP 4 MiB echo (GSO segmentation + full MTU)"
 	rc_c=$(tcpsnmp "$NS_C" 16); rt_c=$(tcpsnmp "$NS_C" 13)
 	if run_tcp T2 4194304; then
-		ok "T2 TCP 4 MiB 双向回显一致"
+		ok "T2 TCP 4 MiB bidirectional echo matches"
 	else
-		bad "T2 TCP 4 MiB 回显失败"
+		bad "T2 TCP 4 MiB echo failed"
 	fi
 	dc=$(( $(tcpsnmp "$NS_C" 16) - rc_c )); dr=$(( $(tcpsnmp "$NS_C" 13) - rt_c ))
-	info "客户端 netns: Tcp InCsumErrors +$dc, RetransSegs +$dr"
-	[ "$dc" -eq 0 ] && ok "T2 无 TCP 校验和错误（XOR 未破坏校验和）" \
-			 || bad "T2 出现 $dc 个 TCP 校验和错误"
-	[ "$dr" -le 20 ] && ok "T2 重传 $dr 个（正常范围）" || bad "T2 重传过多: $dr"
+	info "client netns: Tcp InCsumErrors +$dc, RetransSegs +$dr"
+	[ "$dc" -eq 0 ] && ok "T2 no TCP checksum errors (XOR did not break the checksum)" \
+			 || bad "T2 saw $dc TCP checksum errors"
+	[ "$dr" -le 20 ] && ok "T2 $dr retransmissions (normal range)" || bad "T2 too many retransmissions: $dr"
 fi
 
 # ---------------------------------------------------------------- T3
 
-say "T3 UDP 8×3000B echo（内层分片）"
+say "T3 UDP 8x3000B echo (inner fragmentation)"
 d_before=$(ctr "$NS_S" rx_delivered)
 if run_udp T3 3000 8; then
-	ok "T3 8 个 3000B 数据报回显一致（内层分片 + 内核重组）"
+	ok "T3 eight 3000B datagrams echoed consistently (inner fragmentation + kernel reassembly)"
 else
-	bad "T3 UDP 大包回显失败"
+	bad "T3 UDP large-packet echo failed"
 fi
 d_after=$(ctr "$NS_S" rx_delivered)
-info "服务端 rx_delivered $d_before -> $d_after（>1 说明内层确实被分片又重组）"
-[ "$((d_after - d_before))" -gt 8 ] && ok "T3 内层分片路径已覆盖（每包多片）" \
-				   || bad "T3 内层包没有分片（mtu 设置没生效？）"
+info "server rx_delivered $d_before -> $d_after (>1 means the inner packet was indeed fragmented and reassembled)"
+[ "$((d_after - d_before))" -gt 8 ] && ok "T3 inner fragmentation path covered (multiple fragments per packet)" \
+				   || bad "T3 inner packet was not fragmented (mtu setting not in effect?)"
 
 # ---------------------------------------------------------------- T4
 
-say "T4 外层分片：df=0 + veth mtu 1000（内外两层都分片）"
+say "T4 outer fragmentation: df=0 + veth mtu 1000 (both layers fragmented)"
 echo 0 > /sys/module/iwan/parameters/df
 nsx "$NS_C" ip link set veth-c mtu 1000
 nsx "$NS_S" ip link set veth-s mtu 1000
 r_before=$(ctr "$NS_S" rx_reasm)
 if run_udp T4 3000 8; then
-	ok "T4 外层分片下回显一致（钩子内联 ip_defrag 重组成功）"
+	ok "T4 echo matches under outer fragmentation (hook inline ip_defrag reassembly succeeded)"
 else
-	bad "T4 外层分片回显失败"
+	bad "T4 outer-fragmentation echo failed"
 fi
 r_after=$(ctr "$NS_S" rx_reasm)
-info "服务端 rx_reasm $r_before -> $r_after"
+info "server rx_reasm $r_before -> $r_after"
 if [ "$((r_after - r_before))" -gt 0 ]; then
-	ok "T4 外层重组发生在钩子里（rx_reasm 增长）"
+	ok "T4 outer reassembly happened in the hook (rx_reasm grew)"
 elif lsmod | grep -q '^nf_conntrack\b'; then
-	# conntrack 在 prio=-400 的 nf_defrag_ipv4 钩子会先把外层拼好再送下来，
-	# 本模块的内联 defrag 就成了冗余（无害）。此时靠功能正确性判定。
-	info "nf_conntrack 已加载：外层可能已被 -400 的 defrag 钩子重组（本模块内联重组冗余但无害）"
-	ok "T4 外层分片下功能正确（重组由 conntrack 的 defrag 钩子完成）"
+	# the conntrack nf_defrag_ipv4 hook at prio=-400 reassembles the outer packet first and passes it down,
+	# so the inline defrag of this module becomes redundant (harmless). In that case judge by functional correctness.
+	info "nf_conntrack is loaded: the outer packet may already be reassembled by the -400 defrag hook (this module's inline reassembly is redundant but harmless)"
+	ok "T4 functionally correct under outer fragmentation (reassembly done by the conntrack defrag hook)"
 else
-	bad "T4 钩子没有做外层重组，且没有 conntrack 可代劳 —— 分片路径有缺陷"
+	bad "T4 the hook did not reassemble the outer packet and there is no conntrack to do it -- fragment path is broken"
 fi
 echo 1 > /sys/module/iwan/parameters/df
 nsx "$NS_C" ip link set veth-c mtu 1500
 nsx "$NS_S" ip link set veth-s mtu 1500
 if run_tcp T4b 262144; then
-	ok "T4b 恢复 df=1/mtu1500 后 TCP 仍正常"
+	ok "T4b TCP still works after restoring df=1/mtu1500"
 else
-	bad "T4b 恢复后 TCP 失败"
+	bad "T4b TCP failed after the restore"
 fi
 
 # ---------------------------------------------------------------- T5
 
-# 凭据 sid/tok 是模块级全局配置：一个模块实例服务所有 netns，改
-# /sys/module/iwan/parameters/tok 等于把两端一起改掉，构不成"不匹配"。
-# 所以负向用例直接构造帧从客户端 netns 发出，验证数据面的凭据闸门：
-#   · tok 错的帧       → 帧头校验就被拒，只涨 rx_bad_hdr
-#   · tok 对但内层非法 → 已过凭据闸门，涨 rx_frames 与 rx_bad_inner
-# 两条一起看才能证明"是凭据在区分"，而不是把外来包统统丢掉。
-say "T5 负向：构造帧验证凭据闸门（错 tok 必丢，对 tok 才进内层校验）"
+# The credentials sid/tok are module-wide global configuration: one module instance serves all netns, so changing
+# /sys/module/iwan/parameters/tok changes both ends at once and cannot create a "mismatch".
+# Therefore the negative cases craft frames and send them from the client netns, verifying the data-plane credential gate:
+#   - frame with wrong tok      -> rejected by the frame-header check, only rx_bad_hdr grows
+#   - correct tok, bad inner    -> passes the credential gate, rx_frames and rx_bad_inner grow
+# Both must be observed together to prove that the credentials are what discriminates, not that all foreign packets are dropped.
+say "T5 negative: crafted frames verify the credential gate (wrong tok always dropped, only correct tok reaches inner validation)"
 
 cat >"$WORK/send_frame.py" <<'PYEOF'
 import socket, struct, sys
 # argv: <mode> <src_ip> <sid> <dst_ip> <port>
 mode, src, sid, dst, port = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4], int(sys.argv[5])
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.bind((src, port))     # 源端口固定为外层端口：模块自己发的包就是 sport=dport
+s.bind((src, port))     # source port fixed to the outer port: packets sent by the module itself use sport=dport
 if mode == "garbage":
-    payload = bytes(60)                              # 首字节 0 != 0x18，非 iWAN 帧
+    payload = bytes(60)                              # first byte 0 != 0x18, not an iWAN frame
 else:
     payload = struct.pack("!BBHI", 0x18, 1, sid, int(mode)) + bytes(40)
 s.sendto(payload, (dst, port))
@@ -288,10 +288,10 @@ f_before=$(ctr "$NS_S" rx_frames)
 p_before=$(ctr "$NS_S" rx_pkts)
 o_before=$(ctr "$NS_S" rx_outer)
 
-# 三帧，外层五元组完全相同，只有载荷里的凭据不同：
-#   ① 垃圾载荷（非 iWAN 帧）     → 帧头被拒
-#   ② tok 错                     → 帧头被拒
-#   ③ tok 对、内层非法           → 过闸门，止于内层校验
+# Three frames, identical outer 5-tuple, differing only in the credentials inside the payload:
+#   (1) garbage payload (not an iWAN frame) -> rejected at the frame header
+#   (2) wrong tok                           -> rejected at the frame header
+#   (3) correct tok, bad inner              -> passes the gate, stops at inner validation
 nsx "$NS_C" python3 "$WORK/send_frame.py" garbage "$OUTER_C" "$SID" "$OUTER_S" "$PORT"
 sleep 0.2
 nsx "$NS_C" python3 "$WORK/send_frame.py" 999 "$OUTER_C" "$SID" "$OUTER_S" "$PORT"
@@ -311,27 +311,27 @@ o_after=$(ctr "$NS_S" rx_outer)
 info "server rx_pkts $p_before -> $p_after, rx_outer $o_before -> $o_after, rx_bad_hdr $h_before -> $h_after, rx_bad_inner $i_before -> $i_after, rx_frames $f_before -> $f_after"
 
 [ "$((p_after - p_before))" -ge 3 ] \
-	&& ok "T5 三帧都到达服务端钩子（rx_pkts +$((p_after - p_before))）" \
-	|| bad "T5 构造帧没到达钩子（rx_pkts +$((p_after - p_before))）：先查发送侧路由/端口，不是凭据问题"
+	&& ok "T5 all three frames reached the server hook (rx_pkts +$((p_after - p_before)))" \
+	|| bad "T5 crafted frames did not reach the hook (rx_pkts +$((p_after - p_before))): check the send-side route/port first, this is not a credential problem"
 [ "$((h_after - h_before))" -ge 2 ] \
-	&& ok "T5 垃圾帧与错 tok 帧都在帧头被拒（rx_bad_hdr +$((h_after - h_before))）" \
-	|| bad "T5 帧头闸门没生效（rx_bad_hdr +$((h_after - h_before))，期望 +2）"
+	&& ok "T5 garbage frame and wrong-tok frame both rejected at the frame header (rx_bad_hdr +$((h_after - h_before)))" \
+	|| bad "T5 frame-header gate did not take effect (rx_bad_hdr +$((h_after - h_before)), expected +2)"
 [ "$((i_after - i_before))" -ge 1 ] \
-	&& ok "T5 对 tok 的帧通过凭据闸门、止于内层校验（rx_bad_inner +$((i_after - i_before))）" \
-	|| bad "T5 对 tok 的帧没走到内层校验（闸门把对的也拒了？）"
+	&& ok "T5 frame with correct tok passed the credential gate and stopped at inner validation (rx_bad_inner +$((i_after - i_before)))" \
+	|| bad "T5 frame with correct tok did not reach inner validation (did the gate reject the correct one too?)"
 [ "$((f_after - f_before))" = 1 ] \
-	&& ok "T5 只有凭据正确那一帧被当数据帧接收（rx_frames +1）" \
-	|| bad "T5 rx_frames 增量应为 1，实际 $((f_after - f_before))"
+	&& ok "T5 only the frame with correct credentials was accepted as a data frame (rx_frames +1)" \
+	|| bad "T5 rx_frames delta should be 1, actual $((f_after - f_before))"
 
-# ---------------------------------------------------------------- 汇总
+# ---------------------------------------------------------------- summary
 
-say "计数器汇总"
+say "counter summary"
 for ns in "$NS_C" "$NS_S"; do
 	echo "  --- $ns ---"
 	nsx "$ns" cat /proc/net/iwan | sed 's/^/    /'
 done
 
-say "结果"
+say "results"
 for r in "${RESULTS[@]}"; do
 	case "$r" in
 	PASS*) printf '  \033[32m%s\033[0m\n' "$r" ;;
@@ -341,9 +341,9 @@ done
 printf '\nPASS=%d FAIL=%d\n' "$PASS" "$FAIL"
 
 if [ "$FAIL" = 0 ]; then
-	echo "全部通过：入站解封（含内联重组、凭据校验）与出站封装（校验和/分段正确）都工作。"
+	echo "all passed: ingress decapsulation (inline reassembly, credential check) and egress encapsulation (checksum/segmentation correct) both work."
 	exit 0
 fi
-echo "有失败用例。排查提示：dmesg | tail -30；/proc/net/iwan 的 rx_bad_* / tx_bad_* 计数；"
-echo "             Tcp InCsumErrors 增长通常意味着 XOR 破坏了校验和（出站路径问题）。"
+echo "there are failing cases. Hints: dmesg | tail -30; rx_bad_* / tx_bad_* counters in /proc/net/iwan;"
+echo "             growing Tcp InCsumErrors usually means XOR broke the checksum (egress path problem)."
 exit 1

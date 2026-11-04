@@ -1,20 +1,20 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  iwancnt.vcxproj — 只计数、可回声的以太虚拟网卡的工程。
+  iwancnt.vcxproj -- project for a counting, echo-capable virtual Ethernet adapter.
 
-  它不属于任何数据面：既不是 WFP 平面（iwan.sys），也不是 NDIS 平面
-  （iwanmp.sys），而是给它们当"对端"的一张网卡，让隧道在同一台机器上就能
-  跑满、并逐帧计数（不经过 QEMU slirp，也不经过用户态）。
+  It belongs to no data plane: neither the WFP plane (iwan.sys) nor the NDIS plane
+  (iwanmp.sys); it is the peer adapter for both, so a tunnel can saturate on one machine
+  and be counted per frame (no QEMU slirp, no user mode in the path).
 
-  因为不依赖任何平面代码，本工程只有一个源文件、不需要额外头文件搜索路径，
-  NDIS 版本宏也只走小型端口那一族（NDISnnn_MINIPORT）；若再混入 NDISnnn 那
-  一族，ndis.h 的宏闸门会直接 #error。
+  Since it depends on no plane code it has a single source file, needs no extra include path,
+  and uses only the miniport macro family (NDISnnn_MINIPORT); mixing in NDISnnn makes the
+  macro gate in ndis.h fail with #error.
 
-  构建（装了 WDK 的 Windows 上，管理员 VS 开发者命令提示符里）：
+  Build (on Windows with the WDK, from an administrator VS developer prompt):
 
     msbuild win-driver\iwancnt.vcxproj /p:Configuration=Release /p:Platform=x64
 
-  安装（客体，测试签名已打开、自签证书已受信）：
+  Install (in the guest, test signing on and the self-signed cert trusted):
     devcon.exe install win-driver\iwancnt.inf iwancnt
 -->
 <Project DefaultTargets="Build" ToolsVersion="Current"
@@ -49,8 +49,8 @@
   <PropertyGroup Label="Configuration">
     <ConfigurationType>Driver</ConfigurationType>
     <DriverType>WDM</DriverType>
-    <!-- 与另两个工程同理：工具集自带的测试签名不带 /fd，会把产物删掉。
-         签名在客体侧做。 -->
+    <!-- Same as the other two projects: the built-in test signing omits /fd and deletes output.
+         Signing happens in the guest. -->
     <SignMode>Off</SignMode>
     <DriverTargetPlatform>Desktop</DriverTargetPlatform>
     <TargetVersion>Windows10</TargetVersion>
@@ -73,8 +73,8 @@
 
   <ItemDefinitionGroup>
     <ClCompile>
-      <!-- 中文注释与日志：必须显式 /utf-8，否则执行字符集 1252 会把中文字符串
-           字面量报成 C4566，配合 TreatWarningAsError 变 C2220。 -->
+      <!-- Sources are plain ASCII; /utf-8 stays as a guard so a future non-ASCII literal
+           cannot become C4566 and then C2220 under TreatWarningAsError. -->
       <AdditionalOptions>/source-charset:utf-8 /execution-charset:utf-8 %(AdditionalOptions)</AdditionalOptions>
       <WarningLevel>Level4</WarningLevel>
       <TreatWarningAsError>true</TreatWarningAsError>
@@ -83,7 +83,7 @@
       <ExceptionHandling>false</ExceptionHandling>
     </ClCompile>
     <Link>
-      <!-- 只要 ndis.lib：没有 WFP、没有路由 API、没有 IoCreateDeviceSecure。 -->
+      <!-- ndis.lib only: no WFP, no routing API, no IoCreateDeviceSecure. -->
       <AdditionalDependencies>ndis.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <EntryPointSymbol>DriverEntry</EntryPointSymbol>
     </Link>
@@ -93,14 +93,14 @@
   </ItemDefinitionGroup>
 
   <ItemGroup>
-    <!-- 小型端口宏族：与 iwanmp 的内层小型端口同一个档位（683）。 -->
+    <!-- Miniport macro family: same level (683) as the iwanmp inner miniport. -->
     <ClCompile Include="iwan_cnt.c">
       <PreprocessorDefinitions>NDIS_MINIPORT_DRIVER;NDIS620_MINIPORT;NDIS683_MINIPORT;NDIS_WDM;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
   </ItemGroup>
-  <!-- iwancnt.inf 不进 <Inf>：PnP INF 需要 .cat，而 .cat 要在客体侧用
-       New-FileCatalog + Set-AuthenticodeSignature 生成。安装走 devcon install /
-       pnputil，INF 作为部署材料留在仓库里。 -->
+  <!-- iwancnt.inf does not go into <Inf>: a PnP INF needs a .cat, produced in the guest with
+       New-FileCatalog + Set-AuthenticodeSignature. Installation uses devcon install /
+       pnputil; the INF stays in the tree as deployment material. -->
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

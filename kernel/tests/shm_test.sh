@@ -1,35 +1,35 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0
 #
-# iWAN /dev/iwan 共享内存页验收 —— 需要 root
+# iWAN /dev/iwan shared memory page acceptance test -- requires root
 #
 #   sudo bash kernel/tests/shm_test.sh [--keep]
 #
-# 验收对象：每 netns 一页的只读共享内存（kernel/iwan_shm.{h,c}，ABI 见
-# CONTROL-PLANE.md §11）。内核每收到一个通过凭据闸门的帧（数据帧或控制帧）就把
-# 当前单调毫秒写进这一页；PT_CLOSE(0x17) 把它置 0；用户态 mmap 只读轮询，
-# 超时即判定断线。本脚本只通过 /dev/iwan 观测，不依赖 netlink 读取时间戳。
+# Target: the read-only shared memory page, one per netns (kernel/iwan_shm.{h,c}, ABI in
+# CONTROL-PLANE.md section 11). For every frame that passes the credential gate (data or control)
+# the kernel writes the current monotonic ms into this page; PT_CLOSE(0x17) zeroes it; userspace
+# polls read-only, and a timeout means link down. This script observes only /dev/iwan, not netlink timestamps.
 #
-# 用例（编号按题目给的语义，执行顺序见下）：
-#   T1 insmod 后 /dev/iwan 存在；未下发会话时 version=1、enabled=0、last_rx_ms=0
-#   T2 两个 netns 各建会话 + 一个内层 UDP 包：收包侧时间戳推进，另一侧不受影响
-#   T3 从对端发 PT_CLOSE：时间戳变 0、peer_state=CLOSED，全程不调用 netlink
-#   T4 SESSION_DOWN：整页清零（保留 version）、enabled=0
-#   T5 先 mmap 再删 netns：映射仍可读、值保持最后一次内容、关 fd 干净
-#   T6 连续两个内层包之间时间戳单调不减
+# Test cases (numbers follow the given semantics; execution order below):
+#   T1 after insmod /dev/iwan exists; before any session version=1, enabled=0, last_rx_ms=0
+#   T2 a session in each of two netns + one inner UDP packet: RX side timestamp advances, other side untouched
+#   T3 peer sends PT_CLOSE: timestamp becomes 0, peer_state=CLOSED, no netlink call at all
+#   T4 SESSION_DOWN: whole page zeroed (version kept), enabled=0
+#   T5 mmap then delete the netns: mapping still readable, values keep the last content, fd close clean
+#   T6 timestamp monotonically non-decreasing between two consecutive inner packets
 #
-# 执行顺序 = T1 T2 T6 T3 T4 T5：T6 需要"活会话 + 非零时间戳"，必须在 T3（CLOSE
-# 置 0）与 T4（拆会话）之前；T5 会销毁 iwc 的 netns，只能放最后。
+# Execution order = T1 T2 T6 T3 T4 T5: T6 needs "live session + non-zero timestamp", so it must run
+# before T3 (CLOSE zeroing) and T4 (session teardown); T5 destroys the iwc netns, so it goes last.
 #
-# 拓扑（与 netlink_test.sh 相同：外层 veth 当网线，内层地址挂 lo，iwan0 由
-# SESSION_UP 按需创建）：
-#   iwc: lo 10.9.0.1/32   veth-c 10.100.0.1/24   会话 --outer-src 10.100.0.1
-#   iws: lo 10.9.0.2/32   veth-s 10.100.0.2/24   会话 --outer-src 10.100.0.2
-# 两端 --dport 6100 且不给 --sport（接收端口 = dport，与旧口径一致）。
-# 两个 netns 都关掉 IPv6：iwan0 起来时内核自动发的 IPv6 RS 会被封装发给对端，
-# 那会在"另一侧不受影响"的断言里制造噪声。
+# Topology (same as netlink_test.sh: outer veth as the wire, inner addresses on lo, iwan0 created
+# on demand by SESSION_UP):
+#   iwc: lo 10.9.0.1/32   veth-c 10.100.0.1/24   session --outer-src 10.100.0.1
+#   iws: lo 10.9.0.2/32   veth-s 10.100.0.2/24   session --outer-src 10.100.0.2
+# Both ends use --dport 6100 and no --sport (receive port = dport, same as the old convention).
+# IPv6 is disabled in both netns: when iwan0 comes up the kernel sends IPv6 RS automatically,
+# which is encapsulated to the peer and adds noise to the "other side untouched" assertion.
 #
-# 只依赖 ip / cc / python3（不需要 nc / tcpdump / ss）。
+# Depends only on ip / cc / python3 (no nc / tcpdump / ss needed).
 
 set -uo pipefail
 
@@ -44,19 +44,19 @@ INNER_C=10.9.0.1
 INNER_S=10.9.0.2
 OUTER_C=10.100.0.1
 OUTER_S=10.100.0.2
-PORT=6100		# 外层隧道端口（两端一致，接收端口 = dport）
-INNER_PORT=9999		# 内层 UDP 目的端口（iwc 的 python3 socket 收）
+PORT=6100		# outer tunnel port (same on both ends, receive port = dport)
+INNER_PORT=9999		# inner UDP destination port (received by the iwc python3 socket)
 SID=4660
 TOK=3405691582
 KEY=0011223344556677
 ENC=1
-MTU=1400		# 1400 + 36 = 1436 < 1500 ⇒ 外层不分片
+MTU=1400		# 1400 + 36 = 1436 < 1500 => no outer fragmentation
 KEEP=0
 
 for a in "$@"; do
 	case "$a" in
 	--keep) KEEP=1 ;;
-	*) echo "未知参数: $a"; exit 2 ;;
+	*) echo "unknown argument: $a"; exit 2 ;;
 	esac
 done
 
@@ -67,38 +67,38 @@ declare -a RESULTS=()
 say()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 ok()   { PASS=$((PASS + 1)); RESULTS+=("PASS  $1"); printf '  \033[32mPASS\033[0m %s\n' "$1"; }
 bad()  { FAIL=$((FAIL + 1)); RESULTS+=("FAIL  $1"); printf '  \033[31mFAIL\033[0m %s\n' "$1"; }
-info() { printf '  · %s\n' "$*"; }
-hint() { printf '  \033[33m提示\033[0m %s\n' "$*"; }
-die()  { printf '\033[31m致命: %s\033[0m\n' "$*"; exit 2; }
+info() { printf '  - %s\n' "$*"; }
+hint() { printf '  \033[33mNOTE\033[0m %s\n' "$*"; }
+die()  { printf '\033[31mFATAL: %s\033[0m\n' "$*"; exit 2; }
 
 nsx() { ip netns exec "$1" "${@:2}"; }
 
-# ---------------------------------------------------------------- 小工具
+# ---------------------------------------------------------------- helpers
 
-SHM=""			# 用户态工具路径（构建后填）
+SHM=""			# userspace tool path (filled after build)
 CTL=""
 WORK=""
-WP=""			# T5 的 watch 进程（cleanup 要收掉）
+WP=""			# T5 watch process (must be reaped by cleanup)
 
-# 共享内存快照：<netns> <tag> → $WORK/shm-<tag>.txt（KEY=value），
-# 返回值 = iwan_shm 的退出码（0 才说明打开+读成功）
+# Shared memory snapshot: <netns> <tag> -> $WORK/shm-<tag>.txt (KEY=value),
+# return value = iwan_shm exit code (0 means open+read succeeded)
 shm_snap() {
 	nsx "$1" "$SHM" dump >"$WORK/shm-$2.txt" 2>"$WORK/shm-$2.err"
 }
 
-sval() { sed -n "s/^$2=//p" "$1" | head -n1; }		# 从快照文件取一个字段
+sval() { sed -n "s/^$2=//p" "$1" | head -n1; }		# take one field from a snapshot file
 
-# 比较两次快照的字段（不含 dev/method/map_len/page_size/ready 这些运行信息）
+# Compare fields of two snapshots (excluding dev/method/map_len/page_size/ready runtime info)
 shm_fields() { grep -v -E '^(dev|method|map_len|page_size|ready)=' "$1"; }
 
-num() { # 非数字一律当 0
+num() { # anything non-numeric counts as 0
 	case "${1:-}" in
 	''|*[!0-9]*) echo 0 ;;
 	*) echo "$1" ;;
 	esac
 }
 
-# 内层 UDP 接收端：先打印 RECV_READY=1 再 recvfrom，避免竞态
+# Inner UDP receiver: print RECV_READY=1 first, then recvfrom, to avoid a race
 start_udp_recv() { # <netns> <bind_ip> <port> <log>
 	nsx "$1" python3 -c '
 import socket, sys
@@ -116,7 +116,7 @@ except Exception as e:
 	echo $!
 }
 
-# 从 netns 里发一个内层 UDP 报文（源地址显式绑定，保证走 iwan0 的路由）
+# Send one inner UDP datagram from the netns (source is bound explicitly so it routes via iwan0)
 send_udp() { # <netns> <src_ip> <dst_ip> <dport>
 	nsx "$1" python3 -c '
 import socket, sys
@@ -127,8 +127,8 @@ print("INNER_TX_OK")
 ' "$2" "$3" "$4"
 }
 
-# 等日志里出现就绪行。两种标记不同，不要用一个模式去等另一个：
-#   UDP 接收端 → RECV_READY=1     iwan_shm watch → left_netns=1
+# Wait for a readiness line in the log. The two markers differ; do not wait for one using the other:
+#   UDP receiver -> RECV_READY=1     iwan_shm watch -> left_netns=1
 wait_ready() { # <log> <pattern>
 	local pat="${2:-^READY=1$}"
 	for _ in $(seq 1 80); do
@@ -138,13 +138,13 @@ wait_ready() { # <log> <pattern>
 	return 1
 }
 
-# 发一个内层 UDP 包，并确认它真的到了 iwc 的 socket（避免 ICMP 回程噪声，
-# 也避免"其实没发出去"被误判成"时间戳没推进"）。
+# Send an inner UDP packet and confirm it really reached iwc's socket (avoids ICMP return noise,
+# and avoids mistaking "never sent" for "timestamp did not advance").
 inner_one() { # <tag>
 	local rlog="$WORK/recv-$1.log" rp
 	rp=$(start_udp_recv "$NS_C" "$INNER_C" "$INNER_PORT" "$rlog")
 	if ! wait_ready "$rlog" '^RECV_READY=1$'; then
-		info "iwc 的内层接收端没起来"
+		info "iwc inner receiver did not start"
 		kill "$rp" 2>/dev/null
 		return 1
 	fi
@@ -157,11 +157,11 @@ inner_one() { # <tag>
 	grep -q '^INNER_RX_FROM=' "$rlog"
 }
 
-# 内层地址/路由：各自只挂自己的内层地址到 lo，去对端内层地址的路由指向 iwan0。
-# 必须**可重复调用**：SESSION_DOWN 会把 iwan0 删掉，挂在它上面的路由随之消失；
-# 重建会话后不补回来，内层包就会因为没有回程路由被 rp_filter 丢掉 —— 表现为
-# "内层包没到 socket"，而此时共享内存的时间戳其实已经被更新了（很容易被误判
-# 成内核缺陷）。
+# Inner addresses/routes: each side adds only its own inner address on lo, peer inner addr routes via iwan0.
+# Must be **repeatable**: SESSION_DOWN deletes iwan0, and routes on it disappear with it;
+# if not restored after the session is recreated, inner packets are dropped by rp_filter for lack
+# of a return route -- showing as "inner packet never reached the socket", while the shm timestamp
+# has in fact been updated (easily misread as a kernel bug).
 setup_inner_routes() { # <netns>
 	local ns="$1" own peer
 	if [ "$ns" = "$NS_C" ]; then own="$INNER_C"; peer="$INNER_S"
@@ -170,7 +170,7 @@ setup_inner_routes() { # <netns>
 	nsx "$ns" ip route replace "$peer/32" dev iwan0 2>/dev/null
 }
 
-# watch 日志解析
+# watch log parsing
 iter_last() { sed -n 's/^iter=\([0-9]*\) .*/\1/p' "$1" | tail -n1; }
 iter_rx()   { sed -n 's/^iter=[0-9]* t_ms=[0-9]* last_rx_ms=\([0-9]*\) .*/\1/p' "$1" | tail -n1; }
 
@@ -180,8 +180,8 @@ dmesg_oops_count() {
 	dmesg 2>/dev/null | grep -c -E 'BUG:|Oops|general protection fault|use-after-free|KASAN' || true
 }
 
-# 等子进程退出，超时（0.1s 粒度）返回 124
-wait_pid_timeout() { # <pid> <秒>
+# Wait for a child to exit; timeout (0.1s granularity) returns 124
+wait_pid_timeout() { # <pid> <seconds>
 	local pid="$1" secs="$2" i
 	for ((i = 0; i < secs * 10; i++)); do
 		if ! kill -0 "$pid" 2>/dev/null; then
@@ -194,20 +194,20 @@ wait_pid_timeout() { # <pid> <秒>
 	return 124
 }
 
-# ---------------------------------------------------------------- 清理
+# ---------------------------------------------------------------- cleanup
 
 cleanup() {
 	[ -n "$WP" ] && kill "$WP" 2>/dev/null
 	if [ "$KEEP" = 0 ]; then
 		if [ -n "$WORK" ] && [ -x "$CTL" ]; then
-			# 先让模块自己拆会话（顺便验证幂等：设备/netns 可能已经不在了）
+			# Let the module tear down its sessions first (also tests idempotency: dev/netns may be gone)
 			ip netns exec "$NS_C" "$CTL" session-down >/dev/null 2>&1
 			ip netns exec "$NS_S" "$CTL" session-down >/dev/null 2>&1
 		fi
 		ip netns del "$NS_C" 2>/dev/null
 		ip netns del "$NS_S" 2>/dev/null
-		# 模块在每个 netns 都可能建过 iwan0；init netns 里这一个要显式删除，
-		# 否则设备引用着模块，rmmod 会被内核拒绝（Module iwan is in use）。
+		# The module may have created iwan0 in every netns; the one in init netns must be deleted
+		# explicitly, otherwise the device holds the module and rmmod is refused (Module iwan is in use).
 		ip link del iwan0 2>/dev/null
 		rmmod iwan 2>/dev/null
 		[ -n "$WORK" ] && rm -rf "$WORK"
@@ -215,39 +215,39 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# ---------------------------------------------------------------- 前置
+# ---------------------------------------------------------------- preconditions
 
-[ "$(id -u)" = 0 ] || die "需要 root：sudo bash $0"
-command -v ip >/dev/null || die "缺少 iproute2"
-command -v cc >/dev/null || die "缺少 cc"
-command -v python3 >/dev/null || die "缺少 python3（构造控制帧/收发内层 UDP 用）"
-[ -f "$CTL_SRC" ] || die "缺少 $CTL_SRC"
-[ -f "$SHM_SRC" ] || die "缺少 $SHM_SRC"
+[ "$(id -u)" = 0 ] || die "root required: sudo bash $0"
+command -v ip >/dev/null || die "missing iproute2"
+command -v cc >/dev/null || die "missing cc"
+command -v python3 >/dev/null || die "missing python3 (needed to build control frames / inner UDP)"
+[ -f "$CTL_SRC" ] || die "missing $CTL_SRC"
+[ -f "$SHM_SRC" ] || die "missing $SHM_SRC"
 
 WORK="$(mktemp -d /tmp/iwan-shm-test.XXXXXX)"
 CTL="$WORK/iwan_ctl"
 SHM="$WORK/iwan_shm"
 
-say "构建内核模块与用户态工具"
-make -C "$KDIR" >"$WORK/build.log" 2>&1 || { tail -20 "$WORK/build.log"; die "模块构建失败"; }
-[ -f "$KO" ] || die "没有生成 $KO"
+say "Building the kernel module and userspace tools"
+make -C "$KDIR" >"$WORK/build.log" 2>&1 || { tail -20 "$WORK/build.log"; die "module build failed"; }
+[ -f "$KO" ] || die "$KO was not generated"
 WARN=$(grep -c -i 'warning' "$WORK/build.log" \
 	| head -n1)
-info "模块构建完成: $KO（构建日志 warning 行数 $WARN，来自内核构建系统的编译器提示）"
+info "module build done: $KO (build log warning lines: $WARN, compiler hints from the kernel build system)"
 cc -O2 -std=gnu11 -D_GNU_SOURCE -Wall -Wextra -o "$CTL" "$CTL_SRC" \
 	>"$WORK/ctl-build.log" 2>&1 \
-	|| { cat "$WORK/ctl-build.log"; die "iwan_ctl 构建失败"; }
-info "iwan_ctl 构建完成（$(grep -c . "$WORK/ctl-build.log") 行编译输出，0 行即无警告）"
+	|| { cat "$WORK/ctl-build.log"; die "iwan_ctl build failed"; }
+info "iwan_ctl build done ($(grep -c . "$WORK/ctl-build.log") lines of compiler output, 0 means no warnings)"
 cc -O2 -std=gnu11 -D_GNU_SOURCE -Wall -Wextra -o "$SHM" "$SHM_SRC" \
 	>"$WORK/shm-build.log" 2>&1 \
-	|| { cat "$WORK/shm-build.log"; die "iwan_shm 构建失败" ; }
-info "iwan_shm 构建完成（$(grep -c . "$WORK/shm-build.log") 行编译输出，0 行即无警告）"
+	|| { cat "$WORK/shm-build.log"; die "iwan_shm build failed" ; }
+info "iwan_shm build done ($(grep -c . "$WORK/shm-build.log") lines of compiler output, 0 means no warnings)"
 if [ -n "${SUDO_UID:-}" ] && [ "${SUDO_UID:-0}" != 0 ]; then
 	chown "${SUDO_UID}:${SUDO_GID:-$SUDO_UID}" "$KDIR"/*.o "$KO" 2>/dev/null
 	chown -R "${SUDO_UID}:${SUDO_GID:-$SUDO_UID}" "$KDIR/.tmp_versions" 2>/dev/null
 fi
 
-# 控制帧构造（与 netlink_test.sh 同一份：8B 帧头 + MD5(头||"mw") 的 16B 签名）
+# Control frame construction (same as netlink_test.sh: 8B header + 16B MD5(header||"mw") signature)
 cat >"$WORK/send_ctrl.py" <<'PYEOF'
 import hashlib, socket, struct, sys
 # argv: <type> <enc> <sid> <tok> <src_ip> <dst_ip> <port>
@@ -256,31 +256,31 @@ src, dst, port = sys.argv[5], sys.argv[6], int(sys.argv[7])
 hdr = struct.pack("!BBHI", typ, enc, sid, tok)
 frame = hdr + hashlib.md5(hdr + b"mw").digest()
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.bind((src, port))		# 源端口也用隧道端口（模块自己发的包就是 sport=dport）
+s.bind((src, port))		# the source port is the tunnel port too (the module's own packets use sport=dport)
 s.sendto(frame, (dst, port))
 print("CTRL_TX type=0x%02x len=%d %s:%d -> %s:%d" % (typ, len(frame), src, port, dst, port))
 PYEOF
 
-# ---------------------------------------------------------------- 拓扑 + insmod
+# ---------------------------------------------------------------- topology + insmod
 
-say "拓扑与加载（insmod 不带任何会话参数）"
+say "Topology and load (insmod with no session parameters)"
 rmmod iwan 2>/dev/null
 ip netns del "$NS_C" 2>/dev/null
 ip netns del "$NS_S" 2>/dev/null
 ip link del iwan0 2>/dev/null
-ip netns add "$NS_C" || die "创建 netns $NS_C 失败"
-ip netns add "$NS_S" || die "创建 netns $NS_S 失败"
+ip netns add "$NS_C" || die "failed to create netns $NS_C"
+ip netns add "$NS_S" || die "failed to create netns $NS_S"
 ip link add veth-c netns "$NS_C" type veth peer name veth-s netns "$NS_S" \
-	|| die "创建 veth 失败"
+	|| die "failed to create veth"
 for ns in "$NS_C" "$NS_S"; do
 	nsx "$ns" ip link set lo up
-	# 解封后的内层包源地址(10.9.0.x)回程路由走 iwan0，而包是从 veth 进来的；
-	# strict 模式(rp_filter=1)会直接丢掉。新建 netns 默认就是 0，显式设置以免
-	# 受宿主 sysctl 影响。
+	# The decapsulated inner packet source (10.9.0.x) has its return route via iwan0 while the packet
+	# arrived on veth; strict mode (rp_filter=1) drops it. A new netns defaults to 0, set it
+	# explicitly to avoid host sysctl influence.
 	nsx "$ns" sysctl -qw net.ipv4.conf.all.rp_filter=0 2>/dev/null
 	nsx "$ns" sysctl -qw net.ipv4.conf.default.rp_filter=0 2>/dev/null
-	# 关 IPv6：iwan0 起来时内核会自动发 IPv6 RS，它会被封装后到达对端并推进
-	# 对端的时间戳，污染"另一侧不受影响"的断言。
+	# Disable IPv6: when iwan0 comes up the kernel sends an IPv6 RS automatically, which is
+	# encapsulated to the peer and advances its timestamp, polluting the "other side untouched" assertion.
 	nsx "$ns" sysctl -qw net.ipv6.conf.all.disable_ipv6=1 2>/dev/null
 	nsx "$ns" sysctl -qw net.ipv6.conf.default.disable_ipv6=1 2>/dev/null
 done
@@ -288,18 +288,18 @@ nsx "$NS_C" ip addr add "$OUTER_C/24" dev veth-c
 nsx "$NS_C" ip link set veth-c up
 nsx "$NS_S" ip addr add "$OUTER_S/24" dev veth-s
 nsx "$NS_S" ip link set veth-s up
-insmod "$KO" || die "insmod 失败（dmesg | tail 看原因）"
-info "insmod 完成：$(grep -c '^iwan ' /proc/modules) 个 iwan 模块实例"
+insmod "$KO" || die "insmod failed (check dmesg | tail for the reason)"
+info "insmod done: $(grep -c '^iwan ' /proc/modules) iwan module instance(s)"
 
 # ---------------------------------------------------------------- T1
 
-say "T1 /dev/iwan 存在；未下发会话时 version=1、enabled=0、last_rx_ms=0"
+say "T1 /dev/iwan exists; before any session version=1, enabled=0, last_rx_ms=0"
 
 if [ -c /dev/iwan ]; then
-	ok "T1a /dev/iwan 存在（misc_register + devtmpfs 自动建节点）"
+	ok "T1a /dev/iwan exists (misc_register + devtmpfs create the node automatically)"
 	ls -l /dev/iwan | sed 's/^/    /'
 else
-	bad "T1a /dev/iwan 不存在（misc_register 失败？看 dmesg）"
+	bad "T1a /dev/iwan does not exist (misc_register failed? check dmesg)"
 fi
 
 if shm_snap "$NS_C" t1 >/dev/null; then
@@ -310,36 +310,36 @@ if shm_snap "$NS_C" t1 >/dev/null; then
 	ps=$(num "$(sval "$F" peer_state)")
 	rf=$(num "$(sval "$F" rx_frames)")
 	rc=$(num "$(sval "$F" rx_ctrl_frame)")
-	info "iwc 未下发会话: version=$v last_rx_ms=$lr enabled=$en peer_state=$ps rx_frames=$rf rx_ctrl_frame=$rc"
+	info "iwc before any session: version=$v last_rx_ms=$lr enabled=$en peer_state=$ps rx_frames=$rf rx_ctrl_frame=$rc"
 	if [ "$v" = 1 ] && [ "$lr" = 0 ] && [ "$en" = 0 ] && [ "$ps" = 0 ] \
 	   && [ "$rf" = 0 ] && [ "$rc" = 0 ]; then
-		ok "T1b 初始页面正确：version=1、enabled=0、last_rx_ms=0、peer_state=0、两个计数为 0"
+		ok "T1b initial page correct: version=1, enabled=0, last_rx_ms=0, peer_state=0, both counters 0"
 	else
-		bad "T1b 初始页面字段不符（期望 version=1 enabled=0 last_rx_ms=0 peer_state=0 计数=0）"
+		bad "T1b initial page fields mismatch (expected version=1 enabled=0 last_rx_ms=0 peer_state=0 counters=0)"
 		sed 's/^/    /' "$F"
 	fi
 else
-	bad "T1b iwc 里执行 iwan_shm dump 失败"
+	bad "T1b iwan_shm dump failed inside iwc"
 	sed 's/^/    /' "$WORK/shm-t1.err"
 fi
 
-# mmap 与 pread 两条读路径必须给出同一份数据
+# The two read paths, mmap and pread, must return the same data
 if nsx "$NS_C" "$SHM" dump --pread >"$WORK/shm-t1-pread.txt" 2>&1; then
 	if diff -u <(shm_fields "$WORK/shm-t1.txt") \
 		   <(shm_fields "$WORK/shm-t1-pread.txt") >"$WORK/shm-t1-diff.txt"; then
-		ok "T1c mmap 视图与 pread 视图逐字段一致（节点支持两条只读路径）"
+		ok "T1c mmap view and pread view match field by field (the node supports both read-only paths)"
 	else
-		bad "T1c mmap 与 pread 视图不一致"
+		bad "T1c mmap and pread views differ"
 		sed 's/^/    /' "$WORK/shm-t1-diff.txt"
 	fi
 else
-	bad "T1c iwan_shm dump --pread 失败"
+	bad "T1c iwan_shm dump --pread failed"
 	sed 's/^/    /' "$WORK/shm-t1-pread.txt"
 fi
 
 # ---------------------------------------------------------------- T2
 
-say "T2 两端 SESSION_UP + 一个内层 UDP 包（收包侧推进、另一侧不受影响）"
+say "T2 SESSION_UP on both ends + one inner UDP packet (RX side advances, other side untouched)"
 
 up_ok=1
 for spec in "$NS_C:$OUTER_C:$OUTER_S" "$NS_S:$OUTER_S:$OUTER_C"; do
@@ -349,28 +349,28 @@ for spec in "$NS_C:$OUTER_C:$OUTER_S" "$NS_S:$OUTER_S:$OUTER_C"; do
 		--dport "$PORT" --mtu "$MTU" >"$WORK/up-$ns.txt" 2>&1; then
 		info "$ns SESSION_UP: $(sed -n 's/^DEVNAME=/dev=/p;s/^MTU=/mtu=/p' "$WORK/up-$ns.txt" | tr '\n' ' ')"
 	else
-		bad "T2 $ns SESSION_UP 失败"; sed 's/^/    /' "$WORK/up-$ns.txt"; up_ok=0
+		bad "T2 $ns SESSION_UP failed"; sed 's/^/    /' "$WORK/up-$ns.txt"; up_ok=0
 	fi
-	# 内层地址/路由：曾经两个 netns 都挂两个地址，于是对端地址在本地也成了
-	# "本机地址"，内层包被本地投递短路、根本不出 iwan0（T2c/T6/T3/T5a 全失败
-	# 的根因，内核侧其实是好的）。现在统一走这个 helper。
+	# Inner addresses/routes: both netns used to carry both addresses, so the peer address also became
+	# a "local address" and inner packets short-circuited at local delivery, never leaving iwan0 (root
+	# cause of T2c/T6/T3/T5a all failing though the kernel side was fine). Now always use this helper.
 	setup_inner_routes "$ns"
 done
 
 if [ "$up_ok" = 1 ]; then
-	ok "T2a 两端 SESSION_UP 成功（iwan0 由会话按需创建）"
-	# 会话刚建立：时间戳从 0 开始，enabled=1
+	ok "T2a SESSION_UP succeeded on both ends (iwan0 created on demand by the session)"
+	# Session just established: timestamp starts at 0, enabled=1
 	shm_snap "$NS_C" t2a >/dev/null; shm_snap "$NS_S" t2b >/dev/null
 	base_c=$(num "$(sval "$WORK/shm-t2a.txt" last_rx_ms)")
 	base_s=$(num "$(sval "$WORK/shm-t2b.txt" last_rx_ms)")
 	en_c=$(num "$(sval "$WORK/shm-t2a.txt" enabled)")
 	en_s=$(num "$(sval "$WORK/shm-t2b.txt" enabled)")
 	fr_c0=$(num "$(sval "$WORK/shm-t2a.txt" rx_frames)")
-	info "基线（发内层包之前）: iwc last_rx_ms=$base_c enabled=$en_c rx_frames=$fr_c0；iws last_rx_ms=$base_s enabled=$en_s"
+	info "baseline (before the inner packet): iwc last_rx_ms=$base_c enabled=$en_c rx_frames=$fr_c0; iws last_rx_ms=$base_s enabled=$en_s"
 	if [ "$base_c" = 0 ] && [ "$base_s" = 0 ] && [ "$en_c" = 1 ] && [ "$en_s" = 1 ]; then
-		ok "T2b SESSION_UP 后：两端 enabled=1、last_rx_ms=0（新会话从零开始）"
+		ok "T2b after SESSION_UP: enabled=1 on both ends, last_rx_ms=0 (new session starts from zero)"
 	else
-		bad "T2b SESSION_UP 后的初始页面不符（期望 enabled=1 且 last_rx_ms=0）"
+		bad "T2b initial page after SESSION_UP mismatch (expected enabled=1 and last_rx_ms=0)"
 	fi
 
 	if inner_one t2; then
@@ -379,32 +379,32 @@ if [ "$up_ok" = 1 ]; then
 		new_c=$(num "$(sval "$WORK/shm-t2c.txt" last_rx_ms)")
 		new_s=$(num "$(sval "$WORK/shm-t2d.txt" last_rx_ms)")
 		fr_c1=$(num "$(sval "$WORK/shm-t2c.txt" rx_frames)")
-		info "iws→iwc 一个内层包后: iwc last_rx_ms=$base_c→$new_c（rx_frames $fr_c0→$fr_c1）；iws last_rx_ms=$base_s→$new_s"
+		info "iws->iwc after one inner packet: iwc last_rx_ms=$base_c->$new_c (rx_frames $fr_c0->$fr_c1); iws last_rx_ms=$base_s->$new_s"
 		if [ "$new_c" -gt "$base_c" ] && [ "$new_c" -gt 0 ]; then
-			ok "T2c 收包侧 iwc 时间戳推进（$base_c→$new_c，单调毫秒）"
+			ok "T2c RX side iwc timestamp advanced ($base_c->$new_c, monotonic ms)"
 		else
-			bad "T2c 收包侧 iwc 时间戳没有推进（$base_c→$new_c）"
+			bad "T2c RX side iwc timestamp did not advance ($base_c->$new_c)"
 		fi
 		if [ "$new_s" = "$base_s" ]; then
-			ok "T2d 另一侧 iws 不受影响（last_rx_ms 仍为 $new_s）：页面按 netns 隔离"
+			ok "T2d other side iws untouched (last_rx_ms still $new_s): pages are isolated per netns"
 		else
-			bad "T2d 另一侧 iws 的时间戳也变了（$base_s→$new_s）：不是按 netns 隔离！"
+			bad "T2d other side iws timestamp changed too ($base_s->$new_s): not isolated per netns!"
 		fi
 		if [ "$fr_c1" -gt "$fr_c0" ]; then
-			ok "T2e 页面的 rx_frames 同步增长（+$((fr_c1 - fr_c0))，与 /proc、GET_STATS 同源）"
+			ok "T2e page rx_frames grew in sync (+$((fr_c1 - fr_c0)), same source as /proc and GET_STATS)"
 		else
-			bad "T2e 页面的 rx_frames 没增长（$fr_c0→$fr_c1）"
+			bad "T2e page rx_frames did not grow ($fr_c0->$fr_c1)"
 		fi
 	else
-		bad "T2c 内层包没有到达 iwc 的 socket（测试环境问题，后面的断言不可信）"
+		bad "T2c inner packet did not reach iwc's socket (test environment issue; later assertions unreliable)"
 	fi
 else
-	bad "T2 会话没建起来，跳过后续断言"
+	bad "T2 session not established, skipping later assertions"
 fi
 
 # ---------------------------------------------------------------- T6
 
-say "T6 连续两个内层包之间时间戳单调不减（在 T3/T4 之前跑：需要活会话）"
+say "T6 timestamp monotonically non-decreasing between two consecutive inner packets (run before T3/T4: needs a live session)"
 
 if inner_one t6a; then
 	sleep 0.25
@@ -412,32 +412,32 @@ if inner_one t6a; then
 	if inner_one t6b; then
 		sleep 0.25
 		t2=$(num "$(nsx "$NS_C" "$SHM" dump 2>/dev/null | sed -n 's/^last_rx_ms=//p')")
-		info "两个内层包: t1=$t1 t2=$t2（差 $((t2 - t1)) ms）"
+		info "two inner packets: t1=$t1 t2=$t2 (delta $((t2 - t1)) ms)"
 		if [ "$t1" -gt 0 ] && [ "$t2" -ge "$t1" ]; then
-			ok "T6 时间戳单调不减（t1=$t1 > 0，t2=$t2 >= t1）"
+			ok "T6 timestamp non-decreasing (t1=$t1 > 0, t2=$t2 >= t1)"
 		else
-			bad "T6 时间戳不满足单调不减（t1=$t1 t2=$t2）"
+			bad "T6 timestamp is not monotonically non-decreasing (t1=$t1 t2=$t2)"
 		fi
 	else
-		bad "T6 第二个内层包没到 iwc"
+		bad "T6 second inner packet did not reach iwc"
 	fi
 else
-	bad "T6 第一个内层包没到 iwc"
+	bad "T6 first inner packet did not reach iwc"
 fi
 
 # ---------------------------------------------------------------- T3
 
-say "T3 对端发 PT_CLOSE(0x17)：时间戳变 0、peer_state=CLOSED（只用 mmap 观测）"
+say "T3 peer sends PT_CLOSE(0x17): timestamp becomes 0, peer_state=CLOSED (observed via mmap only)"
 
 shm_snap "$NS_C" t3a >/dev/null
 pre_rx=$(num "$(sval "$WORK/shm-t3a.txt" last_rx_ms)")
 pre_ctrl=$(num "$(sval "$WORK/shm-t3a.txt" rx_ctrl_frame)")
 pre_state=$(num "$(sval "$WORK/shm-t3a.txt" peer_state)")
-info "CLOSE 之前: last_rx_ms=$pre_rx peer_state=$pre_state rx_ctrl_frame=$pre_ctrl"
+info "before CLOSE: last_rx_ms=$pre_rx peer_state=$pre_state rx_ctrl_frame=$pre_ctrl"
 if [ "$pre_rx" -gt 0 ]; then
-	ok "T3a 前置条件成立：CLOSE 之前时间戳非零（$pre_rx）"
-	# 注意：从这里到读结果之间，脚本只调用 iwan_shm（/dev/iwan mmap），
-	# 不调用 iwan_ctl 的任何 netlink 命令 —— 事件到达是内核直接写共享内存。
+	ok "T3a precondition holds: timestamp non-zero before CLOSE ($pre_rx)"
+	# Note: between here and reading the result the script calls only iwan_shm (/dev/iwan mmap),
+	# no iwan_ctl netlink command at all -- the kernel writes shared memory directly on arrival.
 	nsx "$NS_S" python3 "$WORK/send_ctrl.py" 0x17 "$ENC" "$SID" "$TOK" \
 		"$OUTER_S" "$OUTER_C" "$PORT" | sed 's/^/    /'
 	sleep 0.3
@@ -446,35 +446,35 @@ if [ "$pre_rx" -gt 0 ]; then
 	post_state=$(num "$(sval "$WORK/shm-t3b.txt" peer_state)")
 	post_ctrl=$(num "$(sval "$WORK/shm-t3b.txt" rx_ctrl_frame)")
 	post_name=$(sval "$WORK/shm-t3b.txt" peer_state_name)
-	info "CLOSE 之后: last_rx_ms=$post_rx peer_state=$post_state($post_name) rx_ctrl_frame=$pre_ctrl→$post_ctrl"
+	info "after CLOSE: last_rx_ms=$post_rx peer_state=$post_state ($post_name) rx_ctrl_frame=$pre_ctrl->$post_ctrl"
 	if [ "$post_rx" = 0 ]; then
-		ok "T3b 收到 PT_CLOSE 后时间戳置 0（用户态据此判定断线）"
+		ok "T3b timestamp zeroed after PT_CLOSE (userspace declares link down on this)"
 	else
-		bad "T3b 收到 PT_CLOSE 后时间戳仍为 $post_rx（应置 0）"
+		bad "T3b timestamp still $post_rx after PT_CLOSE (should be 0)"
 	fi
 	if [ "$post_state" = 3 ]; then
 		ok "T3c peer_state=CLOSED($post_state)"
 	else
-		bad "T3c peer_state=$post_state（期望 3=CLOSED）"
+		bad "T3c peer_state=$post_state (expected 3=CLOSED)"
 	fi
 	if [ "$post_ctrl" -gt "$pre_ctrl" ]; then
-		ok "T3d 页面的 rx_ctrl_frame 增长（$pre_ctrl→$post_ctrl）：内核确实收到了这一帧"
+		ok "T3d page rx_ctrl_frame grew ($pre_ctrl->$post_ctrl): the kernel really received this frame"
 	else
-		bad "T3d 页面的 rx_ctrl_frame 没增长（$pre_ctrl→$post_ctrl）"
+		bad "T3d page rx_ctrl_frame did not grow ($pre_ctrl->$post_ctrl)"
 	fi
-	info "本用例只跑了 iwan_shm dump/watch（/dev/iwan mmap），没有任何 get-stats/events 调用"
+	info "this case ran only iwan_shm dump/watch (/dev/iwan mmap), no get-stats/events call at all"
 else
-	bad "T3a 前置条件不成立：CLOSE 之前时间戳就是 0（T2/T6 的包没被记上）"
+	bad "T3a precondition fails: timestamp was already 0 before CLOSE (T2/T6 packets not recorded)"
 fi
 
 # ---------------------------------------------------------------- T4
 
-say "T4 SESSION_DOWN：整页清零（保留 version）、enabled=0"
+say "T4 SESSION_DOWN: whole page zeroed (version kept), enabled=0"
 
 if nsx "$NS_C" "$CTL" session-down >"$WORK/down-c.txt" 2>&1; then
-	ok "T4a iwc SESSION_DOWN 成功（netlink 只用来拆会话，时间戳仍从共享内存读）"
+	ok "T4a iwc SESSION_DOWN succeeded (netlink only tears down the session; timestamp still read from shm)"
 else
-	bad "T4a iwc SESSION_DOWN 失败"
+	bad "T4a iwc SESSION_DOWN failed"
 	sed 's/^/    /' "$WORK/down-c.txt"
 fi
 shm_snap "$NS_C" t4 >/dev/null
@@ -482,91 +482,91 @@ F="$WORK/shm-t4.txt"
 v=$(num "$(sval "$F" version)"); lr=$(num "$(sval "$F" last_rx_ms)")
 en=$(num "$(sval "$F" enabled)"); ps=$(num "$(sval "$F" peer_state)")
 rf=$(num "$(sval "$F" rx_frames)"); rc=$(num "$(sval "$F" rx_ctrl_frame)")
-info "SESSION_DOWN 后: version=$v last_rx_ms=$lr enabled=$en peer_state=$ps rx_frames=$rf rx_ctrl_frame=$rc"
+info "after SESSION_DOWN: version=$v last_rx_ms=$lr enabled=$en peer_state=$ps rx_frames=$rf rx_ctrl_frame=$rc"
 if [ "$v" = 1 ] && [ "$lr" = 0 ] && [ "$en" = 0 ] && [ "$ps" = 0 ] \
    && [ "$rf" = 0 ] && [ "$rc" = 0 ]; then
-	ok "T4b 整页清零且保留 version=1（enabled=0、时间戳/状态/计数全 0）"
+	ok "T4b whole page zeroed and version=1 kept (enabled=0, timestamp/state/counters all 0)"
 else
-	bad "T4b SESSION_DOWN 后页面字段不符（期望 version=1，其余 0）"
+	bad "T4b page fields after SESSION_DOWN mismatch (expected version=1, all else 0)"
 	sed 's/^/    /' "$F"
 fi
 
 # ---------------------------------------------------------------- T5
 
-say "T5 先 mmap 再删 netns：映射仍可读、值保持最后一次内容、关 fd 干净"
+say "T5 mmap then delete the netns: mapping still readable, values keep the last content, fd close clean"
 
-# T4 拆过会话，这里重新建一个，并制造一个非零时间戳作为"最后一次内容"
+# T4 tore down the session; recreate one here and produce a non-zero timestamp as the "last content"
 if nsx "$NS_C" "$CTL" session-up --sid "$SID" --tok "$TOK" --enc "$ENC" \
 	--key "$KEY" --outer-src "$OUTER_C" --outer-dst "$OUTER_S" \
 	--dport "$PORT" --mtu "$MTU" >"$WORK/up-c2.txt" 2>&1; then
-	info "iwc 会话已重建"
-	# SESSION_DOWN 删掉了 iwan0，内层路由也随设备消失 ⇒ 必须补回来，
-	# 否则下面的内层包会被 rp_filter 丢掉。
+	info "iwc session recreated"
+	# SESSION_DOWN deleted iwan0, so the inner routes disappeared with the device => they must be restored,
+	# otherwise the following inner packet is dropped by rp_filter.
 	setup_inner_routes "$NS_C"
 	setup_inner_routes "$NS_S"
 else
-	bad "T5 iwc 重新 SESSION_UP 失败"; sed 's/^/    /' "$WORK/up-c2.txt"
+	bad "T5 iwc re-SESSION_UP failed"; sed 's/^/    /' "$WORK/up-c2.txt"
 fi
 if inner_one t5; then
 	sleep 0.2
 else
-	# 内层通路不可用时不要放弃：直接发一个 PT_PING_REQ（只走外层，与内层
-	# 路由无关），内核照样会刷新这一页的时间戳。
-	info "T5a 内层包没到 iwc，改用对端发 PT_PING_REQ 制造时间戳"
+	# Do not give up when the inner path is unusable: send a PT_PING_REQ directly (outer path only,
+	# independent of inner routes); the kernel still refreshes this page's timestamp.
+	info "T5a inner packet did not reach iwc; peer sends PT_PING_REQ to produce a timestamp instead"
 	nsx "$NS_S" python3 "$WORK/send_ctrl.py" 0x29 "$ENC" "$SID" "$TOK" \
 		"$OUTER_S" "$OUTER_C" "$PORT" >/dev/null 2>&1
 	sleep 0.3
 fi
-# v1 一律读页面真实值。以前这里在内层包没到时把 v1 强制置 0 当占位符，
-# 于是 T5d/T5f 拿真实页面值去跟假想的 0 比，报出两个并不存在的"值不一致"。
+# v1 always reads the real page value. Previously, when the inner packet was lost, v1 was forced
+# to 0 as a placeholder, so T5d/T5f compared real values to a fake 0 and reported two bogus mismatches.
 v1=$(num "$(sval <(nsx "$NS_C" "$SHM" dump 2>/dev/null) last_rx_ms)")
 if [ "$v1" -gt 0 ]; then
-	ok "T5a 前置条件成立：删 netns 之前时间戳非零（$v1）"
+	ok "T5a precondition holds: timestamp non-zero before deleting the netns ($v1)"
 else
-	bad "T5a 删 netns 之前时间戳为 0，无法验证值保持"
+	bad "T5a timestamp was 0 before deleting the netns; cannot verify value retention"
 fi
 
 OOPS0=$(dmesg_oops_count)
 R0=$(num "$(modrefcnt)")
 
-# 关键：在 iwc 里打开 /dev/iwan + mmap，然后把自己挪到 PID 1 所在 netns。
-# 这样"原 netns 被删除"才会真正走完 pernet exit（页面引用只剩 file 的那一个），
-# 从而验证引用计数：映射还在 ⇒ 页面还在。
+# Key: inside iwc, open /dev/iwan + mmap, then move the process into the netns of PID 1.
+# This makes "the original netns is deleted" really complete pernet exit (only the file's page ref
+# remains), verifying the refcount: mapping still there => page still there.
 nsx "$NS_C" "$SHM" watch --count 40 --interval 100 --leave-netns \
 	>"$WORK/t5-watch.log" 2>&1 &
 WP=$!
 if wait_ready "$WORK/t5-watch.log" '^left_netns=1$'; then
-	ok "T5b 打开 + mmap + 迁移出原 netns 成功（页面已由打开的 file 持有）"
+	ok "T5b open + mmap + migrate out of the original netns succeeded (file holds the page)"
 else
-	bad "T5b watch 没打印 left_netns=1（mmap 或 setns 失败）"
+	bad "T5b watch did not print left_netns=1 (mmap or setns failed)"
 	sed 's/^/    /' "$WORK/t5-watch.log"
 	kill "$WP" 2>/dev/null
 fi
 
 R1=$(num "$(modrefcnt)")
 if [ "$R1" -ge "$((R0 + 1))" ]; then
-	ok "T5c 打开的 file 让模块引用计数 +1（$R0→$R1）：release 是唯一归还点"
+	ok "T5c the open file adds 1 to the module refcount ($R0->$R1): release is the only return point"
 else
-	bad "T5c 模块引用计数没有 +1（$R0→$R1）：打开的 file 没有持引用？"
+	bad "T5c module refcount did not increase by 1 ($R0->$R1): does the open file not hold a reference?"
 fi
 
 I_BEFORE=$(iter_last "$WORK/t5-watch.log")
 V_BEFORE=$(iter_rx "$WORK/t5-watch.log")
 if [ "${V_BEFORE:-0}" = "$v1" ]; then
-	ok "T5d watch（mmap）与 dump（另一次打开）读到同一个值：$V_BEFORE"
+	ok "T5d watch (mmap) and dump (another open) read the same value: $V_BEFORE"
 else
-	bad "T5d watch 读到 ${V_BEFORE:-空}，dump 读到 $v1（同一次打开应一致）"
+	bad "T5d watch read ${V_BEFORE:-empty}, dump read $v1 (same open should agree)"
 fi
 
-# 删掉 iwc：此刻进程已不在该 netns 里，pernet exit 会真正跑完
+# Delete iwc: the process is no longer in that netns now, so pernet exit really completes
 if ip netns del "$NS_C" 2>/dev/null; then
-	info "ip netns del $NS_C 已执行（进程已迁出，pernet exit 会真正走完）"
+	info "ip netns del $NS_C done (process migrated out; pernet exit will really complete)"
 else
-	bad "ip netns del $NS_C 失败"
+	bad "ip netns del $NS_C failed"
 fi
 sleep 0.5
 
-# 等 watch 至少再打印一次新迭代：删除之后仍然能读这一页且不 oops
+# Wait for watch to print at least one more iteration: the page is still readable after deletion, no oops
 I_AFTER=""
 for _ in $(seq 1 60); do
 	I_AFTER=$(iter_last "$WORK/t5-watch.log")
@@ -575,50 +575,50 @@ for _ in $(seq 1 60); do
 done
 V_AFTER=$(iter_rx "$WORK/t5-watch.log")
 if [ -n "${I_AFTER:-}" ] && [ "${I_AFTER:-0}" -gt "${I_BEFORE:-0}" ]; then
-	ok "T5e 删除 netns 之后映射仍可读（iter $I_BEFORE→$I_AFTER，页面没有被提前回收）"
+	ok "T5e mapping still readable after deleting the netns (iter $I_BEFORE->$I_AFTER, page not freed early)"
 else
-	bad "T5e 删除 netns 之后没有新的迭代（iter=${I_AFTER:-空}）：映射是否已失效或进程卡死？"
+	bad "T5e no new iteration after deleting the netns (iter=${I_AFTER:-empty}): mapping dead or process stuck?"
 	tail -5 "$WORK/t5-watch.log" | sed 's/^/    /'
 fi
 if [ "${V_AFTER:-x}" = "$v1" ]; then
-	ok "T5f 值保持最后一次内容（last_rx_ms=$V_AFTER，删 netns 不改变页面内容）"
+	ok "T5f value keeps the last content (last_rx_ms=$V_AFTER; deleting the netns does not change the page)"
 else
-	bad "T5f 删除 netns 后值变了：$v1 → ${V_AFTER:-空}"
+	bad "T5f value changed after deleting the netns: $v1 -> ${V_AFTER:-empty}"
 fi
 
-# 让 watch 自己跑完 --count（关 fd 干净、不带 oops 地退出）
+# Let watch finish --count on its own (clean fd close, exits without oops)
 wait_pid_timeout "$WP" 15
 WRC=$?
 if [ "$WRC" = 0 ]; then
-	ok "T5g watch 自行退出（--count 用尽）且退出码 0：release 干净"
+	ok "T5g watch exited on its own (--count exhausted) with code 0: clean release"
 else
-	bad "T5g watch 退出异常（rc=$WRC；124 = 超时未退出，可能卡在 release）"
+	bad "T5g watch exited abnormally (rc=$WRC; 124 = timed out, possibly stuck in release)"
 	tail -5 "$WORK/t5-watch.log" | sed 's/^/    /'
 fi
 WP=""
 
 R2=$(num "$(modrefcnt)")
 if [ "$R2" -lt "$R1" ]; then
-	ok "T5h 关闭 fd 之后模块引用计数回落（$R1→$R2）"
+	ok "T5h module refcount dropped after closing the fd ($R1->$R2)"
 else
-	bad "T5h 关闭 fd 之后模块引用计数没有回落（$R1→$R2）：release 没有归还引用？"
+	bad "T5h module refcount did not drop after closing the fd ($R1->$R2): release not returning the ref?"
 fi
 
 if dmesg >/dev/null 2>&1; then
 	OOPS1=$(dmesg_oops_count)
 	if [ "${OOPS1:-0}" -le "${OOPS0:-0}" ]; then
-		ok "T5i 整个过程 dmesg 没有新增 oops/BUG/use-after-free（$OOPS0→$OOPS1）"
+		ok "T5i no new oops/BUG/use-after-free in dmesg throughout ($OOPS0->$OOPS1)"
 	else
-		bad "T5i dmesg 出现新的 oops/BUG（$OOPS0→$OOPS1）：先看 dmesg | tail -40"
+		bad "T5i new oops/BUG in dmesg ($OOPS0->$OOPS1): check dmesg | tail -40 first"
 		dmesg | tail -20 | sed 's/^/    /'
 	fi
 else
-	info "dmesg 不可读（缺少 CAP_SYSLOG），跳过 oops 检查"
+	info "dmesg not readable (missing CAP_SYSLOG), skipping the oops check"
 fi
 
-# ---------------------------------------------------------------- 结果
+# ---------------------------------------------------------------- results
 
-say "结果（执行顺序 T1 T2 T6 T3 T4 T5）"
+say "Results (execution order T1 T2 T6 T3 T4 T5)"
 for r in "${RESULTS[@]}"; do
 	case "$r" in
 	PASS*) printf '  \033[32m%s\033[0m\n' "$r" ;;
@@ -628,19 +628,19 @@ done
 printf '\nPASS=%d FAIL=%d\n' "$PASS" "$FAIL"
 
 if [ "$KEEP" = 1 ]; then
-	echo "--keep：保留现场 $WORK（netns 与模块也保留）"
+	echo "--keep: keep the scene $WORK (netns and module are kept too)"
 fi
 
 if [ "$FAIL" = 0 ]; then
-	echo "全部通过：/dev/iwan 的初始状态、每帧时间戳、netns 隔离、PT_CLOSE 置 0、"
-	echo "SESSION_DOWN 清零、mmap 后删 netns 的引用计数都符合 CONTROL-PLANE.md §11。"
+	echo "All passed: /dev/iwan initial state, per-frame timestamp, netns isolation, PT_CLOSE zeroing,"
+	echo "SESSION_DOWN zeroing, and the refcount for mmap-then-delete-netns all match CONTROL-PLANE.md section 11."
 	exit 0
 fi
-echo "有失败用例。排查提示：dmesg | tail -30；"
-echo "  1) T1 失败 → /dev/iwan 是否建出来（misc_register/devtmpfs）、页面 version 是否被改；"
-echo "  2) T2/T6 时间戳不推进 → 会话是否真的建立（GET_STATS 的 sid/devname）、"
-echo "     内层包是否走 iwan0（ip route get）、外层端口/凭据是否一致；"
-echo "  3) T2d 另一侧也变 → 是否有别的流量（IPv6 RS/ICMP）打进对端，先关 IPv6 再看；"
-echo "  4) T3 时间戳不为 0 → PT_CLOSE 的 sid/tok 是否等于会话凭据（0x17 走会话凭据）；"
-echo "  5) T5 失败 → 先看 watch 日志与 dmesg，重点怀疑 netns 销毁与 mmap 的引用计数。"
+echo "Some cases failed. Debug hints: dmesg | tail -30;"
+echo "  1) T1 fails -> check whether /dev/iwan was created (misc_register/devtmpfs) and whether the page version changed;"
+echo "  2) T2/T6 timestamp not advancing -> check whether the session is really established (GET_STATS sid/devname),"
+echo "     whether the inner packet goes via iwan0 (ip route get), and whether the outer port/credentials match;"
+echo "  3) T2d other side changes too -> check for other traffic (IPv6 RS/ICMP) hitting the peer (disable IPv6 first);"
+echo "  4) T3 timestamp not 0 -> check whether PT_CLOSE sid/tok equal the session credentials (0x17 uses session creds);"
+echo "  5) T5 fails -> check the watch log and dmesg, suspect netns teardown vs mmap refcount."
 exit 1

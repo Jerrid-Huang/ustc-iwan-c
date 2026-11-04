@@ -36,12 +36,70 @@ void ctrl_hdr(buf_t *out, uint8_t typ, uint8_t enc, uint16_t sid, uint32_t tok)
     buf_put(out, s, sizeof s);
 }
 
+static uint32_t rd_le32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static void wr_le32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16);
+    p[3] = (uint8_t)(v >> 24);
+}
+
+void echo_put(buf_t *out, const struct iwan_echo *e)
+{
+    uint8_t b[IWAN_ECHO_LEN];
+    int i;
+
+    memset(b, 0, sizeof b);
+    for (i = 0; i < 8; i++)
+        b[i] = (uint8_t)(e->tick >> (8 * i));
+    wr_le32(b + 8, e->cur);
+    wr_le32(b + 12, e->min);
+    wr_le32(b + 16, e->max);
+    /* b[20..23] stay zero: the pad is meaningless, only the length is */
+    memcpy(b + 24, "SDRT", 4);
+    b[28] = (uint8_t)(e->sdrt_magic >> 24);
+    b[29] = (uint8_t)(e->sdrt_magic >> 16);
+    b[30] = (uint8_t)(e->sdrt_magic >> 8);
+    b[31] = (uint8_t)e->sdrt_magic;
+    b[32] = (uint8_t)(e->sdrt_cnt >> 24);
+    b[33] = (uint8_t)(e->sdrt_cnt >> 16);
+    b[34] = (uint8_t)(e->sdrt_cnt >> 8);
+    b[35] = (uint8_t)e->sdrt_cnt;
+    buf_put(out, b, sizeof b);
+}
+
+bool echo_parse(const uint8_t *p, size_t len, struct iwan_echo *out)
+{
+    int i;
+
+    if (len < IWAN_ECHO_LEN)
+        return false;
+    out->tick = 0;
+    for (i = 7; i >= 0; i--)
+        out->tick = (out->tick << 8) | p[i];
+    out->cur = rd_le32(p + 8);
+    out->min = rd_le32(p + 12);
+    out->max = rd_le32(p + 16);
+    out->sdrt = memcmp(p + 24, "SDRT", 4) == 0;
+    out->sdrt_magic = ((uint32_t)p[28] << 24) | ((uint32_t)p[29] << 16) |
+                      ((uint32_t)p[30] << 8) | (uint32_t)p[31];
+    out->sdrt_cnt = ((uint32_t)p[32] << 24) | ((uint32_t)p[33] << 16) |
+                    ((uint32_t)p[34] << 8) | (uint32_t)p[35];
+    return true;
+}
+
 void tlv_put(buf_t *out, uint8_t typ, const void *val, uint8_t vlen)
 {
     if (vlen > IWAN_TLV_VLEN_MAX) {
         /* the length byte stores vlen+2: 254/255 would wrap and corrupt
          * the frame; callers must guard (see build_open). A violation
-         * here is a programming error — fail loudly, not silently. */
+         * here is a programming error -- fail loudly, not silently. */
         log_err("tlv_put: value too long (%u > %d)", vlen,
                 IWAN_TLV_VLEN_MAX);
         abort();
@@ -91,7 +149,7 @@ bool s2ip4(const char *s, uint8_t out[4])
     for (int i = 0; i < 4; i++) {
         if (*s < '0' || *s > '9')
             return false;
-        /* R23-F3 F1: reject leading-zero octets ("010", "00") — Linux
+        /* R23-F3 F1: reject leading-zero octets ("010", "00") -- Linux
          * ip/ifconfig read them as OCTAL (8) while we'd parse decimal (10),
          * so the same config would configure the tunnel differently per
          * backend. "0" alone is fine. */

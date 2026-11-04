@@ -44,7 +44,7 @@ typedef struct {
     bool        all;
     const char *server;
     const char *tun;
-    /* "tun"（默认）或 "kernel"（内核数据面，仅 Linux；见 cli_common.h） */
+    /* "tun" (default) or "kernel" (kernel data plane, Linux only; see cli_common.h) */
     const char *data_plane;
     slist_t     proxy_cidr;
     slist_t     proxy_ip;
@@ -70,7 +70,7 @@ _Noreturn void oidc_die_with_cause(const char *msg, const char *cause);
 void oidc_pause_if_relaunched(void);
 /* oidc_eprintf is the raw-stderr printer (no newline, no flush) shared
  * with the core CLI helpers: err_printf (util.h) has the identical
- * contract, so this is a plain alias — a function wrapper could not
+ * contract, so this is a plain alias - a function wrapper could not
  * forward the variadic args anyway. */
 #define oidc_eprintf err_printf
 void oidc_rand_bytes(uint8_t *out, size_t n);
@@ -96,7 +96,7 @@ void oidc_config_free(Config *cf);
 /* R37-FIX-A2 / A2b (R3-L18): the ONE root-write guard and the ONE
  * canonical spelling of the config path. Both live in oidc_config.c next
  * to normalize_path() and are shared by the three call sites that MUST
- * agree — the --config-dir CLI gate, iwan-client-oidc's early gate and
+ * agree - the --config-dir CLI gate, iwan-client-oidc's early gate and
  * the oidc_save_config() backstop. Declared here so the prototype cannot
  * drift from the definition; the file-local normalization helper and its
  * NormPath scratch type deliberately do NOT appear: neither is exported. */
@@ -113,7 +113,7 @@ char *oidc_build_dev_body(const char *type, const char *device_id,
 /* oidc_jwt.c */
 /* verify an id_token JWT (signature against the issuer's JWKS plus
  * aud/iss/exp claim validation and, when expected_nonce is non-NULL,
- * the OIDC nonce echo — OIDC Core 3.1.3.7); returns 0 when valid,
+ * the OIDC nonce echo - OIDC Core 3.1.3.7); returns 0 when valid,
  * non-zero otherwise (reason on stderr). Fail-closed on network/parse
  * errors. expected_nonce = the nonce sent in the authorization request
  * (NULL skips the nonce check). */
@@ -129,7 +129,7 @@ void oidc_print_servers(Json *servers);
 Json *oidc_find_server(Json *servers, const char *spec);
 Json *oidc_select_server(Json *servers);
 /* R37-WG-E1 (L28/L39): a terminal-safe copy of a remote-controlled string
- * — C0/C1 control bytes, stray/invalid UTF-8 and non-shortest (overlong),
+ * - C0/C1 control bytes, stray/invalid UTF-8 and non-shortest (overlong),
  * surrogate or >U+10FFFF sequences each become '?'. DISPLAY ONLY: the
  * raw value must keep being used for matching, comparison and storage.
  * Caller owns the result (free it; oidc_die paths may rely on _Noreturn). */

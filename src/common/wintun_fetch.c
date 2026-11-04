@@ -1,4 +1,4 @@
-/* wintun_fetch.c — locate / interactively fetch wintun.dll (Windows only)
+/* wintun_fetch.c -- locate / interactively fetch wintun.dll (Windows only)
  *
  * TUN mode needs wintun.dll next to the executable. When it is missing:
  *   - interactive stdin: ask once, then download the PINNED build
@@ -25,13 +25,13 @@
 
 /* M2 (FIND): fetching "the latest" build while the SHA-256 pin in
  * wintun_pin.h is fixed to exactly WINTUN_PINNED_VERSION is
- * self-contradictory — the moment upstream ships anything newer (or drops
+ * self-contradictory -- the moment upstream ships anything newer (or drops
  * 0.14.1), the downloaded DLL fails the pin and the auto-install breaks
  * permanently (fail-closed but functionally dead). So we deliberately
  * fetch the one version the pin can accept, from the official release
  * URL below (wintun.net/builds/wintun-<ver>.zip, same naming the index
  * page uses). Upgrading wintun now requires bumping WINTUN_PINNED_VERSION
- * AND the matching hash(es) in wintun_pin.h together — no "latest"
+ * AND the matching hash(es) in wintun_pin.h together -- no "latest"
  * tracking by design. */
 #define WINTUN_PINNED_VERSION "0.14.1"
 #define WINTUN_ZIP_FMT  "https://www.wintun.net/builds/wintun-%s.zip"
@@ -40,7 +40,7 @@
  * and the tmpdir-derived paths below could not fit (7 warnings that broke
  * the -DIWAN_WERROR=ON Windows cross build). Size every buffer to the worst
  * case its inputs can actually expand to, and check each snprintf return
- * value at the call site — nothing here may truncate silently. */
+ * value at the call site -- nothing here may truncate silently. */
 /* A MAX_PATH-sized directory plus an appended component, and with room for
  * ps_squote() doubling every embedded quote (2 * (MAX_PATH - 1) bytes). */
 #define PS_PATH_MAX     (2 * MAX_PATH)
@@ -85,11 +85,11 @@ static int file_exists(const char *path)
  * single quotes are doubled. The exe dir is attacker-influenceable
  * (install path), so every interpolated path goes through here.
  * Returns 0 on success and -1 when the escaped form does not fit in
- * `cap` — like every snprintf-based sibling above, a truncation is
+ * `cap` -- like every snprintf-based sibling above, a truncation is
  * REPORTED, never silent, and the caller fails closed. (The ceiling
- * cannot be reached through a MAX_PATH-limited directory — even a
+ * cannot be reached through a MAX_PATH-limited directory -- even a
  * directory made entirely of single quotes would need >240 of them to
- * overflow 2*MAX_PATH — but a consistency check costs nothing and the
+ * overflow 2*MAX_PATH -- but a consistency check costs nothing and the
  * sibling paths all fail loud.) */
 static int ps_squote(char *out, size_t cap, const char *src)
 {
@@ -114,7 +114,7 @@ static int ps_squote(char *out, size_t cap, const char *src)
 /* run a command and capture its stdout (line-oriented use only).
  *
  * R18-1: the result must participate in the caller's failure decision.
- * *ps_rc (optional) receives 0 on success and 1 on ANY failure — a
+ * *ps_rc (optional) receives 0 on success and 1 on ANY failure -- a
  * non-zero PowerShell exit status (every command below runs under
  * $ErrorActionPreference='Stop' and ends with `; exit $LASTEXITCODE`,
  * so a cmdlet error really turns into a non-zero process exit), a
@@ -146,7 +146,7 @@ static char *ps_capture(const char *ps_expr, int *ps_rc){
         return NULL;
     }
     buf[0] = '\0';   /* FIND-W-2: a child with no stdout leaves the malloc'd
-                      * buffer untouched — ensure NUL so consumers (strstr
+                      * buffer untouched -- ensure NUL so consumers (strstr
                       * over it) read an empty string, not uninitialized
                       * (possibly over-read) heap */
     char line[512];
@@ -173,7 +173,7 @@ static char *ps_capture(const char *ps_expr, int *ps_rc){
 /* Recursively remove a directory tree (files as well as subdirectories).
  * R20-1/T1: RemoveDirectoryA only removes an EMPTY directory, so a
  * partially-extracted tmpdir (Expand-Archive failing mid-flight) was
- * never cleaned up by the old `RemoveDirectoryA(tmpdir)` call — "fail
+ * never cleaned up by the old `RemoveDirectoryA(tmpdir)` call -- "fail
  * then clean" was structurally ineffective. Walk the tree with
  * FindFirstFile/FindNextFile instead and remove everything; each step is
  * best-effort (a failure may leave a residual entry, but the routine
@@ -181,12 +181,12 @@ static char *ps_capture(const char *ps_expr, int *ps_rc){
 static void delete_tree(const char *path)
 {
     /* R25 (R24-A1-1): the ROOT entry `path` itself may be a pre-planted
-     * junction/symlink (<exe_dir>\wintun-tmp) — FindFirstFileA(path\*)
+     * junction/symlink (<exe_dir>\wintun-tmp) -- FindFirstFileA(path\*)
      * FOLLOWS the link transparently and would enumerate and recursively
      * delete the TARGET's contents (the exact hole 910dd02's inner-item
      * guard missed at the function entry). Check the entry itself and,
      * when it is a reparse point, remove just the link without following
-     * and return — same RemoveDirectoryA+DeleteFileA pair as the inner
+     * and return -- same RemoveDirectoryA+DeleteFileA pair as the inner
      * branch below. This is a PRE-ENUMERATION check: the entry is
      * verified before FindFirstFileA ever sees it, so a residual
      * entry-swap TOCTOU is not statically reachable in the routine's
@@ -219,12 +219,12 @@ static void delete_tree(const char *path)
                 continue;   /* cannot address this entry; skip it */
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
                 /* R22-A1-1: never recurse into a reparse point
-                 * (junction/symlink) — that would FOLLOW the link and
+                 * (junction/symlink) -- that would FOLLOW the link and
                  * delete the TARGET's contents, or recurse forever on a
                  * self-referencing link (stack overflow). Remove the
                  * link itself without following: RemoveDirectoryA
                  * removes a junction (and a dir symlink), DeleteFileA
-                 * also removes a dir symlink — both best-effort, the
+                 * also removes a dir symlink -- both best-effort, the
                  * miss of one is covered by the other. */
                 if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
                     RemoveDirectoryA(sub);
@@ -312,7 +312,7 @@ int wintun_ensure(void)
      * whatever the wintun.net index currently headlines. The pin gate
      * below (wintun_pin_ok_a) can only accept WINTUN_PINNED_VERSION's
      * DLL, so there is no point round-tripping through a "latest" page
-     * scrape — that was exactly the self-contradiction that broke the
+     * scrape -- that was exactly the self-contradiction that broke the
      * auto-install on the next upstream release. */
     char ver[32];
     n = snprintf(ver, sizeof ver, "%s", WINTUN_PINNED_VERSION);
@@ -352,12 +352,12 @@ int wintun_ensure(void)
         return -1;   /* fail closed like every sibling snprintf check;
                       * nothing has been downloaded or extracted yet */
     }
-    /* FIND-W-1: the two %s slots were reversed — the URL wants the
+    /* FIND-W-1: the two %s slots were reversed -- the URL wants the
      * VERSION (wintun-%s.zip), -OutFile wants the local zip path. As
      * written, every download produced a 404 URL + a file named "0.14.1".
      * R18-1: the old command opened with a parenthesized expression and
-     * appended the named parameter outside it — "(Invoke-WebRequest …)
-     * -OutFile '…'" — which is a PARSE error in PowerShell (after a
+     * appended the named parameter outside it -- "(Invoke-WebRequest ...)
+     * -OutFile '...'" -- which is a PARSE error in PowerShell (after a
      * closed `)` only an operator, `.`/`::` member access, `[ ]`
      * indexing, `( )` invocation or a pipe/redirection may follow; a
      * named parameter token cannot.  Verified against PowerShell:
@@ -376,7 +376,7 @@ int wintun_ensure(void)
     }
     log_info("downloading wintun-%s.zip ...", ver);
     char *dlout = ps_capture(cmd, &rc);
-    /* R18-1: the caller's decision must use ps_capture()'s result — the
+    /* R18-1: the caller's decision must use ps_capture()'s result -- the
      * old code discarded it, so a parse-error'd / failed download raced
      * on to Expand-Archive and then mis-reported "zip does not contain
      * bin\amd64\wintun.dll".  Check the exit status AND the produced zip
@@ -413,7 +413,7 @@ int wintun_ensure(void)
             log_err("PowerShell output: %s", exout);
         free(exout);
         /* T1/R20-1: the Expand failure branch used to return after a
-         * bare RemoveDirectoryA(tmpdir) — a NO-OP while tmpdir holds the
+         * bare RemoveDirectoryA(tmpdir) -- a NO-OP while tmpdir holds the
          * files Expand already wrote - so partial extraction residue was
          * left in the exe directory. Route through the single cleanup
          * exit below, which recursively removes the whole tree. */
@@ -435,7 +435,7 @@ int wintun_ensure(void)
         goto fail;
     }
     /* the fetched artifact must match the pinned official build before
-     * it lands next to the exe — the download is over TLS but a pinned
+     * it lands next to the exe -- the download is over TLS but a pinned
      * hash also protects against a compromised mirror / on-disk tamper */
     if (!wintun_pin_ok_a(src)) {
         log_err("downloaded wintun.dll does not match the pinned build; "
@@ -446,7 +446,7 @@ int wintun_ensure(void)
         log_err("cannot move %s -> %s (error %lu)", src, dll,
                 (unsigned long)GetLastError());
         /* R18-1/T3 + T1/R20-1: this failure branch used to leak the
-         * zip/DLL/late-extraction files in tmpdir — the unified failure
+         * zip/DLL/late-extraction files in tmpdir -- the unified failure
          * exit below now owns all of them. */
         goto fail;
     }
@@ -464,7 +464,7 @@ fail:
      * the zip + recursively remove the tmpdir tree", so a failed
      * Expand-Archive (partial files already written), a missing arch
      * folder, a pin mismatch or a failed MoveFileA can no longer leave
-     * residue in the exe directory. Best-effort by design — cleanup
+     * residue in the exe directory. Best-effort by design -- cleanup
      * never changes the failure return. */
     fetch_cleanup(zip, tmpdir);
     return -1;

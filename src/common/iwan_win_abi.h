@@ -1,25 +1,25 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * iwan_win_abi.h — Windows 内核数据面（WFP callout）与用户态客户端之间的 ABI。
+ * iwan_win_abi.h -- ABI between the Windows kernel data plane (WFP callout) and the userspace client.
  *
- * 设计对应关系（详见 docs/win-wfp-data-plane.md）：
- *   · 会话模型逐项对应 Linux 侧 genetlink 的属性集（kernel/iwan_genl.h）：
- *     外层端点、内层 MTU、加密标志与密钥、绑定（出口网卡/出口 IP）、
- *     会话 id/令牌、开关位、统计计数器；
- *   · 存活状态对应 /dev/iwan 那一页只读共享内存（kernel/iwan_shm.h）：
- *     布局版本、固定偏移、0 = 从未收到/已断开，语义完全一致；
- *   · Windows 多出来的三项是平台差异，不是语义差异：
- *     内层地址（回环适配器上要挂哪个地址）、被代理目标集合（WFP 出向按它
- *     匹配，用来替代 Linux 的"路由到 iwan0"）、流上下文开关（WFP 自带
- *     连接跟踪，用来替代 Linux 的 conntrack + fwmark 策略路由）。
+ * Design mapping (see docs/win-wfp-data-plane.md):
+ *   - The session model maps item by item onto the Linux genetlink attribute set (kernel/iwan_genl.h):
+ *     outer endpoints, inner MTU, encryption flag and key, binding (egress NIC/egress IP),
+ *     session id/token, toggle bits, statistics counters;
+ *   - Liveness state corresponds to that read-only shared-memory page of /dev/iwan (kernel/iwan_shm.h):
+ *     layout version, fixed offsets, 0 = never received/disconnected, semantics fully identical;
+ *   - The three extra Windows fields are platform differences, not semantic differences:
+ *     inner address (which address to attach to the loopback adapter), proxied target set (WFP outbound matches
+ *     against it, replacing Linux's "route to iwan0"), flow-context toggle (WFP's own
+ *     connection tracking, replacing Linux's conntrack + fwmark policy routing).
  *
- * 约定：
- *   · 所有字段主机序；只有外层地址/端口按网络序解释（与 Linux 侧一致）；
- *   · 结构体只显式补齐到固定布局，偏移由本文件末尾的断言钉死；
- *   · 版本号只在字段增删时 +1，且必须同步驱动、客户端与本文件的断言。
+ * Conventions:
+ *   - All fields are host order; only outer addresses/ports are interpreted in network order (same as Linux);
+ *   - Structs are explicitly padded to a fixed layout only; offsets are pinned by the assertions at the end of this file;
+ *   - The version number is bumped by 1 only on field additions/removals, and the driver, client and assertions in this file must be updated together.
  *
- * 本文件不依赖 WDK 专有头：内核态包含 ntddk.h/wdm.h，用户态包含
- * windows.h/winioctl.h，两边都能直接 include。
+ * This file does not depend on WDK-proprietary headers: kernel mode includes ntddk.h/wdm.h, userspace includes
+ * windows.h/winioctl.h, so both sides can include it directly.
  */
 #ifndef IWAN_WIN_ABI_H
 #define IWAN_WIN_ABI_H
@@ -28,13 +28,13 @@
 #  include <ntddk.h>
 #  include <wdm.h>          /* CTL_CODE */
 /*
- * 内核态没有 C99 定长类型：WDK 的内核包含路径里没有 <stdint.h>，wdm.h 只提供
- * INT8..UINT64 这组 WDK 名字。本文件通篇用 C99 名字（用户态那两侧本来就有
- * <stdint.h>），所以在这里补一层等宽别名，而不是把上百处字段类型改成 WDK 名字
- * 再分两套维护 —— ABI 结构体的字段类型在三个编译目标里必须是同一份声明。
+ * Kernel mode has no C99 fixed-width types: the WDK kernel include path has no <stdint.h>, and wdm.h only provides
+ * the INT8..UINT64 set of WDK names. This file uses the C99 names throughout (the two userspace sides already have
+ * <stdint.h>), so a layer of same-width aliases is added here instead of changing hundreds of field types to WDK names
+ * and maintaining two sets -- the ABI struct field types must be one single declaration in all three build targets.
  *
- * C11 允许把 typedef 重定义成同一类型（6.7/3），MSVC 在 /std:c11 下同样接受，
- * 所以将来某个 WDK 若自己提供了这些名字，只要宽度相同也不会冲突。
+ * C11 allows redefining a typedef to the same type (6.7/3), and MSVC accepts it under /std:c11 as well,
+ * so if some future WDK provides these names itself, there is no conflict as long as the widths match.
  */
 typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
@@ -46,16 +46,16 @@ typedef long long          int64_t;
 typedef unsigned long long uint64_t;
 
 /*
- * 同理没有 offsetof：它是 <stddef.h> 的宏，内核包含路径里没有这个头。
- * 用编译器内建的那套写法自己给一个；C11 允许同一宏重定义为相同展开，
- * 所以万一将来某个 WDK 提供了它也不会冲突。size_t 由 WDK 自己提供。
+ * Likewise there is no offsetof: it is a <stddef.h> macro and that header is not in the kernel include path.
+ * Provide one using the compiler built-in form; C11 allows redefining the same macro to the same expansion,
+ * so it will not conflict if some future WDK provides it. size_t is provided by the WDK itself.
  */
 #  ifndef offsetof
 #    define offsetof(type, member) ((size_t)(ULONG_PTR)&(((type *)0)->member))
 #  endif
 #elif defined(IWAN_WIN_ABI_BARE)
-/* 裸模式：主机侧对拍测试（tests/win_frame_test.c）只要结构与常量，
- * 不引入 windows.h，这样同一份 ABI 能在 Linux 上编译检查。 */
+/* Bare mode: the host-side cross-check test (tests/win_frame_test.c) only needs the structs and constants,
+ * without pulling in windows.h, so the same ABI can be compiled and checked on Linux. */
 #  include <stdint.h>
 #  include <stddef.h>
 #else
@@ -64,55 +64,55 @@ typedef unsigned long long uint64_t;
 #  include <stdint.h>
 #endif
 
-/* ---- 版本 ------------------------------------------------------------- */
+/* ---- Version ---------------------------------------------------------- */
 
-/* 设备与 IOCTL 的 ABI 版本：驱动与客户端不一致时拒绝开会话。
- * 3：SESSION_OPEN 末尾追加 outer_if_guid（承载网卡接口 GUID，16 字节）。
- *    起因：NDIS 的绑定索引与用户态 GetBestRoute2 给的接口索引实测不是同一套
- *    编号（同一张以太网卡：netio 报 7，NDIS 绑定参数报 23），按索引选承载必然
- *    选不中，而症状与"根本没绑上承载"完全相同。GUID 在两套编号里都有，是唯一
- *    稳定的同一性判据。
- * 2：SESSION_OPEN 末尾追加 outer_hop（外层下一跳）。旧客户端送 136 字节的
- *    请求会被 size 校验挡下，这是有意的 —— 缺了下一跳就没法在承载网上把外
- *    层帧发出去，静默降级比当面拒绝更糟。 */
+/* Device and IOCTL ABI version: refuse to open a session when the driver and client disagree.
+ * 3: append outer_if_guid (carrier NIC interface GUID, 16 bytes) at the end of SESSION_OPEN.
+ *    Cause: the NDIS binding index and the interface index given by userspace GetBestRoute2 are in practice not the same
+ *    numbering scheme (same Ethernet NIC: netio reports 7, NDIS binding parameters report 23); selecting the carrier by index inevitably fails,
+ *    and the symptom is exactly the same as "the carrier was never bound at all". The GUID exists in both schemes and is the only
+ *    stable identity criterion.
+ * 2: append outer_hop (outer next hop) at the end of SESSION_OPEN. An old client sending a 136-byte
+ *    request is rejected by the size check, and that is intentional -- without the next hop the outer
+ *    frame cannot be sent on the carrier network, and silent degradation is worse than an outright refusal. */
 #define IWAN_WIN_ABI_VERSION      3u
 
-/* 存活共享内存页的布局版本：与 Linux 的 IWAN_SHM_VERSION 同步（同一套
- * 用户态读取代码吃两边的页，所以版本号必须一起动） */
+/* Liveness shared-memory page layout version: kept in sync with Linux's IWAN_SHM_VERSION (the same
+ * userspace reader code consumes the pages from both sides, so the version numbers must move together) */
 #define IWAN_WIN_SHM_VERSION      1u
 
-/* 封装开销与内层 MTU 边界（客户端与驱动共用一套，避免两边算出的值分叉）：
- *   外层 IPv4 = 20 + 8(UDP) + 8(帧头) = 36
- *   外层 IPv6 = 40 + 8(UDP) + 8(帧头) = 56
- * 内层 MTU 的声明值是 min(服务器协商值, 承载网卡 MTU - 开销)：承载 MTU 是
- * 网卡给的硬上限，协商值是服务端愿意收的大小，只有取小者才既封得下又不会
- * 被对端丢。 */
+/* Encapsulation overhead and inner MTU bounds (client and driver share one set, so the values they compute cannot diverge):
+ *   outer IPv4 = 20 + 8(UDP) + 8(frame header) = 36
+ *   outer IPv6 = 40 + 8(UDP) + 8(frame header) = 56
+ * The declared inner MTU is min(server-negotiated value, carrier NIC MTU - overhead): the carrier MTU is
+ * the hard limit given by the NIC, the negotiated value is what the server is willing to receive, and only the smaller one both fits and avoids
+ * being dropped by the peer. */
 #define IWAN_WIN_OVERHEAD_V4      36u
 #define IWAN_WIN_OVERHEAD_V6      56u
 #define IWAN_WIN_MTU_MIN          68u
 #define IWAN_WIN_MTU_HARD_MAX_V4  65499u
 #define IWAN_WIN_MTU_HARD_MAX_V6  65479u
 
-/* ---- 设备名（裸模式不需要） ------------------------------------------- */
+/* ---- Device names (not needed in bare mode) --------------------------- */
 
 #if !defined(IWAN_WIN_ABI_BARE)
 
 #define IWAN_WIN_DEVICE_NAME      L"\\Device\\iwan"
 #define IWAN_WIN_DOS_NAME         L"\\DosDevices\\iwan"
 #define IWAN_WIN_USER_PATH        L"\\\\.\\iwan"
-/* 第二个平面（小型端口 + 协议驱动，iwanmp.sys）用另一套设备名：两个平面可以
- * 同时装在一台机器上，用户态按 --data-plane 选一个打开，便于对照测量。 */
+/* The second plane (miniport + protocol driver, iwanmp.sys) uses a different set of device names: the two planes can
+ * be installed on one machine at the same time; userspace picks one to open via --data-plane, for A/B measurement. */
 #define IWAN_WIN_DEVICE_NAME_MP   L"\\Device\\iwanmp"
 #define IWAN_WIN_DOS_NAME_MP      L"\\DosDevices\\iwanmp"
 #define IWAN_WIN_USER_PATH_MP     L"\\\\.\\iwanmp"
-/* 只读映射给用户态的命名节对象（对应 Linux 的 /dev/iwan mmap）。
- * 注意两个平面共用同一个节名：一个时刻只该有一个会话在跑，否则用户态读到的
- * 时间戳会分不清是谁写的（Linux 侧同样是全局一份）。 */
+/* Named section object mapped read-only into userspace (corresponds to Linux's /dev/iwan mmap).
+ * Note that both planes share the same section name: only one session should run at a time, otherwise the timestamp
+ * userspace reads cannot be attributed to a writer (the Linux side likewise has a single global copy). */
 #define IWAN_WIN_SHM_NAME         L"\\BaseNamedObjects\\iwan_shm"
 
 /* ---- IOCTL ------------------------------------------------------------ */
 
-#define IWAN_WIN_DEVICE_TYPE      0x8331u   /* 自定义，避开系统设备类型 */
+#define IWAN_WIN_DEVICE_TYPE      0x8331u   /* custom, avoids system device types */
 
 #define IOCTL_IWAN_SESSION_OPEN \
 	CTL_CODE(IWAN_WIN_DEVICE_TYPE, 0x800, METHOD_BUFFERED, FILE_WRITE_DATA)
@@ -125,105 +125,105 @@ typedef unsigned long long uint64_t;
 
 #endif /* !IWAN_WIN_ABI_BARE */
 
-/* ---- 会话开关位（对应 IWAN_A_FLAG_*） --------------------------------- */
+/* ---- Session toggle bits (correspond to IWAN_A_FLAG_*) ---------------- */
 
-/* 把内层地址挂到回环适配器上（Linux 侧对应"创建 iwan0"，默认置位）。
- * 不置位时驱动只做转发，不碰本机地址表。 */
+/* Attach the inner address to the loopback adapter (on Linux this corresponds to "create iwan0"; set by default).
+ * When cleared, the driver only forwards and does not touch the local address table. */
 #define IWAN_WIN_FLAG_BIND_INNER      0x0001u
-/* 为入向连接建立流上下文，使其回包按来路回去（Linux 侧对应 conntrack +
- * fwmark 策略路由那一整套；Windows 用 WFP 原生流上下文，默认置位） */
+/* Establish flow contexts for inbound connections so their replies go back the way they came (on Linux this corresponds to the whole
+ * conntrack + fwmark policy routing stack; Windows uses native WFP flow contexts, set by default) */
 #define IWAN_WIN_FLAG_REPLY_VIA_TUNNEL 0x0002u
-/* 显式绑定了外层出口网卡（oi f_index 有效），对应 IWAN_A_OIF */
+/* Outer egress NIC explicitly bound (oi f_index valid), corresponds to IWAN_A_OIF */
 #define IWAN_WIN_FLAG_BIND_OIF        0x0004u
-/* 显式绑定了外层出口 IP（bind_ip / bind_ip6 有效），对应 IWAN_A_IP* */
+/* Outer egress IP explicitly bound (bind_ip / bind_ip6 valid), corresponds to IWAN_A_IP* */
 #define IWAN_WIN_FLAG_BIND_IP         0x0008u
 
-/* ---- 对端状态（对应 enum iwan_peer_state） ---------------------------- */
+/* ---- Peer state (corresponds to enum iwan_peer_state) ----------------- */
 
 enum iwan_win_peer_state {
 	IWAN_WIN_PEER_UNKNOWN = 0,
-	IWAN_WIN_PEER_UP,	/* 收过有效帧 */
-	IWAN_WIN_PEER_SILENT,	/* 保留编号：驱动无定时器，判活由用户态轮询 */
-	IWAN_WIN_PEER_CLOSED,	/* 收到 PT_CLOSE */
+	IWAN_WIN_PEER_UP,	/* received a valid frame */
+	IWAN_WIN_PEER_SILENT,	/* reserved value: the driver has no timer, liveness is polled from userspace */
+	IWAN_WIN_PEER_CLOSED,	/* received PT_CLOSE */
 };
 
-/* ---- 目标集合条目（被代理目标；WFP 出向按它做最长前缀匹配） ----------- */
+/* ---- Target set entries (proxied targets; WFP outbound does longest-prefix matching) ---- */
 
 #define IWAN_WIN_AF_V4            4u
 #define IWAN_WIN_AF_V6            6u
 
-/* 目标集合条目上限：客户端与驱动共用同一个界，超出时开会话必须明确失败，
- * 避免用户态把内核池吃光（Linux 侧的等价边界在用户态展开 --proxy-cidr 时）。 */
+/* Upper bound on target set entries: client and driver share the same limit; opening a session must fail explicitly when it is exceeded,
+ * so userspace cannot exhaust the kernel pool (the equivalent bound on Linux is applied when userspace expands --proxy-cidr). */
 #define IWAN_WIN_MAX_TARGETS      4096u
 
 typedef struct _IWAN_WIN_TARGET {
 	uint32_t family;	/* IWAN_WIN_AF_V4 / IWAN_WIN_AF_V6 */
-	uint32_t prefix_len;	/* v4: 0..32，v6: 0..128 */
-	uint8_t  addr[16];	/* 网络序；v4 用前 4 字节，其余为 0 */
+	uint32_t prefix_len;	/* v4: 0..32, v6: 0..128 */
+	uint8_t  addr[16];	/* network order; v4 uses the first 4 bytes, the rest are 0 */
 } IWAN_WIN_TARGET, *PIWAN_WIN_TARGET;
 
-/* ---- 开会话请求 ------------------------------------------------------- */
+/* ---- Open-session request --------------------------------------------- */
 
 /*
- * 变长：targets 紧跟在结构体之后（同一块 IOCTL 缓冲），共 target_count 项，
- * 每项 IWAN_WIN_TARGET。target_offset 是相对本结构体起始的偏移，正常情况下
- * 等于 sizeof(IWAN_WIN_SESSION_OPEN)；留出这个字段是为了将来在前面追加字段
- * 时不破坏旧客户端。
+ * Variable length: targets follow immediately after the struct (same IOCTL buffer), target_count items,
+ * each an IWAN_WIN_TARGET. target_offset is the offset relative to the start of this struct, normally
+ * equal to sizeof(IWAN_WIN_SESSION_OPEN); the field is reserved so that future prepending of fields
+ * does not break old clients.
  */
 typedef struct _IWAN_WIN_SESSION_OPEN {
 	uint32_t abi_version;	/* IWAN_WIN_ABI_VERSION */
-	uint32_t size;		/* 本结构体大小，用于版本兼容判断 */
+	uint32_t size;		/* size of this struct, used for version compatibility checks */
 
-	/* 会话标识与控制面参数（对应 SID/TOK/ENC/KEY） */
+	/* Session identity and control-plane parameters (correspond to SID/TOK/ENC/KEY) */
 	uint16_t sid;
 	uint16_t reserved0;
 	uint32_t tok;
-	uint8_t  enc;		/* 1 = PT_DATA_ENC + XOR，0 = 明文 */
+	uint8_t  enc;		/* 1 = PT_DATA_ENC + XOR, 0 = plaintext */
 	uint8_t  key[8];	/* MD5(user||pass)[0..8) */
 
-	/* 外层端点（主机序字段 + 网络序地址/端口，与 Linux 侧一致） */
+	/* Outer endpoints (host-order fields + network-order addresses/ports, same as Linux) */
 	uint32_t outer_src;	/* be32 */
 	uint32_t outer_dst;	/* be32 */
-	uint16_t sport;		/* be16；0 表示与 dport 相同 */
+	uint16_t sport;		/* be16; 0 means same as dport */
 	uint16_t dport;		/* be16 */
-	uint8_t  outer_src6[16];/* 外层 v6 源；与 outer_dst6 同时非零才按 v6 处理 */
-	uint8_t  outer_dst6[16];/* 外层 v6 目的 */
+	uint8_t  outer_src6[16];/* outer v6 source; treated as v6 only when both this and outer_dst6 are non-zero */
+	uint8_t  outer_dst6[16];/* outer v6 destination */
 
-	/* 绑定（对应 IWAN_A_OIF / IWAN_A_IP / IWAN_A_IP6） */
+	/* Bindings (correspond to IWAN_A_OIF / IWAN_A_IP / IWAN_A_IP6) */
 	uint32_t flags;		/* IWAN_WIN_FLAG_* */
-	uint32_t oif_index;	/* 承载网卡 ifindex（BIND_OIF） */
-	uint32_t bind_ip;	/* be32，本端外层出口 IP（BIND_IP） */
-	uint8_t  bind_ip6[16];	/* 本端外层出口 v6 */
+	uint32_t oif_index;	/* carrier NIC ifindex (BIND_OIF) */
+	uint32_t bind_ip;	/* be32, local-end outer egress IP (BIND_IP) */
+	uint8_t  bind_ip6[16];	/* local-end outer egress v6 */
 
-	/* 内层（Windows 特有：Linux 侧内层地址由模块建 iwan0 时自己挂） */
-	uint32_t inner_ip;	/* be32，本机分配到的内层地址 */
-	uint8_t  inner_ip6[16];	/* 内层 v6（ULA），无则全 0 */
-	uint32_t inner_mtu;	/* 内层 MTU；0 = carrier_mtu - 封装开销 */
-	uint32_t carrier_mtu;	/* 承载网卡 MTU：客户端查得后报上来，驱动按
-				 * "inner_mtu + 开销 <= carrier_mtu" 校验 */
+	/* Inner (Windows-specific: on Linux the module attaches the inner address itself when creating iwan0) */
+	uint32_t inner_ip;	/* be32, inner address assigned to this machine */
+	uint8_t  inner_ip6[16];	/* inner v6 (ULA), all 0 if none */
+	uint32_t inner_mtu;	/* inner MTU; 0 = carrier_mtu - encapsulation overhead */
+	uint32_t carrier_mtu;	/* carrier NIC MTU: looked up by the client and reported up; the driver validates with
+				 * "inner_mtu + overhead <= carrier_mtu" */
 
-	/* 目标集合 */
-	uint32_t target_offset;	/* 相对本结构体起始 */
+	/* Target set */
+	uint32_t target_offset;	/* relative to the start of this struct */
 	uint32_t target_count;
 
-	/* 外层下一跳：控制面查好路由传下来（be32）。
+	/* Outer next hop: looked up by the control plane and passed down (be32).
 	 *
-	 * 为什么不让驱动自己查：内核态没有可用的取路由 API —— GetBestRoute2 那一
-	 * 族只在用户态 netioapi.h 里；协议驱动若自己猜下一跳，对端不在链路上时
-	 * ARP 永远不响，表现为"会话建立了但一个字节都出不去"。控制面本来就要为
-	 * 承载 MTU 做一次 GetBestRoute2（src/common/kdp_win.c），顺手取 NextHop
-	 * 不增加任何开销。
-	 * 0 = 未提供：按"对端在链路上"处理（对端与承载网卡同网段时这就是正确值）。 */
+	 * Why not let the driver look it up itself: kernel mode has no usable route-lookup API -- the GetBestRoute2
+	 * family lives only in userspace netioapi.h; if the protocol driver guesses the next hop itself, when the peer is not on-link
+	 * ARP never answers, which shows up as "the session is up but not a single byte gets out". The control plane already needs
+	 * one GetBestRoute2 for the carrier MTU (src/common/kdp_win.c), and taking NextHop along the way
+	 * adds no overhead.
+	 * 0 = not provided: treated as "peer is on-link" (this is the correct value when the peer is in the same subnet as the carrier NIC). */
 	uint32_t outer_hop;
-	uint32_t reserved1;	/* 保持 8 字节对齐；必须为 0 */
+	uint32_t reserved1;	/* keeps 8-byte alignment; must be 0 */
 
-	/* 承载网卡接口 GUID（16 字节，与 GetAdaptersAddresses 的 AdapterName /
-	 * ConvertInterfaceLuidToGuid 同一字节序）。全 0 = 未提供，驱动退回按
-	 * oif_index 匹配（两套编号都试），只为过渡期兼容。 */
+	/* Carrier NIC interface GUID (16 bytes, same byte order as GetAdaptersAddresses' AdapterName /
+	 * ConvertInterfaceLuidToGuid). All 0 = not provided; the driver falls back to matching by
+	 * oif_index (trying both numbering schemes), for transition-period compatibility only. */
 	uint8_t  outer_if_guid[16];
 } IWAN_WIN_SESSION_OPEN, *PIWAN_WIN_SESSION_OPEN;
 
-/* ---- 统计（计数器名称与顺序对应 enum iwan_stats_attr） ---------------- */
+/* ---- Statistics (counter names and order correspond to enum iwan_stats_attr) ---- */
 
 typedef struct _IWAN_WIN_STATS {
 	uint64_t rx_pkts;
@@ -245,7 +245,7 @@ typedef struct _IWAN_WIN_STATS {
 	uint64_t ev_dropped;
 } IWAN_WIN_STATS, *PIWAN_WIN_STATS;
 
-/* ---- 查询会话（SESSION_GET / SHM_QUERY 的回复） ----------------------- */
+/* ---- Query session (reply to SESSION_GET / SHM_QUERY) ----------------- */
 
 typedef struct _IWAN_WIN_SESSION_INFO {
 	uint32_t abi_version;
@@ -254,21 +254,21 @@ typedef struct _IWAN_WIN_SESSION_INFO {
 	uint16_t sid;
 	uint16_t reserved0;
 	uint32_t peer_state;	/* enum iwan_win_peer_state */
-	uint32_t enabled;	/* 会话级数据面开关 */
-	uint32_t effective_mtu;	/* 生效的内层 MTU（会话建立时按承载网卡 MTU 校验过） */
-	uint32_t carrier_index;	/* 实际承载网卡 ifindex（对应 IWAN_A_CARRIER） */
-	uint32_t dev_owned;	/* 1 = 内层地址由本驱动挂上（对应 IWAN_A_DEV_OWNED） */
+	uint32_t enabled;	/* session-level data plane switch */
+	uint32_t effective_mtu;	/* effective inner MTU (validated against the carrier NIC MTU when the session was established) */
+	uint32_t carrier_index;	/* actual carrier NIC ifindex (corresponds to IWAN_A_CARRIER) */
+	uint32_t dev_owned;	/* 1 = inner address attached by this driver (corresponds to IWAN_A_DEV_OWNED) */
 	uint32_t reserved1;
 
-	uint64_t last_rx_ms;	/* 与共享内存页同一份存储（对应 IWAN_A_LAST_KEEPALIVE_MS） */
-	uint64_t shm_section_size;	/* 共享内存页大小（SHM_QUERY 用） */
-	uint64_t shm_user_va;	/* SHM_QUERY：映射到调用进程的只读地址；
-				 * 只在调用 SHM_QUERY 的那个进程里有效 */
+	uint64_t last_rx_ms;	/* same storage as the shared-memory page (corresponds to IWAN_A_LAST_KEEPALIVE_MS) */
+	uint64_t shm_section_size;	/* shared-memory page size (for SHM_QUERY) */
+	uint64_t shm_user_va;	/* SHM_QUERY: read-only address mapped into the calling process;
+				 * valid only in the process that called SHM_QUERY */
 
 	IWAN_WIN_STATS stats;
 } IWAN_WIN_SESSION_INFO, *PIWAN_WIN_SESSION_INFO;
 
-/* ---- 存活共享内存页（布局与 kernel/iwan_shm.h 一致） ------------------ */
+/* ---- Liveness shared-memory page (layout matches kernel/iwan_shm.h) --- */
 
 #define IWAN_WIN_SHM_OFF_VERSION        0x00
 #define IWAN_WIN_SHM_OFF_PAD            0x04
@@ -281,15 +281,15 @@ typedef struct _IWAN_WIN_SESSION_INFO {
 
 typedef struct _IWAN_WIN_SHM {
 	uint32_t version;	/* IWAN_WIN_SHM_VERSION */
-	uint32_t pad;		/* 恒 0 */
-	uint64_t last_rx_ms;	/* 单调毫秒；0 = 从未收到 / 已断开 */
+	uint32_t pad;		/* always 0 */
+	uint64_t last_rx_ms;	/* monotonic milliseconds; 0 = never received / already disconnected */
 	uint32_t peer_state;	/* enum iwan_win_peer_state */
 	uint32_t enabled;
 	uint64_t rx_frames;
 	uint64_t rx_ctrl_frame;
 } IWAN_WIN_SHM, *PIWAN_WIN_SHM;
 
-/* ---- 布局断言（内核态、用户态、交叉编译器都要过） --------------------- */
+/* ---- Layout assertions (must pass in kernel mode, userspace and cross-compilers) ---- */
 
 #if defined(_KERNEL_MODE)
 #  define IWAN_WIN_STATIC_ASSERT(cond, msg) static_assert(cond, msg)
@@ -299,7 +299,7 @@ typedef struct _IWAN_WIN_SHM {
 #  define IWAN_WIN_STATIC_ASSERT(cond, msg) _Static_assert(cond, msg)
 #endif
 
-/* 共享内存页：与 Linux 的 IWAN_SHM_OFF_* 逐个对齐（同一份用户态读取代码） */
+/* Shared-memory page: aligned one by one with Linux's IWAN_SHM_OFF_* (same userspace reader code) */
 IWAN_WIN_STATIC_ASSERT(IWAN_WIN_SHM_OFF_VERSION == 0x00, "shm version offset");
 IWAN_WIN_STATIC_ASSERT(IWAN_WIN_SHM_OFF_PAD == 0x04, "shm pad offset");
 IWAN_WIN_STATIC_ASSERT(IWAN_WIN_SHM_OFF_LAST_RX_MS == 0x08, "shm last_rx offset");
@@ -309,110 +309,110 @@ IWAN_WIN_STATIC_ASSERT(IWAN_WIN_SHM_OFF_RX_FRAMES == 0x18, "shm rx_frames offset
 IWAN_WIN_STATIC_ASSERT(IWAN_WIN_SHM_OFF_RX_CTRL_FRAME == 0x20, "shm rx_ctrl offset");
 
 IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_SHM, version) == IWAN_WIN_SHM_OFF_VERSION,
-		       "IWAN_WIN_SHM.version 偏移");
+		       "IWAN_WIN_SHM.version offset");
 IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_SHM, pad) == IWAN_WIN_SHM_OFF_PAD,
-		       "IWAN_WIN_SHM.pad 偏移");
+		       "IWAN_WIN_SHM.pad offset");
 IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_SHM, last_rx_ms) == IWAN_WIN_SHM_OFF_LAST_RX_MS,
-		       "IWAN_WIN_SHM.last_rx_ms 偏移");
+		       "IWAN_WIN_SHM.last_rx_ms offset");
 IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_SHM, peer_state) == IWAN_WIN_SHM_OFF_PEER_STATE,
-		       "IWAN_WIN_SHM.peer_state 偏移");
+		       "IWAN_WIN_SHM.peer_state offset");
 IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_SHM, enabled) == IWAN_WIN_SHM_OFF_ENABLED,
-		       "IWAN_WIN_SHM.enabled 偏移");
+		       "IWAN_WIN_SHM.enabled offset");
 IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_SHM, rx_frames) == IWAN_WIN_SHM_OFF_RX_FRAMES,
-		       "IWAN_WIN_SHM.rx_frames 偏移");
+		       "IWAN_WIN_SHM.rx_frames offset");
 IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_SHM, rx_ctrl_frame) == IWAN_WIN_SHM_OFF_RX_CTRL_FRAME,
-		       "IWAN_WIN_SHM.rx_ctrl_frame 偏移");
+		       "IWAN_WIN_SHM.rx_ctrl_frame offset");
 IWAN_WIN_STATIC_ASSERT(sizeof(IWAN_WIN_SHM) == IWAN_WIN_SHM_HDR_SIZE,
-		       "IWAN_WIN_SHM 必须恰好是 0x28 字节");
+		       "IWAN_WIN_SHM must be exactly 0x28 bytes");
 
-/* ---- 冻结偏移：实测值，改字段前先看 tests/win_abi_layout.c -------------
+/* ---- Frozen offsets: measured values; check tests/win_abi_layout.c before changing fields -----
  *
- * 驱动是 64 位、客户端可能是 32 位，所以下面这些数字必须在两种目标下一致。
- * 已用 x86_64-w64-mingw32-gcc 与 i686-w64-mingw32-gcc 各编译运行一次并逐行
- * 比对过（见 tests/win_abi_layout.c 的用法），除 sizeof(void*) 外无差异；
- * mingw 与 MSVC 对 __int64 都是 8 字节对齐，所以 MSVC 目标同样成立。
- * 这些断言一旦失败，说明 ABI 破了 —— 客户端与驱动会各按各的偏移解释同一块
- * 缓冲，必须同时改驱动、客户端与本文件的版本号。
+ * The driver is 64-bit and the client may be 32-bit, so the numbers below must be identical under both targets.
+ * These were compiled and run once each with x86_64-w64-mingw32-gcc and i686-w64-mingw32-gcc, and compared
+ * line by line (see usage in tests/win_abi_layout.c); no differences except sizeof(void*);
+ * mingw and MSVC both align __int64 to 8 bytes, so the MSVC target holds as well.
+ * If any of these assertions fails, the ABI is broken -- the client and driver would interpret the same
+ * buffer using different offsets, and the driver, client and version number in this file must be changed together.
  */
-IWAN_WIN_STATIC_ASSERT(sizeof(IWAN_WIN_TARGET) == 24, "IWAN_WIN_TARGET 必须是 24 字节");
-IWAN_WIN_STATIC_ASSERT(sizeof(IWAN_WIN_STATS) == 17 * 8, "IWAN_WIN_STATS 必须是 17 个 u64");
-/* 只钉 sizeof 与最后一个字段是不够的：把 rx_outer 与 rx_reasm 换个位置，
- * 这两个断言照样通过，而用户态解析器会整体错位。下面把三段边界各钉一个。 */
+IWAN_WIN_STATIC_ASSERT(sizeof(IWAN_WIN_TARGET) == 24, "IWAN_WIN_TARGET must be 24 bytes");
+IWAN_WIN_STATIC_ASSERT(sizeof(IWAN_WIN_STATS) == 17 * 8, "IWAN_WIN_STATS must be 17 u64s");
+/* Pinning sizeof and the last field is not enough: swap rx_outer and rx_reasm and
+ * these two assertions still pass, while the userspace parser is shifted wholesale. The three boundaries below are each pinned. */
 IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_STATS, rx_outer) == 8,
-		       "IWAN_WIN_STATS.rx_outer 偏移");
+		       "IWAN_WIN_STATS.rx_outer offset");
 IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_STATS, rx_frames) == 24,
-		       "IWAN_WIN_STATS.rx_frames 偏移");
+		       "IWAN_WIN_STATS.rx_frames offset");
 IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_STATS, rx_nomem) == 72,
-		       "IWAN_WIN_STATS.rx_nomem 偏移");
+		       "IWAN_WIN_STATS.rx_nomem offset");
 IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_STATS, tx_pkts) == 88,
-		       "IWAN_WIN_STATS.tx_pkts 偏移");
+		       "IWAN_WIN_STATS.tx_pkts offset");
 IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_STATS, tx_bad_state) == 104,
-		       "IWAN_WIN_STATS.tx_bad_state 偏移");
+		       "IWAN_WIN_STATS.tx_bad_state offset");
 IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_STATS, tx_err) == 120,
-		       "IWAN_WIN_STATS.tx_err 偏移");
+		       "IWAN_WIN_STATS.tx_err offset");
 IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_STATS, ev_dropped) == 128,
-		       "IWAN_WIN_STATS.ev_dropped 偏移");
+		       "IWAN_WIN_STATS.ev_dropped offset");
 IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_SESSION_OPEN, outer_src6) == 40,
-		       "SESSION_OPEN.outer_src6 偏移");
+		       "SESSION_OPEN.outer_src6 offset");
 IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_SESSION_OPEN, inner_ip6) == 104,
-		       "SESSION_OPEN.inner_ip6 偏移");
+		       "SESSION_OPEN.inner_ip6 offset");
 IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_SESSION_OPEN, carrier_mtu) == 124,
-		       "SESSION_OPEN.carrier_mtu 偏移");
+		       "SESSION_OPEN.carrier_mtu offset");
 IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_SESSION_OPEN, target_offset) == 128,
-		       "SESSION_OPEN.target_offset 偏移");
+		       "SESSION_OPEN.target_offset offset");
 IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_SESSION_OPEN, target_count) == 132,
-		       "SESSION_OPEN.target_count 偏移");
+		       "SESSION_OPEN.target_count offset");
 IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_SESSION_OPEN, outer_hop) == 136,
-		       "SESSION_OPEN.outer_hop 偏移");
+		       "SESSION_OPEN.outer_hop offset");
 IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_SESSION_OPEN, outer_if_guid) == 144,
-		       "SESSION_OPEN.outer_if_guid 偏移");
+		       "SESSION_OPEN.outer_if_guid offset");
 IWAN_WIN_STATIC_ASSERT(sizeof(IWAN_WIN_SESSION_OPEN) == 160,
-		       "IWAN_WIN_SESSION_OPEN 必须是 160 字节");
+		       "IWAN_WIN_SESSION_OPEN must be 160 bytes");
 IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_SESSION_INFO, last_rx_ms) == 40,
-		       "SESSION_INFO.last_rx_ms 偏移");
+		       "SESSION_INFO.last_rx_ms offset");
 IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_SESSION_INFO, shm_user_va) == 56,
-		       "SESSION_INFO.shm_user_va 偏移");
+		       "SESSION_INFO.shm_user_va offset");
 IWAN_WIN_STATIC_ASSERT(offsetof(IWAN_WIN_SESSION_INFO, stats) == 64,
-		       "SESSION_INFO.stats 偏移");
+		       "SESSION_INFO.stats offset");
 IWAN_WIN_STATIC_ASSERT(sizeof(IWAN_WIN_SESSION_INFO) == 200,
-		       "IWAN_WIN_SESSION_INFO 必须是 200 字节");
+		       "IWAN_WIN_SESSION_INFO must be 200 bytes");
 
-/* ---- 出向拒绝样本（诊断区，只写不判） ---------------------------------
+/* ---- Outbound rejection sample (diagnostic area, write-only) ----------
  *
- * 共享页 0x00..0x27 是跨平台布局，0x100 起两边都没用（kernel/iwan_shm.h 的
- * 偏移止于 0x20）。放这里而不是扩 STATS：SESSION_INFO 的大小与偏移一个都
- * 不动，用户态旧解析器继续可用。
+ * Shared page 0x00..0x27 is the cross-platform layout; 0x100 onwards is unused on both sides (the
+ * kernel/iwan_shm.h offsets stop at 0x20). Placed here instead of extending STATS: none of SESSION_INFO's
+ * size or offsets change, so old userspace parsers keep working.
  *
- * 存在的理由：计数器只能说明"被拒了几个"，说明不了"为什么被拒"。UDP 全拒、
- * ICMP 全过时，只有这一条记录能区分"缓冲区不以 IPv4 首部开头"和"total
- * length 与 NET_BUFFER 长度矛盾"。
+ * Rationale: counters only say "how many were rejected", not "why". When all UDP is rejected and
+ * all ICMP passes, only this one record can distinguish "the buffer does not start with an IPv4 header" from "total
+ * length contradicts the NET_BUFFER length".
  */
 #define IWAN_WIN_SHM_OFF_DIAG	0x100
 #define IWAN_WIN_DIAG_MAGIC	0x49574447u	/* 'IWDG' */
 
 #define IWAN_WIN_DIAG_TX_NB_NULL	1
-#define IWAN_WIN_DIAG_TX_HDR_BAD	2	/* 头部不连续/不足 20 字节/非 IPv4 */
-#define IWAN_WIN_DIAG_TX_LEN_BAD	3	/* ihl 或 tot 与 NB 长度矛盾 */
-#define IWAN_WIN_DIAG_TX_MTU		4	/* 加封装开销超过承载 MTU */
+#define IWAN_WIN_DIAG_TX_HDR_BAD	2	/* header not contiguous / shorter than 20 bytes / not IPv4 */
+#define IWAN_WIN_DIAG_TX_LEN_BAD	3	/* ihl or tot contradicts the NB length */
+#define IWAN_WIN_DIAG_TX_MTU		4	/* encapsulation overhead exceeds the carrier MTU */
 #define IWAN_WIN_DIAG_TX_ENCAP_FAIL	5
-#define IWAN_WIN_DIAG_TX_INFLIGHT	6	/* 在途注入数达上限 */
-#define IWAN_WIN_DIAG_TX_COALESCE	7	/* 第二遍取整包失败 */
-#define IWAN_WIN_DIAG_TX_NO_NEIGHBOR	8	/* 下一跳 MAC 未解析出来（NDIS 平面） */
-#define IWAN_WIN_DIAG_TX_V6_NOT_IMPL	9	/* NDIS 平面的外层 v6 尚未实现 */
-#define IWAN_WIN_DIAG_TX_SEND_FAIL	10	/* 交给承载网卡失败（NDIS 平面） */
+#define IWAN_WIN_DIAG_TX_INFLIGHT	6	/* in-flight injection count reached the limit */
+#define IWAN_WIN_DIAG_TX_COALESCE	7	/* failed to obtain the whole packet on the second pass */
+#define IWAN_WIN_DIAG_TX_NO_NEIGHBOR	8	/* next-hop MAC not resolved (NDIS plane) */
+#define IWAN_WIN_DIAG_TX_V6_NOT_IMPL	9	/* outer v6 on the NDIS plane is not implemented yet */
+#define IWAN_WIN_DIAG_TX_SEND_FAIL	10	/* handing to the carrier NIC failed (NDIS plane) */
 
 typedef struct _IWAN_WIN_DIAG {
 	uint32_t magic;
 	uint32_t reason;
 	uint32_t len;		/* NET_BUFFER_DATA_LENGTH */
-	uint32_t tot;		/* 读到的 IPv4 total length，未取到为 0 */
-	uint32_t pkt0;		/* 被拒缓冲区首字节，未取到为 0xFFFF */
-	uint32_t seq;		/* 每次写入自增，读者据此判断记录已更新 */
-	uint8_t  first[16];	/* 被拒缓冲区前 16 字节 */
+	uint32_t tot;		/* IPv4 total length read; 0 if not obtained */
+	uint32_t pkt0;		/* first byte of the rejected buffer; 0xFFFF if not obtained */
+	uint32_t seq;		/* incremented on every write; readers use it to tell the record was updated */
+	uint8_t  first[16];	/* first 16 bytes of the rejected buffer */
 } IWAN_WIN_DIAG, *PIWAN_WIN_DIAG;
 
-IWAN_WIN_STATIC_ASSERT(sizeof(IWAN_WIN_DIAG) == 40, "IWAN_WIN_DIAG 大小");
+IWAN_WIN_STATIC_ASSERT(sizeof(IWAN_WIN_DIAG) == 40, "IWAN_WIN_DIAG size");
 IWAN_WIN_STATIC_ASSERT(IWAN_WIN_SHM_OFF_DIAG + sizeof(IWAN_WIN_DIAG) <= 4096,
-		       "诊断区必须在共享页内");
+		       "diagnostic area must fit within the shared page");
 
 #endif /* IWAN_WIN_ABI_H */

@@ -1,30 +1,30 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * iwan_ctl —— iWAN 控制面（genetlink）命令行工具，纯 C + libc。
+ * iwan_ctl -- iWAN control plane (genetlink) command line tool, pure C + libc.
  *
- * ABI: kernel/iwan_genl.h（冻结，直接 include，不重复定义这里的常量）；
- *      设计说明: kernel/CONTROL-PLANE.md。
+ * ABI: kernel/iwan_genl.h (frozen; included directly, do not redefine its constants);
+ *      design notes: kernel/CONTROL-PLANE.md.
  *
- * 家族 id 与多播组 id 一律用 CTRL_CMD_GETFAMILY 查 "iwan" 得到
- * （等价于 libnl 的 genl_ctrl_resolve / genl_ctrl_resolve_grp），不硬编码
- * 家族号；netlink 消息自己拼，不依赖 libmnl/libnl。
+ * Family id and multicast group id are always resolved by querying "iwan" with CTRL_CMD_GETFAMILY
+ * (equivalent to libnl's genl_ctrl_resolve / genl_ctrl_resolve_grp); no hardcoded
+ * family number; netlink messages are built by hand, with no libmnl/libnl dependency.
  *
- * 字节序（按 iwan_genl.h 的逐字段注释）：
- *   · IWAN_A_SID(u16) / TOK(u32) / ENC(u8) / MTU(u32) / ENABLED(u8) / FLAGS(u32)
- *     用主机序；
- *   · IWAN_A_OUTER_SRC/DST(be32) 与 SPORT/DPORT(be16) 用网络序
- *     （它们对应内核里的 __be32/__be16 字段）。
+ * Byte order (per the per-field comments in iwan_genl.h):
+ *   - IWAN_A_SID(u16) / TOK(u32) / ENC(u8) / MTU(u32) / ENABLED(u8) / FLAGS(u32)
+ *     use host byte order;
+ *   - IWAN_A_OUTER_SRC/DST(be32) and SPORT/DPORT(be16) use network byte order
+ *     (they correspond to __be32/__be16 fields in the kernel).
  *
- * 事件里控制帧的 PT_* 类型常量来自 PROTOCOL.md 第 3 节（冻结值，与
- * src/common/protocol.h 一致），只用于把 FRAME_TYPE 标注成人可读的名字。
+ * The PT_* control frame type constants in events come from PROTOCOL.md section 3 (frozen values, matching
+ * src/common/protocol.h), used only to label FRAME_TYPE with a human-readable name.
  *
- * 退出码：0 成功；1 参数/内核错误；2 用法错误；3 get-stats 内核报错
- *         （此时仍把 error= 与会话空值打到 stdout，便于脚本判定"会话不存在"）；
- *         4 events 在超时前没收到 --count 条事件。
+ * Exit codes: 0 success; 1 argument/kernel error; 2 usage error; 3 get-stats kernel error
+ *         (in that case error= and empty session values are still printed to stdout, so scripts can detect "session does not exist");
+ *         4 events received fewer than --count events before the timeout.
  */
 
 #ifndef _GNU_SOURCE
-#define _GNU_SOURCE	/* 本仓库约定（命令行通常也会 -D_GNU_SOURCE） */
+#define _GNU_SOURCE	/* repo convention (the command line usually passes -D_GNU_SOURCE too) */
 #endif
 #include <arpa/inet.h>
 #include <errno.h>
@@ -47,12 +47,12 @@
 #define BUF_SZ		8192
 
 /*
- * iwan_genl.h 说明了 KEY 是"8 字节 MD5(user||pass)[0..8)"，但没有给长度
- * 常量；这里按注释定义局部常量（建议上游在 ABI 头补一个 IWAN_KEY_LEN）。
+ * iwan_genl.h says KEY is "8-byte MD5(user||pass)[0..8)" but does not provide a length
+ * constant; define a local constant here per the comment (upstream should add IWAN_KEY_LEN to the ABI header).
  */
 #define IWAN_KEY_BYTES	8
 
-/* PROTOCOL.md 第 3 节：帧类型（冻结；0x19-0x28 未分配） */
+/* PROTOCOL.md section 3: frame types (frozen; 0x19-0x28 unassigned) */
 enum iwan_pt {
 	PT_OPEN_REJECT	= 0x11,
 	PT_OPEN_ACK	= 0x12,
@@ -69,7 +69,7 @@ enum iwan_pt {
 static const char *progname = "iwan_ctl";
 static uint32_t nl_seq;
 
-/* ---------------------------------------------------------------- 基础工具 */
+/* ---------------------------------------------------------------- basic helpers */
 
 static void die(const char *fmt, ...) __attribute__((noreturn, format(printf, 1, 2)));
 
@@ -77,7 +77,7 @@ static void die(const char *fmt, ...)
 {
 	va_list ap;
 
-	fprintf(stderr, "%s: 错误: ", progname);
+	fprintf(stderr, "%s: error: ", progname);
 	va_start(ap, fmt);
 	vfprintf(stderr, fmt, ap);
 	va_end(ap);
@@ -88,32 +88,32 @@ static void die(const char *fmt, ...)
 static void usage(FILE *fd)
 {
 	fprintf(fd,
-"用法:\n"
+"usage:\n"
 "  iwan_ctl session-up --sid N --tok N --enc 0|1 --key HEX16 \\\n"
 "                    --outer-src IP --outer-dst IP --dport N \\\n"
 "                    [--outer-src6 IP6 --outer-dst6 IP6] [--ip6 IP6] \\\n"
 "                    [--sport N] [--mtu N] [--oif N] [--no-create-dev]\n"
-"                    [--reserved-flag-bit1]  置位保留的 FLAGS bit1（代答未实现），\n"
-"                                            用来验证内核拒绝保留位（期望 -EINVAL）\n"
+"                    [--reserved-flag-bit1]  set reserved FLAGS bit1 (kernel proxy answer not implemented),\n"
+"                                            used to verify the kernel rejects reserved bits (expects -EINVAL)\n"
 "  iwan_ctl session-down\n"
 "  iwan_ctl set-peer --outer-dst IP [--sport N] [--dport N]\n"
 "  iwan_ctl set-enabled 0|1\n"
 "  iwan_ctl get-stats\n"
 "  iwan_ctl events [--count N] [--timeout SEC]\n"
 "\n"
-"说明:\n"
-"  · 家族 \"%s\" 与多播组 \"%s\" 用 CTRL_CMD_GETFAMILY 解析，不硬编码家族号\n"
-"  · --outer-src = 本端外层地址，--outer-dst = 对端外层地址（见 iwan_genl.h）\n\
-  · --outer-src6/--outer-dst6 = 外层 v6 端点（外层版本由“给了哪一对”决定；\n\
-    两对同时给是 -EINVAL，本工具照发，用来测那条判据）\n\
-  · --ip6 = 绑定的出口 v6 地址（必须等于 --outer-src6 且属于本机接口）\n\
-  · --oif = 显式绑定的承载网卡 ifindex（IWAN_A_OIF；绑定路径不容忍解析错误）\n"
-"  · get-stats 把配置快照/计数器按 KEY=value 打到 stdout；回执里缺的属性\n"
-"    打印成空值（KEY=），内核报错时额外打印 error=<原因> 并以 3 退出\n"
-"  · events 每条事件打印 EVENT=<事件名> 加属性；控制帧附 FRAME_HEX 与\n"
-"    FRAME_TYPE_NAME，--timeout 0 表示一直等，--count 0 表示不限条数\n"
-"  · 退出码: 0 成功, 1 参数/内核错误, 2 用法错误, 3 get-stats 内核报错,\n"
-"            4 events 超时未收满 --count 条\n",
+"notes:\n"
+"  - family \"%s\" and multicast group \"%s\" are resolved with CTRL_CMD_GETFAMILY; no hardcoded family number\n"
+"  - --outer-src = local outer address, --outer-dst = peer outer address (see iwan_genl.h)\n\
+  - --outer-src6/--outer-dst6 = outer v6 endpoints (the outer version is decided by \"which pair is given\";\n\
+    giving both pairs is -EINVAL; this tool sends it anyway to test that check)\n\
+  - --ip6 = bound egress v6 address (must equal --outer-src6 and belong to a local interface)\n\
+  - --oif = explicitly bound carrier NIC ifindex (IWAN_A_OIF; the binding path does not tolerate resolution errors)\n"
+"  - get-stats prints the config snapshot/counters to stdout as KEY=value; attributes missing from the reply\n"
+"    are printed as empty values (KEY=); on a kernel error it also prints error=<reason> and exits 3\n"
+"  - events prints EVENT=<event name> plus attributes for each event; control frames include FRAME_HEX and\n"
+"    FRAME_TYPE_NAME; --timeout 0 means wait forever, --count 0 means no limit\n"
+"  - exit codes: 0 success, 1 argument/kernel error, 2 usage error, 3 get-stats kernel error,\n"
+"            4 events timed out before receiving --count events\n",
 		IWAN_GENL_NAME, IWAN_GENL_MCGRP_EVENTS);
 }
 
@@ -125,7 +125,7 @@ static uint64_t now_ms(void)
 	return (uint64_t)ts.tv_sec * 1000 + (uint64_t)(ts.tv_nsec / 1000000);
 }
 
-/* ---------------------------------------------------------------- 消息构造 */
+/* ---------------------------------------------------------------- message construction */
 
 struct iwan_req {
 	char		buf[BUF_SZ];
@@ -156,7 +156,7 @@ static struct nlattr *nla_put(struct iwan_req *r, uint16_t type,
 	struct nlattr *nla;
 
 	if (off + NLA_HDRLEN + len > sizeof(r->buf))
-		die("netlink 消息超出 %d 字节缓冲区", BUF_SZ);
+		die("netlink message exceeds %d-byte buffer", BUF_SZ);
 	nla = (struct nlattr *)(r->buf + off);
 	nla->nla_type = type;
 	nla->nla_len = NLA_HDRLEN + len;
@@ -181,13 +181,13 @@ static void nla_put_u32(struct iwan_req *r, uint16_t t, uint32_t v)
 	nla_put(r, t, &v, sizeof(v));
 }
 
-/* be32：地址已经是 inet_pton 给出的网络序字节，直接放 */
+/* be32: the address is already network-order bytes from inet_pton, put it in directly */
 static void nla_put_be32(struct iwan_req *r, uint16_t t, uint32_t be)
 {
 	nla_put(r, t, &be, sizeof(be));
 }
 
-/* be16：主机序端口转网络序后放 */
+/* be16: convert the host-order port to network order, then put it in */
 static void nla_put_be16(struct iwan_req *r, uint16_t t, uint16_t host)
 {
 	uint16_t be = htons(host);
@@ -200,11 +200,11 @@ static void nla_put_str(struct iwan_req *r, uint16_t t, const char *s)
 	nla_put(r, t, s, strlen(s) + 1);
 }
 
-/* ---------------------------------------------------------------- 属性解析 */
+/* ---------------------------------------------------------------- attribute parsing */
 
 /*
- * NLA_OK/NLA_NEXT 是内核内部宏（include/net/netlink.h），UAPI 头里没有，
- * 这里按同样的语义自己写一份，避免依赖内核源码树。
+ * NLA_OK/NLA_NEXT are kernel-internal macros (include/net/netlink.h), not present in UAPI headers,
+ * so write our own with the same semantics here, avoiding a dependency on the kernel source tree.
  */
 static bool nla_ok(const struct nlattr *nla, int rem)
 {
@@ -272,7 +272,7 @@ static bool attr_u64(struct nlattr **tb, int t, uint64_t *out)
 	return true;
 }
 
-/* 属性里的 be16 -> 主机序端口；不存在返回 -1 */
+/* be16 in an attribute -> host-order port; returns -1 if absent */
 static int attr_port(struct nlattr **tb, int t)
 {
 	uint16_t be;
@@ -282,7 +282,7 @@ static int attr_port(struct nlattr **tb, int t)
 	return (int)ntohs(be);
 }
 
-/* 属性里的 be32 -> 点分十进制；不存在返回 false */
+/* be32 in an attribute -> dotted decimal; returns false if absent */
 static bool attr_ip(struct nlattr **tb, int t, char *out, size_t outsz)
 {
 	uint32_t be;
@@ -310,7 +310,7 @@ static bool attr_str(struct nlattr **tb, int t, char *out, size_t outsz)
 	return true;
 }
 
-/* ---------------------------------------------------------------- 连接 */
+/* ---------------------------------------------------------------- connection */
 
 struct nl_ctx {
 	int		fd;
@@ -332,7 +332,7 @@ static void nl_open(struct nl_ctx *c)
 	sa.nl_family = AF_NETLINK;
 	if (bind(c->fd, (struct sockaddr *)&sa, sizeof(sa)) < 0)
 		die("bind(netlink): %s", strerror(errno));
-	/* 回执超时：模块没应答时报错而不是挂死 */
+	/* reply timeout: report an error instead of hanging when the module does not answer */
 	tv.tv_sec = 2;
 	tv.tv_usec = 0;
 	if (setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0)
@@ -340,8 +340,8 @@ static void nl_open(struct nl_ctx *c)
 }
 
 /*
- * 发一条请求并等回执。返回 0 成功、负 errno。
- * reply/replylen 带回第一条数据消息（genlmsghdr + 属性），可为 NULL。
+ * Send one request and wait for the reply. Returns 0 on success, negative errno on failure.
+ * reply/replylen return the first data message (genlmsghdr + attributes); may be NULL.
  */
 static int nl_talk(struct nl_ctx *c, struct iwan_req *r, char *reply,
 		   size_t replysz, size_t *replylen)
@@ -380,7 +380,7 @@ static int nl_talk(struct nl_ctx *c, struct iwan_req *r, char *reply,
 					(const struct nlmsgerr *)NLMSG_DATA(h);
 
 				if (e->error)
-					return e->error;	/* 负 errno */
+					return e->error;	/* negative errno */
 				return 0;			/* ACK */
 			}
 			if (h->nlmsg_type == NLMSG_DONE)
@@ -400,7 +400,7 @@ static int nl_talk(struct nl_ctx *c, struct iwan_req *r, char *reply,
 	}
 }
 
-/* 解析家族 id 与多播组 id（只做一次）；失败带清晰原因退出。 */
+/* Resolve family id and multicast group id (once only); exit with a clear reason on failure. */
 static void nl_resolve(struct nl_ctx *c)
 {
 	struct iwan_req r;
@@ -418,14 +418,14 @@ static void nl_resolve(struct nl_ctx *c)
 	nla_put_str(&r, CTRL_ATTR_FAMILY_NAME, IWAN_GENL_NAME);
 	err = nl_talk(c, &r, reply, sizeof(reply), &rl);
 	if (err)
-		die("查询 genetlink 家族 \"%s\" 失败: %s（模块没加载？）",
+		die("failed to query genetlink family \"%s\": %s (module not loaded?)",
 		    IWAN_GENL_NAME, strerror(-err));
 	if (rl < GENL_HDRLEN)
-		die("家族查询回执过短（%zu 字节）", rl);
+		die("family query reply too short (%zu bytes)", rl);
 	parse_attrs(reply + GENL_HDRLEN, (int)rl - GENL_HDRLEN, tb,
 		    CTRL_ATTR_MAX + 1);
 	if (!attr_u16(tb, CTRL_ATTR_FAMILY_ID, &fam_id) || !fam_id)
-		die("内核回执里没有 CTRL_ATTR_FAMILY_ID");
+		die("kernel reply has no CTRL_ATTR_FAMILY_ID");
 	if (tb[CTRL_ATTR_MCAST_GROUPS]) {
 		struct nlattr *g;
 		int glen = nla_payload_len(tb[CTRL_ATTR_MCAST_GROUPS]);
@@ -449,9 +449,9 @@ static void nl_resolve(struct nl_ctx *c)
 		}
 	}
 	if (!grp_id)
-		die("家族 \"%s\" 没有多播组 \"%s\"（模块版本不匹配？）",
+		die("family \"%s\" has no multicast group \"%s\" (module version mismatch?)",
 		    IWAN_GENL_NAME, IWAN_GENL_MCGRP_EVENTS);
-	fprintf(stderr, "%s: 家族 \"%s\" id=%u, 多播组 \"%s\" id=%d\n",
+	fprintf(stderr, "%s: family \"%s\" id=%u, multicast group \"%s\" id=%d\n",
 		progname, IWAN_GENL_NAME, fam_id, IWAN_GENL_MCGRP_EVENTS,
 		grp_id);
 	c->fam_id = fam_id;
@@ -459,7 +459,7 @@ static void nl_resolve(struct nl_ctx *c)
 	c->resolved = true;
 }
 
-/* ---------------------------------------------------------------- 参数 */
+/* ---------------------------------------------------------------- arguments */
 
 struct args {
 	bool	sid_given, tok_given, enc_given, key_given;
@@ -470,13 +470,13 @@ struct args {
 	uint32_t tok;
 	uint8_t	enc;
 	uint8_t	key[IWAN_KEY_BYTES];
-	uint32_t osrc, odst;	/* be32（inet_pton 结果） */
-	/* 外层 v6 端点与出口 IP（切片 2）。两对地址"都给"是合法输入形态之一
-	 * —— 内核必须 -EINVAL 拒，本工具照发，专门用来测那条判据。 */
+	uint32_t osrc, odst;	/* be32 (inet_pton result) */
+	/* Outer v6 endpoints and egress IP (slice 2). "Giving both" address pairs is one legal input shape
+	 * -- the kernel must reject it with -EINVAL; this tool sends it anyway to test exactly that check. */
 	struct in6_addr osrc6, odst6, ip6;
 	uint16_t dport, sport;
 	uint32_t mtu;
-	uint32_t oif;		/* 显式绑定的承载网卡 ifindex（IWAN_A_OIF） */
+	uint32_t oif;		/* explicitly bound carrier NIC ifindex (IWAN_A_OIF) */
 	int	count, timeout;
 };
 
@@ -488,7 +488,7 @@ static unsigned long parse_ul(const char *s, const char *what)
 	errno = 0;
 	v = strtoul(s, &end, 0);
 	if (errno || end == s || *end)
-		die("%s 不是合法整数: \"%s\"", what, s);
+		die("%s is not a valid integer: \"%s\"", what, s);
 	return v;
 }
 
@@ -497,7 +497,7 @@ static uint16_t parse_u16(const char *s, const char *what)
 	unsigned long v = parse_ul(s, what);
 
 	if (v > 0xffffUL)
-		die("%s 超出 u16 范围: %s", what, s);
+		die("%s is out of u16 range: %s", what, s);
 	return (uint16_t)v;
 }
 
@@ -506,7 +506,7 @@ static uint32_t parse_u32(const char *s, const char *what)
 	unsigned long v = parse_ul(s, what);
 
 	if (v > 0xffffffffUL)
-		die("%s 超出 u32 范围: %s", what, s);
+		die("%s is out of u32 range: %s", what, s);
 	return (uint32_t)v;
 }
 
@@ -521,35 +521,35 @@ static int hexval(char ch)
 	return -1;
 }
 
-/* --key HEX16 -> 8 字节 */
+/* --key HEX16 -> 8 bytes */
 static void parse_key(const char *s, uint8_t out[IWAN_KEY_BYTES])
 {
 	size_t i;
 
 	if (strlen(s) != IWAN_KEY_BYTES * 2)
-		die("--key 需要 %d 个十六进制字符（%d 字节），实际 %zu 个字符",
+		die("--key needs %d hex characters (%d bytes), got %zu characters",
 		    IWAN_KEY_BYTES * 2, IWAN_KEY_BYTES, strlen(s));
 	for (i = 0; i < IWAN_KEY_BYTES; i++) {
 		int hi = hexval(s[2 * i]);
 		int lo = hexval(s[2 * i + 1]);
 
 		if (hi < 0 || lo < 0)
-			die("--key 含非十六进制字符: \"%s\"", s);
+			die("--key contains a non-hex character: \"%s\"", s);
 		out[i] = (uint8_t)((hi << 4) | lo);
 	}
 }
 
-/* IP -> be32（网络序，直接塞进属性） */
+/* IP -> be32 (network order, stuffed into the attribute directly) */
 static uint32_t parse_ip(const char *s, const char *what)
 {
 	struct in_addr a;
 
 	if (inet_pton(AF_INET, s, &a) != 1)
-		die("%s 不是合法 IPv4 地址: \"%s\"", what, s);
+		die("%s is not a valid IPv4 address: \"%s\"", what, s);
 	return a.s_addr;
 }
 
-/* 外层 v6 字面量：允许裸地址与 [地址] 两种写法（与客户端一致） */
+/* Outer v6 literal: allow both a bare address and [address] (matching the client) */
 static void parse_ip6(const char *s, const char *what, struct in6_addr *out)
 {
 	char buf[INET6_ADDRSTRLEN];
@@ -560,14 +560,14 @@ static void parse_ip6(const char *s, const char *what, struct in6_addr *out)
 		n -= 2;
 	}
 	if (n == 0 || n >= sizeof(buf))
-		die("%s 太长/为空: \"%s\"", what, s);
+		die("%s is too long/empty: \"%s\"", what, s);
 	memcpy(buf, s, n);
 	buf[n] = '\0';
 	if (inet_pton(AF_INET6, buf, out) != 1)
-		die("%s 不是合法 IPv6 地址: \"%s\"", what, buf);
+		die("%s is not a valid IPv6 address: \"%s\"", what, buf);
 }
 
-/* ---------------------------------------------------------------- 命令 */
+/* ---------------------------------------------------------------- commands */
 
 static void send_or_die(struct nl_ctx *c, struct iwan_req *r, const char *what,
 			char *reply, size_t replysz, size_t *replylen)
@@ -575,7 +575,7 @@ static void send_or_die(struct nl_ctx *c, struct iwan_req *r, const char *what,
 	int err = nl_talk(c, r, reply, replysz, replylen);
 
 	if (err)
-		die("%s 失败: %s", what, strerror(-err));
+		die("%s failed: %s", what, strerror(-err));
 }
 
 static void put_stats_attrs(struct iwan_req *r, const struct args *a)
@@ -619,13 +619,13 @@ static int cmd_session_up(struct nl_ctx *c, const struct args *a)
 	    !a->dport_given ||
 	    !((a->osrc_given && a->odst_given) ||
 	      (a->osrc6_given && a->odst6_given)))
-		die("session-up 需要 --sid --tok --enc --key --dport 与外层地址对"
-		    "（--outer-src/--outer-dst 或 --outer-src6/--outer-dst6）"
-		    "；--sport/--mtu/--ip6 可选");
+		die("session-up requires --sid --tok --enc --key --dport and an outer address pair"
+		    " (--outer-src/--outer-dst or --outer-src6/--outer-dst6)"
+		    "; --sport/--mtu/--ip6 are optional");
 	if (a->enc > 1)
-		die("--enc 只能是 0 或 1，实际 %u", a->enc);
+		die("--enc must be 0 or 1, got %u", a->enc);
 	if (a->sport_given && !a->sport)
-		die("--sport 不能为 0（省略即用 --dport）");
+		die("--sport must not be 0 (omit it to use --dport)");
 
 	nl_resolve(c);
 	req_init(&r, c->fam_id, NLM_F_REQUEST | NLM_F_ACK, IWAN_CMD_SESSION_UP,
@@ -636,7 +636,7 @@ static int cmd_session_up(struct nl_ctx *c, const struct args *a)
 		if (!a->no_create_dev)
 			flags |= IWAN_A_FLAG_CREATE_DEV;
 		if (a->reserved_flag_bit1)
-			flags |= IWAN_A_FLAG_ANSWER_PING;   /* 保留位，模块应拒绝 */
+			flags |= IWAN_A_FLAG_ANSWER_PING;   /* reserved bit, the module should reject it */
 		nla_put_u32(&r, IWAN_A_FLAGS, flags);
 	}
 	send_or_die(c, &r, "SESSION_UP", reply, sizeof(reply), &rl);
@@ -649,18 +649,18 @@ static int cmd_session_up(struct nl_ctx *c, const struct args *a)
 	has_mtu = attr_u32(tb, IWAN_A_MTU, &rmtu);
 	has_owned = attr_u32(tb, IWAN_A_DEV_OWNED, &rowned);
 	if (!has_dev) {
-		/* 回执缺 DEVNAME 时按设计默认名，让脚本还能继续并给出提示 */
+		/* When the reply lacks DEVNAME, use the designed default name so scripts can continue with a warning */
 		snprintf(dev, sizeof(dev), "iwan0");
-		fprintf(stderr, "%s: 警告: SESSION_UP 回执没有 IWAN_A_DEVNAME，"
-			"按 \"iwan0\" 处理\n", progname);
+		fprintf(stderr, "%s: warning: SESSION_UP reply has no IWAN_A_DEVNAME, "
+			"treating it as \"iwan0\"\n", progname);
 	}
 	printf("DEVNAME=%s\n", dev);
 	printf("MTU=%u\n", has_mtu ? rmtu :
 	       (a->mtu_given ? a->mtu : 1500 - 36));
 	printf("MTU_FROM_REPLY=%d\n", has_mtu ? 1 : 0);
-	/* DEV_OWNED=1：这张 iwan0 是模块建的（SESSION_DOWN 会删它）；
-	 * 0：不是模块建的（例如用户自己 ip link add 的 iwan 设备）；
-	 * 老内核没有这个属性时回 -1，脚本据此跳过该项断言。 */
+	/* DEV_OWNED=1: this iwan0 was created by the module (SESSION_DOWN deletes it);
+	 * 0: not created by the module (for example an iwan device the user added with ip link add);
+	 * older kernels without this attribute return -1, and scripts skip that assertion accordingly. */
 	printf("DEV_OWNED=%d\n", has_owned ? (int)rowned : -1);
 	printf("DEV_OWNED_FROM_REPLY=%d\n", has_owned ? 1 : 0);
 	return 0;
@@ -688,7 +688,7 @@ static int cmd_set_peer(struct nl_ctx *c, const struct args *a)
 	int sport, dport;
 
 	if (!a->odst_given)
-		die("set-peer 需要 --outer-dst IP（--sport/--dport 可选）");
+		die("set-peer requires --outer-dst IP (--sport/--dport optional)");
 
 	nl_resolve(c);
 	req_init(&r, c->fam_id, NLM_F_REQUEST | NLM_F_ACK, IWAN_CMD_SET_PEER,
@@ -726,7 +726,7 @@ static int cmd_set_enabled(struct nl_ctx *c, int val)
 	struct iwan_req r;
 
 	if (val != 0 && val != 1)
-		die("set-enabled 只接受 0 或 1，实际 %d", val);
+		die("set-enabled accepts only 0 or 1, got %d", val);
 	nl_resolve(c);
 	req_init(&r, c->fam_id, NLM_F_REQUEST | NLM_F_ACK, IWAN_CMD_SET_ENABLED,
 		 IWAN_GENL_VERSION);
@@ -736,7 +736,7 @@ static int cmd_set_enabled(struct nl_ctx *c, int val)
 	return 0;
 }
 
-/* 事件里控制帧的类型名（PROTOCOL.md 冻结值） */
+/* Control frame type names in events (frozen values from PROTOCOL.md) */
 static const char *frame_type_name(uint8_t t)
 {
 	switch (t) {
@@ -776,7 +776,7 @@ static const char *peer_state_name(uint8_t s)
 	}
 }
 
-/* 一条事件：事件名 + 属性；控制帧把帧字节 hex 打印并标注帧类型 */
+/* One event: event name + attributes; control frames print frame bytes as hex and label the frame type */
 static void print_event(uint8_t cmd, struct nlattr **tb)
 {
 	char ip[INET_ADDRSTRLEN];
@@ -837,7 +837,7 @@ static void print_event(uint8_t cmd, struct nlattr **tb)
 	fflush(stdout);
 }
 
-/* 嵌套 IWAN_A_STATS 里的计数器；缺属性按 0 */
+/* Counters inside the nested IWAN_A_STATS; missing attributes count as 0 */
 static long long stat_val(struct nlattr **st, int idx)
 {
 	uint64_t v = 0;
@@ -895,8 +895,8 @@ static int cmd_get_stats(struct nl_ctx *c)
 	attr_u32(tb, IWAN_A_FLAGS, &flags);
 	attr_ip(tb, IWAN_A_OUTER_SRC, osrc, sizeof(osrc));
 	attr_ip(tb, IWAN_A_OUTER_DST, odst, sizeof(odst));
-	/* 承载网卡绑定：请求值（oif/bind_ip）与**实际生效**的承载网卡
-	 * （carrier）一起打印——三者不一致就是排障要找的线索 */
+	/* Carrier NIC binding: the requested values (oif/bind_ip) and the **actually effective** carrier
+	 * (carrier) are printed together -- inconsistency among the three is the clue to look for when debugging */
 	attr_u32(tb, IWAN_A_OIF, &oif);
 	attr_ip(tb, IWAN_A_IP, bip, sizeof(bip));
 	attr_u32(tb, IWAN_A_CARRIER, &carrier);
@@ -910,7 +910,7 @@ static int cmd_get_stats(struct nl_ctx *c)
 			sprintf(keyhex + 2 * i, "%02x", k[i]);
 	}
 
-	/* 稳定顺序的 KEY=value；缺的属性是空值，脚本只 grep 需要的键 */
+	/* KEY=value in stable order; missing attributes are empty and scripts grep only the keys they need */
 	printf("error=%s\n", err ? strerror(-err) : "");
 	printf("session=%d\n", ((has_sid && sid) || (has_tok && tok) ||
 				(has_dev && dev[0])) ? 1 : 0);
@@ -950,7 +950,7 @@ static int cmd_get_stats(struct nl_ctx *c)
 	printf("tx_err=%lld\n", stat_val(st, IWAN_S_TX_ERR));
 
 	if (err)
-		fprintf(stderr, "%s: GET_STATS 失败: %s\n", progname,
+		fprintf(stderr, "%s: GET_STATS failed: %s\n", progname,
 			strerror(-err));
 	return rc;
 }
@@ -964,7 +964,7 @@ static int cmd_events(struct nl_ctx *c, const struct args *a)
 	one = c->grp_id;
 	if (setsockopt(c->fd, SOL_NETLINK, NETLINK_ADD_MEMBERSHIP, &one,
 		       sizeof(one)) < 0)
-		die("加入多播组 \"%s\"(id=%d) 失败: %s",
+		die("failed to join multicast group \"%s\"(id=%d): %s",
 		    IWAN_GENL_MCGRP_EVENTS, c->grp_id, strerror(errno));
 	printf("READY=1\n");
 	fflush(stdout);
@@ -995,7 +995,7 @@ static int cmd_events(struct nl_ctx *c, const struct args *a)
 			die("poll: %s", strerror(errno));
 		}
 		if (pr == 0)
-			break;			/* 超时 */
+			break;			/* timeout */
 		n = recv(c->fd, buf, sizeof(buf), 0);
 		if (n < 0) {
 			if (errno == EINTR || errno == EAGAIN)
@@ -1022,7 +1022,7 @@ static int cmd_events(struct nl_ctx *c, const struct args *a)
 		}
 	}
 	if (a->count > 0 && got < a->count) {
-		fprintf(stderr, "%s: events 超时：只收到 %d/%d 条（timeout=%ds）\n",
+		fprintf(stderr, "%s: events timeout: received only %d/%d (timeout=%ds)\n",
 			progname, got, a->count, a->timeout);
 		rc = 4;
 	}
@@ -1080,7 +1080,7 @@ int main(int argc, char **argv)
 		return 0;
 	}
 
-	optind = 2;	/* 跳过子命令，从它的参数开始解析 */
+	optind = 2;	/* skip the subcommand; parse starting from its arguments */
 	while ((c = getopt_long(argc, argv, "", long_opts, NULL)) != -1) {
 		switch (c) {
 		case OPT_SID:
@@ -1095,7 +1095,7 @@ int main(int argc, char **argv)
 			uint32_t v = parse_u32(optarg, "--enc");
 
 			if (v > 1)
-				die("--enc 只能是 0 或 1，实际 %u", v);
+				die("--enc must be 0 or 1, got %u", v);
 			a.enc = (uint8_t)v;
 			a.enc_given = true;
 			break;
@@ -1164,31 +1164,31 @@ int main(int argc, char **argv)
 	nl_open(&ctx);
 	if (!strcmp(cmd, "session-up")) {
 		if (optind != argc)
-			die("session-up 有多余参数: %s", argv[optind]);
+			die("session-up has extra arguments: %s", argv[optind]);
 		rc = cmd_session_up(&ctx, &a);
 	} else if (!strcmp(cmd, "session-down")) {
 		if (optind != argc)
-			die("session-down 不接受参数");
+			die("session-down takes no arguments");
 		rc = cmd_session_down(&ctx);
 	} else if (!strcmp(cmd, "set-peer")) {
 		if (optind != argc)
-			die("set-peer 有多余参数: %s", argv[optind]);
+			die("set-peer has extra arguments: %s", argv[optind]);
 		rc = cmd_set_peer(&ctx, &a);
 	} else if (!strcmp(cmd, "set-enabled")) {
 		if (optind != argc - 1)
-			die("用法: iwan_ctl set-enabled 0|1");
+			die("usage: iwan_ctl set-enabled 0|1");
 		rc = cmd_set_enabled(&ctx,
 				     (int)parse_ul(argv[optind], "set-enabled"));
 	} else if (!strcmp(cmd, "get-stats")) {
 		if (optind != argc)
-			die("get-stats 不接受参数");
+			die("get-stats takes no arguments");
 		rc = cmd_get_stats(&ctx);
 	} else if (!strcmp(cmd, "events")) {
 		if (optind != argc)
-			die("events 有多余参数: %s", argv[optind]);
+			die("events has extra arguments: %s", argv[optind]);
 		rc = cmd_events(&ctx, &a);
 	} else {
-		fprintf(stderr, "%s: 未知子命令 \"%s\"\n", progname, cmd);
+		fprintf(stderr, "%s: unknown subcommand \"%s\"\n", progname, cmd);
 		usage(stderr);
 		return 2;
 	}

@@ -88,7 +88,7 @@ int pp_http_target(const char *s, size_t n, bool is_connect,
             s += 8;
             n -= 8;
             /* R47-H1-04: an https:// absolute-URI must default to port
-             * 443, not the 80 hardcoded above — the scheme was stripped
+             * 443, not the 80 hardcoded above -- the scheme was stripped
              * but never remembered. An explicit :port later in the
              * authority overrides this default (both parse paths write
              * `port`). http:// keeps 80; CONNECT is unaffected
@@ -191,8 +191,8 @@ int pp_socks_greeting(const uint8_t *d, size_t n, bool have_token,
     size_t nmethods;
     int want = have_token ? 2 : 0;
     /* courtesy fallback: a token-less server normally selects 0x00, but
-     * a client that offers ONLY RFC1929 (0x02) — e.g. curl -U against a
-     * passwordless proxy — must not be rejected with 0xff; the server
+     * a client that offers ONLY RFC1929 (0x02) -- e.g. curl -U against a
+     * passwordless proxy -- must not be rejected with 0xff; the server
      * accepts the auth flow and validates nothing. */
     int fallback = have_token ? -1 : 2;
 
@@ -269,8 +269,8 @@ int pp_socks_auth_frame(const uint8_t *d, size_t n, char *user,
         return -1;
     if (ulen >= usz)
         /* R46-L4: distinct from the malformed-frame verdict below (return
-         * 0). This frame is complete and well-shaped — RFC1929 ulen is a
-         * single byte, so up to 255 is legal — but the username does not
+         * 0). This frame is complete and well-shaped -- RFC1929 ulen is a
+         * single byte, so up to 255 is legal -- but the username does not
          * fit the caller's `usz` buffer. Callers may treat it as an auth
          * attempt (relay counts it toward the brute-force lockout, R37
          * R1-B-5) rather than a protocol violation. */
@@ -325,7 +325,7 @@ int pp_socks_request(const uint8_t *d, size_t n, uint8_t *cmd,
         out->af = 6;
     } else if (atyp == 3) {
         /* H1 (bughunt): n>=4 is guaranteed above, but reading d[4]
-         * needs n>=5 — a 4-byte frame (05 01 00 03) would OOB/uninit
+         * needs n>=5 -- a 4-byte frame (05 01 00 03) would OOB/uninit
          * read past the frame. Check the domain-length byte's own
          * address before touching it; the full frame bound below
          * (n < 5 + l + 2) then guards the copy. */

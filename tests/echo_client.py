@@ -26,7 +26,7 @@ def socks5_connect(proxy, target_host, target_port):
     ph, pp = proxy
     s = socket.create_connection((ph, pp), timeout=10)
     s.sendall(b"\x05\x01\x00")
-    # R30 F6/F7: full reads — recv() may split the greeting/reply and a
+    # R30 F6/F7: full reads -- recv() may split the greeting/reply and a
     # bare recv(2)/recv(10) then broke the handshake under load
     if recv_exact(s, 2) != SOCKS5_OK:
         s.close()
@@ -51,7 +51,7 @@ def recv_exact(s, n):
 
 
 def run_bulk(s, total_bytes):
-    """Streaming throughput phase: keep the pipe full — write
+    """Streaming throughput phase: keep the pipe full -- write
     continuously while a reader thread drains the echoed bytes. The
     echo rounds already verified byte-exactness; here only the byte
     count matters (the echo server mirrors verbatim). Returns

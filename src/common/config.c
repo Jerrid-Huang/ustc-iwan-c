@@ -51,7 +51,7 @@ static char *home_dir(void)
 {
 #ifdef _WIN32
     /* no passwd database on Windows: USERPROFILE (the port layer's
-     * canonical home) first, then $HOME for msys-style environments —
+     * canonical home) first, then $HOME for msys-style environments --
      * absolute POSIX-style paths only, matching the Linux paranoia */
     char *h = port_home_dir();
     if (h && *h)

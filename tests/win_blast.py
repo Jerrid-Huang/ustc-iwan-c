@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
-"""宿主侧吞吐打流器 / 收流器（Windows 客户端吞吐测量配套）。
+"""Host-side throughput sender / sink (companion for Windows client throughput measurement).
 
-计量口径跟 Linux 基准（tests/bench_proto.sh）保持一致：**只算过线的净荷**，
-pps 按净荷包数、bps 按净荷字节数，另外单独报"发包侧调用次数"以便和净荷区分
-（sendto 成功不等于对端收到，slirp 也会丢）。
+Accounting matches the Linux baseline (tests/bench_proto.sh): **only payload that crosses the wire**,
+pps from payload packet count, bps from payload bytes, plus a separate "sender call count" to distinguish it from payload
+(a successful sendto does not mean the peer received it; slirp drops too).
 
-三种角色：
-  send   宿主发 -> 客体收（标定 slirp 通道的上行容量）
-  sink   宿主收 <- 客体发（标定下行容量，或量隧道出向的外层流速）
-  loop   自环（拿进程自己的上限当参照，避免"量到的是尺子"）
+Three roles:
+  send   host sends -> guest receives (calibrate the slirp channel's uplink capacity)
+  sink   host receives <- guest sends (calibrate downlink, or measure the tunnel's outbound outer rate)
+  loop   self-loop (use the process's own limit as a reference so the "ruler" itself is not measured)
 
-用法：
+Usage:
   win_blast.py send <IP> <PORT> <SECONDS> [PAYLOAD]
   win_blast.py sink <PORT> <SECONDS> [PAYLOAD]
   win_blast.py loop <SECONDS> [PAYLOAD]
 
-输出一行可解析的汇总：
+Output one parseable summary line:
   BLAST role=send pkts=N bytes=N elapsed=SEC rate_pps=N rate_mbps=N
 """
 import socket
@@ -33,16 +33,16 @@ def report(role, pkts, nbytes, elapsed):
 
 
 def do_send(ip, port, seconds, size):
-    """尽量快地发：缓冲区提前建好，循环里只做 sendto。"""
+    """Send as fast as possible: preallocate the buffer, only sendto in the loop."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 << 20)
-    sock.connect((ip, port))          # connect 之后用 send，省去每次解析地址
+    sock.connect((ip, port))          # use send after connect to avoid resolving the address every time
     buf = bytes(size)
     pkts = nbytes = 0
     t0 = time.perf_counter()
     deadline = t0 + seconds
     while time.perf_counter() < deadline:
-        for _ in range(64):           # 小批内循环，少读两次时钟
+        for _ in range(64):           # small inner batch, fewer clock reads
             try:
                 sock.send(buf)
             except OSError:
@@ -77,11 +77,11 @@ def do_sink(port, seconds, expect):
     sock.close()
     report("sink", pkts, nbytes, elapsed)
     if other:
-        print("BLAST sink_other=%d（净荷长度与期望不符，未计入）" % other, flush=True)
+        print("BLAST sink_other=%d (payload length did not match, not counted)" % other, flush=True)
 
 
 def do_loop(seconds, size):
-    """自环：同一进程发自己收，得到这台机器/这个进程的尺子上限。"""
+    """Self-loop: same process sends and receives, giving the ruler limit of this machine/process."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 << 20)
     sock.bind(("127.0.0.1", 0))
@@ -125,7 +125,7 @@ def main():
     elif role == "loop":
         do_loop(float(sys.argv[2]), int(sys.argv[3]) if len(sys.argv) > 3 else PAYLOAD)
     else:
-        print("未知角色 %s" % role)
+        print("unknown role %s" % role)
         return 2
     return 0
 

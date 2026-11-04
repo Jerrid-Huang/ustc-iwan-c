@@ -124,7 +124,7 @@ static void validate_aliases(const cli_opt *opts, size_t nopts,
          * dereferencing past the string. Every read stays in-bounds: t
          * is NULL-checked first, t[0]/t[1] exist for any non-NULL
          * string, and t[2] is reached only when t[0]=='-' && t[1]=='-'
-         * — i.e. at a length-2 string ("--") where t[2] is the
+         * -- i.e. at a length-2 string ("--") where t[2] is the
          * terminating NUL, or a longer string with a real character. */
         if (t == NULL || t[0] != '-' || t[1] != '-' || t[2] == '\0') {
             fprintf(stderr,
@@ -149,7 +149,7 @@ static void track_flag(Cli *c, const cli_opt *o, const cli_ctl *ctl)
 {
     (void)ctl;
     /* L7 (bughunt): dedup against seen_names[] (unbounded) instead of
-     * the 16-slot usage render table — the render table is filled only
+     * the 16-slot usage render table -- the render table is filled only
      * for the first CLI_MAX_USAGE distinct options, so a 17th+ option
      * would escape duplication detection. */
     for (int j = 0; j < c->nseen; j++)
@@ -306,7 +306,7 @@ void cli_parse(Cli *c, int argc, char **argv, int start,
     /* R14-A2 (leak fix): seen_names[] is a grow-only realloc array; the
      * pointed-to strings are static option names from the caller's opts
      * table (never individually allocated here), so only the pointer
-     * array itself must be freed. Done on the single normal return — the
+     * array itself must be freed. Done on the single normal return -- the
      * -h/--help/-V and error paths exit() the process instead, so the
      * successful parse was the one leak that outlived the CLI layer (an
      * ASan build reported it on every well-formed invocation). Null out

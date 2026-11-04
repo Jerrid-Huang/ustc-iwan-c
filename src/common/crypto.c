@@ -22,12 +22,12 @@ typedef uint64_t u64_may_alias __attribute__((may_alias));
  * OPENSSL_init_crypto -> CRYPTO_THREAD_run_once -> pthread_once ->
  * CRYPTO_THREAD_lock_new -> CRYPTO_zalloc; when that malloc returns NULL the
  * ONCE control block is left run==done (the callback is marked finished even
- * though it never completed), so OPENSSL_init_crypto() NEVER RETURNS — the
- * thread blocks forever in futex(FUTEX_WAIT) — and the
+ * though it never completed), so OPENSSL_init_crypto() NEVER RETURNS -- the
+ * thread blocks forever in futex(FUTEX_WAIT) -- and the
  * `if (crypto_init() != 0) oom_abort();` line after it is never reached. An
  * injected single NULL malloc therefore produced a silent permanent hang, not
  * a diagnostic; it also made pure-CLI paths (--help, no args, bad
- * subcommand) initialise libcrypto at all — they did ZERO libcrypto work on
+ * subcommand) initialise libcrypto at all -- they did ZERO libcrypto work on
  * e07fe75 and survived any single malloc failure there. Measured on OpenSSL
  * 3.5.5: `FI_FAIL=malloc:1` / `#2` -> rc=124 (timeout) for --help before this
  * change (see .cc_tmp/r39fix/logs/crypto/before.txt).
@@ -36,7 +36,7 @@ typedef uint64_t u64_may_alias __attribute__((may_alias));
  * allocations through the functions installed here. Ours never return NULL
  * (a genuine OOM takes oom_abort() instead), so the once/lock state machine
  * can no longer observe an allocation failure and can never be left
- * inconsistent — there is nothing left to hang on. CRYPTO_set_mem_functions()
+ * inconsistent -- there is nothing left to hang on. CRYPTO_set_mem_functions()
  * must be the FIRST libcrypto call in the process: it returns 0 once the
  * library has been initialised by any other call, and it is the only hook
  * that covers every internal allocation. Returning 0 is fatal here (never
@@ -307,8 +307,8 @@ int hex_decode(const char *hex, size_t hexlen, uint8_t *out, size_t outcap)
         return -1;
     for (size_t i = 0; i < n; i++) {
         /* hex_nibble (util.h) takes a plain `char` and accepts only the
-         * three ASCII digit ranges; every other byte — including every
-         * negative `char` (0x80..0xFF on the wire) — falls through to its
+         * three ASCII digit ranges; every other byte -- including every
+         * negative `char` (0x80..0xFF on the wire) -- falls through to its
          * -1 "invalid" result. Widening the argument to `unsigned char`
          * first was a no-op, because the parameter converts it straight
          * back to `char`; it only produced -Wsign-conversion noise. The

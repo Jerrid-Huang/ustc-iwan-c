@@ -63,7 +63,7 @@ bool valid_listen(const char *val, char *err, size_t errsz)
  * R14 H-1: an EMPTY token is equally dangerous in the opposite
  * direction. Callers key "is auth configured?" off the option being
  * non-NULL, and both --socks-token= and --socks-token "" arrive here as
- * a non-NULL "" — so an empty value used to "pass" this check, get stored
+ * a non-NULL "" -- so an empty value used to "pass" this check, get stored
  * as a set token, and silently turn --allow-remote into an open
  * (passwordless) proxy. Empty must be rejected outright. */
 bool validate_token_len(const char *val, char *err, size_t errsz)
@@ -153,8 +153,20 @@ int auth_result_addrs(const AuthResult *res, uint32_t *inner_ip,
                       uint32_t *gateway)
 {
     uint8_t b[4];
-    if (!s2ip4(res->tun, b))
-        return 0;
+    if (!s2ip4(res->tun, b)) {
+        if (!res->unissued)
+            return 0;
+        /* Minimal ACK (server no longer issues an address after upgrade): socks/proxy only use inner_ip
+         * as the inner source address; pick a deterministic address within 172.31.0.0/16 so the same token
+         * stays stable across reconnects; the gateway takes .1 in the same subnet, used only for the lwIP routing table. */
+        uint32_t h = res->tok ? (res->tok * 2654435761u) : 0x5bd1e995u;
+        uint32_t x = (h >> 16) % 62u + 1u;
+        uint32_t y = (h >> 8) % 250u + 2u;
+        *inner_ip = 0xAC1F0000u | (x << 16) | y;
+        if (gateway)
+            *gateway = 0xAC1F0000u | (x << 16) | 1u;
+        return 1;
+    }
     *inner_ip = ip4_u32(b);
     if (!s2ip4(res->gw, b))
         return -1;
@@ -162,7 +174,7 @@ int auth_result_addrs(const AuthResult *res, uint32_t *inner_ip,
     return 1;
 }
 
-/* ---- --data-plane （见 cli_common.h 的契约） ---- */
+/* ---- --data-plane (see the contract in cli_common.h) ---- */
 
 bool validate_data_plane(const char *val, char *err, size_t errsz)
 {
@@ -172,37 +184,37 @@ bool validate_data_plane(const char *val, char *err, size_t errsz)
         return true;
     if (strcmp(val, IWAN_DATA_PLANE_KERNEL) == 0) {
 #if defined(__linux__) || defined(_WIN32)
-        /* Linux = 内核模块 iwan；Windows = WFP callout 驱动 iwan.sys。
-         * 两者语义相同（内核态数据面、报文不进用户态），所以共用同一个取值。
-         * 驱动没装时由运行期决定：auto 会回退 TUN，显式 kernel 报错退出。 */
+        /* Linux = kernel module iwan; Windows = WFP callout driver iwan.sys.
+         * Both have the same semantics (kernel-mode data plane, packets do not enter userspace), so they share one value.
+         * When the driver is not installed the runtime decides: auto falls back to TUN, an explicit kernel exits with an error. */
         return true;
 #else
-        /* 其余平台（macOS 等）显式传 kernel 必须是用法错误，不能静默降级：
-         * 那台机器上根本不存在这条路径 */
+        /* On other platforms (macOS etc.) an explicit kernel must be a usage error, not a silent fallback:
+         * that path simply does not exist on such a machine */
         snprintf(err, errsz,
-                 "内核数据面（--data-plane kernel）只在 Linux 与 Windows 上可用："
-                 "当前平台没有内核数据面，请用 --data-plane tun（默认的 auto 在本平台就是 tun）");
+                 "The kernel data plane (--data-plane kernel) is available only on Linux and Windows: "
+                 "this platform has no kernel data plane, use --data-plane tun (the default auto is tun on this platform)");
         return false;
 #endif
     }
     if (strcmp(val, IWAN_DATA_PLANE_KERNEL_MP) == 0) {
 #if defined(_WIN32)
-        /* 第二个内核数据面（NDIS 微型端口 + 协议驱动 iwanmp.sys）。它不是
-         * 默认选择，只在显式点名时使用 —— 新平面还在验证阶段。 */
+        /* The second kernel data plane (NDIS miniport + protocol driver iwanmp.sys). It is not
+         * the default choice and is used only when explicitly named -- the new plane is still in the validation phase. */
         return true;
 #else
         snprintf(err, errsz,
-                 "内核数据面（--data-plane kernel-mp）只在 Windows 上可用："
-                 "它是 NDIS 微型端口 + 协议驱动那一版（iwanmp.sys），"
-                 "Linux 侧的内核面就叫 kernel");
+                 "The kernel data plane (--data-plane kernel-mp) is available only on Windows: "
+                 "it is the NDIS miniport + protocol driver version (iwanmp.sys), "
+                 "on Linux the kernel plane is simply called kernel");
         return false;
 #endif
     }
     snprintf(err, errsz,
-             "只能是 auto、tun、kernel 或 kernel-mp"
-             "（auto = 默认，Linux 与 Windows 上先试内核面、不可用则回退 tun；"
-             "kernel = 内核数据面，仅 Linux 与 Windows 可用；"
-             "kernel-mp = Windows 的 NDIS 内核数据面），实际是 \"%s\"", val);
+             "must be auto, tun, kernel or kernel-mp"
+             " (auto = default, try the kernel plane first on Linux and Windows, fall back to tun if unavailable; "
+             "kernel = kernel data plane, Linux and Windows only; "
+             "kernel-mp = Windows NDIS kernel data plane), got \"%s\"", val);
     return false;
 }
 

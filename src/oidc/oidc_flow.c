@@ -49,7 +49,7 @@ char *oidc_build_dev_body(const char *type, const char *device_id,
 #ifndef _WIN32
 /* R37-WG-E1 (L21): XDG_RUNTIME_DIR/TMPDIR are inherited environment, not a
  * contract: a relative value ("." or "relative/dir") used to drop the state
- * file into the current working directory — possibly a shared one — and a
+ * file into the current working directory - possibly a shared one - and a
  * value pointing at someone else's directory is not ours to write into.
  * Accept only an existing absolute directory owned by us or by root (so
  * /tmp, root-owned and sticky, stays eligible); the mitigations around the
@@ -109,7 +109,7 @@ static char *state_file_path(void)
         oidc_die("out of memory");   /* fail closed: cannot persist the state */
 #ifdef _WIN32
     /* no uid on Windows: the USERNAME env var stands in for the per-user
-     * directory component. This is not a security boundary — the file is
+     * directory component. This is not a security boundary - the file is
      * 0600-created with O_EXCL and the random suffix does that work. */
     const char *user = getenv("USERNAME");
     snprintf(p, n, "%s/iwan-oidc-state-%.32s-%08lx", dir,
@@ -149,7 +149,7 @@ static void save_state_file(const char *path, const char *state,
 #endif
         oidc_die("cannot create OAuth state file %s", path);
     }
-    /* two lines: state, then nonce (R49-L3) — both are written in one
+    /* two lines: state, then nonce (R49-L3) - both are written in one
      * fputs run, so a partially-written file (crash mid-write) cannot
      * look like a complete previous state */
     if (fputs(state, f) == EOF || fputc('\n', f) == EOF ||
@@ -191,7 +191,7 @@ static int load_state_file(const char *path, char *state_out, size_t state_sz,
     ssize_t n;
     /* R37-WG-E1 (R3-L4): a signal delivered mid-read made this return -1,
      * and the caller reported it as "authorization response state does not
-     * match the saved state (CSRF check failed)" — an ordinary IO hiccup
+     * match the saved state (CSRF check failed)" - an ordinary IO hiccup
      * presented as an attack, forcing a fresh login. Retry EINTR. */
     do {
         n = read(fd, buf, sizeof buf - 1);
@@ -372,11 +372,11 @@ static Json *exchange_code(const char *code, const char *code_verifier)
     if (!https_post(OIDC_AUTH_HOST, OIDC_TOKEN_PATH, (char *)body.data,
                     headers, &st, &resp)) {
         /* R4-03-4: free resp on the die path, but format the message
-         * FIRST — oidc_die consumes its args immediately and resp must
+         * FIRST - oidc_die consumes its args immediately and resp must
          * still be alive while it is read */
         char msg[512];
         /* R37-WG-E1 (L28): the token endpoint's response body is remote
-         * controlled — neutralize it for the terminal, keeping the raw
+         * controlled - neutralize it for the terminal, keeping the raw
          * pointer for the cleanse below */
         char *resp_s = oidc_printable_dup(resp && *resp ? resp
                                                        : "no response (transport error)");
@@ -396,7 +396,7 @@ static Json *exchange_code(const char *code, const char *code_verifier)
     OPENSSL_cleanse(body.data, body.len);
     buf_free(&body);
     if (st != 200) {
-        /* R4-03-4: same ordering — format before freeing resp */
+        /* R4-03-4: same ordering - format before freeing resp */
         char msg[512];
         /* R37-WG-E1 (L28): same remote-controlled body as above */
         char *resp_s = oidc_printable_dup(resp ? resp : "");
@@ -449,7 +449,7 @@ static void check_csrf_state(const char *cb_state, const char *saved,
      * comparisons in this tree (crypto.c ct_eq); state is a fixed-length
      * CSPRNG string, so a length check first is fine. ct_eq returns
      * non-zero on a MATCH, so a mismatch dies on == 0 (the polarity
-     * here was once inverted — see bughunt SUMMARY-2 H2). */
+     * here was once inverted - see bughunt SUMMARY-2 H2). */
     if (!have_state || strlen(cb_state) != strlen(saved) ||
         ct_eq(cb_state, saved, strlen(cb_state)) == 0)
         oidc_die("authorization response state does not match the saved "
@@ -567,8 +567,8 @@ void oidc_login(char **kp_out, char **user_out)
     char *kp = take_access_token(tok);
     /* R49-L3: the id_token must echo the nonce we issued (validate_claims
      * rejects a missing/mismatched nonce, fail closed). `have_state` is
-     * always true here — check_csrf_state above dies unless the persisted
-     * record was actually loaded — the conditional is API robustness. */
+     * always true here - check_csrf_state above dies unless the persisted
+     * record was actually loaded - the conditional is API robustness. */
     const char *id_token = verify_id_token(tok,
                                            have_state ? saved_nonce : NULL);
     /* the nonce has served its session-binding purpose: scrub it like the
@@ -576,7 +576,7 @@ void oidc_login(char **kp_out, char **user_out)
     OPENSSL_cleanse(nonce, strlen(nonce));
     free(nonce);
     /* L2 (bughunt): scrub the refresh_token/access_token heap strings
-     * before json_free drops them — they outlive their use by a long
+     * before json_free drops them - they outlive their use by a long
      * shot (offline_access scope), so swap-forget is out. */
     {
         const char *rt = json_get_str(tok, "refresh_token");
@@ -592,7 +592,7 @@ void oidc_login(char **kp_out, char **user_out)
     {
         /* R37-WG-E1 (L28): the name inside the (signature-verified)
          * id_token is still issuer-controlled text; the returned
-         * *user_out keeps the raw value — only this print is filtered */
+         * *user_out keeps the raw value - only this print is filtered */
         char *user_s = oidc_printable_dup(username);
         oidc_eprintf("  Authenticated as %s\n", user_s);
         free(user_s);
@@ -671,7 +671,7 @@ int oidc_ctrl_post(const char *path, const char *body,
     int st = 0;
     char *resp = NULL;
     if (!https_post(OIDC_CONTROLLER_HOST, path, body, headers, &st, &resp)) {
-        /* R13-M-6: auth holds "Authorization: Bearer <token>" — scrub
+        /* R13-M-6: auth holds "Authorization: Bearer <token>" - scrub
          * the heap copy before release (R12 L-7: OPENSSL_cleanse) */
         OPENSSL_cleanse(auth, strlen(auth));
         free(auth);

@@ -3,17 +3,17 @@
  * Every accepted connection is re-opened on the local kernel stack, so
  * the traffic obeys the TUN routing rules (default route / --proxy-cidr
  * selection) like any other system traffic. The tunnel data plane is
- * untouched: no lwIP, no session sockets — this file only bridges the
+ * untouched: no lwIP, no session sockets -- this file only bridges the
  * listener to kernel sockets.
  *
  * Protocol surface (one shared port):
  *   SOCKS5 greeting + RFC1929 auth + CONNECT (ATYP 1/3/4)
  *   HTTP CONNECT (tunnel) and absolute-URI forwarding (the original
- *   request line is sent verbatim — RFC 7230 servers accept absolute
+ *   request line is sent verbatim -- RFC 7230 servers accept absolute
  *   URIs on a proxy connection)
  *
  * Thread model: one accept thread; two GLOBAL direction threads
- * (poll-based event loop) shared by all connections — up thread
+ * (poll-based event loop) shared by all connections -- up thread
  * (client -> upstream) and down thread (upstream -> client).
  * relay_proxy_stop closes the listener; every connection is closed
  * and freed when both direction threads retire it (in_use reference
@@ -63,7 +63,7 @@
 
 /* R47-H1-02: bound the number of concurrent BLOCKING getaddrinfo()
  * calls. Resolution is the only handshake step outside the
- * RP_HS_TOTAL_MS budget — a slow / unresponsive resolver used to pin
+ * RP_HS_TOTAL_MS budget -- a slow / unresponsive resolver used to pin
  * up to RP_MAX_CONNS handshake threads for the resolver's whole
  * timeout, blocking every new connection relay-wide. A small cap keeps
  * the saturated case bounded: further connections wait at most
@@ -72,7 +72,7 @@
  * same resolver. The cap is deliberately small (16): healthy lookups
  * finish in milliseconds, the bounded wait absorbs transient bursts,
  * and only a genuinely wedged resolver saturates it. (Chosen over a
- * per-call timeout — a blocking getaddrinfo cannot be interrupted
+ * per-call timeout -- a blocking getaddrinfo cannot be interrupted
  * portably, and a threaded async resolver is unjustified complexity
  * for this L.) */
 #define RP_DNS_MAX_INFLIGHT 16
@@ -129,8 +129,8 @@ static atomic_int g_rp_est_n;
 /* R37 R5 (R3-L22): effective cap on the ESTABLISHED set. The compile-time
  * value (RP_MAX_ESTABLISHED) is only reachable when the process can hold
  * the whole handshake set at the same time as the established set:
- * RP_MAX_CONNS handshake threads, each holding an accepted fd plus —
- * while rp_connect_target runs — a second one (2*RP_MAX_CONNS fds), plus a
+ * RP_MAX_CONNS handshake threads, each holding an accepted fd plus --
+ * while rp_connect_target runs -- a second one (2*RP_MAX_CONNS fds), plus a
  * small working reserve. Under the common soft RLIMIT_NOFILE=1024 the old
  * fixed cap was unreachable: EMFILE arrived first and the client saw a
  * dropped handshake or a rep=5/502 instead of the intended "relay full"
@@ -147,8 +147,8 @@ static atomic_int g_rp_est_n;
  * RLIMIT_NOFILE of 256 and hardened Linux images 512, so that was the
  * COMMON case, not an edge case. relay_proxy_start() now scales the
  * reserve with the granted limit: limit/4, clamped at the ceiling
- * RP_FD_RESERVE, with a floor of min(lim/2, 2*RP_MAX_CONNS) —
- * R34-A2-1 — so the floor itself always fits the limit and a small
+ * RP_FD_RESERVE, with a floor of min(lim/2, 2*RP_MAX_CONNS) --
+ * R34-A2-1 -- so the floor itself always fits the limit and a small
  * limit keeps a usable cap (lim=256 -> cap 64, lim=512 -> cap 128,
  * instead of the R33-B2-L2 collapse to 1). For
  * lim >= 2*RP_MAX_CONNS the reserve covers the whole instantaneous
@@ -158,7 +158,7 @@ static atomic_int g_rp_est_n;
  * arises from fd pressure. For lim < 2*RP_MAX_CONNS the limit cannot
  * hold a full handshake set at all; the reserve takes
  * min(lim/2, 2*RP_MAX_CONNS), established + reserve <= lim stays exact
- * (2*room = lim - reserve), so the established set is never trimmed —
+ * (2*room = lim - reserve), so the established set is never trimmed --
  * but a same-instant full handshake burst can still EMFILE. That
  * window is physically unavoidable below 2*RP_MAX_CONNS and self-heals
  * (the burst is momentary; the next poll/accept round has fds again);
@@ -169,14 +169,14 @@ static int g_rp_max_est = RP_MAX_ESTABLISHED;
 /* R37 R5 (R3-L21, R3-L22): the relay's refusal notices used to be one line
  * per connection, so a full relay (or a dead data plane) could be driven
  * into writing stderr at connection rate. Allow one line per second per
- * site — the same shape as the listener poll/accept warnings below.
+ * site -- the same shape as the listener poll/accept warnings below.
  * now_ms() is monotonic 64-bit milliseconds, so the unsigned difference
  * cannot wrap.
  * R37 R6 (R6-4): the latch is a _Atomic uint64_t with relaxed load/store
- * — the same idiom as last_spawn_warn_ms below. The plain static it used
+ * -- the same idiom as last_spawn_warn_ms below. The plain static it used
  * to be was a real data race (TSan): rp_note_est_full/rp_note_plane_down
  * are reached from every connection thread at once. Two racers may still
- * each print once inside the same second, which is harmless — the bound
+ * each print once inside the same second, which is harmless -- the bound
  * is what matters. */
 static bool rp_note_due(_Atomic uint64_t *last_ms)
 {
@@ -207,7 +207,7 @@ static void rp_note_plane_down(void)
  * success byte goes out, so a client that is told rep=0/200 really has a
  * slot. The R5 read-only pre-check (rp_est_full()) narrowed the window but
  * left it open: N threads could all read n < cap, only one could then win
- * the slot in rp_add(), and the losers had already answered "success" —
+ * the slot in rp_add(), and the losers had already answered "success" --
  * measured as "answered rep=0, then the pair is closed" (R6-A/R6-I).
  *
  * Returns true when a slot was taken; the caller MUST then either hand the
@@ -231,9 +231,9 @@ static bool rp_est_reserve(void)
 
 /* Release a reservation that rp_add() did not consume.
  *
- * R38 (R8-P2-3): the caller's `reserved` token is one-shot — rp_add()
+ * R38 (R8-P2-3): the caller's `reserved` token is one-shot -- rp_add()
  * consumes it when it takes ownership and rp_conn_main()'s `out:` clears it
- * before releasing — so this decrement runs at most once per reservation.
+ * before releasing -- so this decrement runs at most once per reservation.
  *
  * Deliberately NOT clamped at zero: a clamp would keep the counter from
  * going negative, but it cannot restore the cap (a success-path extra
@@ -289,7 +289,7 @@ static void rp_hs_init(struct rp_hs *hs)
 
 /* Poll within the handshake budget for the requested events: the poll
  * timeout is the remaining absolute budget capped at
- * RP_HANDSHAKE_TIMEOUT_MS (the per-poll ceiling still applies — the
+ * RP_HANDSHAKE_TIMEOUT_MS (the per-poll ceiling still applies -- the
  * total budget is independent). EINTR is not a timeout: a signal-
  * interrupted poll is retried while budget remains (M1). Returns 1
  * when the desired event fired, 0 on timeout, budget exhaustion or a
@@ -380,8 +380,8 @@ static int rp_send_full(const struct rp_hs *hs, int fd, const void *buf,
  * four call sites that forward USER PAYLOAD BYTES ALREADY READ OUT OF
  * the client socket (SOCKS CONNECT post-frame tail, HTTP CONNECT
  * post-header tail, HTTP absolute-URI head, HTTP request body). For
- * those bytes a failed send is unrecoverable data loss — the same
- * non-drop argument R21 (dbd5ccb) applied to the relay data plane — so
+ * those bytes a failed send is unrecoverable data loss -- the same
+ * non-drop argument R21 (dbd5ccb) applied to the relay data plane -- so
  * the transient send-pressure errors ENOBUFS/ENOMEM are retried (1 ms
  * backoff, then a POLLOUT wait drawn from the same handshake budget)
  * instead of failing the send: `done` is untouched (w<0 wrote nothing),
@@ -442,7 +442,7 @@ static ssize_t rp_hs_recv(struct rp_hs *hs, int fd, void *buf, size_t len)
 /* R50-C1: empty a peer's unread receive bytes before a refusal close.
  * Linux close() with unread data in the receive queue sends RST
  * instead of FIN, and the RST discards the freshly-sent refusal reply
- * from the peer's buffer — dynamically proven in R50 (probe431.py:
+ * from the peer's buffer -- dynamically proven in R50 (probe431.py:
  * every >8 KiB flood header got "HTTP/1.1 431" then ECONNRESET, since
  * a 431 can only fire when the peer sent more than could be read, i.e.
  * >= 1 byte unread at close; probe502rst.py: 502 + 16/64 KiB pipelined
@@ -451,13 +451,13 @@ static ssize_t rp_hs_recv(struct rp_hs *hs, int fd, void *buf, size_t len)
  * clean EOF.
  *
  * Why drain and not shutdown(fd, SHUT_WR): SHUT_WR half-closes only
- * the WRITE side — the unread receive data that triggers the kernel's
+ * the WRITE side -- the unread receive data that triggers the kernel's
  * RST-on-close is still queued, so the subsequent close() would RST
  * anyway. Draining is the only option that yields FIN, and it lets
  * the peer finish reading the reply before the FIN completes.
  *
  * Bounded: at most RP_HS_INPUT_MAX bytes are consumed (the same
- * absolute budget the handshake already draws from — the parser would
+ * absolute budget the handshake already draws from -- the parser would
  * never have processed more input than this), in a nonblocking recv
  * loop with no poll and no sleep: a peer that keeps refilling the
  * buffer just burns the byte budget and the loop ends in microseconds,
@@ -483,7 +483,7 @@ static void rp_drain_in(int fd)
 /* ---- RFC1929 brute-force lockout (M6c/L6) ----
  * Same semantics as the SOCKS-mode table in socks_flow.c: only
  * WELL-FORMED RFC1929 frames whose credentials fail count toward the
- * budget — wrong-token frames AND (R37 R1-B-5) well-shaped frames with
+ * budget -- wrong-token frames AND (R37 R1-B-5) well-shaped frames with
  * an oversized username are auth attempts; genuinely malformed frames
  * (VER!=1, zero-length ulen/plen) are protocol violations, not auth
  * attempts, so a probe flood cannot lock a legitimate user out
@@ -491,7 +491,7 @@ static void rp_drain_in(int fd)
  * source out for another window; a successful auth clears the source;
  * locked sources are dropped at accept() time. Two differences: the
  * table holds 64 entries (L6: the SOCKS table's 16 was too small for a
- * shared-NAT world), and it is mutex-guarded — unlike the
+ * shared-NAT world), and it is mutex-guarded -- unlike the
  * single-threaded SOCKS event loop, every relay proxy connection runs
  * on its own thread.
  *
@@ -544,7 +544,7 @@ static bool rp_fail_key_of(const struct sockaddr_storage *ss,
 
 static void rp_fail_note(const rp_fail_key *key, bool success)
 {
-    /* M3-2: NULL guard first — rp_fail_key_bytes dereferences key (the
+    /* M3-2: NULL guard first -- rp_fail_key_bytes dereferences key (the
      * old code called it before this check, making the guard dead code
      * and the getpeername-failed path a latent crash) */
     if (!key)
@@ -570,8 +570,8 @@ static bool rp_fail_blocked(const rp_fail_key *key)
 
 /* literal IPv4/IPv6: connect directly, no resolution. The connect runs
  * nonblocking (R4-08-F3): on a blocking socket POSIX never returns
- * EINPROGRESS, so the old code's EINPROGRESS branch — the only place the
- * RP_CONNECT_TIMEOUT_MS bound was applied — was dead and a black-holed
+ * EINPROGRESS, so the old code's EINPROGRESS branch -- the only place the
+ * RP_CONNECT_TIMEOUT_MS bound was applied -- was dead and a black-holed
  * literal target could pin a connection thread for the OS's ~130s
  * default timeout. Now it matches the domain path: nonblock connect,
  * poll for writability within RP_CONNECT_TIMEOUT_MS, check SO_ERROR,
@@ -633,7 +633,7 @@ static int rp_connect_literal(int af, const void *addr, uint16_t port,
         /* immediate success */
     } else if (errno == EINPROGRESS || errno == EINTR) {
         /* R37 R3-L3: POSIX says a signal-interrupted connect() on a
-         * nonblocking socket does NOT abort the attempt — the connection
+         * nonblocking socket does NOT abort the attempt -- the connection
          * is still being established, so wait for POLLOUT like
          * EINPROGRESS instead of reporting "Interrupted system call" as
          * an immediate connect failure (a single-address host then failed
@@ -642,7 +642,7 @@ static int rp_connect_literal(int af, const void *addr, uint16_t port,
          * of aborting the connect (M1) */
         struct pollfd pfd = { .fd = PORT_FD_ARG(fd), .events = POLLOUT };
         if (rp_poll_retry(&pfd, RP_CONNECT_TIMEOUT_MS) <= 0) {
-            /* R46-L6: connect TIMED OUT — RFC 1928 host unreachable (4) */
+            /* R46-L6: connect TIMED OUT -- RFC 1928 host unreachable (4) */
             port_close(fd);
             if (fail_rep)
                 *fail_rep = 4;
@@ -652,7 +652,7 @@ static int rp_connect_literal(int af, const void *addr, uint16_t port,
         socklen_t sl = sizeof soerr;
         if (port_getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr,
                             &sl) != 0 || soerr != 0) {
-            /* R46-L6: async connect failed — map the SO_ERROR like an
+            /* R46-L6: async connect failed -- map the SO_ERROR like an
              * immediate errno (soerr==0 with a failed getsockopt reads
              * as a general failure) */
             port_close(fd);
@@ -667,7 +667,7 @@ static int rp_connect_literal(int af, const void *addr, uint16_t port,
         return -1;
     }
     /* restore blocking for the relay threads; if the mode cannot be
-     * restored, treat it as a connect failure — a stray nonblocking fd
+     * restored, treat it as a connect failure -- a stray nonblocking fd
      * would alias EAGAIN as a hard relay error (C-F4) */
     if (port_set_nonblock(fd, false) != 0) {
         port_close(fd);
@@ -721,7 +721,7 @@ static bool rp_target_blocked(bool guard, int af, const uint8_t *p)
                                            0, 0, 0xff, 0xff };
         if (memcmp(p, lo, 16) == 0)
             return true;                    /* ::1 */
-        /* :: — same rationale as the v4 0.0.0.0 check: on Linux
+        /* :: -- same rationale as the v4 0.0.0.0 check: on Linux
          * connect(AF_INET6,[::]) routes to loopback, so this is an
          * alternate spelling of ::1 that would bypass the gate; a
          * proxy must not be asked to reach an unspecified address
@@ -743,13 +743,13 @@ static bool rp_target_blocked(bool guard, int af, const uint8_t *p)
 
 /* Resolve (when needed) and connect to the target. Returns 0 with the
  * connected fd in *fd_out; on success also reports the ACTUAL upstream
- * socket family in *up_af (AF_INET/AF_INET6) when up_af != NULL — the
+ * socket family in *up_af (AF_INET/AF_INET6) when up_af != NULL -- the
  * family the SOCKS reply's BND.ATYP must match (R46-L5: for a domain
  * target the RESOLVED address's family, not the request's ATYP; literal
  * targets always report their own family). Returns -2 when every
  * candidate was refused by the SSRF gate, -1 on any other failure; on
  * ANY failure, *fail_rep (when non-NULL) holds the RFC 1928 reply code
- * the SOCKS caller must send — 4 for DNS failure / connect timeout /
+ * the SOCKS caller must send -- 4 for DNS failure / connect timeout /
  * host unreachable, 5 for refused / general (R46-L6). */
 static int rp_connect_target(int *fd_out, int *up_af, const char *host,
                              uint16_t port, bool have_ip4,
@@ -784,13 +784,13 @@ static int rp_connect_target(int *fd_out, int *up_af, const char *host,
         return rp_connect_literal(AF_INET6, ip6, port, fd_out, fail_rep);
     }
     /* domain: resolve, then try every address (v4 and v6). The gate
-     * must judge each RESOLVED address — checking only the hostname
+     * must judge each RESOLVED address -- checking only the hostname
      * would let DNS rebinding slip through. */
     if (!rp_dns_acquire()) {
         /* R47-H1-02: the resolver concurrency cap is saturated (a slow
          * DNS server pins the in-flight lookups for its full timeout).
-         * Fail this connection as a DNS failure — rep=4 in SOCKS mode,
-         * 502 in HTTP mode — instead of queueing yet another handshake
+         * Fail this connection as a DNS failure -- rep=4 in SOCKS mode,
+         * 502 in HTTP mode -- instead of queueing yet another handshake
          * thread behind the same resolver. */
         if (fail_rep)
             *fail_rep = 4;
@@ -830,10 +830,10 @@ static int rp_connect_target(int *fd_out, int *up_af, const char *host,
             }
         }
         /* R47-FIXA-L1: this candidate passed the gate, so any failure
-         * below is a REAL target failure. A mixed result set — some
+         * below is a REAL target failure. A mixed result set -- some
          * candidates gate-refused, others really failing (split-horizon
          * DNS: one private/loopback record + one public-refusing record)
-         * — must report the real cause like socks_flow, NOT the
+         * -- must report the real cause like socks_flow, NOT the
          * all-gate-refused rep=2. */
         real_fail = true;
         fd = port_socket(ai->ai_family, SOCK_STREAM, 0);
@@ -850,7 +850,7 @@ static int rp_connect_target(int *fd_out, int *up_af, const char *host,
             last = fd;
             last_af = ai->ai_family;
         } else if (errno == EINPROGRESS || errno == EINTR) {
-            /* R37 R3-L3: see rp_connect_literal — EINTR does not abort a
+            /* R37 R3-L3: see rp_connect_literal -- EINTR does not abort a
              * nonblocking connect */
             /* rp_poll_retry: EINTR keeps this candidate waiting within
              * the timeout instead of skipping it (M1) */
@@ -907,7 +907,7 @@ static int rp_connect_target(int *fd_out, int *up_af, const char *host,
         /* R47-FIXA-L1: -2 (SSRF gate refusal, rep=2) ONLY when every
          * candidate was refused by the gate. If any candidate really
          * tried to connect and failed, report the real cause (fail_rep
-         * set below) — the all-gate-refused latch previously masked a
+         * set below) -- the all-gate-refused latch previously masked a
          * mixed result set as rep=2. */
         return (blocked && !real_fail) ? -2 : -1;
     }
@@ -949,14 +949,14 @@ static bool rp_read_full(int fd, uint8_t *buf, size_t want,
 static void rp_socks_reply(int fd, uint8_t rep, const struct rp_hs *hs,
                            bool v6)
 {
-    /* R45-L1: RFC 1928 requires BND.ATYP to match the target family —
+    /* R45-L1: RFC 1928 requires BND.ATYP to match the target family --
      * answering a CONNECT ATYP=4 (IPv6) upstream with the fixed IPv4
      * frame made strict clients (JDK style) reject even a successful
      * tunnel. A v6 success now returns the 22-byte frame {5, rep, 0, 4,
      * 16x ::, 0, 0}: the proxy is not bound to a concrete source
      * address, so BND.ADDR/port are zero by convention, exactly like
      * the lwIP SOCKS mode's socks_reply6 (socks_flow.c). Error replies
-     * (rep != 0) stay on the 10-byte v4 frame — RFC 1928 allows a zero
+     * (rep != 0) stay on the 10-byte v4 frame -- RFC 1928 allows a zero
      * BND.ADDR there and v4 keeps maximum compatibility. */
     uint8_t r[22] = {5, rep, 0, v6 ? 4 : 1};
     size_t n = v6 ? sizeof r : 10;
@@ -969,9 +969,9 @@ static void rp_socks_reply(int fd, uint8_t rep, const struct rp_hs *hs,
 
 /* returns 0 on success with the upstream connected; -1 on failure.
  * Frame parsing (greeting / RFC1929 / CONNECT) is delegated to
- * proto_parse.c — the same parsers as SOCKS mode.
+ * proto_parse.c -- the same parsers as SOCKS mode.
  *
- * fk: peer lockout key (NULL when getpeername failed — no tracking);
+ * fk: peer lockout key (NULL when getpeername failed -- no tracking);
  * hs: handshake watchdog state; guard: SSRF gate armed for this
  * connection (M7). */
 static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
@@ -1038,7 +1038,7 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
         uint8_t ok[2] = {5, 2};
         (void)rp_send_full(hs, fd, ok, sizeof ok);
         /* RFC1929: [1, ulen, user..., plen, pass...]. Token-less mode
-         * accepts any well-formed frame (courtesy — a client that
+         * accepts any well-formed frame (courtesy -- a client that
          * offered only 0x02, e.g. curl -U, must not be rejected). */
         char user[64];
         const uint8_t *pass;
@@ -1075,7 +1075,7 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
                  * is legal). That is a real brute-force auth attempt (a
                  * credential guess with an oversized user field), so the
                  * deliberate lockout count from R37 R1-B-5 is KEPT.
-                 * R46-L4: this is the ONLY pr!=1 case that counts — see
+                 * R46-L4: this is the ONLY pr!=1 case that counts -- see
                  * the pr==0 branch below. */
                 uint8_t rr[2] = {1, 1};
                 rp_fail_note(fk, false);
@@ -1086,7 +1086,7 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
                 /* R46-L4: a genuinely malformed frame (VER!=1, ulen=0,
                  * plen=0) is a protocol violation, NOT an auth attempt.
                  * Answer {1,1} and close, but do NOT count it toward the
-                 * peer's lockout budget — the M6c contract and the
+                 * peer's lockout budget -- the M6c contract and the
                  * socks_flow equivalent (socks_flow.c auth_reject) only
                  * count well-formed wrong credentials, and tests/
                  * socks_handshake.py marks ulen=0/plen=0/VER!=1 as
@@ -1125,7 +1125,7 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
     for (;;) {
         if (pp_socks_request(b, n, &cmd, &rep, &t) == 0) {
             /* L5: per-connection metadata is too noisy for the
-             * unconditional error log — debug only */
+             * unconditional error log -- debug only */
             log_debug("socks: request ok cmd=%u af=%u port=%u\n", cmd,
                       t.af, t.port);
             break;
@@ -1156,7 +1156,7 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
     /* R4-08-F1: bytes that arrived past the CONNECT frame were already
      * read out of the client socket during the handshake (rp_hs_recv
      * reads in multi-KB chunks), so they must be forwarded to the
-     * upstream once it is connected — the relay's direction loop starts
+     * upstream once it is connected -- the relay's direction loop starts
      * from empty buffers and would otherwise silently drop this
      * pipelined tunnel data. Compute the consumed frame length the same
      * way the parser does (b[3] = ATYP). */
@@ -1187,7 +1187,7 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
              *
              * R37 R7: the check is now a real CAS reservation taken before
              * the reply, so there is no residual "another thread took the
-             * last slot after I checked" window left — the losers of the
+             * last slot after I checked" window left -- the losers of the
              * race are refused here, with rep=1, instead of being told
              * rep=0 and then disconnected. */
             if (!rp_est_reserve()) {
@@ -1204,7 +1204,7 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
             /* R12-T2 (R41-3-1): the reservation gates the cap-full
              * cause only; a DEAD data plane is the second way rp_add()
              * refuses after the reply. Refuse with rep=1 before any
-             * rep=0 goes out — answering "established" and then closing
+             * rep=0 goes out -- answering "established" and then closing
              * is the lie the review measured. `out:` rolls the
              * reservation back (hs->reserved is already set). */
             if (rp_plane_dead()) {
@@ -1214,14 +1214,14 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
                 return -1;
             }
             /* R45-L1 / R46-L5: a success reply's BND.ATYP must match the
-             * family of the ACTUAL upstream socket — the literal family
+             * family of the ACTUAL upstream socket -- the literal family
              * for an ATYP=1/4 request (a literal v6 target gets the
              * 22-byte v6 frame, exactly as before R46-L5), and the
              * RESOLVED family for a domain (ATYP=3) request: a domain
              * that connected via IPv6 gets the 22-byte v6 frame even
              * though the request carried no family. This is the same
              * dispatch as the lwIP SOCKS mode, where a domain is keyed
-             * on the DNS result's family (socks_flow.c target_af) — the
+             * on the DNS result's family (socks_flow.c target_af) -- the
              * earlier comment claimed "the literal family the client
              * asked for governs, matching the lwIP side", which a domain
              * request (t.af == 0) made false. */
@@ -1229,14 +1229,14 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
             /* R37 R6 (K-5): rp_send_full, not a bare port_send. The
              * upstream socket is blocking here, so the old check could
              * not tell a SHORT write or an EINTR from a hard failure and
-             * failed the connection closed — silently losing the bytes
+             * failed the connection closed -- silently losing the bytes
              * already read out of the client socket. rp_send_full
              * completes EINTR/short writes (bounded by the handshake
              * budget) and still fails closed if the bytes cannot be
              * delivered at all. */
             if (n > frame_end &&
                 /* R23 (T2): user payload already read out of the client
-                 * socket (post-frame tail) — transient ENOBUFS/ENOMEM
+                 * socket (post-frame tail) -- transient ENOBUFS/ENOMEM
                  * must not drop it (rp_send_full_payload); the SOCKS
                  * handshake replies above stay on rp_send_full (control,
                  * client-retryable) */
@@ -1249,9 +1249,9 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
         }
         /* M7: a gate refusal is "not allowed" (rep 2), everything else
          * is classified by cause (R46-L6): rp_connect_target mapped the
-         * failure — DNS failure / connect timeout / host unreachable ->
+         * failure -- DNS failure / connect timeout / host unreachable ->
          * rep 4 (host unreachable, RFC 1928), ECONNREFUSED / general ->
-         * rep 5 — mirroring the lwIP SOCKS mode's reply codes. */
+         * rep 5 -- mirroring the lwIP SOCKS mode's reply codes. */
         rp_socks_reply(fd, rc == -2 ? 2 : fail_rep, hs, false);
         return -1;
     }
@@ -1260,7 +1260,7 @@ static int rp_handle_socks(int fd, const uint8_t *first, size_t first_n,
 /* ---- HTTP ---- */
 
 /* R47-H1-01: answer a malformed / unsupported HTTP request with the
- * same 502 the lwIP twin sends (socks_flow.c http-mode error path) —
+ * same 502 the lwIP twin sends (socks_flow.c http-mode error path) --
  * an HTTP client expects a status line for every request, so closing
  * with zero response bytes was a silent hang/retry-loop. The response
  * is a static string; no user-controlled byte is ever echoed, so there
@@ -1275,9 +1275,9 @@ static void rp_http_bad(struct rp_hs *hs, int fd)
 /* R52-B1: HTTP forward is SINGLE-REQUEST semantics. The absolute-URI
  * forward pins one client connection to the upstream chosen at handshake
  * time and the two direction threads then relay it as a transparent
- * duplex pipe that NEVER parses the byte stream again — so a second
+ * duplex pipe that NEVER parses the byte stream again -- so a second
  * request on the same connection cannot be re-dispatched to a different
- * origin, and RFC 7230 §6.3.6 (a proxy MUST NOT forward a request whose
+ * origin, and RFC 7230 section 6.3.6 (a proxy MUST NOT forward a request whose
  * authority differs from the connection it would reuse) is violated
  * silently for exactly that (itself non-compliant) client. Honest
  * assessment: under this transparent-pipe architecture the defect is NOT
@@ -1287,30 +1287,30 @@ static void rp_http_bad(struct rp_hs *hs, int fd)
  * cost:
  *
  *   - the forwarded request's head is rewritten so it carries exactly
- *     one `Connection: close` (RFC 7230 §6.1/§6.6 `close` option). A
+ *     one `Connection: close` (RFC 7230 section 6.1/section 6.6 `close` option). A
  *     compliant upstream then answers with Connection: close and closes
  *     its side; the relay passes that EOF through (SHUT_WR + close), so
  *     the client connection ends after ONE response and a compliant
  *     client never gets a chance to reuse it across origins.
  *   - the client is then expected to pool requests per origin (RFC 7230
- *     §6.3.6) and gets a fresh connection per request.
+ *     section 6.3.6) and gets a fresh connection per request.
  *   - RESIDUAL (documented, not concealable): a client that ignores the
  *     close hint and sends a second request on the still-open pipe (or
  *     pipelines it before upstream's close) is still forwarded to the
- *     FIRST upstream — the blind pipe cannot tell. The residual is also
+ *     FIRST upstream -- the blind pipe cannot tell. The residual is also
  *     inherent to any non-compliant upstream that keeps the connection
  *     open despite Connection: close. Neither is detectable post-
- *     handshake in this architecture; they are exactly RFC 7230 §6.3.6's
+ *     handshake in this architecture; they are exactly RFC 7230 section 6.3.6's
  *     reason for requiring per-origin pooling.
  *
  * The CONNECT tunnel is exempt: after the 200 the connection is opaque
  * (TLS/arbitrary bytes), there is no HTTP request/response stream to
- * re-dispatch and no response to annotate — nothing this rewrite could
+ * re-dispatch and no response to annotate -- nothing this rewrite could
  * add.
  *
- * Upgrade/101 (WebSocket, RFC 7230 §6.7, RFC 6455 §4.1) is a second
+ * Upgrade/101 (WebSocket, RFC 7230 section 6.7, RFC 6455 section 4.1) is a second
  * exemption: a 101 does not end the exchange, it switches the connection
- * to a bidirectional tunnel — no second request can be re-dispatched and
+ * to a bidirectional tunnel -- no second request can be re-dispatched and
  * no cross-origin reuse is possible, so the single-request defence has
  * no hazard to defend here, while the close injection itself would
  * corrupt the handshake (compliant origins only answer 101 to a request
@@ -1322,31 +1322,31 @@ static void rp_http_bad(struct rp_hs *hs, int fd)
  * existing `Connection` header line (skipped) and inserts one
  * `Connection: close\r\n` as the last header, so the forwarded head
  * carries exactly one, canonical, non-ambiguous close option. Header
- * names are matched case-insensitively per RFC 7230 §3.2, tolerating
+ * names are matched case-insensitively per RFC 7230 section 3.2, tolerating
  * OWS before the ':' (R54-WG1-1), via a single shared rp_hdr_name_eq()
  * used by both the exact-size pre-scan and the emit loop. Returns the
  * rewritten length, or 0 meaning "no rewrite: forward the original head
- * verbatim" — for an Upgrade request (R53-A-1) or when the exact
+ * verbatim" -- for an Upgrade request (R53-A-1) or when the exact
  * rewritten size `need` (R53-A-3, precomputed exactly) exceeds outcap. In
  * both cases nothing is written and the caller forwards the original
  * head (same guarantee as forever: the relay never misroutes MORE than
  * today).
  *
  * R53-A-1: the R52-B1 rewrite must NOT touch Upgrade requests. RFC 7230
- * §6.7 / RFC 6455 §4.1: a proxy has to forward the Upgrade verbatim so a
- * compliant origin can answer 101 — rewriting `Connection: Upgrade` into
+ * section 6.7 / RFC 6455 section 4.1: a proxy has to forward the Upgrade verbatim so a
+ * compliant origin can answer 101 -- rewriting `Connection: Upgrade` into
  * `Connection: close` made every strict origin reply 400 and killed
  * WebSocket-over-HTTP-proxy handshakes (a real probe: relay leg got
  * 400 where the direct leg got 101). And the B1 rationale does not apply
  * to a 101: 101 does not END the exchange, it switches the connection to
- * a bidirectional tunnel — there is no second request, no cross-origin
+ * a bidirectional tunnel -- there is no second request, no cross-origin
  * keep-alive frame to re-dispatch, the origin was bound at handshake and
  * the pipe is opaque. So an Upgrade request is exempt: return 0 and the
  * caller forwards the head byte-for-byte, preserving the client's own
  * Connection header family, which for an Upgrade request legitimately
- * contains Upgrade plus whatever else the client paired with it —
+ * contains Upgrade plus whatever else the client paired with it --
  * rewriting any part of it would corrupt the handshake. */
-/* R54-WG1-1 (same family as the un-fixed R53-A-2): per RFC 7230 §3.2 a
+/* R54-WG1-1 (same family as the un-fixed R53-A-2): per RFC 7230 section 3.2 a
  * sender may put optional whitespace (OWS: SP/HTAB) between a header
  * field name and its ':'. Real clients do ("Upgrade : websocket",
  * "Connection : keep-alive"), and the relay must recognise the name in
@@ -1357,13 +1357,13 @@ static void rp_http_bad(struct rp_hs *hs, int fd)
  * obs-fold continuation that lacks one) never matches; an obs-fold
  * continuation line (leading SP/HTAB) that DOES contain a ':' cannot
  * false-positive either, because only whitespace IMMEDIATELY before the
- * colon is stripped — its leading whitespace stays part of the compared
+ * colon is stripped -- its leading whitespace stays part of the compared
  * prefix, and a leading SP/HTAB byte can never equal the first byte of
  * the 7-byte/10-byte names. On a match the colon's index is written to
  * *colon_out (when non-NULL) so callers can inspect the value.
  * rp_http_force_close uses THIS ONE helper in both its pre-scan and its
  * emit walk, so the two passes agree byte-for-byte on which lines are an
- * Upgrade field and which are a Connection field — they can never drift
+ * Upgrade field and which are a Connection field -- they can never drift
  * (the R53-A-3 exact-size `need` contract holds for every spelling). */
 static bool rp_hdr_name_eq(const uint8_t *line, size_t llen,
                            const char *name, size_t namelen,
@@ -1409,21 +1409,21 @@ static size_t rp_http_force_close(uint8_t *out, size_t outcap,
      * rewrite below (the two walks MUST agree byte-for-byte on which and
      * how many bytes the rewrite emits, so the terminator is skipped
      * identically and the Connection-header / Upgrade-header recognition
-     * is identical). It computes two facts before any byte is written —
+     * is identical). It computes two facts before any byte is written --
      * if either makes the rewrite undesired or impossible, we return 0
      * with NOTHING written and the caller forwards the original head
      * verbatim:
      *
-     *   is_upgrade (R53-A-1 + R54-WG1-1): an `Upgrade:` field —
+     *   is_upgrade (R53-A-1 + R54-WG1-1): an `Upgrade:` field --
      *     case-insensitive 7-byte name "upgrade", ':' and a value
      *     holding at least one non-OWS byte (a bare "Upgrade: " is not
      *     a protocol switch; RFC 6455 requires a protocol name). The
-     *     name match is OWS-tolerant: RFC 7230 §3.2 lets a sender place
+     *     name match is OWS-tolerant: RFC 7230 section 3.2 lets a sender place
      *     SP/HTAB before the ':' ("Upgrade : websocket") and real
-     *     clients do, so the match walks back over that whitespace —
+     *     clients do, so the match walks back over that whitespace --
      *     see the shared rp_hdr_name_eq() helper used by BOTH this
      *     pre-scan and the rewrite below (one code path, two calls, so
-     *     the passes can never drift). RFC 7230 §6.7 / RFC 6455 §4.1:
+     *     the passes can never drift). RFC 7230 section 6.7 / RFC 6455 section 4.1:
      *     the proxy must forward the Upgrade so a compliant origin can
      *     answer 101, and the close injection would corrupt the
      *     handshake (see the function doc). The request line cannot
@@ -1435,7 +1435,7 @@ static size_t rp_http_force_close(uint8_t *out, size_t outcap,
      *   need (R53-A-3): the EXACT number of bytes the rewrite would emit,
      *     accumulated with the same rules (a kept line = content + 2, a
      *     dropped Connection line = 0, the final blank line = cclen + 2).
-     *     There is no useful closed-form upper bound — a lone-EOL head
+     *     There is no useful closed-form upper bound -- a lone-EOL head
      *     that still fits the 8 KiB read buffer can balloon ~1.5x (e.g.
      *     4000 x "A\n" + CRLFCRLF needs ~12 KiB out), so the old "8 KiB
      *     +32B always fits" claim was false: the check-then-write macro
@@ -1459,7 +1459,7 @@ static size_t rp_http_force_close(uint8_t *out, size_t outcap,
             break;
         }
         /* R54-WG1-1 + R53-A-1: field-name recognition runs through the
-         * SAME rp_hdr_name_eq() helper as the rewrite walk below — both
+         * SAME rp_hdr_name_eq() helper as the rewrite walk below -- both
          * passes locate the ':', walk back over any OWS before it and
          * compare the same fixed-length name, so `Connection : ...` and
          * `Upgrade : ...` spellings are recognised IDENTICALLY in the
@@ -1502,7 +1502,7 @@ static size_t rp_http_force_close(uint8_t *out, size_t outcap,
         size_t llen = e - i;
         if (llen > 0) {
             /* R54-WG1-1: same OWS-tolerant, case-insensitive name match
-             * as the pre-scan (rp_hdr_name_eq) — the request line has no
+             * as the pre-scan (rp_hdr_name_eq) -- the request line has no
              * ':' that could equal "connection", and a ':' inside e.g.
              * the request-URI can never match after the walk-back */
             bool is_conn = rp_hdr_name_eq(head + i, llen, "connection", 10,
@@ -1540,14 +1540,14 @@ static int rp_handle_http(int fd, const uint8_t *first, size_t first_n,
     size_t n = first_n, hdr_end;
     ssize_t r;
 
-    /* R4-08-F2: no minimum first-packet size here — a legitimately
+    /* R4-08-F2: no minimum first-packet size here -- a legitimately
      * fragmented HTTP request whose first recv() returned < 8 bytes is
      * read to the header terminator below, exactly like the SOCKS path
      * reads a full frame. (The scan guard `i = 4` below simply does
      * nothing until n >= 4.) */
     memcpy(buf, first, first_n);
     /* read until \r\n\r\n. L1: the scan must also run on the final
-     * chunk — `n < sizeof buf - 1` skipped the batch that brought n to
+     * chunk -- `n < sizeof buf - 1` skipped the batch that brought n to
      * 8191, so a legal ~8191-byte header whose terminator arrived in
      * that batch was misjudged as incomplete. With `n < sizeof buf`
      * the last (8191-byte) batch is scanned too; a terminator found
@@ -1570,14 +1570,14 @@ static int rp_handle_http(int fd, const uint8_t *first, size_t first_n,
         }
         if (r == 0 && sizeof buf - 1 - n == 0) {
             /* R47-H1-03: the header outgrew the 8 KiB cap without a
-             * \r\n\r\n terminator — an overlong head (large cookie /
+             * \r\n\r\n terminator -- an overlong head (large cookie /
              * delegation) or LF-only line endings. Reply 431 instead of
              * hanging up silently. The lwIP twin accepts up to 64 KiB
              * (HANDSHAKE_INPUT_MAX); the relay deliberately keeps the
-             * conservative 8 KiB stack buf — a 64 KiB buf across
+             * conservative 8 KiB stack buf -- a 64 KiB buf across
              * RP_MAX_CONNS handshake threads would cost ~16 MiB of
              * thread stacks, and the handshake already caps cumulative
-             * input at RP_HS_INPUT_MAX — so the cap stays at 8 KiB and
+             * input at RP_HS_INPUT_MAX -- so the cap stays at 8 KiB and
              * the refusal is now visible and protocol-correct. */
             static const char toobig[] =
                 "HTTP/1.1 431 Request Header Fields Too Large\r\n"
@@ -1589,7 +1589,7 @@ static int rp_handle_http(int fd, const uint8_t *first, size_t first_n,
                       errno == EINTR)) {
             if (rp_hs_poll(hs, fd) <= 0) {
                 /* R47-H1-01: mirror socks_flow's http_mode 502 on a
-                 * handshake timeout — an HTTP client expects a status
+                 * handshake timeout -- an HTTP client expects a status
                  * line for every request, even one that stalled. */
                 rp_http_bad(hs, fd);
                 return -1;
@@ -1599,7 +1599,7 @@ static int rp_handle_http(int fd, const uint8_t *first, size_t first_n,
         return -1;
     }
     if (hdr_end == (size_t)-1) {
-        /* unreachable fence — every not-found exit above already replied
+        /* unreachable fence -- every not-found exit above already replied
          * (431 for the cap, 502 for the timeout) or is a hard read error
          * where the peer is gone */
         return -1;
@@ -1610,7 +1610,7 @@ static int rp_handle_http(int fd, const uint8_t *first, size_t first_n,
     while (mn < hdr_end && buf[mn] != ' ')
         mn++;
     if (mn == 0 || mn >= hdr_end) {
-        /* R47-H1-01: no method token — malformed request line. */
+        /* R47-H1-01: no method token -- malformed request line. */
         rp_http_bad(hs, fd);
         return -1;
     }
@@ -1660,7 +1660,7 @@ static int rp_handle_http(int fd, const uint8_t *first, size_t first_n,
         (void)rp_send_full(hs, fd, bad, sizeof bad - 1);
         return -1;
     }
-    /* R37 R5 (R3-L21): the HTTP path had the same lie as SOCKS — it
+    /* R37 R5 (R3-L21): the HTTP path had the same lie as SOCKS -- it
      * answered 200 Connection Established (or forwarded the request) and
      * only then had rp_add() refuse the pair. Map "set full" to 503 before
      * any success bytes go out. */
@@ -1672,11 +1672,11 @@ static int rp_handle_http(int fd, const uint8_t *first, size_t first_n,
         (void)rp_send_full(hs, fd, busy, sizeof busy - 1);
         return -1;
     }
-    /* R37 R7 (R3-L21): same as the SOCKS path — the slot is held before
+    /* R37 R7 (R3-L21): same as the SOCKS path -- the slot is held before
      * the 200/forward bytes go out; every failure below is rolled back by
      * rp_conn_main's `out:` label, success is consumed by rp_add(). */
     hs->reserved = true;
-    /* R12-T2 (R41-3-1): dead-plane gate, same as the SOCKS path — refuse
+    /* R12-T2 (R41-3-1): dead-plane gate, same as the SOCKS path -- refuse
      * 503 BEFORE any success (200 / forwarded request) bytes go out,
      * since rp_add() would refuse immediately after them otherwise.
      * `out:` rolls the reservation back. */
@@ -1691,7 +1691,7 @@ static int rp_handle_http(int fd, const uint8_t *first, size_t first_n,
     if (is_connect) {
         static const char ok[] =
             "HTTP/1.1 200 Connection Established\r\n\r\n";
-        /* M3: rp_send_full verifies the ENTIRE reply went out — the old
+        /* M3: rp_send_full verifies the ENTIRE reply went out -- the old
          * `< 0` check only caught hard errors, so a partial (EAGAIN
          * short-write on Windows nonblocking) 200 left the client
          * waiting for a CONNECT response */
@@ -1700,15 +1700,15 @@ static int rp_handle_http(int fd, const uint8_t *first, size_t first_n,
             return -1;
         }
         /* R4-08-F1: forward bytes already-read past the CONNECT header
-         * (e.g. the first TLS bytes coalesced with the request) — they
+         * (e.g. the first TLS bytes coalesced with the request) -- they
          * are no longer in the client socket's kernel buffer and the
          * relay loop would start from empty. R37 R6 (K-5): rp_send_full,
-         * same reason as in rp_handle_socks — a short write or EINTR on
+         * same reason as in rp_handle_socks -- a short write or EINTR on
          * this blocking upstream must not be read as a hard failure. */
         if (n > hdr_end &&
             /* R23 (T2): user payload already read out of the client
              * socket (first TLS bytes coalesced with the CONNECT
-             * header) — transient ENOBUFS/ENOMEM must not drop it;
+             * header) -- transient ENOBUFS/ENOMEM must not drop it;
              * the 200 reply above stays on rp_send_full (control) */
             rp_send_full_payload(hs, up, buf + hdr_end,
                                  n - hdr_end) != 0) {
@@ -1721,16 +1721,16 @@ static int rp_handle_http(int fd, const uint8_t *first, size_t first_n,
      * accept absolute-form on a proxy connection). R52-B1: the head is
      * REWRITTEN to carry exactly one `Connection: close` (rp_http_force_
      * close) so a compliant upstream closes after this one response and
-     * the client connection ends after a single request — the relay
+     * the client connection ends after a single request -- the relay
      * stops promising keep-alive it cannot honor (see the R52-B1
      * comment on rp_http_force_close). Head-only, at handshake time,
-     * zero data-path parsing; rp_http_force_close returns 0 — no rewrite,
-     * nothing written — for an Upgrade request (R53-A-1) or when the
+     * zero data-path parsing; rp_http_force_close returns 0 -- no rewrite,
+     * nothing written -- for an Upgrade request (R53-A-1) or when the
      * EXACT rewritten size would exceed conn_head (R53-A-3; a mixed-EOL
      * head can legitimately need up to ~1.5x its own length, so the old
      * "8 KiB +32B always fits" claim was false), and the original head
      * is then forwarded verbatim, same guarantee as before B1.
-     * R37 R6 (K-5): rp_send_full — the head is sent in one piece and a
+     * R37 R6 (K-5): rp_send_full -- the head is sent in one piece and a
      * short write/EINTR used to abort the forward. R23 (T2): the head
      * is the CLIENT'S OWN REQUEST BYTES (user payload, not a generated
      * control message), so the payload variant retries transient
@@ -1745,7 +1745,7 @@ static int rp_handle_http(int fd, const uint8_t *first, size_t first_n,
         return -1;
     }
     /* R4-08-F1: also forward the request body bytes that were coalesced
-     * with the head into buf — same silent-drop hazard. R37 R6 (K-5):
+     * with the head into buf -- same silent-drop hazard. R37 R6 (K-5):
      * rp_send_full here too; R23 (T2): payload variant (see above). */
     if (n > hdr_end &&
         rp_send_full_payload(hs, up, buf + hdr_end, n - hdr_end) != 0) {
@@ -1775,7 +1775,7 @@ static int rp_handle_http(int fd, const uint8_t *first, size_t first_n,
  *     race on its counter (the first drain makes the second thread's
  *     wakeup check fail and it sleeps forever), and one evfd per
  *     thread breaks the Windows/macOS process-level singleton
- *     substitute — the bounded timeout is portable and race-free.
+ *     substitute -- the bounded timeout is portable and race-free.
  * End semantics: any end condition on one direction half-closes the
  * other (SHUT_WR) and retires the entry; the sockets and the conn are
  * closed when both direction threads retired (atomic dirs 2 -> 0).
@@ -1848,19 +1848,19 @@ atomic_uint_fast64_t g_prof_rp_iters, g_prof_rp_poll0;   /* TEMP loop */
 /* R12-T2 (R41-3-1): has the current relay instance's data plane already
  * died? A direction thread writes g_rp_dir_dead_gen under g_rp_mu in its
  * cleanup:; rp_add() checks it while registering, but by then the success
- * reply (rep=0 / 200) went out — answering "established" right before
+ * reply (rep=0 / 200) went out -- answering "established" right before
  * closing is the lie the review measured (LIE_COUNT(rep0_then_EOF) 6/6).
  * The existing reservation gates only the cap-full cause; this gate
  * closes the dead-plane cause at the SAME point (before the success
  * reply): the caller sends an honest failure reply instead.
  *
- * The read takes g_rp_mu — the marker's guard lock — so a reply-side
+ * The read takes g_rp_mu -- the marker's guard lock -- so a reply-side
  * check that does not see the marker ran before the exit published it,
  * and the pair is then registered before the cleanup retires everything
  * (the "no window" invariant rp_add relies on). A stale marker from a
  * previous relay instance carries a different generation (g_rp_gen is
  * bumped before each instance's threads start), so it cannot poison a
- * restarted relay — the same test rp_add() applies. */
+ * restarted relay -- the same test rp_add() applies. */
 static bool rp_plane_dead(void)
 {
     bool dead;
@@ -1890,13 +1890,13 @@ static bool rp_arr_add(struct rp_conn ***arr, size_t *n, size_t *cap,
 /* R52-B2: per-direction wakeup pipes. A direction thread whose pollset
  * does not yet contain a freshly-registered connection is parked in
  * port_poll() for up to RP_POLL_MS (100 ms) before it rebuilds its
- * pollset — the FIRST payload after a handshake therefore paid up to a
+ * pollset -- the FIRST payload after a handshake therefore paid up to a
  * full poll timeout (~20-100ms, measured ~76ms) of registration-pickup
  * latency on every new connection (interactive SSH/API write). Each
  * direction thread owns a pipe; rp_add writes one byte to both pipes so
  * the parked threads wake, drain and rebuild within microseconds. The
  * pipe is only a PROMPT: correctness never depends on it, because the
- * poll timeout stays as the backstop — a lost/missed/misfired kick is at
+ * poll timeout stays as the backstop -- a lost/missed/misfired kick is at
  * worst today's status-quo latency. POSIX-only (pipe is not pollable via
  * the Windows WSAPoll path); on _WIN32 the direction threads keep the
  * plain RP_POLL_MS bound. */
@@ -1937,7 +1937,7 @@ static void rp_kick_dirs(void) {}
  * transfer it already documents. Without that, a future extra release
  * written against the same flag ("the caller still thinks it owns the
  * slot") decremented the counter once per connection and silently removed
- * the established-set cap — see rp_est_release() below. */
+ * the established-set cap -- see rp_est_release() below. */
 static void rp_add(int c, int u, bool *reserved)
 {
     struct rp_conn *cn;
@@ -1945,7 +1945,7 @@ static void rp_add(int c, int u, bool *reserved)
 
     *reserved = false;   /* rp_add owns (or rolls back) the slot from here */
 
-    /* R37 R1-B-2: RP_MAX_CONNS caps concurrent HANDSHAKE threads only —
+    /* R37 R1-B-2: RP_MAX_CONNS caps concurrent HANDSHAKE threads only --
      * an established-but-idle relayed connection was never bounded (600
      * idle connections = 1200 fds and climbing). That is enough fd
      * pressure to push the client (root under TUN) into EMFILE, which in
@@ -1984,7 +1984,7 @@ static void rp_add(int c, int u, bool *reserved)
     atomic_store(&cn->dirs, 2);
     /* R37 R1-B-4: a fd left in BLOCKING mode would stall the whole
      * direction thread (it serves every connection at once), so refuse
-     * the connection instead of silently ignoring a failed fcntl —
+     * the connection instead of silently ignoring a failed fcntl --
      * rp_connect_target already treats the same failure as fatal. */
     if (port_set_nonblock(c, true) != 0 || port_set_nonblock(u, true) != 0) {
         log_err("rp: cannot switch connection to non-blocking mode: dropped");
@@ -1997,12 +1997,12 @@ static void rp_add(int c, int u, bool *reserved)
 
     pthread_mutex_lock(&g_rp_mu);
     /* R37 R3 (WG-C, R1-B-3 structural): never register into an array
-     * whose direction thread is gone for THIS relay instance — nobody
+     * whose direction thread is gone for THIS relay instance -- nobody
      * would ever retire that entry (its `dirs` count stays > 0, the
      * rp_conn is never closed/freed and g_rp_est_n never decrements).
      * The marker is written under this same mutex, so an entry is either
      * registered before the exit (and retired by rp_dir_main's cleanup)
-     * or refused here — there is no window in between. */
+     * or refused here -- there is no window in between. */
     unsigned gen = atomic_load(&g_rp_gen);
     bool dead = g_rp_dir_dead_gen[0] == gen || g_rp_dir_dead_gen[1] == gen;
     bool ok = !dead && rp_arr_add(&g_rp_up, &g_rp_up_n, &g_rp_up_cap, cn);
@@ -2062,7 +2062,7 @@ static void rp_reap_maybe(struct rp_conn *cn)
 
 /* one direction thread retires its entry: when both have retired, the
  * conn is marked; the actual close+free happens when the last in_use
- * reference drops (not necessarily here — the caller still holds its
+ * reference drops (not necessarily here -- the caller still holds its
  * own reference until its loop bottom). Must run under g_rp_mu. */
 static void rp_release(struct rp_conn *cn)
 {
@@ -2073,7 +2073,7 @@ static void rp_release(struct rp_conn *cn)
 }
 
 /* drop every snapshot reference this loop iteration holds (early exit
- * / loop bottom); must run under g_rp_mu — the last reference out of
+ * / loop bottom); must run under g_rp_mu -- the last reference out of
  * a retired conn closes and frees it */
 static void rp_snap_unref_all(struct rp_conn **snap, size_t n)
 {
@@ -2086,13 +2086,13 @@ static void rp_snap_unref_all(struct rp_conn **snap, size_t n)
  * exits (realloc failure, poll hard error, stop) must RETIRE the entries
  * it still owns. Skipping that leaves this direction's `dirs` count above
  * zero forever, so rp_reap_maybe never closes the two sockets or frees the
- * rp_conn — and, since R1-B-2, g_rp_est_n never decrements either, so
+ * rp_conn -- and, since R1-B-2, g_rp_est_n never decrements either, so
  * RP_MAX_ESTABLISHED eventually refuses every new connection for the rest
  * of the process (a permanent relay outage, not just an fd leak).
  *
  * R3 makes this structural instead of per-site: the helper below is called
- * from the ONE exit point of rp_dir_main (cleanup:), so no early exit —
- * present or future — can forget it. It takes no snapshot: it walks the
+ * from the ONE exit point of rp_dir_main (cleanup:), so no early exit --
+ * present or future -- can forget it. It takes no snapshot: it walks the
  * LIVE array of this direction, which is exactly the set of entries this
  * direction has not released yet (the array doubles as the
  * "not yet retired" marker), so no entry can be released twice.
@@ -2160,10 +2160,10 @@ static void rp_flush(struct rp_ent *e, bool up_dir)
         if (w < 0 && (errno == ENOBUFS || errno == ENOMEM)) {
             /* R20-11: send-buffer / memory pressure is transient and the
              * relay must not drop TCP bytes over it (the UDP pump treats
-             * ENOBUFS exactly like EAGAIN — budgeted stall, never a
+             * ENOBUFS exactly like EAGAIN -- budgeted stall, never a
              * fatal). Unlike EAGAIN the socket can stay POLLOUT-ready
              * while the kernel keeps refusing, which would hot-spin this
-             * poll loop — back off explicitly, then retry on the next
+             * poll loop -- back off explicitly, then retry on the next
              * POLLOUT. plen is untouched (a send that returned -1 wrote
              * nothing), so no byte is dropped, duplicated or reordered. */
             port_sleep_ms(1);
@@ -2211,7 +2211,7 @@ static void *rp_dir_main(void *ud)
     /* R52-B2: per-direction wake pipe (POSIX; see the block above
      * rp_add). This thread creates its own pipe, publishes the write end
      * for rp_kick_dirs() and keeps the read end for its pollset. The
-     * pipe lives for the relay lifetime (never closed, like rp itself —
+     * pipe lives for the relay lifetime (never closed, like rp itself --
      * one relay per process, bounded); a fresh pipe on a relay restart
      * simply replaces the slot. On creation failure only the prompt is
      * lost: the RP_POLL_MS backstop keeps today's behavior. */
@@ -2233,7 +2233,7 @@ static void *rp_dir_main(void *ud)
         }
     }
 #else
-    /* Windows: no pipe wakeup (WSAPoll on a pipe is not usable) — the
+    /* Windows: no pipe wakeup (WSAPoll on a pipe is not usable) -- the
      * RP_POLL_MS pickup bound is the only path, exactly as before R52-B2.
      * `my_wake` is referenced only in the POSIX sections below. */
     (void)my_wake;
@@ -2245,7 +2245,7 @@ static void *rp_dir_main(void *ud)
         if (n > snapcap) {
             struct rp_conn **ns = realloc(snap, n * sizeof *ns);
             if (!ns) {
-                /* R37 R3 (WG-C, R1-B-3): early exit — cleanup: retires
+                /* R37 R3 (WG-C, R1-B-3): early exit -- cleanup: retires
                  * this direction's entries and drops any snapshot refs.
                  * No reference has been taken yet at this point (the
                  * in_use bumps happen below), and the retire there walks
@@ -2259,7 +2259,7 @@ static void *rp_dir_main(void *ud)
             snapcap = n;
         }
         /* M3-4: with no connections both snap and *arrp are NULL, and
-         * memcpy(NULL, NULL, 0) is UB — it fires on every empty
+         * memcpy(NULL, NULL, 0) is UB -- it fires on every empty
          * snapshot under halting UBSan (relay aborting at startup) */
         if (n)
             memcpy(snap, *arrp, n * sizeof *snap);
@@ -2309,7 +2309,7 @@ static void *rp_dir_main(void *ud)
          * slot_from[i]/slot_to[i] map entry i to its pollfd index, so
          * the per-entry event lookup is O(1) instead of an O(n*k)
          * fd scan on every loop iteration. (cur_gen itself was read in
-         * the snapshot's critical section above — see M6.) */
+         * the snapshot's critical section above -- see M6.) */
         /* M7: rebuild also when a connection array changed since this
          * pollset was built (a same-round add+retire keeps the count
          * unchanged, so a count-only check misses it); this also
@@ -2443,7 +2443,7 @@ static void *rp_dir_main(void *ud)
                         if (e->plen == 0) {
                             /* fast path, zero pend: write straight
                              * through. Only a partial/EAGAIN send
-                             * leaves a remainder in pend (bounded —
+                             * leaves a remainder in pend (bounded --
                              * see RP_PEND_LIMIT below). Ordering is
                              * safe: pend is empty, so nothing is
                              * queued ahead of this data. */
@@ -2471,7 +2471,7 @@ static void *rp_dir_main(void *ud)
                                      errno == EWOULDBLOCK ||
                                      errno == EINTR ||
                                      /* R20-11: transient send-buffer /
-                                      * memory pressure — same non-drop
+                                      * memory pressure -- same non-drop
                                       * classification as rp_flush below
                                       * (remainder goes to pend and waits
                                       * on POLLOUT, byte-identical) */
@@ -2497,7 +2497,7 @@ static void *rp_dir_main(void *ud)
                                 }
                                 /* `to` is congested: the remainder
                                  * goes to pend (bounded by the cap
-                                 * check) and we keep reading — one
+                                 * check) and we keep reading -- one
                                  * pass drains the kernel buffer, so
                                  * the read rate no longer depends on
                                  * the poll round frequency */
@@ -2523,12 +2523,12 @@ static void *rp_dir_main(void *ud)
                         /* drained */
                     } else if (errno == ENOBUFS || errno == ENOMEM) {
                         /* R33-B2-L1: transient recv memory / socket-buffer
-                         * pressure — same non-drop classification as the
+                         * pressure -- same non-drop classification as the
                          * send side (R20-11/R22-A2-1), so a transient read
                          * error must NOT half-close the whole connection.
                          * Like the send side the fd can stay POLLIN-ready
                          * while the kernel keeps refusing, which would
-                         * hot-spin this poll loop — back off explicitly
+                         * hot-spin this poll loop -- back off explicitly
                          * (same port_sleep_ms(1) shape as rp_flush below),
                          * then read resumes on the next readable round. */
                         port_sleep_ms(1);
@@ -2542,7 +2542,7 @@ static void *rp_dir_main(void *ud)
             }
             /* rhythm optimization: flush pending data immediately
              * after the drain instead of waiting for the next poll
-             * round's POLLOUT event — one poll round-trip saved per
+             * round's POLLOUT event -- one poll round-trip saved per
              * chunk whenever the peer is congested (the POLLOUT
              * registration stays as the retry path for a still-full
              * peer). */
@@ -2567,7 +2567,7 @@ static void *rp_dir_main(void *ud)
                 }
             }
         }
-        /* M4: no count comparison here — n is the snapshot entry count
+        /* M4: no count comparison here -- n is the snapshot entry count
          * and pf_n is the built pollfd count (up to 2 slots per entry),
          * so any entry with pend (dual registration) makes n != pf_n
          * permanently true and would force a full rebuild every loop
@@ -2601,8 +2601,8 @@ static void *rp_dir_main(void *ud)
     }
 cleanup:
     /* R37 R3 (WG-C, R1-B-3 structural): SINGLE choke point for every
-     * exit of this thread. Retiring here — instead of at each early exit
-     * — is what makes the defect class impossible: a new `goto cleanup`
+     * exit of this thread. Retiring here -- instead of at each early exit
+     * -- is what makes the defect class impossible: a new `goto cleanup`
      * cannot forget it. rp_dir_retire_all() walks the LIVE array (the
      * `snap` buffer may be stale/realloc residue at the realloc-failure
      * exit) and releases every entry this direction still owns; nothing
@@ -2612,7 +2612,7 @@ cleanup:
      * Order matters: retire first, then drop our own snapshot
      * references. rp_dir_retire_all() dereferences the entries, and
      * rp_snap_unref_all() may free one (the last reference out of a
-     * retired conn) — dropping it first could free a conn the retire
+     * retired conn) -- dropping it first could free a conn the retire
      * still wants to touch. At the snap-realloc exit snap_refs is false
      * (no reference taken yet), so only the retire runs.
      *
@@ -2620,7 +2620,7 @@ cleanup:
      * here on nothing would ever retire an entry registered in this
      * array again (the post-exit registration hole the R3 review
      * named), so rp_add refuses new connections and g_rp_stop makes the
-     * other direction thread retire its own array and exit too — the
+     * other direction thread retire its own array and exit too -- the
      * whole data plane is torn down instead of silently leaking. */
     pthread_mutex_lock(&g_rp_mu);
     rp_dir_retire_all(up_dir, arrp, np);
@@ -2710,7 +2710,7 @@ static void *rp_conn_main(void *ud)
      * the success reply; rp_add consumes the token (it clears the flag), so
      * this connection can never release that slot a second time (R38 P2-3). */
     rp_add(fd, up, &hs.reserved);
-    /* M6a: success exit — this thread stops tracking the connection
+    /* M6a: success exit -- this thread stops tracking the connection
      * (the global relay owns it now) */
     atomic_fetch_sub(&g_rp_conn_n, 1);
     free(ca);
@@ -2730,7 +2730,7 @@ out:
         hs.reserved = false;
         rp_est_release();
     }
-    /* M6a: failure exit — every path through here decrements exactly
+    /* M6a: failure exit -- every path through here decrements exactly
      * once (the accept thread's increment is consumed below) */
     if (up >= 0)
         port_close(up);
@@ -2779,7 +2779,7 @@ static void *rp_accept_main(void *ud)
     /* R37 R6 (K-1; twin of R4-L5 in socks.c): hard bound on CONSECUTIVE
      * "aborted request" retries inside this loop, reset by a successful
      * accept. ECONNABORTED/EPROTO belong to the NEW connection whose
-     * request the kernel has ALREADY dequeued — the backlog is not under
+     * request the kernel has ALREADY dequeued -- the backlog is not under
      * pressure, so pacing them taxed an innocent client that arrived
      * inside the 50ms window (R6-K: 3 injected aborts => 149.6ms legal
      * client latency, 6 => 299.0ms). The bound only exists so that a
@@ -2803,7 +2803,7 @@ static void *rp_accept_main(void *ud)
              * (ENOMEM/ENOBUFS under memory pressure). The old code broke
              * out of the loop for any non-EINTR error: the accept thread
              * disappeared while the listener stayed open, so connect()
-             * kept succeeding and nothing was ever accepted again — with
+             * kept succeeding and nothing was ever accepted again -- with
              * no log line at all (the same silent black hole R1-B-1
              * removed from the accept() path). Only a dead/invalid
              * listener fd is fatal. */
@@ -2814,7 +2814,7 @@ static void *rp_accept_main(void *ud)
             }
             /* R37 R3-M2: at least ONE visible line even in Release builds
              * (log_debug is compiled out there), then rate-limited to one
-             * line per second so a persistent error cannot flood stderr —
+             * line per second so a persistent error cannot flood stderr --
              * same shape as the thread-spawn warning below. */
             static uint64_t last_poll_warn_ms;
             uint64_t pw = now_ms();
@@ -2846,7 +2846,7 @@ static void *rp_accept_main(void *ud)
                 continue;
             /* R37 R6 (K-1): an error that belongs to the new connection
              * whose request the kernel has already discarded must not
-             * trigger the backoff — drain the backlog instead. Past
+             * trigger the backoff -- drain the backlog instead. Past
              * ABORT_DRAIN_MAX consecutive aborts the branch falls through
              * to the paced path below (bounded: no hot spin). log_debug
              * only: an aborted peer is a normal event, not a fault. */
@@ -2857,13 +2857,13 @@ static void *rp_accept_main(void *ud)
                     continue;
             }
             /* R37 R1-B-1: every other error accept(2) returns on Linux is
-             * TRANSIENT — EMFILE/ENFILE (fd table full), ENOBUFS/ENOMEM
+             * TRANSIENT -- EMFILE/ENFILE (fd table full), ENOBUFS/ENOMEM
              * (kernel memory pressure), ECONNABORTED (peer RST before we
              * accepted), EPROTO/ENETDOWN/EHOSTDOWN/ENETUNREACH (pending
              * network error). The old code `break`ed out of the loop for
              * all of them, and this thread is detached with no restart:
              * the listener stayed open, so connect() kept succeeding while
-             * nothing was ever accepted again — a silent local-proxy black
+             * nothing was ever accepted again -- a silent local-proxy black
              * hole until process exit, with no log line anywhere. Only a
              * dead/invalid listener fd is fatal now. */
             if (errno == EBADF || errno == EINVAL || errno == ENOTSOCK) {
@@ -2886,7 +2886,7 @@ static void *rp_accept_main(void *ud)
          * read returns EAGAIN. With the fd nonblocking, EAGAIN surfaces
          * and the existing budgeted poll loops close the connection at
          * the 30s deadline, so RP_MAX_CONNS half-open connections can no
-         * longer pin every connection thread — and the relay — forever.
+         * longer pin every connection thread -- and the relay -- forever.
          * rp_add switches the same fd for the relay later, so this only
          * moves that switch before the handshake; a failed switch is
          * fatal for this connection (a blocking fd would reintroduce the
@@ -2929,7 +2929,7 @@ static void *rp_accept_main(void *ud)
         }
 
         /* M6a: shed new connections once the per-connection thread
-         * cap is hit — close immediately, no reply, no thread */
+         * cap is hit -- close immediately, no reply, no thread */
         if (atomic_load(&g_rp_conn_n) >= RP_MAX_CONNS) {
             log_debug("rp: connection cap %d reached, dropping",
                       RP_MAX_CONNS);
@@ -2952,9 +2952,9 @@ static void *rp_accept_main(void *ud)
         atomic_fetch_add(&g_rp_conn_n, 1);
 
         pthread_t th;
-        /* R37 L3 (HEAD-R2 §2.2): pthread_create returns the error number
+        /* R37 L3 (HEAD-R2 section 2.2): pthread_create returns the error number
          * and does NOT set errno, so a failure here must be reported with
-         * strerror(rc). Rate-limited to one line per second — a thread
+         * strerror(rc). Rate-limited to one line per second -- a thread
          * limit (EAGAIN) or OOM (ENOMEM) would otherwise flood the log
          * from this accept loop. */
         int crc = pthread_create(&th, NULL, rp_conn_main, ca);
@@ -3000,7 +3000,7 @@ int relay_proxy_start(const char *listen_str, const char *auth_token,
         return -1;
     }
     /* H-1 (R14): the allow-remote guard judges the token's CONTENT, not
-     * just the pointer — an empty string is "no token" too, so a remote
+     * just the pointer -- an empty string is "no token" too, so a remote
      * bind with `--socks-token ""` and no --socks-no-token must be
      * refused (empty must never be mistaken for a set password). */
     if (!loop && !(auth_token && *auth_token) && !open_proxy) {
@@ -3024,12 +3024,12 @@ int relay_proxy_start(const char *listen_str, const char *auth_token,
      * belongs to the constant, not to the environment). Windows has no
      * getrlimit; there the compile-time value stays in force.
      * R37 R6 (R6-M1) / R34-A2-1: the reserve is scaled to the granted
-     * limit (limit/4), floored at min(lim/2, 2*RP_MAX_CONNS) — NOT an
+     * limit (limit/4), floored at min(lim/2, 2*RP_MAX_CONNS) -- NOT an
      * unconditional 2*RP_MAX_CONNS: the floor must itself fit the
      * granted limit, or a small lim (macOS 256 / hardened Linux 512)
      * collapses the cap to 1. With the min-floor, for lim >=
      * 2*RP_MAX_CONNS the reserve covers the whole INSTANTANEOUS
-     * handshake set (R33-B2-L2: 2*RP_MAX_CONNS fds — RP_MAX_CONNS
+     * handshake set (R33-B2-L2: 2*RP_MAX_CONNS fds -- RP_MAX_CONNS
      * handshake threads, accepted fd + connect-target fd each) and the
      * "never overspend" bound is exact: established set (<= 2*room =
      * lim - reserve) + a same-instant full handshake burst (<= reserve)
@@ -3037,8 +3037,8 @@ int relay_proxy_start(const char *listen_str, const char *auth_token,
      * pressure. For lim < 2*RP_MAX_CONNS the limit cannot hold a full
      * handshake set: the reserve takes min(lim/2, 2*RP_MAX_CONNS),
      * established + reserve <= lim stays exact (2*room = lim - reserve),
-     * so a same-instant full burst can still EMFILE — physically
-     * unavoidable below 2*RP_MAX_CONNS, momentary and self-healing —
+     * so a same-instant full burst can still EMFILE -- physically
+     * unavoidable below 2*RP_MAX_CONNS, momentary and self-healing --
      * while the cap stays usable (the R6-M1 intent). -1 in the log
      * line means "not applicable" (Windows, or an infinite limit); both
      * values are printed so an operator can tell a scaled reserve from
@@ -3055,7 +3055,7 @@ int relay_proxy_start(const char *listen_str, const char *auth_token,
             if (reserve > RP_FD_RESERVE)
                 reserve = RP_FD_RESERVE;
             /* R34-A2-1: the reserve floor is min(lim/2, 2*RP_MAX_CONNS),
-             * not an unconditional 2*RP_MAX_CONNS — the floor must fit
+             * not an unconditional 2*RP_MAX_CONNS -- the floor must fit
              * the granted limit or it collapses the cap (R33-B2-L2 gave
              * cap=1 for any lim <= 515, the macOS 256 / hardened-Linux
              * 512 COMMON cases). For lim >= 2*RP_MAX_CONNS the reserve
@@ -3125,7 +3125,7 @@ int relay_proxy_start(const char *listen_str, const char *auth_token,
 
     /* start the two global direction threads up front */
     atomic_store(&g_rp_stop, 0);
-    /* R37 R3 (WG-C): new relay instance — a death marker left behind by a
+    /* R37 R3 (WG-C): new relay instance -- a death marker left behind by a
      * previous instance must not make rp_add refuse this one. Bumped
      * before any thread of this instance exists (no lock needed). */
     atomic_fetch_add(&g_rp_gen, 1);
@@ -3148,7 +3148,7 @@ int relay_proxy_start(const char *listen_str, const char *auth_token,
              * has already been raised for it to exit */
             atomic_store(&g_rp_stop, 1);
             /* R37 L3: strerror() must be fed the pthread_* RETURN CODE,
-             * not errno (pthread_* do not touch errno — the old line
+             * not errno (pthread_* do not touch errno -- the old line
              * printed "Success" for a real EAGAIN/ENOMEM failure). */
             log_err("relay proxy: cannot start relay threads (rc=%d: %s)",
                     rc, strerror(rc));
@@ -3169,7 +3169,7 @@ int relay_proxy_start(const char *listen_str, const char *auth_token,
      * return code, never errno. */
     int arc = pthread_create(&accept_th, NULL, rp_accept_main, rp);
     if (arc != 0) {
-        /* M5/L2: accept failed — the two direction threads are already
+        /* M5/L2: accept failed -- the two direction threads are already
          * detached and running with g_rp_stop=0 and g_rp_current=rp.
          * Without this cleanup g_rp_current would dangle past this rp's
          * free and the threads would spin forever on the 100ms poll,
@@ -3214,6 +3214,6 @@ void relay_proxy_stop(struct RelayProxy *rp)
      * half-closed, reaped and their fds closed at shutdown instead of
      * being kept until process exit. The struct is deliberately NOT
      * freed: a live connection thread may still read rp->token (one
-     * proxy per process — the leak is bounded by the process
+     * proxy per process -- the leak is bounded by the process
      * lifetime). */
 }

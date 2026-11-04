@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-# iWAN — USTC campus-network VPN client/server (C11).
+# iWAN -- USTC campus-network VPN client/server (C11).
 #
 # Replaces the old hand-rolled Makefile. Semantics are preserved 1:1:
 #   - Linux (native or cross): iwan-client, iwan-client-oidc, iwan-server.
@@ -11,7 +11,7 @@ cmake_minimum_required(VERSION 3.16)
 #     that is impossible (no clang, no linux/bpf.h, or -DIWAN_BPF=OFF)
 #     the build degrades to kernel automq steering (IWAN_NO_STEER_BPF).
 #
-# Typical invocations (see README "构建"):
+# Typical invocations (see README, "Build" section):
 #   cmake -B build && cmake --build build -j          # native Linux
 #   cmake -B build -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/musl-linux-aarch64.cmake \
 #         -DIWAN_MUSL_ROOT=... -DIWAN_OPENSSL_DIR=... -DIWAN_LINUX_STATIC=ON
@@ -40,8 +40,8 @@ endif()
 
 # Release-by-default (CMAKE_C_FLAGS_RELEASE = -O3 -DNDEBUG, CMake's
 # built-in default; this project never removes -DNDEBUG). The code has
-# no runtime assert()s — only _Static_assert, which is NDEBUG-independent
-# — so that -DNDEBUG is inert.
+# no runtime assert()s -- only _Static_assert, which is NDEBUG-independent
+# -- so that -DNDEBUG is inert.
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
@@ -68,7 +68,7 @@ option(IWAN_STATIC       "Windows: statically link OpenSSL + runtime libs" OFF)
 option(IWAN_BPF          "Linux: compile and embed the tun steering eBPF program" ON)
 option(IWAN_WERROR       "Treat compiler warnings as errors" OFF)
 # Strict warning gate for the project's OWN sources (src/, tests/). It is
-# applied per target with target_compile_options — never through
+# applied per target with target_compile_options -- never through
 # CMAKE_C_FLAGS/add_compile_options, which reach every target: the vendored
 # lwIP does not build clean under -Wconversion/-Wshadow, so a global flag
 # set killed the gate inside third_party/ before iwan_core was ever
@@ -107,7 +107,7 @@ set(IWAN_STRICT_FLAGS
 # passing -DIWAN_STRICT_WIN_LLP64=... gets CMake's harmless
 # "Manually-specified variables were not used by the project" warning; the
 # effective flags are the full set (the old default). Downstreams that relied
-# on =OFF for the reduced tier must fix the diagnostic at the source instead —
+# on =OFF for the reduced tier must fix the diagnostic at the source instead --
 # the tier no longer exists to hide it.
 #
 # Coverage of the strict gate, stated exactly (R38 P0-5; the old comment here
@@ -141,11 +141,11 @@ set(IWAN_STRICT_FLAGS
 # stay out of the default gate rather than being silently suppressed. With
 # IWAN_WERROR=ON an un-demoted extras diagnostic is fatal, and the documented
 # "opt-in" switch became "turn this on and the build dies" (R38 P0-2, gcc
-# Release: 144 diagnostics — 140 discarded-qualifiers from -Wwrite-strings,
+# Release: 144 diagnostics -- 140 discarded-qualifiers from -Wwrite-strings,
 # 4 -Wfloat-equal; clang 155, adding 12 -Wcast-align). Each extras flag is
 # therefore demoted by name, AFTER the -Werror in IWAN_STRICT_FLAGS; a bare
 # -Wno-error would also demote the base gate, which is exactly what must not
-# happen. The diagnostics are still printed — warnings, not silence.
+# happen. The diagnostics are still printed -- warnings, not silence.
 option(IWAN_STRICT_EXTRA "Add -Wwrite-strings/-Wfloat-equal/... to IWAN_STRICT (advisory, never fatal)" OFF)
 set(IWAN_STRICT_EXTRA_FLAGS
   -Wfloat-equal -Wcast-align -Wpointer-arith -Wwrite-strings -fno-common)
@@ -158,7 +158,7 @@ set(IWAN_STRICT_EXTRA_NOWERROR_FLAGS
 #   gcc   : ... discards 'const' qualifier from pointer target type [-Wdiscarded-qualifiers]
 #   clang : ... discards qualifiers [-Wincompatible-pointer-types-discards-qualifiers]
 # (Verified in R38 that gcc's -Wno-error=write-strings does NOT demote
-# -Wdiscarded-qualifiers — the per-diagnostic spelling above is required.)
+# -Wdiscarded-qualifiers -- the per-diagnostic spelling above is required.)
 if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
   list(APPEND IWAN_STRICT_EXTRA_NOWERROR_FLAGS -Wno-error=discarded-qualifiers)
 elseif(CMAKE_C_COMPILER_ID MATCHES "Clang")
@@ -167,7 +167,7 @@ elseif(CMAKE_C_COMPILER_ID MATCHES "Clang")
 endif()
 set(IWAN_OPENSSL_DIR "" CACHE PATH "OpenSSL sysroot (include/ + lib/ or lib64/)")
 # ---------------------------------------------------------------------------
-# Global flags — the old Makefile's CFLAGS/LDFLAGS, split per platform.
+# Global flags -- the old Makefile's CFLAGS/LDFLAGS, split per platform.
 # ---------------------------------------------------------------------------
 add_compile_options(-Wall -Wextra)
 
@@ -252,6 +252,7 @@ set(IWAN_CORE_SRCS
   src/common/cli_common.c
   src/common/config.c
   src/common/crypto.c
+  src/common/frag.c
   src/common/gcm.c
   src/common/http_parser.c
   src/common/https.c
@@ -260,9 +261,11 @@ set(IWAN_CORE_SRCS
   src/common/lockout.c
   src/common/port.c
   src/common/protocol.c
+  src/common/echo.c
   src/common/proto_parse.c
   src/common/proxy.c
   src/common/relay_proxy.c
+  src/common/sr.c
   src/common/reply_route.c
   src/common/route_common.c
   src/common/socks.c
@@ -294,11 +297,11 @@ elseif(APPLE)
   # tun_mac.c provides the utun open/attach/detach + name mapping.
   list(APPEND IWAN_CORE_SRCS src/common/route.c src/common/tun.c src/common/tun_mac.c)
 else()
-  # genl_iwan.c / kdp.c = 内核数据面（--data-plane kernel，Linux only）。
-  # 与 route_linux.c 同处一个分支不是巧合：两者都直接依赖 Linux 的内核
-  # 接口（genetlink 与 /dev/iwan）；而 src/iwan_client.c 同时被编进 Windows
-  # 的 iwan-winsvc.exe，所以这两个文件除了不在这里列出，文件体自己也用
-  # #ifdef __linux__ 包住（非 Linux 下只留空翻译单元，不会出现半成品 stub）。
+  # genl_iwan.c / kdp.c = kernel data plane (--data-plane kernel, Linux only).
+  # Sharing this branch with route_linux.c is no coincidence: both depend on
+  # Linux kernel interfaces (genetlink and /dev/iwan); src/iwan_client.c is
+  # also built into Windows iwan-winsvc.exe, so these two files are omitted
+  # here and wrapped in #ifdef __linux__ (non-Linux: empty TU, never a half stub).
   list(APPEND IWAN_CORE_SRCS src/common/route_linux.c src/common/server.c src/common/server_rate.c src/common/tun.c src/common/genl_iwan.c src/common/kdp.c)
 endif()
 
@@ -311,7 +314,7 @@ list(APPEND IWAN_CORE_SRCS src/common/profile.c)
 
 # ---------------------------------------------------------------------------
 # Vendored lwIP 2.2.1 (third_party/lwip): the userspace TCP stack behind the
-# SOCKS mode. NO_SYS=1 raw API, IPv4/TCP only, no socket layer — configured by
+# SOCKS mode. NO_SYS=1 raw API, IPv4/TCP only, no socket layer -- configured by
 # third_party/lwip/lwipopts.h and third_party/lwip/port/arch/cc.h. Built as a
 # standalone static lib; iwan_core links it.
 # ---------------------------------------------------------------------------
@@ -358,21 +361,21 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang")
   target_compile_options(lwip PRIVATE -Wno-tautological-constant-out-of-range-compare)
 endif()
 # vendored ip6_addr.c:284 (ip6addr_ntoa_r) indexes addr[(block+1)>>1]
-# which is addr[4] at the last block — a latent upstream OOB read that
+# which is addr[4] at the last block -- a latent upstream OOB read that
 # gcc's -Warray-bounds only proves on some targets (s390x). Suppress for
 # the third-party library only; the function is used solely for debug
 # printing, never in the data path. Known to both gcc and clang.
 target_compile_options(lwip PRIVATE -Wno-array-bounds)
 
-# 度量档：把内层 MTU 上限与默认值一起抬到 N（默认空 = 关闭，正常构建完全不变）。
-# 打开后客户端与服务端在同一版本下协商出 N；外层 veth 的 MTU 由
-# tests/bench_proto.sh 的 VETH_MTU 负责（必须 >= N + 50）。
+# Jumbo tier: raise the inner MTU cap and default together to N (default empty = off, normal builds unchanged).
+# When enabled, client and server negotiate N within the same version; the outer veth MTU is set by
+# tests/bench_proto.sh's VETH_MTU (must be >= N + 50).
 set(IWAN_JUMBO_MTU "" CACHE STRING
-    "度量用内层 MTU（上限 65499：外层 IPv4 总长 65535 - 36B 封装开销）；空=关闭")
+    "inner MTU for measurement (cap 65499: outer IPv4 total length 65535 - 36B encap overhead); empty=off")
 if(IWAN_JUMBO_MTU)
   add_compile_definitions(IWAN_MTU_MAX=${IWAN_JUMBO_MTU}
                           IWAN_DEFAULT_MTU=${IWAN_JUMBO_MTU})
-  message(STATUS "jumbo MTU 度量档：内层 MTU 上限/默认 = ${IWAN_JUMBO_MTU}")
+  message(STATUS "jumbo MTU tier: inner MTU cap/default = ${IWAN_JUMBO_MTU}")
 endif()
 
 add_library(iwan_core STATIC ${IWAN_CORE_SRCS})
@@ -388,7 +391,7 @@ target_compile_definitions(iwan_core PUBLIC IWAN_TCP_STACK_LWIP=1)
 # OpenSSL. With IWAN_OPENSSL_DIR the sysroot is used verbatim (include/ +
 # lib/ and lib64/, exactly like OPENSSL_DIR); otherwise the system
 # OpenSSL is found. Windows static builds must scope ssl/crypto/winpthread/
-# ssp into a -Bstatic group — a plain -static would also strip the
+# ssp into a -Bstatic group -- a plain -static would also strip the
 # ws2_32/iphlpapi import libs and fail to link (historical Makefile logic).
 # winpthread/libssp are probed so clang-based toolchains (llvm-mingw) that
 # lack one of them still link.
@@ -448,7 +451,7 @@ set(IWAN_STEER_DIR "${CMAKE_CURRENT_BINARY_DIR}/steer")
 function(iwan_enable_bpf)
   find_program(IWAN_CLANG NAMES clang)
   if(NOT IWAN_CLANG)
-    message(WARNING "clang not found — building without tun steering eBPF "
+    message(WARNING "clang not found -- building without tun steering eBPF "
                     "(IWAN_NO_STEER_BPF, kernel automq steering)")
     set(IWAN_BPF OFF PARENT_SCOPE)
     return()
@@ -488,7 +491,7 @@ function(iwan_enable_bpf)
   endforeach()
   if(NOT _bpf_inc)
     message(WARNING "clang cannot compile the bpf target with the available "
-                    "linux headers — building without tun steering eBPF "
+                    "linux headers -- building without tun steering eBPF "
                     "(IWAN_NO_STEER_BPF, kernel automq steering)")
     set(IWAN_BPF OFF PARENT_SCOPE)
     return()
@@ -556,10 +559,10 @@ target_link_libraries(iwan-client PRIVATE iwan_core)
 add_executable(iwan-client-oidc src/iwan_client_oidc.c)
 target_link_libraries(iwan-client-oidc PRIVATE iwan_oidc)
 
-# Windows service front-end (svc_win.c): reuses iwan_client.c verbatim —
+# Windows service front-end (svc_win.c): reuses iwan_client.c verbatim --
 # IWAN_HEADLESS_SVC only renames its main() so the shell can drive the
 # same command paths from the SCM. Classic protocol only; see README
-# "Windows 服务" and the header comment of svc_win.c.
+# "Windows service" and the header comment of svc_win.c.
 if(WIN32)
   option(IWAN_WIN_SVC "Build the Windows service front-end (iwan-winsvc)" ON)
   if(IWAN_WIN_SVC)
@@ -584,7 +587,7 @@ endif()
 # netstack code with a loopback listener; see tests/socks_handshake.py).
 # Off by default so release binaries don't ship it; CI passes
 # -DBUILD_TESTING=ON wherever tests/socks_handshake.py runs.
-# Plain option() — NOT include(CTest), whose enable_testing() defines a
+# Plain option() -- NOT include(CTest), whose enable_testing() defines a
 # `test` target that collides with the integration-suite target below.
 option(BUILD_TESTING "Build the SOCKS5 handshake test harness" OFF)
 if(BUILD_TESTING)
@@ -602,13 +605,18 @@ if(BUILD_TESTING)
   target_link_libraries(lwip_fairness_harness PRIVATE iwan_core)
   # R47-FIXA-I1: relay RFC1929 auth-loop regression harness. Drives the REAL
   # relay (relay_proxy_start -> rp_conn_main -> rp_handle_socks) as a SOCKS5
-  # client and asserts the pr==2 / pr==0 / counted-lockout contract — the
+  # client and asserts the pr==2 / pr==0 / counted-lockout contract -- the
   # auth loop the socks_handshake harness (socks_flow/lwIP) never reaches,
   # which is why the pre-fix pr>0 crasher was invisible to CI. Runner:
   # tests/relay_socks_harness.py (fresh process per case: relay's lockout
   # table is file-static).
   add_executable(relay_socks_harness tests/relay_socks_harness.c)
   target_link_libraries(relay_socks_harness PRIVATE iwan_core)
+  # Panabit SD-WAN extension surface (fragmentation 0x22/0x24, source routing 0x28, SR key derivation,
+  # 36-byte ECHO payload) pure-logic self-test. Fixed vectors and hand-built packets only; no root, no NIC.
+  add_executable(sdwan_ext_test tests/sdwan_ext_test.c)
+  target_link_libraries(sdwan_ext_test PRIVATE iwan_core)
+  add_test(NAME sdwan_ext COMMAND sdwan_ext_test)
   # R55-SK-1 dynamic probe: drives the REAL wait_events() with injected flows
   # against real loopback sockets, so the poll-convergence contract is tested
   # at runtime rather than only by reading code. Asserts three things:
@@ -639,14 +647,14 @@ if(BUILD_TESTING)
     target_link_libraries(pollmap PRIVATE iwan_core)
   endif()
 
-  # 单向容量基准发生器，由 tests/bench_proto.sh 调用：内层 tcp / udp / 裸 IP
-  # （IP 协议号 253），send 与 recv 各一个进程。纯 socket 代码，**故意不链
-  # iwan_core** —— 它不碰生产代码，也就不需要 OpenSSL，能在任何环境单独编译。
-  # 它仍然列在下面的严格告警目标表里（-Werror 一视同仁）。
+  # One-way capacity benchmark generator, invoked by tests/bench_proto.sh: inner tcp / udp / raw IP
+  # (IP protocol 253), one process each for send and recv. Pure socket code, deliberately NOT linking
+  # iwan_core -- it does not touch production code, so it needs no OpenSSL and builds standalone anywhere.
+  # It is still listed in the strict-warning target table below (-Werror applies to everything).
   #
-  # Linux 专属：raw socket + IP_HDRINCL + struct iphdr 都是 Linux 语义，
-  # Apple 的 <netinet/ip.h> 没有 struct iphdr。要移植得另写一个 Winsock/
-  # Darwin 版本，不是加个宏的事，所以这里直接不建。
+  # Linux-only: raw socket + IP_HDRINCL + struct iphdr are all Linux semantics;
+  # Apple's <netinet/ip.h> has no struct iphdr. Porting means writing another Winsock/
+  # Darwin variant, not adding a macro, so it is simply not built here.
   if(UNIX AND NOT APPLE)
     add_executable(bench_proto tests/bench_proto.c)
   endif()
@@ -666,7 +674,7 @@ endif()
 # One flag list for every platform (R38 P2-12/P2-16): non-Windows and Windows
 # both use IWAN_STRICT_FLAGS, and the extras (when enabled) are appended after
 # the -Werror it ends with, followed by their per-diagnostic -Wno-error=
-# demotions. The target SCOPE never changes — lwip never enters this loop.
+# demotions. The target SCOPE never changes -- lwip never enters this loop.
 if(IWAN_STRICT)
   set(_iwan_strict_flags ${IWAN_STRICT_FLAGS})
   if(IWAN_STRICT_EXTRA)
@@ -687,7 +695,7 @@ endif()
 
 # ---------------------------------------------------------------------------
 # Integration suite: tests/integration.sh needs root (TUN devices) and is
-# Linux-only, so it is not wired into CI — run it via sudo locally.
+# Linux-only, so it is not wired into CI -- run it via sudo locally.
 # ---------------------------------------------------------------------------
 if(WIN32 OR APPLE)
   add_custom_target(test
@@ -709,7 +717,7 @@ endif()
 # Know what `cmake --install <build-dir> --prefix <dir>` does here: CMake
 # accepts it and returns 0 WITHOUT copying a single file, because
 # cmake_install.cmake has no file(INSTALL) rules to run. That silent success
-# is a fail-open trap — scripts that "install" and then package or ship the
+# is a fail-open trap -- scripts that "install" and then package or ship the
 # prefix get an empty directory and no error. (`ninja install` / `make
 # install` do fail with "unknown target", but that is not the invocation
 # people reach for.) Until a real install() rule exists, copy the binaries
@@ -721,5 +729,5 @@ endif()
 # lib64 as a non-implicit directory, so the build tree binaries carry a build
 # RPATH pointing there (CMake adds it automatically). The install rule must
 # also set CMAKE_INSTALL_RPATH / INSTALL_RPATH_USE_LINK_PATH so the staged
-# binaries do not keep a build-tree path — otherwise they only run on the
+# binaries do not keep a build-tree path -- otherwise they only run on the
 # machine that built them.

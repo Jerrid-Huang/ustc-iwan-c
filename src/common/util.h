@@ -14,24 +14,24 @@
  * oidc_config.c's err_printf was silently unchecked).
  *
  * The archetype is the plain `printf`, i.e. "whatever the target libc's
- * printf is" — exactly the contract of these wrappers, which all forward
+ * printf is" -- exactly the contract of these wrappers, which all forward
  * `fmt` to vfprintf/vsnprintf. Measured on this tree:
  *   - gcc/Linux and clang/Linux: %zu is valid (gnu semantics), other
  *     mismatches are still rejected;
  *   - MinGW gcc, under the win64 build flags: the same attribute yields
- *     byte-identical diagnostics to a direct libc fprintf call — both
+ *     byte-identical diagnostics to a direct libc fprintf call -- both
  *     reject %zu with "unknown conversion type character 'z' in format"
- *     — so a %zu in a log call is caught in win-cross exactly the way
+ *     -- so a %zu in a log call is caught in win-cross exactly the way
  *     R3-H1's auth.c:416 direct fprintf was, instead of shipping a
  *     broken deliverable.
  * The named archetypes are NOT portable, measured on this tree:
- *   gnu_printf — clang: "'format' attribute argument not supported"
+ *   gnu_printf -- clang: "'format' attribute argument not supported"
  *                (with -Werror that breaks the CI clang leg);
- *   ms_printf  — gcc/Linux: "unrecognized format function type", and
+ *   ms_printf  -- gcc/Linux: "unrecognized format function type", and
  *                clang rejects it too;
- *   gnu_printf — MinGW gcc accepts it but treats %zu as valid, which
+ *   gnu_printf -- MinGW gcc accepts it but treats %zu as valid, which
  *                would silently defeat the Windows check.
- * NOTE: __MINGW_PRINTF_FORMAT cannot be used here either — it is not
+ * NOTE: __MINGW_PRINTF_FORMAT cannot be used here either -- it is not
  * guaranteed to be defined at this point of the include graph (util.h
  * pulls in no libc stdio header), and util.h is included very early
  * everywhere. */
@@ -76,9 +76,9 @@ bool debug_enabled(void);
  *   - the IWAN_WIN_THREAD_PIN sites (tun_win.c:681, proxy.c:619) used
  *     `pin && pin[0] != '0'`: a ONE-BYTE test, so ""/false/no/off (and
  *     their case variants) were ON -> now off, while the whole CLASS of
- *     leading-'0' values that is not exactly the one-byte "0" — "0 ",
+ *     leading-'0' values that is not exactly the one-byte "0" -- "0 ",
  *     "00", "0x", "0abc", "0\n" ... i.e. every string whose first byte is
- *     '0' except "0" itself — was OFF and is now ON. The predicate is
+ *     '0' except "0" itself -- was OFF and is now ON. The predicate is
  *     util.c:54-64 (exact, case-insensitive 0/false/no/off, no trimming),
  *     so trailing garbage is not an off spelling. Documented exception; it
  *     affects the experimental Windows affinity hint only.
@@ -100,7 +100,7 @@ bool env_bool(const char *name, bool dflt);
  *     them), and a site's env_bool_kind names its rule, so a call site can
  *     no longer invent a sixth spelling silently.
  *
- * NOT LANDED — still the lower half of judgement criterion ④ (R38 P2-9):
+ * NOT LANDED -- still the lower half of judgement criterion 4 (R38 P2-9):
  * the DOCUMENTATION half. There is no env-documentation table and none of
  * the four env-doc helpers (find / emit / bool-rule / also-read) in this
  * tree, and the "R7-WG-E checker" that was supposed to compare README.md
@@ -115,7 +115,7 @@ bool env_bool(const char *name, bool dflt);
  * site family). Naming one of these is mandatory: a new
  * `strcmp(v, "0") != 0` is a bug.
  *
- * dflt is NOT uniform across the kinds — the env_bool_value() switch in
+ * dflt is NOT uniform across the kinds -- the env_bool_value() switch in
  * util.c is the authority, and this is what it does:
  *   LOOSE / CS / CS_NO -> dflt is the "unset" answer AND the "set but
  *                         empty" answer (the empty string is treated
@@ -126,7 +126,7 @@ bool env_bool(const char *name, bool dflt);
  *                         allow-lists: unset is false even if dflt is
  *                         true);
  *   ENV_KIND_NUM       -> not a boolean; env_bool_value() returns dflt for
- *                         it, so never call it as one — use env_u64() /
+ *                         it, so never call it as one -- use env_u64() /
  *                         env_ms_range() instead. */
 typedef enum {
     ENV_BOOL_LOOSE = 0,  /* env_bool(): unset AND set-but-empty take dflt;
@@ -137,7 +137,7 @@ typedef enum {
                             case-SENSITIVE, and it has NO "no"/"No"
                             (documented exception, kept value-for-value);
                             unset and set-but-empty take dflt. Do NOT
-                            migrate IWAN_SRV_TUN_SINGLE here — see
+                            migrate IWAN_SRV_TUN_SINGLE here -- see
                             ENV_BOOL_CS_NO below. */
     ENV_BOOL_PRESENT,    /* IWAN_PUMP_PROF: SET AT ALL is ON ("" included);
                             only "unset" takes dflt (unlike LOOSE/CS/CS_NO,
@@ -159,7 +159,7 @@ typedef enum {
                             take dflt, matching the `e && *e` short-circuit
                             of the inline chain it replaced (value-for-value
                             equivalence was checked over 15 cells before the
-                            swap — see .cc_tmp/r38/fixes/notes-srv-h1.md). */
+                            swap -- see .cc_tmp/r38/fixes/notes-srv-h1.md). */
     ENV_KIND_NUM,        /* not a boolean: strict decimal, see env_u64() */
 } env_bool_kind;
 
@@ -186,7 +186,7 @@ int env_scan_i64(const char *s, long long *out);
 uint64_t env_u64(const char *name, uint64_t defval, uint64_t min, uint64_t max,
                  int allow_zero, const char *range_desc);
 
-/* ---------------- the documented env matrix — NOT LANDED (R38 P2-9) ------
+/* ---------------- the documented env matrix -- NOT LANDED (R38 P2-9) ------
  *
  * R37 R7 WG-E's documentation half (an env-documentation table plus the
  * four env-doc helpers: find / emit / bool-rule / also-read) was never
@@ -207,7 +207,7 @@ bool ip_run(char *const args[]);
 /* capture stdout of a command (NULL-terminated argv, excluding argv[0]).
  * Returns malloc'd string or NULL. NOTE: NULL is returned both when the
  * command fails AND when it succeeds with empty output (callers so far
- * treat the two identically — verify before relying on the distinction). */
+ * treat the two identically -- verify before relying on the distinction). */
 char *cmd_capture(char *const args[]);
 
 /* allocation failure is fatal: growable buffers and string helpers have no
@@ -226,7 +226,7 @@ void err_printf(const char *fmt, ...) IWAN_PRINTF_LIKE(1, 2);
 
 /* diagnostic env flags (IWAN_RXDBG / IWAN_FLOWDBG): parsed once per name
  * and cached; any value other than the exact, case-SENSITIVE 0/false/off
- * enables — there is deliberately no "no"/"No" spelling here (that is the
+ * enables -- there is deliberately no "no"/"No" spelling here (that is the
  * ENV_BOOL_CS rule above: a documented exception, not a bug to "fix" in
  * place, because dbg_env()'s looser contract long predates the helper) */
 bool dbg_env(const char *name);

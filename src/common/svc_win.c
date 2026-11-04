@@ -1,4 +1,4 @@
-/* svc_win.c — Windows service front-end for the classic client.
+/* svc_win.c -- Windows service front-end for the classic client.
  *
  * iwan-winsvc.exe = iwan_client.c (compiled with IWAN_HEADLESS_SVC, so
  * its main() is renamed to iwan_client_main) + this shell. The service
@@ -7,12 +7,12 @@
  *
  * Scope guards (see README "Windows service"): classic protocol only.
  * OIDC login needs a browser + stdin and the pwsecret store is a
- * DPAPI user blob — both structurally unavailable to a session-0
+ * DPAPI user blob -- both structurally unavailable to a session-0
  * service, so an OIDC profile must keep running in user context.
  *
  * Lifecycle: the SCM stop command never reaches a console handler in
  * session 0 (no console). The control handler therefore calls
- * port_raise_stop() — the exact function path a console Ctrl+C takes —
+ * port_raise_stop() -- the exact function path a console Ctrl+C takes --
  * plus re-raises while the worker outlives the grace window. The
  * worker exits through the same teardown a Ctrl+C drives (route
  * teardown, default-route restore), so no service-specific cleanup.
@@ -304,7 +304,7 @@ static void WINAPI svc_main(DWORD argc, LPWSTR *argv)
     if (client0 < 0 || client0 >= n) {
         log_ts();
         printf("error: no client args in ImagePath (installed without "
-               "\"-- <client args>\"?) — refusing to start\n");
+               "\"-- <client args>\"?) -- refusing to start\n");
         g_exit_code = 87;
         set_status(SERVICE_STOPPED, 0, 0);
         ExitProcess(87);
@@ -792,7 +792,7 @@ int main(int argc, char **argv)
                 DWORD e = GetLastError();
                 fprintf(stderr,
                         "StartServiceCtrlDispatcher failed (%lu)%s\n", e,
-                        e == 1063 ? " — \"--service run\" is started by the "
+                        e == 1063 ? " -- \"--service run\" is started by the "
                                    "SCM; use `--service start`" : "");
                 return 1;
             }

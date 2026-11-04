@@ -1,9 +1,9 @@
 /*
  * SOCKS5 handshake test harness (root-free).
  *
- * Drives the REAL production SOCKS5 code paths — accept_connections(),
+ * Drives the REAL production SOCKS5 code paths -- accept_connections(),
  * the RFC1929 + CONNECT flow handshake (socks_flow.c), and the userspace
- * netstack — against a loopback TCP listener instead of a VPN socket.
+ * netstack -- against a loopback TCP listener instead of a VPN socket.
  * tests/socks_handshake.py speaks the SOCKS5 wire protocol byte-for-byte
  * and asserts the observable handshake contract.
  *

@@ -1,8 +1,8 @@
-/* iWAN 控制面 ABI（genetlink）v1 —— 内核与用户态共用。
+/* iWAN control-plane ABI (genetlink) v1 -- shared by kernel and user space.
  *
- * 冻结接口，设计说明见 kernel/CONTROL-PLANE.md。本文件只使用标准整数类型，
- * 不含内核专用头，因此用户态可以直接 include；内核侧的 nla_policy 必须与本
- * 文件的类型注释一致，改这里就要同步改 policy。
+ * Frozen interface; for design notes see kernel/CONTROL-PLANE.md. This file uses only standard integer types,
+ * no kernel-only headers, so user space can include it directly; the kernel-side nla_policy must match
+ * the type comments in this file, so any change here requires changing the policy too.
  */
 #ifndef IWAN_GENL_H
 #define IWAN_GENL_H
@@ -10,160 +10,160 @@
 #define IWAN_GENL_NAME		"iwan"
 #define IWAN_GENL_VERSION	1
 
-/* 多播组名：内核 -> 用户态 */
+/* Multicast group name: kernel -> user space */
 #define IWAN_GENL_MCGRP_EVENTS	"events"
 
-/* 事件载荷上限：非数据帧（OPEN/OPEN_ACK/PING/CLOSE 等）都远小于此值 */
+/* Event payload limit: non-data frames (OPEN/OPEN_ACK/PING/CLOSE etc.) are far smaller than this value */
 #define IWAN_CTRL_FRAME_MAX	512
 
-/* 会话密钥长度：IWAN_A_KEY 必须恰好是这么多字节。与 kernel/iwan.h 的
- * IWAN_KEY_LEN 同值，这里再定义一份是为了让用户态不必硬编码。 */
+/* Session key length: IWAN_A_KEY must be exactly this many bytes. Same value as IWAN_KEY_LEN
+ * in kernel/iwan.h; it is defined again here so user space need not hardcode it. */
 #ifndef IWAN_KEY_LEN
 #define IWAN_KEY_LEN	8
 #endif
 
-/* ------------------------------------------------------------ 字节序约定
+/* ------------------------------------------------------------ byte order rules
  *
- * 属性分两类，混用会得到"模块自打自收正常、只有真实对端失败"的缺陷：
+ * Attributes come in two classes; mixing them yields the defect where "the module talks to itself fine and only a real peer fails":
  *
- *   - 普通整数（SID/TOK/ENC/MTU/FLAGS/ENABLED 与全部计数器）：**主机序**；
- *   - 地址与端口（OUTER_SRC/OUTER_DST/SPORT/DPORT）：**网络序**，
- *     用户态必须先 htonl/htons 再放进属性，内核侧对应 be32/be16。
+ *   - plain integers (SID/TOK/ENC/MTU/FLAGS/ENABLED and all counters): **host byte order**;
+ *   - addresses and ports (OUTER_SRC/OUTER_DST/SPORT/DPORT): **network byte order**,
+ *     user space must htonl/htons before storing them in attributes; the kernel side uses be32/be16.
  *
- * 内核内部 struct iwan_cfg / struct iwan_session 的 dport/sport 按**主机序**
- * 存放（出站写外层头时 htons，入站比较时 htons）。因此转换只发生在 netlink
- * 边界这一处：进来 ntohs() 之后存，出去 htons() 之后回。
- * 改动任何一侧前先确认另一侧仍然对齐 —— 这正是历史上出错的地方。
+ * Inside the kernel, dport/sport in struct iwan_cfg / struct iwan_session are kept in **host byte order**
+ * (htons when writing the outer header on egress, htons when comparing on ingress). Conversion therefore happens only at the netlink
+ * boundary: store after ntohs() on the way in, return after htons() on the way out.
+ * Before changing either side, confirm the other still lines up -- this is exactly where it went wrong in the past.
  */
 
-/* ---------------------------------------------------------------- 命令 */
+/* ---------------------------------------------------------------- commands */
 
 enum iwan_genl_cmd {
 	IWAN_CMD_UNSPEC = 0,
-	IWAN_CMD_SESSION_UP,	/* 建立会话，幂等 */
-	IWAN_CMD_SESSION_DOWN,	/* 拆会话：清零状态并删除模块建的网卡 */
-	IWAN_CMD_SET_PEER,	/* 只更新对端地址/端口（漂移、换线） */
-	IWAN_CMD_SET_ENABLED,	/* 临时停/启数据面，不丢会话状态 */
-	IWAN_CMD_GET_STATS,	/* 配置快照 + 计数器 + keepalive 时间戳 */
+	IWAN_CMD_SESSION_UP,	/* create session, idempotent */
+	IWAN_CMD_SESSION_DOWN,	/* tear down session: clear state and delete the NIC created by the module */
+	IWAN_CMD_SET_PEER,	/* update peer address/port only (drift, link change) */
+	IWAN_CMD_SET_ENABLED,	/* temporarily stop/start the data plane without losing session state */
+	IWAN_CMD_GET_STATS,	/* config snapshot + counters + keepalive timestamp */
 	__IWAN_CMD_MAX,
 };
 #define IWAN_CMD_MAX (__IWAN_CMD_MAX - 1)
 
-/* ---------------------------------------------------------------- 属性 */
+/* ---------------------------------------------------------------- attributes */
 
 enum iwan_genl_attr {
 	IWAN_A_UNSPEC = 0,
 	/* --- SESSION_UP / SET_PEER --- */
 	IWAN_A_SID,		/* u16 */
 	IWAN_A_TOK,		/* u32 */
-	IWAN_A_ENC,		/* u8，1 = PT_DATA_ENC + XOR，0 = PT_DATA 明文 */
-	IWAN_A_KEY,		/* 8 字节，MD5(user||pass)[0..8) */
-	IWAN_A_OUTER_SRC,	/* be32，本端外层地址 */
-	IWAN_A_OUTER_DST,	/* be32，对端外层地址 */
+	IWAN_A_ENC,		/* u8, 1 = PT_DATA_ENC + XOR, 0 = PT_DATA plaintext */
+	IWAN_A_KEY,		/* 8 bytes, MD5(user||pass)[0..8) */
+	IWAN_A_OUTER_SRC,	/* be32, local outer address */
+	IWAN_A_OUTER_DST,	/* be32, peer outer address */
 	IWAN_A_DPORT,		/* be16 */
-	IWAN_A_SPORT,		/* be16，省略则用 DPORT */
-	IWAN_A_MTU,		/* u32，省略则 1500 - IWAN_OVERHEAD */
-	IWAN_A_FLAGS,		/* u32，见 IWAN_A_FLAG_* */
+	IWAN_A_SPORT,		/* be16, defaults to DPORT when omitted */
+	IWAN_A_MTU,		/* u32, defaults to 1500 - IWAN_OVERHEAD when omitted */
+	IWAN_A_FLAGS,		/* u32, see IWAN_A_FLAG_* */
 	/* --- SET_ENABLED --- */
 	IWAN_A_ENABLED,		/* u8 */
-	/* --- SESSION_UP / GET_STATS 回执 --- */
-	IWAN_A_DEVNAME,		/* string，实际设备名 */
-	IWAN_A_LAST_KEEPALIVE_MS,	/* u64，单调时钟毫秒；无 keepalive 时为 0 */
-	IWAN_A_PEER_STATE,	/* u8，见 IWAN_PEER_* */
-	IWAN_A_STATS,		/* nested，见 iwan_stats_attr */
-	/* --- SESSION_UP 回执（新增属性，旧客户端忽略即可） --- */
-	IWAN_A_DEV_OWNED,	/* u32，设备归属：1 = 这张设备由本模块创建/认领，
-				 * 后续 SESSION_DOWN 会删除它；0 = 不是我们建的
-				 * （例如用户自己 `ip link add ... type iwan` 的
-				 * 设备，我们不删）。主机序，与同表其它标量一致。
-				 * 注意本属性表达的是"要不要由会话负责删"，不是
-				 * "netdev kind 是不是 iwan"：同名但非本模块的设备
-				 * （TUN/veth 占着 iwan0）会被直接拒绝，SESSION_UP
-				 * 返回 -EBUSY，根本不会有回执。
-				 * 旧客户端不认识这个属性，按 genetlink 惯例忽略即可。 */
-	/* --- SESSION_UP 入参（新增属性，追加在末尾以保证既有属性编号不变；
-	 *     旧客户端不发 = 由 FIB 解析后钉住，行为与引入绑定之前一致） --- */
-	IWAN_A_OIF,		/* u32，主机序：显式绑定外层出口网卡（ifindex）。
-				 * 0 或省略 = 不指定，由 FIB 解析一次并把结果钉住
-				 * —— 两种情况下"这条会话只用一张下游网卡"都成立，
-				 * 区别只在于是谁选的：显式绑定严格用指定那张（内核
-				 * 的 flowi4_oif 是硬绑：设备 UP 且有 IPv4 地址时，即使
-				 * FIB 无路由也会为它合成 scope link 路由，即
-				 * SO_BINDTODEVICE 语义，绑到没有回程路由的卡上会照发
-				 * 而被网络侧丢弃；设备不存在/解析不到路由则返回
-				 * -ENETUNREACH，绝不漂移到别的卡）；未指定则由 FIB
-				 * 选，选完固定，此后不再逐包变化。 */
-	IWAN_A_IP,		/* be32：显式绑定外层出口 IP（"绑 IP"模式）。
-				 * 语义有两层：① 该地址写进外层 IP 头的源地址字段
-				 * （与 OUTER_SRC 同值时二者须一致）；② 它是**绑定
-				 * 规格**——内核用本机地址表把它解析成持有该地址的
-				 * 接口，并按该接口固定承载网卡，等价于"绑网卡"。
-				 * 0 或省略 = 不按 IP 绑定。与 OIF 同时给出时必须指向
-				 * 同一张接口，否则 SESSION_UP 返回 -EINVAL（两个绑定
-				 * 规格互相矛盾时不能取其一）。解析不到（该地址不属于
-				 * 任何本机接口）返回 -EADDRNOTAVAIL。
-				 * 注意：解析用的是**地址表**（本机地址挂在接口上），
-				 * 不是路由表——按路由反查会把"绑 IP"退化成"由 FIB
-				 * 决定"，与"什么都不绑"失去区分。 */
-	IWAN_A_CARRIER,		/* u32，只读（GET/回执）：当前实际承载网卡的
-				 * ifindex，0 = 尚未解析。供控制面对账与诊断
-				 * （"绑 IP/绑网卡"下内核选了哪张卡，日志之外
-				 * 只有这一个可读来源）。写路径忽略本属性。 */
-	/* --- 外层 IPv6 增补（追加在末尾，既有属性编号一个不动） ---------
-	 * 外层地址族由属性**成对出现**决定，不另设"族"开关：给了
-	 * OUTER_SRC6 + OUTER_DST6 就是外层 v6 会话，给了 v4 那对就是 v4
-	 * 会话；两对同时给出返回 -EINVAL（族必须唯一，不能让数据面去猜）。
-	 * 内层不受影响：内层版本仍逐包判（iwan_inner_hdr_check），外层 v6
-	 * 里照样可以跑内层 v4。 */
-	IWAN_A_OUTER_SRC6,	/* 16 字节 struct in6_addr：本端外层 IPv6 地址。
-				 * 必须与 OUTER_DST6 同时给出，且不能全零。 */
-	IWAN_A_OUTER_DST6,	/* 16 字节：对端外层 IPv6 地址 */
-	IWAN_A_IP6,		/* 16 字节：显式绑定外层出口 IPv6 地址
-				 * （"绑 IP"模式的 v6 形态）。语义与 IWAN_A_IP
-				 * 逐条对应：① 它就是外层 IPv6 头的源地址，故必须
-				 * 等于 OUTER_SRC6；② 它是**绑定规格** —— 内核用
-				 * 本机 v6 地址表解析出持有该地址的接口并按该接口
-				 * 固定承载网卡；与 OIF 同时给出时必须指向同一张
-				 * 接口（-EINVAL），解析不到返回 -EADDRNOTAVAIL。
-				 * 全零或省略 = 不按 IP 绑定。 */
+	/* --- SESSION_UP / GET_STATS reply --- */
+	IWAN_A_DEVNAME,		/* string, actual device name */
+	IWAN_A_LAST_KEEPALIVE_MS,	/* u64, monotonic clock in ms; 0 when there is no keepalive */
+	IWAN_A_PEER_STATE,	/* u8, see IWAN_PEER_* */
+	IWAN_A_STATS,		/* nested, see iwan_stats_attr */
+	/* --- SESSION_UP reply (new attributes, old clients may ignore them) --- */
+	IWAN_A_DEV_OWNED,	/* u32, device ownership: 1 = this device was created/claimed by this module,
+				 * a later SESSION_DOWN deletes it; 0 = not created by us
+				 * (e.g. a device the user created with "ip link add ... type iwan";
+				 * we do not delete it). Host byte order, like the other scalars in this table.
+				 * Note this attribute expresses "whether the session is responsible for deleting it", not
+				 * "whether the netdev kind is iwan": a device with the same name but not from this module
+				 * (TUN/veth occupying iwan0) is rejected outright and SESSION_UP
+				 * returns -EBUSY, with no reply at all.
+				 * Old clients do not know this attribute; per genetlink convention they just ignore it. */
+	/* --- SESSION_UP input (new attributes, appended at the end so existing attribute numbers stay unchanged;
+	 *     old clients not sending them = pinned after FIB resolution, same behavior as before binding was introduced) --- */
+	IWAN_A_OIF,		/* u32, host byte order: explicitly bind the outer egress NIC (ifindex).
+				 * 0 or omitted = unspecified: resolve once via FIB and pin the result
+				 * -- in both cases "this session uses only one downstream NIC" holds;
+				 * the only difference is who chose: explicit binding strictly uses the given NIC (the kernel's
+				 * flowi4_oif is a hard bind: when the device is UP and has an IPv4 address, even if
+				 * FIB has no route, a scope link route is synthesized for it, i.e.
+				 * SO_BINDTODEVICE semantics; binding to a NIC with no return route still sends
+				 * and the network side drops it; if the device does not exist or no route resolves, it returns
+				 * -ENETUNREACH and never drifts to another NIC); if unspecified, FIB
+				 * chooses once and it stays fixed, never changing per packet afterwards. */
+	IWAN_A_IP,		/* be32: explicitly bind the outer egress IP ("bind IP" mode).
+				 * Semantics have two layers: (1) the address is written into the source address field of the outer IP header
+				 * (it must agree with OUTER_SRC when both are set); (2) it is the **binding
+				 * spec** -- the kernel resolves it via the local address table to the
+				 * interface holding that address, and pins the carrier NIC to that interface, equivalent to "bind NIC".
+				 * 0 or omitted = no IP binding. When given together with OIF, it must point to
+				 * the same interface, otherwise SESSION_UP returns -EINVAL (when two binding
+				 * specs contradict each other, neither may be chosen). If it cannot be resolved (the address belongs to
+				 * no local interface), returns -EADDRNOTAVAIL.
+				 * Note: resolution uses the **address table** (local addresses attached to interfaces),
+				 * not the routing table -- reverse lookup via a route would degrade "bind IP" into "decided by FIB"
+				 * and lose the distinction from "bind nothing". */
+	IWAN_A_CARRIER,		/* u32, read-only (GET/reply): ifindex of the NIC
+				 * actually carrying the traffic, 0 = not resolved yet. For control-plane reconciliation and diagnostics
+				 * (which NIC the kernel picked under "bind IP/bind NIC"; besides logs,
+				 * this is the only readable source). The write path ignores this attribute. */
+	/* --- outer IPv6 additions (appended at the end, no existing attribute number changes) ---------
+	 * The outer address family is determined by attributes **appearing in pairs**; there is no separate "family" switch:
+	 * OUTER_SRC6 + OUTER_DST6 means an outer v6 session, and the v4 pair means a v4
+	 * session; giving both pairs returns -EINVAL (the family must be unique; the data plane must not guess).
+	 * The inner layer is unaffected: the inner version is still decided per packet (iwan_inner_hdr_check), and inner v4
+	 * can still run inside outer v6. */
+	IWAN_A_OUTER_SRC6,	/* 16 bytes, struct in6_addr: local outer IPv6 address.
+				 * Must be given together with OUTER_DST6 and must not be all zero. */
+	IWAN_A_OUTER_DST6,	/* 16 bytes: peer outer IPv6 address */
+	IWAN_A_IP6,		/* 16 bytes: explicitly bind the outer egress IPv6 address
+				 * (v6 form of "bind IP" mode). Semantics map
+				 * item by item to IWAN_A_IP: (1) it is the source address of the outer IPv6 header, so it must
+				 * equal OUTER_SRC6; (2) it is the **binding spec** -- the kernel uses
+				 * the local v6 address table to resolve the interface holding that address and pins
+				 * the carrier NIC to it; when given together with OIF, it must point to the same
+				 * interface (-EINVAL); if it cannot be resolved, returns -EADDRNOTAVAIL.
+				 * All zero or omitted = no IP binding. */
 	__IWAN_A_MAX,
 };
 #define IWAN_A_MAX (__IWAN_A_MAX - 1)
 
-/* GET_STATS 回执契约（v1 实现口径，改动前先改这里）：
- *  - 只回**发送 socket 所在 netns** 的视图；没有 NLM_F_DUMP 枚举，跨 netns
- *    请逐个 netns 查询。
- *  - **无 netlink 会话时不报错、也不清零**，回的是模块参数层（回落路径）视图，
- *    即"从未 SESSION_UP"时数据面真正在用的那份配置；用户态靠 SID/DEVNAME
- *    判断有无会话。SESSION_DOWN 之后凭据与 LAST_KEEPALIVE_MS 清零。
- *  - LAST_KEEPALIVE_MS 是只读快照（SESSION_UP/SET_PEER 携带该属性返回 -EINVAL），
- *    由 PT_PING_REQ/RSP 更新，SESSION_DOWN 清零。
- *  - SESSION_UP 回执必带 DEVNAME；MTU 回**实测值**（设备已 UP 且无法改时可能与
- *    请求值不同）；DEV_OWNED 回设备归属（见 IWAN_A_DEV_OWNED）。
- *  - **KEY 会回传**（明文 8 字节，与下发值逐字节相同）：实现按"下发即可读回"
- *    处理，用户态据此校验会话是否为本进程下发的。这条与旧版注释"KEY 不回传"
- *    相反，**以实现为准**；正因为会回传，不要把 get-stats 的输出写进日志/
- *    工单/上报（含 KEY、SID、TOK 在内的完整会话凭据）。
+/* GET_STATS reply contract (v1 implementation semantics; change this first before changing code):
+ *  - Only the view of the **netns where the sending socket lives** is returned; there is no NLM_F_DUMP enumeration, so across netns
+ *    query each netns separately.
+ *  - **With no netlink session there is no error and no clearing**, it returns the module-parameter layer (fallback path) view,
+ *    i.e. the config the data plane really uses when SESSION_UP was never called; user space uses SID/DEVNAME
+ *    to tell whether a session exists. After SESSION_DOWN the credentials and LAST_KEEPALIVE_MS are cleared.
+ *  - LAST_KEEPALIVE_MS is a read-only snapshot (SESSION_UP/SET_PEER carrying this attribute return -EINVAL);
+ *    it is updated by PT_PING_REQ/RSP and cleared on SESSION_DOWN.
+ *  - The SESSION_UP reply always carries DEVNAME; MTU returns the **measured value** (it may differ from
+ *    the requested value when the device is already UP and cannot be changed); DEV_OWNED returns device ownership (see IWAN_A_DEV_OWNED).
+ *  - **KEY is echoed back** (plaintext 8 bytes, byte-for-byte identical to what was set): the implementation treats
+ *    "set means readable back", and user space uses this to verify the session was set up by this process. This contradicts
+ *    the old comment "KEY is not echoed back"; **the implementation is authoritative**. Because it is echoed back, do not write get-stats
+ *    output into logs/tickets/reports (complete session credentials including KEY, SID, TOK).
  */
 
-/* SESSION_UP 的 FLAGS 位 */
-#define IWAN_A_FLAG_CREATE_DEV	(1u << 0)	/* 按需创建 iwan0（默认置位） */
-#define IWAN_A_FLAG_ANSWER_PING	(1u << 1)	/* 保留位：v1 不实现内核代答
-						 * PT_PING_REQ，置位即 -EINVAL
-						 * （宁可拒绝，也不假装支持） */
+/* FLAGS bits for SESSION_UP */
+#define IWAN_A_FLAG_CREATE_DEV	(1u << 0)	/* create iwan0 on demand (set by default) */
+#define IWAN_A_FLAG_ANSWER_PING	(1u << 1)	/* reserved bit: v1 does not implement kernel-side answering of
+						 * PT_PING_REQ; setting it returns -EINVAL
+						 * (better to reject than to pretend support) */
 
-/* 对端状态（IWAN_A_PEER_STATE） */
+/* Peer state (IWAN_A_PEER_STATE) */
 enum iwan_peer_state {
 	IWAN_PEER_UNKNOWN = 0,
-	IWAN_PEER_UP,		/* 收过有效帧 */
-	IWAN_PEER_SILENT,	/* 保留编号：v1 从不赋值 —— 内核无定时器，
-				 * 判活由用户态轮询 last_rx_ms 承担 */
-	IWAN_PEER_CLOSED,	/* 收到 PT_CLOSE */
+	IWAN_PEER_UP,		/* has received a valid frame */
+	IWAN_PEER_SILENT,	/* reserved number: v1 never assigns it -- the kernel has no timer,
+				 * liveness detection is done by user space polling last_rx_ms */
+	IWAN_PEER_CLOSED,	/* received PT_CLOSE */
 };
 
-/* GET_STATS 的计数器（IWAN_A_STATS 内嵌一层）。
- * 嵌套表用 iwan_stats_attr，值一律 u64 主机序；未实现的计数器回 0。
- * 名称/语义与 /proc/net/iwan 现有计数器一致，便于两条路径对照。 */
+/* GET_STATS counters (IWAN_A_STATS nests one level).
+ * The nested table uses iwan_stats_attr; all values are u64 in host byte order; unimplemented counters return 0.
+ * Names/semantics match the existing /proc/net/iwan counters so the two paths can be compared. */
 enum iwan_stats_attr {
 	IWAN_S_UNSPEC = 0,
 	IWAN_S_RX_PKTS,
@@ -176,42 +176,42 @@ enum iwan_stats_attr {
 	IWAN_S_RX_BAD_HDR,
 	IWAN_S_RX_BAD_INNER,
 	IWAN_S_RX_NOMEM,
-	IWAN_S_RX_CTRL_FRAME,	/* 过了凭据闸门的非数据帧；被事件限速丢弃的看
-				 * IWAN_S_EV_DROPPED（ev_dropped ≤ 本项） */
+	IWAN_S_RX_CTRL_FRAME,	/* non-data frames that passed the credential gate; for those dropped by event rate limiting see
+				 * IWAN_S_EV_DROPPED (ev_dropped <= rx_ctrl_frame) */
 	IWAN_S_TX_PKTS,
 	IWAN_S_TX_BYTES,
 	IWAN_S_TX_BAD_STATE,
 	IWAN_S_TX_BAD_INNER,
 	IWAN_S_TX_ERR,
-	/* 新增计数器（追加在末尾，前面的序号不动，旧客户端忽略即可）：
-	 * 事件通道被限速丢弃的帧数。控制帧路径没有凭据可校验
-	 * （PT_OPEN/PT_OPEN_ACK/PT_OPEN_REJECT 必须放行给用户态），
-	 * 所以用每 netns 的令牌桶兜住"伪造/风暴帧打满事件通道"这一路。
-	 * 与 IWAN_S_RX_CTRL_FRAME 的关系：那一项记的是**过了凭据闸门**的
-	 * 控制帧总数（含被限速丢掉的），因此恒有 ev_dropped ≤ rx_ctrl_frame；
-	 * 被限速丢掉时共享内存页的时间戳/peer_state 记账照旧发生（只有多播
-	 * 被丢），断线检测不受限速影响。
-	 * /proc/net/iwan 的列序已冻结，这个计数器只在 GET_STATS 里可见。 */
+	/* New counter (appended at the end, earlier numbers unchanged, old clients may ignore it):
+	 * number of frames dropped by event-channel rate limiting. The control-frame path has no credentials to check
+	 * (PT_OPEN/PT_OPEN_ACK/PT_OPEN_REJECT must be passed through to user space),
+	 * so a per-netns token bucket covers the "forged/storm frames saturate the event channel" path.
+	 * Relation to IWAN_S_RX_CTRL_FRAME: that item counts the **frames that passed the credential gate**
+	 * in total (including those dropped by rate limiting), so ev_dropped <= rx_ctrl_frame always holds;
+	 * when rate limiting drops a frame, the shared-memory page timestamp/peer_state accounting still happens (only the multicast
+	 * is dropped), so link-loss detection is unaffected by rate limiting.
+	 * The /proc/net/iwan column order is frozen; this counter is visible only in GET_STATS. */
 	IWAN_S_EV_DROPPED,
-	/* 新增计数器（同样追加在末尾）：外层 v6 分片。本设计外层 v6 不分片
-	 * （v6 无 DF 位，源端分片只会换到对端拒收；会话建立时按承载网卡 MTU
-	 * 校验过"内层 MTU + 封装 <= MTU"），所以这一项非零就说明对端配置与
-	 * 本端不一致（或对端在跑外层 v6 的 jumbo 档）。这些包**不**按本隧道
-	 * 解封：计数后原样交回协议栈（NF_ACCEPT）。
-	 * /proc/net/iwan 的列序已冻结，本项只在 GET_STATS 里可见。 */
+	/* New counter (also appended at the end): outer v6 fragments. This design does not fragment outer v6
+	 * (v6 has no DF bit, so source fragmentation only buys rejection by the peer; at session setup the "inner MTU +
+	 * encapsulation <= MTU" check is done against the carrier NIC MTU), so a non-zero value here means the peer's config
+	 * differs from the local one (or the peer runs an outer v6 jumbo profile). These packets are **not** decapsulated
+	 * for this tunnel: they are counted and handed back to the stack unchanged (NF_ACCEPT).
+	 * The /proc/net/iwan column order is frozen; this item is visible only in GET_STATS. */
 	IWAN_S_RX_FRAG6,
 	__IWAN_S_MAX,
 };
 #define IWAN_S_MAX (__IWAN_S_MAX - 1)
 
-/* ---------------------------------------------------------------- 事件 */
+/* ---------------------------------------------------------------- events */
 
 enum iwan_genl_event {
 	IWAN_EV_UNSPEC = 0,
-	IWAN_EV_CTRL_FRAME,	/* 收到非数据帧，原样转交用户态 */
-	IWAN_EV_PEER_CLOSE,	/* 收到 PT_CLOSE */
-	IWAN_EV_PEER_SILENT,	/* 保留编号：v1 不产生（无内核定时器） */
-	IWAN_EV_KEEPALIVE,	/* 收到 PT_PING_REQ/RSP（可选订阅） */
+	IWAN_EV_CTRL_FRAME,	/* non-data frame received, forwarded to user space as-is */
+	IWAN_EV_PEER_CLOSE,	/* received PT_CLOSE */
+	IWAN_EV_PEER_SILENT,	/* reserved number: v1 never generates it (no kernel timer) */
+	IWAN_EV_KEEPALIVE,	/* received PT_PING_REQ/RSP (optional subscription) */
 	__IWAN_EV_MAX,
 };
 #define IWAN_EV_MAX (__IWAN_EV_MAX - 1)
@@ -219,13 +219,13 @@ enum iwan_genl_event {
 enum iwan_ev_attr {
 	IWAN_EVA_UNSPEC = 0,
 	IWAN_EVA_SID,		/* u16 */
-	IWAN_EVA_FRAME,		/* 原始帧字节（外层 IP/UDP 头之后），≤ IWAN_CTRL_FRAME_MAX */
+	IWAN_EVA_FRAME,		/* raw frame bytes (after the outer IP/UDP header), <= IWAN_CTRL_FRAME_MAX */
 	IWAN_EVA_OUTER_SRC,	/* be32 */
 	IWAN_EVA_OUTER_DST,	/* be32 */
 	IWAN_EVA_SPORT,		/* be16 */
 	IWAN_EVA_DPORT,		/* be16 */
-	IWAN_EVA_SILENT_MS,	/* 保留编号：仅曾计划的 PEER_SILENT 用 */
-	IWAN_EVA_TIMESTAMP_MS,	/* u64，仅 KEEPALIVE */
+	IWAN_EVA_SILENT_MS,	/* reserved number: only used by the once-planned PEER_SILENT */
+	IWAN_EVA_TIMESTAMP_MS,	/* u64, KEEPALIVE only */
 	__IWAN_EVA_MAX,
 };
 #define IWAN_EVA_MAX (__IWAN_EVA_MAX - 1)

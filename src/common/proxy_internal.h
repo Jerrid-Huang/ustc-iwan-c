@@ -15,6 +15,7 @@
 
 #include "common.h"   /* port.h: winsock2/windows.h on Windows, iovec */
 #include "util.h"     /* pace_bucket */
+#include "echo.h"     /* iwan_echo_stats (keepalive latency stats for 60-byte frames) */
 
 #ifndef _WIN32
 #include <sys/socket.h>   /* struct mmsghdr (with _GNU_SOURCE) */
@@ -49,13 +50,13 @@ enum {
     PP_POLLWAIT,      /* recv sub: parked in port_poll (no downlink) */
     PP_DLPKT,         /* downlink: whole per-packet loop (incl tun_write) */
 };
-/* M3-10: per-slot profiler counters — RMW'd by up to TUN_POOL_MAX reader
+/* M3-10: per-slot profiler counters -- RMW'd by up to TUN_POOL_MAX reader
  * threads and read live by run_pump's tick, so they must be atomic
  * (plain uint64_t was a data race whenever IWAN_PUMP_PROF=1). */
 typedef struct { atomic_uint_fast64_t us; atomic_uint_fast64_t n; } pump_prof_t;
 
 /* C4: profiler collection is gated on IWAN_PUMP_PROF (parsed once, like
- * profile.h's g_prof_on) — the per-packet timer/atomic work is pure
+ * profile.h's g_prof_on) -- the per-packet timer/atomic work is pure
  * waste when nobody reads the printout. The single-thread pump variant
  * shares this flag through these externs. */
 extern atomic_int g_pump_prof_on;      /* collection gate (relaxed) */
@@ -109,12 +110,12 @@ typedef struct {
     uint32_t tok;
     uint32_t inner_ip; /* session IP, host order: downlink addr filter */
     uint8_t  enc;
-    /* 槽位定尺（proxy.c pump_slot_init）：内层分组上限取协商 MTU 与
-     * PUMP_SLOT 的较大者，槽位 = 8B 定长封装首部 + 内层分组。固定 2048
-     * 会让大 MTU 会话的内层分组在入队处被静默丢弃。 */
-    size_t   inner_max; /* 内层分组上限字节数 */
-    size_t   slot;      /* 每报文槽位字节数 = 8 + inner_max */
-    unsigned nbatch;    /* 每批槽位数（大 MTU 时自动减少） */
+    /* Slot sizing (proxy.c pump_slot_init): the inner packet limit is the larger
+     * of the negotiated MTU and PUMP_SLOT; slot = 8B fixed encapsulation header +
+     * inner packet. A fixed 2048 silently drops large-MTU inner packets at enqueue. */
+    size_t   inner_max; /* inner packet limit in bytes */
+    size_t   slot;      /* bytes per message slot = 8 + inner_max */
+    unsigned nbatch;    /* slots per batch (auto-reduced for large MTU) */
     size_t   gso_mss;   /* last UDP_SEGMENT value set, 0 = none */
     int      gso_ok;    /* 1 = UDP_SEGMENT usable, 0 = failed, -1 = untried */
     size_t   gso_pending_mss; /* C1 hysteresis: mss seen in recent batches */
@@ -127,15 +128,18 @@ typedef struct {
     pthread_mutex_t send_lock; /* serializes GSO/sendmmsg on the shared socket */
     struct tun_pool *pool;
     pace_bucket pace;   /* aggregate send pacing (util.h); serialized by
-                         * send_lock — the bucket is not thread-safe */
+                         * send_lock -- the bucket is not thread-safe */
     /* M3-1: written by udp2tun_thread and read by run_pump's tick loop
-     * while the thread is alive — must be atomic (plain bool was a
+     * while the thread is alive -- must be atomic (plain bool was a
      * C11 data race; M14 only initialized it) */
     _Atomic bool session_lost; /* set by udp2tun_thread when the tunnel
                           * is considered dead (keepalive failures / no
                           * downlink); distinguishes failure from the
                           * user's Ctrl-C so run_pump can report it */
     pump_prof_t prof[PUMP_PROF_N];   /* [prof] stage timers (whole-run) */
+    /* Panabit 60-byte ECHOREQ latency stats (cur/min/max, microseconds). Zeroing
+     * the whole block is enough; iwan_echo_build/observe take the "first sample" branch. */
+    struct iwan_echo_stats echo;
 } pump_ctx_t;
 
 #endif /* IWAN_PROXY_INTERNAL_H */

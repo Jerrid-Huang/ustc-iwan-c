@@ -34,7 +34,7 @@ uint16_t ip_udp_csum(uint32_t sip, uint32_t dip, const void *udp, size_t n);
  * otherwise, leaving *saddr / *daddr untouched.
  *
  * Address convention: the numeric value with the first octet most
- * significant — 10.0.0.2 -> 0x0A000002 — identical on any endianness
+ * significant -- 10.0.0.2 -> 0x0A000002 -- identical on any endianness
  * and equal to the project's ip4_u32() helper (protocol.h); i.e. the
  * value ntohl() yields for the on-wire big-endian u32.
  *

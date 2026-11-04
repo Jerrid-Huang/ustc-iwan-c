@@ -15,7 +15,7 @@
  *
  * The pr==2 case: a COMPLETE RFC1929 frame whose username length is 64
  * (0x40) fills the relay's 64-byte `user` buffer exactly. The parser
- * (pp_socks_auth_frame, proto_parse.c) returns 2 for ulen >= usz — the
+ * (pp_socks_auth_frame, proto_parse.c) returns 2 for ulen >= usz -- the
  * frame is well-formed, so it is an auth attempt (R37 R1-B-5: counted in
  * the peer lockout), NOT a protocol violation. Before F0/3e7c12b the
  * relay's `if (pr > 0)` treated pr==2 as a valid frame and evaluated
@@ -27,26 +27,26 @@
  * counter +1.
  *
  * Cases (relay_proxy.c in the current tree; each case must run as a
- * fresh PROCESS so the file-static peer lockout table starts clean —
+ * fresh PROCESS so the file-static peer lockout table starts clean --
  * tests/relay_socks_harness.py handles that):
  *
  *   tokpr2    token mode: 5 x pr==2 -> each answers {5,2} then {1,1}
  *             (counted), then the 6th connection from the same peer
- *             (127.0.0.1) is dropped at accept() with NO reply —
+ *             (127.0.0.1) is dropped at accept() with NO reply --
  *             proving pr==2 counts toward the lockout, plus the {1,1}
  *             wire contract and (under ASan/UBSan, 434ef80) the crash.
  *   notokpr2  no-token (courtesy) mode: a pr==2 frame answers {1,1}
  *             and is still counted (no crash).
  *   pr0       token mode: 10 x malformed frame (ulen=0, R46-L4) each
  *             answers {1,1}, then an 11th connection is STILL served
- *             (not blocked) — malformed frames must NOT count.
+ *             (not blocked) -- malformed frames must NOT count.
  *
  *   http_upgrade_exempt
  *             R53-A-1: courtesy (no-token) mode, HTTP absolute-URI
  *             forward of a request with `Upgrade: websocket` +
  *             `Connection: Upgrade` through the REAL relay to a raw-TCP
  *             capture upstream; the upstream must receive the head
- *             VERBATIM — Connection: Upgrade survives, no injected
+ *             VERBATIM -- Connection: Upgrade survives, no injected
  *             Connection: close (the R52-B1 rewrite must exempt
  *             Upgrade/101 handshakes; a rewrite would make every strict
  *             origin reply 400 and kill WS-over-proxy).
@@ -54,13 +54,13 @@
  *             R53-A-3: courtesy mode, a mixed-line-ending head (4000 x
  *             "A\n" + CRLFCRLF, 8045 B < the 8191 B handshake cap) whose
  *             exact rewritten size would exceed the conn_head buffer;
- *             the upstream must receive it VERBATIM — no truncation, no
+ *             the upstream must receive it VERBATIM -- no truncation, no
  *             half-rewrite, no injected Connection: close (the explicit
  *             need>outcap fallback).
  *   http_space_upgrade
  *             R54-WG1-1: courtesy mode, WS absolute-URI request spelled
  *             `Upgrade : websocket` (OWS before the colon, RFC 7230
- *             §3.2-allowed and real-world reachable). The Upgrade
+ *             section 3.2-allowed and real-world reachable). The Upgrade
  *             detector must tolerate that OWS so the R53-A-1 exemption
  *             still fires: upstream receives the head VERBATIM
  *             (Connection: Upgrade preserved, no injected close) and a
@@ -71,7 +71,7 @@
  *             `Connection : keep-alive` (OWS before the colon). The
  *             Connection detector must tolerate that OWS in BOTH the
  *             pre-scan and the emit loop: upstream receives the exact
- *             rewrite — that line dropped, exactly ONE canonical
+ *             rewrite -- that line dropped, exactly ONE canonical
  *             `Connection: close` injected, never a duplicate Connection.
  *   http_space_both
  *             R54-WG1-1: courtesy mode, BOTH fields spaced
@@ -273,7 +273,7 @@ static int attempt(uint16_t port, const uint8_t *frm, size_t flen,
     } else {
         /* blocked peer: dropped at accept() (port_close on the accepted
          * fd) -> the client sees EOF (0), ECONNRESET (-1) or a recv
-         * timeout (0) — never the {5,2}+{1,1} replies. Only a full
+         * timeout (0) -- never the {5,2}+{1,1} replies. Only a full
          * 2-byte reply proves the peer was served. */
         int rv = cli_recv_exact(fd, r, 2);
         if (rv != 1) {
@@ -297,7 +297,7 @@ static int attempt(uint16_t port, const uint8_t *frm, size_t flen,
  * authority in the forwarded request's absolute URI) that accepts one
  * connection and captures every byte the relay forwards. Everything here
  * is blocking and runs on the harness thread while the REAL relay works
- * in its own threads — there is no cross-thread state to share.
+ * in its own threads -- there is no cross-thread state to share.
  *
  * Both HTTP cases run in courtesy (token = NULL) mode: a token-mode
  * relay refuses plain HTTP (HTTP clients cannot do RFC1929; see
@@ -512,7 +512,7 @@ static int case_pr0(const char *token, uint16_t port)
     return bad;
 }
 
-/* R53-A-1: an Upgrade request must be forwarded verbatim — the R52-B1
+/* R53-A-1: an Upgrade request must be forwarded verbatim -- the R52-B1
  * `Connection: close` rewrite would corrupt a 101 handshake (a compliant
  * origin only answers 101 to a request that still bears
  * `Connection: Upgrade`). The upstream must see the client's exact head:
@@ -643,12 +643,12 @@ static int case_http_overflow_fallback(uint16_t port)
     return bad;
 }
 
-/* R54-WG1-1: `Upgrade : websocket` — RFC 7230 §3.2 lets a sender place
+/* R54-WG1-1: `Upgrade : websocket` -- RFC 7230 section 3.2 lets a sender place
  * optional whitespace (OWS: SP/HTAB) between the field name and the
  * colon, and real clients do. The R53-A-1 upgrade detector used to
  * require the colon at exactly index 7, so this spelling escaped the
  * exemption and the R52-B1 rewrite dropped `Connection: Upgrade` while
- * injecting `Connection: close` — a strict RFC 7230 §6.7 origin then
+ * injecting `Connection: close` -- a strict RFC 7230 section 6.7 origin then
  * answers 400 and the WS-over-proxy handshake dies. The upstream must
  * receive the client's exact head VERBATIM. */
 static int case_http_space_upgrade(uint16_t port)
@@ -712,8 +712,8 @@ static int case_http_space_upgrade(uint16_t port)
  * keep-alive`). Both the pre-scan and the emit loop used to require the
  * colon at exactly index 10, so this spelling was NOT recognized as a
  * Connection field: the original line was forwarded unchanged AND a
- * second `Connection: close` was appended — two Connection headers on
- * the wire (per RFC 7230 §3.2 a field name is a single token; a proxy
+ * second `Connection: close` was appended -- two Connection headers on
+ * the wire (per RFC 7230 section 3.2 a field name is a single token; a proxy
  * MUST NOT forward a duplicate Connection field family). The rewrite must
  * drop the OWS-spelled line and inject exactly ONE canonical
  * `Connection: close`. */
@@ -783,7 +783,7 @@ static int case_http_space_conn(uint16_t port)
 }
 
 /* R54-WG1-1: BOTH header fields carry OWS before the colon. The Upgrade
- * exemption must still fire (verbatim forward) — if either detector
+ * exemption must still fire (verbatim forward) -- if either detector
  * missed its spelling, the rewrite would drop `Connection : Upgrade`
  * and inject `Connection: close`, corrupting the 101 handshake. */
 static int case_http_space_both(uint16_t port)
@@ -878,7 +878,7 @@ int main(int argc, char **argv)
     port_socket_init();   /* WSAStartup on Windows; no-op on Linux */
     /* a lockout drop closes the connection mid-handshake: a send() on
      * the RST-ed socket must not kill the harness with SIGPIPE (Windows
-     * has no SIGPIPE — port_ignore_sigpipe is a no-op there) */
+     * has no SIGPIPE -- port_ignore_sigpipe is a no-op there) */
     port_ignore_sigpipe();
 
     uint16_t port = pick_port();

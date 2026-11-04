@@ -3,7 +3,7 @@
 
 /* At-rest protection for the per-line passwords in servers.json.
  * The stored value is the PLAINTEXT password (by decision: the former
- * app-secret GCM layer was obfuscation only — the binary is public, so
+ * app-secret GCM layer was obfuscation only - the binary is public, so
  * it protected nothing). The at-rest protection is the OS facility
  * alone: on Windows the password is sealed with DPAPI (CurrentUser +
  * machine) before landing on disk; on macOS it lives in the login

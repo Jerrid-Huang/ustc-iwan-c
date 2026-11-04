@@ -17,7 +17,7 @@ cd "$(dirname "$0")/.."
 # optional positional args: [THREADS] [debug] [mini]
 # "debug" needs a build that still parses IWAN_DEBUG: configure with
 # -DIWAN_DEBUG_STRIP=OFF (a Release build keeps the optimization but must
-# not strip the diagnostics) — see the self-check below.
+# not strip the diagnostics) -- see the self-check below.
 if [ -n "${1:-}" ]; then
     export IWAN_SRV_THREADS="$1"
 fi
@@ -38,7 +38,7 @@ fi
 #
 # R37 R5 WG-D (R4-L2): "non-empty" is NOT "diagnostics requested". An
 # explicit off-spelling (the user turning the switch OFF) must not trip
-# the abort below — that turned a legal benchmark into a hard failure
+# the abort below -- that turned a legal benchmark into a hard failure
 # with a misleading "this build cannot emit the diagnostics" message.
 # The list must match the parsers:
 #   IWAN_DEBUG   -> env_bool("IWAN_DEBUG", false)   src/common/util.c:75,
@@ -54,11 +54,11 @@ fi
 #
 # R37 R6 WG4 (R6-6): the predicate must not let the shell rewrite the
 # value. The previous form piped it through $(printf | tr), and a command
-# substitution strips TRAILING NEWLINES — "IWAN_DEBUG=$'0\n'" (the classic
+# substitution strips TRAILING NEWLINES -- "IWAN_DEBUG=$'0\n'" (the classic
 # `export IWAN_DEBUG=$(cat file)` / backtick case) arrived at the case
 # statement as "0" and was judged OFF, while env_bool() saw "0\n" and
 # stayed ON. The guard then let a stripped build through and the run
-# produced a silently EMPTY [prof] — exactly what this self-check exists to
+# produced a silently EMPTY [prof] -- exactly what this self-check exists to
 # prevent. A pure `case` on the raw value (off spellings written as
 # explicit case-insensitive globs) has neither the newline-eating
 # substitution nor the external `tr`, whose absence under a minimal PATH
@@ -76,7 +76,7 @@ fi
 # IWAN_PUMP_PROF is deliberately NOT in that predicate: proxy.c:65 (the
 # one-shot gate in pump_prof_gate_init(), :61-70) and proxy.c:85 (the
 # printout gate) only test getenv("IWAN_PUMP_PROF") != NULL, so SET AT ALL
-# — "" and "0" included — switches the pump profiler on; only the unset
+# -- "" and "0" included -- switches the pump profiler on; only the unset
 # variable leaves it off. Hence the existence test `${IWAN_PUMP_PROF+x}`
 # (safe under `set -u`), NOT `${IWAN_PUMP_PROF:-}`, which folds the empty
 # string into "unset" and under-reports by exactly one cell.
@@ -157,7 +157,7 @@ chmod 600 "$WORK/users.txt"
 
 echo "== start iwan-server =="
 # a leftover server from an aborted run would share port 16001 via
-# SO_REUSEPORT and answer OPENs with a stale session table — the client
+# SO_REUSEPORT and answer OPENs with a stale session table -- the client
 # then gets a session whose data plane is dead (instant connect refused
 # / benchmark traffic silently bypassing the tunnel). Make sure only our
 # instance is up.
@@ -183,7 +183,7 @@ fi
 echo "== start bench server (sink + source) =="
 # a leftover bench server from an aborted run would hold the ports forever;
 # the new instance then dies on bind and a READY-looking poll would watch
-# the stale sockets — the benchmark would silently hit the old instance
+# the stale sockets -- the benchmark would silently hit the old instance
 # (R30-B1-F2). Same upfront pkill as bench_multi.sh:176.
 pkill -f 'bench_server.py' 2>/dev/null || true
 sleep 0.3
@@ -191,7 +191,7 @@ stdbuf -oL -eL python3 tests/bench_server.py --bind "$SRV_IP" \
     --sink-port "$SINK_PORT" --source-port "$SOURCE_PORT" &
 BENCH_PID=$!
 # R30-B1-F2: wait for BOTH listeners before the first bench connection.
-# A fixed sleep raced a slow startup and — worse — with a stale instance
+# A fixed sleep raced a slow startup and -- worse -- with a stale instance
 # already holding the ports the new server dies on bind while the stale
 # one keeps listening, so the bench silently hit the OLD instance; ss
 # alone cannot tell (the port IS listening). kill -0 catches the dead

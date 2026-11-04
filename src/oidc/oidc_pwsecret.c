@@ -16,13 +16,13 @@
  *     only when the marker is followed by a valid non-empty even-length
  *     hex payload (R32-B2-L1: a prefix test misread plaintext passwords
  *     that merely START with "WDP1:" as sealed and they could never be
- *     unwrapped back to plaintext — fail-closed);
+ *     unwrapped back to plaintext - fail-closed);
  *   - macOS writes EXACTLY the 4-byte "WKC1" with no payload. Matching it
  *     with strncmp(...,4) made every plaintext password that merely STARTS
  *     with "WKC1" look like a Keychain reference: unwrap then read a stale
  *     Keychain entry (or failed) and the user could never log in with that
  *     password (fail-closed, but a real functional defect). Requiring the
- *     whole string fixes it without touching the stored format — every
+ *     whole string fixes it without touching the stored format - every
  *     value macOS ever wrote is exactly "WKC1" and keeps working;
  *   - every other platform has no sealed store, so nothing is a reference.
  * The function is compiled on all platforms so the decision can be
@@ -31,7 +31,7 @@ static bool pw_is_sealed(const char *stored)
 {
 #if defined(_WIN32)
     /* R32-B2-L1: Windows writes "WDP1:" + hex_encode() of the DPAPI
-     * blob (non-empty, even-length, all-hex — the blob is variable,
+     * blob (non-empty, even-length, all-hex - the blob is variable,
      * ~76 + padded-payload bytes, NOT a fixed 16). Requiring that whole
      * SHAPE instead of just the marker makes a plaintext password that
      * merely STARTS with "WDP1:" no longer look sealed: the old prefix
@@ -64,7 +64,7 @@ static bool pw_is_sealed(const char *stored)
 /* "WDP1:" + DPAPI-bytes-as-hex. The sealed value is the plaintext
  * password (the former GCM layer was obfuscation only). L12 (bughunt):
  * the comment once claimed "Entropy = the app secret" but
- * CryptProtectData below passes NULL — no entropy is used, so the blob
+ * CryptProtectData below passes NULL - no entropy is used, so the blob
  * is sealed to this machine+user only (not to this build). That is
  * exactly the DPAPI guarantee; do not add the app secret as entropy,
  * it is a public constant and would add nothing. */
@@ -165,7 +165,7 @@ char *oidc_unwrap_password(const char *stored, const char *domain,
  * login Keychain under service "ustc-iwan-c" / account "domain|user".
  * R37 WG-E2 (R3-L16): the account key is built into a fixed 512-byte
  * buffer; a truncated key would silently collide with another
- * (domain,user) pair, so a value that does not fit is rejected (NULL —
+ * (domain,user) pair, so a value that does not fit is rejected (NULL -
  * this TU's error channel) instead of being used. */
 static CFStringRef pw_acc(const char *domain, const char *user)
 {
@@ -246,7 +246,7 @@ char *oidc_unwrap_password(const char *stored, const char *domain,
 }
 #else
 /* No per-user OS protection available: store the plaintext password
- * directly (by decision — the former app-secret GCM layer was
+ * directly (by decision - the former app-secret GCM layer was
  * obfuscation only); load_config warns on group/world-readable files
  * and servers.json is created 0600. */
 char *oidc_wrap_password(const char *blob, const char *domain,

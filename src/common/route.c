@@ -32,8 +32,8 @@ static bool mac_run(char *const argv[], const char *what)
 #ifdef _WIN32
 /* R53-E-1: audit the wintun adapter's derived-ULA address surface.
  *
- * A crashed run (whose teardown never ran) leaves ITS ULA — derived
- * from that run's inner IPv4 — on the persistent adapter, and
+ * A crashed run (whose teardown never ran) leaves ITS ULA -- derived
+ * from that run's inner IPv4 -- on the persistent adapter, and
  * route_teardown6 only ever deletes the CURRENT run's ULA, so once the
  * inner IPv4 changes the old ULA address can survive on the adapter.
  * R46-L2 (74437c5) first handled this by auto-deleting every
@@ -43,30 +43,30 @@ static bool mac_run(char *const argv[], const char *what)
  *   The shape test (byte0 = 0xfd, bytes 1..11 zero) selects EXACTLY
  *   the whole fd00::/96 space. `cur` is fd00:0:0:0:0:0:0:<inner IPv4>,
  *   so ANY fd00:0:0:0:0:0:0:yyyy address could equally be the derived
- *   ULA of SOME inner IPv4 — there is no byte-level marker that tells a
+ *   ULA of SOME inner IPv4 -- there is no byte-level marker that tells a
  *   history residue apart from an address the user configured by hand
  *   (say fd00::1/96). No additional enumerable signal helps either: the
  *   address row's prefix length is 96 both for our `netsh ... add
  *   address <ula>/96` and for a user's `/96` add; and the fd00::/96
  *   on-link route exists whenever EITHER was added with a /96 (and is
- *   absent exactly when a user added a bare /128 address) — route
+ *   absent exactly when a user added a bare /128 address) -- route
  *   presence says only "some fd00::/96 address was added with a /96",
  *   never WHO added it. The "delete only isolated addresses" idea is
  *   therefore still unsound: a user's fd00::1/128 has no on-link /96
  *   route either, so it would again be auto-deleted (the R46 over-delete
  *   reproduced for /128-spelled user config). Over-deleting silently
- *   destroys user state — the mirror image of the over-retention that
+ *   destroys user state -- the mirror image of the over-retention that
  *   74437c5 itself promised to avoid ("any user-added global address
- *   ... left alone") — so the only sound policy is: NEVER auto-delete
+ *   ... left alone") -- so the only sound policy is: NEVER auto-delete
  *   inside fd00::/96.
  *
  * Consequence (accepted): residue of prior inner IPv4s is no longer
- * cleaned automatically. Under-deletion is the safe direction — a
+ * cleaned automatically. Under-deletion is the safe direction -- a
  * leftover fd00:: address is inert: the single shared fd00::/96
  * on-link route already makes the whole client pool reachable, that
  * route is kept by the R49-L5 v6 route sweep (all derived ULAs share
  * the same /96 network, so the route matches the sweep's current-ULA/96
- * whitelist entry) and is re-created by the `add` below — residue never
+ * whitelist entry) and is re-created by the `add` below -- residue never
  * affects routing, it only accumulates as invisible addresses. This
  * pass compensates by LOGGING every such address on every run (debug
  * level), naming the manual cleanup command (`netsh interface ipv6
@@ -115,7 +115,7 @@ static void reconcile_stale_ula(const char *tun, const char *tun_ip)
                   "configured address or residue of a prior inner IPv4; "
                   "delete by hand if it is ours: netsh interface ipv6 "
                   "delete address %s %s", ds, tun, cstr, ifa, ds);
-        /* ds/ifa/cstr are read only by log_debug above — the strict
+        /* ds/ifa/cstr are read only by log_debug above -- the strict
          * gates build IWAN_DEBUG_STRIP (log_debug compiles out), so
          * the set-but-unused locals must be marked read */
         (void)ds;
@@ -204,7 +204,7 @@ static void prefix_str(uint32_t net, int prefix, char out[24])
  * onto the adapter by its driver description (the INF DeviceDesc, which
  * Get-NetAdapter shows as InterfaceDescription) and rename it when the
  * alias differs. Already named that way: true. No such adapter, or netsh
- * refused: false — the caller decides whether that is fatal (the WFP
+ * refused: false -- the caller decides whether that is fatal (the WFP
  * data plane uses a KM-TEST adapter the user created, whose name is
  * already whatever --dev says, and never calls this). */
 bool route_iface_ensure_name(const char *want, const char *desc_match)
@@ -288,12 +288,12 @@ bool route_iface_up(const char *tun, const char *tun_ip, uint16_t mtu)
     char *a1[] = { "netsh", "interface", "ipv4", "set", "address", namea,
                    "static", (char *)tun_ip, "255.255.255.0", NULL };
     if (!netsh_run(a1, "iface up: set address")) {
-        /* 地址已经在这张网卡上时 netsh 报 "The object already exists." 并且
-         * **不生效**（既不改正前缀长度也不改地址属性），于是整个 route_setup
-         * 回滚：会话建好了、驱动也收到了参数，用户态却配不上地址。上一次
-         * 会话异常退出（进程被 kill、网卡被改名）都会留下这种残留，所以先
-         * 摘掉再重设一次 —— 这条路径的语义是"把网卡配成这个样子"，不是
-         * "新增一个地址"。 */
+        /* When the address is already on this NIC, netsh reports "The object already exists." and
+         * **takes no effect** (it fixes neither the prefix length nor the address attributes), so the whole route_setup
+         * rolls back: the session is up and the driver received the parameters, yet userspace cannot configure the address. A previous
+         * session that exited abnormally (process killed, NIC renamed) leaves such residue, so remove it
+         * first and set it again once -- this path means "configure the NIC into this shape", not
+         * "add a new address". */
         char *ad[] = { "netsh", "interface", "ipv4", "delete", "address",
                        namea, "address", (char *)tun_ip, NULL };
         (void)netsh_run(ad, "iface up: delete stale address");
@@ -367,7 +367,7 @@ bool route_iface_up(const char *tun, const char *tun_ip, uint16_t mtu)
 /* take the tunnel interface down and flush its addresses (no routes).
  * Shared by route_teardown's tail and the no-route-hijack pump path. */
 #ifdef _WIN32
-/* forward decl: sweep_stale_routes is defined below (R46-L1) — this
+/* forward decl: sweep_stale_routes is defined below (R46-L1) -- this
  * function now also sweeps, so the no-route-hijack pump path reaches
  * the crash-leftover cleanup even though route_setup never ran */
 static void sweep_stale_routes(const char *tun, const char *tun_ip,
@@ -382,8 +382,8 @@ void route_iface_down(const char *tun)
     port_run_cmd(d1);   /* best-effort: no address left, or iface gone */
     /* R46-L1: this function is the teardown of the no-route-hijack pump
      * path (proxy.c teardown_routes calls route_iface_down when no
-     * routes were hijacked), where route_setup — the sweep's only other
-     * reachable site — never runs. A crashed route-hijack run's metric-0
+     * routes were hijacked), where route_setup -- the sweep's only other
+     * reachable site -- never runs. A crashed route-hijack run's metric-0
      * default / stale proxy routes (netsh persistent) would otherwise
      * keep black-holing default traffic into the dead tunnel across an
      * unbounded number of pure-TUN runs. Sweep here too; it is
@@ -391,7 +391,7 @@ void route_iface_down(const char *tun)
      * function, only removes leftovers the explicit deletes missed
      * (nothing that is being kept is newly added after this point).
      * R49-L5: passes no tun_ip/routes6, so the v6 sweep keeps only
-     * fe80::/64 — on this path route_teardown6 already deleted the
+     * fe80::/64 -- on this path route_teardown6 already deleted the
      * current config and the derived ULA/96 immediately before, so any
      * other on-link route left here is residue by definition. */
     sweep_stale_routes(tun, NULL, NULL);
@@ -756,12 +756,12 @@ static bool ip6_prefix_eq(const uint8_t a[16], int plen_a,
 }
 
 /* R49-L5: one whitelist entry for the v6 sweep keep set. Kept routes are
- * exactly {fe80::/64} ∪ {the current derived ULA/96} ∪ {every prefix in
+ * exactly {fe80::/64} union {the current derived ULA/96} union {every prefix in
  * the current routes6 config}; anything else on-link (the user's removed
  * or crash-leftover >= /64 proxy prefixes) is swept like the v4 side
  * always did. The whitelist is bounded below (64): a config longer than
  * that is unrealistic, and an entry dropped off the tail is only deleted
- * and cleanly re-added by the following route_setup6 — never lost. */
+ * and cleanly re-added by the following route_setup6 -- never lost. */
 struct kept6 {
     uint8_t addr[16];
     int plen;
@@ -769,7 +769,7 @@ struct kept6 {
 #define KEPT6_MAX 64
 
 /* is MIB prefix (raw IN6_ADDR bytes, prefix length in plen) in the keep
- * set? Only meaningful for on-link routes — the caller gates on nexthop
+ * set? Only meaningful for on-link routes -- the caller gates on nexthop
  * :: first, so a nexthop-bearing route is never preserved. */
 static bool sweep6_keep(const uint8_t *addr, UCHAR plen,
                         const struct kept6 *keep, size_t nkeep)
@@ -784,12 +784,12 @@ static bool sweep6_keep(const uint8_t *addr, UCHAR plen,
 /* Sweep stale routes still bound to OUR adapter (audit M2): a crash,
  * force-kill or power loss leaves the metric-0 default route and the
  * server /32 pin alive until the next reboot, because the wintun
- * adapter intentionally persists and the stack never reclaims them —
+ * adapter intentionally persists and the stack never reclaims them --
  * the machine would keep routing its default into a dead tunnel.
  * Runs at every setup, BEFORE new routes are added; the on-link
  * connected route the stack manages for the interface address is kept.
  *
- * R45-L2: the v4-only sweep also stranded the IPv6 side — the policy
+ * R45-L2: the v4-only sweep also stranded the IPv6 side -- the policy
  * routes route_setup6 installs (`netsh interface ipv6 add route ...`,
  * all on-link with nexthop ::) and, after a crash of a run that brought
  * the derived ULA up, their stale entries stay on the persistent wintun
@@ -799,12 +799,12 @@ static bool sweep6_keep(const uint8_t *addr, UCHAR plen,
  * interface link-local), the current derived ULA fd00::/96 (derived from
  * tun_ip, so a changed inner IPv4's /96 ROUTE is swept here; the
  * address side of the residue is handled by reconcile_stale_ula
- * (R53-E-1: reported, never auto-deleted — fd00::/96-shaped addresses
+ * (R53-E-1: reported, never auto-deleted -- fd00::/96-shaped addresses
  * are indistinguishable from user config), or one of the currently
  * configured routes6 prefixes. R49-L5 tightened this: the old "every
  * on-link >= /64" keep could not tell a stack route from a user
  * proxy-cidr6 prefix (both are on-link with no nexthop), so a >= /64 v6
- * proxy prefix the user REMOVED from config — or a crash left behind —
+ * proxy prefix the user REMOVED from config -- or a crash left behind --
  * was never swept and the tool could not remove it. tun_ip/routes6 are
  * optional (NULL): the pump-path teardown (route_iface_down) has
  * neither at hand, and there the current config and ULA were just
@@ -840,8 +840,8 @@ static void sweep_stale_routes(const char *tun, const char *tun_ip,
     /* R45-L2: sweep the AF_INET6 table with the same shape (best-
      * effort: a failure to fetch/scan the v6 table must not un-sweep
      * the v4 removals already counted above). R49-L5: keep-set is the
-     * exact whitelist below — fe80::/64 (interface link-local), the
-     * current derived ULA/96 and the configured routes6 prefixes — not
+     * exact whitelist below -- fe80::/64 (interface link-local), the
+     * current derived ULA/96 and the configured routes6 prefixes -- not
      * "every on-link >= /64" (which permanently preserved user >= /64
      * proxy prefixes removed from config). The ULA and config sets are
      * dropped when their inputs are absent: the pump-path teardown
@@ -901,8 +901,8 @@ static void sweep_stale_routes(const char *tun, const char *tun_ip,
             /* keep only the exact whitelist above (all three entries
              * are on-link routes with nexthop :: like every v6 policy
              * route we install, so the on-link gate cannot mis-hit);
-             * every other route on this adapter — including a >= /64
-             * prefix no longer in config, or the black-hole ::/0 — is
+             * every other route on this adapter -- including a >= /64
+             * prefix no longer in config, or the black-hole ::/0 -- is
              * residue and is deleted. The prefix compare is exact
              * (masked bytes + length), never a string contains, so
              * fe80::/64 cannot be confused with any other prefix. */
@@ -932,7 +932,7 @@ bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
 
     /* audit M2: crash leftover cleanup. R49-L5: the sweep is fed the
      * current config so the v6 keep-set includes the configured prefixes
-     * and the current derived ULA/96 — the ONLY things it must preserve;
+     * and the current derived ULA/96 -- the ONLY things it must preserve;
      * removed/crashed >= /64 v6 proxy prefixes are swept here. */
     sweep_stale_routes(tun, tun_ip, routes6);
 
@@ -946,7 +946,7 @@ bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
      * sequence and undo what was applied (mirror the Linux sequence) */
     if (!route_iface_up(tun, tun_ip, mtu)) {
         /* R50-D1: route_iface_up failed BEFORE tun_iface_up6 ran, so no
-         * ULA was added THIS run — but a previous same-shape ULA may
+         * ULA was added THIS run -- but a previous same-shape ULA may
          * still be on the persistent adapter, and route_iface_down's
          * NULL-whitelist sweep would delete its /96 while leaving the
          * address (the pair would then be split for every later run).
@@ -987,7 +987,7 @@ bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
              * (tun_ip/routes6 NULL) would delete the /96 but leave the
              * ULA ADDRESS on the persistent wintun adapter, and the next
              * same-inner-IPv4 run's `netsh add address <ula>/96` would
-             * then fail (address already present) — the /96 is never
+             * then fail (address already present) -- the /96 is never
              * rebuilt and the v6 client pool's on-link route is lost
              * across runs. Delete the current v6 side first so address
              * and route vanish together. */
@@ -1041,7 +1041,7 @@ rollback:
      * tear the device down below. R50-D1: route_iface_up already added
      * the derived ULA + its /96; route_teardown's tail (route_iface_down
      * -> NULL-whitelist sweep) would delete the /96 but leave the ULA
-     * ADDRESS — the next same-inner-IPv4 run's `netsh add address`
+     * ADDRESS -- the next same-inner-IPv4 run's `netsh add address`
      * would then fail and never rebuild the /96. Delete the current v6
      * side FIRST so address and /96 vanish together. */
     log_err("route_setup: rolling back applied routes");
@@ -1052,7 +1052,7 @@ rollback:
 #elif defined(__APPLE__)
 /* macOS session state: whether THIS process actually installed the
  * server /32 pin during route_setup. route_teardown must never remove
- * a route this process did not install — the flag is set only after
+ * a route this process did not install -- the flag is set only after
  * `route add -host <srv>/32 <ogw>` succeeds and cleared by teardown,
  * so a failed-setup rollback removes only our own pin and a
  * pre-existing user/third-party host route is never touched. */
@@ -1117,7 +1117,7 @@ bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
     /* pin the server route via the physical gateway so the session
      * never loops back through the tunnel. NEVER delete a pre-existing
      * host route here: a bare add failing EEXIST while an identical pin
-     * (same /32 via the same gateway) is already present is fine — that
+     * (same /32 via the same gateway) is already present is fine -- that
      * route was not installed by us, so srv_pin_installed stays false
      * and teardown will not remove it. */
     if (srv_v4 && !srv_lo) {
@@ -1178,7 +1178,7 @@ bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
 rollback:
     log_err("route_setup: rolling back applied routes");
     /* route_teardown deletes the server pin only when srv_pin_installed
-     * is set, which it is only after the pin add above succeeded — so a
+     * is set, which it is only after the pin add above succeeded -- so a
      * failed-setup rollback removes only our own pin, never a
      * pre-existing user/third-party host route. */
     route_teardown(tun, srv, ogw, odev, metric, routes_with_default);
@@ -1200,7 +1200,7 @@ static bool srv_pin_installed;
 /* R1-C-C-2: canonical "a.b.c.d/plen" network string. iproute2 (verified
  * on 6.3..6.17) rejects a prefix with host bits set at parse time
  * ("Invalid prefix for given prefix length"), and the permissive builds
- * store the masked key anyway — so `ip route` must be handed the network
+ * store the masked key anyway -- so `ip route` must be handed the network
  * address, not the raw user string ("10.0.0.5/24" -> "10.0.0.0/24").
  * Returns false when `c` is not A.B.C.D/n; the caller then keeps the raw
  * string (old behavior, never worse than before). */
@@ -1233,7 +1233,7 @@ bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
     snprintf(srv32, sizeof srv32, "%s/32", srv);
     char *fc[] = { "route", "flush", "cache", NULL };
 
-    /* B-1/B-2: start a fresh session — neither the tunnel default nor
+    /* B-1/B-2: start a fresh session -- neither the tunnel default nor
      * the server pin is installed yet, so if anything below fails before
      * we install them, the rollback (route_teardown) must not touch the
      * pre-existing routes (it only acts when the matching flag is set) */
@@ -1251,7 +1251,7 @@ bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
     /* the server-pinned /32 only exists in the IPv4 table; an IPv6
      * server address cannot be routed via the (IPv4) default gateway
      * and would fail every `ip route add` attempt, so skip it.
-     * M4 (SUMMARY-2): `replace` not `add` — a pin left behind by a
+     * M4 (SUMMARY-2): `replace` not `add` -- a pin left behind by a
      * crashed client would make every later connection fail with
      * EEXIST (and the stale pin blackholes server traffic) */
     if (srv_v4 && !srv_lo) {
@@ -1263,7 +1263,7 @@ bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
             route_iface_down(tun);
             return false;
         }
-        /* B-2: remember that WE now own this /32 — teardown may only
+        /* B-2: remember that WE now own this /32 -- teardown may only
          * remove it (and only via the same via/dev attributes) when this
          * flag is set, so a pre-existing /32 that we never replaced is
          * never deleted by us */
@@ -1346,7 +1346,7 @@ rollback_routes:
  * paths (see route.h). A setup/pump session that fails AFTER
  * tun_iface_up6 added the derived ULA address (and the on-link /96
  * route the stack attaches to it) rolls back through route_iface_down,
- * whose R49-L5 sweep keeps only fe80::/64 — it deletes the /96 route
+ * whose R49-L5 sweep keeps only fe80::/64 -- it deletes the /96 route
  * but NOTHING deletes the ULA ADDRESS (address deletion lives in
  * route_teardown6, which the rollback never reaches; proxy.c's teardown6
  * only runs on the normal-close path). A later run with the same inner
@@ -1357,7 +1357,7 @@ rollback_routes:
  * sweep runs, so BOTH legs of the pair disappear and the next run
  * re-adds address + /96 atomically. Every delete is best-effort with
  * "not present" at debug level; no-op on Apple/Linux (no persistent
- * adapter, v6 routes vanish with the tun device — the pair cannot be
+ * adapter, v6 routes vanish with the tun device -- the pair cannot be
  * split, and netstack re-derives everything on the next setup). */
 void route_rollback_v6(const char *tun, const char *tun_ip,
                        const slist_t *routes6)
@@ -1370,7 +1370,7 @@ void route_rollback_v6(const char *tun, const char *tun_ip,
             const char *c = routes6->v[i];
             /* none of these routes was installed by the failed session
              * (route_setup6 runs only after route_setup succeeds), so a
-             * present one is a crash/stale leftover being cleaned — a
+             * present one is a crash/stale leftover being cleaned -- a
              * missing one is the common case and logs at debug only */
             char *d[] = { "netsh", "interface", "ipv6", "delete",
                           "route", (char *)c, ifa, NULL };
@@ -1460,7 +1460,7 @@ void route_teardown(const char *tun, const char *srv, const char *ogw,
         } else {
             /* match route_setup's canonical form (host bits cleared):
              * deleting the raw user string can miss the installed key.
-             * Also delete the raw string when it differs — a pre-fix
+             * Also delete the raw string when it differs -- a pre-fix
              * run may have stored an unmasked target. */
             uint32_t net;
             int prefix;
@@ -1495,7 +1495,7 @@ void route_teardown(const char *tun, const char *srv, const char *ogw,
      * `route add -host <srv>/32 <ogw>` succeeds. Qualifying the delete
      * with the gateway makes route(8) target exactly the entry we
      * created, so a pre-existing /32 via another gateway is never
-     * touched. Clear the flag whether or not the delete succeeds —
+     * touched. Clear the flag whether or not the delete succeeds --
      * afterwards we no longer own a pin. */
     if (inet_pton(AF_INET, srv, &s4) == 1 &&
         (ntohl(s4.s_addr) >> 24) != 127 && srv_pin_installed) {
@@ -1516,14 +1516,14 @@ void route_teardown(const char *tun, const char *srv, const char *ogw,
             /* B-1: only ever remove a default that THIS process really
              * installed. route_setup sets srv_default_installed only
              * after `route replace default dev <tun>` succeeded, so when
-             * setup failed before that step (rollback path) — or there
-             * is simply no tunnel default from this session — the
+             * setup failed before that step (rollback path) -- or there
+             * is simply no tunnel default from this session -- the
              * pre-existing physical default(s) are left completely
              * untouched; the old unqualified `route del default` would
              * have deleted the real default and stranded the machine. */
             if (!srv_default_installed)
                 continue;
-            /* we did replace the default: clear the flag up front —
+            /* we did replace the default: clear the flag up front --
              * whether or not the delete below succeeds we no longer own
              * a tunnel default afterwards, so a later teardown (or a
              * fresh session) cannot act on stale state. */
@@ -1546,14 +1546,14 @@ void route_teardown(const char *tun, const char *srv, const char *ogw,
             }
             /* we removed it: restore the original via-gateway route,
              * keeping its metric (captured by capture_default) so route
-             * precedence matches the pre-VPN state — a metric-less
+             * precedence matches the pre-VPN state -- a metric-less
              * restore would install a priority-0 default that shadows
              * (or is shadowed by) other defaults.
              *
              * R1-C-C-1: `replace`, NOT `add`. The kernel matches route
              * aliases by (prefix, dscp, fib_priority), so setup's
              * metric-less `replace default dev <tun>` does not replace a
-             * DHCP default carrying e.g. metric 100 — both coexist and
+             * DHCP default carrying e.g. metric 100 -- both coexist and
              * the physical one is still in the table here. `add` would
              * then fail EEXIST and the device-only fallback below would
              * install a priority-0 on-link default that shadows the real
@@ -1584,7 +1584,7 @@ void route_teardown(const char *tun, const char *srv, const char *ogw,
                  * device-only default route so the machine is never
                  * left with NO default route at all */
                 log_err("route_teardown: restore default via %s dev %s "
-                        "failed — trying device-only default",
+                        "failed -- trying device-only default",
                         ogw, odev);
                 char *d2b[] = { "route", "replace", "default", "dev",
                                 (char *)odev, NULL };
@@ -1614,7 +1614,7 @@ void route_teardown(const char *tun, const char *srv, const char *ogw,
     struct in_addr s4;
     snprintf(srv32, sizeof srv32, "%s/32", srv);
     /* B-2: only remove the server /32 pin this process actually
-     * installed — srv_pin_installed is set by route_setup right after
+     * installed -- srv_pin_installed is set by route_setup right after
      * `route replace <srv>/32 via <ogw> dev <odev>` succeeds. The delete
      * mirrors setup's via/dev attributes, so a pre-existing /32 that is
      * not ours (or one pinned via another gateway/device) is never
@@ -1645,16 +1645,16 @@ void route_setup6(const char *tun, const slist_t *routes6)
         const char *c = routes6->v[i];
         /* R46-L3: mirror the v4 side (route_setup gives the default
          * route an explicit metric=0, outranking every physical default;
-         * proxy-cidr prefixes stay metric-less — the v4 proxy-cidr arm
+         * proxy-cidr prefixes stay metric-less -- the v4 proxy-cidr arm
          * has no metric either, so the two sides stay fully symmetric).
          * Without it a same-prefix ::/0 on the tunnel competes by
          * EFFECTIVE metric, and a physical NIC with a lower v6
-         * interface metric wins — the tunnel ::/0 silently loses.
+         * interface metric wins -- the tunnel ::/0 silently loses.
          * R49-L5: netsh `add route` is an append, so a same-prefix
          * route left by an older config/crash (or by THIS run, when a
          * configured prefix is re-added on a reconnect) would either
          * be duplicated or shadow the new one; mirror the v4 default
-         * arm and the Apple arm — pre-delete idempotently before the
+         * arm and the Apple arm -- pre-delete idempotently before the
          * add. "Not present" is the common case, so its failure is
          * debug-level only (port_run_cmd style, like the v4 arm's
          * `delete route` pre-step). */
@@ -1698,7 +1698,7 @@ void route_setup6(const char *tun, const slist_t *routes6)
      * host that already has a physical IPv6 default: the kernel applies
      * IP6_RT_PRIO_USER (1024) to a v6 netlink route whose RTA_PRIORITY is
      * absent (inet6_rtm_newroute), so (a) a `add ::/0` collided with an
-     * RA default at the same 1024 and rtnetlink answered EEXIST — the
+     * RA default at the same 1024 and rtnetlink answered EEXIST -- the
      * tunnel ::/0 was never installed, and (b) even when the metrics
      * differed, the 1024 tunnel default lost to any lower-metric physical
      * default. The metric below is therefore written EXPLICITLY as
@@ -1708,7 +1708,7 @@ void route_setup6(const char *tun, const slist_t *routes6)
      * physical default stays in the table and self-heals when the TUN
      * unregisters) is only reproducible on v6 by naming metric 0. The
      * v4/v6 replace tradeoffs are otherwise shared: replace is idempotent
-     * (a leftover from an old run — at any metric — is superseded in its
+     * (a leftover from an old run -- at any metric -- is superseded in its
      * slot if identical or re-created), and neither side ever removes the
      * physical default because independent metrics keep both entries in
      * the table; the only shared edge is a pre-existing physical route AT

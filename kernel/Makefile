@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: GPL-2.0
 #
-# 内核侧构建（树外模块）：
-#   make -C kernel            # 用当前运行内核的 headers 构建 iwan.ko
+# Kernel-side build (out-of-tree module):
+#   make -C kernel            # build iwan.ko against the running kernel headers
 #   make -C kernel KDIR=/lib/modules/$(uname -r)/build
 #   make -C kernel clean
 #
-# 产物：iwan.ko（入站 netfilter 解封 + 出站虚拟网卡封装 + /dev/iwan 共享内存页）
+# Output: iwan.ko (inbound netfilter decap + outbound vnic encap + /dev/iwan shm page)
 
 ifneq ($(KERNELRELEASE),)
 obj-m := iwan.o

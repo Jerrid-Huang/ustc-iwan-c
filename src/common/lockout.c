@@ -55,18 +55,18 @@ void lockout_note(lockout_rec *tbl, int n, const void *key, size_t klen,
          * that its ban is lost as the last resort (L-1) */
         e = oldest != NULL ? oldest : earliest;
     /* fresh entry: an empty slot, a slot whose key changed (full-table
-     * eviction taking over a different source's record — the victim's
+     * eviction taking over a different source's record -- the victim's
      * fail count / blocked_until_ms must NOT be inherited by the new
      * key), or the previous burst aged out of the window (R4-06-3: the
      * window ends at exactly window_ms, hence >=). This branch respects
      * an active ban (M-1): a same-key failure that arrives after the
      * counting window but while blocked_until_ms is still in force must
-     * NOT clear the ban — only the counting window restarts and the entry
+     * NOT clear the ban -- only the counting window restarts and the entry
      * stays blocked until blocked_until_ms expires naturally. */
     if (!e->in_use ||
         memcmp(e->key, key, klen) != 0 ||
         now - e->first_fail_ms >= window_ms) {
-        /* M-1: same key, previous burst aged out, ban still active — keep
+        /* M-1: same key, previous burst aged out, ban still active -- keep
          * blocked_until_ms, restart the count window only. The shortcut is
          * limited to same-key window age-outs: when the key differs this
          * is a table eviction and the new key must still take over the
@@ -86,7 +86,7 @@ void lockout_note(lockout_rec *tbl, int n, const void *key, size_t klen,
         e->first_fail_ms = now;
         e->in_use = true;
         /* R1-D-c-1: the fresh-entry path returns early, so it must apply
-         * the threshold itself — max_fails == 1 has to ban on this very
+         * the threshold itself -- max_fails == 1 has to ban on this very
          * first failure (a 2nd try would otherwise always be allowed). */
         if (e->fail >= (int)max_fails)
             e->blocked_until_ms = now + window_ms;

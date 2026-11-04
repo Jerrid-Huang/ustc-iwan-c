@@ -1,25 +1,25 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  iwanmp.vcxproj — NDIS 小型端口 + 协议驱动（第二个 Windows 数据面）的工程。
+  iwanmp.vcxproj -- project for the NDIS miniport + protocol driver (second Windows data plane).
 
-  与 iwan.vcxproj（WFP 平面）的关系：两个二进制、同一套控制面。iwanmp.sys
-  自己就是内层那张虚拟网卡（小型端口），同时注册一个协议驱动把外层 UDP
-  直接放到承载网卡上；不再需要 WFP 的注入 API，也不再有"在途注入占着
-  非分页池"的限流问题。
+  Relation to iwan.vcxproj (the WFP plane): two binaries, one control plane. iwanmp.sys
+  is itself the inner virtual adapter (miniport) and also registers a protocol driver that
+  puts outer UDP straight onto the carrier adapter; no WFP injection API, and no
+  non-paged-pool ceiling from in-flight injection.
 
-  两个翻译单元的 NDIS 版本宏**故意不同**（这也是这个平面唯一别扭的地方）：
-  ndis.h 用 NDIS_MINIPORT_DRIVER / NDIS630 这两族宏分别把小型端口侧与协议
-  侧的原型放出来，而它不允许同一翻译单元里两边都要（第一轮探针实测：
-  km\ndis.h 的宏闸门按这两种模式二选一）。所以：
-    iwan_win_mp.c     走小型端口宏（与 Wintun 同一套）
-    其余源文件         走协议/通用宏
-  两侧只通过 iwan_win.h 里那两个不依赖 NDIS 版本的结构与函数原型打交道。
+  The two translation units deliberately use different NDIS version macros (the only awkward part):
+  ndis.h exposes the miniport side and the protocol side through the NDIS_MINIPORT_DRIVER /
+  NDIS630 macro families respectively, and does not allow both in one unit (measured in the first probe:
+  the macro gate in km\ndis.h picks exactly one of the two modes). Hence:
+    iwan_win_mp.c     takes the miniport macros (same set as Wintun)
+    other sources      take the protocol/generic macros
+  The two sides meet only through the NDIS-version-independent structs and prototypes in iwan_win.h.
 
-  构建（装了 WDK 的 Windows 上，管理员 VS 开发者命令提示符里）：
+  Build (on Windows with the WDK, from an administrator VS developer prompt):
 
     msbuild win-driver\iwanmp.vcxproj /p:Configuration=Release /p:Platform=x64
 
-  安装（客体，测试签名已打开、自签证书已受信）：
+  Install (in the guest, test signing on and the self-signed cert trusted):
     devcon.exe install win-driver\iwanmp.inf iwanmp
 -->
 <Project DefaultTargets="Build" ToolsVersion="Current"
@@ -54,8 +54,8 @@
   <PropertyGroup Label="Configuration">
     <ConfigurationType>Driver</ConfigurationType>
     <DriverType>WDM</DriverType>
-    <!-- 与 iwan.vcxproj 同理：工具集自带的测试签名不带 /fd，会把产物删掉。
-         签名在客体侧做。 -->
+    <!-- Same as iwan.vcxproj: the toolset built-in test signing omits /fd and deletes the output.
+         Signing happens in the guest. -->
     <SignMode>Off</SignMode>
     <DriverTargetPlatform>Desktop</DriverTargetPlatform>
     <TargetVersion>Windows10</TargetVersion>
@@ -78,8 +78,8 @@
 
   <ItemDefinitionGroup>
     <ClCompile>
-      <!-- 中文注释与日志：必须显式 /utf-8，否则执行字符集 1252 会把中文字符串
-           字面量报成 C4566，配合 TreatWarningAsError 变 C2220。 -->
+      <!-- Sources are plain ASCII; /utf-8 stays as a guard so a future non-ASCII literal
+           cannot turn into C4566 and then C2220 under TreatWarningAsError. -->
       <AdditionalOptions>/source-charset:utf-8 /execution-charset:utf-8 %(AdditionalOptions)</AdditionalOptions>
       <AdditionalIncludeDirectories>$(ProjectDir)..\src\common;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <WarningLevel>Level4</WarningLevel>
@@ -90,9 +90,9 @@
       <ExceptionHandling>false</ExceptionHandling>
     </ClCompile>
     <Link>
-      <!-- netio.lib 用不到路由（下一跳由控制面给），但 Ndis* 的少数工具在
-           ndis.lib；wdmsec.lib 给 IoCreateDeviceSecure。不含 fwpkclnt：本平面
-           没有 WFP。 -->
+      <!-- netio.lib: no routing API needed (the control plane supplies the next hop), but a few
+           Ndis* helpers live in ndis.lib; wdmsec.lib provides IoCreateDeviceSecure. No fwpkclnt:
+           this plane has no WFP. -->
       <AdditionalDependencies>ndis.lib;wdmsec.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <EntryPointSymbol>DriverEntry</EntryPointSymbol>
     </Link>
@@ -107,12 +107,12 @@
     <ClCompile Include="iwan_win_frame.c" />
     <ClCompile Include="iwan_win_mpdata.c" />
     <ClCompile Include="iwan_win_proto.c" />
-    <!-- 小型端口这一半单独用小型端口宏，而且不继承工程级的 NDIS630：
-         两族宏（NDISnnn 与 NDISnnn_MINIPORT）不能同时出现在一个翻译单元
-         里。这里用 683 这一档（与参考实现 Wintun 相同），是因为
-         NDIS_SUPPORT_NDIS680 只在声明到 6.80 以上时才置位，而特性表的
-         REVISION_3 与 SynchronousOidRequestHandler 都在那个门后面——注册
-         时要能按运行时版本挑最新 revision，编译期就得先有它。 -->
+    <!-- The miniport half uses the miniport macros alone and does not inherit the project-level
+         NDIS630: the two families (NDISnnn and NDISnnn_MINIPORT) must not appear in one unit.
+         The 683 level is used (as in the Wintun reference) because
+         NDIS_SUPPORT_NDIS680 is only set when declaring 6.80+, and both REVISION_3 of the
+         characteristics table and SynchronousOidRequestHandler sit behind that gate -- registration
+         must pick the newest revision at runtime, so it has to be visible at compile time. -->
     <ClCompile Include="iwan_win_mp.c">
       <PreprocessorDefinitions>NDIS_MINIPORT_DRIVER;NDIS620_MINIPORT;NDIS683_MINIPORT;NDIS_WDM;IWAN_WIN_PLANE_MP;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
@@ -122,9 +122,9 @@
     <ClInclude Include="iwan_win_frame.h" />
     <ClInclude Include="..\src\common\iwan_win_abi.h" />
   </ItemGroup>
-  <!-- iwanmp.inf 与 iwan.inf 一样不进 <Inf>：PnP INF 需要 .cat，而 .cat 要在
-       客体侧用 New-FileCatalog + Set-AuthenticodeSignature 生成。安装走
-       devcon install / pnputil，INF 作为部署材料留在仓库里。 -->
+  <!-- Like iwan.inf, iwanmp.inf does not go into <Inf>: a PnP INF needs a .cat, and the .cat
+       is produced in the guest with New-FileCatalog + Set-AuthenticodeSignature. Installation uses
+       devcon install / pnputil; the INF stays in the tree as deployment material. -->
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

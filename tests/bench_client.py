@@ -11,7 +11,7 @@ window (per-conn lines + aggregate). This is a throughput benchmark:
 correctness is covered by tests/echo_client.py elsewhere.
 
 up:   every conn streams data to the target (a discard sink) and counts
-      what the local kernel accepted — TCP delivery is reliable, so the
+      what the local kernel accepted -- TCP delivery is reliable, so the
       count equals the bytes that traversed the tunnel.
 down: every conn reads the target's stream (a data source) and counts.
 
@@ -62,7 +62,7 @@ def bench_thread(idx, target, proxy, direction, duration, go, results):
             socket.create_connection((th, tp), timeout=15)
         s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         # 30s cap: a tunnel that silently stalls (no RST, no FIN) must
-        # not hang the benchmark forever — the thread times out, reports
+        # not hang the benchmark forever -- the thread times out, reports
         # zero and the run moves on
         s.settimeout(30)
     except OSError as e:
@@ -124,7 +124,7 @@ def main():
         t.join()
     wall = time.monotonic() - t0
     total = sum(results)
-    # R30-B1-1: align with the docstring — exit 0 only when EVERY conn moved
+    # R30-B1-1: align with the docstring -- exit 0 only when EVERY conn moved
     # at least one byte. A sum > 0 silently swallowed partial failures (some
     # conns dead behind a live aggregate), so any 0-byte conn now exits 1
     # with a diagnostic listing the failed conns.

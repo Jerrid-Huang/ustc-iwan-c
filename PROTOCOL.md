@@ -51,11 +51,20 @@ Header length: **8 bytes** (`IWAN_HDR_LEN`).
 | 0x16  | ECHO_RES    | yes             | probe reply (never handled by either side) |
 | 0x17  | CLOSE       | yes             | tear the session down |
 | 0x18  | DATA_ENC    | no              | XOR-encrypted inner IPv4 packet |
+| 0x19  | DATA_DUP    | no              | duplicate of a plaintext DATA frame (Panabit, §14) |
+| 0x20  | DATA_ENC_DUP| no              | duplicate of a DATA_ENC frame (Panabit, §14) |
+| 0x22  | IPFRAG      | no              | inner IPv4 fragment (Panabit, §14) |
+| 0x23  | DATA_IPV6   | no              | plaintext inner IPv6 packet (Panabit, §14) |
+| 0x24  | IPFRAG_ALT  | no              | IPv6 / alternate fragment (Panabit, §14) |
+| 0x28  | SEGRT       | no              | source-routed segment (Panabit, §14) |
 | 0x29  | PING_REQ    | yes             | unauthenticated ping |
 | 0x2A  | PING_RSP    | yes             | unauthenticated ping reply |
 
 The ids are **non-contiguous on purpose** (0x11–0x18, then 0x29/0x2A) and are
-preserved for interop. **0x19–0x28 are unused** and must not be assigned.
+preserved for interop. 0x19–0x28 were originally reserved; they are now the
+Panabit extension space described in §14 — frames carrying them MUST NOT be
+sent to a peer that has not negotiated them (today: never; the extension is
+receive-only except for fragmentation on demand).
 
 ## 4. Control signature and control frames
 
@@ -87,7 +96,7 @@ preserved for interop. **0x19–0x28 are unused** and must not be assigned.
 | 0x02 | PASSWORD    | 16-byte encrypted password |
 | 0x03 | MTU         | mtu, u16 BE |
 | 0x04 | IP          | 4-byte IPv4 address |
-| 0x05 | DNS         | 4-byte IPv4 address |
+| 0x05 | DNS         | 4-byte IPv4 address (8-byte pair for Panabit clients, §14) |
 | 0x06 | GATEWAY     | 4-byte IPv4 address |
 | 0x08 | ENCRYPT     | enc byte (0 or 1) |
 | 0x0F | AUTH_VERIFY | 4-byte nonce, u32 BE |
@@ -105,7 +114,7 @@ preserved for interop. **0x19–0x28 are unused** and must not be assigned.
 2. TLV USERNAME — value `ulen` bytes (total TLV `ulen + 2`)
 3. TLV PASSWORD — length byte `0x12`, value 16 bytes ciphertext
 4. TLV ENCRYPT — value 1 byte: enc
-5. TLV AUTH_VERIFY — value 4 bytes: nonce u32 BE
+5. TLV AUTH_VERIFY — value 4 bytes: nonce u32 BE (**optional, see §6**)
 
 The client nonce is a fresh 32-bit random value.
 
@@ -118,11 +127,10 @@ The client nonce is a fresh 32-bit random value.
 3. TLV GATEWAY (6-byte TLV, 4-byte value)
 4. TLV DNS (6-byte TLV, 4-byte value)
 5. TLV ENCRYPT (3-byte TLV, 1-byte value)
-6. TLV AUTH_VERIFY (6-byte TLV, 4-byte value: **echo of the client's nonce**)
+6. TLV AUTH_VERIFY (6-byte TLV, 4-byte value: **echo of the client's nonce**), present only when the client sent one
 
-The reference server may omit the final AUTH_VERIFY TLV — a **49-byte ACK** —
-and clients must accept it. (AUTH_VERIFY is required in OPEN but optional in
-ACK.)
+Production USTC servers (2026-11 实测, 202.38.64.106:6001) omit it — a
+**53-byte ACK** — and clients must accept it.
 
 ### OPEN_REJECT (server → client)
 
@@ -185,7 +193,9 @@ The data session key is separate: `session_key = MD5(username || password)`.
 - Rate-limit OPEN at **20/s/source**.
 - Require `len >= 24` and a valid signature.
 - Username policy: **≤ 63 bytes** (server-side policy; the wire allows 253).
-- A missing AUTH_VERIFY TLV is **rejected**.
+- A missing AUTH_VERIFY TLV is **accepted** (the official Panabit client never
+  sends it and would be locked out otherwise, §14). When present it must echo
+  the client's nonce; the reply carries it back only in that case.
 - Password check: **constant-time compare** of the received T_PASSWORD against
   the locally computed `encrypt_password()` for the claimed username.
 - On success: `session key = MD5(user || pass)`; **one session slot per user** —
@@ -234,7 +244,10 @@ and a coordinated client/server release.
 ## 12. Interop quirks (the reference server, memorized)
 
 - Signature key is the string `"mw"` (not a real key).
-- AUTH_VERIFY: **required in OPEN**, optional in ACK.
+- AUTH_VERIFY: **optional in OPEN, and off by default** — production servers
+  (2026-11 实测) answer a nonce-bearing OPEN with a degraded "minimal ACK"
+  (username + nonce echo, sid=0, no 0x03/0x04/0x05/0x06) and never open a
+  session. Set `IWAN_OPEN_NONCE=1` to restore it for servers that still echo.
 - OPEN must carry sid = 0 and tok = 0.
 - ECHO_RES echoes the request's sid/tok (server) versus the session's sid/tok
   (client) — the two sides disagree; the frame is never handled anyway.
@@ -249,3 +262,71 @@ The wire has **no version field** (`IWAN_PROTO_VERSION` is informational only �
 a version bump means a *new frame layout*, not a new constant). New layouts
 MUST keep distinct frame-type ids and MUST be shipped with a coordinated
 client+server release.
+
+## 14. Panabit extension space (implemented, receive-side)
+
+The official Panabit client (`linux_sdwand_x86`, reverse-engineered in
+[docs/sdwan-protocol.md](docs/sdwan-protocol.md)) reuses the reserved ids for
+fragmentation, source routing and duplicate delivery. This tree implements the
+receiver side of all of them plus the 60-byte keepalive:
+
+- **Fragmentation (0x22 / 0x24)** — `8B frame header + 8B fragment header
+  {u32 id, u32 meta}` in **host order**, `meta` = `eop:1 | fromin:1 |
+  fragoff:13 | fraglen:11`, payload starts at offset 16 of the datagram. At
+  most two fragments per inner packet are produced by the reference client.
+  Reassembly is keyed on `(sid, token, id)`, expires after 10 s, and only a
+  single contiguous range starting at 0 that ends at `eop` completes.
+  Implemented in `src/common/frag.c`.
+- **SEGRT (0x28)** — the source-routing header sits at **offset 0 of the UDP
+  payload** (no frame header, no signature): `{u8 type=0x28, u8 nextid,
+  u8 linkcnt, u8 algo:3|padlen:5, be32 links[linkcnt]}` followed by a complete
+  inner frame. `algo == 0` is plaintext; the server re-dispatches it. A
+  non-zero `padlen` trims the tail. Implemented in `src/common/sr.c`; the SR
+  key (`jhash` of the links → AES key material) is derived exactly as the
+  client does; encrypted SEGRT is decrypted when the server was started with
+  `--sr-password <PW>` (otherwise it is dropped and counted).
+- **Keepalive (0x15 / 0x16)** — 60 bytes: `8B header + 16B signature + 36B
+  payload`. Payload = `u64 tick (LE) | u32 cur,min,max (LE) | 4B pad | "SDRT" |
+  be32 magic | be32 cnt`; the responder echoes the 36 bytes verbatim and the
+  sender keeps cur/min/max of `now - tick` (§16 of the reverse-engineering
+  notes: the pad bytes are uninitialised in the official client and carry no
+  meaning). Implemented in `src/common/echo.c`; the legacy 24-byte probe is
+  still accepted, and 24-byte ECHO_RES is still valid when the request had no
+  payload.
+- **Duplicates (0x19 / 0x20)** — identical payload, different type id, sent
+  twice by clients that enable the `duppkt` TLV. There is no sequence number,
+  so the receiver delivers both; the inner stack copes.
+- **DNS TLV** — Panabit clients require `len == 8` (primary + secondary
+  address). This tree now sends 8 bytes (the same address twice when only one
+  is configured); old clients read the first 4 bytes.
+- **AUTH_VERIFY (0x0F)** — optional in both directions and **not sent by
+  default**; see §6 and §12.
+- **ECHO frame header** — the official client sends `encrypt = 0` on 0x15/0x16
+  (only OPEN/DATA carry the negotiated bit); this tree now matches.
+- **IPv6 peer TLVs (0x0B / 0x0C / 0x0D)** — ACK-only, `length = 0x12` (two
+  TLV bytes + 16 address bytes, network order): inner tunnel IPv6 address,
+  IPv6 DNS and IPv6 gateway. The client parses them into
+  `AuthResult.tun6/gw6/dns6` (all-zero means "not issued") and prints them
+  (`IPv6  tun=… gw=… dns=…` on the connect banner, plus a decoded per-TLV
+  dump under `IWAN_DEBUG=1` in Debug builds). This server does not emit them
+  yet: the kernel/proxy data planes have no inner-IPv6 routing, so advertising
+  a tunnel address would be a lie.
+
+Timers are aligned with the official client where the value is externally
+observable:
+
+- **ECHOREQ every 2 s** (`IWAN_ECHO_INTERVAL_MS`), in all four client paths
+  (SOCKS, TUN pump, Linux kernel plane, Windows kernel plane).
+- **AUTH timeout 6 s**: three OPENs spaced 2 s (`AUTH_TIMEOUT_MS 2000`,
+  `AUTH_SEND_MAX 3`, no extra delay), matching the client's "AUTH timeout"
+  at `ltime + 6`.
+- **DATA timeout 15 s** is the official client's own state machine value; this
+  tree keeps its equivalent watchdog (`IWAN_RX_STALE_MS`) at the historical
+  **120 s default**, because it was raised to that value after 60 s produced
+  spurious reconnects on a mobile line (six consecutive unanswered keepalives
+  inside one window). At the new 2 s cadence a 15 s window would tolerate
+  only seven lost probes, i.e. it would be stricter than the setting that
+  already failed in the field. The window is configurable, and the floor is
+  now 6 s (three probe periods), so `IWAN_RX_STALE_MS=15000` reproduces the
+  official value exactly when wanted.
+

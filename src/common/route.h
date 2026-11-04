@@ -16,7 +16,7 @@ bool capture_default(char gw[16], char dev[16], char metric[16]);
 /* Apply the VPN routes: flush/up/mtu/addr on tun, then install the
  * proxy routes (default replaced onto tun). Returns true on success;
  * on failure, rolls back everything applied so far (restoring the
- * pre-VPN default route) and returns false — the caller must not
+ * pre-VPN default route) and returns false -- the caller must not
  * start the pump on failure. metric is the pre-VPN default's metric
  * ("" when none) and is carried into the teardown restore. routes6 is
  * the already-expanded IPv6 proxy list (see route_setup6); the Windows
@@ -39,9 +39,9 @@ void route_setup6(const char *tun, const slist_t *routes6);
 void route_teardown6(const char *tun, const char *tun_ip,
                      const slist_t *routes6);
 /* R50-D1: drop the CURRENT run's IPv6 side (each configured routes6
- * prefix + the derived ULA), used only on the Windows ROLLBACK legs —
+ * prefix + the derived ULA), used only on the Windows ROLLBACK legs --
  * route_setup failing after route_iface_up already added the ULA, and
- * the no-route-hijack pump path failing at route_iface_up — BEFORE the
+ * the no-route-hijack pump path failing at route_iface_up -- BEFORE the
  * rollback's route_iface_down. That function's R49-L5 sweep keeps only
  * fe80::/64 (tun_ip/routes6 are NULL there), so it would delete the
  * on-link /96 route while leaving the live ULA ADDRESS on the

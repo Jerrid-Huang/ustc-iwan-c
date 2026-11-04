@@ -6,7 +6,7 @@
 #include "common.h"
 
 /* ============================================================================
- * FROZEN WIRE PROTOCOL — INTEROP-CRITICAL
+ * FROZEN WIRE PROTOCOL -- INTEROP-CRITICAL
  *
  * Everything below this banner is the on-the-wire byte layout of the iwan
  * protocol, shared with the reference implementation (yyy1mu/ustc-iwan).
@@ -49,14 +49,14 @@
 /* MTU sane range: the OPEN_ACK is only header-signed, so never trust a
  * huge MTU; clamp to the IPv4-over-UDP range (also the default). */
 #define IWAN_MTU_MIN       576
-/* 度量档（CMake -DIWAN_JUMBO_MTU=N，默认关闭）会覆盖这两个值：把内层 MTU
- * 抬到接近外层链路能装下的上限，让"每包固定成本"按 MTU 摊销掉 —— 这是不写
- * 任何 GSO/分段代码就能量出摊销收益上限的办法。见 docs/perf-plan.md。 */
-/* 内层 MTU 上限由规范推出：外层 IPv4 总长 <= 65535，减去封装开销
- * 20(IP) + 8(UDP) + 8(定长首部) = 36 ⇒ 65499。与内核模块的
- * IWAN_MAX_MTU（65535 - IWAN_OVERHEAD）同值。承载链路 MTU 必须能装下
- * 内层分组 + 50B（含 14B 链路首部），否则外层会在承载网络上分片。
- * 用户态泵按协商 MTU 动态定尺（proxy.c pump_slot_init），没有 2048 上限。 */
+/* The measurement profile (CMake -DIWAN_JUMBO_MTU=N, off by default) overrides these two values: raise the inner MTU
+ * close to the maximum the outer link can carry, so the "per-packet fixed cost" is amortized over the MTU -- this is the way
+ * to measure the upper bound of amortization gain without writing any GSO/segmentation code. See docs/perf-plan.md. */
+/* The inner MTU ceiling follows from the spec: outer IPv4 total length <= 65535, minus encapsulation overhead
+ * 20(IP) + 8(UDP) + 8(fixed header) = 36 => 65499. Same value as the kernel module's
+ * IWAN_MAX_MTU (65535 - IWAN_OVERHEAD). The carrier link MTU must be able to carry
+ * the inner packet + 50B (including the 14B link header), otherwise the outer packet will fragment on the carrier network.
+ * The userspace pump sizes dynamically per the negotiated MTU (proxy.c pump_slot_init); there is no 2048 limit. */
 #ifndef IWAN_MTU_MAX
 #define IWAN_MTU_MAX       65499
 #endif
@@ -75,13 +75,13 @@
 #define IWAN_UDP_GSO_UNIT 65507
 
 /*
- * 外层 v6 的两把尺子（与内核的 IWAN_OVERHEAD_V6 = 56 对齐）：
- *   · 内层 MTU 上限 = 65535 - 56 = 65479（外层头 40B 比 v4 多 20B）；
- *   · 单个外层 UDP 报文载荷上限 = 65535 - 40 - 8 = 65487。
- * 可达性说明（别误以为它们在当前配置下会咬人）：冻结口径要求内核
- * max_mtu <= 1500，此时 IWAN_MTU_MAX 那一档根本够不到，只有 jumbo 度量档
- * （CMake -DIWAN_JUMBO_MTU=N 且内核抬高 max_mtu）+ 外层 v6 才会碰上。
- * 真到那一步时，各调用点应按会话的外层族选这两个值，而不是继续用 v4 形状。 */
+ * Two measures for outer v6 (aligned with the kernel's IWAN_OVERHEAD_V6 = 56):
+ *   - inner MTU ceiling = 65535 - 56 = 65479 (the outer header is 40B, 20B more than v4);
+ *   - single outer UDP datagram payload ceiling = 65535 - 40 - 8 = 65487.
+ * Reachability note (do not assume these bite under the current config): the frozen rule requires kernel
+ * max_mtu <= 1500, at which the IWAN_MTU_MAX tier is unreachable; only the jumbo measurement profile
+ * (CMake -DIWAN_JUMBO_MTU=N and a raised kernel max_mtu) + outer v6 can hit it.
+ * When that actually happens, each call site should select these two values by the session's outer family, not keep using the v4 shape. */
 #define IWAN_MTU_MAX_V6      65479
 #define IWAN_UDP_GSO_UNIT_V6 65487
 
@@ -108,7 +108,7 @@
  * session socket is shared with non-batch senders: the tunnel-DNS
  * worker (inner 20+8+up-to-271B query + 8B outer <= 307B) and control
  * frames (24B) send() on the same fd. While UDP_SEGMENT is armed, the
- * kernel splits ANY datagram longer than the mss — an ACK-only batch
+ * kernel splits ANY datagram longer than the mss -- an ACK-only batch
  * (48B units) armed mss=48 and silently chopped a 69B DNS query into
  * 48+21B fragments, both dropped by the server's inner-packet gate
  * (flaky tunnel-DNS). Every non-batch frame on the socket must stay
@@ -130,7 +130,7 @@ _Static_assert(IWAN_TLV_VLEN_MAX + 2 <= 255,
 _Static_assert(IWAN_PING_SID == 0xFFFF && IWAN_PING_TOK == 0xFFFFFFFFu,
                "PING wildcard sid/token must fit the header fields");
 
-/* FROZEN WIRE VALUES — reordering/renumbering breaks interop */
+/* FROZEN WIRE VALUES -- reordering/renumbering breaks interop */
 enum {
     PT_OPEN_REJECT = 0x11,
     PT_OPEN_ACK    = 0x12,
@@ -140,11 +140,19 @@ enum {
     PT_ECHO_RES    = 0x16,
     PT_CLOSE       = 0x17,
     PT_DATA_ENC    = 0x18,
+    /* Panabit SD-WAN extensions (docs/sdwan-protocol.md section 8), appended so the
+     * frozen 0x11-0x18/PING values above keep their ids */
+    PT_DATA_DUP     = 0x19,
+    PT_DATA_ENC_DUP = 0x20,
+    PT_IPFRAG       = 0x22,
+    PT_DATA_IPV6    = 0x23,
+    PT_IPFRAG_ALT   = 0x24,
+    PT_SEGRT        = 0x28,
     PT_PING_REQ    = 0x29,
     PT_PING_RSP    = 0x2A,
 };
 
-/* FROZEN WIRE VALUES — reordering/renumbering breaks interop */
+/* FROZEN WIRE VALUES -- reordering/renumbering breaks interop */
 enum {
     T_USERNAME    = 0x01,
     T_PASSWORD    = 0x02,
@@ -153,19 +161,49 @@ enum {
     T_DNS         = 0x05,
     T_GATEWAY     = 0x06,
     T_ENCRYPT     = 0x08,
+    T_DUPPKT      = 0x09,
+    T_PIPE        = 0x0A,
+    T_IPV6        = 0x0B,
+    T_DNS6        = 0x0C,
+    T_GATEWAY6    = 0x0D,
     T_AUTH_VERIFY = 0x0F,
     T_ERR_MSG     = 0x10,
 };
 
 void pkt_hdr(uint8_t typ, uint8_t enc, uint16_t sid, uint32_t tok,
              uint8_t out[IWAN_HDR_LEN]);
+/* Panabit ECHO payload: 36 bytes appended to an ECHO_REQ/ECHO_RES control
+ * frame (docs/sdwan-protocol.md section 7). All fields are LITTLE-endian, unlike the
+ * rest of the protocol, because the official client memcpy()s them. Layout:
+ *   +0  u64 tick (microseconds, echoed back verbatim by the responder)
+ *   +8  u32 cur, +12 u32 min, +16 u32 max delay in microseconds
+ *   +20 4 pad bytes (the client sends uninitialised stack here -- never trust)
+ *   +24 "SDRT", +28 u32 magic, +32 u32 count (route table, always empty) */
+#define IWAN_ECHO_LEN 36
+/* The official client runs the state machine once per tick (1 s) and sends ECHOREQ every 2 ticks,
+ * i.e. a **keepalive probe interval of 2 seconds** (docs/sdwan-protocol.md section 16). The peer tears down the link only after 30 s
+ * without a response, so a 10 s send interval "works", but it is not the official cadence. */
+#define IWAN_ECHO_INTERVAL_MS 2000u
+/* Official client's DATA timeout: reset the state machine when no "valid frame" arrives within 15 seconds
+ * (docs/sdwan-protocol.md section 6). This repo only uses it after confirming the peer replies to keepalives. */
+#define IWAN_DATA_TIMEOUT_MS 15000u
+struct iwan_echo {
+    uint64_t tick;
+    uint32_t cur, min, max;
+    bool     sdrt;
+    uint32_t sdrt_magic;
+    uint32_t sdrt_cnt;
+};
+void echo_put(buf_t *out, const struct iwan_echo *e);
+bool echo_parse(const uint8_t *p, size_t len, struct iwan_echo *out);
+
 /* md5(h8 + IWAN_MW) */
 /* append header WITH sig (for ctrl). out grows. */
 void ctrl_hdr(buf_t *out, uint8_t typ, uint8_t enc, uint16_t sid, uint32_t tok);
 /* append one TLV (len includes the 2 header bytes). */
 void tlv_put(buf_t *out, uint8_t typ, const void *val, uint8_t vlen);
 /* iterate TLVs. Returns 0 on success (or when cb stops the iteration:
- * that is not a parse error — the callback carries the reason in its ud),
+ * that is not a parse error -- the callback carries the reason in its ud),
  * -1 when the frame is truncated or malformed (a length byte < 2, a TLV
  * overrunning the buffer, or trailing bytes). */
 int parse_tlvs(const uint8_t *data, size_t len,

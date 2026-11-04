@@ -1,38 +1,38 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0
 #
-# capture_iwan.py —— 在设备层抓 iWAN 外层报文，把 UDP 载荷写盘，供跨实现对拍。
+# capture_iwan.py -- capture iWAN outer packets at the device layer, write the UDP payloads to disk for cross-implementation comparison.
 #
-# 为什么不用 tcpdump/ss：内核模块的 RX 钩子挂在 netfilter PRE_ROUTING
-# (prio=-300)，命中外层四元组的报文会被 NF_STOLEN / 就地改写成内层包，IP 层
-# 之上的任何观察点都看不到原始外层帧。AF_PACKET 挂在**设备层**
-# （__netif_receive_skb_core 的 ptype 分发），早于 netfilter，所以模块把包
-# "吞"掉之后这里仍然能看到链路层上的原始外层帧。
+# Why not tcpdump/ss: the RX hook of the kernel module sits at netfilter PRE_ROUTING
+# (prio=-300); packets matching the outer 4-tuple are NF_STOLEN / rewritten in place into inner packets, so
+# no observation point above the IP layer can see the original outer frame. AF_PACKET sits at the **device layer**
+# (ptype dispatch in __netif_receive_skb_core), earlier than netfilter, so after the module swallows the packet
+# this point can still see the original outer frame on the link layer.
 #
-# 用法：
+# Usage:
 #   python3 capture_iwan.py --ifname veth-s --dport 6100 \
 #           --count 1 --timeout 8 --out /tmp/cap [--sport 6100] [--l2-len 14]
 #
-# 写盘约定（"一个包一个文件"，文件可以直接喂给 interop_c decap）：
-#   <out>.<i>       第 i 个包的 **UDP 载荷**（纯载荷 = 8B iWAN 帧头 + XOR 内层包）
-#   <out>.<i>.hdr   第 i 个包的外层头**前 26 字节**：IPv4 20B + UDP sport/dport/len
-#                   不含 UDP 校验和（第 27/28 字节）：veth/HW_CSUM 卸载下抓到的
-#                   可能是部分和，比对无意义 —— 与 interop_c outer 的注释同口径。
-#   i 从 0 开始，按抓到的先后顺序编号。
+# On-disk convention ("one packet per file", the files can be fed directly to interop_c decap):
+#   <out>.<i>       **UDP payload** of packet i (pure payload = 8B iWAN frame header + XOR inner packet)
+#   <out>.<i>.hdr   **first 26 bytes** of the outer header of packet i: IPv4 20B + UDP sport/dport/len
+#                   excluding the UDP checksum (bytes 27/28): captured under veth/HW_CSUM offload it
+#                   may be a partial sum, so comparing it is meaningless -- same stance as the comment in interop_c outer.
+#   i starts at 0 and numbers packets in capture order.
 #
-# stdout 是稳定的 KEY=value（每个包一段，段首 INDEX=<i>）：
-#   CAPTURE_READY=1 / IFNAME / WANTED / TIMEOUT            启动握手（脚本等这一行）
+# stdout is stable KEY=value (one section per packet, starting with INDEX=<i>):
+#   CAPTURE_READY=1 / IFNAME / WANTED / TIMEOUT            startup handshake (the script waits for this line)
 #   INDEX / OUTER_IP_SRC / OUTER_IP_DST / OUTER_IP_PROTO / OUTER_IP_TOT_LEN /
 #   OUTER_IP_TTL / OUTER_IP_ID / OUTER_IP_DF / OUTER_IP_CSUM /
 #   OUTER_UDP_SPORT / OUTER_UDP_DPORT / OUTER_UDP_LEN /
-#   PAYLOAD_BYTES / PAYLOAD_FILE / OUTER_HDR_FILE          每个包一段
-#   CAPTURED / WANTED / SKIPPED / RESULT=ok|timeout         收尾
-# 外层头的键名与 `interop_c outer` 完全一致（含 0x%04x 的校验和格式），
-# 于是 interop_test.sh 可以逐字段直接做字符串比较。
+#   PAYLOAD_BYTES / PAYLOAD_FILE / OUTER_HDR_FILE          one section per packet
+#   CAPTURED / WANTED / SKIPPED / RESULT=ok|timeout         epilogue
+# The outer header key names are exactly the same as `interop_c outer` (including the 0x%04x checksum format),
+# so interop_test.sh can compare them field by field as plain strings.
 #
-# stderr 是人看的诊断（跳过的包、非 IPv4/UDP、分片、读设备错误）。
-# 退出码：0 = 抓够；1 = 超时/数量不足（**抓不到是失败，不是挂住**）；2 = 用法
-# 或环境错误（无 CAP_NET_RAW、网卡不存在、输出路径不可写）。
+# stderr is diagnostics for humans (skipped packets, non-IPv4/UDP, fragments, device read errors).
+# Exit codes: 0 = captured enough; 1 = timeout/too few (**failing to capture is a failure, not a hang**); 2 = usage
+# or environment error (no CAP_NET_RAW, interface missing, output path not writable).
 
 import argparse
 import select
@@ -46,15 +46,15 @@ PACKET_OUTGOING = 4		# linux/if_packet.h
 ARPHRD_ETHER = 1		# linux/if_arp.h
 ARPHRD_LOOPBACK = 772
 ARPHRD_NONE = 0xFFFE
-ETH_HLEN = 14			# ARPHRD_ETHER / ARPHRD_LOOPBACK 的链路层头
-HDR_PREFIX = 26			# IPv4 20B + UDP sport/dport/len（不含 UDP 校验和）
+ETH_HLEN = 14			# link-layer header for ARPHRD_ETHER / ARPHRD_LOOPBACK
+HDR_PREFIX = 26			# IPv4 20B + UDP sport/dport/len (excluding the UDP checksum)
 IP_DF = 0x4000
 IP_MF = 0x2000
 IP_OFFMASK = 0x1FFF
 
 
 def emit(line):
-	"""stdout 逐行 flush：脚本靠 CAPTURE_READY 行做握手，不能被缓冲吃掉。"""
+	"""stdout line-by-line flush: the script uses the CAPTURE_READY line as a handshake, so it must not be eaten by buffering."""
 	sys.stdout.write("%s\n" % line)
 	sys.stdout.flush()
 
@@ -65,7 +65,7 @@ def warn(msg):
 
 
 def ipv4_csum_ok(hdr):
-	"""IPv4 头校验和自洽（ones' complement 求和 == 0xFFFF）。"""
+	"""IPv4 header checksum is self-consistent (ones' complement sum == 0xFFFF)."""
 	s = 0
 	for i in range(0, len(hdr) - 1, 2):
 		s += (hdr[i] << 8) | hdr[i + 1]
@@ -75,10 +75,10 @@ def ipv4_csum_ok(hdr):
 
 
 def l2_len_for(buf, hatype, explicit):
-	"""链路层头长度。
+	"""Link-layer header length.
 
-	SOCK_RAW 的 AF_PACKET **包含**链路层头（SOCK_DGRAM 才剥掉），所以要先
-	跳过它才能看到 IPv4。这里按 sll_hatype 判定；--l2-len 可显式覆盖。
+	SOCK_RAW AF_PACKET **includes** the link-layer header (only SOCK_DGRAM strips it), so it must be
+	skipped first to see IPv4. Decided from sll_hatype here; --l2-len overrides it explicitly.
 	"""
 	if explicit is not None:
 		return explicit
@@ -86,23 +86,23 @@ def l2_len_for(buf, hatype, explicit):
 		return ETH_HLEN
 	if hatype == ARPHRD_NONE:
 		return 0
-	# 兜底：首字节高 4 位是 4 说明拿到的已经是 IPv4 本身。
+	# Fallback: if the top 4 bits of the first byte are 4, what we got is already IPv4 itself.
 	if len(buf) > 0 and (buf[0] >> 4) == 4:
 		return 0
-	raise ValueError("未知链路类型 hatype=%d，请用 --l2-len 显式指定" % hatype)
+	raise ValueError("unknown link type hatype=%d, use --l2-len to specify it explicitly" % hatype)
 
 
 def parse_frame(buf, l2):
-	"""解析链路层之下的 IPv4 + UDP，返回字段字典（纯手写，不引第三方库）。"""
+	"""Parse IPv4 + UDP below the link layer, return a field dict (hand-written, no third-party libraries)."""
 	if len(buf) < l2 + 20:
-		raise ValueError("帧太短（%d 字节）" % len(buf))
+		raise ValueError("frame too short (%d bytes)" % len(buf))
 	ip = l2
 	vihl = buf[ip]
 	if (vihl >> 4) != 4:
-		raise ValueError("不是 IPv4（version=%d）" % (vihl >> 4))
+		raise ValueError("not IPv4 (version=%d)" % (vihl >> 4))
 	ihl = (vihl & 0x0F) * 4
 	if ihl < 20 or len(buf) < ip + ihl:
-		raise ValueError("IPv4 头长度非法（ihl=%d）" % ihl)
+		raise ValueError("invalid IPv4 header length (ihl=%d)" % ihl)
 
 	tot_len = struct.unpack_from("!H", buf, ip + 2)[0]
 	ip_id = struct.unpack_from("!H", buf, ip + 4)[0]
@@ -126,27 +126,27 @@ def parse_frame(buf, l2):
 		"OUTER_IP_CSUM_OK": 1 if ipv4_csum_ok(buf[ip:ip + ihl]) else 0,
 	}
 	if proto != 17:
-		info["reason"] = "非 UDP（proto=%d）" % proto
+		info["reason"] = "not UDP (proto=%d)" % proto
 		return info
 	if frag & IP_OFFMASK:
-		info["reason"] = "非首片外层分片（frag_off=0x%04x），片内没有 UDP 头" % frag
+		info["reason"] = "outer fragment that is not the first fragment (frag_off=0x%04x), no UDP header inside a fragment" % frag
 		return info
 	if frag & IP_MF:
-		info["reason"] = "外层仍带 MF（本片不是完整数据报）"
+		info["reason"] = "the outer packet still has MF set (this fragment is not a complete datagram)"
 		return info
 	if len(buf) < ip + ihl + 8:
-		raise ValueError("UDP 头不完整")
+		raise ValueError("incomplete UDP header")
 
 	sport, dport, ulen, ucsum = struct.unpack_from("!HHHH", buf, ip + ihl)
 	payload_off = ip + ihl + 8
-	# 内层数据的边界：UDP 长度 与 IP 总长 取小，再夹到实际抓到的字节数。
+	# Boundary of the inner data: take the smaller of the UDP length and the IP total length, then clamp to the bytes actually captured.
 	udp_data = max(ulen - 8, 0)
 	ip_end = len(buf)
 	if tot_len >= ihl:
 		ip_end = min(ip + tot_len, len(buf))
 	payload_end = min(payload_off + udp_data, ip_end)
 	if payload_end < payload_off:
-		raise ValueError("UDP 长度 %d 与 IP 总长 %d 矛盾" % (ulen, tot_len))
+		raise ValueError("UDP length %d contradicts IP total length %d" % (ulen, tot_len))
 
 	info.update({
 		"OUTER_UDP_SPORT": sport,
@@ -167,52 +167,52 @@ def write_file(path, data):
 def main(argv):
 	ap = argparse.ArgumentParser(
 		prog="capture_iwan.py",
-		description="在设备层抓 iWAN 外层 UDP 报文，写出 UDP 载荷与外层头前缀",
-		epilog="退出码：0 抓够 / 1 超时 / 2 用法或环境错误")
-	ap.add_argument("--ifname", required=True, help="抓包网卡（在当前 netns 里）")
-	ap.add_argument("--dport", required=True, type=int, help="外层 UDP 目的端口")
+		description="capture iWAN outer UDP packets at the device layer, write out the UDP payload and the outer header prefix",
+		epilog="exit codes: 0 captured enough / 1 timeout / 2 usage or environment error")
+	ap.add_argument("--ifname", required=True, help="capture interface (in the current netns)")
+	ap.add_argument("--dport", required=True, type=int, help="outer UDP destination port")
 	ap.add_argument("--sport", type=int, default=None,
-			help="外层 UDP 源端口（默认不过滤）")
-	ap.add_argument("--count", type=int, default=1, help="要抓几个包（默认 1）")
+			help="outer UDP source port (no filtering by default)")
+	ap.add_argument("--count", type=int, default=1, help="how many packets to capture (default 1)")
 	ap.add_argument("--timeout", type=float, default=8.0,
-			help="总超时秒数（默认 8，超时退出码 1）")
+			help="total timeout in seconds (default 8, timeout exits with code 1)")
 	ap.add_argument("--out", required=True,
-			help="输出前缀：载荷写 <out>.i，外层头前缀写 <out>.i.hdr")
+			help="output prefix: payload written to <out>.i, outer header prefix written to <out>.i.hdr")
 	ap.add_argument("--l2-len", type=int, default=None,
-			help="链路层头长度（默认按 hatype 自动判定）")
+			help="link-layer header length (default: determined automatically from hatype)")
 	args = ap.parse_args(argv)
 
 	if args.count < 1:
-		ap.error("--count 必须 >= 1")
+		ap.error("--count must be >= 1")
 	if args.timeout <= 0:
-		ap.error("--timeout 必须 > 0")
+		ap.error("--timeout must be > 0")
 	for name, v in (("--dport", args.dport), ("--sport", args.sport)):
 		if v is not None and not (0 <= v <= 65535):
-			ap.error("%s 超出 [0,65535]" % name)
+			ap.error("%s out of range [0,65535]" % name)
 
 	try:
 		s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW,
 				  socket.htons(ETH_P_IP))
 	except PermissionError:
-		warn("没有 CAP_NET_RAW：请用 root（或 sudo）运行")
+		warn("no CAP_NET_RAW: run as root (or with sudo)")
 		return 2
 	except OSError as e:
-		warn("创建 AF_PACKET 套接字失败：%s" % e)
+		warn("failed to create AF_PACKET socket: %s" % e)
 		return 2
 
 	try:
 		s.bind((args.ifname, 0))
 	except OSError as e:
-		warn("绑定网卡 %s 失败：%s（网卡在当前 netns 里存在吗？）"
+		warn("failed to bind interface %s: %s (does the interface exist in the current netns?)"
 		     % (args.ifname, e))
 		return 2
-	# 抓包不能因为用户态来不及收就丢帧（默认 rmem 只有 ~200KB）。
+	# capture must not drop frames just because user space is slow to receive (the default rmem is only ~200KB).
 	try:
 		s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
 	except OSError:
 		pass
 
-	# 握手行必须先于任何 recv 出现：调用脚本据此确定"已经在抓了"再发包。
+	# The handshake line must appear before any recv: the calling script uses it to know that capturing is already running before sending packets.
 	emit("CAPTURE_READY=1")
 	emit("IFNAME=%s" % args.ifname)
 	emit("WANTED=%d" % args.count)
@@ -229,18 +229,18 @@ def main(argv):
 		try:
 			ready, _, _ = select.select([s], [], [], remain)
 		except OSError as e:
-			warn("select 失败：%s" % e)
+			warn("select failed: %s" % e)
 			return 2
 		if not ready:
 			break
 		try:
 			buf, addr = s.recvfrom(65535)
 		except OSError as e:
-			warn("收包失败：%s" % e)
+			warn("recv failed: %s" % e)
 			return 2
 
-		# sll_pkttype：只认"收到的"。本机发出的帧（例如对端解封后内核回的
-		# ICMP 差错被模块重新封装）同样会被 AF_PACKET 看到，不能算抓到的包。
+		# sll_pkttype: only accept "received" packets. Frames sent by this host (for example the kernel's
+		# ICMP error reply after the peer decapsulated, re-encapsulated by the module) are also visible to AF_PACKET and must not count as captured packets.
 		pkttype = addr[2] if len(addr) > 2 else -1
 		hatype = addr[3] if len(addr) > 3 else ARPHRD_NONE
 		if pkttype == PACKET_OUTGOING:
@@ -250,16 +250,16 @@ def main(argv):
 			l2 = l2_len_for(buf, hatype, args.l2_len)
 			info = parse_frame(buf, l2)
 		except ValueError as e:
-			warn("跳过一帧：%s" % e)
+			warn("skipping a frame: %s" % e)
 			skipped += 1
 			continue
 
 		if "reason" in info:
-			warn("跳过一帧：%s" % info["reason"])
+			warn("skipping a frame: %s" % info["reason"])
 			skipped += 1
 			continue
 		if info["OUTER_UDP_DPORT"] != args.dport:
-			skipped += 1	# 同网卡上的其它 UDP 流量是常态，不逐条刷屏
+			skipped += 1	# other UDP traffic on the same NIC is normal, do not flood the log per packet
 			continue
 		if args.sport is not None and info["OUTER_UDP_SPORT"] != args.sport:
 			skipped += 1
@@ -272,7 +272,7 @@ def main(argv):
 			write_file(pl_path, info["payload"])
 			write_file(hdr_path, info["hdr"])
 		except OSError as e:
-			warn("写 %s 失败：%s" % (pl_path, e))
+			warn("failed to write %s: %s" % (pl_path, e))
 			return 2
 
 		emit("INDEX=%d" % idx)
@@ -287,14 +287,14 @@ def main(argv):
 		emit("PAYLOAD_FILE=%s" % pl_path)
 		emit("OUTER_HDR_FILE=%s" % hdr_path)
 		if not info["OUTER_IP_CSUM_OK"]:
-			warn("第 %d 个包的外层 IP 头校验和不自洽" % idx)
+			warn("outer IP header checksum of packet %d is not self-consistent" % idx)
 		captured += 1
 
 	emit("CAPTURED=%d" % captured)
 	emit("SKIPPED=%d" % skipped)
 	if captured < args.count:
 		emit("RESULT=timeout")
-		warn("超时 %gs：只抓到 %d/%d 个 dport=%d 的外层包"
+		warn("timeout %gs: only captured %d/%d outer packets with dport=%d"
 		     % (args.timeout, captured, args.count, args.dport))
 		return 1
 	emit("RESULT=ok")

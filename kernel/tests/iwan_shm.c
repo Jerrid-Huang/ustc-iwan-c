@@ -1,23 +1,23 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * iwan_shm.c — /dev/iwan 共享内存页的只读查看工具（纯 libc）。
+ * iwan_shm.c - read-only inspection tool for the /dev/iwan shared memory page (pure libc).
  *
  *   iwan_shm dump  [--pread]
  *   iwan_shm watch [--count N] [--interval MS] [--leave-netns]
  *
- * 背景：keepalive 的发送在用户态，内核每收到一个通过凭据闸门的帧就把当前
- * 单调毫秒写进**该 netns 一页**共享内存；本工具只读这一页（内核侧 open()
- * 拒绝写方式打开、mmap() 拒绝 PROT_WRITE）。用户态的断线判据：
- *   · last_rx_ms == 0  → 从未收到 / 已断开（PT_CLOSE 会把时间戳置 0）；
- *   · 超过阈值没推进   → 判定断线并退出（阈值由调用方决定，本工具只报数）。
+ * Background: keepalive sending is in userspace; for every frame passing the credential gate the
+ * kernel writes the current monotonic ms into **the one page of that netns**; this tool only reads
+ * that page (kernel open() rejects write mode, mmap() rejects PROT_WRITE). Userspace link-down rules:
+ *   - last_rx_ms == 0  -> never received / disconnected (PT_CLOSE zeroes the timestamp);
+ *   - no advance past a threshold -> down and exit (caller decides it; this tool only reports values).
  *
- * 页面布局与偏移来自 kernel/iwan_shm.h（冻结 ABI）；本文件对同一批偏移再
- * 做一次静态断言，内核改了而用户态没跟上就编译不过。
+ * The page layout and offsets come from kernel/iwan_shm.h (frozen ABI); this file re-checks the
+ * same offsets with static assertions, so a kernel change without userspace fails to compile.
  *
- * 编译（见 kernel/tests/shm_test.sh）：
+ * Build (see kernel/tests/shm_test.sh):
  *   cc -O2 -std=gnu11 -D_GNU_SOURCE -Wall -Wextra -o iwan_shm iwan_shm.c
  *
- * 退出码（与 iwan_ctl.c 同风格）：0 成功；1 打开/映射/读取失败；2 用法错误。
+ * Exit codes (same style as iwan_ctl.c): 0 success; 1 open/mmap/read failure; 2 usage error.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -37,22 +37,22 @@
 
 #include "../iwan_shm.h"
 
-/* 用户态这一侧也把 ABI 偏移钉死：页面布局改动必须两边同时改 */
+/* The userspace side also pins the ABI offsets: any layout change must update both sides */
 _Static_assert(offsetof(struct iwan_shm, version) == IWAN_SHM_OFF_VERSION,
-	       "iwan_shm: version 偏移与 ABI 不符");
+	       "iwan_shm: version offset does not match ABI");
 _Static_assert(offsetof(struct iwan_shm, pad) == IWAN_SHM_OFF_PAD,
-	       "iwan_shm: pad 偏移与 ABI 不符");
+	       "iwan_shm: pad offset does not match ABI");
 _Static_assert(offsetof(struct iwan_shm, last_rx_ms) == IWAN_SHM_OFF_LAST_RX_MS,
-	       "iwan_shm: last_rx_ms 偏移与 ABI 不符");
+	       "iwan_shm: last_rx_ms offset does not match ABI");
 _Static_assert(offsetof(struct iwan_shm, peer_state) == IWAN_SHM_OFF_PEER_STATE,
-	       "iwan_shm: peer_state 偏移与 ABI 不符");
+	       "iwan_shm: peer_state offset does not match ABI");
 _Static_assert(offsetof(struct iwan_shm, enabled) == IWAN_SHM_OFF_ENABLED,
-	       "iwan_shm: enabled 偏移与 ABI 不符");
+	       "iwan_shm: enabled offset does not match ABI");
 _Static_assert(offsetof(struct iwan_shm, rx_frames) == IWAN_SHM_OFF_RX_FRAMES,
-	       "iwan_shm: rx_frames 偏移与 ABI 不符");
+	       "iwan_shm: rx_frames offset does not match ABI");
 _Static_assert(offsetof(struct iwan_shm, rx_ctrl_frame) ==
 	       IWAN_SHM_OFF_RX_CTRL_FRAME,
-	       "iwan_shm: rx_ctrl_frame 偏移与 ABI 不符");
+	       "iwan_shm: rx_ctrl_frame offset does not match ABI");
 
 #define DEV_PATH	"/dev/iwan"
 #define INIT_NETNS	"/proc/1/ns/net"
@@ -66,7 +66,7 @@ static void die(const char *fmt, ...)
 {
 	va_list ap;
 
-	fprintf(stderr, "%s: 错误: ", progname);
+	fprintf(stderr, "%s: error: ", progname);
 	va_start(ap, fmt);
 	vfprintf(stderr, fmt, ap);
 	va_end(ap);
@@ -77,23 +77,23 @@ static void die(const char *fmt, ...)
 static void usage(FILE *fd)
 {
 	fprintf(fd,
-"用法:\n"
+"Usage:\n"
 "  iwan_shm dump  [--pread]\n"
 "  iwan_shm watch [--count N] [--interval MS] [--leave-netns]\n"
 "\n"
-"说明:\n"
-"  · 打开 %s（只读）并 mmap 一页：dump 打印一次全部字段，watch 每\n"
-"    --interval 毫秒打印一行（带与上次的差值，便于看时间戳是否在推进）。\n"
-"  · 字段一律主机序；peer_state_name: 0=UNKNOWN 1=UP 2=SILENT 3=CLOSED；\n"
-"    last_rx_ms=0 表示从未收到有效帧或对端已 PT_CLOSE（用户态据此判定断线）。\n"
-"  · --pread: dump 改用 pread(2) 读整页快照（不开映射），用来对照 mmap 与\n"
-"    read 两条路径是否给出同一份数据。\n"
-"  · --leave-netns: mmap 之后把进程挪到 PID 1 所在 netns，于是**原 netns\n"
-"    可以被删除**（页面由打开的 file 持有引用）；成功后打印 left_netns=1。\n"
-"    用来验证「先 mmap 再删 netns」时映射仍然有效、值保持最后一次内容。\n"
-"  · watch --count 0（默认）表示一直打印；每行以 iter= 开头，t_ms= 是本进程\n"
-"    单调时钟（自启动起的毫秒）。\n"
-"  · 退出码: 0 成功, 1 打开/映射/读取失败, 2 用法错误。\n",
+"Description:\n"
+"  - open %s (read-only) and mmap one page: dump prints all fields once, watch prints\n"
+"    one line every --interval ms (with the delta from the previous line, to see progress).\n"
+"  - all fields are host byte order; peer_state_name: 0=UNKNOWN 1=UP 2=SILENT 3=CLOSED;\n"
+"    last_rx_ms=0 means no valid frame ever received or the peer sent PT_CLOSE (userspace declares down).\n"
+"  - --pread: dump uses pread(2) to read a whole-page snapshot (no mapping), to compare\n"
+"    whether the mmap and read paths return the same data.\n"
+"  - --leave-netns: after mmap, move the process into the netns of PID 1, so the **original\n"
+"    netns can be deleted** (the page is referenced by the open file); then prints left_netns=1.\n"
+"    Used to verify that after mmap-then-delete-netns the mapping stays valid and keeps the last content.\n"
+"  - watch --count 0 (default) prints forever; each line starts with iter=, t_ms= is this\n"
+"    process's monotonic clock (ms since boot).\n"
+"  - exit codes: 0 success, 1 open/mmap/read failure, 2 usage error.\n",
 		DEV_PATH);
 }
 
@@ -113,7 +113,7 @@ static void sleep_ms(uint64_t ms)
 	};
 
 	while (nanosleep(&ts, &ts) == -1 && errno == EINTR)
-		;	/* 只被信号中断：按剩余时间接着睡 */
+		;	/* interrupted only by a signal: sleep for the remaining time */
 }
 
 static const char *peer_state_name(uint32_t s)
@@ -128,10 +128,10 @@ static const char *peer_state_name(uint32_t s)
 }
 
 /*
- * 打开 /dev/iwan 并按 mode 取得页面视图。
- *   use_mmap=true  → mmap(PROT_READ, MAP_SHARED)：零系统调用的轮询路径；
- *   use_mmap=false → pread 整页到本地缓冲：对照路径（进度用）。
- * 返回的指针带 volatile：这一页是内核随时在写的共享内存，循环里必须每次实读。
+ * Open /dev/iwan and obtain a page view according to the mode.
+ *   use_mmap=true  -> mmap(PROT_READ, MAP_SHARED): zero-syscall polling path;
+ *   use_mmap=false -> pread the whole page into a local buffer: reference path (for progress).
+ * The pointer is volatile: the kernel writes this shared page anytime, so reload it every loop.
  */
 static const volatile struct iwan_shm *open_page(bool use_mmap, void **map_out,
 						 size_t *map_len,
@@ -142,11 +142,11 @@ static const volatile struct iwan_shm *open_page(bool use_mmap, void **map_out,
 	int fd;
 
 	if (page_size <= 0 || (size_t)page_size < sizeof(struct iwan_shm))
-		die("系统页大小异常: %ld", page_size);
+		die("abnormal system page size: %ld", page_size);
 
 	fd = open(DEV_PATH, O_RDONLY | O_CLOEXEC);
 	if (fd < 0)
-		die("打开 %s 失败: %s（模块加载了吗？）", DEV_PATH,
+		die("open %s failed: %s (is the module loaded?)", DEV_PATH,
 		    strerror(errno));
 
 	if (use_mmap) {
@@ -154,7 +154,7 @@ static const volatile struct iwan_shm *open_page(bool use_mmap, void **map_out,
 			       fd, 0);
 
 		if (p == MAP_FAILED)
-			die("mmap(%s, %ld, PROT_READ, MAP_SHARED) 失败: %s",
+			die("mmap(%s, %ld, PROT_READ, MAP_SHARED) failed: %s",
 			    DEV_PATH, page_size, strerror(errno));
 		shm = (const volatile struct iwan_shm *)p;
 		*map_out = p;
@@ -165,12 +165,12 @@ static const volatile struct iwan_shm *open_page(bool use_mmap, void **map_out,
 		ssize_t n;
 
 		if (!b)
-			die("malloc(%ld) 失败", page_size);
+			die("malloc(%ld) failed", page_size);
 		n = pread(fd, b, (size_t)page_size, 0);
 		if (n < 0)
-			die("pread(%s) 失败: %s", DEV_PATH, strerror(errno));
+			die("pread(%s) failed: %s", DEV_PATH, strerror(errno));
 		if (n != page_size)
-			die("pread(%s) 只返回 %zd 字节（期望 %ld）", DEV_PATH,
+			die("pread(%s) returned only %zd bytes (expected %ld)", DEV_PATH,
 			    n, page_size);
 		shm = (const volatile struct iwan_shm *)b;
 		*map_out = NULL;
@@ -178,10 +178,10 @@ static const volatile struct iwan_shm *open_page(bool use_mmap, void **map_out,
 		*buf_out = b;
 	}
 
-	/* 版本不匹配只告警不失败：字段偏移可能仍然可用，交给调用方判断 */
+	/* Version mismatch only warns, does not fail: offsets may still work; caller decides */
 	if (shm->version != IWAN_SHM_VERSION)
 		fprintf(stderr,
-			"%s: 警告: 页面 version=%u，本工具期望 %u\n",
+			"%s: warning: page version=%u, this tool expects %u\n",
 			progname, (unsigned)shm->version, IWAN_SHM_VERSION);
 	return shm;
 }
@@ -239,12 +239,12 @@ static int cmd_watch(unsigned long count, uint64_t interval, bool leave_netns)
 		int nfd = open(INIT_NETNS, O_RDONLY | O_CLOEXEC);
 
 		if (nfd < 0)
-			die("打开 %s 失败: %s", INIT_NETNS, strerror(errno));
+			die("open %s failed: %s", INIT_NETNS, strerror(errno));
 		if (setns(nfd, CLONE_NEWNET) != 0)
-			die("setns(%s, CLONE_NEWNET) 失败: %s", INIT_NETNS,
+			die("setns(%s, CLONE_NEWNET) failed: %s", INIT_NETNS,
 			    strerror(errno));
 		close(nfd);
-		/* 脚本等这一行：此刻 mmap 已完成，且本进程不再持有原 netns */
+		/* The script waits for this line: mmap is done and this process no longer holds the netns */
 		printf("left_netns=1\n");
 		fflush(stdout);
 	}
@@ -256,7 +256,7 @@ static int cmd_watch(unsigned long count, uint64_t interval, bool leave_netns)
 		uint64_t frames = shm->rx_frames;
 		uint64_t ctrl = shm->rx_ctrl_frame;
 
-		/* 差值为有符号：last_rx_ms 会因为 PT_CLOSE 归零而变小 */
+		/* Deltas are signed: last_rx_ms can go backwards when PT_CLOSE zeroes it */
 		printf("iter=%lu t_ms=%llu last_rx_ms=%llu d_last_rx_ms=%lld "
 		       "peer_state=%u peer_state_name=%s enabled=%u "
 		       "rx_frames=%llu d_rx_frames=%lld "
@@ -303,7 +303,7 @@ static unsigned long parse_ul(const char *s, const char *what)
 	errno = 0;
 	v = strtoul(s, &end, 0);
 	if (errno || *end || end == s)
-		die("%s 不是合法数字: \"%s\"", what, s);
+		die("%s is not a valid number: \"%s\"", what, s);
 	return v;
 }
 
@@ -325,7 +325,7 @@ int main(int argc, char **argv)
 		return 0;
 	}
 
-	optind = 2;	/* 跳过子命令，从它的参数开始解析 */
+	optind = 2;	/* skip the subcommand, start parsing at its arguments */
 	while ((c = getopt_long(argc, argv, "", long_opts, NULL)) != -1) {
 		switch (c) {
 		case OPT_COUNT:
@@ -351,18 +351,18 @@ int main(int argc, char **argv)
 
 	if (!strcmp(cmd, "dump")) {
 		if (optind != argc)
-			die("dump 有多余参数: %s", argv[optind]);
+			die("dump has extra arguments: %s", argv[optind]);
 		if (leave_netns)
-			die("dump 不支持 --leave-netns（用 watch）");
+			die("dump does not support --leave-netns (use watch)");
 		return cmd_dump(!pread_mode);
 	} else if (!strcmp(cmd, "watch")) {
 		if (optind != argc)
-			die("watch 有多余参数: %s", argv[optind]);
+			die("watch has extra arguments: %s", argv[optind]);
 		if (pread_mode)
-			die("watch 不支持 --pread（watch 就是 mmap 轮询路径）");
+			die("watch does not support --pread (watch is the mmap polling path)");
 		return cmd_watch(count, interval, leave_netns);
 	}
-	fprintf(stderr, "%s: 未知子命令 \"%s\"\n", progname, cmd);
+	fprintf(stderr, "%s: unknown subcommand \"%s\"\n", progname, cmd);
 	usage(stderr);
 	return 2;
 }

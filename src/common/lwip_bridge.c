@@ -199,7 +199,7 @@ static void conn_reconcile_rxq(TcpConn *c)
         return;
     /* R07-FIX B-2 (LOW, defensive): rxq.len >= rxq_unrecved means the socks
      * layer has drained every delivered-but-unacknowledged byte, so there is
-     * nothing left to tcp_recved() — the subtraction below would underflow.
+     * nothing left to tcp_recved() -- the subtraction below would underflow.
      * Unreachable today: recv_cb only appends both counters in lockstep and
      * every drain/last reconcile drops rxq_unrecved by the same amount, so
      * rxq_unrecved - rxq.len stays a non-negative "unacked" count. Guard is
@@ -281,7 +281,7 @@ static int bridge_output_parse(Netstack *ns, const struct pbuf *p,
     size_t ihl, thlen, tot;
 
     *has_payload = 0;
-    /* R21 (C2): we only need the IP+TCP header bytes, not all 80 — a sub-80B
+    /* R21 (C2): we only need the IP+TCP header bytes, not all 80 -- a sub-80B
      * DATA frame (e.g. 20B IP + 20B TCP + 20B payload) was previously
      * unparseable and got misclassified as CTL, bypassing the per-conn
      * fair-share cap. Copy up to 80 and verify against what each family
@@ -315,11 +315,11 @@ static int bridge_output_parse(Netstack *ns, const struct pbuf *p,
          * was an asymmetry with no basis in the wire format: the TCP
          * data-offset field is 4 bits (max thlen 60) for BOTH IP
          * versions, so a v6 SYN carrying >20B of options (thlen
-         * 44..60) is valid — rejecting it misclassified the SYN as
+         * 44..60) is valid -- rejecting it misclassified the SYN as
          * NS_TX_CONN_CTL and lost the per-conn fair-share accounting.
          * v6 has no ihl (fixed 40-byte header), so the v4 guard minus
          * ihl is "thlen > sizeof h", unreachable because a 4-bit
-         * offset caps thlen at 60 < 80 — i.e. the branch now accepts
+         * offset caps thlen at 60 < 80 -- i.e. the branch now accepts
          * the full valid thlen range exactly like v4. Safe: only the
          * base 20-byte TCP header is read here (ports at t[0..3],
          * data offset at t[12]) and got >= 60 guarantees those bytes;
@@ -367,7 +367,7 @@ static int bridge_output_parse(Netstack *ns, const struct pbuf *p,
     return -1;
 }
 
-/* frame one outbound IP packet (v4 or v6 — the tunnel treats the inner
+/* frame one outbound IP packet (v4 or v6 -- the tunnel treats the inner
  * payload as opaque) into a tx slot: [8B outer][inner IP]. */
 static err_t bridge_output_frame(Netstack *ns, struct pbuf *p)
 {
@@ -440,7 +440,7 @@ static err_t bridge_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p,
                          err_t err)
 {
     TcpConn *c = (TcpConn *)arg;
-    /* R07-FIX B-3 (LOW, defensive): stale callback — the slot was reused but
+    /* R07-FIX B-3 (LOW, defensive): stale callback -- the slot was reused but
      * the OLD pcb's recv still reached us. Free the pbuf we own before
      * returning, or it leaks. p may be NULL (that is lwIP's EOF marker, not a
      * buffer) in which case there is nothing to free. Unreachable today:
@@ -496,7 +496,7 @@ static void bridge_err(void *arg, err_t err)
     buf_free(&c->rxq);    /* discard undrained data, like native conn_clear */
     /* R07-FIX B-4 (LOW, invariant): keep rxq_unrecved in sync with the
      * conn_reconcile_rxq invariant (append adds, drain drops the same
-     * amount, reset to 0) — the rxq is being discarded wholesale here, so
+     * amount, reset to 0) -- the rxq is being discarded wholesale here, so
      * the outstanding unacknowledged count must go back to 0 too, or a
      * later reconcile on this slot's reused life could compute a bogus
      * tcp_recved() window. */
@@ -519,11 +519,11 @@ static err_t bridge_poll(void *arg, struct tcp_pcb *pcb)
 /* H4: every pcb must be gone from lwIP's global lists before a second
  * lwip_init() runs: tcp_init() only re-seeds the local port (the lists
  * survive) while memp_init() re-pools the very memory the pcbs occupy
- * — the next allocations alias the stale entries (list self-loop /
+ * -- the next allocations alias the stale entries (list self-loop /
  * state corruption). tcp_abort/tcp_close unlink each pcb and hand its
  * memory back to the pool; tcp_abort fires the err callback
  * (bridge_err clears the owning TcpConn slot while ns is still
- * intact). TIME-WAIT and LISTEN pcbs fire no callback — their slots
+ * intact). TIME-WAIT and LISTEN pcbs fire no callback -- their slots
  * are reset by the caller's memset. */
 static void ns_teardown_pcbs(void)
 {
@@ -545,14 +545,14 @@ bool ns_init(Netstack *ns, uint32_t inner_ip, uint32_t gw, uint16_t mtu)
     struct netif *old_netif = ns->netif;   /* save before the memset */
 
     /* H4: a live stack (re-auth, any session) may still have pcbs on
-     * lwIP's lists — tear them down before the memset + re-init. A
+     * lwIP's lists -- tear them down before the memset + re-init. A
      * first init finds an empty netif pointer and skips this. */
     if (old_netif != NULL) {
         ns_teardown_pcbs();
         /* FIND-F03-4: the teardown frees every pcb, but a TIME_WAIT
          * pcb's abort fires no err callback (lwIP frees TW without
-         * TCP_EVENT_ERR), so that slot's rxq — undrained trailing bytes
-         * from a graceful half-close — is never released by bridge_err.
+         * TCP_EVENT_ERR), so that slot's rxq -- undrained trailing bytes
+         * from a graceful half-close -- is never released by bridge_err.
          * Free every slot's rxq now; buf_free is idempotent, so slots
          * already released by bridge_err are safe. Without this the
          * memset below drops the pointers and each re-auth leaks them. */
@@ -575,8 +575,8 @@ bool ns_init(Netstack *ns, uint32_t inner_ip, uint32_t gw, uint16_t mtu)
 
     /* Single-source numeric parse (R38-A1-1): the hand-written
      * strtoul()+end-pointer block that used to live here accepted
-     * " 1000"/"+1000"/"\t1000", which env_scan_u64() — and therefore every
-     * other numeric setting in the tree — rejects as invalid (warning +
+     * " 1000"/"+1000"/"\t1000", which env_scan_u64() -- and therefore every
+     * other numeric setting in the tree -- rejects as invalid (warning +
      * default). allow_zero is deliberately 0: the documented floor is
      * 1000 ms, and letting an explicit "0" through would install a 0 ms
      * connect timeout, i.e. every inner TCP connect fails instantly. */
@@ -604,7 +604,7 @@ bool ns_init(Netstack *ns, uint32_t inner_ip, uint32_t gw, uint16_t mtu)
         oom_abort();
     ns->netif = n;
     if (netif_add(n, &ip, &mask, &g, ns, bridge_netif_init, ip4_input) == NULL) {
-        /* FIND-R19-F5: netif_add failure is NOT fatal-silent — free the
+        /* FIND-R19-F5: netif_add failure is NOT fatal-silent -- free the
          * half-configured netif, clear ns->netif and report so the caller
          * can fail startup / schedule a re-auth retry instead of leaving a
          * broken stack (receive_vpn would feed a dead netif to ip4_input). */
@@ -682,9 +682,9 @@ static int ns_flow_held(int idx)
     return g_flow_ref[idx] != 0;
 }
 
-/* R37 R1-A-9: lwIP frees a pcb *silently* in two places — tcp_alloc()'s
+/* R37 R1-A-9: lwIP frees a pcb *silently* in two places -- tcp_alloc()'s
  * tcp_kill_timewait() (MEMP_NUM_TCP_PCB exhausted) and tcp_slowtmr()'s
- * TIME_WAIT expiry — with no err callback, and tcp_alloc hands the very same
+ * TIME_WAIT expiry -- with no err callback, and tcp_alloc hands the very same
  * memp element to the pcb it is allocating. A TcpConn slot that still points
  * at the old pcb therefore (a) dangles and (b) can ALIAS an unrelated live
  * connection, so ns_tick's conn_reconcile_rxq() would tcp_recved() into the
@@ -849,7 +849,7 @@ fail:
      * pcb (c->pcb is not assigned until success). Nulling the arg first
      * would make bridge_err dereference a NULL conn (crash). Note the
      * pcb is FREED by tcp_abort (tcp_abandon -> tcp_free), so no
-     * tcp_arg(pcb, ...) is allowed after it — that would be a
+     * tcp_arg(pcb, ...) is allowed after it -- that would be a
      * use-after-free write into the returned memp (FIND-F03-2). */
     tcp_abort(pcb);   /* async bridge_err already ran; pcb now free */
     c->pcb = NULL;
@@ -934,7 +934,7 @@ int ns_send_reservev(Netstack *ns, int idx, struct iovec *iov, int maxn)
     if (c->state == NS_CLOSED || c->state == NS_FIN_WAIT)
         return 0;
     /* backpressure: cap the reserved space at the current snd_buf so that
-     * every ns_send_commit's tcp_write is guaranteed to succeed — otherwise
+     * every ns_send_commit's tcp_write is guaranteed to succeed -- otherwise
      * the readv bytes beyond snd_buf would be silently lost. */
     size_t avail = c->pcb->snd_buf;
     if (avail < NS_MSS)
@@ -1008,7 +1008,7 @@ void ns_close(Netstack *ns, int idx)
      * called when the LOCAL client EOFs its write side, and the peer may
      * still send its response afterwards. A full tcp_close() sets
      * TF_RXCLOSED, which makes lwIP ABORT (RST) on any data that arrives
-     * after our FIN — that would kill every half-closed request/response
+     * after our FIN -- that would kill every half-closed request/response
      * stream. tcp_shutdown(shut_rx=0, shut_tx=1) sends the FIN without
      * closing the receive side. */
     if (c->state == NS_ESTABLISHED) {
@@ -1033,7 +1033,7 @@ void ns_abort(Netstack *ns, int idx)
     tcp_abort(c->pcb);
     /* FIND-F03-5: tcp_abort on a TIME_WAIT pcb (tcp_abandon's TW branch,
      * tcp.c) frees the pcb WITHOUT firing the err callback, so bridge_err
-     * never runs and c->pcb would dangle — the next ns_tick could then
+     * never runs and c->pcb would dangle -- the next ns_tick could then
      * tcp_recved() a freed pcb via conn_reconcile_rxq (real UAF). Clear
      * the slot unconditionally: on a normal abort bridge_err already ran
      * synchronously (pcb==NULL, reap_pending=1) and this is a no-op; on
@@ -1041,7 +1041,7 @@ void ns_abort(Netstack *ns, int idx)
      * R07-FIX B-4 (LOW, invariant): this TW branch discards undelivered
      * downlink data, so it must also drop rxq and zero rxq_unrecved to match
      * bridge_err's semantics and the conn_reconcile_rxq invariant (append
-     * adds, drain drops the same amount, reset goes back to 0) — otherwise
+     * adds, drain drops the same amount, reset goes back to 0) -- otherwise
      * the slot's next life could reconcile a stale unacked count. */
     if (c->pcb != NULL) {
         c->pcb = NULL;
@@ -1177,7 +1177,7 @@ int ns_tick(Netstack *ns, uint64_t now)
         }
         /* half-closed (our FIN sent, local client gone): if the peer never
          * FINs back (keep-alive server, hung upstream), the pcb/slot/flow
-         * triple would hang forever — bound it like the connect timeout.
+         * triple would hang forever -- bound it like the connect timeout.
          * ns_abort unifies cleanup (see R2-1 ns_abort comment). */
         if (c->state == NS_FIN_WAIT &&
             now - c->state_ms > NS_FIN_WAIT_TIMEOUT) {
@@ -1185,7 +1185,7 @@ int ns_tick(Netstack *ns, uint64_t now)
             ns_abort(ns, i);
             continue;
         }
-        /* FIND-R2-3: graceful close, peer never ACKs our FIN — the pcb
+        /* FIND-R2-3: graceful close, peer never ACKs our FIN -- the pcb
          * parks in LAST_ACK where lwIP's RTO backoff could hold it for
          * minutes before freeing it. R2-2 deliberately does NOT abort a
          * graceful close (to avoid a gratuitous RST), so this timeout is

@@ -1,24 +1,24 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * 同一翻译单元里重复包含 iwan_win_abi.h：包含卫士必须挡住第二次定义。
+ * Including iwan_win_abi.h twice in the same translation unit: the include guard must block the second definition.
  *
- * 这个用例来自一次真实事故。给共享页加诊断区时，我把新块"追加到文件末尾"，
- * 而文件末行恰好是那个收尾的 `#endif`（后面跟一行注释 IWAN_WIN_ABI_H）——
- * 新块落在卫士之外，于是
- * 任何一个间接包含两次该头的翻译单元都会重新定义 IWAN_WIN_DIAG：
+ * This case comes from a real incident: when adding a diagnostic area to the shared
+ * page I "appended the new block to the end of the file", and the last line happened
+ * to be the closing #endif (followed by a comment IWAN_WIN_ABI_H) -- so the new block
+ * landed outside the guard, so any TU indirectly including the header twice redefined IWAN_WIN_DIAG:
  *
  *   iwan_win_abi.h(342,16): error C2011: '_IWAN_WIN_DIAG': 'struct' type redefinition
- *   iwan_win_abi.h(352,1): error C2338: static_assert failed: 'IWAN_WIN_DIAG 大小'
+ *   iwan_win_abi.h(352,1): error C2338: static_assert failed: 'IWAN_WIN_DIAG size'
  *
- * 第二个报错是假象：类型重定义之后 static_assert 的求值已不可信。
- * 用例本身的判据很窄也很硬——"重复包含不产生诊断"，不需要知道任何布局。
+ * The second error is an artifact: after the type redefinition, evaluating
+ * static_assert is unreliable. The criterion is narrow and strict -- "duplicate inclusion produces no diagnostics" -- and needs no layout knowledge.
  */
 #include "iwan_win_abi.h"
 #include "iwan_win_abi.h"
 
 int main(void)
 {
-	/* 顺带固定住诊断区的对外承诺：40 字节，且完全落在共享页内。 */
+	/* Also pin the diagnostic area's external contract: 40 bytes, fully inside the shared page. */
 	if (sizeof(IWAN_WIN_DIAG) != 40)
 		return 1;
 	if (IWAN_WIN_SHM_OFF_DIAG + sizeof(IWAN_WIN_DIAG) > 4096)

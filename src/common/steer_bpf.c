@@ -1,4 +1,4 @@
-/* steer_bpf.c — tun steering classifier (TUNSETSTEERINGEBPF).
+/* steer_bpf.c -- tun steering classifier (TUNSETSTEERINGEBPF).
  * Returns a flow hash for each inner IP packet; the kernel maps it to a
  * queue via ret % numqueues. Replaces the tun driver's automq flow
  * table, whose flow hash degenerates to a per-device constant here
@@ -23,7 +23,7 @@ int steer(struct __sk_buff *skb)
 
     /* Version gate: only IPv4 flows are steered. Parsing the 4-tuple at
      * IPv4 offsets (12/16/20/22) on IPv6 packets would hash them all to
-     * ~one queue — the exact degeneration this classifier replaces for
+     * ~one queue -- the exact degeneration this classifier replaces for
      * our fd00::/96-derived ULA traffic. Non-IPv4 (IPv6 etc.) returns 0
      * and lets the kernel distribute normally; we never drop data, only
      * (mis)balance. */
@@ -38,7 +38,7 @@ int steer(struct __sk_buff *skb)
      * queue 0. The offset assumes an optionless IPv4 header (IHL=5):
      * true for tun-device traffic (the kernel emits and accepts
      * optionless headers there), and a wrong queue choice on exotic
-     * input only misbalances the reader pool — it never drops data.
+     * input only misbalances the reader pool -- it never drops data.
      * Hash TCP too: the pool's whole point is spreading the dominant
      * inner-TCP load, not just the DNS/QUIC UDP fraction. */
     if (proto != 6 && proto != 17)

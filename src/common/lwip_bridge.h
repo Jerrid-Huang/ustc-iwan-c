@@ -143,7 +143,7 @@ void ns_rx_packet(Netstack *ns, const uint8_t *pkt, size_t n);
 /* Capacity of one zero-copy RX pool slot (lwip_bridge.c: NS_RX_POOL slots of
  * this size, inner-packet payload capacity NS_RX_SLOT - IWAN_HDR_LEN). The
  * VPN recv loop fills the acquired buffers directly, so its iov_len MUST be
- * this value — socks.c uses the macro and _Static_asserts its own RX_SLOT
+ * this value -- socks.c uses the macro and _Static_asserts its own RX_SLOT
  * against it instead of keeping a private copy that could drift. */
 #define NS_RX_SLOT 2048
 

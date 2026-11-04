@@ -1,17 +1,17 @@
 # CI matrix (all CMake now, no Makefile):
-#   linux-native — x86_64 native, gcc + clang, -Werror
-#   sanitize     — ASan+UBSan gcc build (no -Werror: sanitizer
+#   linux-native -- x86_64 native, gcc + clang, -Werror
+#   sanitize     -- ASan+UBSan gcc build (no -Werror: sanitizer
 #                  instrumentation trips known warnings; the grep gate
 #                  below still fails on any warning/error)
-#   linux-cross  — fully static musl binaries for every common Linux
+#   linux-cross  -- fully static musl binaries for every common Linux
 #                  arch (x86_64, i686, aarch64, armv7, riscv64, ppc64le,
 #                  s390x), qemu smoke where the arch is not runnable
-#   win-cross    — MinGW-w64 static exes for Windows x86_64 + i686,
+#   win-cross    -- MinGW-w64 static exes for Windows x86_64 + i686,
 #                  wine smoke + real wire test (x86_64)
-#   win-arm64    — Windows ARM64 via llvm-mingw (clang) + the prebuilt
+#   win-arm64    -- Windows ARM64 via llvm-mingw (clang) + the prebuilt
 #                  MSYS2 clangarm64 OpenSSL (no mingw-aarch64 Configure
 #                  target exists in OpenSSL 3.x)
-#   release      — tag-only: packages everything into per-arch archives
+#   release      -- tag-only: packages everything into per-arch archives
 #
 # The integration suite (tests/integration.sh) needs root + TUN devices
 # and therefore runs only locally, via sudo.
@@ -202,10 +202,13 @@ jobs:
         run: |
           python3 tests/socks_handshake.py
           python3 tests/socks_handshake.py --token review-token
-          # R48-L3: relay lockout regression harness (R47-FIXA-I1) — each
+          # R48-L3: relay lockout regression harness (R47-FIXA-I1) -- each
           # case in its own process (relay lockout table is file-static).
           # BUILD_TESTING=ON builds the relay_socks_harness binary.
           python3 tests/relay_socks_harness.py
+          # Panabit SD-WAN extension surface: fragment reassembly, SEGRT header,
+          # SR key derivation (incl. reference jhash/key vectors), 36-byte ECHO payload; pure logic, no root.
+          ./build-sanitize/sdwan_ext_test
 
       # Root-free data-plane test: the lwIP bridge uploads a pattern through
       # the readv/commit path against an in-process fake TCP peer and verifies
@@ -464,7 +467,7 @@ jobs:
           # wine32:i386, which needs the i386 architecture enabled; the
           # x86_64 exes run under the wine64 loader alone. Note the
           # wine64 package installs /usr/lib/wine/wine64 but no 'wine64'
-          # command — the smoke steps resolve the loader themselves.
+          # command -- the smoke steps resolve the loader themselves.
           # linux-libc-dev + clang are required by the wire-smoke step's
           # Linux rebuild (steer_bpf.c includes <linux/bpf.h>).
           sudo apt-get install -y ${{ matrix.mingw_pkg }} zstd wine64 clang linux-libc-dev
@@ -503,7 +506,7 @@ jobs:
       - name: Verify PE binaries (${{ matrix.arch }})
         run: |
           # static-link gate: the exes must not import OpenSSL or
-          # winpthread DLLs — they must run on a stock Windows.
+          # winpthread DLLs -- they must run on a stock Windows.
           # iwan-winsvc.exe (service front-end) shares iwan_core with the
           # classic client and is gated exactly the same way.
           for b in bin/iwan-client.exe bin/iwan-client-oidc.exe \
@@ -569,7 +572,7 @@ jobs:
       # Root-free SOCKS5 handshake suite against the Windows build: the
       # harness exe runs under the wine loader (wine's winsock shares
       # the host loopback), so the suite drives the real Windows
-      # accept/handshake/netstack code — same wire checks as the Linux
+      # accept/handshake/netstack code -- same wire checks as the Linux
       # sanitize job.
       - name: SOCKS5 handshake suite (wine, ${{ matrix.arch }})
         if: matrix.arch == 'x86_64'
@@ -690,9 +693,9 @@ jobs:
   # Both architectures on one runner type: as of 2026 GitHub's macos-14
   # label resolves to an Apple Silicon runner, so x86_64 is
   # cross-compiled. Each arch builds its own static no-shared OpenSSL
-  # from source (darwin64-<arch>-cc) — no Homebrew dependency, so the
+  # from source (darwin64-<arch>-cc) -- no Homebrew dependency, so the
   # release zips run on a stock macOS. Wire smoke is skipped: no
-  # iwan-server binary exists on macOS — the TUN/route paths (utun +
+  # iwan-server binary exists on macOS -- the TUN/route paths (utun +
   # ifconfig/route) need root and are validated on real Macs by users.
   macos:
     if: ${{ !inputs.only_win_cross }}
@@ -871,7 +874,7 @@ jobs:
           if-no-files-found: error
 
   # Publish a GitHub Release on tag pushes (v*): Linux binaries built
-  # here (deliberately NOT via needs: linux-native — the matrix job is
+  # here (deliberately NOT via needs: linux-native -- the matrix job is
   # cancelled as a unit whenever any matrix leg is preempted, which
   # would skip the release), musl + Windows binaries from the artifacts.
   # Trigger with:
@@ -947,14 +950,14 @@ jobs:
 
           # Windows static exes (win32/iwan-win32-<arch>/bin/*.exe).
           # Bundle the official wintun.dll per arch so the archive runs
-          # out of the box; pinned 0.14.1 (current upstream build) — bump
+          # out of the box; pinned 0.14.1 (current upstream build) -- bump
           # deliberately, not by drift. Redistribution is permitted by
           # the wintun license; WINTUN.txt documents it.
           curl -sL --retry 3 --max-time 300 \
             "https://www.wintun.net/builds/wintun-0.14.1.zip" \
             -o /tmp/wintun.zip
           mkdir -p /tmp/wintun && cd /tmp/wintun && unzip -oq /tmp/wintun.zip
-          # zip 布局：顶层 wintun/ 目录 -> wintun/bin/<arch>/wintun.dll
+          # zip layout: top-level wintun/ dir -> wintun/bin/<arch>/wintun.dll
           [ -f wintun/bin/amd64/wintun.dll ] && \
             [ -f wintun/bin/x86/wintun.dll ] && \
             [ -f wintun/bin/arm64/wintun.dll ]

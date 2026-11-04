@@ -1,4 +1,4 @@
-/* wintun_pin.h — SHA-256 pin for the bundled wintun.dll (Windows only)
+/* wintun_pin.h -- SHA-256 pin for the bundled wintun.dll (Windows only)
  *
  * Both the loader (tun_win.c) and the auto-fetcher (wintun_fetch.c)
  * must only accept the exact official wintun build we ship. Generic
@@ -39,7 +39,7 @@ bool wintun_pin_ok_a(const char *path);
  * dependency-import resolution hardened against CWD/PATH DLL planting.
  * The module is passed by absolute path, but without loader flags its own
  * import dependencies would resolve through the standard search order
- * (current directory → PATH), letting a hostile same-named DLL dropped
+ * (current directory -> PATH), letting a hostile same-named DLL dropped
  * in the CWD load into this process at the pinned module's privilege.
  *
  * tun_win.c must call this instead of plain LoadLibraryW AFTER both

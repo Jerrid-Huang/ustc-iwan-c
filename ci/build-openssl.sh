@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ci/build-openssl.sh — build a static (no-shared) OpenSSL for a native or
+# ci/build-openssl.sh -- build a static (no-shared) OpenSSL for a native or
 # cross target. Used by CI for every architecture; also handy locally.
 #
 # usage: ci/build-openssl.sh <Configure-target> <cross-prefix> <prefix> [extra Configure args...]

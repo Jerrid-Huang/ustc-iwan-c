@@ -4,7 +4,7 @@
 #include <stdbool.h>
 
 /* POST a request body via `openssl s_client` (the payload is a bare
- * string; the _json suffix historically lied — JSON handling lives in
+ * string; the _json suffix historically lied -- JSON handling lives in
  * json.c at the call sites). Returns true on HTTP round-trip.
  *
  * Guarantees on return: *body_out is ALWAYS assigned (malloc'd, caller

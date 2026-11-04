@@ -1,56 +1,56 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * iWAN 单向容量发生器 —— 内层跑 tcp / udp / 裸 IP（IP 协议号 253）
+ * iWAN unidirectional capacity generator -- inner runs tcp / udp / raw IP (IP protocol 253)
  *
- * 用法：
+ * Usage:
  *   bench_proto send --proto tcp|udp|raw --target A.B.C.D --port P
  *                    [--size N] [--duration S] [--threads K]
  *   bench_proto recv --proto tcp|udp|raw --bind A.B.C.D --port P
  *                    [--duration S] [--threads K] [--idle-ms M]
  *
- * --size 的口径（三种协议不一样，默认值见下）：
- *   udp = UDP 净荷，默认 1200，上限 65507（IPv4 总长 65535 减 20B IP 头
- *         与 8B UDP 头；与 src/common/protocol.h 的 IWAN_UDP_GSO_UNIT 同值）；
- *   raw = **整包**长度（含 20 字节 IP 头），默认 1200，上限 65535 ⇒ 负载
- *         上限 65515。tests/bench_proto.sh 里 SIZE_RAW=1220 就是按这个口径
- *         （整包 1220 / 负载 1200）传的；
- *   tcp = 每次写的块，默认 65536，不设上限（内核按 MSS 切）。
- * 内层 MTU 上限 65499（src/common/protocol.h 的 IWAN_MTU_MAX）⇒ udp 净荷超过
- * 65471、raw 整包超过 65499 时内层会分片，量到的是分片路径而不是单个大包。
+ * Meaning of --size (differs per protocol; defaults below):
+ *   udp = UDP payload, default 1200, max 65507 (IPv4 total 65535 minus 20B IP header
+ *         and 8B UDP header; same value as IWAN_UDP_GSO_UNIT in src/common/protocol.h);
+ *   raw = **whole packet** length (including the 20-byte IP header), default 1200, max 65535 => payload
+ *         max 65515. SIZE_RAW=1220 in tests/bench_proto.sh uses exactly this convention
+ *         (whole packet 1220 / payload 1200);
+ *   tcp = bytes per write, default 65536, no limit (kernel splits by MSS).
+ * Inner MTU max is 65499 (IWAN_MTU_MAX in src/common/protocol.h) => udp payload above
+ * 65471, or raw whole packet above 65499, gets fragmented in the inner layer; you then measure the fragment path, not a single big packet.
  *
- * 输出（stdout，机器可解析，由 tests/bench_proto.sh 汇总成表）：
+ * Output (stdout, machine-parsable, summarized into a table by tests/bench_proto.sh):
  *   READY  proto=<p> role=recv addr=<ip>:<port> rcvbuf=<n> threads=<k>
  *   RESULT proto=<p> role=send bytes=<> pkts=<> secs=<> gbps=<> pps=<> errs=<> threads=<> size=<>
  *   RESULT proto=<p> role=recv bytes=<> pkts=<> secs=<> gbps=<> pps=<> bad=<>
  *          conns=<> idle=<0|1> remote=<ip> chg=<n> maxsize=<>
  *
- *   size/maxsize 是负载口径（都放在行尾，既有字段与顺序不动）：send 的 size
- *   是**每包发出去的负载**（raw 已减掉 20B IP 头，tcp 是写块）；recv 的
- *   maxsize 是收到的最大单包净荷（tcp 是单次 recv 读到的最多字节数）——
- *   收包缓冲区一旦装不下，内核会静默截断并少算字节数，maxsize 会明显偏小，
- *   这是从日志核对"大包真的到了"的证据。
+ *   size/maxsize use the payload convention (kept at end of line; existing fields and order unchanged): send's size
+ *   is the **payload sent per packet** (raw already excludes the 20B IP header; tcp is bytes per write); recv's
+ *   maxsize is the largest single-packet payload received (tcp: most bytes read by one recv) --
+ *   if the receive buffer cannot hold a packet, the kernel silently truncates and undercounts bytes, and maxsize becomes clearly too small;
+ *   that is the log evidence for checking "the big packet really arrived".
  *
- *   remote/chg 是"识破绕过"用的：收到的第一个远端地址（UDP/raw = 包的源地址，
- *   TCP = 连接对端）以及它变化的次数。内层流量若没进隧道、从 veth 直穿，
- *   这里会写成 172.31.201.x 之类而不是隧道地址。
+ *   remote/chg detect bypass: the first remote address received (UDP/raw = packet source address,
+ *   TCP = connection peer) and how many times it changed. If inner traffic bypasses the tunnel and crosses the veth directly,
+ *   this is recorded as 172.31.201.x or similar instead of the tunnel address.
  *
- * 另有自检入口（不需要权限）：bench_proto selftest —— 核对 raw 档拼出来的
- * IP 头（含校验和自校验）与 --size 上限的大包（长度/铺满/缓冲区容量）。
+ * There is also a self-test entry (no privileges needed): bench_proto selftest -- checks the raw-mode
+ * IP header it builds (including checksum self-check) and the --size-limit big packet (length/fill/buffer capacity).
  *
- * 语义（为什么这样测）：
- *   · 单向饱和：发送侧用**阻塞** socket，内核背压 ⇒ 计数就是"链路实际接受的量"，
- *     不会出现"发了 100 Gbps、收到 2 Gbps"的假象；丢包体现在收发计数之差上。
- *   · goodput 的 secs 用接收侧"末包 - 首包"，不是进程运行时间也不含建链/启动时间；
- *     pps 同窗口。基线（lo 直连）与隧道（TUN）用同一把尺，才好比。
- *   · raw 档：IP 头里 src/id/校验和留 0 交给内核按路由代填（Linux raw_send_hdrinc
- *     的行为；id 只有为 0 时才会被 ip_select_ident() 代填），负载以 8 字节魔术
- *     开头，接收侧逐包校验并统计 bad —— 一旦收到别家流量会立刻暴露，而不是被
- *     算进数字里。
- *   · 接收侧收到过包后空闲 idle-ms（默认 700ms）即结束：尾部在途包仍会被计入，
- *     两边不需要严格对表。
+ * Semantics (why measured this way):
+ *   - Unidirectional saturation: the sender uses a **blocking** socket, so kernel backpressure => counts are "what the link actually accepted";
+ *     no illusion of "sent 100 Gbps, received 2 Gbps"; loss shows up as the tx/rx counter difference.
+ *   - goodput secs use receiver-side "last packet - first packet", not process runtime, excluding connection setup/startup;
+ *     pps uses the same window. Baseline (direct lo) and tunnel (TUN) use the same ruler, so they compare fairly.
+ *   - raw mode: src/id/checksum in the IP header are left 0 for the kernel to fill from the route (Linux raw_send_hdrinc
+ *     behavior; id is filled by ip_select_ident() only when 0), payload starts with an 8-byte magic
+ *     prefix, and the receiver validates every packet and counts bad -- foreign traffic is exposed immediately instead of being
+ *     counted in the numbers.
+ *   - Receiver ends after idle-ms with no packets (default 700ms): packets still in flight at the tail are counted,
+ *     so the two sides need no exact handshake.
  *
- * 注意：_GNU_SOURCE 由 CMakeLists.txt:179 统一定义，本文件不要再定义一次
- * （clang 在 -Werror 下会报 -Wmacro-redefined）。
+ * Note: _GNU_SOURCE is defined centrally by CMakeLists.txt:179; do not define it again in this file
+ * (clang reports -Wmacro-redefined under -Werror).
  */
 #include <arpa/inet.h>
 #include <errno.h>
@@ -72,30 +72,30 @@
 #define MAX_THREADS 64
 #define MAGIC_LEN 8
 /*
- * --size 的两条硬上限（口径见文件头）。取协议上限而不是"内层 MTU 该有多少"：
- * 超了必须报错退出，不能靠内核回 EMSGSIZE、更不能静默截断。
+ * Two hard --size limits (see file header). Use protocol limits, not "what inner MTU should be":
+ * exceeding them must fail loudly, not rely on kernel EMSGSIZE and certainly not silently truncate.
  */
-#define MAX_UDP_SIZE 65507      /* UDP 净荷：65535 - 20(IP) - 8(UDP) */
-#define MAX_RAW_SIZE 65535      /* raw 整包：IPv4 总长字段的硬上限 */
+#define MAX_UDP_SIZE 65507      /* UDP payload: 65535 - 20(IP) - 8(UDP) */
+#define MAX_RAW_SIZE 65535      /* raw whole packet: hard limit of the IPv4 total-length field */
 /*
- * 收包缓冲区按上面两条里最大的那条开（raw 收上来的整包）。原来这里是 1400
- * （按"内层 MTU 1400"定的），大 MTU 下 recvfrom 会**静默截断**：缓冲区小于
- * 对端报文时内核只拷 buf 那么多并原样返回长度，bad 不涨、看着无损，字节数
- * 却少算 —— 比报错难查得多。也不放栈上：64 个读线程 × 64KiB 会撑爆栈；
- * 每读线程 malloc 一份（dgram_reader）。
+ * Receive buffer is sized by the larger of the two limits (the raw whole packet). It used to be 1400
+ * (based on "inner MTU 1400"); with a big MTU, recvfrom **silently truncates**: when the buffer is smaller than
+ * the peer packet, the kernel copies only buf bytes and returns that length; bad does not grow, it looks lossless, but byte counts
+ * are undercounted -- far harder to diagnose than an error. Do not put it on the stack: 64 reader threads x 64KiB would blow the stack;
+ * each reader thread mallocs its own (dgram_reader).
  */
 #define DGRAM_BUF 65535
 static const char MAGIC[MAGIC_LEN] = { 'I', 'W', 'A', 'N', 'B', 'N', 'C', 'H' };
 
 struct cfg {
     const char *proto;
-    const char *ip;         /* send: 目的地址; recv: 绑定地址 */
+    const char *ip;         /* send: destination; recv: bind address */
     int port;
-    int size;               /* --size: udp=UDP 净荷; raw=整包（含 20B IP 头）;
-                             * tcp=每次写多少。口径见文件头 */
-    int duration;           /* 打流秒数 */
-    int threads;            /* tcp: 连接数; udp/raw: 并发发送线程数 */
-    int idle_ms;            /* recv: 空闲多久算结束 */
+    int size;               /* --size: udp=UDP payload; raw=whole packet (incl. 20B IP header);
+                             * tcp=bytes per write. See file header. */
+    int duration;           /* run duration in seconds */
+    int threads;            /* tcp: connections; udp/raw: concurrent sender threads */
+    int idle_ms;            /* recv: idle time before finishing */
 };
 
 struct result {
@@ -104,32 +104,32 @@ struct result {
     atomic_ullong errs;
     atomic_ullong bad;
     atomic_ullong conns;
-    atomic_llong first_ms;  /* recv: 首包时刻（自 CLOCK_MONOTONIC 起的毫秒） */
-    atomic_llong last_ms;   /* recv: 末包时刻 */
-    /* recv: 收到的第一个远端地址（网络序，0=还没收到）与它变化的次数。
-     * UDP/raw 是包的源地址，TCP 是连接的对端地址。它的用处是**识破绕过**：
-     * 内层流量若没进隧道而从 veth 直穿，这里会写成 172.31.201.2 之类，
-     * 而不是隧道地址 —— 比只看字节数可靠。 */
+    atomic_llong first_ms;  /* recv: first-packet time (ms since CLOCK_MONOTONIC) */
+    atomic_llong last_ms;   /* recv: last-packet time */
+    /* recv: first remote address received (network order, 0 = none yet) and change count.
+     * UDP/raw: packet source address; TCP: connection peer. Its purpose is **bypass detection**:
+     * if inner traffic bypasses the tunnel and crosses the veth directly, this is 172.31.201.2 or similar,
+     * not the tunnel address -- more reliable than bytes alone. */
     atomic_uint remote_first;
     atomic_ullong remote_chg;
-    /* recv: 收到的最大单包净荷（raw 已减 20B IP 头）。它只有一个用处：
-     * 缓冲区装不下时内核会静默截断，这个数会卡在缓冲区大小上，日志里一眼
-     * 能看出"报的大包其实只收到 1400"。 */
+    /* recv: largest single-packet payload received (raw excludes 20B IP header). Used only to:
+     * reveal silent truncation when the buffer is too small: the value sticks at buffer size, and logs
+     * immediately show "the claimed big packet was really only 1400". */
     atomic_ullong max_payload;
 };
 
 struct worker {
     const struct cfg *c;
     struct result *r;
-    struct sockaddr_in dst; /* send 用 */
-    int fd;                 /* tcp recv 用（accept 到的连接） */
+    struct sockaddr_in dst; /* send only */
+    int fd;                 /* tcp recv (accepted connection) */
 };
 
 /*
- * g_deadline 是普通 double，靠两条 happens-before 边保证安全：
- *   send: 主线程先写 g_deadline，再 release 写 g_go，工作线程 acquire 读 g_go；
- *   recv: 主线程先写 g_deadline，再 pthread_create，工作线程由创建获得可见性。
- * 之后所有线程只读，故不需要原子类型。
+ * g_deadline is a plain double; two happens-before edges make it safe:
+ *   send: main thread writes g_deadline, then release-writes g_go; workers acquire-read g_go;
+ *   recv: main thread writes g_deadline, then pthread_create; creation gives workers visibility.
+ * Afterwards all threads only read it, so no atomic type is needed.
  */
 static atomic_bool g_go;
 static atomic_bool g_stop;
@@ -165,7 +165,7 @@ static void die_errno(const char *what)
     exit(2);
 }
 
-/* 收包侧的窗口记账：只在真正读到数据时更新，空转不会把首包时刻提前。 */
+/* Receive-side window accounting: updated only on real data, so spinning cannot move first-packet time earlier. */
 static void recv_stamp(struct result *r, unsigned long long bytes)
 {
     long long t = now_ms();
@@ -176,28 +176,28 @@ static void recv_stamp(struct result *r, unsigned long long bytes)
     atomic_store_explicit(&r->last_ms, t, memory_order_relaxed);
     atomic_fetch_add_explicit(&r->bytes, bytes, memory_order_relaxed);
     atomic_fetch_add_explicit(&r->pkts, 1, memory_order_relaxed);
-    /* 最大单包净荷（单调不减）：必须 load + CAS，直接 store 会让晚到的较小
-     * 值把大值盖掉，看起来就像"没收到过大包"。 */
+    /* Max single-packet payload (monotonic): must load + CAS; a direct store lets a late smaller
+     * value overwrite the big one, looking like "no big packet was received". */
     prev = atomic_load_explicit(&r->max_payload, memory_order_relaxed);
     while (bytes > prev &&
            !atomic_compare_exchange_weak_explicit(&r->max_payload, &prev, bytes,
                                                   memory_order_relaxed,
                                                   memory_order_relaxed))
-        ;                               /* prev 已被刷成当前值，重比 */
+        ;                               /* prev was refreshed to current; retry compare */
 }
 
 static void fill_payload(unsigned char *buf, int size, unsigned long long seq)
 {
     memset(buf, 0x5a, (size_t)size);
     memcpy(buf, MAGIC, MAGIC_LEN);
-    /* 大端序号：将来排查乱序/重复时直接用 */
+    /* Big-endian sequence number: directly usable when debugging reorder/duplicates */
     for (int i = 0; i < 8; i++)
         buf[MAGIC_LEN + i] = (unsigned char)((seq >> (56 - 8 * i)) & 0xff);
 }
 
-/* 等 fd 可读/可写，最多 200ms。返回 false 就是超时或被打断，调用方回循环头
- * 重新看截止时间 —— 所有热循环都必须经过这里，绝不能出现"无限期阻塞在某次
- * 系统调用里"的路径（对端被 SIGKILL 时那种路径会让整个基准挂死）。 */
+/* Wait for fd readable/writable, at most 200ms. false means timeout or interruption; caller returns to loop head
+ * and rechecks the deadline -- every hot loop must go through here; never allow "block indefinitely in a
+ * syscall" paths (such a path hangs the whole benchmark when the peer is SIGKILLed). */
 static bool wait_fd(int fd, short events)
 {
     struct pollfd p = { .fd = fd, .events = events, .revents = 0 };
@@ -210,7 +210,7 @@ static int raw_socket(int type)
     int fd = socket(AF_INET, type, RAW_PROTO);
 
     if (fd < 0 && (errno == EPERM || errno == EACCES))
-        die("raw socket 需要 root 或 CAP_NET_RAW（IP 协议号 253）");
+        die("raw socket requires root or CAP_NET_RAW (IP protocol 253)");
     if (fd < 0)
         die_errno("socket(SOCK_RAW)");
     return fd;
@@ -222,19 +222,19 @@ static void resolve(const char *ip, int port, struct sockaddr_in *out)
     out->sin_family = AF_INET;
     out->sin_port = htons((uint16_t)port);
     if (inet_pton(AF_INET, ip, &out->sin_addr) != 1) {
-        fprintf(stderr, "error: 不是合法 IPv4 地址: %s\n", ip);
+        fprintf(stderr, "error: not a valid IPv4 address: %s\n", ip);
         exit(2);
     }
 }
 
 /*
- * 逐字节按网络序装配 16 位字来求和。
+ * Sum byte by byte, assembling 16-bit words in network order.
  *
- * 不要"优化"成把缓冲区当 uint16_t* 读：那与前面经 struct iphdr * 的写构成
- * 严格别名违规，-O2 下 gcc 会把读提到写之前。实测（selftest 抓到的）：算出来
- * 的校验和少算了 daddr，写进包里是 0xb1f1 而正确值是 0x9fde，每个包都会在
- * 对端被丢。逐字节读的类型是 unsigned char，可以和任何类型别名，编译器必须
- * 守住顺序。
+ * Do not "optimize" this into reading the buffer as uint16_t*: that violates strict aliasing with the earlier write via struct iphdr *
+ * and under -O2 gcc hoists the read before the write. Measured (caught by selftest): the computed
+ * checksum omitted daddr, wrote 0xb1f1 instead of the correct 0x9fde, and every packet was
+ * dropped by the peer. Byte reads use unsigned char, which may alias anything, so the compiler must
+ * preserve order.
  */
 static uint32_t sum_net16(const void *p, int bytes)
 {
@@ -248,17 +248,17 @@ static uint32_t sum_net16(const void *p, int bytes)
     return sum;
 }
 
-/* 返回值转成主机序，直接赋给 iph->check；写进内存的字节就是网络序校验和 */
+/* Return value is host order, assigned directly to iph->check; bytes in memory are the network-order checksum */
 static uint16_t ip_checksum(const void *p, int bytes)
 {
     return ntohs((uint16_t)~sum_net16(p, bytes));
 }
 
 /*
- * IP_HDRINCL 下内核**不会**替我们填源地址：头里写 0 的包在 lo 上会被当
- * martian 源丢掉，实测表现是"发送侧 7 Gbps、接收侧一个包都没有"。
- * 用一次 UDP connect 借内核做路由查找，再 getsockname 拿源地址 ——
- * connect 只查路由不发包，所以不需要对端存在。
+ * With IP_HDRINCL the kernel does **not** fill the source address: packets with 0 in the header are treated on lo
+ * as martian-source and dropped; measured symptom: "sender 7 Gbps, receiver zero packets".
+ * Use one UDP connect to borrow the kernel's route lookup, then getsockname to get the source address --
+ * connect only looks up the route and sends nothing, so the peer need not exist.
  */
 static struct in_addr resolve_src(const struct sockaddr_in *dst)
 {
@@ -270,7 +270,7 @@ static struct in_addr resolve_src(const struct sockaddr_in *dst)
         die_errno("socket(SOCK_DGRAM)");
     if (connect(fd, (const struct sockaddr *)dst, sizeof *dst) != 0) {
         close(fd);
-        die_errno("raw 档查源地址失败（目标没有路由？）");
+        die_errno("raw mode source-address lookup failed (no route to target?)");
     }
     memset(&me, 0, sizeof me);
     if (getsockname(fd, (struct sockaddr *)&me, &sl) != 0) {
@@ -281,7 +281,7 @@ static struct in_addr resolve_src(const struct sockaddr_in *dst)
     return me.sin_addr;
 }
 
-/* 拼一个裸 IPv4 包（20 字节头 + 负载）。src/id/校验和都显式填，不依赖内核。 */
+/* Build a raw IPv4 packet (20-byte header + payload). src/id/checksum filled explicitly, not relying on the kernel. */
 static void build_raw_ipv4(unsigned char *buf, int size, unsigned long long seq,
                            struct in_addr src, struct in_addr dst)
 {
@@ -304,7 +304,7 @@ static void build_raw_ipv4(unsigned char *buf, int size, unsigned long long seq,
     ip->check = ip_checksum(buf, (int)sizeof *ip);
 }
 
-/* 记录/比较首个远端地址（多个读线程共用，用原子存网络序整数避免字符串竞争） */
+/* Record/compare first remote address (shared by readers; atomic network-order int avoids string races) */
 static void note_remote(struct result *r, const struct sockaddr_in *peer)
 {
     unsigned int a = peer->sin_addr.s_addr;
@@ -318,7 +318,7 @@ static void note_remote(struct result *r, const struct sockaddr_in *peer)
 }
 
 
-/* ---------------------------------------------------------------- 发送侧 */
+/* ---------------------------------------------------------------- sender side */
 
 static void *send_tcp(void *arg)
 {
@@ -331,28 +331,28 @@ static void *send_tcp(void *arg)
     if (fd < 0)
         die_errno("socket(SOCK_STREAM)");
     if (connect(fd, (const struct sockaddr *)&w->dst, sizeof w->dst) != 0)
-        die_errno("connect（对端没在监听？）");
+        die_errno("connect (peer not listening?)");
     buf = malloc((size_t)c->size);
     if (buf == NULL)
-        die("malloc 失败");
+        die("malloc failed");
 
     atomic_fetch_add_explicit(&g_workers_ready, 1, memory_order_release);
     while (!atomic_load_explicit(&g_go, memory_order_acquire))
-        usleep(200);                        /* 等主线程统一发令 */
+        usleep(200);                        /* wait for the main thread's start signal */
 
     while (now_s() < g_deadline) {
         ssize_t n;
 
         fill_payload(buf, c->size, seq++);
-        /* 阻塞式 send 在对端不读时会永远停在系统调用里（绕过截止时间），
-         * 所以走"等可写 + MSG_DONTWAIT"；背压语义不变：缓冲满就等。 */
+        /* A blocking send stays in the syscall forever when the peer does not read (bypassing the deadline),
+         * so use "wait writable + MSG_DONTWAIT"; backpressure semantics unchanged: wait when the buffer is full. */
         if (!wait_fd(fd, POLLOUT))
             continue;
         n = send(fd, buf, (size_t)c->size, MSG_NOSIGNAL | MSG_DONTWAIT);
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
             continue;
         if (n <= 0) {
-            /* 连接已死：继续打没有意义，把错误留给汇总侧判断 */
+            /* Connection is dead: flooding on is pointless; leave the error for the summary side to judge */
             atomic_fetch_add_explicit(&w->r->errs, 1, memory_order_relaxed);
             break;
         }
@@ -385,7 +385,7 @@ static void *send_dgram(void *arg)
 
     buf = calloc(1, (size_t)c->size);
     if (buf == NULL)
-        die("calloc 失败");
+        die("calloc failed");
     payload = raw ? c->size - (int)sizeof(struct iphdr) : c->size;
     if (raw)
         src = resolve_src(&w->dst);
@@ -408,13 +408,13 @@ static void *send_dgram(void *arg)
                    (const struct sockaddr *)&w->dst, sizeof w->dst);
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK)
-                continue;               /* 缓冲满：不是错误，是背压 */
-            /* 无连接协议：单次失败（路由/ICMP 端口不可达）不该终止整轮 */
+                continue;               /* buffer full: not an error, backpressure */
+            /* Connectionless protocol: a single failure (route/ICMP port unreachable) must not end the run */
             unsigned long long e = atomic_fetch_add_explicit(
                 &w->r->errs, 1, memory_order_relaxed) + 1;
 
             if (e > 10000)
-                break;                  /* 一直失败就别热转了 */
+                break;                  /* stop spinning if it keeps failing */
             usleep(1000);
             continue;
         }
@@ -427,12 +427,12 @@ static void *send_dgram(void *arg)
     return NULL;
 }
 
-/* ---------------------------------------------------------------- 接收侧 */
+/* ---------------------------------------------------------------- receiver side */
 
 /*
- * 裸 IP 的收包缓冲区**含 20 字节 IP 头**（raw socket 一贯如此），魔术前缀在
- * 它后面。不跳过这段的话每个包都会被记成坏包、字节数恒为 0，症状和"根本没
- * 通"一模一样。非 root 跑不了 raw，所以这条只能靠读代码 + selftest 拦住。
+ * Raw IP receive buffers **include the 20-byte IP header** (always true for raw sockets); the magic prefix is
+ * after it. Without skipping it, every packet is marked bad and bytes stay 0, with the same symptom as "totally
+ * broken". Non-root cannot run raw, so this can only be caught by code review + selftest.
  */
 static bool payload_ok(const unsigned char *buf, ssize_t n, bool raw)
 {
@@ -450,35 +450,35 @@ static bool payload_ok(const unsigned char *buf, ssize_t n, bool raw)
 }
 
 /*
- * 数据报接收的读线程：多个线程共用同一个 fd（内核按包唤醒其中一个，
- * 每个包只会被读走一次）。所以 recv 拿到 EAGAIN 是**正常竞争**，必须继续，
- * 不能当成错误退出 —— 否则 K 个读线程会在第一个包上互相把对方踢掉。
+ * Datagram receive reader: multiple threads share one fd (the kernel wakes one per packet,
+ * each packet is consumed once). So recv getting EAGAIN is **normal contention** and must continue,
+ * not exit as an error -- otherwise K readers kick each other out on the first packet.
  */
 static void *dgram_reader(void *arg)
 {
     struct worker *w = arg;
-    /* 每读线程一份，按协议上限开（大 MTU 下 --size 可以给到 65471+） */
+    /* One per reader, sized to the protocol max (--size can reach 65471+ with a big MTU) */
     unsigned char *buf = malloc(DGRAM_BUF);
-    /* 裸 IP 报的是**负载**字节数（与 udp/tcp 一致），所以要减掉 IP 头 */
+    /* Raw IP reports **payload** bytes (consistent with udp/tcp), so subtract the IP header */
     const ssize_t off =
         (strcmp(w->c->proto, "raw") == 0) ? (ssize_t)sizeof(struct iphdr) : 0;
 
     if (buf == NULL)
-        die("malloc 失败");
+        die("malloc failed");
     while (!atomic_load_explicit(&g_stop, memory_order_relaxed) &&
            now_s() < g_deadline) {
         struct pollfd p = { .fd = w->fd, .events = POLLIN, .revents = 0 };
         ssize_t n;
 
-        /* 必须带超时地等：直接阻塞在 recv 上时，空闲判定置位的 g_stop
-         * 要等到硬上限才生效，收场会白等 5 秒（看起来像假死）。 */
+        /* Must wait with timeout: when blocked directly in recv, g_stop set by the idle decision
+         * only takes effect at the hard limit, wasting 5 seconds at shutdown (looks like a hang). */
         if (poll(&p, 1, 200) <= 0)
             continue;
-        /* MSG_DONTWAIT 是必需的，不是优化：K 个读线程共用同一个 fd 时，
-         * poll 报可读后可能被别的线程先一步把包取走。fd 是阻塞的话，输掉
-         * 这一手的线程会**永久**停在 recv 里（EAGAIN 分支根本没机会执行），
-         * 收尾时的 pthread_join 就卡死了 —— 实测卡了 300 秒以上。
-         * 带上 MSG_DONTWAIT，输家立刻拿到 EAGAIN 并回到循环头。 */
+        /* MSG_DONTWAIT is required, not an optimization: with K readers sharing one fd,
+         * after poll reports readable another thread may grab the packet first. If the fd blocks, the loser
+         * stays in recv **forever** (the EAGAIN branch never runs),
+         * and pthread_join at shutdown hangs -- measured hangs over 300 seconds.
+         * With MSG_DONTWAIT the loser immediately gets EAGAIN and returns to the loop head. */
         {
             struct sockaddr_in peer;
             socklen_t pl = (socklen_t)sizeof peer;
@@ -519,27 +519,27 @@ static void *recv_dgram(void *arg)
     if (fd < 0)
         die_errno("socket(SOCK_DGRAM)");
     (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof rcvbuf);
-    /* raw 档**不要**绑端口：raw socket 的 bind 端口会变成收包过滤条件
-     * （比对包里的前 4 个字节），而裸 IP 没有端口概念 ⇒ 一个包都收不到。
-     * 非 root 跑不了 raw，所以这个坑只能在真机上踩到，必须写清楚。 */
+    /* raw mode must **not** bind a port: a raw socket's bind port becomes a receive filter
+     * (compares the first 4 bytes of the packet), and raw IP has no port concept => zero packets received.
+     * Non-root cannot run raw, so this pitfall only appears on a real host; document it clearly. */
     resolve(c->ip, raw ? 0 : c->port, &me);
     if (bind(fd, (const struct sockaddr *)&me, sizeof me) != 0)
-        die_errno("bind（端口被占？）");
+        die_errno("bind (port already in use?)");
     (void)getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &got, &sl);
     printf("READY proto=%s role=recv addr=%s:%d rcvbuf=%d threads=%d\n", c->proto,
            c->ip, raw ? 0 : c->port, got, c->threads);
     fflush(stdout);
 
-    /* 多读线程不是奢侈：单线程 recv 的天花板约 1.1 Mpps，在 lo 上打 1200 字节
-     * 就会先于链路饱和（实测单线程 3.58 Gbps 无损，4 线程发送时接收侧掉 29%
-     * —— 那是"接收侧收不过来"，不是链路丢包，会被误读）。 */
+    /* Multiple readers are not a luxury: single-thread recv tops out near 1.1 Mpps; on lo with 1200-byte
+     * packets it saturates before the link (measured: single thread 3.58 Gbps lossless; with 4 sender threads rx drops 29%
+     * -- that is "receiver cannot keep up", not link loss, and is easily misread). */
     n = c->threads < 1 ? 1 : c->threads;
     for (int i = 0; i < n; i++) {
         ws[i].c = c;
         ws[i].r = w->r;
         ws[i].fd = fd;
         if (pthread_create(&th[i], NULL, dgram_reader, &ws[i]) != 0)
-            die("pthread_create 失败");
+            die("pthread_create failed");
     }
     for (int i = 0; i < n; i++)
         pthread_join(th[i], NULL);
@@ -553,16 +553,16 @@ static void *recv_one_tcp(void *arg)
     unsigned char *buf = malloc(1 << 20);
 
     if (buf == NULL)
-        die("malloc 失败");
+        die("malloc failed");
     while (!atomic_load_explicit(&g_stop, memory_order_relaxed)) {
         struct pollfd p = { .fd = w->fd, .events = POLLIN, .revents = 0 };
         ssize_t n;
 
-        /* 同 recv_dgram：带超时地等，g_stop 一到就散 */
+        /* Like recv_dgram: wait with timeout; leave as soon as g_stop is set */
         if (poll(&p, 1, 200) <= 0)
             continue;
-        /* 同样带 MSG_DONTWAIT：连接被对端 RST、或对端被 SIGKILL 后不再发数据
-         * 时，阻塞的 recv 会越过 g_stop 永远停住，收尾的 join 就挂死。 */
+        /* Also MSG_DONTWAIT: when the peer RSTs the connection or stops sending after SIGKILL,
+         * a blocking recv passes g_stop and stays forever, hanging the join at shutdown. */
         n = recv(w->fd, buf, 1 << 20, MSG_DONTWAIT);
         if (n < 0) {
             if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
@@ -570,7 +570,7 @@ static void *recv_one_tcp(void *arg)
             break;
         }
         if (n == 0)
-            break;                      /* 对端正常关闭 */
+            break;                      /* peer closed normally */
         recv_stamp(w->r, (unsigned long long)n);
     }
     free(buf);
@@ -595,11 +595,11 @@ static void *recv_tcp(void *arg)
     (void)setsockopt(lfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof rcvbuf);
     resolve(c->ip, c->port, &me);
     if (bind(lfd, (const struct sockaddr *)&me, sizeof me) != 0)
-        die_errno("bind（端口被占？）");
+        die_errno("bind (port already in use?)");
     if (listen(lfd, 64) != 0)
         die_errno("listen");
-    /* accept 也必须有界：poll 报可读后若那条排队连接被对端 RST 掉，阻塞的
-     * accept 会等下一个连接，g_stop 与截止时间都拦不住它。 */
+    /* accept must also be bounded: if a queued connection is RST by the peer after poll reports readable, a blocking
+     * accept waits for the next connection; neither g_stop nor the deadline stops it. */
     {
         int fl = fcntl(lfd, F_GETFL, 0);
 
@@ -616,7 +616,7 @@ static void *recv_tcp(void *arg)
         struct pollfd p = { .fd = lfd, .events = POLLIN, .revents = 0 };
         int fd;
 
-        /* 监听 fd 上也必须带超时：阻塞在 accept 上时 g_stop 叫不醒它 */
+        /* The listen fd also needs a timeout: g_stop cannot wake it from a blocking accept */
         if (poll(&p, 1, 200) <= 0)
             continue;
         fd = accept(lfd, NULL, NULL);
@@ -637,12 +637,12 @@ static void *recv_tcp(void *arg)
             ws[n].r = w->r;
             ws[n].fd = fd;
             if (pthread_create(&th[n], NULL, recv_one_tcp, &ws[n]) != 0)
-                die("pthread_create 失败");
+                die("pthread_create failed");
             n++;
             atomic_store_explicit(&w->r->conns, (unsigned long long)n,
                                   memory_order_relaxed);
         } else {
-            close(fd);                  /* 只按约定连接数收，多出来的直接关 */
+            close(fd);                  /* accept only the agreed count; close extras */
         }
     }
     close(lfd);
@@ -651,7 +651,7 @@ static void *recv_tcp(void *arg)
     return NULL;
 }
 
-/* ---------------------------------------------------------------- 主流程 */
+/* ---------------------------------------------------------------- main flow */
 
 static int parse_int(const char *s, const char *what)
 {
@@ -659,7 +659,7 @@ static int parse_int(const char *s, const char *what)
     long v = strtol(s, &end, 10);
 
     if (end == NULL || *end != '\0' || v <= 0 || v > (1 << 30)) {
-        fprintf(stderr, "error: %s 取值非法: %s\n", what, s);
+        fprintf(stderr, "error: invalid value for %s: %s\n", what, s);
         exit(2);
     }
     return (int)v;
@@ -668,18 +668,18 @@ static int parse_int(const char *s, const char *what)
 static void usage(void)
 {
     fprintf(stderr,
-            "用法:\n"
+            "Usage:\n"
             "  bench_proto send --proto tcp|udp|raw --target A.B.C.D --port P\n"
             "                    [--size N] [--duration S] [--threads K]\n"
             "  bench_proto recv --proto tcp|udp|raw --bind A.B.C.D --port P\n"
             "                    [--duration S] [--threads K] [--idle-ms M]\n"
-            "  --size: udp = UDP 净荷（<= 65507，默认 1200）\n"
-            "          raw = 整包长度，含 20B IP 头（<= 65535，默认 1200）\n"
-            "          tcp = 每次写的块（默认 65536）\n");
+            "  --size: udp = UDP payload (<= 65507, default 1200)\n"
+            "          raw = whole-packet length, incl. 20B IP header (<= 65535, default 1200)\n"
+            "          tcp = bytes per write (default 65536)\n");
     exit(2);
 }
-/* 自检：raw socket 要 CAP_NET_RAW，非 root 跑不了端到端，但"头拼错"是必然
- * 静默失败的一类缺陷，至少把它挡在发车之前。不需要任何权限。 */
+/* Self-test: raw sockets need CAP_NET_RAW, so end-to-end cannot run as non-root, but "wrong header" is a
+ * silent-failure defect class; at least block it before launch. Needs no privileges. */
 static int selftest(void)
 {
     unsigned char buf[2048];
@@ -691,7 +691,7 @@ static int selftest(void)
 
     if (inet_pton(AF_INET, "10.1.2.3", &src) != 1 ||
         inet_pton(AF_INET, "10.9.9.9", &dst) != 1)
-        die("selftest: inet_pton 失败");
+        die("selftest: inet_pton failed");
     memset(buf, 0, sizeof buf);
     build_raw_ipv4(buf, size, 0x1122334455667788ULL, src, dst);
 
@@ -705,57 +705,57 @@ static int selftest(void)
         }                                                                      \
     } while (0)
 
-    CHK(ip->version == 4 && ip->ihl == 5, "版本/IHL = 4/5");
-    CHK((int)ntohs(ip->tot_len) == size, "tot_len = 整包长度");
-    CHK(ip->protocol == RAW_PROTO, "协议号 = 253");
-    CHK(ip->saddr == src.s_addr, "源地址显式填（0 在 lo 上会被当 martian 丢）");
-    CHK(ip->daddr == dst.s_addr, "目的地址正确");
-    CHK(ip->id != 0, "id 非 0（不指望内核代填）");
-    CHK(memcmp(buf + sizeof *ip, MAGIC, MAGIC_LEN) == 0, "负载魔术前缀正确");
-    CHK(payload_ok(buf, size, true), "payload_ok 认得带 IP 头的裸包");
-    CHK(!payload_ok(buf, size, false), "payload_ok 不跳过 IP 头时应当拒绝（偏移必须对）");
+    CHK(ip->version == 4 && ip->ihl == 5, "version/IHL = 4/5");
+    CHK((int)ntohs(ip->tot_len) == size, "tot_len = whole-packet length");
+    CHK(ip->protocol == RAW_PROTO, "protocol = 253");
+    CHK(ip->saddr == src.s_addr, "source address filled explicitly (0 is dropped as martian on lo)");
+    CHK(ip->daddr == dst.s_addr, "destination address correct");
+    CHK(ip->id != 0, "id is nonzero (kernel must not fill it)");
+    CHK(memcmp(buf + sizeof *ip, MAGIC, MAGIC_LEN) == 0, "payload magic prefix correct");
+    CHK(payload_ok(buf, size, true), "payload_ok accepts raw packet with IP header");
+    CHK(!payload_ok(buf, size, false), "payload_ok rejects when IP header is not skipped (offset must be right)");
     {
-        unsigned char wrong[2048];   /* 不能叫 bad：会遮蔽上面的计数器 */
+        unsigned char wrong[2048];   /* cannot be named bad: it would shadow the counter above */
 
         memcpy(wrong, buf, (size_t)size);
         ((struct iphdr *)(void *)wrong)->protocol = 6;
-        CHK(!payload_ok(wrong, size, true), "协议号不对的包被拒");
+        CHK(!payload_ok(wrong, size, true), "packet with wrong protocol rejected");
     }
     sum = sum_net16(buf, (int)sizeof *ip);
-    CHK(sum == 0xffffU, "IP 头校验和自校验（网络序 16 位和 = 0xffff）");
+    CHK(sum == 0xffffU, "IP header checksum self-check (network-order 16-bit sum = 0xffff)");
     if (sum != 0xffffU) {
-        printf("       诊断：头 20 字节 =");
+        printf("       diagnostic: first 20 header bytes =");
         for (int i = 0; i < (int)sizeof *ip; i++)
             printf(" %02x", buf[i]);
-        printf("\n       网络序折叠和 = %04x（应为 ffff），check 字段字节 = %02x %02x\n",
+        printf("\n       folded network-order sum = %04x (should be ffff), check field bytes = %02x %02x\n",
                sum, buf[10], buf[11]);
     }
     /*
-     * 大包（--size 上限）也自检一遍：raw 非 root 跑不了端到端，而"长度字段
-     * 只有 16 位""负载没铺到末字节""收包缓冲区装不下"这三类缺陷只在大包上
-     * 暴露，且都是静默失败。用堆：65535 放不进 buf[]。
+     * Also self-check the big packet (--size limit): raw cannot run end-to-end as non-root, and "length field
+     * is only 16 bits", "payload does not reach the last byte", "receive buffer cannot hold it" only surface on big
+     * packets, and all fail silently. Use the heap: 65535 does not fit in buf[].
      */
     {
-        const int jsize = MAX_RAW_SIZE;         /* 整包上限 65535 */
+        const int jsize = MAX_RAW_SIZE;         /* whole-packet limit 65535 */
         unsigned char *j = malloc((size_t)jsize);
 
         if (j == NULL)
-            die("selftest: malloc 失败");
+            die("selftest: malloc failed");
         build_raw_ipv4(j, jsize, 0xdeadbeefcafef00dULL, src, dst);
         CHK(((struct iphdr *)(void *)j)->tot_len == htons((uint16_t)jsize),
-            "大包 tot_len = 整包长度（16 位字段正好封顶）");
+            "big packet tot_len = whole-packet length (16-bit field exactly at max)");
         CHK(sum_net16(j, (int)sizeof(struct iphdr)) == 0xffffU,
-            "大包 IP 头校验和自校验");
-        CHK(payload_ok(j, jsize, true), "大包认得（含 IP 头）");
-        CHK(j[jsize - 1] == 0x5a, "大包负载铺满到末字节（长度没算少）");
+            "big packet IP header checksum self-check");
+        CHK(payload_ok(j, jsize, true), "big packet accepted (includes IP header)");
+        CHK(j[jsize - 1] == 0x5a, "big packet payload fills to the last byte (length not undercounted)");
         CHK(memcmp(j + sizeof(struct iphdr) + MAGIC_LEN,
                    "\xde\xad\xbe\xef\xca\xfe\xf0\x0d", 8) == 0,
-            "大包序号按大端写在魔术之后");
-        CHK(jsize <= DGRAM_BUF, "收包缓冲区装得下上限整包");
+            "big packet sequence is big-endian after the magic");
+        CHK(jsize <= DGRAM_BUF, "receive buffer holds the maximum whole packet");
         free(j);
     }
 #undef CHK
-    printf("selftest: %s（%d 项失败）\n", bad == 0 ? "PASS" : "FAIL", bad);
+    printf("selftest: %s (%d failures)\n", bad == 0 ? "PASS" : "FAIL", bad);
     return bad == 0 ? 0 : 1;
 }
 
@@ -810,22 +810,22 @@ int main(int argc, char **argv)
         usage();
     if (strcmp(c.proto, "tcp") != 0 && strcmp(c.proto, "udp") != 0 &&
         strcmp(c.proto, "raw") != 0) {
-        fprintf(stderr, "error: --proto 只能是 tcp/udp/raw: %s\n", c.proto);
+        fprintf(stderr, "error: --proto must be tcp/udp/raw: %s\n", c.proto);
         return 2;
     }
     if (c.threads > MAX_THREADS)
-        die("--threads 超过上限 64");
+        die("--threads exceeds the limit 64");
     if (c.size == 0)
         c.size = strcmp(c.proto, "tcp") == 0 ? (1 << 16) : 1200;
     if (strcmp(c.proto, "raw") == 0 &&
         (c.size < (int)sizeof(struct iphdr) + MAGIC_LEN + 8 ||
          c.size > MAX_RAW_SIZE))
-        die("--size 对 raw 档是整包长度（含 20 字节 IP 头），上限 65535"
-            "（即负载 16..65515）");
+        die("--size for raw is the whole-packet length (including 20-byte IP header), max 65535"
+            "(payload 16..65515)");
     if (strcmp(c.proto, "udp") == 0 &&
         (c.size < MAGIC_LEN + 8 || c.size > MAX_UDP_SIZE))
-        die("--size 对 udp 档要给 UDP 净荷，上限 65507（16..65507，"
-            "再加 28 字节 IP/UDP 头不超过 65535）");
+        die("--size for udp is the UDP payload, max 65507 (16..65507,"
+            "plus 28 bytes IP/UDP header must not exceed 65535)");
 
     atomic_store(&g_go, false);
     atomic_store(&g_stop, false);
@@ -835,15 +835,15 @@ int main(int argc, char **argv)
     if (is_recv) {
         pthread_t mon;
 
-        /* 硬上限 = 打流时长 + 5s：发送侧全挂时接收侧也必须收场 */
+        /* Hard limit = duration + 5s: recv must finish even if all senders hang */
         g_deadline = now_s() + (double)c.duration + 5.0;
-        /* 必须先填好 worker 再创建线程：线程一起来就会读 c/r */
+        /* Must fill worker before creating the thread: it reads c/r immediately */
         ws[0].c = &c;
         ws[0].r = &res;
         if (pthread_create(&mon, NULL,
                            strcmp(c.proto, "tcp") == 0 ? recv_tcp : recv_dgram,
                            &ws[0]) != 0)
-            die("pthread_create 失败");
+            die("pthread_create failed");
         for (;;) {
             long long last = atomic_load_explicit(&res.last_ms,
                                                   memory_order_relaxed);
@@ -875,16 +875,16 @@ int main(int argc, char **argv)
             ws[i].r = &res;
             ws[i].dst = dst;
             if (pthread_create(&th[i], NULL, fn, &ws[i]) != 0)
-                die("pthread_create 失败");
+                die("pthread_create failed");
         }
-        /* 起跑线：等所有线程就绪（tcp 档含连接建立，建链时间不算进窗口） */
+        /* Start line: wait for all threads ready (tcp includes connection setup, not counted in window) */
         t_barrier = now_s() + 10.0;
         while (atomic_load_explicit(&g_workers_ready, memory_order_acquire) <
                    nthreads &&
                now_s() < t_barrier)
             usleep(1000);
         if (atomic_load(&g_workers_ready) < nthreads)
-            die("工作线程 10s 内没就绪（tcp 档常见原因是对端没在监听）");
+            die("worker threads not ready within 10s (common tcp cause: peer not listening)");
         g_deadline = now_s() + (double)c.duration;
         atomic_store(&g_go, true);
         for (int i = 0; i < nthreads; i++)
@@ -918,8 +918,8 @@ int main(int argc, char **argv)
                    atomic_load(&res.max_payload));
         } else {
             double secs = (double)c.duration;
-            /* 行尾的 size 是每包负载：raw 的 --size 是整包，这里要减掉 IP 头，
-             * 否则日志上的口径和 recv 的 maxsize 对不上。 */
+            /* End-of-line size is per-packet payload: raw --size is the whole packet, subtract the IP header here,
+             * otherwise the log convention does not match recv's maxsize. */
             int payload = strcmp(c.proto, "raw") == 0
                               ? c.size - (int)sizeof(struct iphdr) : c.size;
 

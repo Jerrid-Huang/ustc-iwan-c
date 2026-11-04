@@ -45,13 +45,13 @@ fi
 # IWAN_DEBUG / IWAN_PUMP_PROF / IWAN_PROFILE are not compiled into a
 # build configured with IWAN_DEBUG_STRIP=ON, and CMakeLists.txt:48-58
 # defaults that option to ON for EVERY non-Debug build type (Release
-# included) — while this script itself builds Release at "== build ==".
+# included) -- while this script itself builds Release at "== build ==".
 # A benchmark run would then silently report empty [prof]/per-second
 # output; refuse to continue instead.
 #
 # R37 R5 WG-D (R4-L2): "non-empty" is NOT "diagnostics requested". An
 # explicit off-spelling (the user turning the switch OFF) must not trip
-# the abort below — that turned a legal benchmark into a hard failure
+# the abort below -- that turned a legal benchmark into a hard failure
 # with a misleading "this build cannot emit the diagnostics" message.
 # The list must match the parsers:
 #   IWAN_DEBUG   -> env_bool("IWAN_DEBUG", false)   src/common/util.c:75,
@@ -67,11 +67,11 @@ fi
 #
 # R37 R6 WG4 (R6-6): the predicate must not let the shell rewrite the
 # value. The previous form piped it through $(printf | tr), and a command
-# substitution strips TRAILING NEWLINES — "IWAN_DEBUG=$'0\n'" (the classic
+# substitution strips TRAILING NEWLINES -- "IWAN_DEBUG=$'0\n'" (the classic
 # `export IWAN_DEBUG=$(cat file)` / backtick case) arrived at the case
 # statement as "0" and was judged OFF, while env_bool() saw "0\n" and
 # stayed ON. The guard then let a stripped build through and the run
-# produced a silently EMPTY [prof] — exactly what this self-check exists to
+# produced a silently EMPTY [prof] -- exactly what this self-check exists to
 # prevent. A pure `case` on the raw value (off spellings written as
 # explicit case-insensitive globs) has neither the newline-eating
 # substitution nor the external `tr`, whose absence under a minimal PATH
@@ -89,7 +89,7 @@ fi
 # IWAN_PUMP_PROF is deliberately NOT in that predicate: proxy.c:65 (the
 # one-shot gate in pump_prof_gate_init(), :61-70) and proxy.c:85 (the
 # printout gate) only test getenv("IWAN_PUMP_PROF") != NULL, so SET AT ALL
-# — "" and "0" included — switches the pump profiler on; only the unset
+# -- "" and "0" included -- switches the pump profiler on; only the unset
 # variable leaves it off. Hence the existence test `${IWAN_PUMP_PROF+x}`
 # (safe under `set -u`), NOT `${IWAN_PUMP_PROF:-}`, which folds the empty
 # string into "unset" and under-reports by exactly one cell.
@@ -147,7 +147,7 @@ exec > >(tee "$OUT") 2>&1
 
 SERVER_PID=""; CLI_PIDS=""; BENCH_PIDS=""; BENCH_SRV_PID=""; INPUT_RULE_SRV=0; INPUT_RULE_VETH=0
 # R18-2: any bench_client that dies mid-window (or the whole data plane
-# going dark) must abort the run like bench.sh — not print a fake
+# going dark) must abort the run like bench.sh -- not print a fake
 # "0 Mbit/s TOTAL" with exit 0.
 BENCH_RC=0
 
@@ -324,7 +324,7 @@ for C in $CLIENTS_LIST; do
     # kernel UDP counters (server-side rcvbuf overflow shows in
     # RcvbufErrors, field 6). Udp: InDatagrams NoPorts InErrors
     # OutDatagrams RcvbufErrors SndbufErrors; digit-anchored sed skips
-    # the header line. NOTE: field 5 is OutDatagrams — an early version
+    # the header line. NOTE: field 5 is OutDatagrams -- an early version
     # of this script misread it as RcvbufErrors and reported phantom
     # drops of ~500k/s (outgoing datagrams!).
     u0=$(sed -n 's/^Udp: \([0-9][0-9]*\) \([0-9][0-9]*\) \([0-9][0-9]*\) \([0-9][0-9]*\) \([0-9][0-9]*\) \([0-9][0-9]*\).*/\1 \2 \3 \4 \5 \6/p' /proc/net/snmp)
@@ -445,7 +445,7 @@ for C in $CLIENTS_LIST; do
         done
         # R18-2: `[ -n "$v" ] || v=0` used to paper over an absent AGG
         # line with a fake 0, and nothing checked the clients' exit
-        # status — a completely dead bench still reported
+        # status -- a completely dead bench still reported
         # "TOTAL: 0 Mbit/s aggregate" + "BENCH MULTI DONE", exit 0.
         # Now a missing aggregate, a zero total, or any client failure
         # aborts with exit 1 (bench.sh contract).
@@ -461,7 +461,7 @@ for C in $CLIENTS_LIST; do
 
     if [ "$PROXY_MODE" != 1 ]; then
         # R32-A2-2: clients often already exited (e.g. crash/done) before
-        # this per-iteration reap — kill then returns 1 (ESRCH) and set -e
+        # this per-iteration reap -- kill then returns 1 (ESRCH) and set -e
         # would abort the loop mid-run; the cleanup is best-effort.
         [ -n "$CLI_PIDS" ] && kill $CLI_PIDS 2>/dev/null || true
         CLI_PIDS=""

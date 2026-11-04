@@ -20,9 +20,9 @@ void udp_gso_clear(int fd, int *ok, size_t *gso_mss);
  * Returns 1 when armed/usable, 0 when GSO is unavailable right now
  * (the caller falls back to per-datagram sendmmsg). Probing is cached
  * in *ok; a hard failure disables GSO but is re-probed at most once
- * per second (M11: the cause can be transient — a permanent disable
+ * per second (M11: the cause can be transient -- a permanent disable
  * would silently cap throughput for the process lifetime). */
-/* C1: re-arm hysteresis — a new uniform mss is armed only after this many
+/* C1: re-arm hysteresis -- a new uniform mss is armed only after this many
  * consecutive batches with the same mss; mixed-MTU (A/B alternating)
  * streams stop flipping the socket option on every batch (each flip is a
  * setsockopt syscall on the hot send path). */

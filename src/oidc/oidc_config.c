@@ -32,7 +32,7 @@ static long server_port(Json *s)
     long v = 0;
     if (p && json_type(p) == JSON_NUM) {
         /* L9 (bughunt, #6): a remote /m/config can carry serverPort:1e19
-         * — a legal double (< DBL_MAX), but out of long range, so the
+         * - a legal double (< DBL_MAX), but out of long range, so the
          * (long) cast below would be UB. Check the numeric domain FIRST
          * (exact port, 1..65535), then cast. */
         double dv = json_num(p);
@@ -57,7 +57,7 @@ static long server_port(Json *s)
 static bool mkdir_p(const char *path)
 {
     /* returns true when at least one directory component was actually
-     * created (i.e. did not already exist) — the caller uses this to
+     * created (i.e. did not already exist) - the caller uses this to
      * decide whether it is safe to chown a directory it made vs one
      * that predates the run (chowning a pre-existing system dir such as
      * /etc/cron.d would be a local privilege-escalation primitive) */
@@ -108,14 +108,14 @@ static bool is_path_sep(char c)
     /* R37-FIX-A2b (R2-B2-2): '\' is a separator ONLY on Windows. The
      * previous revision accepted it on POSIX as well, which turned the
      * relative spelling "\etc" into the ABSOLUTE "/etc": the root guard
-     * saw a non-root path and let it through, while the kernel — for
-     * which '\' is an ordinary character — would have kept it in the cwd.
+     * saw a non-root path and let it through, while the kernel - for
+     * which '\' is an ordinary character - would have kept it in the cwd.
      * As root (sudo re-exec) that wrote /etc/servers.json and chown()ed it
      * to SUDO_UID; before that revision the same spelling died cleanly in
      * the root guard. On POSIX only '/' starts or divides components.
      * (mkdir_p() below still treats '\' as a separator on POSIX: that only
      * ever creates an extra intermediate directory, it can never change
-     * which file open()/rename()/chown() act on — those hand the path to
+     * which file open()/rename()/chown() act on - those hand the path to
      * the kernel, which splits on '/' alone.) */
 #ifdef _WIN32
     return c == '/' || c == '\\';
@@ -136,7 +136,7 @@ static bool is_ascii_alpha(char c)
  * exceeds PATH_MAX). The caller must then REFUSE the path (L27, R3-A3):
  * keeping the relative spelling leaves `rooted` false, so the root-write
  * guard reports "not root" for a spelling the kernel still resolves
- * against a cwd we cannot see — exactly the fail-open the guard exists to
+ * against a cwd we cannot see - exactly the fail-open the guard exists to
  * prevent. */
 static char *join_cwd(const char *path)
 {
@@ -162,8 +162,8 @@ static char *join_cwd(const char *path)
  * a config path. The guard that refuses to write into the filesystem root
  * used to look at the RAW spelling, so `--config-dir /foo/..` (and "/..",
  * "/tmp/../..", "~/../..") passed it, joined into "/foo/../servers.json",
- * and as root (sudo re-exec) wrote /servers.json and — via mkdir_p +
- * restore_owner — chown()ed "/" to the invoking user.
+ * and as root (sudo re-exec) wrote /servers.json and - via mkdir_p +
+ * restore_owner - chown()ed "/" to the invoking user.
  *
  * Canonicalization stays TEXTUAL on purpose: realpath() resolves symlinks,
  * and this result is handed to mkdir_p()/open()/rename()/chown(); following
@@ -172,7 +172,7 @@ static char *join_cwd(const char *path)
  * follows intermediate symlinks) is closed separately in
  * oidc_save_config() with component-wise lstat() checks. realpath() is
  * used only as a BOOLEAN input to the root verdict in
- * oidc_config_dir_resolves_to_root() — never as a path given to a syscall.
+ * oidc_config_dir_resolves_to_root() - never as a path given to a syscall.
  *   - a RELATIVE spelling is first joined with the cwd (see join_cwd), so
  *     ".." is resolved against the real root and the result denotes the
  *     same object the kernel resolves the raw spelling to;
@@ -190,7 +190,7 @@ static char *join_cwd(const char *path)
  * res->is_root is set when nothing but a root marker is left (i.e. the
  * path IS the filesystem/drive/share root).
  * res->unresolved is set when the textual result must NOT be trusted:
- *   - L27 (R3-A3): a relative spelling whose join_cwd() failed — res->err
+ *   - L27 (R3-A3): a relative spelling whose join_cwd() failed - res->err
  *     carries the getcwd() errno;
  *   - L38 (R3-A3): a ".." with nothing left to pop and no root marker to
  *     stop at. The old code appended ".." there and the NEXT ".." popped
@@ -219,7 +219,7 @@ static char *normalize_path(const char *path, NormPath *res)
      * oidc_load_config() still opened the raw spelling: --fetch wrote
      * ./cfg/servers.json and --list then read ../cfg/servers.json. It also
      * left a relative root escape open (--config-dir ../../.. from a
-     * shallow cwd resolves to "/" — the guard saw only the text and let a
+     * shallow cwd resolves to "/" - the guard saw only the text and let a
      * root write through). Joining makes guard, mkdir_p(), rename() and
      * chown() all see the real target. (_WIN32 drive-relative "C:foo" is
      * left alone: cwd-joining would change its meaning.) */
@@ -234,7 +234,7 @@ static char *normalize_path(const char *path, NormPath *res)
             path = joined;
         } else {
             /* L27 (R3-A3): fail-CLOSED. Keeping the relative spelling is
-             * not an option — `rooted` would stay false, the root guard
+             * not an option - `rooted` would stay false, the root guard
              * would report "not root" and a spelling like "../.." (which
              * the kernel resolves against a cwd we failed to read) would
              * be written as root. Mark the whole normalization unusable
@@ -266,7 +266,7 @@ static char *normalize_path(const char *path, NormPath *res)
         while (i < n && is_path_sep(path[i]))
             i++;
     } else if (n >= 2 && is_path_sep(path[0]) && is_path_sep(path[1])) {
-        /* UNC: "\\server\share" is the root marker — keep both components
+        /* UNC: "\\server\share" is the root marker - keep both components
          * so ".." can never climb above the share root */
         rooted = true;
         i = 2;
@@ -321,7 +321,7 @@ static char *normalize_path(const char *path, NormPath *res)
                  * "../../.." -> ".."): the two branches cancelled, so the
                  * result pointed at a directory the caller never spelled
                  * (and a legitimate ".." was silently dropped). Do not
-                 * emit that text at all — mark the normalization
+                 * emit that text at all - mark the normalization
                  * unresolvable (err stays 0: not an OS error) and let the
                  * callers refuse. A faithful "preserve every .." result
                  * would be WORSE: combined with the fail-open L27 above it
@@ -353,18 +353,18 @@ static char *normalize_path(const char *path, NormPath *res)
  * Relative values are resolved against the cwd exactly like the save path,
  * so "--config-dir ../../.." from a shallow cwd is recognized as a root
  * write instead of being silently rewritten.
- * An empty/NULL value is NOT reported as root here — the CLI gates reject
+ * An empty/NULL value is NOT reported as root here - the CLI gates reject
  * empty separately with a clearer message, and the save backstop treats
  * "/servers.json" (a value with no directory component) as root itself.
  * M9 (R3-A3): a textual verdict cannot see a SYMLINK, so a path that
  * exists is additionally resolved with realpath() and reported as root
  * when that lands on "/" (e.g. --config-dir link-to-/). realpath() feeds
  * THIS BOOLEAN ONLY: its result is never handed to mkdir/open/rename/chown
- * — the save path re-validates every component with lstat() and keeps
+ * - the save path re-validates every component with lstat() and keeps
  * using the caller's (normalized) spelling.
  * L27/L38 (R3-A3): an unresolvable normalization (getcwd() failed for a
  * relative value, or a ".." that cannot be popped) is reported as root so
- * every gate refuses it — fail-closed. */
+ * every gate refuses it - fail-closed. */
 bool oidc_config_dir_resolves_to_root(const char *dir)
 {
     if (!dir || dir[0] == '\0')
@@ -376,7 +376,7 @@ bool oidc_config_dir_resolves_to_root(const char *dir)
     bool root = res.is_root;         /* already true when unresolved */
 #ifndef _WIN32
     if (!root) {
-        /* realpath() may fail (the directory does not exist yet) — then
+        /* realpath() may fail (the directory does not exist yet) - then
          * the textual verdict stands. Only the boolean is taken: the
          * resolved string is never used for a syscall target. */
         char rp[4096];
@@ -392,12 +392,12 @@ bool oidc_config_dir_resolves_to_root(const char *dir)
  * path for the whole process. main() calls this once, right after joining
  * --config-dir with "/servers.json", and hands the result to
  * oidc_save_config(), oidc_load_config(), the proxy.conf sibling and every
- * diagnostic — otherwise --fetch writes the normalized path while
+ * diagnostic - otherwise --fetch writes the normalized path while
  * --list/--connect fopen() the raw spelling, and any ".." (or, before this
  * revision, "\") component makes the two disagree. normalize_path() inside
  * oidc_save_config() stays as an idempotent backstop for direct callers.
  * Never returns the empty string; the caller owns the result. Dies
- * (fail-closed) when the input cannot be resolved at all — see L27/L38. */
+ * (fail-closed) when the input cannot be resolved at all - see L27/L38. */
 char *oidc_config_canon_path(const char *path)
 {
     NormPath res;
@@ -405,7 +405,7 @@ char *oidc_config_canon_path(const char *path)
     if (!np)
         oom_abort();
     /* L27/L38 (R3-A3): never hand back a spelling that is not a faithful
-     * resolution of the input — the save backstop would otherwise be the
+     * resolution of the input - the save backstop would otherwise be the
      * only thing standing between it and a filesystem write. */
     if (res.unresolved) {
         const char *why = res.err ? strerror(res.err)
@@ -437,7 +437,7 @@ void oidc_fetch_config(Config *cf)
     char *resp = NULL;
     int st = oidc_ctrl_post("/m/auth", dev_body, kp, &resp);
     if (st != 200) {
-        /* M1 (bughunt): oidc_die formats %s from `detail` AFTER free —
+        /* M1 (bughunt): oidc_die formats %s from `detail` AFTER free -
          * detail is only an alias pointer into resp, so vfprintf reads
          * freed heap. Copy the body into a stack buffer first.
          * R37-WG-G (L28): the body is remote controlled (controller
@@ -468,7 +468,7 @@ void oidc_fetch_config(Config *cf)
     free(dev_body);
     free(ka_body);
     if (st != 200) {
-        /* R37-WG-G (L28): same treatment as the /m/auth body above —
+        /* R37-WG-G (L28): same treatment as the /m/auth body above -
          * the response body is remote controlled, so the terminal gets
          * a filtered copy (bounded by the same 256-byte stack buffer),
          * freed before oidc_die(). The raw `resp` stays the only buffer
@@ -516,12 +516,12 @@ void oidc_fetch_config(Config *cf)
              * the ciphertext is obfuscation only). Decrypt ONCE here
              * and store the PLAINTEXT: Windows seals it with DPAPI and
              * macOS moves it into the login Keychain directly, and on
-             * Linux the file is 0600 plaintext by decision — the
+             * Linux the file is 0600 plaintext by decision - the
              * app-secret ciphertext layer added nothing (the binary is
              * public). json_get_str returns NULL for a missing field,
              * and the wrap routine feeds it to strlen(); a malicious
              * /m/config entry without passWord/userName must not crash
-             * the whole (possibly root) process — treat missing as
+             * the whole (possibly root) process - treat missing as
              * empty. An undecryptable blob is stored verbatim (the
              * connect path's legacy-GCM fallback handles it). */
             const char *pw_raw = json_get_str(s, "passWord");
@@ -539,7 +539,7 @@ void oidc_fetch_config(Config *cf)
             }
             oidc_esc_put(&b, pw ? pw : (pw_raw ? pw_raw : ""));
             /* R32-B2-L2: on Linux the wrap copy IS the plaintext bytes
-             * (xstrdup of `plain`/pw_raw) — scrub before release like
+             * (xstrdup of `plain`/pw_raw) - scrub before release like
              * the `plain` intermediate above; on sealed platforms pw is
              * a non-secret marker/hex and the wipe is a no-op. */
             if (pw) {
@@ -564,7 +564,7 @@ void oidc_fetch_config(Config *cf)
     cf->servers = json_get(root, "servers");
     cf->pretty = oidc_buf_to_cstr(&b);
 
-    /* L2 (bughunt): kp holds the access_token — scrub before release */
+    /* L2 (bughunt): kp holds the access_token - scrub before release */
     if (kp) {
         OPENSSL_cleanse(kp, strlen(kp));
         free(kp);
@@ -575,18 +575,18 @@ void oidc_fetch_config(Config *cf)
 #ifndef _WIN32
 /* ---------------------------------------------------------------------
  * M9 (R3-A3): every path below is resolved by the KERNEL, which follows
- * intermediate symlinks — while the root guard above only reads text.
+ * intermediate symlinks - while the root guard above only reads text.
  * A3 proved the hole with inode + strace + a non-root equivalent: with a
  * link planted in a writable directory (`ln -s / <writable>/rootlink`),
- * `--all --config-dir <…>/rootlink[/<newdir>]` (the sudo re-exec keeps
- * the spelling) made the guard — and all four gates — say "not root",
+ * `--all --config-dir <...>/rootlink[/<newdir>]` (the sudo re-exec keeps
+ * the spelling) made the guard - and all four gates - say "not root",
  * then mkdir_p()/open()/rename()/chown() wrote to the LINK TARGET; when
  * mkdir_p() created the directory through the link, dir_created became
  * true and restore_owner() chowned that directory (any name, any
  * traversable location) to the invoking user: a local escalation
  * primitive from a non-root invocation.
  *
- * A textual check cannot fix this — that IS the bug — so the components
+ * A textual check cannot fix this - that IS the bug - so the components
  * are inspected with lstat(2) instead. The checks are deliberately
  * conservative (a symlinked ANCESTOR such as ~/.config -> /data/config is
  * refused too): refusing a save that cannot be proven safe is the
@@ -595,8 +595,8 @@ void oidc_fetch_config(Config *cf)
  * These checks are NOT atomic. An attacker able to write a parent can
  * swap a component between the lstat() and the mkdir/open/rename/chown()
  * that follows (TOCTOU). The complete fix is fd-relative (openat(dirfd,
- * comp, O_NOFOLLOW|O_DIRECTORY), openat(dirfd, tmp, …), renameat(),
- * fchownat(dirfd, name, …, AT_SYMLINK_NOFOLLOW), fsync(dirfd)); it is
+ * comp, O_NOFOLLOW|O_DIRECTORY), openat(dirfd, tmp, ...), renameat(),
+ * fchownat(dirfd, name, ..., AT_SYMLINK_NOFOLLOW), fsync(dirfd)); it is
  * deliberately not attempted here. The window is narrowed by re-running
  * the checks right before rename() and by re-inspecting both chown()
  * targets immediately before each chown(). */
@@ -679,7 +679,7 @@ enum {
  * standing at <dir>/servers.json is never a legitimate destination for a
  * root-run save. Rejecting (rather than unlinking first) keeps one
  * invariant for the whole function: no symlink is ever present at a path
- * this code renames or chowns. st_nlink > 1 is refused too — replacing one
+ * this code renames or chowns. st_nlink > 1 is refused too - replacing one
  * of several hard-link names silently drops that name, and any chown that
  * still sees the shared inode (the pre-rename window, or a future
  * reordering of rename/chown) changes the owner of every other name. A
@@ -781,12 +781,12 @@ static bool parse_sudo_id(const char *s, unsigned long max,
  * created) are root-owned; hand both back to the invoking user, or
  * the next non-sudo run cannot read or rewrite the config.
  * R37-FIX-A2: both arguments are now the NORMALIZED paths from
- * oidc_save_config() — chown() must never receive a raw "…/.." spelling,
+ * oidc_save_config() - chown() must never receive a raw ".../.." spelling,
  * which the kernel resolves (chown("/foo/..") is chown("/")).
  * L17 + M9 re-check (R3-A3): the SUDO_* values are parsed strictly (a bad
  * value skips the chown with a warning instead of silently chowning to
  * uid 0 or to the "do not change" sentinel), and both chown() targets are
- * re-inspected with lstat() immediately before the call — chown(2)
+ * re-inspected with lstat() immediately before the call - chown(2)
  * follows a final symlink and resolves every intermediate one. */
 static void restore_owner(const char *path, const char *dir, bool dir_created)
 {
@@ -851,7 +851,7 @@ void oidc_save_config(const char *path, const Config *cf)
 
     /* R37-FIX-A2 (HIGH): every decision AND every filesystem action below
      * uses ONE canonical spelling of the path. Normalizing only the guard
-     * would leave mkdir_p()/chown() on the raw "…/.." string — which is how
+     * would leave mkdir_p()/chown() on the raw ".../.." string - which is how
      * `--config-dir /foo/..` both created "/foo" and chown()ed "/" (the
      * kernel resolves "..", our text check did not). */
     const char *opath = path;
@@ -862,7 +862,7 @@ void oidc_save_config(const char *path, const Config *cf)
     /* L27/L38 (R3-A3) fail-CLOSED: an unresolved normalization must never
      * reach a syscall. The old code kept the relative spelling when
      * getcwd() failed, the guard then saw rooted == false and let it
-     * through — and with L38 fixed to preserve ".." that spelling would
+     * through - and with L38 fixed to preserve ".." that spelling would
      * have resolved to "/" under root. Report the real reason instead. */
     if (nres.unresolved) {
         const char *why = nres.err ? strerror(nres.err)
@@ -931,7 +931,7 @@ void oidc_save_config(const char *path, const Config *cf)
     /* M9: re-inspect now that mkdir_p() ran. A component that did not
      * exist during the first walk cannot have been a link then, but an
      * attacker who created it FIRST (as a link) made mkdir() fail with
-     * EEXIST, which mkdir_p() treats as success — so this second walk is
+     * EEXIST, which mkdir_p() treats as success - so this second walk is
      * what catches that sequence. The target is checked here too, before
      * any temp file exists, so a refusal leaves nothing behind. */
     config_dest_verify(path, dir, NULL);
@@ -1015,7 +1015,7 @@ void oidc_save_config(const char *path, const Config *cf)
      * REPLACE_EXISTING keeps the atomic-replace semantics */
     if (!MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING)) {
         /* M3-7: MoveFileExA reports failure via GetLastError (ERROR_*),
-         * not errno — strerror(errno) was stale/misleading */
+         * not errno - strerror(errno) was stale/misleading */
         DWORD gle = GetLastError();
         _unlink(tmp);
         oidc_die("cannot write config to %s: Windows error %lu (0x%lx)",
@@ -1026,7 +1026,7 @@ void oidc_save_config(const char *path, const Config *cf)
      * and this rename() an attacker who can write a parent can swap a
      * component for a symlink; rename() would then follow it. Re-run the
      * checks and remove the temp file before dying, so a refusal leaves
-     * neither a redirected write nor a stray .tmp. (Not atomic — the
+     * neither a redirected write nor a stray .tmp. (Not atomic - the
      * fd-relative form documented at config_dir_check() is the real fix.) */
     config_dest_verify(path, dir, tmp);
     if (rename(tmp, path) != 0) {
@@ -1040,7 +1040,7 @@ void oidc_save_config(const char *path, const Config *cf)
      * directory entry back to the old file. Guard the empty case
      * (dir == NULL or ""): open(NULL, O_RDONLY|O_DIRECTORY) is UB, and
      * with no directory component there is simply no parent dir to
-     * fsync — skip it (log_debug). Non-empty normal paths are unchanged. */
+     * fsync - skip it (log_debug). Non-empty normal paths are unchanged. */
     if (dir && dir[0] != '\0') {
         int dfd = open(dir, O_RDONLY | O_DIRECTORY);
         if (dfd >= 0) {
@@ -1049,7 +1049,7 @@ void oidc_save_config(const char *path, const Config *cf)
         }
     } else {
         log_debug("config save: no parent directory to fsync (dir is "
-                  "empty/absent) — skipping parent-dir fsync");
+                  "empty/absent) - skipping parent-dir fsync");
     }
 #endif
     free(tmp);
@@ -1057,7 +1057,7 @@ void oidc_save_config(const char *path, const Config *cf)
     restore_owner(path, dir, dir_created);
     free(dir);
     /* WIN-RUNTIME (R3-A3): %zu is not implemented by the Windows msvcrt
-     * printf — it prints a wrong value at runtime (oidc_eprintf has no
+     * printf - it prints a wrong value at runtime (oidc_eprintf has no
      * format attribute, so the compiler cannot catch it). %llu with an
      * explicit cast is the in-tree convention (json.c:55, auth.c:463). */
     oidc_eprintf("  Saved %llu server(s) to %s\n",
@@ -1076,7 +1076,7 @@ void oidc_load_config(const char *path, Config *cf)
         oidc_die_with_cause(msg, strerror(errno));
     }
     /* the file holds per-line PLAINTEXT server passwords (by decision:
-     * the app-secret ciphertext layer was obfuscation only) — warn when
+     * the app-secret ciphertext layer was obfuscation only) - warn when
      * it is group/world readable instead of silently loading (POSIX
      * only: Windows has no group/world permission bits) */
 #ifndef _WIN32

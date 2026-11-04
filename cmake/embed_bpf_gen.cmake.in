@@ -1,4 +1,4 @@
-# embed_bpf_gen.cmake.in — template for the BPF object -> C array embedding step.
+# embed_bpf_gen.cmake.in -- template for the BPF object -> C array embedding step.
 #
 # CMakeLists.txt runs configure_file() on this template, so @IN@ / @OUT@ become
 # literal paths inside the generated script, and the build recipe invokes that

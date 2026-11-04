@@ -7,7 +7,7 @@
  * opened on the local kernel stack, so they follow the TUN routing
  * rules exactly like any other system traffic (the chosen design: the
  * proxy is an alternative ENTRY into the same tunnel, not a second
- * data plane — the lwIP userspace stack stays SOCKS-mode-only).
+ * data plane -- the lwIP userspace stack stays SOCKS-mode-only).
  *
  * One listener serves both protocols (same-port mix, like SOCKS mode):
  * a SOCKS5 greeting (0x05) or an HTTP method token selects the parser.

@@ -27,22 +27,22 @@
 #define RATE_BUCKETS_PER_SHARD  (RATE_BUCKETS / RATE_SHARDS)
 #define RATE_GATE_WAYS          16
 
-/* 族无关的限速键。v6 的 128 位地址必须全部参与（绝不能只取前 4 字节：同
- * 一个 /32 前缀下一堆 v6 客户端会被并成一桶，20/s 的 OPEN 预算被单个客户
- * 端吃光）；v4 走的哈希与加 v6 之前逐位相同，所以 v4 的限速口径与桶分布
- * 完全不变。 */
+/* Family-agnostic rate-limit key. All 128 bits of a v6 address must participate (never take only the first 4 bytes: many v6 clients
+ * under the same /32 prefix would be merged into one bucket, and a single client eats the whole 20/s OPEN budget);
+ * v4 hashing is bit-for-bit identical to before v6 was added, so the v4 rate-limit behavior and bucket distribution are
+ * completely unchanged. */
 struct rate_key {
-    uint8_t addr[16];   /* 网络序；AF_INET 只用 addr[0..3]，其余为 0 */
+    uint8_t addr[16];   /* network byte order; AF_INET uses only addr[0..3], the rest is 0 */
     uint8_t fam;        /* AF_INET / AF_INET6 */
 };
 
 struct rate_bucket {
-    /* 存完整源地址（不是索引哈希）：v4 的键就是精确的 32 位地址，v6 是
-     * 精确的 16 字节地址，不同源绝不共桶。 */
+    /* Store the full source address (not an index hash): the v4 key is the exact 32-bit address, v6 is
+     * the exact 16-byte address, so different sources never share a bucket. */
     struct rate_key key;
-    /* 槽位是否已被占用。显式 valid 位取代旧的 `ip != 0` 空槽哨兵：v6 地址
-     * 的前 4 字节常常是 0（::1、::ffff:0:x…），旧哨兵会把不同源当成同一个
-     * 空槽。 */
+    /* Whether the slot is in use. An explicit valid bit replaces the old `ip != 0` empty-slot sentinel: the first
+     * 4 bytes of a v6 address are often 0 (::1, ::ffff:0:x...), and the old sentinel would treat different sources as the same
+     * empty slot. */
     bool valid;
     uint64_t win;      /* window start (monotonic ms) */
     uint32_t open_cnt, ping_cnt, echo_cnt;
@@ -59,11 +59,11 @@ struct rate_shard {
 static struct rate_shard g_rate_shards[RATE_SHARDS];
 
 struct rate_gate {
-    /* 完整源身份：v4 = 32 位网络序地址（与旧实现存的 ip 逐位相同），
-     * v6 = 64 位 FNV-1a 哈希（碰撞概率 2^-64，槽位只做 "该源超预算" 的
-     * 记忆，不是计数表）。 */
+    /* Full source identity: v4 = 32-bit network-order address (bit-for-bit the ip stored by the old implementation),
+     * v6 = 64-bit FNV-1a hash (collision probability 2^-64; the slot only remembers "this source is over budget",
+     * it is not a counter table). */
     _Atomic uint64_t id;
-    _Atomic uint8_t valid;          /* 显式占用位，取代 `ip != 0` 哨兵 */
+    _Atomic uint8_t valid;          /* explicit occupancy bit, replaces the `ip != 0` sentinel */
     _Atomic uint64_t over_until_ms; /* budget refills at this monotonic ms */
 };
 
@@ -174,7 +174,7 @@ void server_rate_limits_init(void)
     g_up_throttle_ms = rate_limit_env("IWAN_SRV_THROTTLE_MS", SRV_THROTTLE_DEFAULT_MS);
 }
 
-/* 从规范化后的外层对端构造限速键 */
+/* Build a rate-limit key from the normalized outer peer */
 static struct rate_key rate_key_from_peer(const struct iwan_peer *peer)
 {
     struct rate_key k;
@@ -190,7 +190,7 @@ static inline bool rate_key_is_v4(const struct rate_key *k)
     return k->fam == (uint8_t)AF_INET;
 }
 
-/* AF_INET 的 32 位网络序地址（= 旧实现里当键用的那个值） */
+/* 32-bit network-order address for AF_INET (= the value the old implementation used as the key) */
 static inline uint32_t rate_key_v4(const struct rate_key *k)
 {
     uint32_t ip;
@@ -199,7 +199,7 @@ static inline uint32_t rate_key_v4(const struct rate_key *k)
     return ip;
 }
 
-/* v6：16 字节地址 + 族标签的 64 位 FNV-1a */
+/* v6: 64-bit FNV-1a of the 16-byte address + family tag */
 static inline uint64_t rate_key_mix6(const struct rate_key *k)
 {
     uint64_t h = 1469598103934665603ull;   /* FNV-1a offset basis */
@@ -219,8 +219,8 @@ static inline bool rate_key_eq(const struct rate_key *a,
     return a->fam == b->fam && memcmp(a->addr, b->addr, sizeof a->addr) == 0;
 }
 
-/* gate 槽位里存的完整身份值：v4 = 32 位地址（与旧实现逐位相同），
- * v6 = 64 位哈希。 */
+/* Full identity value stored in a gate slot: v4 = 32-bit address (bit-for-bit the same as the old implementation),
+ * v6 = 64-bit hash. */
 static inline uint64_t rate_key_id(const struct rate_key *k)
 {
     if (rate_key_is_v4(k))
@@ -228,8 +228,8 @@ static inline uint64_t rate_key_id(const struct rate_key *k)
     return rate_key_mix6(k);
 }
 
-/* 分片/桶内位置的 32 位索引哈希：v4 与旧实现完全一致（10 位：低 6 位是桶
- * 内位置、次 4 位是分片）；v6 用 64 位哈希折叠。 */
+/* 32-bit index hash for shard/bucket position: v4 matches the old implementation exactly (10 bits: the low 6 bits are
+ * the in-bucket position, the next 4 bits are the shard); v6 folds the 64-bit hash. */
 static inline uint32_t rate_key_hash32(const struct rate_key *k)
 {
     uint64_t h;
@@ -250,8 +250,8 @@ static inline void rate_shard_unlock(const struct rate_key *k)
     pthread_mutex_unlock(&g_rate_shards[rate_ip_shard(k)].mu);
 }
 
-/* 1024 个 gate 槽的下标：v4 走旧的 (ip * MUL) >> 22，逐位不变；v6 取哈希
- * 高 10 位。 */
+/* Index of the 1024 gate slots: v4 uses the old (ip * MUL) >> 22, bit-for-bit unchanged; v6 takes the top
+ * 10 bits of the hash. */
 static inline unsigned rate_gate_slot(const struct rate_key *k)
 {
     if (rate_key_is_v4(k))

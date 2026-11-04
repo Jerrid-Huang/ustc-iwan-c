@@ -1,7 +1,7 @@
 /* Windows (MinGW-w64) TUN backend: the wintun driver (wintun.dll).
  *
  * The wintun API is resolved at runtime with LoadLibraryA/GetProcAddress,
- * so the binary links and runs without the DLL present — only open_tun
+ * so the binary links and runs without the DLL present -- only open_tun
  * fails then, with a message pointing at wintun.net. A wintun "adapter"
  * is a persistent virtual NIC created on demand; the "session" (ring
  * buffer) is the live data path, and there is exactly one session per
@@ -11,7 +11,7 @@
  *   - the tun_pool reader pool collapses to ONE reader thread;
  *   - tun fds are small indexes into a static session table (open/close
  *     are single-threaded in the client, so the table needs no locks);
- *   - tun_write (WintunSendPacket) blocks while the ring is full — the
+ *   - tun_write (WintunSendPacket) blocks while the ring is full -- the
  *     kernel ring IS the backpressure, so no EAGAIN can occur.
  *
  * Compile/Windows only: the Makefile excludes tun.c and builds this file
@@ -57,7 +57,7 @@ typedef WINTUN_SESSION_HANDLE(WINAPI *wintun_start_session_fn)(
 typedef void (WINAPI *wintun_end_session_fn)(WINTUN_SESSION_HANDLE session);
 typedef DWORD (WINAPI *wintun_get_running_driver_version_fn)(void);
 /* wintun >= 0.14: reserve ring space (blocks until room) then send the
- * reserved buffer (VOID — cannot fail); wintun <= 0.13 used a single
+ * reserved buffer (VOID -- cannot fail); wintun <= 0.13 used a single
  * BOOL send(Session, Packet, PacketSize). Both are kept: the 0.14 form
  * is detected by the WintunAllocateSendPacket export. */
 typedef BYTE *(WINAPI *wintun_allocate_send_packet_fn)(
@@ -113,7 +113,7 @@ atomic_uint_fast64_t g_tun_wait_us, g_tun_timeouts, g_tun_wakeups,
 
 /* Fixed adapter GUID: one stable identity for every run and every
  * machine, so Windows tracks the adapter as "the" iwan adapter. Random
- * constant generated once for this project. NEVER change it — a changed
+ * constant generated once for this project. NEVER change it -- a changed
  * GUID orphans previously created adapters (they linger as stale
  * interfaces in ncpa.cpl until deleted by hand). */
 static const GUID IWAN_WINTUN_GUID = {
@@ -184,7 +184,7 @@ static bool wintun_load(void)
                      * privilege). The Authenticode+pin checks above still
                      * gate which file is loaded. */
                     iwan_wintun.dll = wintun_load_secure(dllpath);
-                    /* NOTE: no early return here — the GetProcAddress
+                    /* NOTE: no early return here -- the GetProcAddress
                      * resolution below MUST run for every successful
                      * load, or the API pointers stay NULL and open_tun
                      * calls through a NULL function pointer. */
@@ -205,7 +205,7 @@ static bool wintun_load(void)
         if (sn > 0 && sn < MAX_PATH - 16) {
             wcscpy(sysdll + sn, L"\\wintun.dll");
             if (wintun_verify(sysdll) && wintun_pin_ok(sysdll)) {
-                /* M3: same secure load as the exe-dir branch above — no
+                /* M3: same secure load as the exe-dir branch above -- no
                  * CWD/PATH resolution for wintun.dll's own imports. */
                 iwan_wintun.dll = wintun_load_secure(sysdll);
             } else {
@@ -214,7 +214,7 @@ static bool wintun_load(void)
             }
         }
         if (iwan_wintun.dll == NULL) {
-            log_err("wintun.dll not found or blocked — install the "
+            log_err("wintun.dll not found or blocked -- install the "
                     "wintun driver from wintun.net (or WireGuard) and "
                     "place wintun.dll next to the executable "
                     "(exe-dir load error %lu, system load error %lu)",
@@ -228,12 +228,12 @@ static bool wintun_load(void)
  * -Wpedantic rejects twice over ("ISO C forbids conversion of function
  * pointer to object pointer type" + "ISO C forbids assignment between
  * function pointer and 'void *'"), and the cast is a strict-aliasing
- * violation besides. GetProcAddress already returns FARPROC — a function
- * pointer — so copying its bytes is how the address moves into a
+ * violation besides. GetProcAddress already returns FARPROC -- a function
+ * pointer -- so copying its bytes is how the address moves into a
  * differently-typed function pointer with no cast at all (the idiom the
  * Win32 docs use for GetProcAddress). It is a pure representation copy
- * between function-pointer types of identical size — the _Static_assert
- * below proves that per member at compile time — so a NULL result stays a
+ * between function-pointer types of identical size -- the _Static_assert
+ * below proves that per member at compile time -- so a NULL result stays a
  * NULL member (all-zero is the null function pointer on the Windows ABI,
  * exactly as the previous cast relied on). */
 #define WINTUN_STORE_FN(dst, src)                                             \
@@ -248,7 +248,7 @@ static bool wintun_load(void)
         FARPROC fn_addr = GetProcAddress(iwan_wintun.dll, name);              \
         WINTUN_STORE_FN(iwan_wintun.member, fn_addr);                         \
         if (iwan_wintun.member == NULL) {                                     \
-            log_err("wintun.dll is missing %s — update wintun.dll from "      \
+            log_err("wintun.dll is missing %s -- update wintun.dll from "      \
                     "wintun.net", name);                                      \
             FreeLibrary(iwan_wintun.dll);                                     \
             iwan_wintun_loaded = -1;                                          \
@@ -263,7 +263,7 @@ static bool wintun_load(void)
     WINTUN_LOAD_ONE(get_running_driver_version, "WintunGetRunningDriverVersion");
     /* 0.14+ exports WintunAllocateSendPacket; 0.13 and earlier do not
      * (there WintunSendPacket takes the packet size as the 3rd arg). Both
-     * are optional — a NULL is a legitimate outcome, so they stay out of
+     * are optional -- a NULL is a legitimate outcome, so they stay out of
      * WINTUN_LOAD_ONE, which fails the whole load on a NULL. */
     FARPROC p_alloc =
         GetProcAddress(iwan_wintun.dll, "WintunAllocateSendPacket");
@@ -271,7 +271,7 @@ static bool wintun_load(void)
     WINTUN_STORE_FN(iwan_wintun.allocate_send_packet, p_alloc);
     WINTUN_STORE_FN(iwan_wintun.send_packet, p_send);
     if (iwan_wintun.send_packet == NULL) {
-        log_err("wintun.dll is missing WintunSendPacket — update "
+        log_err("wintun.dll is missing WintunSendPacket -- update "
                 "wintun.dll from wintun.net");
         FreeLibrary(iwan_wintun.dll);
         iwan_wintun_loaded = -1;
@@ -331,7 +331,7 @@ static bool utf8_to_wchar(const char *s, wchar_t *out, size_t cap)
 /* wintun >= 0.14 removed WintunDeleteAdapter from the DLL, so an orphaned
  * adapter is deleted through SetupDi (DIF_REMOVE) by matching the adapter's
  * friendly name. Used ONLY for adapters this process created itself and
- * never got a session on (M5 orphan cleanup) — a pre-existing/reused
+ * never got a session on (M5 orphan cleanup) -- a pre-existing/reused
  * adapter is never passed here (hard boundary). Returns 1 when a device
  * was removed. */
 static int wintun_delete_adapter_by_name(const wchar_t *name)
@@ -453,7 +453,7 @@ int open_tun(const char *name)
          * live session on it; the error code cannot distinguish the two
          * (hard boundary: never remove an adapter this process did not
          * create). A wedged stale adapter therefore is never deleted
-         * automatically here — the user clears it by hand (wintun /
+         * automatically here -- the user clears it by hand (wintun /
          * ncpa.cpl) or it disappears on reboot. */
         if (session == NULL) {
             log_err("tun: WintunStartSession failed (error %lu)",
@@ -463,7 +463,7 @@ int open_tun(const char *name)
             /* M5 orphan cleanup: an adapter WE created this run and never
              * got a session started on is ours alone (created == true,
              * this process, never returned a session), so removing it is
-             * inside the hard boundary — wintun adapters are persistent
+             * inside the hard boundary -- wintun adapters are persistent
              * by default and would otherwise linger forever as a dead
              * "iwan" NIC. Reused adapters (created == false) are never
              * touched here. */
@@ -552,7 +552,7 @@ static ptrdiff_t tun_write_bounded(int fd, const void *buf, size_t len,
     }
     uint64_t t0 = now_ms();
     if (iwan_wintun.allocate_send_packet) {
-        /* wintun 0.14+: reserve ring space (blocks until room — that is
+        /* wintun 0.14+: reserve ring space (blocks until room -- that is
          * the backpressure), copy, then send the reserved buffer; the
          * send itself cannot fail. A NULL alloc normally means the
          * session is gone (or the packet exceeds WINTUN_MAX_IP_PACKET_SIZE),
@@ -626,7 +626,7 @@ int tun_write_retry(int fd, const uint8_t *pkt, size_t len, int max_ms,
 {
     /* FIND-W-3 + R16: align with tun.h's contract ("max_ms == 0 waits
      * indefinitely") and with the POSIX backend: max_ms <= 0 means NO
-     * budget — keep retrying (subject to stop) instead of any fixed
+     * budget -- keep retrying (subject to stop) instead of any fixed
      * iteration window. tun_write_bounded is time/condition-driven: with
      * max_ms == 0 the loop retries until success or stop (truly
      * indefinite), with a positive max_ms it honours the full millisecond
@@ -675,7 +675,7 @@ static unsigned __stdcall tun_reader_main(void *ud)
     /* experimental pinning (IWAN_WIN_THREAD_PIN=1): uplink reader ->
      * CPU 1, ABOVE_NORMAL. Avoids vCPU migration (L1/L2 cold) and
      * stays off CPU 0, where the virtio/wintun DPCs land. Off spellings
-     * (0/false/no/off, case-insensitive) disable it: env_bool, R37 R5 —
+     * (0/false/no/off, case-insensitive) disable it: env_bool, R37 R5 --
      * the old `pin[0] != '0'` read ""/"no"/"off" as ON. */
     {
         if (env_bool("IWAN_WIN_THREAD_PIN", false)) {

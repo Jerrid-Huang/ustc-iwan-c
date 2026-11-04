@@ -1,11 +1,11 @@
-/* 最小 libbpf 垫片 —— 本机没有 libbpf-dev 时用，配合 iproute2 的 legacy
- * 加载器（`ip route ... encap bpf xmit obj x.o sec lwt_xmit` / `tc filter ...
- * bpf da obj x.o`）。iproute2 自己解析 ELF 并重定位，不需要 libbpf。
+/* Minimal libbpf shim -- for use when libbpf-dev is not available, together with iproute2's legacy
+ * loader (`ip route ... encap bpf xmit obj x.o sec lwt_xmit` / `tc filter ...
+ * bpf da obj x.o`). iproute2 parses the ELF and relocates by itself; libbpf is not needed.
  *
- * helper 用"常量函数指针"声明：这是 libbpf 之前的标准做法，指针值就是
- * BPF_FUNC_* 编号，加载器会把它重定位成真正的 helper 调用。
- * 若系统装了 libbpf-dev，用 -I/usr/include 让 <bpf/bpf_helpers.h> 命中官方
- * 版本即可（把本目录的 -I 放到最后）。
+ * Helpers are declared as "constant function pointers": the standard practice before libbpf; the pointer value is
+ * the BPF_FUNC_* number, and the loader relocates it into a real helper call.
+ * If libbpf-dev is installed, use -I/usr/include so <bpf/bpf_helpers.h> resolves to the official
+ * version (put this directory's -I last).
  */
 #ifndef IWAN_BPF_HELPERS_H
 #define IWAN_BPF_HELPERS_H
@@ -19,13 +19,13 @@
 #define __always_inline inline __attribute__((always_inline))
 #define __noinline __attribute__((noinline))
 
-/* BTF 式映射定义所需宏（libbpf 1.0+ 已不支持 legacy struct bpf_map_def） */
+/* Macros needed for BTF-style map definitions (libbpf 1.0+ no longer supports legacy struct bpf_map_def) */
 #define __uint(name, val) int (*name)[val]
 #define __type(name, val) typeof(val) *name
 #define __array(name, val) typeof(val) *name[]
 
-/* 计数器自增。必须内联展开：map 引用要作为常量直接传给 helper，
- * 不能把 map 指针当函数参数（否则 clang 会生成传 map fd 的调用形式）。 */
+/* Counter increment. Must be inlined: the map reference must be passed to the helper as a constant,
+ * not as a function parameter (otherwise clang generates the call form that passes a map fd). */
 #define BUMP(map, idx)							\
 	do {								\
 		__u32 _k = (idx);					\
@@ -52,13 +52,13 @@ static long (*bpf_skb_adjust_room)(void *skb, __s32 len_diff, __u32 mode,
 static long (*bpf_lwt_push_encap)(void *skb, __u32 type, void *hdr,
 				  __u32 len) = (void *) BPF_FUNC_lwt_push_encap;
 
-/* 字节序：x86/arm64 上 BPF 为小端 ⇒ htons/ntohs 就是 bswap */
+/* Byte order: BPF is little-endian on x86/arm64 => htons/ntohs are just bswap */
 #define bpf_htons(x) __builtin_bswap16(x)
 #define bpf_ntohs(x) __builtin_bswap16(x)
 #define bpf_htonl(x) __builtin_bswap32(x)
 #define bpf_ntohl(x) __builtin_bswap32(x)
 
-/* 精简协议头（只用到固定长度字段，避免依赖内核内部头） */
+/* Minimal protocol headers (only fixed-length fields, to avoid depending on kernel internal headers) */
 struct ethhdr_min {
 	__u8 dst[6];
 	__u8 src[6];

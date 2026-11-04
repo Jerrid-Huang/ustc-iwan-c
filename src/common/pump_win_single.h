@@ -5,7 +5,7 @@
 
 #ifdef _WIN32
 /* Single-thread Windows TUN uplink: one thread reads the wintun ring and
- * immediately WSASends each packet — no SPSC producer/consumer handoff,
+ * immediately WSASends each packet -- no SPSC producer/consumer handoff,
  * no semaphores, no separate sender thread, and no copy (the payload is
  * XORed in place inside the ring buffer and sent as header+payload
  * iovecs). Selected with IWAN_WIN_PUMP_SINGLE=1. The downlink recv

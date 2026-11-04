@@ -2,21 +2,21 @@
 #define IWAN_GENL_IWAN_H
 
 /*
- * iWAN 内核数据面的 genetlink 控制面客户端（Linux only）。
+ * genetlink control-plane client for the iWAN kernel data plane (Linux only).
  *
- * ABI 唯一权威是 kernel/iwan_genl.h（冻结），本文件直接 include 它，不复制
- * 常量；设计说明见 kernel/CONTROL-PLANE.md。实现手法照搬
- * kernel/tests/iwan_ctl.c：纯 libc + 自己拼 netlink 消息，不引入
- * libnl/libmnl。
+ * The sole ABI authority is kernel/iwan_genl.h (frozen); this file includes it directly and does not copy
+ * constants; for the design see kernel/CONTROL-PLANE.md. The implementation follows
+ * kernel/tests/iwan_ctl.c: plain libc + hand-built netlink messages, no
+ * libnl/libmnl dependency.
  *
- * 字节序：本文件的入参结构体一律用**主机序**（地址也是如此），转换只在
- * genl_iwan.c 的属性封装处做一次 —— 与 kernel/iwan_genl.h 的"转换只在
- * netlink 边界做一次"一致。
+ * Byte order: input structs in this file always use **host byte order** (addresses too); conversion is done only
+ * once at the attribute packing site in genl_iwan.c -- matching kernel/iwan_genl.h's rule that "conversion happens only
+ * once at the netlink boundary".
  *
- * Linux-only 的原因与接线方式见 CMakeLists.txt：本文件与 genl_iwan.c、
- * kdp.c 一起只进 Linux 分支；文件体再用 __linux__ 包住，是因为
- * src/iwan_client.c 同时被编进 Windows 的 iwan-winsvc.exe，非 Linux 下
- * include 到它也必须能编过（只有声明消失，没有半成品 stub）。
+ * For the Linux-only reason and wiring see CMakeLists.txt: this file, together with genl_iwan.c and
+ * kdp.c, is built only in the Linux branch; the file body is additionally wrapped in __linux__ because
+ * src/iwan_client.c is also compiled into the Windows iwan-winsvc.exe, so on non-Linux
+ * including it must still compile (only declarations disappear; there is no half-finished stub).
  */
 
 #if defined(__linux__)
@@ -24,49 +24,49 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <netinet/in.h>		/* struct in6_addr（外层 v6 端点） */
+#include <netinet/in.h>		/* struct in6_addr (outer v6 endpoint) */
 
 #include "../../kernel/iwan_genl.h"
 
-/* IWAN_CMD_SESSION_UP 的会话参数（主机序）。
+/* Session parameters for IWAN_CMD_SESSION_UP (host byte order).
  *
- * sport 必须**从第一次起就显式给出**并且每次一致：模块把首次 SESSION_UP
- * 的 sport 存下来参与幂等比较，首次省略存 0，之后显式给值会 -EINVAL
- * （见 CONTROL-PLANE.md §10.2）。调用方用 getsockname() 取本地实际端口，
- * 于是"重连换了临时端口"必须先 SESSION_DOWN（kdp.c 就是这么做的）。 */
+ * sport must be **given explicitly from the very first call** and stay identical every time: the module stores the sport of the first SESSION_UP
+ * for idempotent comparison; if omitted on the first call it stores 0, and explicitly supplying it later returns -EINVAL
+ * (see CONTROL-PLANE.md section 10.2). The caller uses getsockname() to get the actual local port,
+ * so "reconnect changed the ephemeral port" requires SESSION_DOWN first (that is what kdp.c does). */
 typedef struct {
     uint16_t sid;
     uint32_t tok;
-    uint8_t  enc;                    /* 1 = PT_DATA_ENC + XOR, 0 = 明文 */
+    uint8_t  enc;                    /* 1 = PT_DATA_ENC + XOR, 0 = plaintext */
     uint8_t  key[IWAN_KEY_LEN];      /* MD5(user||pass)[0..8) */
-    uint32_t outer_src;              /* 本端外层地址（v4，主机序） */
-    uint32_t outer_dst;              /* 对端外层地址（v4，主机序） */
-    /* 外层版本（切片 2）：由**调用方按会话套接字的族**决定，与
-     * outer_src/outer_dst 互斥 —— outer_v6=true 时只用下面两个 16 字节
-     * 字段，并把 v4 字段留 0（内核侧按"给了哪一对"判族，两对同时给会
-     * -EINVAL）。v4 会话必须显式给 outer_v6=false。 */
+    uint32_t outer_src;              /* local outer address (v4, host byte order) */
+    uint32_t outer_dst;              /* peer outer address (v4, host byte order) */
+    /* Outer version (slice 2): decided by **the caller according to the session socket family**, mutually
+     * exclusive with outer_src/outer_dst -- when outer_v6=true only the two 16-byte fields below are
+     * used and the v4 fields are left 0 (the kernel decides the family by "which pair was given"; giving both pairs
+     * returns -EINVAL). v4 sessions must explicitly pass outer_v6=false. */
     bool     outer_v6;
-    struct in6_addr outer_src6;      /* 本端外层地址（v6） */
-    struct in6_addr outer_dst6;      /* 对端外层地址（v6） */
-    uint16_t dport;                  /* 服务器端口，主机序 */
-    uint16_t sport;                  /* 本端实际端口，主机序 */
-    uint32_t mtu;                    /* 0 = 不带 IWAN_A_MTU（用模块默认） */
-    /* 承载网卡绑定（三模式，见 docs/kernel-data-plane.md）：
-     *   oif=0, bind_ip=0   什么都不绑：内核按 FIB 解析一次后钉住，路径失效自愈
-     *   oif!=0             绑网卡：严格用这张接口，失败逐包拒绝（不漂移）
-     *   bind_ip!=0         绑 IP：内核按地址表解析出持有该地址的接口，
-     *                      等价于绑那张接口；该地址同时是外层头的源地址，
-     *                      所以必须等于 outer_src（内核会 -EINVAL 拒绝不一致）
-     * 两者同时给出时必须指向同一张接口（内核 -EINVAL 拒绝）。 */
-    uint32_t oif;                    /* 绑定的承载网卡 ifindex，0 = 不绑 */
-    uint32_t bind_ip;                /* 绑定的出口 IP（v4，主机序），0 = 不绑 */
-    /* 绑定的出口 v6 地址：全零 = 不绑（语义与 bind_ip 逐条对应：必须等于
-     * outer_src6、必须是本机地址、与 oif 同时给出时必须同接口） */
+    struct in6_addr outer_src6;      /* local outer address (v6) */
+    struct in6_addr outer_dst6;      /* peer outer address (v6) */
+    uint16_t dport;                  /* server port, host byte order */
+    uint16_t sport;                  /* actual local port, host byte order */
+    uint32_t mtu;                    /* 0 = omit IWAN_A_MTU (use module default) */
+    /* Carrier NIC binding (three modes, see docs/kernel-data-plane.md):
+     *   oif=0, bind_ip=0   bind nothing: the kernel resolves once via FIB and pins it; a broken path self-heals
+     *   oif!=0             bind NIC: strictly use this interface; failure rejects packets individually (no drift)
+     *   bind_ip!=0         bind IP: the kernel resolves via the address table the interface holding that address,
+     *                      equivalent to binding that interface; the address is also the outer header source address,
+     *                      so it must equal outer_src (the kernel rejects a mismatch with -EINVAL)
+     * When both are given they must point to the same interface (otherwise the kernel returns -EINVAL). */
+    uint32_t oif;                    /* bound carrier NIC ifindex, 0 = unbound */
+    uint32_t bind_ip;                /* bound egress IP (v4, host byte order), 0 = unbound */
+    /* Bound egress v6 address: all zero = unbound (semantics mirror bind_ip item by item: it must equal
+     * outer_src6, must be a local address, and must use the same interface when given together with oif) */
     struct in6_addr bind_ip6;
 } genl_iwan_session;
 
-/* GET_STATS 快照（诊断用；判断"有没有会话"看 sid==0 && tok==0，
- * 不要看 dev 是否为空 —— 无会话时 DEVNAME 是 "-" 而不是空串）。 */
+/* GET_STATS snapshot (for diagnostics; to decide "is there a session" check sid==0 && tok==0,
+ * not whether dev is empty -- without a session DEVNAME is "-", not an empty string). */
 typedef struct {
     uint16_t sid;
     uint32_t tok;
@@ -78,60 +78,60 @@ typedef struct {
     uint64_t rx_ctrl_frame;
     uint64_t rx_delivered;
     uint64_t tx_pkts;
-    uint64_t tx_err;                 /* 数据面在外层查找阶段丢弃的分组数
-                                      * （显式绑定不可用时只会涨这一项） */
-    /* 绑定状态（只读导出，用于对账）：请求的绑定规格 + 实际生效的承载网卡 */
-    uint32_t oif;                    /* 请求的绑定网卡，0 = 未指定 */
-    uint32_t bind_ip;                /* 请求的绑定出口 IP（v4），0 = 未指定 */
-    uint32_t carrier;                /* 实际承载网卡 ifindex，0 = 尚未解析 */
-    /* 外层 v6 会话才有效的三项：回执里"属性在不在"就是族判据
-     * （v4 会话这三个属性一个都不发） */
+    uint64_t tx_err;                 /* number of packets dropped by the data plane during outer lookup
+                                      * (this counter only grows when explicit binding is unavailable) */
+    /* Binding state (read-only export, for reconciliation): requested binding spec + actual effective carrier NIC */
+    uint32_t oif;                    /* requested binding NIC, 0 = unspecified */
+    uint32_t bind_ip;                /* requested binding egress IP (v4), 0 = unspecified */
+    uint32_t carrier;                /* actual carrier NIC ifindex, 0 = not resolved yet */
+    /* Three items valid only for outer v6 sessions: "is the attribute present" in the reply is the family criterion
+     * (a v4 session sends none of these three attributes) */
     bool     outer_v6;
     struct in6_addr outer_src6;
     struct in6_addr outer_dst6;
     struct in6_addr bind_ip6;
 } genl_iwan_stats;
 
-/* 事件回调（events 组是可选/诊断通道，见 kdp.c 的用法）。
- * ev = enum iwan_genl_event，frame = IWAN_EVA_FRAME 原始字节（可为 NULL）。 */
+/* Event callback (the events group is an optional/diagnostic channel; see usage in kdp.c).
+ * ev = enum iwan_genl_event, frame = raw IWAN_EVA_FRAME bytes (may be NULL). */
 typedef void (*genl_iwan_ev_cb)(void *ud, uint8_t ev, const uint8_t *frame,
                                 size_t len);
 
 typedef struct genl_iwan genl_iwan;
 
-/* 打开 genetlink 套接字。失败返回 NULL 并把中文原因写进 err。 */
+/* Open a genetlink socket. Returns NULL on failure and writes the reason into err. */
 genl_iwan *genl_iwan_open(char *err, size_t errsz);
 void genl_iwan_close(genl_iwan *g);
 
-/* 解析家族 id（+ 可选的 events 组 id），幂等；0 成功，负 errno 失败。 */
+/* Resolve the family id (+ optional events group id), idempotent; 0 on success, negative errno on failure. */
 int genl_iwan_resolve(genl_iwan *g, char *err, size_t errsz);
 
-/* IWAN_CMD_SESSION_UP（幂等重放）。0 成功；负 errno 失败。
+/* IWAN_CMD_SESSION_UP (idempotent replay). 0 on success; negative errno on failure.
  *
- * 成功时 dev/devsz 收到回执里的 IWAN_A_DEVNAME（属性缺失、为空或内核回了
- * 无会话占位符 "-" 时回落 "iwan0" 并记一条 log_err），mtu_out 收到实测
- * MTU（可为 NULL）。
+ * On success dev/devsz receives IWAN_A_DEVNAME from the reply (if the attribute is missing, empty, or the kernel returned
+ * the no-session placeholder "-", it falls back to "iwan0" and logs a log_err), and mtu_out receives the measured
+ * MTU (may be NULL).
  *
- * 设备归属只在这里的回执契约内处理：不回执可选的 IWAN_A_DEV_OWNED
- * 一类新增属性的值（枚举常量无法用 #ifdef 探测，硬引用会与"冻结 ABI"的
- * 编译顺序打架）；"iwan0 已被非 iwan 设备占用"由 kdp.c 的启动前
- * `ip -d link show dev iwan0` 预检 + SESSION_UP 回 -EBUSY 两条腿覆盖。 */
+ * Device ownership is handled only within the reply contract here: values of new optional attributes such as IWAN_A_DEV_OWNED are not
+ * echoed back (enum constants cannot be probed with #ifdef, and hard references would clash with the "frozen ABI"
+ * build order); "iwan0 is already taken by a non-iwan device" is covered by two legs: kdp.c's pre-startup
+ * `ip -d link show dev iwan0` precheck + SESSION_UP returning -EBUSY. */
 int genl_iwan_session_up(genl_iwan *g, const genl_iwan_session *s,
                          char *dev, size_t devsz, uint32_t *mtu_out,
                          char *err, size_t errsz);
 
-/* IWAN_CMD_SESSION_DOWN：清零凭据并删除模块创建的那张网卡。 */
+/* IWAN_CMD_SESSION_DOWN: zero the credentials and delete the NIC created by the module. */
 int genl_iwan_session_down(genl_iwan *g, char *err, size_t errsz);
 
-/* IWAN_CMD_GET_STATS（本 netns 视图）。 */
+/* IWAN_CMD_GET_STATS (view of this netns). */
 int genl_iwan_get_stats(genl_iwan *g, genl_iwan_stats *st, char *err,
                         size_t errsz);
 
-/* 可选：加入 "events" 多播组。家族没有该组或失败都只返回 -1，调用方按
- * 诊断通道处理，绝不因此判定数据面不可用。 */
+/* Optional: join the "events" multicast group. If the family has no such group or the join fails, it only returns -1; the caller treats
+ * it as a diagnostic channel and must never conclude that the data plane is unavailable because of it. */
 int genl_iwan_events_subscribe(genl_iwan *g, char *err, size_t errsz);
 
-/* 非阻塞排空已就绪的事件，逐条回调。返回处理条数，-1 表示套接字错误。 */
+/* Non-blocking drain of ready events, invoking the callback for each. Returns the number processed; -1 means a socket error. */
 int genl_iwan_events_drain(genl_iwan *g, genl_iwan_ev_cb cb, void *ud);
 
 #endif /* __linux__ */

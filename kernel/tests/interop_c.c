@@ -1,60 +1,60 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * interop_c.c — iWAN 数据面「跨实现互通」验证的 C 侧参照实现。
+ * interop_c.c - C-side reference implementation for iWAN data-plane cross-implementation interop validation.
  *
- * 配合 kernel/tests/interop_test.sh 与 kernel/tests/capture_iwan.py 使用：
- * 把内核模块（kernel/iwan_tx.c 出站封装 / kernel/iwan_rx.c 入站解封）在线上
- * 产生的字节，与本工具（走生产代码路径）产生的字节做逐字节对拍。
+ * Used together with kernel/tests/interop_test.sh and kernel/tests/capture_iwan.py:
+ * it takes the bytes the kernel module (kernel/iwan_tx.c outbound encapsulation / kernel/iwan_rx.c inbound decapsulation) produces on the wire
+ * and compares them byte by byte with the bytes this tool (which goes through the production code path) produces.
  *
- * 冻结线格式（PROTOCOL.md §2/§6/§8 与 src/common/protocol.h）：
- *   [外层 IPv4 20B][外层 UDP 8B][8B 帧头: type, enc, sid(u16 BE), tok(u32 BE)]
- *   [XOR 后的内层 IPv4 包]
- *   - 帧头 8 字节只由生产函数 pkt_hdr() 生成，本文件不自己拼字节；
- *   - XOR 只作用于**内层 IP 包整体**（含内层 IP 头），用生产函数 xor_crypt()，
- *     密钥 8 字节、按字节偏移循环；帧头与外层头不参与 XOR；
- *   - 会话密钥 = MD5(username||password) 的前 8 字节（可用 --user/--pass 让
- *     生产函数 session_key() 现场推导，而不是在脚本里硬编码）。
+ * Frozen wire format (PROTOCOL.md sec. 2/6/8 and src/common/protocol.h):
+ *   [outer IPv4 20B][outer UDP 8B][8B frame header: type, enc, sid(u16 BE), tok(u32 BE)]
+ *   [inner IPv4 packet after XOR]
+ *   - the 8-byte frame header is generated only by the production function pkt_hdr(); this file never assembles bytes itself;
+ *   - XOR applies only to the **whole inner IP packet** (including the inner IP header), via the production function xor_crypt(),
+ *     with an 8-byte key cycling by byte offset; the frame header and outer header do not take part in XOR;
+ *   - session key = first 8 bytes of MD5(username||password) (--user/--pass let the
+ *     production function session_key() derive it on the spot instead of hardcoding it in the script).
  *
- * 编译（interop_test.sh 用的就是这一行）：
+ * Build (interop_test.sh uses exactly this line):
  *   cc -O2 -std=gnu11 -D_GNU_SOURCE -Wall -Wextra -I src/common -o interop_c \
  *      kernel/tests/interop_c.c src/common/protocol.c src/common/crypto.c -lcrypto
- * -D_GNU_SOURCE 不可省：src/common/port.h 的 sendmmsg/recvmmsg/accept4 需要它，
- * 否则报 implicit declaration 直接编译失败（实测）。
- * pkt_hdr() 在 protocol.c，xor_crypt()/session_key()/md5() 在 crypto.c（后者需要
- * libcrypto 的 EVP_*）。这两个 .o 里还有本工具不调用的函数，它们引用 util.c 的
- * log_err()/oom_abort() 与 buffer.c 的 buf_put()/buf_put_u8()；本文件末尾给出
- * 等价的最小实现，避免把 util.c/port.c 的整棵依赖树拖进链接（那四个桩不会被
- * 本工具的任何一条路径执行）。
+ * -D_GNU_SOURCE cannot be omitted: sendmmsg/recvmmsg/accept4 in src/common/port.h need it,
+ * otherwise you get implicit declaration and the build fails outright (measured).
+ * pkt_hdr() is in protocol.c, xor_crypt()/session_key()/md5() are in crypto.c (the latter needs
+ * libcrypto's EVP_*). Those two .o files also contain functions this tool does not call; they reference util.c's
+ * log_err()/oom_abort() and buffer.c's buf_put()/buf_put_u8(); the end of this file provides
+ * equivalent minimal implementations, avoiding dragging util.c/port.c's whole dependency tree into the link (those four stubs are never
+ * executed by any path of this tool).
  *
- * 模式：
- *   encap  --in <内层IPv4包> --out <外层UDP载荷>
- *          载荷 = pkt_hdr() 的 8 字节 + xor_crypt(内层包)
- *   decap  --in <外层UDP载荷> --out <内层IPv4包>
- *          按 type/enc/sid/tok 校验帧头（与 pkt_hdr() 的输出逐字节比较），
- *          解密并还原内层包；内含一次 xor_crypt 往返自检
- *   mkudp  --out <内层IPv4包> [--payload-out <纯载荷>]
- *          生成确定性的内层 IPv4+UDP 包（IP/UDP 校验和按明文正确填写），
- *          用于「内容已知」的注入与投递断言
- *   cmpin  --got <文件> --want <文件> [--ignore-stack-fields]
- *          逐字节比较两个内层包；--ignore-stack-fields 跳过协议栈会改写的
- *          id/frag_off/ttl/checksum 字段（仅用于内核协议栈自己造的包），
- *          同时校验 got 的 IP 头自洽（版本/长度/校验和/未分片）
- *   outer  --out <28字节> --src <IP> --dst <IP> [--sport N] [--dport N]
+ * Modes:
+ *   encap  --in <inner IPv4 packet> --out <outer UDP payload>
+ *          payload = 8 bytes of pkt_hdr() + xor_crypt(inner packet)
+ *   decap  --in <outer UDP payload> --out <inner IPv4 packet>
+ *          validate the frame header by type/enc/sid/tok (byte by byte against pkt_hdr()'s output),
+ *          decrypt and restore the inner packet; includes one xor_crypt round-trip self-check
+ *   mkudp  --out <inner IPv4 packet> [--payload-out <raw payload>]
+ *          generate a deterministic inner IPv4+UDP packet (IP/UDP checksums filled in correctly for the plaintext),
+ *          for "known content" injection and delivery assertions
+ *   cmpin  --got <file> --want <file> [--ignore-stack-fields]
+ *          compare two inner packets byte by byte; --ignore-stack-fields skips the
+ *          id/frag_off/ttl/checksum fields the stack rewrites (only for packets built by the kernel stack itself),
+ *          and also verifies got's IP header is self-consistent (version/length/checksum/not fragmented)
+ *   outer  --out <28 bytes> --src <IP> --dst <IP> [--sport N] [--dport N]
  *          [--payload-len N] [--ttl N] [--id N] [--df 0|1]
- *          生成期望的外层 IPv4+UDP 头（外层头不属于冻结帧格式，这里按内核
- *          模块当前的构造给出期望值），并把字段以 KEY=value 打到 stdout，
- *          与 capture_iwan.py 的元数据同名，便于脚本逐字段断言
+ *          generate the expected outer IPv4+UDP header (the outer header is not part of the frozen frame format; here the expected
+ *          values follow the kernel module's current construction), and print the fields as KEY=value to stdout,
+ *          using the same names as capture_iwan.py's metadata so scripts can assert field by field
  *
- * 公共选项：
- *   --key <16位hex>        会话密钥（默认 0011223344556677，与既有测试一致）
- *   --user <U> --pass <P>  用生产 session_key() 推导密钥（覆盖 --key）
- *   --sid <u16>            默认 4660
- *   --tok <u32>            默认 3405691582
- *   --enc <0|1>            默认 1（0x18 PT_DATA_ENC + XOR；0 = 0x14 PT_DATA 明文）
- *   --quiet                不在 stderr 打印进度信息
+ * Common options:
+ *   --key <16 hex digits>  session key (default 0011223344556677, same as existing tests)
+ *   --user <U> --pass <P>  derive the key with production session_key() (overrides --key)
+ *   --sid <u16>            default 4660
+ *   --tok <u32>            default 3405691582
+ *   --enc <0|1>            default 1 (0x18 PT_DATA_ENC + XOR; 0 = 0x14 PT_DATA plaintext)
+ *   --quiet                do not print progress info to stderr
  *
- * stdout 是稳定的 KEY=value（给脚本解析），stderr 是人看的进度/诊断。
- * 失败一律退出码非 0（用法错 2，校验/比较失败 1）。
+ * stdout is stable KEY=value (for scripts to parse), stderr is human-readable progress/diagnostics.
+ * Any failure exits non-zero (usage error 2, validation/comparison failure 1).
  */
 
 #include <errno.h>
@@ -68,10 +68,10 @@
 #include "protocol.h"
 #include "util.h"
 
-/* PROTOCOL.md §10：UDP 数据报上限；内层包必须完整落在一个数据报里 */
+/* PROTOCOL.md sec. 10: UDP datagram limit; an inner packet must fit entirely in one datagram */
 #define MAX_DATAGRAM 65507
-#define MIN_INNER    20 /* 最小 IPv4 头 */
-#define OUTER_HDR    28 /* 外层 IPv4 20 + UDP 8 */
+#define MIN_INNER    20 /* minimum IPv4 header */
+#define OUTER_HDR    28 /* outer IPv4 20 + UDP 8 */
 
 #define DEF_KEY "0011223344556677"
 #define DEF_SID 4660
@@ -106,7 +106,7 @@ static _Noreturn void die(const char *fmt, ...)
 {
     va_list ap;
 
-    fputs("interop_c: 错误: ", stderr);
+    fputs("interop_c: error: ", stderr);
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
     va_end(ap);
@@ -114,7 +114,7 @@ static _Noreturn void die(const char *fmt, ...)
     exit(1);
 }
 
-/* ---------------------------------------------------------------- 小工具 */
+/* ---------------------------------------------------------------- helpers */
 
 static uint16_t get16(const uint8_t *p)
 {
@@ -141,9 +141,9 @@ static long parse_long(const char *s, long lo, long hi, const char *what)
     errno = 0;
     v = strtol(s, &end, 0);
     if (errno != 0 || !end || *end != '\0' || end == s)
-        die("%s: 不是合法整数: %s", what, s);
+        die("%s: not a valid integer: %s", what, s);
     if (v < lo || v > hi)
-        die("%s: %ld 超出范围 [%ld, %ld]", what, v, lo, hi);
+        die("%s: %ld out of range [%ld, %ld]", what, v, lo, hi);
     return v;
 }
 
@@ -163,21 +163,21 @@ static void parse_key_hex(const char *s, uint8_t key[8])
     size_t i;
 
     if (strlen(s) != 16)
-        die("--key 需要 16 位十六进制（8 字节会话密钥），得到 \"%s\"", s);
+        die("--key requires 16 hex digits (8-byte session key), got \"%s\"", s);
     for (i = 0; i < 8; i++) {
         int hi = hexval((unsigned char)s[2 * i]);
         int lo = hexval((unsigned char)s[2 * i + 1]);
 
         if (hi < 0 || lo < 0)
-            die("--key 含非十六进制字符: \"%s\"", s);
+            die("--key contains non-hex characters: \"%s\"", s);
         key[i] = (uint8_t)((hi << 4) | lo);
     }
 }
 
 static void parse_ip4(const char *s, uint8_t out[4], const char *what)
 {
-    if (!s2ip4(s, out)) /* 生产代码（protocol.c）的点分四段解析 */
-        die("%s: 不是合法 IPv4 地址: %s", what, s);
+    if (!s2ip4(s, out)) /* production code (protocol.c) dotted-quad parser */
+        die("%s: not a valid IPv4 address: %s", what, s);
 }
 
 static uint8_t *read_file(const char *path, size_t *lenp)
@@ -188,20 +188,20 @@ static uint8_t *read_file(const char *path, size_t *lenp)
 
     f = fopen(path, "rb");
     if (!f)
-        die("打开 %s 失败: %s", path, strerror(errno));
+        die("failed to open %s: %s", path, strerror(errno));
     if (fseek(f, 0, SEEK_END) != 0)
-        die("定位 %s 失败: %s", path, strerror(errno));
+        die("failed to seek %s: %s", path, strerror(errno));
     n = ftell(f);
     if (n < 0)
-        die("取 %s 长度失败: %s", path, strerror(errno));
+        die("failed to get size of %s: %s", path, strerror(errno));
     if (n > MAX_DATAGRAM)
-        die("%s: %ld 字节超过 UDP 数据报上限 %d", path, n, MAX_DATAGRAM);
+        die("%s: %ld bytes exceeds UDP datagram limit %d", path, n, MAX_DATAGRAM);
     rewind(f);
     buf = malloc(n > 0 ? (size_t)n : 1);
     if (!buf)
         oom_abort();
     if (n > 0 && fread(buf, 1, (size_t)n, f) != (size_t)n)
-        die("读取 %s 失败: %s", path, strerror(errno));
+        die("failed to read %s: %s", path, strerror(errno));
     fclose(f);
     *lenp = (size_t)n;
     return buf;
@@ -212,16 +212,16 @@ static void write_file(const char *path, const uint8_t *p, size_t n)
     FILE *f = fopen(path, "wb");
 
     if (!f)
-        die("创建 %s 失败: %s", path, strerror(errno));
+        die("failed to create %s: %s", path, strerror(errno));
     if (n > 0 && fwrite(p, 1, n, f) != n) {
         fclose(f);
-        die("写 %s 失败: %s", path, strerror(errno));
+        die("failed to write %s: %s", path, strerror(errno));
     }
     if (fclose(f) != 0)
-        die("关闭 %s 失败: %s", path, strerror(errno));
+        die("failed to close %s: %s", path, strerror(errno));
 }
 
-/* -------------------------------------------------------------- 校验和 */
+/* -------------------------------------------------------------- checksum */
 
 static uint32_t csum_add(uint32_t sum, const uint8_t *p, size_t n)
 {
@@ -241,7 +241,7 @@ static uint16_t csum_finish(uint32_t sum)
     return (uint16_t)~sum;
 }
 
-/* 1 = 校验和自洽；0 = 不合法 */
+/* 1 = checksum self-consistent; 0 = invalid */
 static int ip_csum_ok(const uint8_t *p, size_t n)
 {
     if (n < MIN_INNER)
@@ -249,7 +249,7 @@ static int ip_csum_ok(const uint8_t *p, size_t n)
     return csum_finish(csum_add(0, p, MIN_INNER)) == 0;
 }
 
-/* 1 = 校验和自洽；2 = 字段为 0（IPv4 允许"未计算"）；0 = 不合法 */
+/* 1 = checksum self-consistent; 2 = field is 0 (IPv4 allows "not computed"); 0 = invalid */
 static int udp_csum_state(const uint8_t *p, size_t n)
 {
     uint32_t s = 0;
@@ -258,7 +258,7 @@ static int udp_csum_state(const uint8_t *p, size_t n)
 
     if (n < MIN_INNER + 8 || p[9] != 17)
         return 0;
-    ulen = get16(p + 2) - MIN_INNER; /* IP tot_len - IP 头 */
+    ulen = get16(p + 2) - MIN_INNER; /* IP tot_len - IP header */
     if (ulen < 8 || ulen > n - MIN_INNER)
         return 0;
     len = get16(p + MIN_INNER + 4);
@@ -267,14 +267,14 @@ static int udp_csum_state(const uint8_t *p, size_t n)
     uc = get16(p + MIN_INNER + 6);
     if (uc == 0)
         return 2;
-    s = csum_add(s, p + 12, 8); /* 伪头：src + dst */
-    s += 17;                    /* 伪头：proto（16 位里只有低字节） */
-    s += len;                   /* 伪头：UDP 长度 */
+    s = csum_add(s, p + 12, 8); /* pseudo-header: src + dst */
+    s += 17;                    /* pseudo-header: proto (only the low byte of the 16 bits) */
+    s += len;                   /* pseudo-header: UDP length */
     s = csum_add(s, p + MIN_INNER, ulen);
     return csum_finish(s) == 0 ? 1 : 0;
 }
 
-/* ---------------------------------------------------------------- 选项 */
+/* ---------------------------------------------------------------- options */
 
 static void resolve_key(const char *key_hex, const char *user, const char *pass,
                         uint8_t key[8], char hexout[17], const char **source)
@@ -283,18 +283,18 @@ static void resolve_key(const char *key_hex, const char *user, const char *pass,
         uint8_t full[16];
 
         if (!user || !pass)
-            die("--user 与 --pass 必须成对给出");
-        if (crypto_init() != 0) /* 生产代码：libcrypto 受控初始化 */
-            die("libcrypto 初始化失败");
-        session_key(user, pass, full); /* 生产代码：MD5(username||password) */
-        memcpy(key, full, 8);          /* 数据面只用前 8 字节（PROTOCOL.md §8） */
+            die("--user and --pass must be given as a pair");
+        if (crypto_init() != 0) /* production code: controlled libcrypto init */
+            die("libcrypto initialization failed");
+        session_key(user, pass, full); /* production code: MD5(username||password) */
+        memcpy(key, full, 8);          /* data plane uses only the first 8 bytes (PROTOCOL.md sec. 8) */
         wipe(full, sizeof full);
         *source = "session_key";
     } else {
         parse_key_hex(key_hex, key);
         *source = "hex";
     }
-    hex_encode(key, 8, hexout); /* 生产代码：小写 hex */
+    hex_encode(key, 8, hexout); /* production code: lowercase hex */
 }
 
 static void check_inner(const uint8_t *p, size_t n, const char *what)
@@ -302,17 +302,17 @@ static void check_inner(const uint8_t *p, size_t n, const char *what)
     unsigned ver, ihl, tot;
 
     if (n < MIN_INNER)
-        die("%s: 只有 %zu 字节，不足一个 IPv4 头", what, n);
+        die("%s: only %zu bytes, shorter than one IPv4 header", what, n);
     ver = p[0] >> 4;
     ihl = (unsigned)(p[0] & 0x0F) * 4;
     if (ver != 4)
-        die("%s: version=%u，不是 IPv4", what, ver);
+        die("%s: version=%u, not IPv4", what, ver);
     if (ihl < MIN_INNER)
-        die("%s: ihl=%u 非法", what, ihl);
+        die("%s: ihl=%u invalid", what, ihl);
     tot = get16(p + 2);
     if (tot != n)
-        die("%s: IP tot_len=%u 与长度 %zu 不一致"
-            "（冻结格式要求一个数据报恰好是一个完整内层包）",
+        die("%s: IP tot_len=%u does not match length %zu"
+            " (the frozen format requires one datagram to be exactly one complete inner packet)",
             what, tot, n);
 }
 
@@ -343,36 +343,36 @@ static int do_encap(int argc, char **argv)
         else if (!strcmp(o, "--tok") && v) { tok = parse_long(v, 0, 4294967295L, "--tok"); a++; }
         else if (!strcmp(o, "--enc") && v) { enc = parse_long(v, 0, 1, "--enc"); a++; }
         else if (!strcmp(o, "--quiet")) { g_quiet = true; }
-        else die("encap: 未知或不完整选项 %s（--help 看用法）", o);
+        else die("encap: unknown or incomplete option %s (see --help for usage)", o);
     }
     if (!in || !out)
-        die("encap 需要 --in <内层IPv4包> --out <外层UDP载荷>");
+        die("encap requires --in <inner IPv4 packet> --out <outer UDP payload>");
 
     resolve_key(key_hex, user, pass, key, hexout, &ksrc);
 
     inner = read_file(in, &n);
     check_inner(inner, n, "--in");
     if (n + IWAN_HDR_LEN > MAX_DATAGRAM)
-        die("--in: %zu 字节 + 8 字节帧头超过 UDP 数据报上限 %d",
+        die("--in: %zu bytes + 8-byte frame header exceeds UDP datagram limit %d",
             n, MAX_DATAGRAM);
 
     frame = malloc(IWAN_HDR_LEN + n);
     if (!frame)
         oom_abort();
-    /* ① 生产代码构造 8 字节帧头（type/enc/sid BE/tok BE） */
+    /* (1) production code builds the 8-byte frame header (type/enc/sid BE/tok BE) */
     pkt_hdr(enc ? (uint8_t)PT_DATA_ENC : (uint8_t)PT_DATA, (uint8_t)enc,
             (uint16_t)sid, (uint32_t)tok, frame);
-    /* ② 只 XOR 内层 IP 包整体（含内层 IP 头），从包首偏移 0 开始循环密钥 */
+    /* (2) XOR only the whole inner IP packet (including the inner IP header), cycling the key from packet offset 0 */
     memcpy(frame + IWAN_HDR_LEN, inner, n);
     xor_crypt(frame + IWAN_HDR_LEN, n, key, 8);
 
     write_file(out, frame, IWAN_HDR_LEN + n);
 
-    /* 自检：帧头必须与 pkt_hdr() 的输出逐字节一致（这里再生成一次比较） */
+    /* self-check: the frame header must match pkt_hdr() output byte by byte (regenerated here to compare) */
     pkt_hdr(enc ? (uint8_t)PT_DATA_ENC : (uint8_t)PT_DATA, (uint8_t)enc,
             (uint16_t)sid, (uint32_t)tok, want);
     if (memcmp(frame, want, IWAN_HDR_LEN) != 0)
-        die("内部不一致：帧头与 pkt_hdr() 输出不同");
+        die("internal inconsistency: frame header differs from pkt_hdr() output");
 
     printf("MODE=encap\n");
     printf("INNER_BYTES=%zu\n", n);
@@ -386,7 +386,7 @@ static int do_encap(int argc, char **argv)
     printf("INNER_IP_CSUM_OK=%d\n", ip_csum_ok(inner, n));
     printf("INNER_UDP_CSUM_STATE=%d\n", udp_csum_state(inner, n));
     hex_encode(frame, IWAN_HDR_LEN, hdrhex);
-    info("帧头字节: %s", hdrhex);
+    info("frame header bytes: %s", hdrhex);
 
     free(frame);
     free(inner);
@@ -419,23 +419,23 @@ static int do_decap(int argc, char **argv)
         else if (!strcmp(o, "--tok") && v) { tok = parse_long(v, 0, 4294967295L, "--tok"); a++; }
         else if (!strcmp(o, "--enc") && v) { enc = parse_long(v, 0, 1, "--enc"); a++; }
         else if (!strcmp(o, "--quiet")) { g_quiet = true; }
-        else die("decap: 未知或不完整选项 %s（--help 看用法）", o);
+        else die("decap: unknown or incomplete option %s (see --help for usage)", o);
     }
     if (!in || !out)
-        die("decap 需要 --in <外层UDP载荷> --out <内层IPv4包>");
+        die("decap requires --in <outer UDP payload> --out <inner IPv4 packet>");
 
     resolve_key(key_hex, user, pass, key, hexout, &ksrc);
 
     frame = read_file(in, &n);
     if (n < IWAN_HDR_LEN + MIN_INNER)
-        die("--in: 只有 %zu 字节，不足 8 字节帧头 + 一个 IPv4 头", n);
+        die("--in: only %zu bytes, shorter than an 8-byte frame header + an IPv4 header", n);
 
-    /* 帧头校验：直接与生产 pkt_hdr() 的输出比较（type/enc/sid BE/tok BE） */
+    /* frame header check: compare directly against production pkt_hdr() output (type/enc/sid BE/tok BE) */
     pkt_hdr(enc ? (uint8_t)PT_DATA_ENC : (uint8_t)PT_DATA, (uint8_t)enc,
             (uint16_t)sid, (uint32_t)tok, want);
     if (memcmp(frame, want, IWAN_HDR_LEN) != 0) {
-        die("帧头不符: 收到 type=0x%02x enc=%u sid=%u tok=%lu，"
-            "期望 type=0x%02x enc=%ld sid=%ld tok=%ld",
+        die("frame header mismatch: got type=0x%02x enc=%u sid=%u tok=%lu, "
+            "expected type=0x%02x enc=%ld sid=%ld tok=%ld",
             frame[0], frame[1], get16(frame + 2),
             (unsigned long)get32(frame + 4),
             want[0], enc, sid, tok);
@@ -447,14 +447,14 @@ static int do_decap(int argc, char **argv)
     if (!inner || !again)
         oom_abort();
     memcpy(inner, frame + IWAN_HDR_LEN, inner_len);
-    xor_crypt(inner, inner_len, key, 8); /* 生产代码解密 */
-    check_inner(inner, inner_len, "解出的内层包");
+    xor_crypt(inner, inner_len, key, 8); /* production code decryption */
+    check_inner(inner, inner_len, "decapsulated inner packet");
 
-    /* 往返自检：同一个生产函数再加密一次必须逐字节还原成输入帧的载荷 */
+    /* round-trip self-check: encrypting once more with the same production function must restore the input frame's payload byte by byte */
     memcpy(again, inner, inner_len);
     xor_crypt(again, inner_len, key, 8);
     if (memcmp(again, frame + IWAN_HDR_LEN, inner_len) != 0)
-        die("往返自检失败：xor_crypt 在同一输入上不是对合");
+        die("round-trip self-check failed: xor_crypt is not an involution on the same input");
 
     write_file(out, inner, inner_len);
 
@@ -479,7 +479,7 @@ static int do_decap(int argc, char **argv)
     printf("INNER_IP_CSUM_OK=%d\n", ip_csum_ok(inner, inner_len));
     printf("INNER_UDP_CSUM_STATE=%d\n", udp_csum_state(inner, inner_len));
     printf("ROUNDTRIP=1\n");
-    info("帧头校验通过，解出 %zu 字节内层包（%s -> %s proto=%u）",
+    info("frame header check passed, decapsulated a %zu-byte inner packet (%s -> %s proto=%u)",
          inner_len, ip_s, ip_d, inner[9]);
 
     free(again);
@@ -520,18 +520,18 @@ static int do_mkudp(int argc, char **argv)
         else if (!strcmp(o, "--payload-hex") && v) { phex = v; a++; }
         else if (!strcmp(o, "--payload-str") && v) { pstr = v; a++; }
         else if (!strcmp(o, "--quiet")) { g_quiet = true; }
-        else die("mkudp: 未知或不完整选项 %s（--help 看用法）", o);
+        else die("mkudp: unknown or incomplete option %s (see --help for usage)", o);
     }
     if (!out)
-        die("mkudp 需要 --out <内层IPv4包>");
+        die("mkudp requires --out <inner IPv4 packet>");
     if (phex && pstr)
-        die("--payload-hex 与 --payload-str 只能给一个");
+        die("only one of --payload-hex and --payload-str may be given");
 
     if (phex) {
         size_t hl = strlen(phex);
 
         if (hl % 2)
-            die("--payload-hex 长度必须是偶数");
+            die("--payload-hex length must be even");
         plen = hl / 2;
         payload = malloc(plen > 0 ? plen : 1);
         if (!payload)
@@ -549,7 +549,7 @@ static int do_mkudp(int argc, char **argv)
                     vl = (int)k;
             }
             if (vh < 0 || vl < 0)
-                die("--payload-hex 含非十六进制字符");
+                die("--payload-hex contains non-hex characters");
             hi = (unsigned)vh;
             lo = (unsigned)vl;
             payload[i] = (uint8_t)((hi << 4) | lo);
@@ -561,7 +561,7 @@ static int do_mkudp(int argc, char **argv)
             oom_abort();
         memcpy(payload, pstr, plen);
     } else {
-        /* 确定性图案，与 kernel/tests/echo_net.py 的 PAT 相同：(i*7+3)&0xFF */
+        /* deterministic pattern, same as PAT in kernel/tests/echo_net.py: (i*7+3)&0xFF */
         plen = plen_opt >= 0 ? (size_t)plen_opt : 32;
         payload = malloc(plen > 0 ? plen : 1);
         if (!payload)
@@ -570,7 +570,7 @@ static int do_mkudp(int argc, char **argv)
             payload[i] = (uint8_t)((i * 7 + 3) & 0xFF);
     }
     if (plen > 65479)
-        die("载荷 %zu 字节太大（内层上限 65479 = 65507 - 20 - 8）", plen);
+        die("payload of %zu bytes is too large (inner limit 65479 = 65507 - 20 - 8)", plen);
 
     parse_ip4(src_s, src, "--src");
     parse_ip4(dst_s, dst, "--dst");
@@ -580,7 +580,7 @@ static int do_mkudp(int argc, char **argv)
     if (!pkt)
         oom_abort();
 
-    /* 内层 IPv4 头（明文语义：校验和按明文算，XOR 后仍自洽） */
+    /* inner IPv4 header (plaintext semantics: checksum computed over the plaintext, still self-consistent after XOR) */
     pkt[0] = 0x45;
     pkt[1] = 0x00; /* TOS */
     put16(pkt + 2, (uint16_t)total);
@@ -593,7 +593,7 @@ static int do_mkudp(int argc, char **argv)
     memcpy(pkt + 16, dst, 4);
     put16(pkt + 10, csum_finish(csum_add(0, pkt, MIN_INNER)));
 
-    /* 内层 UDP 头 + 载荷 */
+    /* inner UDP header + payload */
     put16(pkt + 20, (uint16_t)sport);
     put16(pkt + 22, (uint16_t)dport);
     put16(pkt + 24, (uint16_t)(8 + plen));
@@ -601,14 +601,14 @@ static int do_mkudp(int argc, char **argv)
     if (plen)
         memcpy(pkt + 28, payload, plen);
 
-    /* UDP 校验和 = 伪头(src,dst,0,proto,len) + UDP 头(csum=0) + 载荷 */
+    /* UDP checksum = pseudo-header(src,dst,0,proto,len) + UDP header(csum=0) + payload */
     s = csum_add(0, pkt + 12, 8);
     s += 17;
     s += (uint32_t)(8 + plen);
     s = csum_add(s, pkt + 20, 8 + plen);
     uc = csum_finish(s);
     if (uc == 0)
-        uc = 0xFFFF; /* 0 表示"未计算"，算出来是 0 必须写成 0xFFFF */
+        uc = 0xFFFF; /* 0 means "not computed"; if the result comes out 0 it must be written as 0xFFFF */
     put16(pkt + 26, uc);
 
     write_file(out, pkt, total);
@@ -634,7 +634,7 @@ static int do_mkudp(int argc, char **argv)
     printf("PAYLOAD_BYTES=%zu\n", plen);
     if (payload_out)
         printf("PAYLOAD_FILE=%s\n", payload_out);
-    info("生成内层包 %zu 字节（%s:%ld -> %s:%ld，载荷 %zu 字节）",
+    info("generated a %zu-byte inner packet (%s:%ld -> %s:%ld, payload %zu bytes)",
          total, src_s, sport, dst_s, dport, plen);
 
     free(pkt);
@@ -660,30 +660,30 @@ static int do_cmpin(int argc, char **argv)
         else if (!strcmp(o, "--want") && v) { want_f = v; a++; }
         else if (!strcmp(o, "--ignore-stack-fields")) { ignore_stack = true; }
         else if (!strcmp(o, "--quiet")) { g_quiet = true; }
-        else die("cmpin: 未知或不完整选项 %s（--help 看用法）", o);
+        else die("cmpin: unknown or incomplete option %s (see --help for usage)", o);
     }
     if (!got_f || !want_f)
-        die("cmpin 需要 --got <文件> --want <文件>");
+        die("cmpin requires --got <file> --want <file>");
 
     got = read_file(got_f, &gn);
     want = read_file(want_f, &wn);
 
-    /* got 的自洽检查：版本/长度/未分片/IP 头校验和 */
+    /* got self-consistency checks: version/length/no fragmentation/IP header checksum */
     if (gn < MIN_INNER || (got[0] >> 4) != 4 || (got[0] & 0x0F) < 5)
-        die("%s: 不是合法 IPv4 包", got_f);
+        die("%s: not a valid IPv4 packet", got_f);
     if ((got[0] & 0x0F) != 5)
-        die("%s: ihl=%u（本工具只比较无选项的 IPv4 头）", got_f,
+        die("%s: ihl=%u (this tool only compares IPv4 headers without options)", got_f,
             (unsigned)(got[0] & 0x0F));
     if ((size_t)get16(got + 2) != gn)
-        die("%s: IP tot_len=%u 与文件长度 %zu 不一致", got_f,
+        die("%s: IP tot_len=%u does not match file length %zu", got_f,
             (unsigned)get16(got + 2), gn);
     if (get16(got + 6) & 0x3FFF)
-        die("%s: 内层包带分片（frag_off=0x%04x）", got_f,
+        die("%s: inner packet is fragmented (frag_off=0x%04x)", got_f,
             (unsigned)get16(got + 6));
     if (!ip_csum_ok(got, gn))
-        die("%s: IP 头校验和不自洽（解封后的明文已被破坏？）", got_f);
+        die("%s: IP header checksum is not self-consistent (plaintext corrupted after decapsulation?)", got_f);
     if (got[9] == 17 && udp_csum_state(got, gn) == 0)
-        die("%s: 内层 UDP 长度/校验和不自洽", got_f);
+        die("%s: inner UDP length/checksum is not self-consistent", got_f);
 
     printf("MODE=cmpin\n");
     printf("GOT_BYTES=%zu\n", gn);
@@ -704,7 +704,7 @@ static int do_cmpin(int argc, char **argv)
     if (gn != wn) {
         printf("RESULT=diff\n");
         printf("DIFF_OFFSET=-1\n");
-        info("长度不同：got=%zu want=%zu", gn, wn);
+        info("lengths differ: got=%zu want=%zu", gn, wn);
         free(got);
         free(want);
         return 1;
@@ -712,8 +712,8 @@ static int do_cmpin(int argc, char **argv)
 
     for (i = 0; i < gn; i++) {
         if (ignore_stack) {
-            /* 协议栈会自己填的字段：id(8,9) frag_off(10,11) ttl(12)
-             * IP 头校验和(16..19)；其余字节必须逐字节相同 */
+            /* fields the stack fills in itself: id(8,9) frag_off(10,11) ttl(12)
+             * IP header checksum(16..19); all other bytes must be identical byte for byte */
             if (i == 8 || i == 9 || i == 10 || i == 11 || i == 12 ||
                 (i >= 16 && i <= 19))
                 continue;
@@ -726,8 +726,8 @@ static int do_cmpin(int argc, char **argv)
 
     if (diff < 0) {
         printf("RESULT=ok\n");
-        info("逐字节一致：%zu 字节%s", gn,
-             ignore_stack ? "（已跳过 id/frag_off/ttl/校验和）" : "");
+        info("byte-for-byte identical: %zu bytes%s", gn,
+             ignore_stack ? " (skipped id/frag_off/ttl/checksum)" : "");
         free(got);
         free(want);
         return 0;
@@ -737,7 +737,7 @@ static int do_cmpin(int argc, char **argv)
     printf("DIFF_OFFSET=%d\n", diff);
     printf("GOT_BYTE=0x%02x\n", (unsigned)got[diff]);
     printf("WANT_BYTE=0x%02x\n", (unsigned)want[diff]);
-    info("首个差异在偏移 %d：got=0x%02x want=0x%02x", diff,
+    info("first difference at offset %d: got=0x%02x want=0x%02x", diff,
          (unsigned)got[diff], (unsigned)want[diff]);
     free(got);
     free(want);
@@ -768,23 +768,23 @@ static int do_outer(int argc, char **argv)
         else if (!strcmp(o, "--df") && v) { df = parse_long(v, 0, 1, "--df"); a++; }
         else if (!strcmp(o, "--payload-len") && v) { paylen = parse_long(v, 0, 65479, "--payload-len"); a++; }
         else if (!strcmp(o, "--quiet")) { g_quiet = true; }
-        else die("outer: 未知或不完整选项 %s（--help 看用法）", o);
+        else die("outer: unknown or incomplete option %s (see --help for usage)", o);
     }
     if (!out || !src_s || !dst_s)
-        die("outer 需要 --out <28字节头文件> --src <IP> --dst <IP>");
+        die("outer requires --out <28-byte header file> --src <IP> --dst <IP>");
 
     parse_ip4(src_s, src, "--src");
     parse_ip4(dst_s, dst, "--dst");
-    /* 模块的 iwan_tx.c: sport = cfg.sport ? cfg.sport : cfg.dport */
+    /* module's iwan_tx.c: sport = cfg.sport ? cfg.sport : cfg.dport */
     sport_v = (uint16_t)(sport >= 0 ? sport : dport);
     udplen = (uint16_t)(8 + paylen);
     iplen = (uint16_t)(MIN_INNER + udplen);
     if (iplen < MIN_INNER)
-        die("外层 IP 总长溢出");
+        die("outer IP total length overflow");
 
-    /* 外层头不属于冻结帧格式；这里镜像内核模块当前的构造：
-     * version=4 ihl=5 tos=0 id=0 ttl=64 proto=UDP，DF 由 --df（模块默认 1），
-     * 端口与地址一律**大端**（这正是历史上出过字节序缺陷的地方）。 */
+    /* the outer header is not part of the frozen frame format; this mirrors the kernel module's current construction:
+     * version=4 ihl=5 tos=0 id=0 ttl=64 proto=UDP, DF from --df (module default 1),
+     * ports and addresses are always **big-endian** (this is exactly where byte-order bugs occurred historically). */
     memset(hdr, 0, sizeof hdr);
     hdr[0] = 0x45;
     put16(hdr + 2, iplen);
@@ -798,8 +798,8 @@ static int do_outer(int argc, char **argv)
     put16(hdr + 20, sport_v);
     put16(hdr + 22, (uint16_t)dport);
     put16(hdr + 24, udplen);
-    put16(hdr + 26, 0); /* UDP 校验和留 0：veth 的 HW_CSUM 卸载下抓到的值可能是
-                         * 部分和，不参与逐字节比较（脚本只比较前 26 字节） */
+    put16(hdr + 26, 0); /* leave UDP checksum 0: under veth's HW_CSUM offload the captured value may be a
+                         * partial sum and does not take part in the byte-by-byte comparison (the script only compares the first 26 bytes) */
 
     write_file(out, hdr, sizeof hdr);
 
@@ -816,7 +816,7 @@ static int do_outer(int argc, char **argv)
     printf("OUTER_UDP_SPORT=%u\n", sport_v);
     printf("OUTER_UDP_DPORT=%ld\n", dport);
     printf("OUTER_UDP_LEN=%u\n", udplen);
-    info("期望外层头：%s:%u -> %s:%ld proto=17 DF=%ld tot_len=%u（UDP 校验和置 0，不比较）",
+    info("expected outer header: %s:%u -> %s:%ld proto=17 DF=%ld tot_len=%u (UDP checksum set to 0, not compared)",
          src_s, sport_v, dst_s, dport, df, iplen);
     return 0;
 }
@@ -826,18 +826,18 @@ static int do_outer(int argc, char **argv)
 static _Noreturn void usage(int rc)
 {
     fprintf(rc ? stderr : stdout,
-        "用法:\n"
-        "  interop_c encap --in <内层IPv4包> --out <外层UDP载荷> [公共选项]\n"
-        "  interop_c decap --in <外层UDP载荷> --out <内层IPv4包> [公共选项]\n"
-        "  interop_c mkudp --out <内层IPv4包> [--payload-out <纯载荷>] [选项]\n"
-        "  interop_c cmpin --got <文件> --want <文件> [--ignore-stack-fields]\n"
-        "  interop_c outer --out <28字节头> --src <IP> --dst <IP> [选项]\n"
+        "usage:\n"
+        "  interop_c encap --in <inner IPv4 packet> --out <outer UDP payload> [common options]\n"
+        "  interop_c decap --in <outer UDP payload> --out <inner IPv4 packet> [common options]\n"
+        "  interop_c mkudp --out <inner IPv4 packet> [--payload-out <raw payload>] [options]\n"
+        "  interop_c cmpin --got <file> --want <file> [--ignore-stack-fields]\n"
+        "  interop_c outer --out <28-byte header> --src <IP> --dst <IP> [options]\n"
         "\n"
-        "公共选项: --key <16位hex> | --user <U> --pass <P>（生产 session_key()）\n"
+        "common options: --key <16 hex digits> | --user <U> --pass <P> (production session_key())\n"
         "          --sid <u16> --tok <u32> --enc <0|1> --quiet\n"
-        "mkudp 选项: --src --dst --sport --dport --ttl --id --df\n"
+        "mkudp options: --src --dst --sport --dport --ttl --id --df\n"
         "            --payload-len <N> | --payload-hex <hex> | --payload-str <s>\n"
-        "outer 选项: --sport --dport --payload-len --ttl --id --df\n");
+        "outer options: --sport --dport --payload-len --ttl --id --df\n");
     exit(rc);
 }
 
@@ -859,16 +859,16 @@ int main(int argc, char **argv)
     if (!strcmp(argv[1], "outer"))
         return do_outer(argc - 2, argv + 2);
 
-    fprintf(stderr, "interop_c: 未知模式 %s\n", argv[1]);
+    fprintf(stderr, "interop_c: unknown mode %s\n", argv[1]);
     usage(2);
 }
 
-/* ---------------------------------------------------------------- 链接桩
+/* ---------------------------------------------------------------- link stubs
  *
- * 下面四个函数是 protocol.c / crypto.c 里**本工具不调用**的函数所引用的符号。
- * 定义它们（而不是链接 util.c + buffer.c）是为了让这个测试工具的依赖只有
- * libcrypto：util.c/port.c 会把整个用户态平台层拖进来（socket/线程/配置…），
- * 与「只验证线格式」的目标无关。本工具的代码路径不会执行到它们。
+ * The four functions below are symbols referenced by functions in protocol.c / crypto.c that **this tool does not call**.
+ * Defining them (instead of linking util.c + buffer.c) keeps this test tool's dependencies to
+ * libcrypto only: util.c/port.c would drag in the whole user-space platform layer (socket/thread/config...),
+ * which is unrelated to the goal of "verifying only the wire format". This tool's code paths never reach them.
  */
 void log_err(const char *fmt, ...)
 {
@@ -883,7 +883,7 @@ void log_err(const char *fmt, ...)
 
 _Noreturn void oom_abort(void)
 {
-    fputs("interop_c: 内存分配失败\n", stderr);
+    fputs("interop_c: memory allocation failed\n", stderr);
     abort();
 }
 
@@ -892,7 +892,7 @@ void buf_put(buf_t *b, const void *p, size_t n)
     (void)b;
     (void)p;
     (void)n;
-    fputs("interop_c: 不该走到这里（buf_put 桩）\n", stderr);
+    fputs("interop_c: should never get here (buf_put stub)\n", stderr);
     abort();
 }
 
@@ -900,6 +900,6 @@ void buf_put_u8(buf_t *b, uint8_t v)
 {
     (void)b;
     (void)v;
-    fputs("interop_c: 不该走到这里（buf_put_u8 桩）\n", stderr);
+    fputs("interop_c: should never get here (buf_put_u8 stub)\n", stderr);
     abort();
 }

@@ -21,7 +21,7 @@
 
 /* A UAC-relaunched console app (port_elevate_self sets
  * IWAN_ELEVATED_RELAUNCH) owns a console window that Windows closes
- * the moment the process exits — taking any error message with it.
+ * the moment the process exits - taking any error message with it.
  * Hold the window open on failure so the user can read the error. */
 void oidc_pause_if_relaunched(void)
 {

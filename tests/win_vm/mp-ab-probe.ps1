@@ -1,16 +1,21 @@
-﻿# 内层适配器 OPEN 探针：把 vm-rx.ps1 包一层，只测会话建立与保持。
+# Inner adapter OPEN probe: wraps vm-rx.ps1, only tests session setup and keepalive.
 #
-# 单独成文件而不是内联在 vm-mp-full.ps1 里，是因为它要用不同的命令行参数
-# 反复跑（媒介形状、承载 GUID、保持秒数），内联的 here-string 一旦有引号
-# 就会在 ssh -> cmd -> powershell 三层转义里变形（踩过多次）。
+# Separate file instead of inline in vm-mp-full.ps1 because it is run repeatedly with different
+# command-line arguments (medium shape, carrier GUID, hold seconds); an inline here-string with quotes
+# gets mangled through ssh -> cmd -> powershell triple escaping (hit this several times).
 param(
     [switch]$GetOnly,
     [int]$HoldSeconds = 0,
     [int]$OifIndex = 0,
     [string]$OuterIfGuid = '',
-    # 内层 ping 次数。扫媒介形状时它是"这个形状能不能发出去"的唯一判据：
-    # 能发时 tx_pkts 才会动（会话已开、包已进封装）。
-    [int]$PingCount = 0
+    # Inner ping count. When sweeping medium shapes it is the only criterion for "can this shape send at all":
+    # tx_pkts moves only when sending works (session open, packets encapsulated).
+    [int]$PingCount = 0,
+    # Outer peer. Default goes through slirp to the host (10.0.2.2); using the guest's own address becomes "guest-internal carrier",
+    # used to measure the driver's own ceiling (not limited by slirp's ~286 Mbps single-flow ceiling).
+    [string]$PeerIp = '10.0.2.2',
+    [string]$LocalIp = '',
+    [int]$PeerPort = 45678
 )
 $ErrorActionPreference = 'Continue'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -32,7 +37,7 @@ $rxArgs = @{
     InnerIp = '10.99.0.1'; Target = '10.99.0.2'; InnerMtu = 1400
     CarrierMtu = 1500; OifIndex = $oif; OuterHop = 0
     OuterIfGuid = $OuterIfGuid
-    PeerIp = '10.0.2.2'; PeerPort = 45678; PingCount = $PingCount
+    PeerIp = $PeerIp; PeerPort = $PeerPort; PingCount = $PingCount; LocalIp = $LocalIp
     Inject = (-not $GetOnly); SkipSelfTest = $true; ShmDump = $true
     HoldSeconds = $HoldSeconds
 }

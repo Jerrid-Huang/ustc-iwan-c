@@ -47,7 +47,7 @@ atomic_uint_fast64_t g_prof_tun_rbig;       /* wintun packets > 1508B */
 atomic_uint_fast64_t g_prof_tun_rdrop;      /* wintun packets > PUMP_SLOT */
 _Atomic uint32_t g_prof_tun_rmax;       /* max wintun packet len (B) */
 
-/* C4: profiler collection gate — parsed once (first call), read on the
+/* C4: profiler collection gate -- parsed once (first call), read on the
  * per-packet hot path via pump_prof_on(). IWAN_DEBUG_STRIP builds never
  * collect (the env var is never parsed). */
 atomic_int g_pump_prof_on;
@@ -139,25 +139,21 @@ atomic_uint_fast64_t g_prof_pump_tx, g_prof_pump_rx;   /* [prof] tunnel bytes */
  * smaller than the frame, the kernel would split the 24-byte control
  * packet into several datagrams and the server would drop the corrupt
  * frame (same hazard send_batch documents for the per-message path). */
-static int send_ctrl(pump_ctx_t *ctx, uint8_t typ, uint8_t enc, uint16_t sid,
-                     uint32_t tok) {
-    buf_t pkt;
-    buf_init(&pkt);
-    ctrl_hdr(&pkt, typ, enc, sid, tok);
-    size_t want = pkt.len;
+/* Send the already-assembled control frame. GSO must be disabled (24/60 bytes
+ * are not MSS multiples) and the previous mss restored after: C1's lag strategy avoids hot-path probing. */
+static int send_frame(pump_ctx_t *ctx, const buf_t *pkt)
+{
+    size_t want = pkt->len;
+    ssize_t r;
     pthread_mutex_lock(&ctx->send_lock);
     {
-        /* clear is required (a 24B frame is not an mss multiple), but
-         * C1: re-arm the PREVIOUS mss afterwards instead of leaving the
-         * socket bare — the next batch then does not re-probe/re-arm on
-         * the hot path */
         size_t armed = ctx->gso_mss;
         if (armed != 0) {
             int z = 0;
             port_setsockopt(ctx->sockfd, SOL_UDP, UDP_SEGMENT, &z, sizeof z);
             ctx->gso_mss = 0;
         }
-        ssize_t r = port_send(ctx->sockfd, pkt.data, want, 0);
+        r = port_send(ctx->sockfd, pkt->data, want, 0);
         if (armed != 0) {
             int m = (int)armed;
             if (port_setsockopt(ctx->sockfd, SOL_UDP, UDP_SEGMENT, &m,
@@ -167,32 +163,67 @@ static int send_ctrl(pump_ctx_t *ctx, uint8_t typ, uint8_t enc, uint16_t sid,
             /* re-arm failed: leave gso_mss 0; the next batch re-probes
              * via udp_gso_prepare as before */
         }
-        pthread_mutex_unlock(&ctx->send_lock);
-        buf_free(&pkt);
-        if (r < 0 || (size_t)r != want)
-            return -1;
-        return 0;
     }
+    pthread_mutex_unlock(&ctx->send_lock);
+    if (r < 0 || (size_t)r != want)
+        return -1;
+    return 0;
+}
+
+static int send_ctrl(pump_ctx_t *ctx, uint8_t typ, uint8_t enc, uint16_t sid,
+                     uint32_t tok)
+{
+    buf_t pkt;
+    int rc;
+
+    buf_init(&pkt);
+    ctrl_hdr(&pkt, typ, enc, sid, tok);
+    rc = send_frame(ctx, &pkt);
+    buf_free(&pkt);
+    return rc;
+}
+
+/* Panabit ECHOREQ/ECHORES: 8B header + 16B signature + 36B payload. The tick
+ * in the payload lets the peer compute latency after a verbatim echo; a non-NULL reply echoes the full request payload. */
+static int send_echo(pump_ctx_t *ctx, uint8_t typ, const uint8_t *reply,
+                     size_t reply_len)
+{
+    buf_t pkt;
+    int rc;
+
+    buf_init(&pkt);
+    if (typ == PT_ECHO_REQ) {
+        /* Measured on the official client: the ECHO frame header's encrypt bit is always 0 */
+        iwan_echo_build(&pkt, typ, 0, ctx->sid, ctx->tok,
+                        &ctx->echo, now_us());
+    } else {
+        ctrl_hdr(&pkt, typ, ctx->enc, ctx->sid, ctx->tok);
+        if (reply != NULL && reply_len != 0)
+            buf_put(&pkt, reply, reply_len);
+    }
+    rc = send_frame(ctx, &pkt);
+    buf_free(&pkt);
+    return rc;
 }
 
 #define PUMP_BATCH 32
 #define PUMP_SLOT  2048
-/* PUMP_SLOT 是槽位**下限**，不是上限：槽位尺寸由协商出的内层 MTU 决定
- * （pump_slot_init）。历史实现把它当上限用，于是大 MTU 会话的内层分组在
- * 入队处被 log_debug 级静默丢弃 —— 2026-10-07 实测内层 MTU 60000 时 TCP
- * 两向 100% 不通而日志无痕。现在按 MTU 定尺，并把批数相应减少，使每队列
- * 缓冲仍约 64 KiB 量级；MTU<=2040 时与原行为逐字节一致。 */
-#define PUMP_KEEPALIVE_MS 10000u
-/* keepalive send must fail this many times in a row before the tunnel
- * is declared dead: a transient network blip (wifi roam, carrier
- * hiccup) must not kill the session, while a persistent failure means
- * the socket is gone */
-#define PUMP_KA_FAIL_MAX 3
+/* PUMP_SLOT is the slot **lower bound**, not an upper bound: slot size is set by the negotiated inner MTU
+ * (pump_slot_init). The old code treated it as an upper bound, so large-MTU inner packets were silently dropped
+ * at enqueue at log_debug -- measured 2026-10-07 with inner MTU 60000: TCP failed 100% both ways, no log trace.
+ * Now sized by MTU with proportionally fewer batches to keep each queue buffer at ~64 KiB; still byte-identical
+ * to the old behavior for MTU<=2040. */
+/* Keepalive probe interval: same as the official client, one ECHOREQ every 2 s
+ * (IWAN_ECHO_INTERVAL_MS). Only governs the send cadence. */
+#define PUMP_KEEPALIVE_MS IWAN_ECHO_INTERVAL_MS
+/* Death window: the official client resets only after 30 s without a valid frame;
+ * with a 2 s send period this folds into 30/2=15 consecutive failures, equivalent to the old 10 s x 3. */
+#define PUMP_KA_FAIL_MAX 15
 /* R54-WG4-1 (C3): consecutive poll_error-only rounds (revents has
  * POLLERR/POLLHUP but no POLLIN) before the no-data poll/recv pair is
  * declared session loss. Linux consumes each pending ICMP error on the
  * next recvmmsg (ECONNREFUSED), so one error = one poll/recv pair =
- * network-paced, not a hot spin — but a state that keeps producing
+ * network-paced, not a hot spin -- but a state that keeps producing
  * error polls without ever yielding a datagram must terminate instead
  * of spinning the pump; 64 is far above any legitimate burst before
  * the error bit clears. */
@@ -209,7 +240,7 @@ static int send_ctrl(pump_ctx_t *ctx, uint8_t typ, uint8_t enc, uint16_t sid,
  *
  * 120s (not 60s): the USTC servers answer every ECHO_REQ, so a long
  * downlink silence means the return path is dropping UDP, not that the
- * session died — and the 60s default caused spurious reconnects on the
+ * session died -- and the 60s default caused spurious reconnects on the
  * mobile line (6 consecutive keepalives lost inside one window), which
  * the Rust reference client never exhibits (it has no downlink-stale
  * check at all). 120s = 12 consecutive unanswered keepalives. */
@@ -218,22 +249,42 @@ static int send_ctrl(pump_ctx_t *ctx, uint8_t typ, uint8_t enc, uint16_t sid,
 /* parsed once per process: the pump loop would otherwise re-run
  * getenv+strtoul on every iteration; 0 disables the watchdog (aligned
  * with the README contract and socks.c) */
-unsigned pump_rx_stale_ms(void)
+unsigned pump_rx_stale_ms(void);
+
+/* Same criteria as socks.c: use the official 15 s data timeout only when the peer
+ * really answers keepalives (an ECHORESP was received); otherwise fall back to
+ * 120 s (relays that ignore keepalives). Explicit IWAN_RX_STALE_MS always wins; 0 disables the watchdog. */
+static unsigned pump_stale_window(bool peer_echoes)
 {
     static unsigned cached;
     static int parsed;
+    static bool explicit_env;
 
-    if (parsed)
-        return cached;
+    if (parsed) {
+        if (explicit_env)
+            return cached;
+        return peer_echoes ? (unsigned)IWAN_DATA_TIMEOUT_MS : cached;
+    }
     parsed = 1;
+    explicit_env = getenv("IWAN_RX_STALE_MS") != NULL;
     cached = (unsigned)env_ms_range("IWAN_RX_STALE_MS",
                                     PUMP_RX_STALE_MS_DEFAULT,
                                     3 * (long long)PUMP_KEEPALIVE_MS,
                                     86400000, 1, "(0 to disable, "
-                                                 "30s..24h)");
-    return cached;
+                                                 "6s..24h)");
+    if (explicit_env)
+        return cached;
+    return peer_echoes ? (unsigned)IWAN_DATA_TIMEOUT_MS : cached;
 }
 
+unsigned pump_rx_stale_ms(void)
+{
+    return pump_stale_window(false);
+}
+
+/* In-place re-auth/reconnect backoff: decoupled from keepalive cadence, kept at
+ * 10 s to avoid a re-OPEN storm every 2 s. */
+#define PUMP_REAUTH_MS 10000u
 /* Liveness-contract accessors shared with the kernel data plane supervisor
  * (src/common/kdp.c, Linux-only): the two data planes must agree on the
  * keepalive cadence and the consecutive-send-failure budget, and kdp must
@@ -252,16 +303,16 @@ unsigned pump_ka_fail_max(void)
 #define PUMP_POLL_CEIL_MS 1000  /* cap on the recvmmsg park timeout */
 #define RX_BATCH 64             /* recvmmsg batch size (iov/msgs arrays) */
 
-/* 槽位定尺：内层 MTU 决定每报文缓冲（8B 封装首部 + 内层分组）。下限
- * PUMP_SLOT 保证小 MTU 会话的行为与历史一致（slot=8+PUMP_SLOT、每批
- * PUMP_BATCH 个槽位）；MTU 变大时槽位变大、批数减少，使每队列缓冲维持
- * 在 64 KiB 量级而不是随 MTU 线性膨胀。上限 IWAN_MTU_MAX 由 protocol.h
- * 按外层 IPv4 总长 65535 推出。 */
+/* Slot sizing: inner MTU determines the per-message buffer (8B encapsulation
+ * header + inner packet). The PUMP_SLOT lower bound keeps small-MTU behavior
+ * identical to history (slot=8+PUMP_SLOT, PUMP_BATCH slots per batch); a larger
+ * MTU grows the slot and shrinks the batch count, keeping each queue buffer
+ * around 64 KiB instead of linear in MTU; protocol.h derives IWAN_MTU_MAX from the 65535-byte outer IPv4 total. */
 static void pump_slot_init(pump_ctx_t *ctx, uint16_t auth_mtu)
 {
     size_t inner = auth_mtu > PUMP_SLOT ? (size_t)auth_mtu : (size_t)PUMP_SLOT;
     if (inner > IWAN_MTU_MAX)
-        inner = IWAN_MTU_MAX;   /* 控制面已钳制；这里兜底 */
+        inner = IWAN_MTU_MAX;   /* control plane clamped it; fallback here */
     ctx->inner_max = inner;
     ctx->slot = 8 + inner;
     ctx->nbatch = PUMP_BATCH;
@@ -292,7 +343,7 @@ static _Thread_local pump_tx_t g_tx;   /* Linux per-reader batch */
  * budget is spent. Returns 1 when the caller should retry the send, 0
  * when it must give up and yield to the receive path (which drains the
  * socket and clears the backpressure). NOTE: mirrors the retry skeleton
- * of socks.c socks_send_batch2 — keep the two in sync. */
+ * of socks.c socks_send_batch2 -- keep the two in sync. */
 static int pump_send_retry(pump_ctx_t *ctx, uint64_t retry_t0)
 {
     return udp_send_stall_wait(ctx->sockfd, retry_t0,
@@ -303,7 +354,7 @@ static int pump_send_retry(pump_ctx_t *ctx, uint64_t retry_t0)
  * A full socket buffer backpressures the TUN read loop (kernel TCP then
  * throttles the app); only fatal errors stop the pump.
  * NOTE: structurally identical to socks.c socks_send_batch2 (GSO +
- * sendmmsg + EAGAIN budget) — keep the two in sync when changing retry
+ * sendmmsg + EAGAIN budget) -- keep the two in sync when changing retry
  * or pacing semantics. */
 /* TX path return contract shared by send_batch and send_gso:
  * TX_DONE = batch handled (sent, or yielded to the receive path after
@@ -338,17 +389,17 @@ static int send_batch(pump_ctx_t *ctx, struct mmsghdr *msgs, unsigned n)
         if (errno == EAGAIN || errno == EWOULDBLOCK ||
             errno == ENOBUFS || errno == EPERM ||
             /* R23 (R22-B1-2): ENOMEM (socket-buffer/memory pressure) is
-             * the same transient class — send_batch must not kill the
+             * the same transient class -- send_batch must not kill the
              * session over it. Unified with send_gso / pump_win_single /
              * socks.c (all now retry ENOMEM); UDP datagrams are droppable,
              * a re-auth storm on ENOMEM is not. */
             errno == ENOMEM) {
             /* EPERM: netfilter OUTPUT DROP returns EPERM for the
-             * dropped datagram — transient per-packet, retry like
+             * dropped datagram -- transient per-packet, retry like
              * EAGAIN. The wait lives in pump_send_retry: poll at most
              * the remaining retry budget (with the 5ms budget the
              * remaining time always binds), then stop retrying once it
-             * is spent — an unbounded retry here wedges the pump, while
+             * is spent -- an unbounded retry here wedges the pump, while
              * the receive thread (udp2tun) keeps draining the socket so
              * backpressure clears once we stop hammering it. poll()
              * already waited for writability, so no post-poll usleep. */
@@ -364,7 +415,7 @@ static int send_batch(pump_ctx_t *ctx, struct mmsghdr *msgs, unsigned n)
             /* R37 R3-M4: sendmmsg() reports the errno of the FIRST unsent
              * datagram. EMSGSIZE (datagram exceeds the path MTU with DF
              * set: inner MTU > outer) and EINVAL (argument this socket
-             * rejects) are per-datagram FEATURE failures — exactly how
+             * rejects) are per-datagram FEATURE failures -- exactly how
              * send_gso above classifies them ("a hard GSO error means the
              * feature is unusable on this socket, not that the tunnel
              * died"). They must not mark the session lost: the old code
@@ -398,7 +449,7 @@ static int send_batch(pump_ctx_t *ctx, struct mmsghdr *msgs, unsigned n)
  * datagram boundaries and the wire output is identical to sendmmsg.
  * Same retry/backpressure semantics as send_batch.
  * NOTE: structurally identical to socks.c socks_send_batch2 (GSO +
- * sendmmsg + EAGAIN budget) — keep the two in sync when changing retry
+ * sendmmsg + EAGAIN budget) -- keep the two in sync when changing retry
  * or pacing semantics. */
 static int send_gso(pump_ctx_t *ctx, struct iovec *iov, unsigned n,
                     size_t mss)
@@ -424,7 +475,7 @@ static int send_gso(pump_ctx_t *ctx, struct iovec *iov, unsigned n,
                                 &ctx->gso_mss, &ctx->gso_pending_mss,
                                 &ctx->gso_streak)) {
         /* re-arm a WORKING GSO socket failed (or GSO was already known
-         * unavailable) — fall back to sendmmsg */
+         * unavailable) -- fall back to sendmmsg */
         return TX_FALLBACK;
     }
     if (!ctx->gso_ok)
@@ -461,13 +512,13 @@ static int send_gso(pump_ctx_t *ctx, struct iovec *iov, unsigned n,
             continue;
         if (errno == EAGAIN || errno == EWOULDBLOCK ||
             errno == ENOBUFS || errno == EPERM ||
-            /* R23 (R22-B1-2): ENOMEM is transient here too — with the
+            /* R23 (R22-B1-2): ENOMEM is transient here too -- with the
              * old classification send_batch killed the session on
              * ENOMEM while send_gso merely disabled GSO (contradiction);
              * unified: both retry within the budget. */
             errno == ENOMEM) {
             /* EPERM: netfilter OUTPUT DROP returns EPERM for the
-             * dropped datagram — transient per-packet, retry like
+             * dropped datagram -- transient per-packet, retry like
              * EAGAIN (same budget-bounded wait as send_batch: poll at
              * most the remaining retry budget, then yield to the
              * receive path) */
@@ -591,10 +642,10 @@ static void pump_tun_pkt(void *ud, uint8_t *pkt, size_t len, bool last)
      * oversized inner packet must never be copied into the batch
      * buffer, or it would clobber the adjacent slot (heap overflow).
      * The pool's last=true flush signal carries len==0, so this check
-     * lives after the drain path above. 上限是协商出的内层 MTU，不是固定
-     * 的 2048：这样大 MTU 会话的内层分组才进得了槽位。 */
+     * lives after the drain path above. The limit is the negotiated inner MTU, not
+     * the fixed 2048: only then do large-MTU inner packets fit into a slot. */
     if (len == 0 || len > ctx->inner_max) {
-        /* %llu/%zu：Windows 的 msvcrt printf 没有 %zu（json.c:55） */
+        /* %llu/%zu: Windows msvcrt printf has no %zu (json.c:55) */
         log_debug("pump: drop packet, len %llu out of [1, %llu]",
                   (unsigned long long)len,
                   (unsigned long long)ctx->inner_max);
@@ -640,9 +691,9 @@ static void pump_tun_pkt(void *ud, uint8_t *pkt, size_t len, bool last)
     /* latency cap: under sustained load, stop filling this batch after
      * PUMP_MAX_LAT_US so no packet waits a full batch (32 x
      * inter-arrival) before being sent */
-    /* 批满即发：容量是 ctx->nbatch（= min(PUMP_BATCH, 64KiB/slot)），不是
-     * 固定的 PUMP_BATCH —— 大 MTU 时 nbatch 可能只有 1，仍按 PUMP_BATCH
-     * 刷新就会写到分配区之外（2026-10-07 内层 MTU 65499 时客户端因此段错误）。 */
+    /* Flush when full: capacity is ctx->nbatch (= min(PUMP_BATCH, 64KiB/slot)),
+     * not the fixed PUMP_BATCH -- with a large MTU nbatch may be only 1, and
+     * flushing by PUMP_BATCH would write past the allocation (2026-10-07, inner MTU 65499: client segfault). */
     if (q->n >= ctx->nbatch || now_us() - q->t0 >= PUMP_MAX_LAT_US)
         pump_flush(ctx, q);
 }
@@ -674,9 +725,9 @@ static void pump_reader_exit(void)
 /* R38 (R8-P2-4): the two "wrong encryption state" gates below fire once per
  * received datagram and err_printf() is NOT compiled out by
  * IWAN_DEBUG_STRIP (see util.h: it has no #ifdef), so a peer that keeps
- * sending frames with the wrong enc bit — a re-authed peer with different
+ * sending frames with the wrong enc bit -- a re-authed peer with different
  * encryption settings, or a stale/spoofed sender that already passed the
- * sid/token gate — turns this client's stderr into an unbounded stream in
+ * sid/token gate -- turns this client's stderr into an unbounded stream in
  * Release builds too. Each signal gets its own 1-line/s limiter, the same
  * shape and rationale as the K-3 limiter in socks.c (vpn_handle_datagram):
  * "plaintext on an encrypted session" and "encrypted on a plaintext
@@ -729,7 +780,7 @@ static void *udp2tun_thread(void *ud) {
 #  endif
 #else
     /* experimental pinning (IWAN_WIN_THREAD_PIN=1): downlink recv ->
-     * CPU 2, ABOVE_NORMAL — pairs with the uplink reader on CPU 1 and
+     * CPU 2, ABOVE_NORMAL -- pairs with the uplink reader on CPU 1 and
      * stays off CPU 0 (virtio/wintun DPCs). Off spellings (0/false/no/
      * off, case-insensitive) disable it: env_bool, R37 R5. */
     {
@@ -782,7 +833,9 @@ static void *udp2tun_thread(void *ud) {
     }
     while (!g_stop) {
         uint64_t now = now_ms();
-        if (pump_rx_stale_ms() != 0 && now - last_rx > pump_rx_stale_ms()) {
+        unsigned stale_ms = pump_stale_window(ctx->echo.have);
+
+        if (stale_ms != 0 && now - last_rx > stale_ms) {
             /* the server answers our ECHO_REQ keepalives, so a live
              * session always produces downlink within ~10s;
              * IWAN_RX_STALE_MS of silence (default 120s) means the
@@ -795,8 +848,7 @@ static void *udp2tun_thread(void *ud) {
             break;
         }
         if (now >= last_ka + PUMP_KEEPALIVE_MS) {
-            if (send_ctrl(ctx, PT_ECHO_REQ, ctx->enc, ctx->sid,
-                          ctx->tok) != 0) {
+            if (send_echo(ctx, PT_ECHO_REQ, NULL, 0) != 0) {
                 int e = errno;
                 /* transient errors (roaming, carrier hiccup) recover, but
                  * the recovery evidence is a RECEIVED frame (ka_fail is
@@ -860,14 +912,14 @@ static void *udp2tun_thread(void *ud) {
                 g_stop = 1;   /* any pump-fatal error stops the tunnel */
                 break;
             }
-            /* R54-WG4-1 (C3): poll() error bits used to be invisible here —
+            /* R54-WG4-1 (C3): poll() error bits used to be invisible here --
              * only pr<0 was checked, so a connected-UDP session socket that
              * kept receiving ICMP port-unreachable errors (POLLERR) made poll
              * return instantly with no POLLIN, and the recvmmsg/poll pair
              * churned at error-arrival pace. Handle the bits explicitly so
              * the error state CONVERGES:
              *  - POLLNVAL = the fd is no longer a valid socket (closed /
-             *    replaced): recvmmsg on it can only fail/loop — fail safe
+             *    replaced): recvmmsg on it can only fail/loop -- fail safe
              *    and let the caller reconnect.
              *  - POLLERR/POLLHUP with no POLLIN: fall through to recvmmsg,
              *    which consumes the pending ICMP error (ECONNREFUSED ->
@@ -904,12 +956,12 @@ static void *udp2tun_thread(void *ud) {
                 continue;   /* signal */
             if (errno == ECONNREFUSED || errno == EHOSTUNREACH ||
                 errno == ENETUNREACH || errno == ECONNRESET) {
-                /* 连通 UDP 套接字的 ICMP 端口不可达/主机不可达（Windows 由
-                 * SIO_UDP_CONNRESET 静音，Linux/macOS 会看到）——这是"对端
-                 * 不在"的证据。以前这里直接 continue，指望 keepalive 的发送
-                 * 侧发现；实测发送侧看不到它（错误先被这里的 recvmmsg 消费，
-                 * 于是 send 成功），预算永远不累积。现在计入同一条"无人应答"
-                 * 预算，只有收到过门限的帧才清零。 */
+                /* ICMP port/host unreachable on a connected UDP socket (silenced by
+                 * SIO_UDP_CONNRESET on Windows, visible on Linux/macOS) -- evidence the peer
+                 * is gone. This used to continue, hoping the keepalive send side would notice;
+                 * measured: it never does (recvmmsg consumes the error here first, so send
+                 * succeeds) and the budget never accrued. Now charged to the same "unanswered"
+                 * budget, cleared only by a frame that passed the gate. */
                 int e = errno;
 
                 if (++ka_fail >= PUMP_KA_FAIL_MAX) {
@@ -953,7 +1005,7 @@ static void *udp2tun_thread(void *ud) {
             uint32_t ptok = ((uint32_t)m[4] << 24) | ((uint32_t)m[5] << 16) |
                             ((uint32_t)m[6] << 8) | (uint32_t)m[7];
             /* mirror receive_vpn: sid/token must match BEFORE any
-             * control action — an unauthenticated PT_CLOSE must not be
+             * control action -- an unauthenticated PT_CLOSE must not be
              * able to tear the tunnel down */
             if (psid != ctx->sid || ptok != ctx->tok) {
                 atomic_fetch_add(&g_prof_recv_badtok, 1);
@@ -967,8 +1019,8 @@ static void *udp2tun_thread(void *ud) {
              * client a zombie. Mirrors the A-4 fix in socks.c
              * (vpn_handle_datagram). */
             last_rx = now_ms();
-            /* 只有过了 sid/token 门限的帧才算对端活着（与 last_rx 同口径），
-             * 同时清零"无人应答"失败预算：send 成功不算，收到帧才算。 */
+            /* Only a frame past the sid/token gate proves the peer alive (same criterion as
+             * last_rx), and it clears the "unanswered" budget: send success does not count, a received frame does. */
             ka_fail = 0;
             if (t == PT_CLOSE) {
                 /* control packets carry the 16-byte header sig */
@@ -979,13 +1031,22 @@ static void *udp2tun_thread(void *ud) {
                 g_stop = 1;
                 break;
             }
+            if (t == PT_ECHO_RES) {
+                if (!verify_sig(m, (size_t)n))
+                    continue;
+                if (n > IWAN_CTRL_LEN)
+                    iwan_echo_observe(&ctx->echo, m + IWAN_CTRL_LEN,
+                                      (size_t)n - IWAN_CTRL_LEN, now_us());
+                continue;
+            }
             if (t == PT_ECHO_REQ) {
                 if (!verify_sig(m, (size_t)n))
                     continue;
-                if (send_ctrl(ctx, PT_ECHO_RES, ctx->enc, ctx->sid,
-                              ctx->tok) != 0) {
+                if (send_echo(ctx, PT_ECHO_RES, m + IWAN_CTRL_LEN,
+                              (size_t)n > IWAN_CTRL_LEN
+                                  ? (size_t)n - IWAN_CTRL_LEN : 0) != 0) {
                     /* M13: same transient-error discipline as the
-                     * ECHO_REQ send direction above — one failed reply
+                     * ECHO_REQ send direction above -- one failed reply
                      * (roaming, carrier hiccup, transient ENOBUFS) does
                      * not kill the session; only PUMP_KA_FAIL_MAX
                      * consecutive failures do */
@@ -1049,7 +1110,7 @@ static void *udp2tun_thread(void *ud) {
                 ip6_derive_ula(ctx->inner_ip, want6);
                 /* ingress filter (audit M5, v6): a downlink frame must be
                  * addressed to THIS session's derived ULA and must never
-                 * claim it as source — anything else is an injector's
+                 * claim it as source -- anything else is an injector's
                  * forgery (reflection / self-spoof), not traffic the
                  * guest solicited */
                 if (memcmp(d6, want6, 16) != 0 ||
@@ -1067,7 +1128,7 @@ static void *udp2tun_thread(void *ud) {
                 }
                 /* ingress filter (audit M5): a downlink frame must be
                  * addressed to THIS session's IP and must never claim our
-                 * own address as source — anything else is an injector's
+                 * own address as source -- anything else is an injector's
                  * forgery (reflection / self-spoof), not traffic the guest
                  * solicited */
                 if (daddr != ctx->inner_ip || saddr == ctx->inner_ip) {
@@ -1078,7 +1139,7 @@ static void *udp2tun_thread(void *ud) {
             }
             /* C2 (bounded part): TUN writes are one frame per call (a
              * multi-iovec writev would be coalesced into ONE frame the
-             * gate drops), so batching is impossible — but the wait must
+             * gate drops), so batching is impossible -- but the wait must
              * not be unbounded either: a saturated TUN write side would
              * head-of-line block the whole downlink thread. 5ms budget
              * (PUMP_SEND_RETRY_MS); packets still unwritable after it
@@ -1098,7 +1159,7 @@ static void *udp2tun_thread(void *ud) {
                  *    delay + exit code 1 on every Ctrl-C under load).
                  *  - g_stop: another thread already declared the reason
                  *    (its writer sets session_lost), or the pump_tun_pkt
-                 *    OOM below did — rc must stay 1 there.
+                 *    OOM below did -- rc must stay 1 there.
                  *  - EAGAIN/EWOULDBLOCK: the 5ms budget expired while
                  *    the TUN write side was transiently full (tun.c:349,
                  *    tun_win.c driver stalls). Per the comment above the
@@ -1110,9 +1171,9 @@ static void *udp2tun_thread(void *ud) {
                  *    EINTR when the 5ms budget expires while the write
                  *    keeps being interrupted (tun.c:~376). That is the
                  *    same "budget expired, frame dropped" outcome as
-                 *    EAGAIN above — a signal interrupting a syscall says
+                 *    EAGAIN above -- a signal interrupting a syscall says
                  *    nothing about the device, which was never reported
-                 *    broken — so it takes the same branch. The old code
+                 *    broken -- so it takes the same branch. The old code
                  *    fell through to the fatal path and tore down a
                  *    healthy session on a mere signal (SIGCHLD/SIGWINCH
                  *    delivery under load), i.e. an unnecessary reconnect.
@@ -1130,7 +1191,7 @@ static void *udp2tun_thread(void *ud) {
                 }
                 log_err("tun write: %s", strerror(errno));
                 /* device gone (ENODEV/EIO): the session is unrecoverable
-                 * from this end too — reconnect (rc=1) rather than
+                 * from this end too -- reconnect (rc=1) rather than
                  * reporting a clean user stop */
                 ctx->session_lost = true;
                 g_stop = 1;
@@ -1146,7 +1207,7 @@ static void *udp2tun_thread(void *ud) {
 static void on_signal(int sig) {
 #ifndef _WIN32
     /* R1-B2-6: this runs in signal context, so only async-signal-safe
-     * calls are allowed — the old err_printf() took the stderr lock and
+     * calls are allowed -- the old err_printf() took the stderr lock and
      * could malloc (util.c:374-383). A constant write() is safe; on
      * Windows the handler runs on the console-callback thread, where
      * stdio is fine. */
@@ -1163,7 +1224,7 @@ static void on_signal(int sig) {
 static void install_signals(void) {
     /* process-wide stop handler: SIGINT/SIGTERM/SIGHUP via sigaction on
      * POSIX, console ctrl events (normalized to SIGINT) on Windows.
-     * No save/restore — the old code installed with NULL oldact, and
+     * No save/restore -- the old code installed with NULL oldact, and
      * the handler lives for the process lifetime either way. */
     port_set_stop_handler(on_signal);
 }
@@ -1238,7 +1299,7 @@ static void push_unique(slist_t *s, const char *str) {
  * of them. The old first line ("no dot => a domain") let the DOTLESS
  * spellings through, which is the same hole: getaddrinfo() read
  * "--proxy-cidr 1" as 0.0.0.1/32, "0x7f000001" as 127.0.0.1/32,
- * "0"/"0X1"/"4294967295" likewise — while "1/32" (the CIDR branch) was
+ * "0"/"0X1"/"4294967295" likewise -- while "1/32" (the CIDR branch) was
  * rejected. Removing the dot test closes all of them without touching
  * real names: a domain such as "localhost", "dns.example" or "abc" is
  * not fully consumed by strtoul (its first character is not a digit or
@@ -1315,7 +1376,7 @@ static int expand_route_targets_fam(const slist_t *targets, slist_t *out,
                     return -1;
                 }
                 /* R1-B2-5: mirror cidr_parse's strict first-digit check
-                 * (route.c:242-243) — without it "/ 8", "/+8" and a
+                 * (route.c:242-243) -- without it "/ 8", "/+8" and a
                  * bare "/" were accepted and only failed later inside
                  * `ip -6 route` with a generic error line */
                 if (p[an + 1] < '0' || p[an + 1] > '9') {
@@ -1387,7 +1448,7 @@ static int expand_route_targets_fam(const slist_t *targets, slist_t *out,
             } else if (strchr(p, ':') != NULL) {
                 /* R2-L36 (v6 parity): a domain name can never contain ':',
                  * so this was meant as an IPv6 literal and inet_pton already
-                 * rejected it — do not hand it to getaddrinfo(), which
+                 * rejected it -- do not hand it to getaddrinfo(), which
                  * accepts additional permissive spellings. */
                 log_err("invalid route target '%s' (malformed IPv6 literal)",
                         p);
@@ -1530,7 +1591,7 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
              * previous same-shape derived ULA may survive this abort on
              * the persistent wintun adapter, and route_iface_down's
              * NULL-whitelist sweep would delete its /96 while leaving the
-             * address — a later run's `netsh add address` would then fail
+             * address -- a later run's `netsh add address` would then fail
              * and never rebuild the /96. Delete the current v6 side first
              * so address and /96 vanish together (no-op outside Windows). */
             route_rollback_v6(tun_name, auth_tun_ip, &routes6);
@@ -1580,7 +1641,7 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
     pump_ctx_t ctx;
     memset(ctx.prof, 0, sizeof ctx.prof);
     pump_prof_gate_init();   /* C4: parse IWAN_PUMP_PROF once, up front */
-    pump_slot_init(&ctx, auth_mtu);   /* 槽位按协商 MTU 定尺 */
+    pump_slot_init(&ctx, auth_mtu);   /* size slots from the negotiated MTU */
     ctx.tun_fd = tun_fd;
     ctx.sockfd = sockfd;
     /* R33-FIX-B: the session socket comes from udp_connect() as a
@@ -1619,7 +1680,7 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
     ctx.gso_mss = 0;
     ctx.gso_ok = -1;
     /* M14 (SUMMARY-2): the rest of the sentinel/state fields must be
-     * initialized explicitly — session_lost is read by the tick loop
+     * initialized explicitly -- session_lost is read by the tick loop
      * and the GSO hysteresis state by the first send batch, all before
      * any write (stack garbage previously drove that control flow) */
     ctx.session_lost = false;
@@ -1718,8 +1779,8 @@ int run_pump(int tun_fd, const char *tun_name, int sockfd,
                     ogw_metric, &routes, had_routes, &routes6);
 
     send_ctrl(&ctx, PT_CLOSE, enc, sid, tok);
-    /* 无条件打印：与内核数据面（kdp.c）保持一致 —— 这是客户端侧唯一一处"已向对端
-     * 发出告别帧"的可见证据，每条会话一行，不是调试噪音。 */
+    /* Print unconditionally, matching the kernel data plane (kdp.c): this is the only
+     * visible client-side evidence that a farewell frame was sent; one line per session, not debug noise. */
     err_printf("CLOSE sent\n");
 
     if (pump_prof_wanted())
@@ -1735,7 +1796,7 @@ fail:
     /* shared failure cleanup: undo routes, free the route lists, destroy
      * the TX lock. The failing site handles its own prefix first (the
      * pthread_create path destroys the live pool and sets g_stop; the
-     * pool-create path has no pool to destroy) — the tail below is
+     * pool-create path has no pool to destroy) -- the tail below is
      * identical in both. */
 #ifdef _WIN32
     if (sender_started) {

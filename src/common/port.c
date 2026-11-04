@@ -96,7 +96,7 @@ enum { CAL_COLD = 0, CAL_BUSY = 1, CAL_READY = 2 };
 /* True for the single caller that must compute the payload, false once it
  * has been published. The wait is bounded by the calibration itself (which
  * cannot fail) and happens at most once per process, never in steady state
- * — the fast path is just the caller's acquire load, no lock, no call. */
+ * -- the fast path is just the caller's acquire load, no lock, no call. */
 static bool cal_claim(_Atomic int *state)
 {
     int expect = CAL_COLD;
@@ -115,7 +115,7 @@ static void cal_publish(_Atomic int *state)
 }
 #endif
 
-/* Windows µs clock: RDTSC, calibrated once against QPC.
+/* Windows microsecond clock: RDTSC, calibrated once against QPC.
  *
  * Why not QPC?  In virtual machines QPC's backing clock is chosen
  * *per-processor* and can flip at runtime: on some vCPUs it is the
@@ -123,12 +123,12 @@ static void cal_publish(_Atomic int *state)
  * 100MHz counter costing microseconds per call.  The hot paths here
  * (profiling stage timers, pacing, batch latency caps) call it once
  * per packet, so a worst-case QPC makes the profiler itself the
- * dominant cost and falsifies every stage number (measured: 3.8µs vs
+ * dominant cost and falsifies every stage number (measured: 3.8us vs
  * 13ns per call on the same guest, same binary, at the same time).
  * RDTSC on a modern x86 (KVM/QEMU `-cpu host` included) is invariant,
  * globally monotonic and ~13ns per call.  Calibrate its frequency once
  * at first use against QPC (QPC is still the right clock for a one-off
- * 5ms calibration) and cache the ticks-per-µs factor.
+ * 5ms calibration) and cache the ticks-per-us factor.
  *
  * Caveat: if the process is live-migrated to a host with a different
  * TSC frequency the factor goes stale and timers drift.  Acceptable
@@ -143,11 +143,11 @@ uint64_t port_now_us(void)
      * shows `_M_X64 100` / `_M_IX86 600`). This test therefore works today
      * only because port.h includes <windows.h> before this line. A TU that
      * reaches port_now_us without those headers, or a toolchain that never
-     * defines them, would silently fall through to the QPC branch below —
+     * defines them, would silently fall through to the QPC branch below --
      * a clock up to ~300x slower per call (3.8us vs 13ns, see above) with
      * no diagnostic. The compiler-predefined `__i386__`/`__x86_64__` are
      * always available, so OR them in; on every current target this is a
-     * no-op (both mingw architectures already took this branch — verified
+     * no-op (both mingw architectures already took this branch -- verified
      * by preprocessing this file for i686 and x86_64). */
 #if defined(_WIN32) && \
     (defined(_M_IX86) || defined(_M_X64) || \
@@ -203,12 +203,12 @@ uint64_t port_now_us(void)
     }
     uint64_t now = (uint64_t)((double)__rdtsc() / tsc_per_us);
 #elif defined(_WIN32)
-    /* ARM64 Windows: no TSC instruction — use QPC (monotonic, high
+    /* ARM64 Windows: no TSC instruction -- use QPC (monotonic, high
      * resolution; its per-call cost is fine on native ARM hardware).
      * NOTE: this branch is ARM64-only in practice; the x86/x64 mingw and
      * MSVC builds take the RDTSC branch above (R38 P2-2 scope note: the
      * calibration race fixed here was reachable on both, but the only
-     * platform this branch runs on — Windows-on-ARM — is not exercised by
+     * platform this branch runs on -- Windows-on-ARM -- is not exercised by
      * the R38 gates, so this part is static hardening only). */
     static LARGE_INTEGER qpc_freq;   /* QPC ticks per second (payload) */
     static _Atomic int qpc_state;
@@ -407,7 +407,7 @@ bool port_is_admin(void)
 #ifdef _WIN32
 /* join argv[start..] with spaces into a Windows command line; quote
  * args containing spaces and escape embedded quotes. Every argument is
- * converted UTF-8 -> UTF-16 first: netsh interface names (e.g. "以太网"
+ * converted UTF-8 -> UTF-16 first: netsh interface names (e.g. "Ethernet" localized
  * on a zh-CN system) reach here as UTF-8 via route.c's
  * WideCharToMultiByte(CP_UTF8), and a byte-for-byte (wchar_t) cast
  * would garble them so netsh could not find the interface. The helper
@@ -558,8 +558,8 @@ int port_elevate_self(int argc, char **argv)
     /* The UAC elevation machinery (AppInfo service, session 0) cannot
      * resolve drive letters: an exe launched from a mapped drive fails
      * with ERROR_PATH_NOT_FOUND (3) even though the file exists. Resolve
-     * the UNC form — WNetGetConnectionW for standard mappings,
-     * QueryDosDeviceW for SUBST'd drives — and relaunch via that. */
+     * the UNC form -- WNetGetConnectionW for standard mappings,
+     * QueryDosDeviceW for SUBST'd drives -- and relaunch via that. */
     if (exe[0] != L'\0' && exe[1] == L':') {
         wchar_t dletter[3] = { exe[0], L':', L'\0' };
         wchar_t remote[4096] = L"";
@@ -672,7 +672,7 @@ int port_elevate_self(int argc, char **argv)
         log_err("UAC policies: ValidateAdminCodeSignatures=%lu "
                 "EnableLUA=%lu%s",
                 vas, lua,
-                vas ? " — this policy blocks elevating UNSIGNED "
+                vas ? " -- this policy blocks elevating UNSIGNED "
                       "executables without any prompt; disable it or run "
                       "iwan from an administrator console" : "");
     }
@@ -702,8 +702,8 @@ long port_cpu_count(void)
 }
 
 #ifdef _WIN32
-/* R37 WG-E2 (R3-L22): a Windows home directory must be fully qualified —
- * drive-absolute ("X:\..." / "X:/...") or UNC ("\\server\share") — the
+/* R37 WG-E2 (R3-L22): a Windows home directory must be fully qualified --
+ * drive-absolute ("X:\..." / "X:/...") or UNC ("\\server\share") -- the
  * same paranoia config.c applies to $HOME on POSIX. Without this check a
  * malformed USERPROFILE ("relative\dir") or HOMEPATH ("foo" with
  * HOMEDRIVE=C:) resolved the config directory (servers.json: server,
@@ -863,7 +863,7 @@ char *port_cmd_capture(char *const argv[], size_t max)
     PROCESS_INFORMATION pi;
     wchar_t cmdline[2048];
     /* capacity in ELEMENTS (the old guards compared size_t n, an element
-     * index, against sizeof cmdline which is BYTES — off by the wchar_t
+     * index, against sizeof cmdline which is BYTES -- off by the wchar_t
      * size); every write below is bounded against this length */
     const size_t cmd_cap = sizeof cmdline / sizeof cmdline[0];
     size_t n = 0;
@@ -930,7 +930,7 @@ char *port_cmd_capture(char *const argv[], size_t max)
 
     /* Same System32 resolution as port_run_cmd (bare helper names only):
      * CreateProcessW(NULL, cmdline) would search exe-dir and CWD before
-     * System32 — a local hijack for an elevated helper run (W-M2). */
+     * System32 -- a local hijack for an elevated helper run (W-M2). */
     wchar_t appbuf[MAX_PATH];
     const wchar_t *appname = win_system32_appname(argv, 0, appbuf,
                                                   MAX_PATH);
@@ -963,7 +963,7 @@ char *port_cmd_capture(char *const argv[], size_t max)
          * an empty read end returns immediately, not when data lands), so
          * mirror the POSIX arm's "poll with remaining budget" as:
          * non-blocking PeekNamedPipe probe + ReadFile when data is there,
-         * plus a process-exit probe and a Sleep yield when it is empty —
+         * plus a process-exit probe and a Sleep yield when it is empty --
          * every step bounded by the shared deadline. */
         uint64_t now = port_now_ms();
         int remaining = deadline > now ? (int)(deadline - now) : 0;
@@ -1003,7 +1003,7 @@ char *port_cmd_capture(char *const argv[], size_t max)
     if (timed_out) {
         /* the 60s read budget expired (child hung without writing and
          * without closing stdout): the child is still alive, so kill it
-         * NOW and let the bounded reap below just collect it — this
+         * NOW and let the bounded reap below just collect it -- this
          * avoids a second full 60s wait inside the reap. */
         TerminateProcess(pi.hProcess, 1);
     }
@@ -1016,7 +1016,7 @@ char *port_cmd_capture(char *const argv[], size_t max)
     /* bounded reap, same policy as port_run_cmd and the POSIX arm (the
      * shared 60s budget + TerminateProcess + keep collecting): a wedged
      * helper must not hang the caller indefinitely. Whatever we captured
-     * is returned — partial output beats an indefinite wedge. */
+     * is returned -- partial output beats an indefinite wedge. */
     for (;;) {
         uint64_t now = port_now_ms();
         int remaining = deadline > now ? (int)(deadline - now) : 0;
@@ -1093,13 +1093,13 @@ char *port_cmd_capture(char *const argv[], size_t max)
             break;              /* hard poll error: keep what we already
                                  * have (same semantic as read errors) */
         }
-        /* pr > 0: POLLIN/POLLHUP/POLLERR — proceed to read; EOF (HUP)
+        /* pr > 0: POLLIN/POLLHUP/POLLERR -- proceed to read; EOF (HUP)
          * reads as 0 below */
         ssize_t r = read(fds[0], out + got, max - got);
         if (r < 0) {
             if (errno == EINTR)
                 continue;   /* L-F4: a signal must not silently truncate
-                             * the captured output — retry the read */
+                             * the captured output -- retry the read */
             break;          /* hard read error: keep what we already have */
         }
         if (r == 0)
@@ -1109,7 +1109,7 @@ char *port_cmd_capture(char *const argv[], size_t max)
     if (timed_out) {
         /* the 60s read budget expired (child hung without writing and
          * without closing stdout): the child is still alive, so SIGKILL
-         * it NOW and let the bounded reap below just collect it — this
+         * it NOW and let the bounded reap below just collect it -- this
          * avoids a second full 60s wait inside the reap. */
         kill(pid, SIGKILL);
     }
@@ -1117,14 +1117,14 @@ char *port_cmd_capture(char *const argv[], size_t max)
      * the only remaining reference, so a child that overruns `max` gets
      * EPIPE/SIGPIPE on its next write instead of blocking on a full
      * pipe forever. The old "parent/child deadlock" chain does not
-     * hold — the child never holds the read end (it closed fds[0] in
+     * hold -- the child never holds the read end (it closed fds[0] in
      * the exec branch) and the parent closes it here before waitpid;
      * the real unbounded risk is an un-timed waitpid below. */
     close(fds[0]);
     out[got] = '\0';
     /* bounded reap, same policy as port_run_cmd (60s + SIGKILL + keep
      * reaping): a wedged helper must not hang the caller indefinitely.
-     * Whatever we captured is returned — partial output beats an
+     * Whatever we captured is returned -- partial output beats an
      * indefinite wedge (same spirit as the Windows branch above). */
     int st = 0;
     for (;;) {
@@ -1303,7 +1303,7 @@ int port_set_nonblock(int fd, bool nb)
 /* Per-call MSG_DONTWAIT emulation: winsock has no per-call flag, so
  * FIONBIO is toggled around the operation when the socket is blocking.
  * The nonblocking state is left ON once set (callers that need blocking
- * semantics — the auth socket — never pass MSG_DONTWAIT). */
+ * semantics -- the auth socket -- never pass MSG_DONTWAIT). */
 static int ensure_nonblock(int fd)
 {
     u_long mode = 1;
@@ -1351,8 +1351,8 @@ ssize_t port_recv(int fd, void *buf, size_t len, int flags)
 }
 
 /* Convert an iovec array to WSABUF layout. NOTE: WSABUF is {ULONG len;
- * CHAR *buf} — the reverse field order of struct iovec {void *iov_base;
- * size_t iov_len} — so a direct cast is invalid (WSAEFAULT). Use the
+ * CHAR *buf} -- the reverse field order of struct iovec {void *iov_base;
+ * size_t iov_len} -- so a direct cast is invalid (WSAEFAULT). Use the
  * stack array when it fits, else heap. Returns NULL with errno=ENOMEM
  * on allocation failure (heap path only); *heap_out records ownership. */
 #define IOV_TO_WSABUF_STACK 64
@@ -1427,8 +1427,8 @@ int port_sendmmsg(int fd, struct mmsghdr *msgvec, unsigned vlen, int flags)
     if (ensure_dontwait(fd, flags) != 0)
         return -1;
     /* Fast path: most callers build sendmmsg entries with one iovec
-     * (R58-I-01: srv_dl_flush and handle_tun_downlink use two — hdr +
-     * payload — and correctly fall to the general per-datagram path via
+     * (R58-I-01: srv_dl_flush and handle_tun_downlink use two -- hdr +
+     * payload -- and correctly fall to the general per-datagram path via
      * the msg_iovlen != 1 check below). Convert the batch to WSABUF once
      * for the single-iovec case instead of re-doing iov_to_wsabuf + stack
      * setup per datagram. Windows still performs one WSASendTo per
@@ -1530,7 +1530,7 @@ int port_recvmmsg(int fd, struct mmsghdr *msgvec, unsigned vlen, int flags,
         return -1;
     /* Fast path: our recvmmsg callers use one iovec per message and
      * stable static buffers. Convert the whole batch to WSABUF once,
-     * then loop WSARecvFrom — still one syscall per datagram (Windows
+     * then loop WSARecvFrom -- still one syscall per datagram (Windows
      * has no native recvmmsg), but no per-datagram conversion cost. */
     {
         int single = 1;
@@ -1582,7 +1582,7 @@ int port_recvmmsg(int fd, struct mmsghdr *msgvec, unsigned vlen, int flags,
                     if (e == WSAEWOULDBLOCK) {
                         /* empty queue: Linux recvmmsg(MSG_DONTWAIT)
                          * returns -1/EAGAIN, and the pump's receive loop
-                         * ONLY parks on v < 0 — returning 0 here made it
+                         * ONLY parks on v < 0 -- returning 0 here made it
                          * busy-spin a full core. A partial batch (got>0)
                          * is still returned as messages received. */
                         if (got > 0)
@@ -1667,7 +1667,7 @@ ssize_t port_readv(int fd, const struct iovec *iov, int iovcnt)
 {
     /* Real Windows (observed on Tiny11) fails WSARecv with WSAEFAULT
      * (10014) for scatter/gather buffers located in the module's static
-     * data on an otherwise healthy accepted TCP socket — while plain
+     * data on an otherwise healthy accepted TCP socket -- while plain
      * recv() on the same socket works (the SOCKS handshake proves it).
      * recv() has no gather, but our hot path (ns_send_reservev) hands
      * back contiguous slices of one scratch array, so a single recv()
@@ -1792,7 +1792,7 @@ int port_connect(int fd, const struct sockaddr *addr, socklen_t len)
         SOCKET_ERROR) {
         int e = WSAGetLastError();
         /* nonblocking connect: POSIX reports EINPROGRESS; winsock may
-         * report WSAEWOULDBLOCK, WSAEINPROGRESS or WSAEALREADY —
+         * report WSAEWOULDBLOCK, WSAEINPROGRESS or WSAEALREADY --
          * normalize all three so callers' EINPROGRESS/EAGAIN checks
          * catch every in-flight case */
         if (e == WSAEWOULDBLOCK || e == WSAEINPROGRESS ||
@@ -1876,14 +1876,14 @@ int port_setsockopt(int fd, int level, int optname, const void *optval,
         return 0;
     }
     /* SO_REUSEADDR on Windows lets ANOTHER process bind the same
-     * addr:port — it does not grant Linux-style TIME_WAIT reuse. Our
-     * every SO_REUSEADDR call site (socks.c:860, relay_proxy.c:1462 — a
+     * addr:port -- it does not grant Linux-style TIME_WAIT reuse. Our
+     * every SO_REUSEADDR call site (socks.c:860, relay_proxy.c:1462 -- a
      * sock.c line may drift under the parallel socks.c fixer) is a TCP
      * listener, so translate it to SO_EXCLUSIVEADDRUSE (int 1):
      * no other process can bind our listening address (closes the local
      * port-steal / hijack hole). Cost: a restart while the old socket
      * is still in TIME_WAIT is rejected (no reuse), which is the
-     * opposite of what Linux callers may expect — acceptable for a
+     * opposite of what Linux callers may expect -- acceptable for a
      * client whose restart already waits for the port to free. Error
      * semantics stay on set_sock_errno like every other path. */
     if (level == SOL_SOCKET && optname == SO_REUSEADDR) {
@@ -1916,7 +1916,7 @@ int port_poll(struct pollfd *fds, nfds_t nfds, int timeout_ms)
      * empty pollset with WSAEINVAL. Several callers rely on the timeout
      * wakeup (the relay proxy direction threads park here before the
      * first connection arrives), so emulate the sleep. 0xFFFFFFFF ms is
-     * INFINITE — matches WSAPoll's -1 timeout. */
+     * INFINITE -- matches WSAPoll's -1 timeout. */
     if (nfds == 0) {
         port_sleep_ms(timeout_ms < 0 ? (unsigned)-1
                                       : (unsigned)timeout_ms);
@@ -1996,8 +1996,8 @@ int port_poll(struct pollfd *fds, nfds_t nfds, int timeout_ms)
 /* One shared implementation for Windows and macOS (they differ only in
  * SOCKET vs int, closesocket vs close, and the nonblocking call); the
  * contract is documented in port.h: the wake side is a static peer
- * socket — only one evfd exists per process in practice (the SOCKS DNS
- * wakeup) — and the returned fd is a normal socket: poll-able and
+ * socket -- only one evfd exists per process in practice (the SOCKS DNS
+ * wakeup) -- and the returned fd is a normal socket: poll-able and
  * closed with port_evfd_close. */
 
 #ifdef _WIN32
@@ -2060,7 +2060,7 @@ int port_evfd_create(void)
     /* the read side must never block the drain; the peer side is only
      * ever written to. Make BOTH nonblocking (the old code also shrank
      * SO_RCVBUF to 1 byte, which made the tiny loopback buffer fill
-     * after a single wake and then block on the next one — removed: the
+     * after a single wake and then block on the next one -- removed: the
      * loopback default is plenty for a one-byte wake, and a full peer
      * buffer must never stall a DNS worker holding g_dns_wait_mu). */
     if (port_set_nonblock((int)s, true) != 0 ||
@@ -2089,7 +2089,7 @@ int port_evfd_wake(int fd)
         return -1;
     /* R38 P2-5: same rule as the POSIX eventfd inline in port.h. EINTR
      * means send() was interrupted before the datagram was queued, so the
-     * wake would be lost if it were reported as a failure — retry it
+     * wake would be lost if it were reported as a failure -- retry it
      * (bounded so a signal storm cannot spin here). EAGAIN is the opposite
      * case and keeps its old "success" meaning below: a full peer/loop
      * buffer means a wake is already pending, so the reader is (or is about
@@ -2103,7 +2103,7 @@ int port_evfd_wake(int fd)
         set_sock_errno(fd);
 #endif
         /* a full peer/loop buffer means a wake is already pending, so
-         * the reader is (or is about to be) awake — treat that as
+         * the reader is (or is about to be) awake -- treat that as
          * success rather than failing a DNS worker. */
         if (errno == EAGAIN || errno == EWOULDBLOCK)
             return 0;

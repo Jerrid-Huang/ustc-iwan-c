@@ -23,7 +23,7 @@
 
 #ifndef IWAN_DEBUG_STRIP
 /* R20 (T2): debug_enabled() is called from every server recv thread on its
- * first use — a plain lazy static is a data race across threads. Atomic. */
+ * first use -- a plain lazy static is a data race across threads. Atomic. */
 static _Atomic int debug_cached = -1;
 #endif
 
@@ -44,7 +44,7 @@ _Noreturn void oom_abort(void)
     abort();
 }
 
-/* R37 R5 (R3-L17): the shared boolean-env rule — full contract in
+/* R37 R5 (R3-L17): the shared boolean-env rule -- full contract in
  * util.h. Defined unconditionally (outside IWAN_DEBUG_STRIP): the
  * Windows-only callers (tun_win.c, proxy.c, port.c, oidc_util.c) exist
  * in stripped builds too.
@@ -71,7 +71,7 @@ bool env_bool_value(env_bool_kind kind, const char *v, bool dflt)
          * are OFF (dflt): the pre-R7 inline chain tested `v && *v` before
          * the strcmp list, so an empty value must not reach it. The R7
          * refactor initially dropped that test and turned IWAN_RXDBG= (set
-         * but empty) ON — caught by the 116-cell equivalence matrix in
+         * but empty) ON -- caught by the 116-cell equivalence matrix in
          * .cc_tmp/r37/r7/envmatrix.c. */
         if (v == NULL || *v == '\0')
             return dflt;
@@ -167,7 +167,7 @@ void exec_sanitize(void)
     unsetenv("DYLD_LIBRARY_PATH");
     unsetenv("DYLD_FRAMEWORK_PATH");
     unsetenv("DYLD_FALLBACK_LIBRARY_PATH");
-    /* R37 R3-M6: these three select CODE, not just a trust anchor — a
+    /* R37 R3-M6: these three select CODE, not just a trust anchor -- a
      * config file may load providers/engines, and the other two name the
      * directories those loadable objects are searched in. sudo's
      * env_reset drops them by default, but 'env_keep += "OPENSSL_CONF"',
@@ -259,13 +259,13 @@ bool ip_run(char *const args[])
 
 /* Capture stdout of `ip ...` (bounded semantics, platform-aligned):
  * Linux forks/reads itself but reaps with the same 60s + SIGKILL policy
- * as port.c port_cmd_capture (R4 fix) — a wedged `ip`/helper must not
+ * as port.c port_cmd_capture (R4 fix) -- a wedged `ip`/helper must not
  * hang route configuration or the daemon forever, and on timeout the
  * captured-so-far output is returned (partial output beats an indefinite
  * wedge, exactly like the Windows branch, which delegates to
  * port_cmd_capture's own 60s+SIGKILL below). */
 #ifndef _WIN32
-/* R19: bounded reap for the OOM read-abort paths — mirror the normal
+/* R19: bounded reap for the OOM read-abort paths -- mirror the normal
  * path's 60s + SIGKILL policy so a wedged child cannot hang the
  * daemon even when we are abandoning the capture. */
 static void cmd_capture_reap_bounded(pid_t pid, int *st, uint64_t deadline)
@@ -366,7 +366,7 @@ char *cmd_capture(char *const args[])
             read_err = true;    /* hard poll error: fail like read errors */
             break;
         }
-        /* pr > 0: POLLIN/POLLHUP/POLLERR — proceed to read; EOF (HUP)
+        /* pr > 0: POLLIN/POLLHUP/POLLERR -- proceed to read; EOF (HUP)
          * reads as 0 and hard errors set read_err below */
         ssize_t n = read(fds[0], out + len, cap - len - 1);
         if (n < 0) {
@@ -385,7 +385,7 @@ char *cmd_capture(char *const args[])
     if (timed_out) {
         /* the 60s read budget expired (child hung without writing and
          * without closing stdout): the child is still alive, so SIGKILL
-         * it NOW and let the reap loop below just collect it — this
+         * it NOW and let the reap loop below just collect it -- this
          * avoids a second full 60s wait inside the reap. */
         kill(pid, SIGKILL);
     }
@@ -414,7 +414,7 @@ char *cmd_capture(char *const args[])
     if (timed_out) {
         /* we SIGKILLed the child ourselves: partial output is the
          * deliberate result here, so WIFSIGNALED(st) (set for our own
-         * SIGKILL) must NOT drop through to the failure path below —
+         * SIGKILL) must NOT drop through to the failure path below --
          * same policy as the Windows branch / port_cmd_capture. */
         log_err("cmd_capture: %s timed out after 60s; returning partial "
                 "output", args[0]);
@@ -432,7 +432,7 @@ char *cmd_capture(char *const args[])
         return NULL;
     /* consumers parse `ip route/addr` output (a few hundred bytes); the
      * 1 MiB bound is far above any real output. Divergence: on success
-     * with empty output this returns "" where Linux returns NULL — the
+     * with empty output this returns "" where Linux returns NULL -- the
      * util.h contract notes callers treat the two identically. */
     char *out = port_cmd_capture(argv, 1024 * 1024);
     free(argv);
@@ -493,7 +493,7 @@ bool dbg_env(const char *name)
         if (strcmp(names[i], name) == 0)
             return vals[i] != 0;
     {
-        /* R37 R7 WG-E: the predicate is env_bool_value(ENV_BOOL_CS, ...) —
+        /* R37 R7 WG-E: the predicate is env_bool_value(ENV_BOOL_CS, ...) --
          * one implementation, value-for-value identical to the old inline
          * strcmp chain (0/false/off exact and case-sensitive, no "no",
          * empty value OFF, unset OFF). */
@@ -510,15 +510,15 @@ bool dbg_env(const char *name)
 /* Strict decimal scan for the numeric env vars (R37 R3 / L18): the WHOLE
  * string must be a canonical decimal integer. strtoll() (used here before)
  * silently accepted leading whitespace (" 1") and an explicit '+' ("+1"),
- * while parse_uint() — the parser behind IWAN_SRV_THREADS and the CLI
- * numbers — rejects both, so "IWAN_AUTH_FAIL_MAX=' 1'" quietly tightened
+ * while parse_uint() -- the parser behind IWAN_SRV_THREADS and the CLI
+ * numbers -- rejects both, so "IWAN_AUTH_FAIL_MAX=' 1'" quietly tightened
  * the brute-force lockout to 1 failure while "IWAN_SRV_THREADS=' 1'" warned
  * and fell back to the default. Both domains now reject the same spellings
  * (leading/trailing whitespace, '+', trailing garbage, empty, overflow):
  * the caller logs the value and keeps its default. A leading '-' is kept
  * for API generality (env_ms_range takes signed bounds); the min/max check
  * in the caller still rejects negatives for every current variable.
- * R37 R7 WG-E (R6-I4): this is now THE scanner — env_scan_i64() is the
+ * R37 R7 WG-E (R6-I4): this is now THE scanner -- env_scan_i64() is the
  * signed form and env_scan_u64() (below, the body parse_uint() used to
  * carry) the unsigned one; env_ms_range(), env_u64(), parse_uint() and
  * str_to_u16() all delegate here, so the accepted domain is one function.
@@ -561,7 +561,7 @@ int env_scan_i64(const char *s, long long *out)
 /* Parse an environment variable as a millisecond duration. Returns defval
  * when the variable is unset/empty, when it fails to parse, or when it is
  * out of [min, max]; a warning is logged for the bad-value cases. When
- * allow_zero is nonzero, an explicit 0 is returned unvalidated — the
+ * allow_zero is nonzero, an explicit 0 is returned unvalidated -- the
  * "watchdog disabled" sentinel. Wrapper callers that must parse once per
  * process cache the result themselves. */
 long long env_ms_range(const char *name, long long defval, long long min,
@@ -588,15 +588,15 @@ long long env_ms_range(const char *name, long long defval, long long min,
     return n;
 }
 
-/* R37 R7 WG-E: unsigned sibling of env_ms_range — same contract, same
+/* R37 R7 WG-E: unsigned sibling of env_ms_range -- same contract, same
  * warning text, and the same env_scan_u64() domain as parse_uint().
- * R38 (P1-2): this function is now really called — lwip_bridge.c:569
+ * R38 (P1-2): this function is now really called -- lwip_bridge.c:569
  * (ns_init(), IWAN_NS_CONNECT_TIMEOUT_MS, min 1000/max 300000, allow_zero
  * deliberately 0) is its call site, and the hand-written strtoul()
- * +end-pointer block that used to sit there (R2-G1 §N3) is gone. That
+ * +end-pointer block that used to sit there (R2-G1 section N3) is gone. That
  * block accepted " 1000"/"+1000"/"\t1000"; this one rejects them with the
  * warning above and returns defval, because env_scan_u64() (util.h) is the
- * env layer's only strict decimal scanner — the remaining local strtol
+ * env layer's only strict decimal scanner -- the remaining local strtol
  * parsers (proxy.c queue counts, server.c rate_limit_parse()) have their
  * own narrower jobs and are not env-layer scanners. */
 uint64_t env_u64(const char *name, uint64_t defval, uint64_t min,
@@ -790,7 +790,7 @@ void pace_bucket_init(pace_bucket *b)
         if (v && *v) {
             /* R37 L16: 0 is the documented "pacing disabled" sentinel
              * (util.h) and is exactly what an unset variable yields, so
-             * an explicit "0" must be accepted silently — the old
+             * an explicit "0" must be accepted silently -- the old
              * `&& pps > 0` test reported it as an invalid value and
              * printed a bogus error (IWAN_RX_STALE_MS=0 has always been
              * accepted via allow_zero). The resulting state is identical:
@@ -840,7 +840,7 @@ void pace_take(pace_bucket *b, int npk)
          * between slices: a shutdown signal breaks out within one slice
          * instead of after minutes, the total is still CAS bounded on
          * uint64_t (no truncation), and a normal small need (<= one
-         * slice) sleeps exactly as before — pause semantics are byte-for-
+         * slice) sleeps exactly as before -- pause semantics are byte-for-
          * byte unchanged, only the interruptibility of a LONG pause is
          * new (and only when the process is stopping anyway). */
         if (need > 0) {

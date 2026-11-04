@@ -1,17 +1,17 @@
-# Windows 客体侧吞吐打流/收流（内层净荷计量，口径对齐 tests/bench_proto.sh）。
+# Windows guest side throughput generator/sink (inner payload accounting, same units as tests/bench_proto.sh).
 #
-# 为什么用 C#：客体上没有编译器，PowerShell 循环只能跑几千 pps（那是尺子不是
-# 隧道），Add-Type 现场编译一段 C# 能到几十万 pps，且不需要额外工具链。
+# Why C#: the guest has no compiler, and a PowerShell loop only reaches a few thousand pps (that is a ruler,
+# not a tunnel); Add-Type compiles a C# snippet on the spot to hundreds of thousands of pps, with no extra toolchain.
 #
-# 为什么要多线程：单线程 C# Send/ReceiveFrom 约 3 万 pps（实测 30228 pps /
-# 290 Mbps），拿它量内核数据面只会量到尺子。**先量尺子再量隧道**：不开会话跑
-# 一遍同参数的基准，就是这台客体用户态栈的上限。
+# Why multithreaded: single-threaded C# Send/ReceiveFrom is about 30k pps (measured 30228 pps /
+# 290 Mbps), so using it to measure the kernel data plane only measures the ruler. Measure the ruler first, then the tunnel:
+# run the same-parameter baseline without a session to get this guest user-space stack's ceiling.
 #
-# 用法（由宿主侧脚本调用，别手敲嵌套引号）：
+# Usage (called by host-side scripts; do not hand-type nested quotes):
 #   powershell -File C:\iwan\vm-bench.ps1 -Mode sink -Port 9999 -Seconds 20 -Threads 4
 #   powershell -File C:\iwan\vm-bench.ps1 -Mode gen -Dst 10.99.0.2 -Dport 9999 -Seconds 20 -Threads 4
 #
-# 输出一行可解析汇总（纯 ASCII，避免控制台编码把证据吃掉）：
+# Print one parseable summary line (pure ASCII, so console encoding does not eat the evidence):
 #   BENCH role=sink pkts=N bytes=N elapsed_ms=N rate_pps=N rate_mbps=N srcs=N src0=IP:PORT
 param(
     [string]$Mode  = 'sink',
@@ -46,16 +46,16 @@ public class IwanBench
 
     static bool Live(Stopwatch sw) { return !_stop && sw.ElapsedMilliseconds < _deadlineMs; }
 
-    // 收：收到即丢，只数净荷。srcs 用来证明包确实来自驱动注入那条路
-    // （内层源地址应当只有一个），而不是别的路径漏过来的。
-    // 多个线程对同一个 UDP socket 并发 ReceiveFrom 是允许的（内核串行取包），
-    // 这样接收侧不会成为尺子。
+    // Receive: drop on arrival, count payload only. srcs proves packets really came from the driver injection path
+    // (the inner source address should be a single one), not leaked from some other path.
+    // Multiple threads calling ReceiveFrom on one UDP socket concurrently is allowed (the kernel serializes receives),
+    // so the receive side does not become the ruler.
     public static string Sink(string bind, int port, int seconds, int threads)
     {
         Socket s = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
         s.ReceiveBufferSize = 8 << 20;
-        // 必须设收超时：否则没流量时 ReceiveFrom 永久阻塞，Live() 的时限检查
-        // 只在两次收包之间才轮到 —— 收流器会一直挂到被杀，什么都不打印。
+        // Must set a receive timeout: otherwise ReceiveFrom blocks forever with no traffic, and the Live() deadline check
+        // only runs between receives -- the sink hangs until killed and prints nothing.
         s.ReceiveTimeout = 200;
         s.Bind(new IPEndPoint(IPAddress.Parse(bind), port));
         if (threads < 1) threads = 1;
@@ -83,7 +83,7 @@ public class IwanBench
             th[i].IsBackground = true;
             th[i].Start();
         }
-        // 头一个包单独看一眼来源：主线程也参与收，顺便记录 src0
+        // Peek at the source of the first packet separately: the main thread also receives, and records src0 along the way
         byte[] b0 = new byte[65536];
         EndPoint f0 = new IPEndPoint(IPAddress.Any, 0);
         while (Live(sw))
@@ -106,15 +106,15 @@ public class IwanBench
                    sw.Elapsed.TotalSeconds, extra);
     }
 
-    // 发：缓冲区提前建好，循环里只做 Send。每个线程一个 socket（绑定 Sport 时
-    // 只有第一个线程绑，其余用临时端口 —— 隧道闸门看的是外层目的端口，标定
-    // 内层容量时不必强求同源端口）。
+    // Send: buffers are built up front; the loop only calls Send. One socket per thread (when binding Sport,
+    // only the first thread binds, the rest use ephemeral ports -- the tunnel gate looks at the outer destination port,
+    // so inner capacity calibration does not need the same source port).
     public static string Gen(string bind, int sport, string dst, int dport, int seconds,
                              int size, int threads, int warmupMs, int pps)
     {
-        // 限速（0 = 不限）：目标整机 Pps 按线程均分，粒度取约 1 ms 的突发
-        // （最多 64 包）。先 Sleep 再自旋 —— 单靠 Sleep 会被 15.6 ms 的
-        // 时钟粒度打成几百 pps，那样测到的就不是"给定速率下的容量"。
+        // Rate limit (0 = unlimited): total Pps split evenly across threads, burst granularity about 1 ms
+        // (max 64 packets). Sleep first, then spin -- Sleep alone is quantized to 15.6 ms and
+        // collapses to a few hundred pps, so what is measured is no longer the capacity at the given rate.
         int burst = 64;
         long periodTicks = 0;
         if (pps > 0)
@@ -135,7 +135,7 @@ public class IwanBench
             th[i] = new Thread(delegate() {
                 Socket s = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
                 s.SendBufferSize = 4 << 20;
-        s.SendTimeout = 500;   // 发送缓冲满时也别永久阻塞
+        s.SendTimeout = 500;   // do not block forever when the send buffer is full either
                 if (sport != 0 && idx == 0)
                     s.Bind(new IPEndPoint(IPAddress.Parse(bind), sport));
                 s.Connect(new IPEndPoint(IPAddress.Parse(dst), dport));
@@ -181,9 +181,9 @@ public class IwanBench
                    sw.Elapsed.TotalSeconds, extra);
     }
 
-    // 自环：同一进程内一边发一边收。用途是标定这台客机"内层用户态 -> 网卡 ->
-    // 用户态"的上限，同时验证目标地址确实会回环（收不到就说明包被丢了，
-    // 而不是尺子不准）。
+    // Loopback: send and receive in the same process. Used to calibrate this guest
+    // inner user space -> NIC -> user space ceiling, and to verify the target address really loops back
+    // (if nothing arrives, packets were dropped, not the ruler being off).
     public static string Loop(string dst, int port, int seconds, int size, int threads)
     {
         Socket r = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);

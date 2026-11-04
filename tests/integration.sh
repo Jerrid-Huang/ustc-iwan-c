@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # iWAN integration test: builds the real client and server binaries, then
-# exercises the data plane end to end in BOTH client modes — socks and
-# TUN — with 4 concurrent TCP echo connections each.
+# exercises the data plane end to end in BOTH client modes -- socks and
+# TUN -- with 4 concurrent TCP echo connections each.
 #
 # Requires root (TUN devices on both sides). Run with sudo:
 #     sudo ./tests/integration.sh
@@ -38,7 +38,7 @@ SUBNET=172.16.0.0/16
 # client event loop can consume it (~3.6 Gbit/s downlink ceiling,
 # measured with bench down). The client's 16MB UDP rcvbuf then fills,
 # backpressure propagates through the server's TUN TX queue, the server
-# drops uplink segments, and the TCP retransmit storm stalls the test —
+# drops uplink segments, and the TCP retransmit storm stalls the test --
 # at 8 MiB/conn it fails ~80% of runs. Real links never reach that
 # rate; single-direction throughput is covered by bench.sh.
 BULK_MB=${BULK_MB:-2}
@@ -112,7 +112,7 @@ NAT_IF=$(ip route show default 2>/dev/null | awk 'NR==1 {for (i=1;i<=NF;i++) if 
 [ -n "$NAT_IF" ] || NAT_IF=lo
 # tunnel-DNS target: the system resolver (the gateway usually answers;
 # fall back to the loopback stub). A hardcoded public resolver is NOT
-# used here — it may be filtered on the host's network, which would
+# used here -- it may be filtered on the host's network, which would
 # fail the tunnel-DNS check for the wrong reason.
 SYS_DNS=${SYS_DNS:-223.5.5.5}   # public DNS; the system DNS may collide with Tailscale's CGNAT routes
 [ -n "$SYS_DNS" ] || SYS_DNS=127.0.0.53
@@ -170,7 +170,7 @@ echo "== mode 1: socks client, 4 TCP echo connections =="
 ./bin/iwan-client socks --server 127.0.0.1 --port "$PORT" \
     --user test --pass s3cret --listen "127.0.0.1:$SOCKS_PORT" &
 SOCKS_PID=$!
-# R30-B1-F5: wait for the LISTENER, not a fixed sleep — on a slow host
+# R30-B1-F5: wait for the LISTENER, not a fixed sleep -- on a slow host
 # the client could still be mid-OPEN when echo_client started and all
 # 4 conns got ECONNREFUSED (a fake failure; the old comment only covered
 # "port busy"). Same ss poll + kill -0 double check as bench.sh:212-231.
@@ -201,7 +201,7 @@ python3 tests/echo_client.py --target "$SRV_IP:$ECHO_PORT" \
 #    tunnel and the server relays it to the configured resolver;
 # 2) local fallback: when the server hands out dns=0.0.0.0 (as the real
 #    USTC service does), the client resolves on the real network via
-#    114.114.114.114 — mirroring the Rust reference — instead of failing
+#    114.114.114.114 -- mirroring the Rust reference -- instead of failing
 #    every domain CONNECT.
 command -v curl >/dev/null || {
     echo "error: curl required for the SOCKS5 domain CONNECT checks" >&2

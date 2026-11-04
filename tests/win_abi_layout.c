@@ -1,15 +1,15 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * win_abi_layout.c — 打印 Windows 数据面 ABI 的尺寸与偏移，供 32/64 位比对。
+ * win_abi_layout.c - print Windows data-plane ABI sizes and offsets for 32/64-bit comparison.
  *
- * 驱动（64 位）与客户端（可能是 32 位）共用 src/common/iwan_win_abi.h，
- * 所以同一份结构体在两种目标下的布局必须逐字段一致。用法：
+ * The driver (64-bit) and client (possibly 32-bit) share src/common/iwan_win_abi.h,
+ * so the same struct layout must match field by field on both targets. Usage:
  *
  *   x86_64-w64-mingw32-gcc -std=c11 -I src/common tests/win_abi_layout.c -o /tmp/l64 && /tmp/l64 > a
  *   i686-w64-mingw32-gcc   -std=c11 -I src/common tests/win_abi_layout.c -o /tmp/l32 && /tmp/l32 > b
- *   diff a b        # 必须无输出
+ *   diff a b        # must print nothing
  *
- * 只依赖 iwan_win_abi.h 里的断言与这里的打印，不需要驱动、不需要联网。
+ * Only the asserts in iwan_win_abi.h and the prints here are needed; no driver, no network.
  */
 #include <stdio.h>
 #include <stddef.h>

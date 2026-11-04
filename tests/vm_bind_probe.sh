@@ -1,15 +1,15 @@
 #!/bin/bash
-# 承载网卡事件语义探针（只测 raw）——为"控制面该监听哪些事件"提供实测依据。
+# Bearer-NIC event semantics probe (raw only) -- empirical basis for "which events the control plane must watch".
 #
-# 在崩溃靶场 guest 里跑：bash /bench/tests/vm_bind_probe.sh [MTU]
+# Run inside the crash-lab guest: bash /bench/tests/vm_bind_probe.sh [MTU]
 #
-# 拓扑与 tests/vm_bind.sh 相同（cl netns + 两对 veth + iwan0，走模块参数与
-# /proc/net/iwan 回落路径，不建 netlink 会话）。
+# Topology is the same as tests/vm_bind.sh (cl netns + two veth pairs + iwan0, using module params and
+# the /proc/net/iwan fallback path, without creating a netlink session).
 #
-# 探针逐项改变承载设备的状态，观察数据面的两类归宿：
-#   tx_pkts 增长 = 模块接受了报文并交给了外层栈（链路层再丢不再回传错误）；
-#   tx_err  增长 = 模块在外层路由查找阶段就丢弃（拒绝发送）。
-# 每项给出"假设"与"实测"，供判断控制面必须对哪些事件做出反应。
+# The probe changes bearer device state item by item and observes the two possible data-plane outcomes:
+#   tx_pkts grows = the module accepted the packet and handed it to the outer stack (later link-layer drops are not reported back);
+#   tx_err  grows = the module dropped it at outer route lookup (refused to send).
+# Each item states a "hypothesis" and the "measured" result, to judge which events the control plane must react to.
 set -u
 
 MTU=${1:-2000}
@@ -23,27 +23,27 @@ OK=0
 MISS=0
 NEIGH_MAC=
 
-ok()   { OK=$((OK + 1)); echo "    [符合假设] $*"; }
-miss() { MISS=$((MISS + 1)); echo "    [不符假设] $*"; }
-note() { echo "  · $*"; }
-die()  { echo "[probe] 致命: $*"; exit 2; }
+ok()   { OK=$((OK + 1)); echo "    [hypothesis holds] $*"; }
+miss() { MISS=$((MISS + 1)); echo "    [hypothesis fails] $*"; }
+note() { echo "  - $*"; }
+die()  { echo "[probe] fatal: $*"; exit 2; }
 
-# 按名字取值（同 vm_bind.sh）：读回里既有行首键也有行中键
+# Look up a counter by name (same as vm_bind.sh): the readback has both line-leading and mid-line keys
 ctr() { ip netns exec "$NET" awk -v k="$1" \
 	'{for(i=1;i<NF;i++) if($i==k){print $(i+1); exit}}' /proc/net/iwan; }
 prx() { cat /sys/class/net/"$1"/statistics/rx_packets; }
 setconf() {
 	local kv="tx_src=$OUTER_C tx_dst=$OUTER_S enabled=1 oif=${1:-0}"
-	# 必须显式写 oif=0：/proc 写入是按项覆盖，缺项保留旧值 —— 否则"自动固定"
-	# 那一组会继续沿用上一组设的显式绑定，测出来的根本不是 FIB 路径。
-	ip netns exec "$NET" sh -c "echo '$kv' > /proc/net/iwan" || die "写 /proc/net/iwan 失败"
+	# oif=0 must be written explicitly: writes to /proc override per item and keep old values for omitted keys -- otherwise the "auto pin"
+	# group would keep using the explicit binding set by the previous group, and the measured path would not be FIB at all.
+	ip netns exec "$NET" sh -c "echo '$kv' > /proc/net/iwan" || die "writing /proc/net/iwan failed"
 }
 send5() { ip netns exec "$NET" bash -c "for i in 1 2 3 4 5; do echo x > /dev/udp/$INNER/$PORT; done"; }
-static_neigh() {	# vethb3 上没有 OUTER_S，需要静态邻居才能完成下一跳解析
+static_neigh() {	# vethb3 has no OUTER_S; a static neighbor is needed for next-hop resolution
 	ip -n $NET neigh replace $OUTER_S lladdr "$NEIGH_MAC" dev vethb3 2>/dev/null
 }
 
-# 观测一轮：$1 名称 $2 假设 $3 该出线的对端 $4 期望(tx_pkts,tx_err)
+# Observe one round: $1 name $2 hypothesis $3 peer on the expected egress $4 expected(tx_pkts,tx_err)
 probe() {
 	local name=$1 hyp=$2 peer=$3 wp=$4 we=$5
 	local p0 e0 u0 p1 e1 u1 dp de du
@@ -53,26 +53,26 @@ probe() {
 	p1=$(ctr tx_pkts); e1=$(ctr tx_err); u1=$(prx "$peer")
 	dp=$((p1 - p0)); de=$((e1 - e0)); du=$((u1 - u0))
 	note "$name"
-	note "  假设：$hyp"
-	note "  实测：tx_pkts +$dp（期望 $wp）tx_err +$de（期望 $we）$peer RX +$du（期望 ≥$wp）"
+	note "  hypothesis: $hyp"
+	note "  measured: tx_pkts +$dp (expect $wp) tx_err +$de (expect $we) $peer RX +$du (expect >=$wp)"
 	if [ "$dp" = "$wp" ] && [ "$de" = "$we" ] && [ "$du" -ge "$wp" ]; then ok "$name"; else miss "$name"; fi
 }
 
-[ -f "$KO" ] || die "缺少 $KO"
-[ "$(id -u)" = 0 ] || die "需要 root（靶场 guest 内就是 root）"
+[ -f "$KO" ] || die "missing $KO"
+[ "$(id -u)" = 0 ] || die "root required (the crash-lab guest runs as root)"
 
-echo "== vm_bind_probe: 建拓扑 =="
+echo "== vm_bind_probe: create topology =="
 ip netns del $NET 2>/dev/null
 ip link del vethbp0 2>/dev/null
 ip link del vethb2 2>/dev/null
-ip netns add $NET || die "建 netns 失败"
-ip link add vethbp0 type veth peer name vethbp1 || die "建 veth 失败"
+ip netns add $NET || die "failed to create netns"
+ip link add vethbp0 type veth peer name vethbp1 || die "failed to create veth"
 ip link set vethbp1 netns $NET
 ip addr add $OUTER_S/24 dev vethbp0
 ip link set vethbp0 up
 ip -n $NET addr add $OUTER_C/24 dev vethbp1
 ip -n $NET link set vethbp1 up
-ip link add vethb2 type veth peer name vethb3 || die "建第二对 veth 失败"
+ip link add vethb2 type veth peer name vethb3 || die "failed to create second veth pair"
 ip link set vethb3 netns $NET
 ip addr add 10.55.0.1/24 dev vethb2
 ip link set vethb2 up
@@ -84,10 +84,10 @@ ip netns exec $NET sh -c 'echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6' 2>/
 rmmod iwan 2>/dev/null
 insmod "$KO" enabled=1 any_dir=1 outer_src="$OUTER_C" outer_dst="$OUTER_S" \
 	dport="$PORT" sid=4660 tok=3405691582 key=0011223344556677 enc=1 \
-	batch=1 df=1 max_mtu="$MTU" || die "insmod 失败"
-ip -n $NET link add iwan0 type iwan || die "建 iwan0 失败"
+	batch=1 df=1 max_mtu="$MTU" || die "insmod failed"
+ip -n $NET link add iwan0 type iwan || die "failed to create iwan0"
 ip -n $NET link set iwan0 up
-ip -n $NET route add $INNER/32 dev iwan0 || die "加内层路由失败"
+ip -n $NET route add $INNER/32 dev iwan0 || die "failed to add inner route"
 
 OIF_VETH=$(ip netns exec $NET cat /sys/class/net/vethbp1/ifindex)
 OIF_B3=$(ip netns exec $NET cat /sys/class/net/vethb3/ifindex)
@@ -95,36 +95,36 @@ NEIGH_MAC=$(cat /sys/class/net/vethb2/address)
 note "cl: vethbp1 ifindex=$OIF_VETH, vethb3 ifindex=$OIF_B3"
 static_neigh
 
-echo "== vm_bind_probe: ① 接口管理状态（down/up，显式绑定）=="
+echo "== vm_bind_probe: (1) interface admin state (down/up, explicit binding) =="
 setconf "$OIF_B3"
-probe "①-0 基线：显式绑 vethb3（UP、有地址）" "接受并出线" vethb2 5 0
+probe "1-0 baseline: explicitly bound to vethb3 (UP, has address)" "accept and send out" vethb2 5 0
 ip -n $NET link set vethb3 down
-probe "①-1 vethb3 down" "查找失败 ⇒ 拒绝发送" vethb2 0 5
+probe "1-1 vethb3 down" "lookup fails => refuse to send" vethb2 0 5
 ip -n $NET link set vethb3 up
-static_neigh	# down 会清掉邻居表
-probe "①-2 vethb3 up（恢复）" "恢复出线" vethb2 5 0
+static_neigh	# down clears the neighbor table
+probe "1-2 vethb3 up (restored)" "egress restored" vethb2 5 0
 
-echo "== vm_bind_probe: ② 接口地址集合（删地址/加地址，显式绑定）=="
+echo "== vm_bind_probe: (2) interface address set (del/add address, explicit binding) =="
 ip -n $NET addr del 10.55.0.2/24 dev vethb3
-probe "②-1 删除 vethb3 的唯一 IPv4 地址" "合成路由失效 ⇒ 拒绝发送" vethb2 0 5
+probe "2-1 delete vethb3's only IPv4 address" "synthetic route invalid => refuse to send" vethb2 0 5
 ip -n $NET addr add 10.55.0.2/24 dev vethb3
-probe "②-2 地址恢复" "恢复出线" vethb2 5 0
+probe "2-2 address restored" "egress restored" vethb2 5 0
 
-echo "== vm_bind_probe: ③ FIB 路径（自动固定，down/up）=="
+echo "== vm_bind_probe: (3) FIB path (auto pin, down/up) =="
 setconf ""
 ip -n $NET route flush cache 2>/dev/null
-probe "③-0 不写 oif：FIB 解析到 vethbp1" "接受并从 vethbp1 出线" vethbp0 5 0
+probe "3-0 no oif written: FIB resolves to vethbp1" "accept and send out via vethbp1" vethbp0 5 0
 ip -n $NET link set vethbp1 down
-probe "③-1 vethbp1 down（无备选外层路径）" "查找失败 ⇒ 拒绝发送" vethbp0 0 5
+probe "3-1 vethbp1 down (no alternate outer path)" "lookup fails => refuse to send" vethbp0 0 5
 ip -n $NET link set vethbp1 up
-probe "③-2 vethbp1 up（自动路径自愈）" "重新解析并恢复出线" vethbp0 5 0
+probe "3-2 vethbp1 up (auto path self-heals)" "re-resolve and restore egress" vethbp0 5 0
 
-echo "== vm_bind_probe: ④ 接口删除（显式绑定）=="
+echo "== vm_bind_probe: (4) interface deletion (explicit binding) =="
 setconf "$OIF_B3"
 ip -n $NET link del vethb3
-# vethb3 消失后 root netns 侧的 vethb2 也随之消失，无法再读对端计数，
-# 这一项只保留发送侧证据（tx_err 增长）。
-probe "④-1 删除被显式绑定的 vethb3" "查找失败（-ENODEV）⇒ 拒绝发送" vethbp0 0 5
+# After vethb3 disappears its root-netns peer vethb2 also disappears, so the peer counters can no longer be read;
+# this item keeps only the sender-side evidence (tx_err growth).
+probe "4-1 delete the explicitly bound vethb3" "lookup fails (-ENODEV) => refuse to send" vethbp0 0 5
 
-echo "== vm_bind_probe: 结果 符合假设=$OK 不符假设=$MISS =="
+echo "== vm_bind_probe: result hypotheses-hold=$OK hypotheses-fail=$MISS =="
 exit 0

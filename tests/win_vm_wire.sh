@@ -1,53 +1,53 @@
 #!/bin/bash
-# Windows 数据面线测（入向：重组后拦截 -> 解封 -> 重组前注入）一键复现。
+# Windows data-plane wire test (inbound: intercept after reassembly -> decapsulate -> inject before reassembly), one-shot repro.
 #
-# 用法：tests/win_vm_wire.sh [iwan.sys 路径] [对端窗口秒数] [对端 IP]
-#   默认对端 IP = 10.0.2.2（QEMU slirp 网关，见下面的拓扑说明）
-#   默认 iwan.sys = /home/uker/iwan-sys/win-driver-x64/build/x64/Release/iwan.sys
-#   取件：gh run list --workflow win-driver.yml --branch ci/win-driver-build --limit 1
+# Usage: tests/win_vm_wire.sh [iwan.sys path] [peer window seconds] [peer IP]
+#   Default peer IP = 10.0.2.2 (QEMU slirp gateway, see the topology notes below)
+#   Default iwan.sys = /home/uker/iwan-sys/win-driver-x64/build/x64/Release/iwan.sys
+#   Fetch: gh run list --workflow win-driver.yml --branch ci/win-driver-build --limit 1
 #         gh run download <id> -D /home/uker/iwan-sys
-#         （放在持久路径，别放 /tmp —— 宿主重启会清空）
-#   默认窗口 160 s（要大于客体脚本"开会话 + ping + 线测保持"的总时长）
+#         (put it on a persistent path, not /tmp -- a host reboot wipes it)
+#   Default window 160 s (must exceed the guest script's total session + ping + wire-hold time)
 #
-# 拓扑（对端用 slirp 网关，不依赖宿主 LAN 地址）：
-#   宿主 0.0.0.0:45678（tests/win_wire_peer.py）<- 10.0.2.2 <- QEMU slirp
-#        <- 客体 Ethernet 10.0.2.15；客体内 iWAN（KM-TEST 回环）10.99.0.1/24、10.99.0.2/24
+# Topology (peer uses the slirp gateway, no dependency on a host LAN address):
+#   host 0.0.0.0:45678 (tests/win_wire_peer.py) <- 10.0.2.2 <- QEMU slirp
+#        <- guest Ethernet 10.0.2.15; inside the guest iWAN (KM-TEST loopback) 10.99.0.1/24, 10.99.0.2/24
 #
-#   客体发往 10.0.2.2:45678 的 UDP 会被 slirp 直接投给宿主 socket（实测可行），
-#   宿主回包的源地址在客体看仍是 10.0.2.2 —— 所以会话 outer_dst 也必须是
-#   10.0.2.2，驱动的五元组闸门才对得上。**不要**再用宿主 LAN 地址：宿主一
-#   重启，有线网卡地址就没了（enp8s0 DOWN、改走 WiFi），整套线测会静默失效
-#   —— 表现是对端 hellos=0（本脚本现在是硬失败，不是警告）。
+#   UDP the guest sends to 10.0.2.2:45678 is delivered by slirp straight to the host socket (verified working),
+#   so the host reply still looks like source 10.0.2.2 to the guest -- which is why the session outer_dst must
+#   also be 10.0.2.2 for the driver's 5-tuple gate to match. Do **NOT** use the host LAN address again: once the host
+#   reboots, the wired NIC address is gone (enp8s0 DOWN, falls back to WiFi) and the whole wire test silently breaks
+#   -- the symptom is peer hellos=0 (this script now hard-fails instead of warning).
 #
-#   客体开一条 iWAN 会话：外层 10.0.2.15:40660 <-> 10.0.2.2:45678，
-#   sid 0x1234、tok 0x12345678、key 0102030405060708、enc=1、内层 10.99.0.2/32。
-#   客体用户态往对端发 "IWAN-WIRE-HELLO"（不经过驱动，用来让对端知道回谁）；
-#   宿主对端 tests/win_wire_peer.py 收到后回灌构造好的外层帧：
-#     · 正常帧 ×3/轮  —— 必须被驱动拦下、解封、把内层包重新注入网络层；
-#     · 坏凭据帧 ×2    —— 必须被驱动的凭据校验拒绝。
+#   The guest opens one iWAN session: outer 10.0.2.15:40660 <-> 10.0.2.2:45678,
+#   sid 0x1234, tok 0x12345678, key 0102030405060708, enc=1, inner 10.99.0.2/32.
+#   Guest userland sends "IWAN-WIRE-HELLO" to the peer (not through the driver, so the peer knows whom to reply to);
+#   upon receipt the host peer tests/win_wire_peer.py replays crafted outer frames:
+#     - normal frames x3/round -- must be intercepted by the driver, decapsulated, and the inner packet re-injected into the network stack;
+#     - bad-credential frames x2 -- must be rejected by the driver's credential check.
 #
-# 判据（guest 侧 rx-out.txt 的 STATS 行，全部来自 IOCTL_IWAN_SESSION_GET）：
-#   rx_outer     = 命中五元组的外层数据报数（源端口=会话 dport、目的端口=会话 sport）
-#   rx_frames    = 其中通过帧头校验（类型/enc/凭据）的数据帧数
-#   rx_delivered = 内层包成功注入网络层的次数
-#   rx_bad_hdr   = 坏凭据/坏结构样本数 —— 应当恰好等于对端发出的坏样本数（2）
-#   通过标准：rx_frames >= 10 且 rx_delivered == rx_frames 且 rx_bad_hdr == 2，
-#             且线测结束后 ssh 仍然通（历史上"终止型过滤器写 CONTINUE"就是
-#             一建会话全机断网，见 win-driver/iwan_win_wfp.c 的判定注释）。
+# Criteria (the STATS lines in guest-side rx-out.txt, all values from IOCTL_IWAN_SESSION_GET):
+#   rx_outer     = outer datagrams matching the 5-tuple (source port = session dport, dest port = session sport)
+#   rx_frames    = of those, data frames passing header validation (type/enc/credentials)
+#   rx_delivered = number of inner packets successfully injected into the network stack
+#   rx_bad_hdr   = bad-credential/bad-structure sample count -- must exactly equal the number of bad samples the peer sent (2)
+#   Pass criteria: rx_frames >= 10 and rx_delivered == rx_frames and rx_bad_hdr == 2,
+#             and ssh is still up after the wire test (historically a "terminating filter written as CONTINUE"
+#             took the whole machine offline on session setup; see the verdict comment in win-driver/iwan_win_wfp.c).
 #
-# 踩过的坑（都在这套脚本里被显式处理）：
-#   · 必须 -Inject -Wire 同时给：线测整段挂在 if ($Inject) 里面，只给 -Wire 不跑；
-#   · 嵌套 ssh -> powershell 会把 -File 脚本参数吃掉，所以客体侧用
-#     C:\iwan\vm-wire-run.ps1 这种参数写死的包装脚本；
-#   · $-Args 是 PowerShell 自动变量，包装脚本里改名叫 $ScriptArgs；
-#   · 客体 C: 曾经 0 字节可用，Add-Type 与 scp 双双静默失败 —— 先看 fsutil；
-#   · 串口日志是成串到达的，别拿宿主侧 tail 的时间戳算时序；
-#   · 计数器名字必须与所在函数对得上：rx_batch_skip 曾被插进出向 v6 的分类
-#     函数里，于是"入向没被调用"这个结论是假的，白绕了一轮；
-#   · 注入出来的内层包，在客体防火墙眼里是"凭空出现的入向 UDP"：没有放行
-#     规则时会被静默丢掉，而注入 API 仍然返回成功（rx_delivered 照涨）。
-#     生产里注入的是被隧道流量的**回应**，状态防火墙会放行；线测里对端灌的
-#     是凭空构造的包，所以本脚本临时加一条 UDP 9999 入向放行规则，跑完删掉。
+# Pitfalls already hit (all handled explicitly in this script):
+#   - -Inject -Wire must be given together: the entire wire test hangs off if ($Inject), so -Wire alone does not run it;
+#   - nested ssh -> powershell swallows -File script arguments, so the guest side uses
+#     a wrapper script such as C:\iwan\vm-wire-run.ps1 with hardcoded arguments;
+#   - $-Args is a PowerShell automatic variable; the wrapper renames it to $ScriptArgs;
+#   - the guest C: once had 0 bytes free and both Add-Type and scp failed silently -- check fsutil first;
+#   - serial log lines arrive in bursts; do not order events by host-side tail timestamps;
+#   - counter names must match the function they live in: rx_batch_skip was once inserted into the outbound v6 classification
+#     function, so the conclusion "inbound was never called" was false and cost a wasted round;
+#   - injected inner packets look like "out-of-nowhere inbound UDP" to the guest firewall: without an allow
+#     rule they are silently dropped while the inject API still returns success (rx_delivered still climbs).
+#     Production injects the **replies** to tunneled traffic, which a stateful firewall allows; in this wire test the peer sends
+#     crafted packets, so this script temporarily adds an inbound UDP 9999 allow rule and deletes it after the run.
 set -u
 
 SYS_PATH="${1:-/home/uker/iwan-sys/win-driver-x64/build/x64/Release/iwan.sys}"
@@ -59,69 +59,69 @@ OUT=/tmp/win_vm_wire
 mkdir -p "$OUT"
 
 say() { echo "[wire] $*"; }
-die() { echo "[wire] 失败：$*" >&2; exit 1; }
+die() { echo "[wire] FAIL: $*" >&2; exit 1; }
 
-[ -f "$SYS_PATH" ] || die "找不到驱动 $SYS_PATH（先 gh run download）"
+[ -f "$SYS_PATH" ] || die "driver not found: $SYS_PATH (run gh run download first)"
 timeout 15 ssh -o ConnectTimeout=8 -o BatchMode=yes nano11 'echo ok' >/dev/null 2>&1 \
-    || die "客体 nano11 不可达（127.0.0.1:2222）"
+    || die "guest nano11 unreachable (127.0.0.1:2222)"
 
-# 客体侧脚本是这套验证的一半，留在客体上会随环境丢失：顺手归档到 tests/win_vm/
+# The guest-side scripts are half of this verification and would be lost with the environment if left on the guest: archive them to tests/win_vm/ while at it
 if [ ! -d "$HERE/win_vm" ]; then
     mkdir -p "$HERE/win_vm"
     timeout 120 scp -q 'nano11:C:/iwan/*.ps1' "$HERE/win_vm/" 2>/dev/null \
-        && say "已把客体脚本归档到 tests/win_vm/（$(ls -1 "$HERE/win_vm" | wc -l) 个）"
+        && say "archived guest scripts to tests/win_vm/ ($(ls -1 "$HERE/win_vm" | wc -l) files)"
 fi
 
-say "换驱动：$SYS_PATH ($(stat -c%s "$SYS_PATH") 字节)"
+say "Swapping driver: $SYS_PATH ($(stat -c%s "$SYS_PATH") bytes)"
 timeout 60 ssh -o ConnectTimeout=12 nano11 'sc.exe stop iwan' >/dev/null 2>&1
 sleep 3
-timeout 150 scp -q "$SYS_PATH" 'nano11:C:/iwan/iwan.sys' || die "传驱动失败（客盘满？）"
+timeout 150 scp -q "$SYS_PATH" 'nano11:C:/iwan/iwan.sys' || die "driver copy failed (guest disk full?)"
 timeout 200 ssh -o ConnectTimeout=12 nano11 \
     'powershell -NoProfile -ExecutionPolicy Bypass -File C:\iwan\vm-load.ps1 -SysPath C:\iwan\iwan.sys' \
-    2>&1 | tr -d '\r' 2>/dev/null | grep -q "State    : Running" || die "驱动没起来（State 不是 Running）"
-say "驱动 State: Running"
+    2>&1 | tr -d '\r' 2>/dev/null | grep -q "State    : Running" || die "driver did not start (State is not Running)"
+say "driver State: Running"
 
-# 客体侧准备：C: 空间（盘满会让 Add-Type/scp 静默失败）+ 内层包入向放行。
-# 这台客体盘一直很紧（16 GB 盘、跑测前约 230 MB 空闲），清理脚本见
-# C:\iwan\vm-clean.ps1；再不够就得动 C:\Windows\LiveKernelReports（约 685 MB
-# 的内核转储，是之前几次假死留下的证据，删之前先问用户）。
-# 只认真实空闲那一行：fsutil 另外还会打总容量、配额空闲、池占用（有 0），
-# 按数值大小取最大/最小都会取错（曾经把 16 GB 总容量当空闲放行）。
+# Guest-side prep: C: free space (a full disk makes Add-Type/scp fail silently) + inbound allow for inner packets.
+# This guest disk is always tight (16 GB disk, ~230 MB free before a test run); see
+# C:\iwan\vm-clean.ps1 for cleanup; if that is still not enough you must touch C:\Windows\LiveKernelReports (~685 MB
+# of kernel dumps, evidence left by earlier hangs -- ask the user before deleting).
+# Only trust the real free-space line: fsutil also prints total capacity, quota free, and pool usage (some zeros),
+# so picking max/min by numeric value goes wrong (once treated 16 GB total capacity as free space).
 FREE=$(timeout 60 ssh -o ConnectTimeout=12 nano11 'fsutil volume diskfree C:' 2>/dev/null \
-       | tr -d '\r' | grep -iE '^(Total free bytes|总可用字节数)' \
+       | tr -d '\r' | grep -iE $'^(Total free bytes|\xe6\x80\xbb\xe5\x8f\xaf\xe7\x94\xa8\xe5\xad\x97\xe8\x8a\x82\xe6\x95\xb0)' \
        | grep -oE '[0-9][0-9,]{5,}' | tr -d ',' | head -1)
 if [ -n "$FREE" ] && [ "$FREE" -lt 209715200 ]; then
-    die "客体 C: 可用空间不足（${FREE} 字节）—— 先清 C:\\Windows\\Temp 等"
+    die "guest C: insufficient free space (${FREE} bytes) -- clean C:\\Windows\\Temp etc. first"
 fi
-say "客体 C: 可用 ${FREE:-未知} 字节"
+say "guest C: ${FREE:-unknown} bytes free"
 timeout 60 ssh -o ConnectTimeout=12 nano11 \
     'netsh advfirewall firewall add rule name="iwan-wire-in" dir=in action=allow protocol=UDP localport=9999' \
-    >/dev/null 2>&1 && say "已加 UDP 9999 入向放行（跑完删除）"
+    >/dev/null 2>&1 && say "added inbound UDP 9999 allow rule (removed after the run)"
 
-# 防"空跑"：先把客体上的输出文件删掉，跑完必须重新出现 —— 曾经因为脚本
-# 根本没跑（驱动没加载、脚本静默退出）而读到上一次的 rx-out.txt，把陈旧数字
-# 当成新结论。
+# Anti-"empty run": delete the guest output file first; it must reappear after the run -- once the script
+# never ran at all (driver not loaded, script exited silently) and we read the previous rx-out.txt, taking stale numbers
+# as a new conclusion.
 timeout 60 ssh -o ConnectTimeout=12 nano11 \
     'powershell -NoProfile -Command "Remove-Item C:\\iwan\\rx-out.txt -Force -ErrorAction SilentlyContinue"' \
     >/dev/null 2>&1
 
-# 客体包装脚本由本脚本生成并上传：嵌套 ssh -> powershell 会吃掉 -File 脚本的
-# 参数，所以参数必须落在客体文件里；而"落在哪里"由这里决定，免得客体上留着
-# 上一次的对端 IP（地址变了会变成 hellos=0 的静默空跑）。
-# 控制台输出设成 UTF-8：否则宿主抓到的日志里中文全是 '?'（数字与 ASCII 载荷
-# 不受影响，但证据可读性差很多）。
+# The guest wrapper script is generated by this script and uploaded: nested ssh -> powershell eats -File script
+# arguments, so the arguments must live in a guest-side file; what lands there is decided here, so the guest does not keep
+# the previous peer IP (a changed address becomes a silent hellos=0 empty run).
+# Set console output to UTF-8: otherwise Chinese in the host-captured log is all '?' (numbers and ASCII payloads
+# are unaffected, but evidence readability is much worse).
 printf '\xef\xbb\xbf[Console]::OutputEncoding=[Text.Encoding]::UTF8\r\n& C:\\iwan\\vm-rx.ps1 -Inject -Wire -PeerIp %s -PeerPort %s -PingCount 0 -HoldSeconds 20\r\n' \
     "$PEER_IP" "$PEER_PORT" > "$OUT/vm-wire-run.ps1"
 timeout 90 scp -q "$OUT/vm-wire-run.ps1" 'nano11:C:/iwan/vm-wire-run.ps1' \
-    || die "上传客体包装脚本失败"
-say "客体包装脚本：对端 ${PEER_IP}:${PEER_PORT}"
+    || die "failed to upload the guest wrapper script"
+say "guest wrapper script: peer ${PEER_IP}:${PEER_PORT}"
 
-say "启动宿主对端（窗口 ${WINDOW}s）"
+say "starting host peer (window ${WINDOW}s)"
 python3 "$HERE/win_wire_peer.py" "$WINDOW" > "$OUT/peer.log" 2>&1 &
 PEER=$!
 sleep 3
 
-say "运行客体线测（-Inject -Wire，包装脚本见 $OUT/vm-wire-run.ps1）"
+say "running guest wire test (-Inject -Wire, wrapper script at $OUT/vm-wire-run.ps1)"
 timeout $((WINDOW + 60)) ssh -o ConnectTimeout=12 nano11 \
     'powershell -NoProfile -ExecutionPolicy Bypass -File C:\iwan\vm-wire-run.ps1' \
     > "$OUT/guest.log" 2>&1
@@ -129,18 +129,18 @@ timeout $((WINDOW + 60)) ssh -o ConnectTimeout=12 nano11 \
 wait $PEER 2>/dev/null
 PEERLINE=$(grep -a "^PEER done" "$OUT/peer.log" || true)
 if [ -z "$PEERLINE" ]; then
-    die "对端没有打印汇总行（客体脚本很可能根本没跑起来，日志见 $OUT/guest.log）"
+    die "peer printed no summary line (the guest script probably never started; see $OUT/guest.log)"
 fi
 say "$PEERLINE"
 HELLOS=$(echo "$PEERLINE" | grep -oE 'hellos=[0-9]+' | cut -d= -f2)
-[ "${HELLOS:-0}" -gt 0 ] || die "对端一个 HELLO 都没收到：客体侧没发出流量，或对端地址不对（当前 ${PEER_IP}:${PEER_PORT}；客体日志见 $OUT/guest.log）"
+[ "${HELLOS:-0}" -gt 0 ] || die "peer received no HELLO at all: the guest side sent no traffic, or the peer address is wrong (current ${PEER_IP}:${PEER_PORT}; guest log at $OUT/guest.log)"
 
-# 证据优先取客体落盘的 rx-out.txt；没有就退回控制台日志（内容一样：STATS 行与
-# ASCII 载荷都在，中文会因控制台编码丢失，不影响判据）。
+# Prefer the evidence dumped by the guest to rx-out.txt; without it fall back to the console log (same content: STATS lines and
+# ASCII payloads are both there; Chinese is lost to console encoding, which does not affect the criteria).
 EVID="$OUT/rx-out.txt"
 timeout 120 scp -q 'nano11:C:/iwan/rx-out.txt' "$EVID" 2>/dev/null || {
     EVID="$OUT/guest.log"
-    say "客体没有 rx-out.txt，改从控制台日志取证据（$EVID）"
+    say "guest has no rx-out.txt; taking evidence from the console log instead ($EVID)"
 }
 
 python3 - "$EVID" <<'PY' || exit 1
@@ -157,30 +157,30 @@ for m in re.finditer(r'STATS (\w+) ((?:\w+=\S+ ?)+)', txt):
     stats[tag] = dict(kv.split('=') for kv in body.split())
 final = stats.get('final') or (list(stats.values())[-1] if stats else None)
 if not final:
-    print('[wire] 失败：rx-out.txt 里没有 STATS 行'); sys.exit(1)
+    print('[wire] FAIL: no STATS line in rx-out.txt'); sys.exit(1)
 g = lambda k: int(final.get(k, 0))
-print('[wire] 最终计数：' + ' '.join('%s=%s' % (k, final[k]) for k in
+print('[wire] final counters: ' + ' '.join('%s=%s' % (k, final[k]) for k in
       ('rx_outer', 'rx_frames', 'rx_delivered', 'rx_batch', 'rx_batch_skip',
        'rx_bad_hdr', 'rx_bad_inner', 'ev_dropped') if k in final))
 ok = True
 if g('rx_frames') < 10:
-    print('[wire] 失败：rx_frames=%d，外层帧没被拦住' % g('rx_frames')); ok = False
+    print('[wire] FAIL: rx_frames=%d, outer frames were not intercepted' % g('rx_frames')); ok = False
 if g('rx_delivered') != g('rx_frames'):
-    print('[wire] 失败：rx_delivered=%d != rx_frames=%d，有帧没注入成功'
+    print('[wire] FAIL: rx_delivered=%d != rx_frames=%d, some frames were not injected successfully'
           % (g('rx_delivered'), g('rx_frames'))); ok = False
 if g('rx_batch') != 0:
-    print('[wire] 失败：rx_batch=%d，有注入在完成回调里被 WFP 退回'
-          '（rx_reasm 是失败状态码累加，除以 rx_batch 得原值；'
-          '0xC000000D=STATUS_INVALID_PARAMETER 多半是网卡索引/隔离舱给错）' % g('rx_batch'))
+    print('[wire] FAIL: rx_batch=%d, some injections were bounced by WFP in the completion callback '
+          '(rx_reasm sums the failure status codes; divide by rx_batch to get the original value; '
+          '0xC000000D=STATUS_INVALID_PARAMETER is mostly a wrong NIC index/isolation compartment)' % g('rx_batch'))
     ok = False
 if g('rx_bad_hdr') != 2:
-    print('[wire] 失败：rx_bad_hdr=%d，坏凭据样本数不对（期望 2）' % g('rx_bad_hdr')); ok = False
-if 'IWAN-INNER-OK' in txt or '内层已交付' in txt:
-    print('[wire] 附加证据：客体用户态收到了内层载荷 IWAN-INNER-OK')
+    print('[wire] FAIL: rx_bad_hdr=%d, bad-credential sample count is wrong (expected 2)' % g('rx_bad_hdr')); ok = False
+if 'IWAN-INNER-OK' in txt:
+    print('[wire] extra evidence: guest userland received the inner payload IWAN-INNER-OK')
 else:
-    print('[wire] 注意：客体用户态没收到内层包。先看 rx_batch/rx_batch_skip/rx_reasm '
-          '（注入完成状态诊断：成功/失败各一个计数，失败时 rx_reasm 累加状态码原值）；'
-          '若完成是成功的，再排除客体防火墙（本脚本已加 UDP 9999 放行）。')
+    print('[wire] note: guest userland received no inner packet. First check rx_batch/rx_batch_skip/rx_reasm '
+          '(injection completion status diagnostics: one counter each for success/failure; on failure rx_reasm sums the raw status codes); '
+          'if completion is successful, rule out the guest firewall (this script already added the UDP 9999 allow rule).')
 sys.exit(0 if ok else 1)
 PY
 RC=$?
@@ -189,7 +189,7 @@ timeout 60 ssh -o ConnectTimeout=12 nano11 \
     'netsh advfirewall firewall delete rule name="iwan-wire-in"' >/dev/null 2>&1
 
 timeout 15 ssh -o ConnectTimeout=8 -o BatchMode=yes nano11 'echo ok' >/dev/null 2>&1 \
-    && say "线测后网络：通" || { say "线测后网络：不通"; RC=1; }
+    && say "network after wire test: up" || { say "network after wire test: down"; RC=1; }
 
-[ $RC -eq 0 ] && say "通过（证据在 $OUT/）" || say "未通过（证据在 $OUT/）"
+[ $RC -eq 0 ] && say "PASS (evidence in $OUT/)" || say "FAIL (evidence in $OUT/)"
 exit $RC

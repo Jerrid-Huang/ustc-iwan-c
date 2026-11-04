@@ -1,31 +1,31 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * iwan_shm.c — /dev/iwan：每 netns 一页只读共享内存（mmap 给用户态）。
+ * iwan_shm.c - /dev/iwan: one read-only shared memory page per netns (mmap for userspace).
  *
- * 为什么需要它：keepalive 的**发送**在用户态（内核不管发送），但"对端还活着
- * 吗"必须由内核给出依据 —— 内核每收到一个通过凭据闸门的帧（数据帧或控制帧）
- * 就把当前单调毫秒写进这一页，用户态定期轮询即可，不需要任何系统调用。
- * 收到 PT_CLOSE(0x17) 时时间戳置 0，用户态见到 0 即判定断线并退出。
+ * Why it is needed: keepalive **sending** is in userspace (the kernel does not send), but
+ * "is the peer still alive" must have kernel evidence -- for every frame (data or control)
+ * that passes the credential gate the kernel writes the current monotonic ms into this page,
+ * so userspace just polls, no syscall; PT_CLOSE(0x17) zeroes it, and seeing 0 means down => exit.
  *
- * 布局冻结在 kernel/iwan_shm.h（偏移 + 版本 + static_assert），用户态按固定
- * 偏移读；时基是 iwan_now_ms()，与 netlink 的 IWAN_A_LAST_KEEPALIVE_MS 完全
- * 一致，而且是**同一个存储**（struct iwan_session 里不再存第二份）。
+ * The layout is frozen in kernel/iwan_shm.h (offsets + version + static_assert); userspace reads
+ * by those fixed offsets. The time base is iwan_now_ms(), exactly identical to netlink's
+ * IWAN_A_LAST_KEEPALIVE_MS, and it is **the same storage** (no second copy in struct iwan_session).
  *
- * 生命周期（不能有 use-after-free，用户态可能"先 mmap 再删 netns"）：
- *   · 每 netns 一页：alloc_page() 拿到的 1 个引用就是 **pernet 引用**；
- *   · 每次 open() 用 get_page() 再持 1 个引用，release() 时 put_page()；
- *     mmap 的映射经 vma 持有 file 引用 ⇒ 只要映射还在，file 就在，页面引用
- *     就不会提前释放；用户在 netns 消失后继续读自己的映射是安全的；
- *   · pernet exit 的顺序是硬约束：先摘 netfilter 钩子（iwan_rx_net_exit 内含
- *     synchronize_rcu()，保证没有在途钩子还会写这一页），再把 pn->shm 置 NULL，
- *     最后放 pernet 引用；
- *   · 最后一个引用由 put_page() 回收（内部 __free_page，order 0）。
+ * Lifecycle (no use-after-free: userspace may "mmap first, then delete the netns"):
+ *   - one page per netns: the 1 reference taken by alloc_page() is the **pernet reference**;
+ *   - each open() takes 1 more ref via get_page(); release() does put_page(); the mmap
+ *     mapping holds the file ref via its vma => while the mapping lives the file lives, so
+ *     the page is not freed early; reading it after the netns is gone is safe;
+ *   - pernet exit order is a hard constraint: first detach the netfilter hooks (iwan_rx_net_exit
+ *     contains synchronize_rcu(), guaranteeing no in-flight hook still writes this page), then
+ *     set pn->shm to NULL, and finally drop the pernet reference;
+ *   - the last reference is reclaimed by put_page() (internal __free_page, order 0).
  *
- * 为什么用户态只读：这一页是"内核 → 用户态"的单向快照，用户态写它没有任何
- * 语义（内核每个帧都会覆盖时间戳）。open() 直接拒绝写方式打开，mmap() 拒绝
- * 偏移非 0/超过一页/PROT_WRITE，并清掉 VM_MAYWRITE 让 mprotect 也改不成可写。
- * 页面里没有密钥等敏感数据，因此不加 capability 检查：进程只能看到**自己
- * netns** 的那一页。
+ * Why userspace is read-only: this page is a one-way "kernel -> userspace" snapshot; userspace
+ * writes have no semantics (the kernel overwrites the timestamp on every frame). open() rejects
+ * write mode outright, mmap() rejects non-zero offset / more than one page / PROT_WRITE, and
+ * clears VM_MAYWRITE so even mprotect cannot make it writable. The page holds no keys or other
+ * sensitive data, so no capability check: a process can only see the page of **its own netns**.
  */
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
@@ -45,51 +45,51 @@
 #include "iwan_genl.h"
 #include "iwan_shm.h"
 
-/* ---- 布局断言：IWAN_SHM_OFF_* 就是 ABI -------------------------------
+/* ---- Layout asserts: IWAN_SHM_OFF_* is the ABI ------------------------
  *
- * 头文件给用户态的偏移是冻结值，结构体字段顺序/类型若被改动，
- * 这里编译期就会失败（用户态工具也有一份等价断言，见 tests/iwan_shm.c）。
+ * The offsets given to userspace by the header are frozen; if struct field order/type changes,
+ * this fails at compile time (the userspace tool has an equivalent assert, see tests/iwan_shm.c).
  */
 static_assert(offsetof(struct iwan_shm, version) == IWAN_SHM_OFF_VERSION,
-	      "iwan_shm: version 偏移与 ABI 不符");
+	      "iwan_shm: version offset does not match ABI");
 static_assert(offsetof(struct iwan_shm, pad) == IWAN_SHM_OFF_PAD,
-	      "iwan_shm: pad 偏移与 ABI 不符");
+	      "iwan_shm: pad offset does not match ABI");
 static_assert(offsetof(struct iwan_shm, last_rx_ms) == IWAN_SHM_OFF_LAST_RX_MS,
-	      "iwan_shm: last_rx_ms 偏移与 ABI 不符");
+	      "iwan_shm: last_rx_ms offset does not match ABI");
 static_assert(offsetof(struct iwan_shm, peer_state) == IWAN_SHM_OFF_PEER_STATE,
-	      "iwan_shm: peer_state 偏移与 ABI 不符");
+	      "iwan_shm: peer_state offset does not match ABI");
 static_assert(offsetof(struct iwan_shm, enabled) == IWAN_SHM_OFF_ENABLED,
-	      "iwan_shm: enabled 偏移与 ABI 不符");
+	      "iwan_shm: enabled offset does not match ABI");
 static_assert(offsetof(struct iwan_shm, rx_frames) == IWAN_SHM_OFF_RX_FRAMES,
-	      "iwan_shm: rx_frames 偏移与 ABI 不符");
+	      "iwan_shm: rx_frames offset does not match ABI");
 static_assert(offsetof(struct iwan_shm, rx_ctrl_frame) ==
 	      IWAN_SHM_OFF_RX_CTRL_FRAME,
-	      "iwan_shm: rx_ctrl_frame 偏移与 ABI 不符");
+	      "iwan_shm: rx_ctrl_frame offset does not match ABI");
 static_assert(sizeof(struct iwan_shm) == IWAN_SHM_HDR_SIZE,
-	      "iwan_shm: 头部大小与 ABI 不符（尾部保留区不算在结构体里）");
+	      "iwan_shm: header size does not match ABI (trailing reserved area is not part of the struct)");
 static_assert(IWAN_SHM_HDR_SIZE <= PAGE_SIZE,
-	      "iwan_shm: 一页放不下 ABI 头部");
+	      "iwan_shm: the ABI header does not fit in one page");
 
-/* ---- 每 netns 页面：分配 / 释放 -------------------------------------- */
+/* ---- Per-netns page: allocate / free ---------------------------------- */
 
 int iwan_shm_net_init(struct iwan_net *pn)
 {
 	struct page *page;
 	struct iwan_shm *shm;
 
-	/* 这 1 个引用 = pernet 引用；调用者负责在 exit 时归还 */
+	/* This 1 reference = the pernet reference; the caller returns it on exit */
 	page = alloc_page(GFP_KERNEL | __GFP_ZERO);
 	if (!page)
 		return -ENOMEM;
 	shm = page_address(page);
 	if (!shm) {
-		/* 高端内存且未 kmap：本模块面向 64 位服务器，不支持这种配置。
-		 * 宁可让该 netns 初始化失败，也不要留下一页用户态读不到的页。 */
+		/* Highmem without kmap: this module targets 64-bit servers and does not
+		 * support that setup. Fail netns init rather than leave a page userspace cannot read. */
 		__free_page(page);
 		return -ENOMEM;
 	}
-	/* 版本是页面身份；其余字段 __GFP_ZERO 已清零：
-	 * enabled = 0、last_rx_ms = 0、peer_state = IWAN_PEER_UNKNOWN = 0 */
+	/* Version is the page identity; __GFP_ZERO already cleared the rest:
+	 * enabled = 0, last_rx_ms = 0, peer_state = IWAN_PEER_UNKNOWN = 0 */
 	WRITE_ONCE(shm->version, IWAN_SHM_VERSION);
 	WRITE_ONCE(pn->shm_page, page);
 	WRITE_ONCE(pn->shm, shm);
@@ -100,16 +100,16 @@ void iwan_shm_net_exit(struct iwan_net *pn)
 {
 	struct page *page = READ_ONCE(pn->shm_page);
 
-	/* 调用者必须已经摘掉 netfilter 钩子（iwan_net_exit 的顺序）。
-	 * 先摘指针：任何漏网的读者（READ_ONCE(pn->shm)）看到 NULL 就什么都不做；
-	 * 再放 pernet 引用，最后一个引用消失时整页回收。 */
+	/* The caller must already have detached the netfilter hooks (iwan_net_exit order).
+	 * Detach the pointer first: any stray reader (READ_ONCE(pn->shm)) sees NULL and does nothing;
+	 * then drop the pernet reference; the page is freed when the last reference goes away. */
 	WRITE_ONCE(pn->shm, NULL);
 	WRITE_ONCE(pn->shm_page, NULL);
 	if (page)
 		put_page(page);
 }
 
-/* ---- 会话级字段（控制面调用；进程上下文） ---------------------------- */
+/* ---- Session-level fields (called from the control plane; process context) -- */
 
 void iwan_shm_session_up(struct iwan_net *pn)
 {
@@ -117,10 +117,10 @@ void iwan_shm_session_up(struct iwan_net *pn)
 
 	if (!shm)
 		return;
-	/* 新会话从零开始：时间戳 0（"还没收到过帧"）、peer_state 回 UNKNOWN、
-	 * 会话级计数器归零。注意不在这里置 enabled —— 会话真正生效（valid
-	 * 置位）之后由调用者调 iwan_shm_set_enabled()，避免用户态先看到
-	 * enabled=1 而数据面还没接上。 */
+	/* A new session starts from zero: timestamp 0 ("no frame received yet"), peer_state back
+	 * to UNKNOWN, session-level counters zeroed. Note enabled is NOT set here -- after the
+	 * session really takes effect (valid set) the caller calls iwan_shm_set_enabled(), so
+	 * userspace does not see enabled=1 before the data plane is wired up. */
 	WRITE_ONCE(shm->version, IWAN_SHM_VERSION);
 	WRITE_ONCE(shm->last_rx_ms, 0);
 	WRITE_ONCE(shm->peer_state, IWAN_PEER_UNKNOWN);
@@ -134,19 +134,19 @@ void iwan_shm_session_down(struct iwan_net *pn)
 
 	if (!shm)
 		return;
-	/* 整页清零（含保留区），只保留 version：ABI 版本是页面身份，不随会话
-	 * 消失。用户态此刻可能正在读这一页，看到的是"清零过程中"的中间态，
-	 * 但所有字段的终态都是"无会话"（enabled=0、last_rx_ms=0），语义安全。 */
+	/* Zero the whole page (including the reserved area), keeping only version: the ABI version
+	 * is the page identity, not lost with the session. Userspace may be reading now and see
+	 * mid-zeroing state, but all fields settle to "no session" (enabled=0, last_rx_ms=0): safe. */
 	memset(shm, 0, PAGE_SIZE);
 	WRITE_ONCE(shm->version, IWAN_SHM_VERSION);
 }
 
 /*
- * 页面 enabled = 该 netns 的**会话级**数据面开关，与数据面 iwan_dp_get() 的
- * dp.enabled 同口径：会话开关 && 模块参数总开关。
- *   · 有会话：SESSION_UP / SET_ENABLED(1) → 1（模块参数 enabled=0 时仍为 0）；
- *   · 无会话（模块参数回落路径，旧的 tcp_echo_test 场景）：恒 0 —— 页面是
- *     会话级视图，那条路径的用户态不读这一页。
+ * Page enabled = the **session-level** data plane switch of this netns, same definition as
+ * dp.enabled of iwan_dp_get() in the data plane: session switch && module parameter master switch.
+ *   - with a session: SESSION_UP / SET_ENABLED(1) -> 1 (still 0 when module param enabled=0);
+ *   - without a session (module parameter fallback path, old tcp_echo_test scenario):
+ *     always 0 -- the page is a session-level view and userspace on that path never reads it.
  */
 void iwan_shm_set_enabled(struct iwan_net *pn, bool sess_enabled)
 {
@@ -157,7 +157,7 @@ void iwan_shm_set_enabled(struct iwan_net *pn, bool sess_enabled)
 		WRITE_ONCE(shm->enabled, on ? 1u : 0u);
 }
 
-/* ---- /dev/iwan 文件接口 ---------------------------------------------- */
+/* ---- /dev/iwan file interface ------------------------------------------- */
 
 static int iwan_shm_open(struct inode *inode, struct file *file)
 {
@@ -165,25 +165,25 @@ static int iwan_shm_open(struct inode *inode, struct file *file)
 	struct page *page;
 
 	(void)inode;
-	/* 这一页是内核写、用户态读的单向快照：写方式打开没有意义 */
+	/* This page is a kernel-write / userspace-read one-way snapshot: write open is meaningless */
 	if (file->f_mode & FMODE_WRITE)
 		return -EACCES;
 
 	/*
-	 * 按**打开进程当时的 netns** 绑定。这里不需要 get_net()，也不会与
-	 * pernet exit 竞争：调用者的 nsproxy 就持有该 netns 的引用，只要它还在
-	 * 这个 netns 里，netns 清理（以及随后的 pernet exit）就不可能发生 ——
-	 * 所以 net_generic() 与 pn->shm_page 此刻都有效。
+	 * Bind to the **netns of the opening process at open time**. No get_net() is needed here and
+	 * there is no race with pernet exit: the caller's nsproxy holds a reference to that netns, so
+	 * as long as it is still in this netns, cleanup (and the subsequent pernet exit) cannot happen
+	 * -- therefore net_generic() and pn->shm_page are both valid right now.
 	 *
-	 * 绑定完成后 file 只认 struct page（file->private_data），不再解引用 pn：
-	 * 这正是"先 mmap/打开、再删 netns"能安全工作的原因 —— netns 消失后
-	 * pn 连同 net_generic 的内存一起没了，而页面靠 file 的引用活着。
+	 * After binding, file only knows the struct page (file->private_data), never pn again: this
+	 * is why "mmap/open first, delete netns later" works -- after the netns disappears pn and
+	 * the net_generic memory are gone, while the page survives on the file reference.
 	 */
 	pn = iwan_net_of(current->nsproxy->net_ns);
 	page = READ_ONCE(pn->shm_page);
 	if (!page)
-		return -ENODEV;		/* 该 netns 的页面已被摘除/分配失败 */
-	get_page(page);			/* 每个打开的 file 持 1 个引用 */
+		return -ENODEV;		/* this netns' page was detached or allocation failed */
+	get_page(page);			/* each open file holds 1 reference */
 	file->private_data = page;
 	return 0;
 }
@@ -191,13 +191,13 @@ static int iwan_shm_open(struct inode *inode, struct file *file)
 static int iwan_shm_release(struct inode *inode, struct file *file)
 {
 	(void)inode;
-	put_page(file->private_data);	/* 最后一个引用时回收整页 */
+	put_page(file->private_data);	/* frees the whole page on the last reference */
 	file->private_data = NULL;
 	return 0;
 }
 
-/* 一次性读取的辅助路径（排障、以及不支持 mmap 的场合）：整页快照，
- * 偏移与长度由 simple_read_from_buffer 裁剪。轮询请用 mmap。 */
+/* One-shot read helper path (troubleshooting, and where mmap is unsupported): whole-page
+ * snapshot; simple_read_from_buffer trims offset and length. Use mmap for polling. */
 static ssize_t iwan_shm_read(struct file *file, char __user *ubuf,
 			     size_t count, loff_t *ppos)
 {
@@ -212,21 +212,21 @@ static int iwan_shm_mmap(struct file *file, struct vm_area_struct *vma)
 	struct page *page = file->private_data;
 	unsigned long size = vma->vm_end - vma->vm_start;
 
-	/* ABI 只有一页：偏移必须为 0，长度不得超过一页
-	 * （mmap 的长度已被 VFS 向上取整到页边界） */
+	/* The ABI is one page: offset must be 0 and length must not exceed one page
+	 * (the mmap length has already been rounded up to a page boundary by the VFS) */
 	if (vma->vm_pgoff != 0 || size > PAGE_SIZE)
 		return -EINVAL;
-	/* 只读：拒绝 PROT_WRITE，并清掉 VM_MAYWRITE，使随后的
-	 * mprotect(PROT_WRITE) 也失败 —— 用户态只读是 ABI 的一部分 */
+	/* Read-only: reject PROT_WRITE and clear VM_MAYWRITE so a later
+	 * mprotect(PROT_WRITE) also fails -- userspace read-only is part of the ABI */
 	if (vma->vm_flags & VM_WRITE)
 		return -EPERM;
 	vm_flags_clear(vma, VM_MAYWRITE);
-	/* 不许 mremap 扩张、不进 core dump（要求里点名的两个标志；
-	 * remap_pfn_range 自己也会置 VM_DONTEXPAND|VM_DONTDUMP|VM_IO|VM_PFNMAP） */
+	/* No mremap expansion, no core dump (the two flags named by the requirement;
+	 * remap_pfn_range also sets VM_DONTEXPAND|VM_DONTDUMP|VM_IO|VM_PFNMAP itself) */
 	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
 
-	/* file 持页面引用、vma 持 file 引用 ⇒ 映射期间页面不会被回收。
-	 * VM_PFNMAP 的映射不参与缺页分配，用户态只能通过普通访存读。 */
+	/* file holds the page ref, vma holds the file ref => the page is not freed while mapped.
+	 * A VM_PFNMAP mapping takes no part in fault allocation; userspace reads via normal loads. */
 	return remap_pfn_range(vma, vma->vm_start, page_to_pfn(page), size,
 			       vma->vm_page_prot);
 }
@@ -243,7 +243,7 @@ static struct miscdevice iwan_shm_dev = {
 	.minor	= MISC_DYNAMIC_MINOR,
 	.name	= IWAN_SHM_DEV_NAME,
 	.fops	= &iwan_shm_fops,
-	.mode	= 0444,		/* devtmpfs 自动建出 /dev/iwan，只读节点 */
+	.mode	= 0444,		/* devtmpfs creates /dev/iwan automatically, read-only node */
 };
 
 int iwan_shm_init(void)
@@ -251,7 +251,7 @@ int iwan_shm_init(void)
 	int err = misc_register(&iwan_shm_dev);
 
 	if (err)
-		pr_err("/dev/%s 注册失败 %d\n", IWAN_SHM_DEV_NAME, err);
+		pr_err("/dev/%s registration failed %d\n", IWAN_SHM_DEV_NAME, err);
 	return err;
 }
 

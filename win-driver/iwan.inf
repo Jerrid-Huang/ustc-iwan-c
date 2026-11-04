@@ -1,22 +1,22 @@
-; iwan.inf — Windows 内核数据面驱动（WFP callout）安装信息
+; iwan.inf -- install info for the Windows kernel data-plane driver (WFP callout)
 ;
-; 这是一个"非 PnP 的内核服务"INF：驱动不绑定任何硬件，由客户端/服务按需启动，
-; 对应 Linux 侧 modprobe iwan。ServiceType=1（内核驱动）、StartType=3（按需）。
+; This is a non-PnP kernel-service INF: the driver binds no hardware and is started on demand
+; by the client/service, like modprobe iwan on Linux. ServiceType=1 (kernel), StartType=3 (demand).
 ;
-; 安装（管理员）：
+; Install (as administrator):
 ;   pnputil /add-driver iwan.inf /install
-; 或（不走驱动库，直接落文件并建服务）：
+; Or (skip the driver store, drop the file and create the service directly):
 ;   rundll32 setupapi.dll,InstallHinfSection DefaultInstall 132 .\iwan.inf
-; 卸载：
+; Uninstall:
 ;   rundll32 setupapi.dll,InstallHinfSection DefaultUninstall 132 .\iwan.inf
 ;
-; 注意：本文件**不参与驱动编译**（iwan.vcxproj 里没有 <Inf> 项）。原因是 WDK 的
-; InfVerif 按设计拒绝 [DefaultInstall] 形式的 primitive 驱动 INF（1420/1421/1423），
-; 而这类 INF 恰恰是非 PnP 内核服务的正统写法。实际安装走 install.ps1 的 sc.exe
-; 路径（见 README），INF 是给"想用 setupapi/pnputil 装"的人留的备选材料。
+; Note: this file takes no part in the driver build (iwan.vcxproj has no <Inf> item). The WDK
+; InfVerif by design rejects primitive driver INFs written as [DefaultInstall] (1420/1421/1423),
+; which is exactly how a non-PnP kernel service is properly declared. Real installs use the
+; sc.exe path in install.ps1 (see README); this INF is optional material for setupapi/pnputil.
 ;
-; 架构装饰（.NTamd64 / .NTx86）是 InfVerif 的硬要求，两个架构都写全 —— 驱动本身
-; 在 x64 与 x86 上都能编。
+; The architecture decorations (.NTamd64 / .NTx86) are a hard InfVerif requirement; both are
+; spelled out here -- the driver builds for both x64 and x86.
 
 [Version]
 Signature   = "$Windows NT$"
@@ -72,4 +72,4 @@ DelService = iwan,0x200
 ProviderName = "iWAN"
 DiskName     = "iWAN kernel data plane"
 ServiceName  = "iWAN kernel data plane (WFP callout)"
-ServiceDesc  = "把 iWAN 数据面放进内核：WFP callout 出向封装、入向解封，报文不进用户态。"
+ServiceDesc  = "Puts the iWAN data plane in the kernel: WFP callout encap on output, decap on input; packets never enter user mode."

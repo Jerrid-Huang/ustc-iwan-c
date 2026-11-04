@@ -1,11 +1,11 @@
 /*
- * iWAN 内核数据面监督器（Linux only）。设计见 kdp.h。
+ * iWAN kernel data plane supervisor (Linux only). See kdp.h for the design.
  *
- * 与 TUN 泵（proxy.c run_pump）的分工：
- *   相同：路由展开/劫持与回滚、进程级停止处理、10s keepalive 发送、
- *         IWAN_RX_STALE_MS 判死、三态返回码；
- *   不同：没有 TUN fd、没有读写线程；数据面完全在内核，用户态只
- *         1s 轮询 /dev/iwan 的 last_rx_ms + 1s 排空可选的 events 组。
+ * division of labor vs the TUN pump (proxy.c run_pump):
+ *   same: route expansion/hijack and rollback, process-level stop handling, 10s keepalive sends,
+ *         IWAN_RX_STALE_MS death detection, three-state return code;
+ *   different: no TUN fd, no reader/writer threads; the data plane is fully in the kernel, userspace only
+ *         1s polls /dev/iwan's last_rx_ms + drains the optional events group every 1s.
  */
 
 #if defined(__linux__)
@@ -13,7 +13,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <ifaddrs.h>	/* kdp_bind_ok：从内核现读接口/地址状态 */
+#include <ifaddrs.h>	/* kdp_bind_ok: read interface/address state live from the kernel */
 #include <net/if.h>
 #include <netinet/in.h>
 #include <stdio.h>
@@ -29,18 +29,19 @@
 #include "kdp.h"
 #include "reply_route.h"
 #include "protocol.h"
+#include "echo.h"
 #include "proxy.h"
 #include "route.h"
 #include "util.h"
 
-/* 共享内存轮询周期（决策：1s）与循环让步粒度（Ctrl-C 响应）。
- * 判死阈值/保活周期不在这里复制：用 proxy.c 导出的同一套访问器，避免
- * 两条数据面在 IWAN_RX_STALE_MS 语义上漂移。 */
+/* Shared memory poll period (decision: 1s) and loop yield granularity (Ctrl-C response).
+ * The death threshold/keepalive period are not copied here: use the same accessors exported by proxy.c, to avoid
+ * the two data planes drifting on IWAN_RX_STALE_MS semantics. */
 #define KDP_POLL_MS  1000u
 #define KDP_SLEEP_MS 100u
 
-/* 模块固定用它（SESSION_UP 回执里的 DEVNAME 才是权威，这里只用于启动前
- * 的归属预检） */
+/* The module always uses it (the DEVNAME in the SESSION_UP reply is authoritative; this is only used for the pre-startup
+ * ownership precheck) */
 #define KDP_DEV_DEFAULT "iwan0"
 
 struct kdp {
@@ -69,8 +70,8 @@ struct kdp {
     slist_t routes6;
     bool    had_routes;
 
-    /* 承载网卡绑定（由调用方填，见 kdp.h 的 kdp_bind）：会话建立时写进
-     * sess.oif/sess.bind_ip，1s 节拍里每次重新判定有效性。 */
+    /* Carrier NIC bind (filled by the caller, see kdp_bind in kdp.h): written into
+     * sess.oif/sess.bind_ip, validity re-checked on every 1s tick. */
     kdp_bind bind;
 
     bool    session_up;
@@ -78,18 +79,18 @@ struct kdp {
     bool    shm_ok;
     bool    events_ok;
     bool    session_lost;
-    reply_route_state rr;      /* 回程路由（conntrack）状态 */
+    reply_route_state rr;      /* reply route (conntrack) state */
 };
 
-/* ------------------------------------------------------------ 小工具 */
+/* ------------------------------------------------------------ helpers */
 
 static uint64_t ms_since(uint64_t now, uint64_t then)
 {
     return now > then ? now - then : 0;
 }
 
-/* 进程级停止处理：与 run_pump 同一套（port_set_stop_handler + 共享的
- * g_stop/g_user_stop），所以重连循环的三态语义完全一致。 */
+/* Process-level stop handling: the same set as run_pump (port_set_stop_handler + shared
+ * g_stop/g_user_stop), so the reconnect loop's three-state semantics match exactly. */
 static void kdp_on_signal(int sig)
 {
     (void)sig;
@@ -97,28 +98,28 @@ static void kdp_on_signal(int sig)
     g_user_stop = 1;
 }
 
-/* 与 run_pump 的 send_ctrl 同形（同一个 24B 签名控制帧、同一条会话套接字）。
- * 内核模式下套接字保持阻塞（只有 10s 一条的控制帧），不做 GSO 处理。 */
-/* ---------------------------------------------------------- 绑定有效性
+/* Same shape as run_pump's send_ctrl (same 24B signed control frame, same session socket).
+ * In kernel mode the socket stays blocking (only one control frame every 10s); no GSO handling. */
+/* ---------------------------------------------------------- bind validity
  *
- * 判据每次从内核现读（getifaddrs），不保存"上一次看到的地址/状态"：
- * 地址与链路状态的事实来源是内核，用户态缓存只会制造两份真相。
- *   · 绑 IP：该地址必须仍在某张本机接口上，且那张接口 UP 且有载波；
- *   · 绑网卡：该接口必须存在，且 UP 且有载波。
- * IFF_RUNNING 就是链路载波（IFF_LOWER_UP 的同一事实）：载波丢失时设备仍然
- * UP、内核侧外层查找也仍然成功，报文会被链路层丢弃且不回传错误 —— 这是
- * 数据面唯一没有信号的失效分支，只能在这里判。veth 的载波恒为 up，
- * 所以靶场测不到这一分支（需要真实网卡）。
+ * Criteria are read live from the kernel each time (getifaddrs); no "last seen address/state" is stored:
+ * the kernel is the source of truth for address and link state; a userspace cache only creates two truths.
+ *   - bound IP: the address must still be on some local interface, and that interface must be UP with carrier;
+ *   - bound NIC: the interface must exist, and be UP with carrier.
+ * IFF_RUNNING is the link carrier (the same fact as IFF_LOWER_UP): when carrier is lost the device is still
+ * UP, and the kernel-side outer lookup still succeeds, so packets are dropped by the link layer with no error returned -- this is
+ * the data plane's only failure branch with no signal, and it can only be detected here. veth carrier is always up,
+ * so the test range cannot hit this branch (a real NIC is required).
  */
 static bool ifa_flags_ok(const char *name, unsigned flags, char *why,
                          size_t whysz)
 {
     if (!(flags & IFF_UP)) {
-        snprintf(why, whysz, "承载网卡 %s 已 down（flags=0x%x）", name, flags);
+        snprintf(why, whysz, "carrier NIC %s is down (flags=0x%x)", name, flags);
         return false;
     }
     if (!(flags & IFF_RUNNING)) {
-        snprintf(why, whysz, "承载网卡 %s 无载波（flags=0x%x）", name, flags);
+        snprintf(why, whysz, "carrier NIC %s has no carrier (flags=0x%x)", name, flags);
         return false;
     }
     return true;
@@ -137,13 +138,13 @@ bool kdp_bind_ok(const kdp_bind *b, char *why, size_t whysz)
     if (why != NULL && whysz != 0)
         why[0] = '\0';
     if (getifaddrs(&ifa0) != 0)
-        return true;	/* 状态未知：不动作，正确性由内核侧兜底 */
+        return true;	/* state unknown: do nothing; the kernel side provides correctness as fallback */
 
     for (ifa = ifa0; ifa != NULL; ifa = ifa->ifa_next) {
         if (ifa->ifa_name == NULL)
             continue;
         if (b->bind_v6) {
-            /* 外层 v6 的绑 IP：同一套判据，地址是 16 字节 */
+            /* outer v6 bound IP: same criteria, the address is 16 bytes */
             const struct sockaddr_in6 *sin6;
             char a6[INET6_ADDRSTRLEN];
 
@@ -156,7 +157,7 @@ bool kdp_bind_ok(const kdp_bind *b, char *why, size_t whysz)
             if (b->oif != 0 && if_nametoindex(ifa->ifa_name) != b->oif) {
                 if (why != NULL && whysz != 0)
                     snprintf(why, whysz,
-                             "绑定的出口 IP %s 不在承载网卡 %s 上（它在 %s）",
+                             "bound egress IP %s is not on carrier NIC %s (it is on %s)",
                              inet_ntop(AF_INET6, &b->bind_ip6, a6,
                                        sizeof(a6)),
                              b->dev != NULL ? b->dev : "(ifindex)",
@@ -179,8 +180,8 @@ bool kdp_bind_ok(const kdp_bind *b, char *why, size_t whysz)
             sin = (const struct sockaddr_in *)(const void *)ifa->ifa_addr;
             if (ntohl(sin->sin_addr.s_addr) != b->bind_ip)
                 continue;
-            /* 同时给了网卡时两者必须指向同一张接口（内核侧同样会 -EINVAL
-             * 拒绝；这里早一步给出更具体的原因）。 */
+            /* When a NIC is also given the two must point to the same interface (the kernel side likewise returns -EINVAL
+             * and rejects; this reports a more specific reason one step earlier). */
             if (b->oif != 0 &&
                 if_nametoindex(ifa->ifa_name) != b->oif) {
                 if (why != NULL && whysz != 0) {
@@ -188,7 +189,7 @@ bool kdp_bind_ok(const kdp_bind *b, char *why, size_t whysz)
 
                     a.s_addr = htonl(b->bind_ip);
                     snprintf(why, whysz,
-                             "绑定的出口 IP %s 不在承载网卡 %s 上（它在 %s）",
+                             "bound egress IP %s is not on carrier NIC %s (it is on %s)",
                              inet_ntop(AF_INET, &a,
                                        (char[INET_ADDRSTRLEN]){0},
                                        INET_ADDRSTRLEN),
@@ -218,18 +219,18 @@ bool kdp_bind_ok(const kdp_bind *b, char *why, size_t whysz)
             if (b->bind_v6) {
                 char a6[INET6_ADDRSTRLEN];
 
-                snprintf(why, whysz, "绑定的出口 IP %s 已不在本机地址表里",
+                snprintf(why, whysz, "bound egress IP %s is no longer in the local address table",
                          inet_ntop(AF_INET6, &b->bind_ip6, a6, sizeof(a6)));
             } else if (b->bind_ip != 0) {
                 struct in_addr a;
 
                 a.s_addr = htonl(b->bind_ip);
                 snprintf(why, whysz,
-                         "绑定的出口 IP %s 已不在本机地址表里",
+                         "bound egress IP %s is no longer in the local address table",
                          inet_ntop(AF_INET, &a, (char[INET_ADDRSTRLEN]){0},
                                    INET_ADDRSTRLEN));
             } else {
-                snprintf(why, whysz, "绑定的承载网卡 %s 已不存在",
+                snprintf(why, whysz, "bound carrier NIC %s no longer exists",
                          b->dev != NULL ? b->dev : "(ifindex)");
             }
         }
@@ -245,7 +246,7 @@ void kdp_bind_wait(const kdp_bind *b)
     for (;;) {
         if (kdp_bind_ok(b, why, sizeof(why)))
             return;
-        log_err("内核数据面: 绑定尚不可用（%s），等待恢复后再握手", why);
+        log_err("kernel data plane: bind not usable yet (%s), waiting for recovery before the handshake", why);
         port_sleep_ms(1000);
         if (g_user_stop)
             return;
@@ -259,7 +260,15 @@ static int kdp_send_ctrl(const struct kdp *k, uint8_t typ)
     ssize_t r;
 
     buf_init(&pkt);
-    ctrl_hdr(&pkt, typ, k->enc, k->sid, k->tok);
+    if (typ == PT_ECHO_REQ) {
+        /* The official client's ECHOREQ is 8+16+36=60 bytes: the tick in the payload lets the peer
+         * echo it back verbatim so latency can be measured. Kernel data plane RX is in the kernel, ECHO_RES is unavailable,
+         * so here we only send the payload and keep no statistics -- but the length and tick must match the official client,
+         * otherwise the peer may treat it as a short frame. */
+        iwan_echo_build(&pkt, typ, k->enc, k->sid, k->tok, NULL, now_us());
+    } else {
+        ctrl_hdr(&pkt, typ, k->enc, k->sid, k->tok);
+    }
     want = pkt.len;
     r = port_send(k->sockfd, pkt.data, want, 0);
     buf_free(&pkt);
@@ -281,9 +290,9 @@ static void kdp_shm_close(struct kdp *k)
     k->shm_ok = false;
 }
 
-/* 打开并只读映射本 netns 的共享内存页。/dev/iwan 不存在时**明确报错**，
- * 不静默降级成 TUN（决策 6）。必须在 SESSION_UP 之前调用：一旦建立会话，
- * 钩子就开始吞包，那时才发现监控不可用就晚了。 */
+/* Open and read-only map this netns's shared memory page. When /dev/iwan is absent, **report an explicit error**,
+ * do not silently degrade to TUN (decision 6). Must be called before SESSION_UP: once a session is established,
+ * the hook starts swallowing packets, and finding out then that monitoring is unavailable is too late. */
 static bool kdp_shm_open(struct kdp *k, char *err, size_t errsz)
 {
     void *p;
@@ -294,23 +303,23 @@ static bool kdp_shm_open(struct kdp *k, char *err, size_t errsz)
     if (k->shm_fd < 0) {
         if (errno == ENOENT)
             snprintf(err, errsz,
-                     "内核数据面需要 /dev/iwan（共享内存页），但该设备不存在。\n"
-                     "  请加载与本客户端同批构建的内核模块"
-                     "（sudo insmod kernel/iwan.ko），\n"
-                     "  或改用 --data-plane tun");
+                     "kernel data plane needs /dev/iwan (shared memory page), but the device does not exist.\n"
+                     "  Please load a kernel module built from the same batch as this client"
+                     " (sudo insmod kernel/iwan.ko),\n"
+                     "  or switch to --data-plane tun");
         else if (errno == EACCES || errno == EPERM)
             snprintf(err, errsz,
-                     "打开 /dev/iwan 被拒: %s（需要该设备的读权限）",
+                     "opening /dev/iwan was denied: %s (read permission on that device is required)",
                      strerror(errno));
         else
-            snprintf(err, errsz, "打开 /dev/iwan 失败: %s", strerror(errno));
+            snprintf(err, errsz, "opening /dev/iwan failed: %s", strerror(errno));
         return false;
     }
     pg = sysconf(_SC_PAGESIZE);
     k->shm_len = pg > 0 ? (size_t)pg : 4096u;
     p = mmap(NULL, k->shm_len, PROT_READ, MAP_SHARED, k->shm_fd, 0);
     if (p == MAP_FAILED) {
-        snprintf(err, errsz, "mmap(/dev/iwan) 失败: %s", strerror(errno));
+        snprintf(err, errsz, "mmap(/dev/iwan) failed: %s", strerror(errno));
         close(k->shm_fd);
         k->shm_fd = -1;
         return false;
@@ -319,8 +328,8 @@ static bool kdp_shm_open(struct kdp *k, char *err, size_t errsz)
     memcpy(&ver, k->shm + IWAN_SHM_OFF_VERSION, sizeof(ver));
     if (ver != (uint32_t)IWAN_SHM_VERSION) {
         snprintf(err, errsz,
-                 "/dev/iwan 共享内存布局版本 %u 与本客户端期望的 %u 不一致："
-                 "内核模块与客户端不是同批构建",
+                 "/dev/iwan shared memory layout version %u does not match the %u this client expects:"
+                 " the kernel module and the client were not built from the same batch",
                  ver, (unsigned)IWAN_SHM_VERSION);
         kdp_shm_close(k);
         return false;
@@ -329,9 +338,9 @@ static bool kdp_shm_open(struct kdp *k, char *err, size_t errsz)
     return true;
 }
 
-/* 最近一次通过凭据闸门的帧的单调毫秒；0 = 从未收到 / 已断开。
- * 与 now_ms() 同一时基（ktime_get_mono_fast_ns 折算），对齐的 64 位读用
- * 原子内建，避免 32 位平台上读到撕裂值。 */
+/* Monotonic milliseconds of the last frame that passed the credential gate; 0 = never received / disconnected.
+ * Same time base as now_ms() (ktime_get_mono_fast_ns converted); the aligned 64-bit read uses an
+ * atomic builtin to avoid torn values on 32-bit platforms. */
 static uint64_t kdp_shm_last_rx(const struct kdp *k)
 {
     if (!k->shm_ok || k->shm == NULL)
@@ -341,19 +350,19 @@ static uint64_t kdp_shm_last_rx(const struct kdp *k)
         __ATOMIC_RELAXED);
 }
 
-/* ------------------------------------------- 启动前预检（握手之前） */
+/* ------------------------------------------- pre-startup precheck (before the handshake) */
 
 static bool kdp_precheck_device(char *err, size_t errsz);
 
-/* 共享内存页说"这条会话最近还有人在用"吗。
+/* Does the shared memory page say "this session is still in use recently"?
  *
- * 判据只有三个字段：enabled=1（会话级数据面开关）、last_rx_ms 非 0、且距今
- * 小于 2×keepalive（10s → 20s）。读时间戳分不清"刚建立、还没收到任何帧"与
- * "崩溃残留且从未收帧"，所以只在"最近确实收到过帧"时判活；更旧的会话按残留
- * 处理，仍交给 SESSION_UP 的冲突检查兜底 —— 预检绝不能把残留会话挡死，否则
- * 一次 SIGKILL 之后客户端再也起不来（E2 用例覆盖的场景）。
+ * Only three fields are used as criteria: enabled=1 (session-level data plane toggle), last_rx_ms non-zero, and
+ * less than 2x keepalive ago (10s -> 20s). Reading the timestamp cannot distinguish "just established, no frame received yet" from
+ * "a crash leftover that never received a frame", so a session is live only when "a frame was really received recently"; older sessions are
+ * treated as leftover and still falling back to the SESSION_UP conflict check -- the precheck must never block leftover sessions, otherwise
+ * after one SIGKILL the client can never start again (the scenario covered by the E2 test case).
  *
- * age_ms（可为 NULL）收到"最后收帧距今多少毫秒"，0 表示从未收到。 */
+ * age_ms (may be NULL) receives "how many milliseconds since the last frame received"; 0 means never received. */
 static bool kdp_session_is_live(const struct kdp *k, uint64_t *age_ms)
 {
     uint32_t enabled = 0;
@@ -372,12 +381,12 @@ static bool kdp_session_is_live(const struct kdp *k, uint64_t *age_ms)
     if (age_ms != NULL)
         *age_ms = age;
     return enabled != 0 && last_rx != 0 && now > last_rx &&
-           age < (uint64_t)pump_keepalive_ms() * 2u;
+           age < (uint64_t)pump_keepalive_ms() * 10u;
 }
 
-/* 预检主体：共享内存页已映射好（k->shm_ok）之后的两件事 —— 本 netns 是否
- * 已有活会话、iwan0 归属。kdp_run 与 kdp_plane_precheck 共用同一份判据与
- * 报错文本，两条路径不会漂移。 */
+/* Precheck body: the two things after the shared memory page is mapped (k->shm_ok) -- whether this netns
+ * already has a live session, and iwan0 ownership. kdp_run and kdp_plane_precheck share the same criteria and
+ * error text, so the two paths cannot drift. */
 static bool kdp_precheck_core(const struct kdp *k, char *err, size_t errsz,
                               bool *busy)
 {
@@ -387,13 +396,13 @@ static bool kdp_precheck_core(const struct kdp *k, char *err, size_t errsz,
         *busy = false;
     if (kdp_session_is_live(k, &age)) {
         snprintf(err, errsz,
-                 "本 netns 已有一条活会话：%llu ms 前还收到过对端帧"
-                 "（enabled=1，判活窗口 %u ms）。\n"
-                 "  内核模块 iwan 的会话是**按 netns 单例**的："
-                 "一条 netns 只能有一条内核会话。\n"
-                 "  请先停掉那个客户端（Ctrl-C），或换一个 netns 运行；"
-                 "确认是崩溃残留时用 sudo iwan_ctl session-down 清掉再试。",
-                 (unsigned long long)age, pump_keepalive_ms() * 2u);
+                 "this netns already has a live session: a peer frame was received %llu ms ago"
+                 " (enabled=1, live window %u ms).\n"
+                 "  Sessions of the iwan kernel module are **singleton per netns**: "
+                 "a netns can have only one kernel session.\n"
+                 "  Please stop that client first (Ctrl-C), or run in another netns; "
+                 "if you are sure it is a crash leftover, clear it with sudo iwan_ctl session-down and retry.",
+                 (unsigned long long)age, pump_keepalive_ms() * 10u);
         if (busy != NULL)
             *busy = true;
         return false;
@@ -410,8 +419,8 @@ bool kdp_plane_precheck(char *err, size_t errsz, bool *busy)
         *busy = false;
     memset(&k, 0, sizeof k);
     k.shm_fd = -1;
-    /* /dev/iwan 缺失 / 权限 / 布局版本不符的报错由 kdp_shm_open 给出，与
-     * kdp_run 内部那条一字不差。这里只借它做一次临时映射，读完立刻关。 */
+    /* /dev/iwan missing / permission / layout version mismatch errors are reported by kdp_shm_open, identical
+     * kdp_run's counterpart; here it is only borrowed for one temporary mapping, closed right after reading. */
     if (!kdp_shm_open(&k, err, errsz))
         return false;
     ok = kdp_precheck_core(&k, err, errsz, busy);
@@ -419,28 +428,28 @@ bool kdp_plane_precheck(char *err, size_t errsz, bool *busy)
     return ok;
 }
 
-/* 模块的 SESSION_UP 冲突报错来自 kernel/iwan_netlink.c 的 extack
- * （"SESSION_UP 与已有会话冲突（<字段> 不同）"，e2e 里断言过）。用它把
- * "已有会话"这一类失败与"参数不合法/设备被占"区分开：前者不能回退到 TUN
- * （回退会拿同一账号把那条会话顶掉），后者可以。措辞变了也不会变危险 ——
- * 认不出来时按"不 busy"处理，回退到 TUN 会在 iwan0 被模块占着时失败退出。 */
+/* The module's SESSION_UP conflict error comes from kernel/iwan_netlink.c's extack
+ * ("SESSION_UP conflicts with an existing session (<field> differs)", asserted in e2e). Use it to
+ * "existing session" failures apart from "invalid parameter / device busy": the former must not fall back to TUN
+ * (falling back would use the same account to kick that session out), the latter may. A wording change does not make it dangerous --
+ * when unrecognized it is treated as "not busy"; falling back to TUN then fails out while iwan0 is held by the module. */
 static bool kdp_err_is_conflict(const char *err)
 {
-    return err != NULL && strstr(err, "冲突") != NULL;
+    return err != NULL && strstr(err, "\xe5\x86\xb2\xe7\xaa\x81") != NULL;
 }
 
-/* --------------------------------------------------- 设备归属预检 */
+/* --------------------------------------------------- device ownership precheck */
 
-/* `ip -d link show dev iwan0` 的 detail 行给出 kind（TUN 设备是
- * "tun type tun ..."，模块建的卡是 "iwan"）。ARPHRD 都是 65534，名字/
- * 类型无法区分，只能看这一行。
+/* `ip -d link show dev iwan0`'s detail line gives kind (a TUN device is
+ * "tun type tun ...", a module-created interface is "iwan"). ARPHRD is 65534 for both, so the name/
+ * type cannot distinguish them; only this line can be inspected.
  *
- * 三种结果：
- *   设备不存在        -> 放行（SESSION_UP 按需创建）
- *   kind == "iwan"    -> 放行
- *   kind 是别的      -> 硬报错（本机 iwan0 被真实隧道当 TUN 占用的情形）
- *   iproute2 没给 kind -> 放行 + debug 提示（老版本 iproute2；此时由
- *                        SESSION_UP 的 -EBUSY/-EEXIST 兜底） */
+ * Three outcomes:
+ *   device does not exist  -> allow (SESSION_UP creates it on demand)
+ *   kind == "iwan"    -> allow
+ *   kind is something else -> hard error (case where local iwan0 is occupied as a TUN by a real tunnel)
+ *   iproute2 gave no kind -> allow + debug hint (old iproute2; here the
+ *                        SESSION_UP -EBUSY/-EEXIST path is the fallback) */
 static bool kdp_precheck_device(char *err, size_t errsz)
 {
     char *out;
@@ -452,8 +461,8 @@ static bool kdp_precheck_device(char *err, size_t errsz)
     out = cmd_capture((char *[]){ "-d", "link", "show", "dev",
                                   KDP_DEV_DEFAULT, NULL });
     if (out == NULL) {
-        /* 设备不存在，或者 `ip` 本身不可用（两者都继续：路由代码随后会
-         * 报出真正的原因） */
+        /* Device does not exist, or `ip` itself is unavailable (continue in both cases: the routing code will
+         * report the real cause afterwards) */
         return true;
     }
     line = out;
@@ -487,35 +496,35 @@ static bool kdp_precheck_device(char *err, size_t errsz)
 
     if (have_detail && strcmp(kind, "iwan") != 0) {
         snprintf(err, errsz,
-                 "%s 已存在，但不是 iwan 内核模块创建的设备"
-                 "（ip -d 显示类型 \"%s\"）：\n"
-                 "  内核数据面固定使用 %s，模块不会接管别人的设备"
-                 "（会返回 -EBUSY）。\n"
-                 "  请先删除它（sudo ip link del %s）后重试，"
-                 "或改用 --data-plane tun",
+                 "%s already exists, but it is not a device created by the iwan kernel module"
+                 " (ip -d shows type \"%s\"):\n"
+                 "  The kernel data plane always uses %s; the module will not take over someone else's device"
+                 " (it returns -EBUSY).\n"
+                 "  Please delete it first (sudo ip link del %s) and retry, "
+                 "or switch to --data-plane tun",
                  KDP_DEV_DEFAULT, kind, KDP_DEV_DEFAULT, KDP_DEV_DEFAULT);
         free(out);
         return false;
     }
     if (!have_detail)
-        log_debug("内核数据面: %s 已存在但 ip -d 未给出 kind，"
-                  "无法预检归属（由 SESSION_UP 兜底）", KDP_DEV_DEFAULT);
+        log_debug("kernel data plane: %s exists but ip -d gave no kind, "
+                  "cannot precheck ownership (SESSION_UP is the fallback)", KDP_DEV_DEFAULT);
     free(out);
     return true;
 }
 
-/* --------------------------------------------------- 会话五元组 */
+/* --------------------------------------------------- session 5-tuple */
 
-/* dport = 服务器端口、sport = 本地实际端口、outer_src = 本地外层地址，
- * 全部取自已连接的套接字本身（getsockname/getpeername）：
- *   · 模块 TX 用 SPORT 当源端口、RX 认"目的端口 = SPORT"，
- *     outer_src 又是对端 peer 绑定的依据，任何一处用错都会漂；
- *   · 会话参数从第一次 SESSION_UP 起固定，所以这里取的值会在整个会话
- *     生命周期里保持不变（重连换端口 -> 先 SESSION_DOWN，见 kdp_teardown）。 */
-/* 把 --server 的字面量解析成 v6 地址：接受裸地址与 [地址] 两种写法（与
- * cli_common.c 的 check_server_ip 同一套）。带 %scope 的链路本地字面量在
- * 这里就拒：内核 ABI 的外层 v6 属性只有 16 字节地址、没有 scope_id，链路
- * 本地外层在数据面无法保证发到正确接口。 */
+/* dport = server port, sport = actual local port, outer_src = local outer address,
+ * all taken from the connected socket itself (getsockname/getpeername):
+ *   - module TX uses SPORT as source port, RX matches "destination port = SPORT",
+ *     outer_src is also the basis for the peer binding; getting either wrong causes drift;
+ *   - session parameters are fixed from the first SESSION_UP, so the values taken here stay
+ *     unchanged for the whole session lifetime (reconnect with a new port -> SESSION_DOWN first, see kdp_teardown). */
+/* Parse the --server literal into a v6 address: accepts both a bare address and the [address] form (the same
+ * cli_common.c check_server_ip set). A link-local literal with %scope is
+ * rejected here: the kernel ABI's outer v6 attribute is only a 16-byte address with no scope_id, so a link-
+ * local outer cannot be guaranteed to reach the right interface in the data plane. */
 static bool kdp_server_ip6(const char *s, struct in6_addr *out)
 {
     char buf[INET6_ADDRSTRLEN];
@@ -547,17 +556,17 @@ static bool kdp_socket_params(struct kdp *k, char *err, size_t errsz)
     memset(&peer, 0, sizeof(peer));
     sl = (socklen_t)sizeof(local);
     if (getsockname(k->sockfd, (struct sockaddr *)(void *)&local, &sl) != 0) {
-        snprintf(err, errsz, "getsockname 会话套接字失败: %s", strerror(errno));
+        snprintf(err, errsz, "getsockname on the session socket failed: %s", strerror(errno));
         return false;
     }
     sl = (socklen_t)sizeof(peer);
     if (getpeername(k->sockfd, (struct sockaddr *)(void *)&peer, &sl) != 0) {
-        snprintf(err, errsz, "getpeername 会话套接字失败: %s", strerror(errno));
+        snprintf(err, errsz, "getpeername on the session socket failed: %s", strerror(errno));
         return false;
     }
     if (local.ss_family != peer.ss_family) {
         snprintf(err, errsz,
-                 "会话套接字两端地址族不一致（本端 %d，对端 %d）",
+                 "session socket has mismatched address families (local %d, peer %d)",
                  (int)local.ss_family, (int)peer.ss_family);
         return false;
     }
@@ -570,8 +579,8 @@ static bool kdp_socket_params(struct kdp *k, char *err, size_t errsz)
         uint32_t src = ntohl(l4->sin_addr.s_addr);
         uint32_t dst = ntohl(p4->sin_addr.s_addr);
 
-        /* 外层版本由会话族决定：v4 会话必须把 v6 侧显式清零（结构体在
-         * 调用方是 memset 过的，这里再清一次是为了不依赖那个前提）。 */
+        /* The outer version is decided by the session family: a v4 session must explicitly zero the v6 side (the struct is
+         * memset by the caller; clearing again here avoids relying on that precondition). */
         k->sess.outer_v6 = false;
         memset(&k->sess.outer_src6, 0, sizeof(k->sess.outer_src6));
         memset(&k->sess.outer_dst6, 0, sizeof(k->sess.outer_dst6));
@@ -582,38 +591,38 @@ static bool kdp_socket_params(struct kdp *k, char *err, size_t errsz)
 
         if (k->sess.sport == 0 || k->sess.dport == 0) {
             snprintf(err, errsz,
-                     "会话套接字端口不完整（sport=%u dport=%u）：套接字未 connect？",
+                     "session socket ports incomplete (sport=%u dport=%u): socket not connected?",
                      (unsigned)k->sess.sport, (unsigned)k->sess.dport);
             return false;
         }
         if (src == 0) {
-            snprintf(err, errsz, "会话套接字本地地址还是 0.0.0.0：请先 connect");
+            snprintf(err, errsz, "session socket local address is still 0.0.0.0: connect first");
             return false;
         }
-        /* 回环外层不可用：本机发出的回环包会重新进入自己的钩子被自己吞掉
-         * （CONTROL-PLANE.md 与 tests/tun_local_test.sh 的同机拓扑陷阱）。 */
+        /* Loopback outer is unusable: a loopback packet sent by this host re-enters its own hook and is swallowed
+         * (the same-host topology trap in CONTROL-PLANE.md and tests/tun_local_test.sh). */
         if ((src >> 24) == 127u || (dst >> 24) == 127u) {
             (void)inet_ntop(AF_INET, &l4->sin_addr, src_s, sizeof(src_s));
             (void)inet_ntop(AF_INET, &p4->sin_addr, dst_s, sizeof(dst_s));
             snprintf(err, errsz,
-                     "外层地址是回环地址（本端 %s，对端 %s）：回环包会重新进入"
-                     "本机钩子被吞掉，\n  内核数据面不能用于同机回环拓扑。"
-                     "请用两个 netns + veth 互联（见 kernel/tests/netlink_test.sh）",
+                     "outer address is a loopback address (local %s, peer %s): loopback packets re-enter "
+                     "the local hook and are swallowed,\n  the kernel data plane cannot be used for same-host loopback topology. "
+                     "Use two netns interconnected by veth (see kernel/tests/netlink_test.sh)",
                      src_s, dst_s);
             return false;
         }
-        /* route_setup 要给服务器装 /32 经物理网关的 pin；地址必须和实际对端
-         * 一致，否则外层包会命中被劫持的 default dev iwan0 而被环路检查丢弃。 */
+        /* route_setup must install a /32 pin for the server via the physical gateway; the address must match the actual peer
+         * otherwise outer packets hit the hijacked default dev iwan0 and are dropped by the loop check. */
         if (!s2ip4(k->server, b4)) {
-            snprintf(err, errsz, "服务器地址 '%s' 不是合法 IPv4 字面量",
+            snprintf(err, errsz, "server address '%s' is not a valid IPv4 literal",
                      k->server);
             return false;
         }
         if (ip4_u32(b4) != dst) {
             (void)inet_ntop(AF_INET, &p4->sin_addr, dst_s, sizeof(dst_s));
             snprintf(err, errsz,
-                     "--server %s 与套接字实际对端 %s 不一致；"
-                     "外层地址必须与服务器的 /32 pin 一致",
+                     "--server %s does not match the socket's actual peer %s; "
+                     "the outer address must match the server's /32 pin",
                      k->server, dst_s);
             return false;
         }
@@ -626,8 +635,8 @@ static bool kdp_socket_params(struct kdp *k, char *err, size_t errsz)
             (const struct sockaddr_in6 *)(const void *)&peer;
         struct in6_addr want;
 
-        /* 外层 v6：端点直接取已连接套接字的两端（与 v4 同一条事实来源，
-         * 母须再查路由表 —— 握手走的就是这条路） */
+        /* Outer v6: endpoints are taken directly from both ends of the connected socket (same source of truth as v4,
+         * no need to consult the routing table again -- this is exactly the path the handshake takes) */
         k->sess.outer_v6 = true;
         k->sess.outer_src = 0;
         k->sess.outer_dst = 0;
@@ -638,20 +647,20 @@ static bool kdp_socket_params(struct kdp *k, char *err, size_t errsz)
 
         if (k->sess.sport == 0 || k->sess.dport == 0) {
             snprintf(err, errsz,
-                     "会话套接字端口不完整（sport=%u dport=%u）：套接字未 connect？",
+                     "session socket ports incomplete (sport=%u dport=%u): socket not connected?",
                      (unsigned)k->sess.sport, (unsigned)k->sess.dport);
             return false;
         }
         if (IN6_IS_ADDR_UNSPECIFIED(&l6->sin6_addr)) {
-            snprintf(err, errsz, "会话套接字本地地址还是 ::: 请先 connect");
+            snprintf(err, errsz, "session socket local address is still ::: connect first");
             return false;
         }
         if (IN6_IS_ADDR_V4MAPPED(&l6->sin6_addr) ||
             IN6_IS_ADDR_V4MAPPED(&p6->sin6_addr)) {
             (void)inet_ntop(AF_INET6, &p6->sin6_addr, dst_s, sizeof(dst_s));
             snprintf(err, errsz,
-                     "会话套接字是 v4-mapped 地址（对端 %s）：v4 外层应当用 "
-                     "AF_INET 套接字", dst_s);
+                     "session socket is a v4-mapped address (peer %s): a v4 outer should use "
+                     "AF_INET socket", dst_s);
             return false;
         }
         if (IN6_IS_ADDR_LINKLOCAL(&l6->sin6_addr) ||
@@ -659,9 +668,9 @@ static bool kdp_socket_params(struct kdp *k, char *err, size_t errsz)
             (void)inet_ntop(AF_INET6, &l6->sin6_addr, src_s, sizeof(src_s));
             (void)inet_ntop(AF_INET6, &p6->sin6_addr, dst_s, sizeof(dst_s));
             snprintf(err, errsz,
-                     "外层 v6 不支持链路本地地址（本端 %s，对端 %s）：内核 ABI "
-                     "的外层 v6 属性\n  只有 16 字节地址、不带 scope_id，无法"
-                     "保证发到正确接口。请给服务器配全局地址或唯一本地地址",
+                     "outer v6 does not support link-local addresses (local %s, peer %s): the kernel ABI "
+                     "outer v6 attribute\n  is only a 16-byte address without scope_id, so it cannot "
+                     "be guaranteed to reach the right interface. Give the server a global or unique-local address",
                      src_s, dst_s);
             return false;
         }
@@ -670,34 +679,34 @@ static bool kdp_socket_params(struct kdp *k, char *err, size_t errsz)
             (void)inet_ntop(AF_INET6, &l6->sin6_addr, src_s, sizeof(src_s));
             (void)inet_ntop(AF_INET6, &p6->sin6_addr, dst_s, sizeof(dst_s));
             snprintf(err, errsz,
-                     "外层地址是回环地址（本端 %s，对端 %s）：回环包会重新进入"
-                     "本机钩子被吞掉，\n  内核数据面不能用于同机回环拓扑。",
+                     "outer address is a loopback address (local %s, peer %s): loopback packets re-enter "
+                     "the local hook and are swallowed,\n  the kernel data plane cannot be used for same-host loopback topology.",
                      src_s, dst_s);
             return false;
         }
         if (!kdp_server_ip6(k->server, &want)) {
             snprintf(err, errsz,
-                     "服务器地址 '%s' 不是合法 IPv6 字面量（外层 v6 会话要求"
-                     "字面量，不支持链路本地 %%scope 写法）", k->server);
+                     "server address '%s' is not a valid IPv6 literal (an outer v6 session requires "
+                     "a literal; link-local %%scope form is not supported)", k->server);
             return false;
         }
         if (!IN6_ARE_ADDR_EQUAL(&want, &p6->sin6_addr)) {
             (void)inet_ntop(AF_INET6, &p6->sin6_addr, dst_s, sizeof(dst_s));
             snprintf(err, errsz,
-                     "--server %s 与套接字实际对端 %s 不一致；"
-                     "外层地址必须与服务器的 /128 pin 一致",
+                     "--server %s does not match the socket's actual peer %s; "
+                     "the outer address must match the server's /128 pin",
                      k->server, dst_s);
             return false;
         }
         return true;
     }
     snprintf(err, errsz,
-             "会话套接字的地址族不受支持（family=%d）：外层只支持 IPv4 与 IPv6",
+             "session socket address family is unsupported (family=%d): the outer supports only IPv4 and IPv6",
              (int)local.ss_family);
     return false;
 }
 
-/* --------------------------------------------------- 路由（与 run_pump 同序） */
+/* --------------------------------------------------- routes (same order as run_pump) */
 
 static bool kdp_routes_up(struct kdp *k)
 {
@@ -705,7 +714,7 @@ static bool kdp_routes_up(struct kdp *k)
         if (!route_setup(k->dev, k->auth_tun_ip, k->auth_mtu, k->server,
                          k->ogw, k->odev, k->ogw_metric, &k->routes,
                          &k->routes6)) {
-            /* route_setup 已自行回滚并打过日志 */
+            /* route_setup already rolled back itself and logged */
             return false;
         }
         log_info("tun %s ready: %llu route%s", k->dev,
@@ -714,9 +723,9 @@ static bool kdp_routes_up(struct kdp *k)
             log_debug("route %s -> dev %s", k->routes.v[i], k->dev);
     } else {
         if (!route_iface_up(k->dev, k->auth_tun_ip, k->auth_mtu)) {
-            /* 与 run_pump 的失败回滚一致（Windows 上还有 v6 侧的清理，
-             * 内核数据面是 Linux-only，route_rollback_v6 在 Linux 是空操作
-             * 之外没有额外语义） */
+            /* Matches run_pump's failure rollback (on Windows there is also v6-side cleanup;
+             * the kernel data plane is Linux-only, and route_rollback_v6 is a no-op on Linux
+             * with no extra semantics beyond that) */
             route_rollback_v6(k->dev, k->auth_tun_ip, &k->routes6);
             route_iface_down(k->dev);
             return false;
@@ -746,34 +755,34 @@ static void kdp_routes_down(struct kdp *k)
     k->routes_up = false;
 }
 
-/* --------------------------------------------------- 可选 events 通道 */
+/* --------------------------------------------------- optional events channel */
 
 static void kdp_event_cb(void *ud, uint8_t ev, const uint8_t *frame, size_t len)
 {
     (void)ud;
-    (void)frame;   /* IWAN_DEBUG_STRIP 下 log_debug 是 no-op，参数被丢弃 */
+    (void)frame;   /* under IWAN_DEBUG_STRIP, log_debug is a no-op and its arguments are discarded */
     switch (ev) {
     case IWAN_EV_PEER_CLOSE:
-        log_debug("内核数据面: 事件 PEER_CLOSE（对端主动断开）");
+        log_debug("kernel data plane: event PEER_CLOSE (peer closed actively)");
         break;
     case IWAN_EV_CTRL_FRAME:
         if (len > 0)
-            log_debug("内核数据面: 事件 CTRL_FRAME type=0x%02x len=%llu",
+            log_debug("kernel data plane: event CTRL_FRAME type=0x%02x len=%llu",
                       (unsigned)frame[0], (unsigned long long)len);
         break;
     default:
-        log_debug("内核数据面: 事件 %u len=%llu", (unsigned)ev,
+        log_debug("kernel data plane: event %u len=%llu", (unsigned)ev,
                   (unsigned long long)len);
         break;
     }
 }
 
-/* ------------------------------------------------------------ 退出 */
+/* ------------------------------------------------------------ exit */
 
-/* 退出顺序（决策 8）：停轮询/事件 -> PT_CLOSE（关 socket 之前）->
- * 拆路由（route_iface_down/route_teardown 依赖设备名，必须在删卡前）->
- * SESSION_DOWN -> 关 fd。任何失败路径都执行相应子集，**绝不留已建立的
- * 会话**（残留会话会让钩子继续吞包，用户只会看到"网络坏了"）。 */
+/* Teardown order (decision 8): stop polling/events -> PT_CLOSE (before closing the socket) ->
+ * tear down routes (route_iface_down/route_teardown depend on the device name, must run before deleting the interface) ->
+ * SESSION_DOWN -> close fd. Any failure path executes the corresponding subset, and **never leaves an established
+ * session behind** (a leftover session makes the hook keep swallowing packets; the user only sees "the network is broken"). */
 static void kdp_teardown(struct kdp *k)
 {
     char err[256];
@@ -782,32 +791,32 @@ static void kdp_teardown(struct kdp *k)
 
     if (k->session_up) {
         if (kdp_send_ctrl(k, PT_CLOSE) != 0)
-            log_debug("内核数据面: PT_CLOSE 发送失败: %s", strerror(errno));
+            log_debug("kernel data plane: PT_CLOSE send failed: %s", strerror(errno));
         else
-            /* 无条件打印（同 kdp_run 结尾的"已停"日志、以及 proxy.c 的 TUN 路径）：
-             * 这是客户端侧唯一一处"已向对端发出告别帧"的可见证据，每条会话最多一行；
-             * 放在 debug_enabled() 后面会让默认 Release 构建（IWAN_DEBUG_STRIP=ON，
-             * IWAN_DEBUG 根本不被解析）永远看不到它，验收也就分不清"没发"与"发了没记录"。 */
+            /* Print unconditionally (same as the "stopped" log at the end of kdp_run, and proxy.c's TUN path):
+             * this is the only client-side visible evidence that a farewell frame was sent to the peer, at most one line per session;
+             * putting it behind debug_enabled() would make the default Release build (IWAN_DEBUG_STRIP=ON,
+             * IWAN_DEBUG is not even parsed) never see it, and acceptance could not tell "not sent" from "sent but not logged". */
             err_printf("CLOSE sent\n");
     }
     kdp_routes_down(k);
     if (k->session_up && k->genl != NULL) {
         if (genl_iwan_session_down(k->genl, err, sizeof(err)) != 0) {
-            log_err("内核数据面: SESSION_DOWN 失败: %s", err);
-            log_err("  会话与 %s 可能残留（钩子会继续吞包）："
-                    "请执行 sudo ip link del %s 并重启模块，或重启系统",
+            log_err("kernel data plane: SESSION_DOWN failed: %s", err);
+            log_err("  session and %s may be left over (the hook will keep swallowing packets): "
+                    "run sudo ip link del %s and reload the module, or reboot",
                     k->dev, k->dev);
         } else {
-            /* 复核：GET_STATS 没有 NLM_F_DUMP，判"有没有会话"看
-             * sid==0 && tok==0（不是 DEVNAME —— 无会话时它是 "-"）。 */
+            /* Re-check: GET_STATS has no NLM_F_DUMP; to judge "is there a session" look at
+             * sid==0 && tok==0 (not DEVNAME -- it is "-" when there is no session). */
             genl_iwan_stats st;
             char e2[256];
 
             if (genl_iwan_get_stats(k->genl, &st, e2, sizeof(e2)) == 0 &&
                 (st.sid != 0 || st.tok != 0))
-                log_err("内核数据面: SESSION_DOWN 之后会话仍在"
-                        "（sid=0x%04x tok=0x%08x）：钩子可能继续吞包，"
-                        "请手动再执行一次 SESSION_DOWN", st.sid, st.tok);
+                log_err("kernel data plane: session still present after SESSION_DOWN"
+                        " (sid=0x%04x tok=0x%08x): the hook may keep swallowing packets, "
+                        "run SESSION_DOWN manually once more", st.sid, st.tok);
         }
         k->session_up = false;
     }
@@ -820,7 +829,7 @@ static void kdp_teardown(struct kdp *k)
     slist_free(&k->routes6);
 }
 
-/* ------------------------------------------------------------ 主入口 */
+/* ------------------------------------------------------------ main entry */
 
 int kdp_run(int sockfd, const uint8_t xor_key[8], uint16_t sid, uint32_t tok,
             uint8_t enc, const char *server, const slist_t *route_targets,
@@ -868,8 +877,8 @@ int kdp_run(int sockfd, const uint8_t xor_key[8], uint16_t sid, uint32_t tok,
     slist_init(&k.routes);
     slist_init(&k.routes6);
 
-    /* run_pump 的第一件事：在任何阻塞设置之前装好停止处理（同一套
-     * g_stop/g_user_stop 语义） */
+    /* run_pump's first step: install stop handling before any blocking setup (the same
+     * g_stop/g_user_stop semantics) */
     port_set_stop_handler(kdp_on_signal);
 
     if (expand_route_targets(route_targets, &k.routes) != 0) {
@@ -891,25 +900,25 @@ int kdp_run(int sockfd, const uint8_t xor_key[8], uint16_t sid, uint32_t tok,
                   k.ogw_metric[0] != '\0' ? " metric " : "", k.ogw_metric);
     }
 
-    /* 启动前预检之一：会话五元组（getsockname/getpeername） */
+    /* Pre-startup precheck 1: session 5-tuple (getsockname/getpeername) */
     if (!kdp_socket_params(&k, err, sizeof(err))) {
-        log_err("内核数据面: %s", err);
+        log_err("kernel data plane: %s", err);
         kdp_teardown(&k);
         return -1;
     }
-    /* "绑 IP"模式下外层源地址就是该 IP（内核侧 iwan_carrier_resolve 要求
-     * 二者一致，不一致直接 -EINVAL）。握手套接字已按它 bind（见
-     * authenticate()），所以正常情况下面两值相等；不等说明系统路由把连接
-     * 指到了别的源地址 —— 那种情况下对端学到的是另一个端点，数据面再用
-     * 绑定地址发就会与对端记录不符，必须报出来。 */
+    /* "bound IP" mode: the outer source address is exactly that IP (the kernel-side iwan_carrier_resolve requires
+     * the two to match, otherwise straight -EINVAL). The handshake socket was already bound to it (see
+     * authenticate(), so normally the two values are equal; inequality means system routing pointed the connection
+     * at another source address -- in that case the peer learned a different endpoint, and if the data plane then sends with the
+     * bound address it disagrees with the peer's record, so it must be reported. */
     if (k.bind.bind_v6) {
-        /* 外层 v6 的"绑 IP"：与下面 v4 分支同一套判断与文本 */
+        /* outer v6 "bound IP": the same check and text as the v4 branch below */
         if (!IN6_ARE_ADDR_EQUAL(&k.sess.outer_src6, &k.bind.bind_ip6)) {
             char a[INET6_ADDRSTRLEN], c[INET6_ADDRSTRLEN];
 
-            log_err("内核数据面: 绑定的出口 IP %s 与会话套接字的源地址 %s "
-                    "不一致（对端按握手源地址记录本端端点，数据面却用绑定"
-                    "地址发送）；按绑定地址下发",
+            log_err("kernel data plane: bound egress IP %s disagrees with the session socket source address %s "
+                    "(the peer records the local endpoint from the handshake source address, but the data plane sends from the bound "
+                    "address); programming the bound address",
                     inet_ntop(AF_INET6, &k.bind.bind_ip6, a, sizeof(a)),
                     inet_ntop(AF_INET6, &k.sess.outer_src6, c, sizeof(c)));
         }
@@ -920,9 +929,9 @@ int kdp_run(int sockfd, const uint8_t xor_key[8], uint16_t sid, uint32_t tok,
 
             a.s_addr = htonl(k.bind.bind_ip);
             c.s_addr = htonl(k.sess.outer_src);
-            log_err("内核数据面: 绑定的出口 IP %s 与会话套接字的源地址 %s "
-                    "不一致（对端按握手源地址记录本端端点，数据面却用绑定"
-                    "地址发送）；按绑定地址下发",
+            log_err("kernel data plane: bound egress IP %s disagrees with the session socket source address %s "
+                    "(the peer records the local endpoint from the handshake source address, but the data plane sends from the bound "
+                    "address); programming the bound address",
                     inet_ntop(AF_INET, &a, (char[INET_ADDRSTRLEN]){0},
                               INET_ADDRSTRLEN),
                     inet_ntop(AF_INET, &c, (char[INET_ADDRSTRLEN]){0},
@@ -931,17 +940,17 @@ int kdp_run(int sockfd, const uint8_t xor_key[8], uint16_t sid, uint32_t tok,
         k.sess.outer_src = k.bind.bind_ip;
     }
 
-    /* 预检之二：/dev/iwan 必须存在且版本匹配（不静默降级成 TUN） */
+    /* Precheck 2: /dev/iwan must exist and the version must match (no silent degradation to TUN) */
     if (!kdp_shm_open(&k, err, sizeof(err))) {
-        log_err("内核数据面: %s", err);
+        log_err("kernel data plane: %s", err);
         kdp_teardown(&k);
         return -1;
     }
-    /* 预检之三：本 netns 是否已有活会话 + iwan0 归属（与 kdp_plane_precheck
-     * 同一套判据与文本；正常路径上调用者已在握手前跑过一次，这里是其它调
-     * 用者（OIDC 等）与竞态的兜底） */
+    /* Precheck 3: whether this netns already has a live session + iwan0 ownership (same as kdp_plane_precheck
+     * criteria and text; on the normal path the caller already ran it before the handshake, this is the fallback for other callers
+     * (OIDC etc.) and for races) */
     if (!kdp_precheck_core(&k, err, sizeof(err), &busy_local)) {
-        log_err("内核数据面: %s", err);
+        log_err("kernel data plane: %s", err);
         if (ns_busy != NULL)
             *ns_busy = busy_local;
         kdp_teardown(&k);
@@ -950,7 +959,7 @@ int kdp_run(int sockfd, const uint8_t xor_key[8], uint16_t sid, uint32_t tok,
 
     k.genl = genl_iwan_open(err, sizeof(err));
     if (k.genl == NULL) {
-        log_err("内核数据面: %s", err);
+        log_err("kernel data plane: %s", err);
         kdp_teardown(&k);
         return -1;
     }
@@ -959,11 +968,11 @@ int kdp_run(int sockfd, const uint8_t xor_key[8], uint16_t sid, uint32_t tok,
         char os[INET6_ADDRSTRLEN] = "";
         char od[INET6_ADDRSTRLEN] = "";
 
-        log_err("内核数据面: %s", err);
-        /* 把**我们发出去的**会话参数原样打出来：拒绝的原因要么是它越界
-         * （典型：内层 MTU 超过模块 max_mtu，默认 1500 —— 度量档构建
-         * IWAN_JUMBO_MTU 会把默认 MTU 抬到上限，本行一眼可见），要么是
-         * 与内核里已有会话不一致（对照下面 GET_STATS 的模块视角）。 */
+        log_err("kernel data plane: %s", err);
+        /* Print the session parameters **we sent** verbatim: the rejection is either out of range
+         * (typical: inner MTU exceeds the module max_mtu, default 1500 -- a metrics-profile build
+         * IWAN_JUMBO_MTU raises the default MTU to the limit, visible at a glance in this line), or
+         * inconsistent with an existing kernel session (compare with the module view from GET_STATS below). */
         if (k.sess.outer_v6) {
             (void)inet_ntop(AF_INET6, &k.sess.outer_src6, os, sizeof(os));
             (void)inet_ntop(AF_INET6, &k.sess.outer_dst6, od, sizeof(od));
@@ -975,20 +984,20 @@ int kdp_run(int sockfd, const uint8_t xor_key[8], uint16_t sid, uint32_t tok,
             a.s_addr = htonl(k.sess.outer_dst);
             (void)inet_ntop(AF_INET, &a, od, sizeof(od));
         }
-        log_err("内核数据面: 本次 SESSION_UP 请求 sid=0x%04x enc=%u mtu=%u "
-                "外层%s %s:%u -> %s:%u oif=%u bind_ip=%s flags=%s",
+        log_err("kernel data plane: this SESSION_UP request sid=0x%04x enc=%u mtu=%u "
+                "outer%s %s:%u -> %s:%u oif=%u bind_ip=%s flags=%s",
                 (unsigned)sid, (unsigned)k.sess.enc, (unsigned)k.sess.mtu,
                 k.sess.outer_v6 ? "v6" : "v4", os, (unsigned)k.sess.sport,
                 od, (unsigned)k.sess.dport, (unsigned)k.sess.oif,
                 (k.sess.outer_v6 ?
                      !IN6_IS_ADDR_UNSPECIFIED(&k.sess.bind_ip6) :
-                     k.sess.bind_ip != 0) ? "有" : "无",
+                     k.sess.bind_ip != 0) ? "yes" : "no",
                 k.sess.mtu != 0 && k.sess.mtu > 1500u
-                    ? "注意：MTU 超过模块 max_mtu 默认值 1500，必被拒"
-                    : "正常");
-        /* "已有会话"这一类失败不能回退到别的数据面：回退会拿同一账号把那
-         * 条会话顶掉。两条判据取或：模块的冲突 extack，或者共享内存里确实
-         * 有一条活会话（对端静默时前者才认得出）。 */
+                    ? "NOTE: MTU exceeds the module max_mtu default of 1500 and will certainly be rejected"
+                    : "ok");
+        /* "existing session" failures must not fall back to another data plane: falling back would take the same account and kick that
+         * session out. Two criteria are OR-ed: the module's conflict extack, or the shared memory indeed showing
+         * a live session (when the peer is silent only the former detects it). */
         if (ns_busy != NULL)
             *ns_busy = kdp_err_is_conflict(err) ||
                        kdp_session_is_live(&k, NULL);
@@ -997,8 +1006,8 @@ int kdp_run(int sockfd, const uint8_t xor_key[8], uint16_t sid, uint32_t tok,
     }
     k.session_up = true;
     {
-        /* inet_ntoa 用静态缓冲区，一次 printf 里两个地址会互相覆盖；
-         * 地址串缓冲按 v6 的长度给（族由 outer_v6 决定） */
+        /* inet_ntoa uses a static buffer, so two addresses in one printf overwrite each other;
+         * the address string buffer is sized for v6 (the family is decided by outer_v6) */
         char os[INET6_ADDRSTRLEN] = "";
         char od[INET6_ADDRSTRLEN] = "";
 
@@ -1013,14 +1022,14 @@ int kdp_run(int sockfd, const uint8_t xor_key[8], uint16_t sid, uint32_t tok,
             a.s_addr = htonl(k.sess.outer_dst);
             (void)inet_ntop(AF_INET, &a, od, sizeof(od));
         }
-        log_info("内核数据面: 会话已建立 dev=%s mtu=%u sid=0x%04x "
-                 "外层%s %s:%u -> %s:%u", k.dev, (unsigned)k.dev_mtu,
+        log_info("kernel data plane: session established dev=%s mtu=%u sid=0x%04x "
+                 "outer%s %s:%u -> %s:%u", k.dev, (unsigned)k.dev_mtu,
                  (unsigned)sid, k.sess.outer_v6 ? "v6" : "v4", os,
                  (unsigned)k.sess.sport, od, (unsigned)k.sess.dport);
     }
-    /* 回程路由：这里才拿到承载网卡 ifindex（设备与承载都定了），所以在这里装。
-     * 先决检查不满足就拒绝本次会话 —— 那意味着规则会静默不生效（回包仍走物理
-     * 网卡），比直接出错更难查。 */
+    /* Reply route: only here is the carrier NIC ifindex obtained (device and carrier both settled), so it is installed here.
+     * If the precondition check is not satisfied, reject this session -- that would mean the rules silently do not take effect (reply packets still go via the physical
+     * NIC), which is harder to diagnose than an outright error. */
     if (bind != NULL && bind->reply_via_tunnel) {
         reply_route_opts  ro;
         genl_iwan_stats   rst;
@@ -1034,54 +1043,54 @@ int kdp_run(int sockfd, const uint8_t xor_key[8], uint16_t sid, uint32_t tok,
         ro.served4 = route_targets;
         ro.served6 = route_targets6;
         ro.kernel_plane = true;
-        /* 承载网卡 ifindex 只在 GET_STATS 里导出（会话回执没有这一项），
-         * 所以此处补一次查询；承载一钉住就不会再变。 */
+        /* The carrier NIC ifindex is only exported in GET_STATS (the session reply has no such field),
+         * so one extra query is made here; once the carrier is pinned it never changes. */
         if (genl_iwan_get_stats(k.genl, &rst, why, sizeof(why)) != 0 ||
             rst.carrier == 0 ||
             if_indextoname(rst.carrier, ifname) == NULL) {
-            log_err("回程路由: 取不到承载网卡（GET_STATS %s，carrier=%u），"
-                    "定不了入方向匹配接口；本次会话拒绝",
-                    rst.carrier == 0 ? "读到 carrier=0" : "失败",
+            log_err("reply route: cannot get the carrier NIC (GET_STATS %s, carrier=%u), "
+                    "cannot determine the inbound match interface; rejecting this session",
+                    rst.carrier == 0 ? "read carrier=0" : "failed",
                     (unsigned)rst.carrier);
             kdp_teardown(&k);
             return -1;
         }
         ro.in_if = ifname;
         if (!reply_route_precheck(&ro, why, sizeof(why))) {
-            log_err("回程路由: 先决检查未过，本次会话拒绝: %s", why);
+            log_err("reply route: precondition check failed, rejecting this session: %s", why);
             kdp_teardown(&k);
             return -1;
         }
         if (!reply_route_setup(&ro, &k.rr, rerr, sizeof(rerr))) {
-            log_err("回程路由: 装规则失败，本次会话拒绝: %s", rerr);
+            log_err("reply route: installing rules failed, rejecting this session: %s", rerr);
             kdp_teardown(&k);
             return -1;
         }
     }
     if (k.dev_mtu != 0 && k.dev_mtu != (uint32_t)auth_mtu)
-        log_err("内核数据面: 回执 MTU %u 与协商 MTU %u 不一致，"
-                "按协商值配置地址/路由", (unsigned)k.dev_mtu,
+        log_err("kernel data plane: reply MTU %u disagrees with negotiated MTU %u, "
+                "configuring address/routes from the negotiated value", (unsigned)k.dev_mtu,
                 (unsigned)auth_mtu);
-    /* 设备归属：本轮模块若回了 IWAN_A_DEV_OWNED 也不额外处理（枚举常量
-     * 无法 #ifdef 探测）；"别人的卡"由预检 + SESSION_UP 的 -EBUSY 覆盖。 */
+    /* Device ownership: even if the module returned IWAN_A_DEV_OWNED this round there is no extra handling (an enum constant
+     * cannot be probed with #ifdef); "someone else's interface" is covered by the precheck + SESSION_UP's -EBUSY. */
 
-    /* events 组降级为可选/诊断：拿不到就只少了日志，不影响数据面 */
+    /* events group is downgraded to optional/diagnostic: failing to get it only loses logs, the data plane is unaffected */
     if (genl_iwan_events_subscribe(k.genl, err, sizeof(err)) == 0) {
         k.events_ok = true;
     } else {
-        log_debug("内核数据面: events 多播组不可用（仅影响诊断日志）: %s",
+        log_debug("kernel data plane: events multicast group unavailable (affects diagnostic logs only): %s",
                   err);
     }
 
-    /* 地址/路由/MTU 仍归用户态：模块只建卡、置 UP、设 MTU */
+    /* Address/routes/MTU still belong to userspace: the module only creates the interface, sets it UP, and sets the MTU */
     if (!kdp_routes_up(&k)) {
-        log_err("内核数据面: 地址/路由配置失败，回滚已建立的会话");
+        log_err("kernel data plane: address/route configuration failed, rolling back the established session");
         kdp_teardown(&k);
         return -1;
     }
 
-    /* 与 run_pump 相同的窗口：setup 期间按下 Ctrl-C 就不再启动数据面，
-     * 但要先把路由与会话回滚干净 */
+    /* Same window as run_pump: if Ctrl-C was pressed during setup, do not start the data plane,
+     * but roll back routes and the session cleanly first */
     if (g_user_stop) {
         log_info("kernel data plane: stop requested during setup; aborting");
         kdp_teardown(&k);
@@ -1092,24 +1101,24 @@ int kdp_run(int sockfd, const uint8_t xor_key[8], uint16_t sid, uint32_t tok,
     log_info("kernel data plane running (dev %s) -- press Ctrl-C to stop",
              k.dev);
 
-    stale = (unsigned)pump_rx_stale_ms();       /* 0 = 关闭看门狗 */
+    stale = (unsigned)pump_rx_stale_ms();       /* 0 = watchdog disabled */
     ka_ms = pump_keepalive_ms();
     ka_fail_max = pump_ka_fail_max();
     t_up = now_ms();
     next_tick = t_up;
-    last_ka = t_up > ka_ms ? t_up - ka_ms : 0;  /* 立即发第一条 keepalive */
+    last_ka = t_up > ka_ms ? t_up - ka_ms : 0;  /* send the first keepalive immediately */
 
     while (!g_stop && !g_user_stop) {
         char bwhy[256];
 
-        /* 0) 绑定有效性。内核只在"外层查找失败"时反应，而绑定的出口 IP
-         *    被删并不构成查找失败（实测：报文照发），承载网卡失去载波同理
-         *    —— 这一条只能在这里判。失效即"关闭内核部分"：teardown 落
-         *    SESSION_DOWN 并让经 iwan0 的那条路由失效，内层流量改由路由表
-         *    的下一条目承担；重连循环在重新握手**之前**等绑定恢复
-         *    （kdp_bind_wait）。 */
+        /* 0) Bind validity. The kernel only reacts to "outer lookup failure", and the bound egress IP
+         *    being deleted does not constitute a lookup failure (measured: packets are still sent); same for the carrier NIC losing carrier
+         *    -- this one can only be judged here. Invalid means "shut down the kernel part": teardown drops
+         *    SESSION_DOWN and invalidates the route via iwan0; inner traffic is then carried by the next
+         *    routing table entry; the reconnect loop waits for the bind to recover **before** re-handshaking
+         *    (kdp_bind_wait). */
         if (!kdp_bind_ok(&k.bind, bwhy, sizeof(bwhy))) {
-            log_err("内核数据面: 绑定失效（%s），停用数据面", bwhy);
+            log_err("kernel data plane: bind invalid (%s), disabling the data plane", bwhy);
             k.session_lost = true;
             break;
         }
@@ -1127,27 +1136,27 @@ int kdp_run(int sockfd, const uint8_t xor_key[8], uint16_t sid, uint32_t tok,
             continue;
         next_tick = now + KDP_POLL_MS;
 
-        /* 1) 存活：/dev/iwan 时间戳（内核每收到一个过闸帧就写，PT_CLOSE
-         *    置 0）。0 在会话刚建立时也表示"还没收到过"，所以用 seen_rx
-         *    区分"从未收到"和"收到过又归零"。 */
+        /* 1) Liveness: the /dev/iwan timestamp (the kernel writes it for every frame that passes the gate, PT_CLOSE
+         *    resets it to 0). Right after the session is established 0 also means "nothing received yet", so seen_rx
+         *    distinguishes "never received" from "received and then reset to zero". */
         lr = kdp_shm_last_rx(&k);
         if (lr != 0) {
             if (!seen_rx) {
                 seen_rx = true;
-                log_info("内核数据面: 收到对端首个有效帧"
-                         "（/dev/iwan 时间戳已非零）");
+                log_info("kernel data plane: received the peer's first valid frame"
+                         " (/dev/iwan timestamp is now non-zero)");
             }
-            /* 收到**新**帧 = 对端活着，清零"无人应答"失败预算。判据只能是
-             * 收到帧：一次成功的 send 不证明对端存在 —— 连通 UDP 套接字把
-             * ICMP 端口不可达隔次上报，中间那次 send 会成功，按"发送成功"
-             * 清零会让 3 次的预算永远到不了（实测：服务端消失后日志反复
-             * 出现"重试 1/3"，最后靠 IWAN_RX_STALE_MS 看门狗判死）。 */
+            /* Receiving a **new** frame = the peer is alive, clear the "no answer" failure budget. The only valid criterion is
+             * receiving a frame: one successful send does not prove the peer exists -- a connected UDP socket reports
+             * ICMP port unreachable on alternate sends, the send in between succeeds, and clearing on "send succeeded"
+             * would make the budget of 3 never be reached (measured: after the server disappears the log repeatedly
+             * shows "retry 1/3", and death finally comes from the IWAN_RX_STALE_MS watchdog). */
             if (lr != last_seen)
                 ka_fail = 0;
             last_seen = lr;
         } else if (seen_rx) {
-            log_err("内核数据面: /dev/iwan 时间戳归零"
-                    "（对端 PT_CLOSE / 会话被清），会话丢失");
+            log_err("kernel data plane: /dev/iwan timestamp reset to zero"
+                    " (peer PT_CLOSE / session cleared), session lost");
             k.session_lost = true;
             break;
         }
@@ -1155,65 +1164,65 @@ int kdp_run(int sockfd, const uint8_t xor_key[8], uint16_t sid, uint32_t tok,
             uint64_t quiet = seen_rx ? ms_since(now, last_seen)
                                      : ms_since(now, t_up);
             if (quiet > stale) {
-                log_err("内核数据面: %llu ms 没有收到任何有效帧"
-                        "（IWAN_RX_STALE_MS=%u），会话丢失",
+                log_err("kernel data plane: no valid frame received for %llu ms"
+                        " (IWAN_RX_STALE_MS=%u), session lost",
                         (unsigned long long)quiet, stale);
                 k.session_lost = true;
                 break;
             }
         }
 
-        /* 2) keepalive 发送仍在用户态（10s PT_ECHO_REQ，与 TUN 泵同参数） */
+        /* 2) keepalive sending is still in userspace (10s PT_ECHO_REQ, same parameters as the TUN pump) */
         if (ms_since(now, last_ka) >= ka_ms) {
             if (kdp_send_ctrl(&k, PT_ECHO_REQ) != 0) {
                 int e = errno;
 
                 if (++ka_fail >= (int)ka_fail_max) {
-                    log_err("内核数据面: 无下行帧期间 keepalive 失败累计 %d 次"
-                            "（最后错误: %s）；会话丢失", ka_fail,
+                    log_err("kernel data plane: keepalive failed %d times while no downlink frame arrived"
+                            " (last error: %s); session lost", ka_fail,
                             strerror(e));
                     k.session_lost = true;
                     break;
                 }
-                err_printf("内核数据面: keepalive 发送失败: %s"
-                           "（无下行帧期间累计 %d/%u）\n", strerror(e),
+                err_printf("kernel data plane: keepalive send failed: %s"
+                           " (accumulated %d/%u while no downlink frame arrived)\n", strerror(e),
                            ka_fail, ka_fail_max);
             }
-            /* 成功与否都推进节奏：失败要每 ka_ms 重试一次，而不是每个
-             * 1 秒节拍都重试 */
+            /* Advance the cadence whether or not it succeeded: a failure retries once per ka_ms, not on every
+             * 1 second tick */
             last_ka = now_ms();
         }
 
-        /* 3) 设备被外部删除（ip link del / netns 拆）：重放幂等的
-         *    SESSION_UP 会重建网卡，但地址/路由要重跑一遍。 */
+        /* 3) Device deleted externally (ip link del / netns teardown): replaying the idempotent
+         *    SESSION_UP recreates the NIC, but address/routes must run again. */
         if (if_nametoindex(k.dev) == 0) {
-            log_err("内核数据面: 设备 %s 被外部删除，重放 SESSION_UP 重建",
+            log_err("kernel data plane: device %s deleted externally, replaying SESSION_UP to recreate",
                     k.dev);
-            k.routes_up = false;   /* 路由随设备一起消失 */
+            k.routes_up = false;   /* routes vanish together with the device */
             if (genl_iwan_session_up(k.genl, &k.sess, k.dev, sizeof(k.dev),
                                      &k.dev_mtu, err, sizeof(err)) != 0) {
-                log_err("内核数据面: 重建 %s 失败: %s；会话丢失", k.dev, err);
+                log_err("kernel data plane: recreating %s failed: %s; session lost", k.dev, err);
                 k.session_lost = true;
                 break;
             }
             if (!kdp_routes_up(&k)) {
-                log_err("内核数据面: 重建后地址/路由配置失败；会话丢失");
+                log_err("kernel data plane: address/route configuration failed after recreation; session lost");
                 k.session_lost = true;
                 break;
             }
-            log_info("内核数据面: %s 已重建", k.dev);
+            log_info("kernel data plane: %s recreated", k.dev);
         }
     }
 
     kdp_teardown(&k);
 
-    /* 无条件打印（刻意不放在 debug_enabled() 后面）：这是"内核数据面已停"唯一一条
-     * 用户可见的收尾日志，每条会话最多一行，没有刷屏风险；而放在调试开关后面会让
-     * 默认的 Release 构建（IWAN_DEBUG_STRIP=ON，IWAN_DEBUG 根本不被解析）永远看不到
-     * 它 —— 用户按 Ctrl-C 后只看到"卡住"，验收脚本的退出语义断言也无从下手。 */
+    /* Print unconditionally (deliberately not behind debug_enabled()): this is the only
+     * user-visible closing log for "kernel data plane stopped", at most one line per session, no risk of flooding; behind the debug toggle,
+     * the default Release build (IWAN_DEBUG_STRIP=ON, IWAN_DEBUG not even parsed) would never see
+     * it -- after Ctrl-C the user would only see "stuck", and the acceptance script's exit-semantics assertions would have nothing to check. */
     err_printf("kernel data plane stopped (%s)\n",
                k.session_lost ? "session lost" : "user stop");
-    /* 1 = 会话丢失（重连）; 0 = 用户停止 —— 与 run_pump 同语义 */
+    /* 1 = session lost (reconnect); 0 = user stop -- same semantics as run_pump */
     return k.session_lost ? 1 : 0;
 }
 

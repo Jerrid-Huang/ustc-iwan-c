@@ -103,7 +103,7 @@ static Json *fetch_json(const char *host, const char *path, const char *what)
     Json *j;
 
     if (!https_get(host, path, &st, &body)) {
-        /* R37-WG-G (L28): the response body is remote controlled — the
+        /* R37-WG-G (L28): the response body is remote controlled - the
          * terminal copy is neutralized. The raw `body` buffer is still
          * the one freed here and parsed below: no verdict depends on
          * the sanitized string. */
@@ -194,7 +194,7 @@ static EVP_PKEY *jwks_rsa_key(Json *key)
      * to authenticate as the user; a weak n (factorable) or a broken e
      * (e=1/2/even: fixed-point or degenerate verification) would let a
      * forger mint id_tokens. The issuer is the configured trust root,
-     * so this guards the "IdP key compromised / mis-issued" case — the
+     * so this guards the "IdP key compromised / mis-issued" case - the
      * client fails closed rather than verify with a weak key. Rejecting
      * the key only SKIPS it (select_jwks_key moves on; other keys are
      * still usable, and if none is left the verify fails closed). */
@@ -207,7 +207,7 @@ static EVP_PKEY *jwks_rsa_key(Json *key)
         bad_bits = bits < JWKS_RSA_MIN_BITS;
         bad_e = !ke || BN_cmp(ke, BN_value_one()) <= 0 || !BN_is_odd(ke);
         if (bad_bits || bad_e) {
-            /* only small local integers are printed — the kid is left
+            /* only small local integers are printed - the kid is left
              * to the caller's filtered diagnostic */
             oidc_eprintf("oidc_jwt_verify: refusing weak JWKS RSA key: "
                          "%d-bit modulus (min %d)%s, exponent=%d bits%s\n",
@@ -293,7 +293,7 @@ fail:
 
 /* exp/aud/iss claim validation (RFC 7519 / OIDC Core); 0 on success.
  * expected_nonce (NULL = no nonce check): the OIDC `nonce` sent in the
- * authorization request — OIDC Core 3.1.3.7 requires the id_token to
+ * authorization request - OIDC Core 3.1.3.7 requires the id_token to
  * echo it back, which binds the token to the client session (RFC 8252
  * 6.3 for native apps). Absent or mismatched -> reject (fail closed). */
 static int validate_claims(Json *pay_j, const char *aud, const char *iss,
@@ -339,7 +339,7 @@ static int validate_claims(Json *pay_j, const char *aud, const char *iss,
         return -1;
     }
     /* RFC 7519 4.1.3: when aud is an array, the token must carry azp
-     * naming the authorized party — otherwise an id_token issued for
+     * naming the authorized party - otherwise an id_token issued for
      * another client under the same issuer would pass the array check */
     {
         Json *audc = json_get(pay_j, "aud");
@@ -361,7 +361,7 @@ static int validate_claims(Json *pay_j, const char *aud, const char *iss,
         const char *tiss = json_get_str(pay_j, "iss");
         if (!tiss || strcmp(tiss, iss) != 0) {
             /* R37-WG-G (L28): the claim is issuer controlled, the
-             * expected `iss` is the caller's local "https://auth…"
+             * expected `iss` is the caller's local "https://auth..."
              * literal. Comparison stays on the raw strings. */
             char *tiss_s = oidc_printable_dup(tiss ? tiss : "(missing)");
             oidc_eprintf("oidc_jwt_verify: id_token iss \"%s\" != \"%s\"\n",
@@ -370,14 +370,14 @@ static int validate_claims(Json *pay_j, const char *aud, const char *iss,
             return -1;
         }
     }
-    /* R49-L3: OIDC Core 3.1.3.7 — when the authorization request carried
+    /* R49-L3: OIDC Core 3.1.3.7 - when the authorization request carried
      * a nonce (this client always does), the id_token MUST echo it back;
      * a missing or mismatched nonce means the token was minted for a
      * different client session (token/session binding). Fail closed.
      * Local, fixed-length strings; constant-time compare like the other
      * sensitive comparisons here (ct_eq returns non-zero on a MATCH). The
      * claim value is issuer-controlled text, but only the diagnostic
-     * copy is filtered — the verdict uses the raw bytes. */
+     * copy is filtered - the verdict uses the raw bytes. */
     if (expected_nonce) {
         const char *tnonce = json_get_str(pay_j, "nonce");
         if (!tnonce || strlen(tnonce) != strlen(expected_nonce) ||
@@ -424,7 +424,7 @@ static Json *fetch_jwks(const char *iss)
         goto out;
     }
     if (!https_url_split(jwks_uri, &jhost, &jpath)) {
-        /* L28: display only — the rejected URL is parsed as-is above */
+        /* L28: display only - the rejected URL is parsed as-is above */
         char *uri_s = oidc_printable_dup(jwks_uri);
         oidc_eprintf("oidc_jwt_verify: invalid jwks_uri \"%s\"\n", uri_s);
         free(uri_s);

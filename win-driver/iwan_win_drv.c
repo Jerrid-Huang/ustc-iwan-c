@@ -1,23 +1,23 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * iwan_win_drv.c — 驱动入口、设备对象与 IOCTL 分发。
+ * iwan_win_drv.c - driver entry, device object and IOCTL dispatch.
  *
- * 对应 Linux 侧的：模块 init/exit + misc 设备注册 + genetlink 控制面入口。
- * 这里只有控制面：报文路径全在数据面文件里（WFP 平面 iwan_win_wfp.c 的
- * callout / NDIS 平面 iwan_win_mp.c + iwan_win_proto.c），且不排队、不起
- * 线程、不用定时器 —— 与 Linux 模块"内核只负责数据传输"的边界一致。
+ * Corresponds to the Linux side: module init/exit + misc device registration + genetlink control plane entry.
+ * Only the control plane is here: the packet path is entirely in the data plane files (callout of WFP plane iwan_win_wfp.c
+ * / NDIS plane iwan_win_mp.c + iwan_win_proto.c), and it does not queue, start
+ * threads or use timers -- matching the Linux module boundary that 'the kernel only carries data'.
  *
- * 本文件被两个平面共用，靠 IWAN_WIN_PLANE_MP 分叉。三处不同：
- *   ① 设备名：WFP 平面 \Device\iwan，NDIS 平面 \Device\iwanmp（两个平面
- *      可以同时装在一台机器上，用户态按 --data-plane 选名字打开）；
- *   ② 数据面的"装上/摘掉"钩子：WFP 是 callout 过滤器，NDIS 是选/放承载；
- *   ③ 卸载：WFP 要关 BFE 引擎，NDIS 只要注销小型端口与协议边。
+ * This file is shared by both planes, forked by IWAN_WIN_PLANE_MP. Three differences:
+ *   (1) Device name: WFP plane \Device\iwan, NDIS plane \Device\iwanmp (the two planes
+ *      can be installed on the same machine at once; user mode opens by name chosen with --data-plane);
+ *   (2) Data plane 'attach/detach' hook: WFP is a callout filter, NDIS selects/releases the carrier;
+ *   (3) Unload: WFP closes the BFE engine, NDIS only deregisters the miniport and protocol edge.
  */
 #include "iwan_win.h"
 
-/* 加载期失败的阶段追踪：NDIS 平面把阶段号写进服务键，WFP 平面编译成空操作。
- * 驱动起不来时用户态没有任何通道（控制设备都没建），这是唯一能一眼看到的
- * 现场 —— 见 iwan_win_mp_trace 的说明。 */
+/* Stage tracing for load-time failures: the NDIS plane writes the stage number into the service key; on the WFP plane it compiles to a no-op.
+ * When the driver fails to start there is no user-mode channel at all (the control device is not even created); this is the only thing
+ * visible at a glance -- see the description of iwan_win_mp_trace. */
 #ifdef IWAN_WIN_PLANE_MP
 #define MP_TRACE(stage, status)	iwan_win_mp_trace((stage), (status))
 #else
@@ -35,7 +35,7 @@
 #endif
 
 #ifndef IWAN_WIN_PLANE_MP
-/* WFP 管理会话（fwpmk.h）：只在 init/fini 里用，进程上下文、PASSIVE_LEVEL */
+/* WFP management session (fwpmk.h): used only in init/fini, process context, PASSIVE_LEVEL */
 static HANDLE g_engine = NULL;
 #endif
 
@@ -57,8 +57,8 @@ iwan_win_dispatch_ioctl(_In_ PDEVICE_OBJECT devobj, _Inout_ PIRP irp)
 	PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(irp);
 	IWAN_WIN_DEVICE_EXTENSION *ext = IWAN_DEVEXT(devobj);
 #ifdef IWAN_WIN_PLANE_MP
-	/* NDIS 平面的 IWAN_DEVEXT 忽略设备对象（控制设备不带扩展，扩展是
-	 * 单例），所以这里要显式声明没用到它，否则 /W4 /WX 下是 C4100。 */
+	/* IWAN_DEVEXT of the NDIS plane ignores the device object (the control device carries no extension; the extension is
+	 * a singleton), so declare explicitly that it is unused, otherwise /W4 /WX gives C4100. */
 	UNREFERENCED_PARAMETER(devobj);
 #endif
 	PVOID buf = irp->AssociatedIrp.SystemBuffer;
@@ -67,9 +67,9 @@ iwan_win_dispatch_ioctl(_In_ PDEVICE_OBJECT devobj, _Inout_ PIRP irp)
 	NTSTATUS st = STATUS_INVALID_DEVICE_REQUEST;
 	ULONG info = 0;
 
-	/* 没有扩展 = 数据面还没注册或已经注销。NDIS 平面的扩展由 DriverEntry
-	 * 分配，正常不会为空；这里按"设备还没就绪"处理，而不是解引用空指针
-	 * —— 控制设备在适配器 Halt 之后仍然存在，那条路上什么都不该保证。 */
+	/* No extension = the data plane is not registered yet or already unregistered. The NDIS plane extension is allocated by DriverEntry
+	 * and is normally never NULL; treat it as 'device not ready' rather than dereferencing NULL
+	 * -- the control device still exists after the adapter Halt, and nothing should be guaranteed on that path. */
 	if (ext == NULL) {
 		irp->IoStatus.Status = STATUS_DEVICE_NOT_READY;
 		irp->IoStatus.Information = 0;
@@ -77,8 +77,8 @@ iwan_win_dispatch_ioctl(_In_ PDEVICE_OBJECT devobj, _Inout_ PIRP irp)
 		return STATUS_DEVICE_NOT_READY;
 	}
 
-	/* 在途 IOCTL 计数：卸载路径会 IoReleaseRemoveLockAndWait，保证扩展
-	 * 不会在还有人用它的时候被释放。取不到（已进入移除态）就明确失败。 */
+	/* In-flight IOCTL counting: the unload path calls IoReleaseRemoveLockAndWait, ensuring the extension
+	 * is not freed while someone is still using it. If acquisition fails (already in remove state), fail explicitly. */
 	if (ext->ctrl_remove_init != 0 &&
 	    !NT_SUCCESS(IoAcquireRemoveLock(&ext->ctrl_remove_lock, irp))) {
 		irp->IoStatus.Status = STATUS_DEVICE_NOT_READY;
@@ -89,16 +89,16 @@ iwan_win_dispatch_ioctl(_In_ PDEVICE_OBJECT devobj, _Inout_ PIRP irp)
 
 	switch (sp->Parameters.DeviceIoControl.IoControlCode) {
 	case IOCTL_IWAN_SESSION_OPEN:
-		/* 请求与回复共用同一块 METHOD_BUFFERED 缓冲：先按请求解释，
-		 * 会话建立成功后再覆盖成回复。targets 紧跟结构体之后。 */
+		/* Request and reply share the same METHOD_BUFFERED buffer: interpret it as a request first,
+		 * then overwrite it with the reply once the session is established. targets come right after the struct. */
 		if (buf == NULL || in_len < sizeof(IWAN_WIN_SESSION_OPEN) ||
 		    out_len < sizeof(IWAN_WIN_SESSION_INFO)) {
 			st = STATUS_BUFFER_TOO_SMALL;
 			break;
 		}
-		/* 会话建立之前先把数据面装上：装上之后才置 valid，第一个报文
-		 * 就不会漏。WFP 平面装上的是过滤器（start 幂等）；NDIS 平面
-		 * 没有"过滤器"可装，改为会话建立之后选定承载（下一段）。 */
+		/* Attach the data plane before establishing the session: set valid only after attachment, so the first packet
+		 * is not missed. On the WFP plane what is attached is the filter (start is idempotent); the NDIS plane
+		 * has no 'filter' to attach, so it selects the carrier after session setup instead (next block). */
 #ifndef IWAN_WIN_PLANE_MP
 		st = iwan_win_wfp_start(ext);
 		if (!NT_SUCCESS(st))
@@ -108,17 +108,17 @@ iwan_win_dispatch_ioctl(_In_ PDEVICE_OBJECT devobj, _Inout_ PIRP irp)
 					   (const IWAN_WIN_SESSION_OPEN *)buf, in_len);
 		if (!NT_SUCCESS(st)) {
 #ifndef IWAN_WIN_PLANE_MP
-			/* 装好了却没建成会话：只有在确实没有会话在跑时才摘掉。
-			 * 旧会话还在就摘，等于把正在用的隧道打断。 */
+			/* Attached but session setup failed: detach only when no session is actually running.
+			 * Detaching while an old session still exists would cut the tunnel in use. */
 			if (!ext->sess.valid)
 				iwan_win_wfp_stop(ext);
 #endif
 			break;
 		}
 #ifdef IWAN_WIN_PLANE_MP
-		/* 选定承载：一条会话只走一张网卡。选不到就让整个 OPEN 失败
-		 * —— 没有承载就没有外层，静默继续等于建了一条发不出包的
-		 * 会话（fail-closed）。 */
+		/* Select the carrier: one session uses only one NIC. If none can be selected, fail the whole OPEN
+		 * -- without a carrier there is no outer, and silently continuing equals creating a session
+		 * that cannot send packets (fail-closed). */
 		st = iwan_win_mp_select_carrier(ext);
 		if (!NT_SUCCESS(st)) {
 			iwan_win_session_close(ext);
@@ -127,7 +127,7 @@ iwan_win_dispatch_ioctl(_In_ PDEVICE_OBJECT devobj, _Inout_ PIRP irp)
 #endif
 		iwan_win_session_info(ext, (IWAN_WIN_SESSION_INFO *)buf);
 #ifdef IWAN_WIN_PLANE_MP
-		/* ARP 诊断计数在这里落盘：数据面在 DISPATCH 上，不能碰 Zw*。 */
+		/* ARP diagnostic counters are persisted here: the data plane runs at DISPATCH and cannot touch Zw*. */
 		iwan_win_mp_trace_arp(ext);
 #endif
 		info = sizeof(IWAN_WIN_SESSION_INFO);
@@ -135,8 +135,8 @@ iwan_win_dispatch_ioctl(_In_ PDEVICE_OBJECT devobj, _Inout_ PIRP irp)
 
 	case IOCTL_IWAN_SESSION_CLOSE:
 		st = iwan_win_session_close(ext);
-		/* 会话已经拆完，数据面没有存在理由：WFP 平面摘掉过滤器（让
-		 * 系统回到"装了驱动但没跑隧道"的状态），NDIS 平面放掉承载。 */
+		/* Session is torn down, the data plane has no reason to exist: the WFP plane detaches the filter (returns
+		 * the system to 'driver installed but no tunnel running'), the NDIS plane releases the carrier. */
 #ifdef IWAN_WIN_PLANE_MP
 		iwan_win_mp_release_carrier(ext);
 #else
@@ -149,8 +149,8 @@ iwan_win_dispatch_ioctl(_In_ PDEVICE_OBJECT devobj, _Inout_ PIRP irp)
 			st = STATUS_BUFFER_TOO_SMALL;
 			break;
 		}
-		/* 有效性与快照必须在同一把锁里取：否则 CLOSE 可以插在中间，
-		 * 让我们以 SUCCESS 返回一份全零的"会话信息"。 */
+		/* Validity and snapshot must be taken under the same lock: otherwise CLOSE can slip in between
+		 * and we return an all-zero 'session info' with SUCCESS. */
 		KeWaitForSingleObject(&ext->ctrl_mutex, Executive, KernelMode, FALSE, NULL);
 		st = ext->sess.valid ? STATUS_SUCCESS : STATUS_INVALID_DEVICE_STATE;
 		if (NT_SUCCESS(st)) {
@@ -196,19 +196,19 @@ iwan_win_unload(_In_ PDRIVER_OBJECT driver)
 	if (devobj != NULL) {
 		IWAN_WIN_DEVICE_EXTENSION *ext = IWAN_DEVEXT(devobj);
 
-		/* 先进移除态、再等在途 IOCTL 做完，然后才拆数据面/删设备。
-		 * 守卫保证两条卸载路径（DriverUnload 与 NDIS UnloadHandler）
-		 * 只会等待一次。 */
+		/* Enter remove state first, then wait for in-flight IOCTLs to finish, and only then tear down the data plane / delete the device.
+		 * The guard ensures the two unload paths (DriverUnload and NDIS UnloadHandler)
+		 * wait only once. */
 		if (ext->ctrl_remove_init != 0 &&
 		    InterlockedExchange(&ext->ctrl_remove_waited, 1) == 0)
 			IoReleaseRemoveLockAndWait(&ext->ctrl_remove_lock, ext);
 
 #ifdef IWAN_WIN_PLANE_MP
-		iwan_win_mp_fini(ext);		/* 先注销小型端口与协议边 */
+		iwan_win_mp_fini(ext);		/* deregister miniport and protocol edge first */
 #else
-		iwan_win_wfp_fini(ext);		/* 先停数据面 */
+		iwan_win_wfp_fini(ext);		/* stop the data plane first */
 #endif
-		iwan_win_session_teardown(ext);	/* 再排空并释放会话状态 */
+		iwan_win_session_teardown(ext);	/* then drain and free session state */
 		iwan_win_ctrl_fini(ext);
 
 		RtlInitUnicodeString(&link, IWAN_DRV_DOS_NAME);
@@ -224,10 +224,10 @@ iwan_win_unload(_In_ PDRIVER_OBJECT driver)
 }
 
 /*
- * 非 PnP 设备没有真实设备类，但 IoCreateDeviceSecure / NdisRegisterDeviceEx
- * 仍要一个 GUID。GUID_DEVCLASS_UNKNOWN 这个符号在内核头里并不存在（第一次
- * 真编译报 C2065），所以用一个本项目固定的 GUID —— 它只在设备对象里做标记用。
- * 两个平面共用同一个 GUID，所以它不是 static：NDIS 平面在 mp.c 里用。
+ * A non-PnP device has no real device class, but IoCreateDeviceSecure / NdisRegisterDeviceEx
+ * still need a GUID. The symbol GUID_DEVCLASS_UNKNOWN does not exist in the kernel headers (the first real
+ * compile reports C2065), so use a project-fixed GUID -- it is only a marker inside the device object.
+ * Both planes share the same GUID, so it is not static: the NDIS plane uses it in mp.c.
  */
 const GUID iwan_win_devclass_guid = {
 	0x6d1a9b21, 0x7c4e, 0x4e2b,
@@ -235,15 +235,15 @@ const GUID iwan_win_devclass_guid = {
 };
 
 /*
- * 两个平面的 DriverEntry 形状不同，不是风格问题：
+ * The two planes have different DriverEntry shapes, and that is not a style issue:
  *
- *  - WFP 平面：先建控制设备（IoCreateDeviceSecure），扩展就是设备扩展，
- *    再注册过滤器（不带设备也能注册，但控制面就没地方放状态了）。
- *  - NDIS 平面：控制设备必须由 NdisRegisterDeviceEx 在注册**之后**建 ——
- *    NdisMRegisterMiniportDriver 要求调用时 DriverObject 是干净的，客体
- *    实测已挂自己的设备对象就回 NDIS_STATUS_BAD_CHARACTERISTICS
- *    (0xC0010005)。扩展因此要自己分配，而且它比控制设备活得久：小型端口
- *    上下文在 MiniportInitializeEx 就要用，控制设备那时可能还没建。
+ *  - WFP plane: create the control device first (IoCreateDeviceSecure); the extension is the device extension,
+ *    then register the filter (it can be registered without a device, but then the control plane has nowhere to keep state).
+ *  - NDIS plane: the control device must be created by NdisRegisterDeviceEx **after** registration --
+ *    NdisMRegisterMiniportDriver requires DriverObject to be clean at call time; on the guest,
+ *    having attached its own device object returns NDIS_STATUS_BAD_CHARACTERISTICS
+ *    (0xC0010005). The extension therefore must be allocated separately, and it outlives the control device: the miniport
+ *    context is needed by MiniportInitializeEx, when the control device may not exist yet.
  */
 NTSTATUS
 DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registry_path)
@@ -251,16 +251,16 @@ DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registry_path)
 	IWAN_WIN_DEVICE_EXTENSION *ext;
 	NTSTATUS st;
 
-	/* 静态分析在本函数报两条 C6014（ext / devobj "泄漏"）：两者都是驱动
-	 * 生命周期资产 —— ext 跟着卸载路径走（UnloadHandler / iwan_win_unload），
-	 * devobj 跟着 IoDeleteDevice 走，都不随 DriverEntry 返回而释放，两条
-	 * 失败路径也各自回滚过。逐条核对后判定为误报，抑制点写在各自的分配处
-	 * （见下面的 #pragma）。 */
+	/* Static analysis reports two C6014s in this function (ext / devobj 'leak'): both are driver
+	 * lifetime assets -- ext follows the unload path (UnloadHandler / iwan_win_unload),
+	 * devobj follows IoDeleteDevice; neither is freed when DriverEntry returns, and both
+	 * failure paths roll back on their own. After checking item by item these are false positives; the suppression is at each allocation site
+	 * (see the #pragma below). */
 
 #ifdef IWAN_WIN_PLANE_MP
-	/* C6014 误报（分配点 ext = IWAN_ALLOC）：ext 是驱动生命周期资产，
-	 * 只在卸载路径（UnloadHandler / iwan_win_unload）释放，fail 标签里也
-	 * 回滚。分析器只看见"分配了、DriverEntry 成功返回前没释放"。 */
+	/* C6014 false positive (allocation site ext = IWAN_ALLOC): ext is a driver lifetime asset,
+	 * freed only on the unload path (UnloadHandler / iwan_win_unload), and rolled back in the fail label too.
+	 * The analyzer only sees 'allocated, not freed before DriverEntry returns success'. */
 #pragma warning(suppress: 6014)
 	ext = (IWAN_WIN_DEVICE_EXTENSION *)IWAN_ALLOC(sizeof(*ext),
 						      IWAN_TAG_SESS);
@@ -271,8 +271,8 @@ DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registry_path)
 	RtlZeroMemory(ext, sizeof(*ext));
 	iwan_win_ctrl_init(ext);
 
-	/* DriverUnload 仍然设置：卸载走 NDIS 的 UnloadHandler，那条路会把
-	 * driver->DeviceObject 置空，于是这个函数变成空操作（双保险）。 */
+	/* DriverUnload is still set: unload goes through NDIS UnloadHandler, and that path clears
+	 * driver->DeviceObject, so this function becomes a no-op (double safety). */
 	driver->DriverUnload = iwan_win_unload;
 
 	st = iwan_win_mp_init(driver, ext, registry_path);
@@ -281,14 +281,14 @@ DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registry_path)
 
 	st = iwan_win_mp_open_control(ext);
 	if (!NT_SUCCESS(st)) {
-		/* 控制设备建不出来 = 用户态打不开 = 装了也没用，但**绝不能在这里
-		 * 回滚**：小型端口（也许还有协议边）已经注册成功，回头去注销再让
-		 * DriverEntry 失败，正是整机无法启动那次事故的机理 —— 半个注册
-		 * 状态下 NDIS 认为驱动还在，卸载路径永远等不到，重启就卡在引导。
-		 * 这里只让它留在 T5 键里（iwan_win_mp_open_control 已写），照常
-		 * 返回成功：适配器会出现、IOCTL 以 STATUS_DEVICE_NOT_READY 失败，
-		 * 原因一眼可见，卸载与重装都还是干净的。 */
-		DbgPrint("iwan-win: 控制设备未就绪（见 T5），装载继续\n");
+		/* Control device cannot be created = user mode cannot open it = useless to install, but **never roll back here**:
+		 * the miniport (and maybe the protocol edge) is already registered; going back to deregister and then failing
+		 * DriverEntry is exactly the mechanism of that incident where the whole machine would not boot -- with a half-registered
+		 * state NDIS thinks the driver is still there, the unload path never completes, and the reboot hangs in boot.
+		 * Here just leave it in the T5 key (iwan_win_mp_open_control already wrote it) and return success as usual:
+		 * the adapter appears and IOCTLs fail with STATUS_DEVICE_NOT_READY,
+		 * the reason is visible at a glance, and unload and reinstall both stay clean. */
+		DbgPrint("iwan-win: control device not ready (see T5), load continues\n");
 	}
 
 	MP_TRACE(4, STATUS_SUCCESS);
@@ -305,18 +305,18 @@ fail:
 	UNICODE_STRING dev_name, dos_name, sddl;
 	PDEVICE_OBJECT devobj = NULL;
 
-	/* 默认 SDDL：只有 System 与 Administrators 能打开设备。用户态客户端
-	 * 需要管理员权限（对应 Linux 侧需要 root），这与 Linux 一致。
+	/* Default SDDL: only System and Administrators can open the device. The user-mode client
+	 * needs administrator rights (corresponding to root on the Linux side), consistent with Linux.
 	 *
-	 * 注意 IoCreateDeviceSecure 的第 7 个参数是 PCUNICODE_STRING，不是 PCWSTR：
-	 * 所以既不能直接把字面量递进去（C4133），也不能把 wdmsec.h 里的
-	 * SDDL_DEVOBJ_* 宏结果再喂给 RtlInitUnicodeString（那个宏本身就是
-	 * UNICODE_STRING，C4024/C2440）。自己建一个最不含糊。 */
+	 * Note the 7th parameter of IoCreateDeviceSecure is PCUNICODE_STRING, not PCWSTR:
+	 * so neither can a literal be passed in directly (C4133), nor can the result of the wdmsec.h
+	 * SDDL_DEVOBJ_* macros be fed to RtlInitUnicodeString again (that macro is itself an
+	 * UNICODE_STRING, C4024/C2440). Build one ourselves, the least ambiguous. */
 	RtlInitUnicodeString(&sddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
 	RtlInitUnicodeString(&dev_name, IWAN_DRV_DEV_NAME);
-	/* C6014 误报（devobj）：设备对象是驱动生命周期资产，随
-	 * IoDeleteDevice（卸载与两条失败路径）释放。缺陷报在本调用的最后一行
-	 * （&devobj 那一行），单行 suppress 贴不上，故只对这一条语句禁用。 */
+	/* C6014 false positive (devobj): the device object is a driver lifetime asset, freed with
+	 * IoDeleteDevice (unload and the two failure paths). The defect is reported on the last line of this call
+	 * (the &devobj line); a single-line suppress cannot attach there, so disable it for this statement only. */
 #pragma warning(push)
 #pragma warning(disable: 6014)
 	st = IoCreateDeviceSecure(driver, sizeof(IWAN_WIN_DEVICE_EXTENSION),
@@ -346,8 +346,8 @@ fail:
 	driver->MajorFunction[IRP_MJ_DEVICE_CONTROL] = iwan_win_dispatch_ioctl;
 	driver->DriverUnload = iwan_win_unload;
 
-	/* WFP 平面用不到注册表路径（NDIS 平面要把它转交给
-	 * NdisMRegisterMiniportDriver）。不写这一行在 /W4 /WX 下是 C4100 硬错误。 */
+	/* The WFP plane does not use the registry path (the NDIS plane hands it to
+	 * NdisMRegisterMiniportDriver). Not writing this line is a hard C4100 error under /W4 /WX. */
 	UNREFERENCED_PARAMETER(registry_path);
 	st = iwan_win_wfp_init(devobj, ext);
 	if (!NT_SUCCESS(st)) {

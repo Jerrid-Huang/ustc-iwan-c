@@ -95,7 +95,7 @@ void pump_win_single_pkt(void *ud, uint8_t *pkt, size_t len, bool last)
             continue;
         if (errno == EAGAIN || errno == EWOULDBLOCK ||
             errno == ENOBUFS || errno == EPERM ||
-            /* R23 (R22-B1-2): ENOMEM — socket-buffer/memory pressure is
+            /* R23 (R22-B1-2): ENOMEM -- socket-buffer/memory pressure is
              * transient, same class as ENOBUFS (on Windows wsa_errno
              * even maps WSAENOBUFS to ENOBUFS); the old code marked the
              * session lost on ENOMEM while the Linux pump only yielded.

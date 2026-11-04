@@ -1,59 +1,59 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * win_vsrv.c — Windows 侧测速用的虚拟服务端（同一份源码可在 Linux 上跑，便于自检）。
+ * win_vsrv.c -- virtual server for Windows-side throughput tests (same source also runs on Linux for self-check).
  *
- * 用途：把"服务端"放进被测机器内部，让外层承载只剩客体自身的回环，从而把客户端
- * 数据面从"客体↔宿主"这段模拟网卡（QEMU slirp）的天花板里摘出来。它只做三件事：
+ * Purpose: put the "server" inside the machine under test, leaving only the guest's own loopback as the outer bearer, so the client's
+ * data plane is removed from the simulated NIC (QEMU slirp) ceiling between guest and host. It does only three things:
  *
- *   · 握手：收到 PT_OPEN 就回 PT_OPEN_ACK（回显客户端首部的 sid/tok 与 nonce）；
- *   · 计数：只数 PT_DATA / PT_DATA_ENC，bytes 记外层 UDP 载荷（8 字节 iwan 首部 +
- *           内层 IP 总长），与 Linux 侧 IWAN_SRV_SINK 同一口径
- *           （src/common/server.c:1678-1682 的 sink_account）；
- *   · 挥手：收到 PT_CLOSE 只计数与打印，不回任何东西。
+ *   - handshake: reply PT_OPEN_ACK to PT_OPEN (echo the client header's sid/tok and nonce);
+ *   - accounting: count only PT_DATA / PT_DATA_ENC; bytes is the outer UDP payload (8-byte iwan header +
+ *           inner IP total length), the same measure as Linux IWAN_SRV_SINK
+ *           (sink_account at src/common/server.c:1678-1682);
+ *   - teardown: count and print PT_CLOSE, reply nothing.
  *
- * "不检查"的确切含义（刻意的，与 Linux sink 一致）：
- *   · 不验签、不校验用户名/口令、不校验 sid/tok 归属；
- *   · 不解密、不解析内层 IP 与传输层、不转发、不写 TUN；
- *   · 短于 8 字节的报文只记一个 short 计数，不回包也不报错。
- * 唯一的回包是控制帧（OPEN_ACK / ECHO_RES / PING_RSP）：不做这三样，真实客户端
- * 根本进不了数据面（客户端侧约束见 src/common/auth.c:227-279）。
+ * Exact meaning of "no checking" (deliberate, same as the Linux sink):
+ *   - no signature check, no username/password check, no sid/tok ownership check;
+ *   - no decryption, no inner IP/transport parsing, no forwarding, no TUN writes;
+ *   - packets shorter than 8 bytes only increment a short counter; no reply and no error.
+ * The only replies are control frames (OPEN_ACK / ECHO_RES / PING_RSP): without these three, a real client
+ * could never reach the data plane (client-side constraints: src/common/auth.c:227-279).
  *
- * 与 Linux sink 的两处差别，都是必需的：
- *   · 签名。控制帧的 16 字节签名是 md5(首部 8 字节 || "mw")
- *     （src/common/protocol.c:22-37 的 pkt_sig），而 mingw 工具链没有 OpenSSL
- *     （树内 md5() 走 EVP，src/common/crypto.c:124）。这里内置一份 RFC 1321
- *     实现，只用于生成控制帧签名；-S 自检把控制帧整帧十六进制打出来，可与树内
- *     ctrl_hdr() 逐字节对照。
- *   · 打印前缀是 VSINK，另含握手/挥手计数与帧长统计。
+ * Two differences from the Linux sink, both required:
+ *   - signature. The 16-byte signature of a control frame is md5(header 8 bytes || "mw")
+ *     (pkt_sig at src/common/protocol.c:22-37), but the mingw toolchain has no OpenSSL
+ *     (in-tree md5() uses EVP, src/common/crypto.c:124). An RFC 1321 implementation
+ *     is embedded here solely to sign control frames; -S self-check dumps whole control frames in hex for
+ *     byte-by-byte comparison with in-tree ctrl_hdr().
+ *   - print prefix is VSINK; also includes handshake/teardown counters and frame-length stats.
  *
- * 构建（客体是 x86-64 Windows）：
+ * Build (guest is x86-64 Windows):
  *   x86_64-w64-mingw32-gcc -std=c11 -O2 -Wall -Wextra -Werror \
  *       -o win_vsrv.exe tests/win_vsrv.c -lws2_32
- * 本机自检：
+ * Local self-check:
  *   gcc -std=c11 -O2 -Wall -Wextra -Werror -o /tmp/win_vsrv tests/win_vsrv.c -lpthread
  *   /tmp/win_vsrv -S
  *
- * 用法：
+ * Usage:
  *   win_vsrv [-b 0.0.0.0] [-p 45678] [-s 20] [-t 2] [-k 0]
  *            [-i 198.18.0.2] [-g 198.18.0.1] [-d 114.114.114.114] [-m 1400]
  *            [-S] [-h]
- *   -i 是回给客户端的隧道内地址（T_IP），客户端拿它配置自己的 TUN；打流目标必须
- *   落在同一 /24（客户端只装直连子网路由，不做默认路由劫持）。
- *   -k 是本端主动发 ECHO_REQ 的间隔秒数，默认 0（真实客户端自己每 10 秒发一次
- *   keepalive，见 src/common/proxy.c:798，本端只需回 ECHO_RES）。
+ *   -i is the tunnel-internal address returned to the client (T_IP); the client uses it to configure its TUN; traffic targets must
+ *   fall inside the same /24 (the client only installs a directly connected subnet route; it does not hijack the default route).
+ *   -k is the interval in seconds for this end to send ECHO_REQ, default 0 (a real client sends its own keepalive every 10 seconds,
+ *   see src/common/proxy.c:798; this end only needs to reply ECHO_RES).
  */
 #ifndef _WIN32
 #  ifndef _GNU_SOURCE
-#    define _GNU_SOURCE 1   /* clock_gettime/nanosleep/getaddrinfo 在 -std=c11 下需要 */
+#    define _GNU_SOURCE 1   /* clock_gettime/nanosleep/getaddrinfo need it under -std=c11 */
 #  endif
 #endif
 
 #ifdef _WIN32
 #  ifndef __USE_MINGW_ANSI_STDIO
-#    define __USE_MINGW_ANSI_STDIO 1  /* %llu 用 mingw 自己的实现，不依赖 MSVCRT */
+#    define __USE_MINGW_ANSI_STDIO 1  /* %llu uses mingw's own implementation, not MSVCRT */
 #  endif
 #  ifndef _WIN32_WINNT
-#    define _WIN32_WINNT 0x0601       /* inet_pton/inet_ntop/getaddrinfo 需要 Vista+ */
+#    define _WIN32_WINNT 0x0601       /* inet_pton/inet_ntop/getaddrinfo need Vista+ */
 #  endif
 #  define WIN32_LEAN_AND_MEAN
 #  include <winsock2.h>
@@ -88,11 +88,11 @@ typedef int sock_t;
 #  define sock_close close
 #endif
 
-/* ---------------------------------------------------------------- 协议常量 */
+/* ---------------------------------------------------------------- protocol constants */
 #define HDR_LEN      8
 #define SIG_LEN      16
 #define CTRL_LEN     (HDR_LEN + SIG_LEN)
-#define CTRL_SIG_MAX 31u          /* 客户端上限 55 字节减去 24：src/common/auth.c:230 */
+#define CTRL_SIG_MAX 31u          /* client limit 55 bytes minus 24: src/common/auth.c:230 */
 
 enum {
     PT_OPEN_REJECT = 0x11,
@@ -121,7 +121,7 @@ enum {
 #define MTU_MIN  576u
 #define MTU_MAX  65499u
 
-/* ------------------------------------------------------------ 大端读写 */
+/* ------------------------------------------------------------ big-endian read/write */
 static uint16_t rd16(const uint8_t *p)
 {
     return (uint16_t)(((uint16_t)p[0] << 8) | p[1]);
@@ -147,11 +147,11 @@ static void wr32(uint8_t *p, uint32_t v)
     p[3] = (uint8_t)v;
 }
 
-/* ------------------------------------------------------- MD5（RFC 1321） */
+/* ------------------------------------------------------- MD5(RFC 1321) */
 /*
- * 只为生成控制帧签名。树内 md5() 依赖 OpenSSL，而客体上的工具链没有 OpenSSL，
- * 所以这里自带一份；正确性由 -S 与树内 ctrl_hdr() 的逐字节对照保证，不由"看着
- * 像 MD5"保证。
+ * Only for signing control frames. The in-tree md5() depends on OpenSSL, and the guest toolchain has none,
+ * so a copy is bundled here; correctness is guaranteed by byte-for-byte comparison of -S output with in-tree ctrl_hdr(),
+ * not by "it looks like MD5".
  */
 typedef struct {
     uint32_t h[4];
@@ -280,8 +280,8 @@ static void md5_buf(const uint8_t *p, size_t len, uint8_t out[16])
     md5_final(&c, out);
 }
 
-/* ------------------------------------------------------- 控制帧与 TLV */
-/* 签名 = md5(首部 8 字节 || "mw")，与 src/common/protocol.c:22-37 的 pkt_sig 同构 */
+/* ------------------------------------------------------- control frames and TLV */
+/* signature = md5(header 8 bytes || "mw"), same construction as pkt_sig at src/common/protocol.c:22-37 */
 static size_t build_ctrl(uint8_t *out, uint8_t typ, uint8_t enc, uint16_t sid,
                          uint32_t tok, const uint8_t *tlvs, size_t tlvlen)
 {
@@ -302,13 +302,13 @@ static size_t build_ctrl(uint8_t *out, uint8_t typ, uint8_t enc, uint16_t sid,
 static size_t tlv_add(uint8_t *p, uint8_t typ, const void *val, size_t vlen)
 {
     p[0] = typ;
-    p[1] = (uint8_t)(vlen + 2);   /* 长度字节存 vlen+2：src/common/protocol.c:39-53 */
+    p[1] = (uint8_t)(vlen + 2);   /* length byte stores vlen+2: src/common/protocol.c:39-53 */
     if (vlen > 0)
         memcpy(p + 2, val, vlen);
     return 2 + vlen;
 }
 
-/* 找到就返回 0；畸形即停，不检查内容 */
+/* return 0 if found; stop on malformed input, do not check contents */
 static int tlv_find(const uint8_t *p, size_t len, uint8_t typ,
                     const uint8_t **val, size_t *vlen)
 {
@@ -329,10 +329,10 @@ static int tlv_find(const uint8_t *p, size_t len, uint8_t typ,
     return -1;
 }
 
-/* ------------------------------------------------------------ 运行参数 */
+/* ------------------------------------------------------------ runtime parameters */
 static sock_t   g_sock = SOCK_BAD;
 static uint16_t g_mtu = 1400;
-static uint32_t g_ip, g_gw, g_dns;      /* 大端字节序存放 */
+static uint32_t g_ip, g_gw, g_dns;      /* stored in big-endian byte order */
 static int      g_ka_sec = 0;
 
 static volatile int g_stop = 0;
@@ -373,7 +373,7 @@ static void sleep_ms(int ms)
 #endif
 }
 
-/* ---------------------------------------------------------------- 工作线程 */
+/* ---------------------------------------------------------------- worker thread */
 typedef struct {
     int id;
     unsigned long long pkts, bytes, opens, closes, echo_req, ping_req;
@@ -418,7 +418,7 @@ static unsigned addr_port(const struct sockaddr_storage *a)
     return 0;
 }
 
-/* OPEN_ACK：回显 sid/tok 与 nonce，带客户端要求的六个 TLV（合计正好 31 字节） */
+/* OPEN_ACK: echo sid/tok and nonce, with the six TLVs requested by the client (31 bytes total) */
 static size_t build_ack(uint8_t *out, const uint8_t *req, size_t reqlen)
 {
     const uint8_t *v;
@@ -448,15 +448,15 @@ static size_t build_ack(uint8_t *out, const uint8_t *req, size_t reqlen)
     o += tlv_add(tlv + o, T_DNS, b, 4);
     b[0] = enc;
     o += tlv_add(tlv + o, T_ENCRYPT, b, 1);
-    /* T_AUTH_VERIFY 在线上可选，但一旦出现客户端就严格校验（auth.c:272-279）：
-     * 原样回显 nonce 是最省事也最稳的做法；长度不是 4 就不带。 */
+    /* T_AUTH_VERIFY is optional on the wire, but once present the client validates it strictly (auth.c:272-279):
+     * echoing the nonce verbatim is simplest and most robust; omit it if the length is not 4. */
     if (reqlen > HDR_LEN &&
         tlv_find(req + HDR_LEN, reqlen - HDR_LEN, T_AUTH_VERIFY, &v, &vl) == 0 && vl == 4)
         o += tlv_add(tlv + o, T_AUTH_VERIFY, v, 4);
 
-    /* 真实服务端是"分配"会话标识，客户端 OPEN 里 sid/tok 都是 0；照抄就会回一个
-     * sid=0 的会话。tok 为 0 客户端直接拒（auth.c:246），sid 为 0 虽不报错但不像
-     * 真实服务端，这里两个都给一个固定的非零值。 */
+    /* A real server "allocates" a session id; in the client OPEN both sid and tok are 0; copying that
+     * would return a session with sid=0. The client rejects tok=0 outright (auth.c:246); sid=0 is not
+     * an error but does not look like a real server, so both are set to fixed non-zero values here. */
     {
         uint16_t sid = rd16(req + 2);
         uint32_t tok = rd32(req + 4);
@@ -491,7 +491,7 @@ static void handle_frame(worker *w, const uint8_t *buf, size_t n,
         if (n > w->max)
             w->max = n;
         if (w->min == 0 || n < w->min)
-            w->min = n;   /* 0 表示"还没有样本"：帧长不可能小于 8 */
+            w->min = n;   /* 0 means "no samples yet": a frame cannot be shorter than 8 */
         remember_peer(from, fromlen);
         return;
     case PT_ECHO_REQ:
@@ -530,7 +530,7 @@ static void recv_loop(worker *w)
         int n = (int)recvfrom(g_sock, (char *)buf, (int)sizeof buf, 0,
                               (struct sockaddr *)&from, &fromlen);
         if (n < 0)
-            continue;   /* 收超时、EINTR、真错误：都不计数 */
+            continue;   /* receive timeout, EINTR, real error: none are counted */
         handle_frame(w, buf, (size_t)n, &from, fromlen);
     }
 }
@@ -561,7 +561,7 @@ static int thread_start(worker *w)
 }
 #endif
 
-/* ---------------------------------------------------------------- 打印 */
+/* ---------------------------------------------------------------- printing */
 typedef struct {
     unsigned long long pkts, bytes, opens, closes, echo_req, ping_req;
     unsigned long long other, short_, min, max;
@@ -592,7 +592,7 @@ static void sum_workers(const worker *w, int nw, total_t *t)
 static void print_tick(const total_t *t, double elapsed_s, double dt_s,
                        unsigned long long prev_pkts, unsigned long long prev_bytes)
 {
-    /* t= 是自启动起的秒数：多相测量要靠它把每个 5 秒区间归到某一相。 */
+    /* t= is seconds since startup: multi-phase measurements use it to assign each 5-second window to a phase. */
     printf("VSINK t=%.1f pkts=%llu bytes=%llu pps=%.1f mbps=%.2f opens=%llu closes=%llu "
            "echo=%llu ping=%llu other=%llu short=%llu\n",
            elapsed_s, t->pkts, t->bytes,
@@ -624,7 +624,7 @@ static void print_final(const worker *w, int nw, const total_t *t, double elapse
     fflush(stdout);
 }
 
-/* ---------------------------------------------------------------- 自检 */
+/* ---------------------------------------------------------------- self-check */
 static void hex_dump(const char *tag, const uint8_t *p, size_t n)
 {
     size_t i;

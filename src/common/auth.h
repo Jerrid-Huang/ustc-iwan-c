@@ -11,8 +11,19 @@ typedef struct {
     char     tun[16];
     char     gw[16];
     char     dns[16];
+    /* OPEN_ACK's IPv6 trio: 0x0b inner v6 address, 0x0c v6 DNS, 0x0d v6 gateway.
+     * Each TLV's length byte is 0x12 (2-byte TLV header + 16-byte address); the value is
+     * a 128-bit address in network order. Empty string = not issued by the server (an all-zero address is treated as
+     * not issued, matching client behavior). This repository's server does not send these three TLVs yet. */
+    char     tun6[46];
+    char     gw6[46];
+    char     dns6[46];
     uint16_t mtu;
     uint8_t  enc;   /* data-plane encryption flag from OPEN_ACK T_ENCRYPT (R23-F2) */
+    /* Minimal ACK of the new protocol: the server replies only with the authentication echo (username + our own nonce),
+     * without issuing tun/gw/dns/mtu. In that case sid/tok are valid, tun/gw/dns are empty strings,
+     * and mtu is the default value. Set only when IWAN_ALLOW_MINIMAL_ACK=1. */
+    bool     unissued;
 } AuthResult;
 
 /* build OPEN packet (appends to out). Returns 0 on success, -1 when the

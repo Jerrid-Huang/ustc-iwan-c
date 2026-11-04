@@ -46,7 +46,7 @@ typedef struct {
                                  * spawn-side cap and IPv6 mode spawns TWO
                                  * workers per flow (AAAA + A), so up to 512
                                  * detached workers can each be pushing one
-                                 * terminal result — a ring of 512 would
+                                 * terminal result -- a ring of 512 would
                                  * drop-oldest on the 512th push and strand
                                  * a flow for its full 30s timeout
                                  * (SUMMARY-2 M10); R34-B3-1: LEN-1 = 512
@@ -58,7 +58,7 @@ typedef struct {
  * (R33 N1) and a multi-tab / multi-domain browser burst can easily exceed
  * 16 concurrent pending domain CONNECTs; the 17th+ worker then spun in
  * dns_register for up to 2s with no slot and pseudo-failed its flow with
- * rep=4. The wait table is now sized 64 — a conservative subset of the
+ * rep=4. The wait table is now sized 64 -- a conservative subset of the
  * result ring's 512 usable slots (every in-flight worker is guaranteed a
  * push slot by R33-N1/R34-B3-1 regardless). 64 covers a large browser
  * burst with ample headroom while keeping the per-entry cost flat:
@@ -130,15 +130,15 @@ typedef struct Flow_s {
                                 * kill-converges once err_rounds exceeds
                                 * FLOW_ERR_ROUNDS_MAX = 32 (see socks.c,
                                 * which #if defined(__linux__) gates this
-                                * whole convergence — R56-001). wait_events
+                                * whole convergence -- R56-001). wait_events
                                 * (socks.c) uses it to bound the ERR|HUP
                                 * convergence: past FLOW_ERR_ROUNDS_MAX the
                                 * client is confirmed dead and the
                                 * undeliverable queue is dropped (force-reap
                                 * semantic). It only ever grows on a REAL
-                                * error — Linux poll never reports these
+                                * error -- Linux poll never reports these
                                 * bits on a half-open socket (R55-SK-1
-                                * probe) — so no reset is required;
+                                * probe) -- so no reset is required;
                                 * flow_alloc's memset starts it at 0 and any
                                 * future ERR on the same fd is the same
                                 * confirmation. */

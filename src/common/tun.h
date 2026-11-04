@@ -28,7 +28,7 @@ int  tun_attach(const char *name);   /* extra queue fd or -1 */
  * child can pass the fds to tun_pool_create_pre and keep a real
  * multi-queue fan-out. Returns the number actually opened (0 on non-Linux
  * where tun_attach is unavailable).
- * R37 R1E-2: Linux/macOS only — the Windows backend (tun_win.c) is a
+ * R37 R1E-2: Linux/macOS only -- the Windows backend (tun_win.c) is a
  * single-queue wintun pool and implements none of the multi-queue API
  * (tun_attach_many, tun_pool_create_pre, tun_reader_qid); declaring them
  * there promised symbols that do not exist (link-time undefined reference).
@@ -112,12 +112,12 @@ int tun_write_retry(int fd, const uint8_t *pkt, size_t len, int max_ms,
  * flag checked by the reader threads (util.h g_stop; may be NULL).
  * tun_pool_set_exit_cb registers an optional per-thread callback that
  * each reader thread runs once, on its own thread, just before exiting
- * (after the final flush signal) — used to free thread-local batch
+ * (after the final flush signal) -- used to free thread-local batch
  * buffers (client pump's g_tx). */
 struct tun_pool;
 /* per-packet callback: pkt is a per-reader scratch buffer, owned by the
  * caller only until the callback returns (a batch-oriented callback may
- * copy it; in-place modification is allowed — the server XORs in place) */
+ * copy it; in-place modification is allowed -- the server XORs in place) */
 typedef void (*tun_pkt_fn)(void *ud, uint8_t *pkt, size_t len, bool last);
 typedef void (*tun_exit_fn)(void);
 
@@ -133,7 +133,7 @@ struct tun_pool *tun_pool_create(const char *name, int fd0, int maxq,
 /* tun_pool_create_pre: same as tun_pool_create, but the eager fill first
  * consumes up to `npre` queue fds from `prefds` (pre-opened by the caller
  * while it still had the privilege), then falls back to tun_attach for any
- * shortfall. Ownership of all `prefds` transfers to the pool — they become
+ * shortfall. Ownership of all `prefds` transfers to the pool -- they become
  * ordinary extra queues (closed by tun_pool_destroy), and any the pool
  * does not need are closed during create. Pass prefds=NULL/npre=0 for the
  * plain behavior. The server uses this to keep a real multi-queue fan-out
@@ -150,13 +150,13 @@ int tun_pool_queues(const struct tun_pool *p);
 /* queue fd for uplink writer `tid` (spread writes across queue fds so
  * the device write lock is not a single serialization point); -1 when
  * the pool is empty. Safe to call concurrently with tun_pool_tick.
- * R54-WG3-3: returns a RAW fd — the caller's own write is NOT protected
+ * R54-WG3-3: returns a RAW fd -- the caller's own write is NOT protected
  * against a concurrent tun_pool_del closing-and-recycling the number.
  * The server therefore writes through tun_pool_write below, which holds
  * the pool lock across the write and closes that window; use this only
  * when the documented "EBADF = transient drop" contract is acceptable. */
 int tun_pool_write_fd(const struct tun_pool *p, unsigned tid);
-/* R54-WG3-3: lock-protected uplink write — select the queue fd for
+/* R54-WG3-3: lock-protected uplink write -- select the queue fd for
  * writer `tid`, and perform the whole tun_write_retry (budget max_ms;
  * mirrors the raw path's EAGAIN-retry "still full after the bound:
  * dropped" contract) under the pool's read lock. tun_pool_del /
@@ -164,7 +164,7 @@ int tun_pool_write_fd(const struct tun_pool *p, unsigned tid);
  * never race an in-flight write: a stale write can never land on a
  * closed-and-recycled fd number. Returns 0 fully written, -1 dropped
  * (errno preserved on fatal; persistent EAGAIN / EBADF are transient
- * drops, the same contract as before). Linux/macOS only — the Windows
+ * drops, the same contract as before). Linux/macOS only -- the Windows
  * wintun backend is single-queue and writes through its own fd. */
 #ifndef _WIN32
 int tun_pool_write(struct tun_pool *p, unsigned tid, const uint8_t *pkt,

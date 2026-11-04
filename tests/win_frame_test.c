@@ -1,18 +1,18 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * win_frame_test.c — Windows 数据面纯逻辑的对拍与自检（可在 Linux 上跑）。
+ * win_frame_test.c - cross-check and self-test of the pure Windows data-plane logic (runs on Linux).
  *
- * 为什么要有这个测试：封装格式是 Windows 驱动与 Linux 模块、用户态客户端三者
- * 互通的硬前提，而它偏偏是最容易写错、又最难在 Windows 上调的部分（写错只会
- * 表现为"对端全丢包"）。所以把纯逻辑抽到 win-driver/iwan_win_frame.c，在本机
- * 用主机编译器与仓库里已有的**独立实现**对拍：
+ * Why this test: encapsulation is the hard prerequisite for interop among the
+ * Windows driver, the Linux module and the user-space client, yet it is the part
+ * easiest to get wrong and hardest to debug on Windows (a mistake shows only as
+ * "the peer drops every packet"). Pure logic is in win-driver/iwan_win_frame.c, cross-checked here with the host compiler against the repo's **independent implementations**:
  *
- *   · 帧头：与 src/common/protocol.c 的 pkt_hdr() 逐字节比对；
- *   · XOR ：与 src/common/crypto.c 的 xor_crypt(key, 8) 逐字节比对；
- *   · 校验和：用独立验证器复算（包含校验和字段时总和必须为 0xFFFF）；
- *   · 目标匹配：最长前缀语义 + "外层服务器地址绝不进隧道"。
+ *   - frame header: byte-for-byte against pkt_hdr() in src/common/protocol.c;
+ *   - XOR: byte-for-byte against xor_crypt(key, 8) in src/common/crypto.c;
+ *   - checksum: recomputed by an independent verifier (sum incl. the checksum field must be 0xFFFF);
+ *   - target match: longest-prefix semantics + "outer server address never enters the tunnel".
  *
- * 构建（本机验证过）：
+ * Build (verified on this host):
  *   gcc -std=c11 -Wall -Wextra -Werror -ffunction-sections -fdata-sections \
  *       -DIWAN_WIN_ABI_BARE -Isrc/common -Iwin-driver \
  *       tests/win_frame_test.c win-driver/iwan_win_frame.c \
@@ -25,7 +25,7 @@
 
 #include "iwan_win_frame.h"
 
-/* 仓库里已有的用户态实现（独立于驱动的那一份），用于对拍 */
+/* Existing user-space implementation in the repo (separate from the driver's), used for cross-checking */
 void pkt_hdr(uint8_t typ, uint8_t enc, uint16_t sid, uint32_t tok,
 	     uint8_t out[8]);
 void xor_crypt(uint8_t *data, size_t len, const uint8_t *key, size_t klen);
@@ -44,7 +44,7 @@ static int g_pass;
 	}								\
 } while (0)
 
-/* ---- 1. 帧头：与用户态 pkt_hdr() 对拍 --------------------------------- */
+/* ---- 1. Frame header: byte-for-byte vs user-space pkt_hdr() -------------- */
 
 static void
 test_frame_hdr(void)
@@ -70,12 +70,12 @@ test_frame_hdr(void)
 		pkt_hdr(cases[i].typ, cases[i].enc, cases[i].sid, cases[i].tok,
 			theirs);
 		CHECK(memcmp(mine, theirs, 8) == 0,
-		      "帧头与用户态 pkt_hdr 不一致（sid=%04x tok=%08x）",
+		      "frame header differs from user-space pkt_hdr (sid=%04x tok=%08x)",
 		      cases[i].sid, cases[i].tok);
 	}
 
-	/* 字段顺序按 kernel/iwan_tx.c 的 fh[] 钉死：类型、enc、
-	 * sid 大端 16 位、tok 大端 32 位 */
+	/* Field order is pinned by fh[] in kernel/iwan_tx.c: type, enc,
+	 * sid big-endian 16-bit, tok big-endian 32-bit */
 	{
 		uint8_t h[8];
 
@@ -84,12 +84,12 @@ test_frame_hdr(void)
 		CHECK(h[0] == 0x18 && h[1] == 0x01 && h[2] == 0x03 &&
 		      h[3] == 0x0c && h[4] == 0x01 && h[5] == 0x02 &&
 		      h[6] == 0x03 && h[7] == 0x04,
-		      "帧头字节序不符：%02x %02x %02x %02x %02x %02x %02x %02x",
+		      "frame header byte order mismatch: %02x %02x %02x %02x %02x %02x %02x %02x",
 		      h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
 	}
 }
 
-/* ---- 2. XOR：与用户态 xor_crypt() 对拍 + 往返自检 ---------------------- */
+/* ---- 2. XOR: byte-for-byte vs user-space xor_crypt() + round-trip self-check - */
 
 static void
 test_xor(void)
@@ -108,38 +108,38 @@ test_xor(void)
 
 			for (k = 0; k < n; k++)
 				a[k] = b[k] = (uint8_t)(k * 31 + 7);
-			/* 逐字节参考：分块（每轮 64 位字）写法必须与它逐位一致。
-			 * 只做往返自检对"相位算错"是盲的——错相位照样能还原。 */
+			/* Byte-by-byte reference: the block form (one 64-bit word per round) must match bit for bit.
+			 * A round-trip self-check alone is blind to a wrong phase - a wrong phase still restores. */
 			for (k = 0; k < n; k++)
 				ref[k] = (uint8_t)((uint8_t)(k * 31 + 7) ^
 						   key[(offs[j] + k) & 7]);
 
-			/* 驱动的实现只在 off 为 0 时对整包使用，但函数本身
-			 * 支持 off（与内核 iwan_xor 的语义一致），这里一并验 */
+			/* The driver only uses it on whole packets with off 0, but the function itself
+			 * supports off (same semantics as kernel iwan_xor); verify that here as well */
 			iwan_win_xor(a, (ULONG)n, key, (ULONG)offs[j]);
 			CHECK(memcmp(a, ref, n) == 0,
-			      "XOR 与逐字节参考不一致（len=%zu off=%u）",
+			      "XOR differs from the byte-by-byte reference (len=%zu off=%u)",
 			      n, offs[j]);
 			if (offs[j] == 0) {
 				xor_crypt(b, n, key, sizeof(key));
 				CHECK(memcmp(a, b, n) == 0,
-				      "XOR 与用户态 xor_crypt 不一致（len=%zu）", n);
+				      "XOR differs from user-space xor_crypt (len=%zu)", n);
 			}
 
-			/* 往返：再 XOR 一次必须还原 */
+			/* Round trip: a second XOR must restore */
 			iwan_win_xor(a, (ULONG)n, key, (ULONG)offs[j]);
 			for (k = 0; k < n; k++)
 				if (a[k] != (uint8_t)(k * 31 + 7))
 					break;
-			CHECK(k == n, "XOR 往返不还原（len=%zu off=%u）",
+			CHECK(k == n, "XOR round trip did not restore (len=%zu off=%u)",
 			      n, offs[j]);
 		}
 	}
 }
 
-/* ---- 3. 校验和：独立验证器复算 ---------------------------------------- */
+/* ---- 3. Checksum: recomputed by an independent verifier ----------------- */
 
-/* 标准的"包含校验和字段一起求和 == 0xFFFF"验证 */
+/* Standard verification: "sum including the checksum field == 0xFFFF" */
 static uint32_t
 sum16(const uint8_t *p, size_t len)
 {
@@ -161,7 +161,7 @@ test_csum(void)
 	uint8_t pkt[64];
 	uint32_t l4;
 
-	/* 造一个 IPv4 + UDP 报文（20 + 8 + 16 字节载荷），校验和字段先留 0 */
+	/* Build an IPv4 + UDP packet (20 + 8 + 16 bytes of payload); checksum fields left 0 */
 	memset(pkt, 0, sizeof(pkt));
 	pkt[0] = 0x45;
 	pkt[8] = 64;
@@ -184,13 +184,13 @@ test_csum(void)
 		pkt[3] = t[1];
 	}
 
-	/* 带"校验和卸载"标记：两张都要补齐 */
+	/* With the "checksum offload" flag: both checksums must be filled in */
 	iwan_win_inner_fix_csum(pkt, 44, TRUE);
 
-	CHECK(sum16(pkt, 20) == 0xFFFF, "IPv4 头校验和验证失败（sum=%04x）",
+	CHECK(sum16(pkt, 20) == 0xFFFF, "IPv4 header checksum verification failed (sum=%04x)",
 	      sum16(pkt, 20));
 
-	/* UDP 校验和验证要带伪首部 */
+	/* UDP checksum verification must include the pseudo-header */
 	l4 = 44 - 20;
 	{
 		uint32_t s = 0;
@@ -207,10 +207,10 @@ test_csum(void)
 			s += ((uint32_t)pkt[i] << 8) | pkt[i + 1];
 		while (s >> 16)
 			s = (s & 0xFFFF) + (s >> 16);
-		CHECK(s == 0xFFFF, "UDP 校验和验证失败（sum=%04x）", s);
+		CHECK(s == 0xFFFF, "UDP checksum verification failed (sum=%04x)", s);
 	}
 
-	/* 不带卸载标记时只重算 IP 头，不动 L4 */
+	/* Without the offload flag only the IP header is recomputed; L4 is untouched */
 	{
 		uint8_t before[64];
 
@@ -221,31 +221,31 @@ test_csum(void)
 		memcpy(before, pkt, 44);
 		iwan_win_inner_fix_csum(pkt, 44, FALSE);
 		CHECK(memcmp(before + 20, pkt + 20, 24) == 0,
-		      "未标记卸载却改动了 L4 区域");
-		CHECK(sum16(pkt, 20) == 0xFFFF, "IP 头校验和未重算");
+		      "L4 area changed although offload was not flagged");
+		CHECK(sum16(pkt, 20) == 0xFFFF, "IP header checksum not recomputed");
 	}
 
-	/* 非 IPv4 或不合法长度：必须原样返回，不能越界写 */
+	/* Non-IPv4 or invalid length: must return unchanged, no out-of-bounds write */
 	{
 		uint8_t junk[8] = { 0x60, 0, 0, 0, 0, 0, 0, 0 };
 
 		iwan_win_inner_fix_csum(junk, sizeof(junk), TRUE);
-		CHECK(junk[0] == 0x60, "非 IPv4 报文被改动");
+		CHECK(junk[0] == 0x60, "non-IPv4 packet was modified");
 	}
 }
 
 
 /*
- * 内层校验和修复必须"地址原样"。
+ * Inner checksum fix must keep the "addresses untouched".
  *
- * 这个用例存在的唯一理由：iwan_win_inner_fix_csum() 曾经把 IPv4 头校验和写
- * 到偏移 12（正确是 10）—— 正好盖住内层源地址的高半字。既有用例抓不到它：
- * 两处校验都用"含校验和字段时总和为 0xFFFF"自证，而校验和正是对"12/13 清零
- * 后的头"算出来、又写回同一位置的，于是自洽；UDP 伪首部读的又是同一段被污染
- * 的地址，两个检查一起被骗过去。
- * 现场症状：帧格式、sid/tok、长度全对，对端能解出帧，但内层源地址变成
- * 122.x.0.2 这种随包递减的值（IP ID 每包 +2，校验和就每包 -2），回包永远
- * 回不来 —— ping 100% 丢、UDP 没有应答。
+ * The only reason this case exists: iwan_win_inner_fix_csum() once wrote the IPv4 header checksum
+ * at offset 12 (correct is 10) - exactly covering the high half-word of the inner source address.
+ * Existing cases could not catch it: both checksum checks prove themselves with "sum incl. the checksum
+ * field == 0xFFFF", and the checksum is computed over the header with 12/13 zeroed and then written back to
+ * the same location, so it is self-consistent; the UDP pseudo-header reads that same corrupted address,
+ * so both checks were fooled together. Field symptom: frame format, sid/tok and length all correct, the peer
+ * decodes the frame, but the inner source address becomes a value like 122.x.0.2 decreasing per packet
+ * (IP ID +2 per packet, so the checksum is -2 per packet); replies never come back - ping 100% loss, no UDP response.
  */
 static void
 test_inner_fix_csum_keeps_addrs(void)
@@ -262,24 +262,24 @@ test_inner_fix_csum_keeps_addrs(void)
 	pkt[9] = 17;			/* UDP */
 	memcpy(pkt + 12, src, 4);
 	memcpy(pkt + 16, dst, 4);
-	pkt[20] = 0x9c; pkt[21] = 0x41;	/* 源端口 40001 */
-	pkt[22] = 0x27; pkt[23] = 0x0f;	/* 目的端口 9999 */
-	pkt[24] = 0x00; pkt[25] = 0x18;	/* UDP 长度 24 = 8 + 16 */
+	pkt[20] = 0x9c; pkt[21] = 0x41;	/* source port 40001 */
+	pkt[22] = 0x27; pkt[23] = 0x0f;	/* destination port 9999 */
+	pkt[24] = 0x00; pkt[25] = 0x18;	/* UDP length 24 = 8 + 16 */
 	for (i = 0; i < 16; i++)
 		pkt[28 + i] = 0xAB;
 
 	iwan_win_inner_fix_csum(pkt, sizeof(pkt), TRUE);
 
 	CHECK(memcmp(pkt + 12, src, 4) == 0,
-	      "内层源地址被改写了（IPv4 头校验和在偏移 10/11，不是 12/13）");
-	CHECK(memcmp(pkt + 16, dst, 4) == 0, "内层目的地址被改写了");
+	      "inner source address was rewritten (IPv4 header checksum is at offset 10/11, not 12/13)");
+	CHECK(memcmp(pkt + 16, dst, 4) == 0, "inner destination address was rewritten");
 	CHECK(!(pkt[10] == 0 && pkt[11] == 0),
-	      "IPv4 头校验和没有写进偏移 10/11");
-	CHECK(sum16(pkt, 20) == 0xFFFF, "IPv4 头校验和自洽性检查失败");
+	      "IPv4 header checksum was not written at offset 10/11");
+	CHECK(sum16(pkt, 20) == 0xFFFF, "IPv4 header checksum self-consistency check failed");
 
-	/* UDP 校验和必须按"真实源地址"的伪首部成立。这里**故意不读 pkt 的
-	 * 12..19 字节**，而是用已知的 src/dst 常数算伪首部 —— 读报文自己的地址
-	 * 会和实现犯同一个错（实现也是拿被污染的地址算的），等于自己证明自己。 */
+	/* The UDP checksum must hold for a pseudo-header built from the "real source address". We **deliberately
+	 * do not read pkt bytes 12..19**, but compute the pseudo-header from the known src/dst constants - reading
+	 * the packet's own addresses would repeat the implementation's mistake (it used the corrupted ones) and prove nothing. */
 	s = 0;
 	for (i = 0; i < 4; i += 2)
 		s += ((uint32_t)src[i] << 8) | src[i + 1];
@@ -290,10 +290,10 @@ test_inner_fix_csum_keeps_addrs(void)
 		s += ((uint32_t)pkt[i] << 8) | pkt[i + 1];
 	while (s >> 16)
 		s = (s & 0xFFFF) + (s >> 16);
-	CHECK(s == 0xFFFF, "UDP 校验和未按真实源地址成立（sum=%04x）", s);
+	CHECK(s == 0xFFFF, "UDP checksum does not hold for the real source address (sum=%04x)", s);
 }
 
-/* ---- 4. 目标匹配 + 外层服务器排除 ------------------------------------- */
+/* ---- 4. Target matching + outer server exclusion ----------------------- */
 
 static void
 put_v4(IWAN_WIN_TARGET *t, const uint8_t *a, uint32_t plen)
@@ -317,28 +317,28 @@ test_targets(void)
 
 	put_v4(&t[0], wide, 16);		/* 202.38.0.0/16 */
 	put_v4(&t[1], campus, 24);	/* 202.38.95.0/24 */
-	put_v4(&t[2], server, 32);	/* 服务器 /32 也在集合里 */
+	put_v4(&t[2], server, 32);	/* the server /32 is in the set too */
 	put_v4(&t[3], other, 32);	/* 8.8.8.8/32 */
 
 	CHECK(iwan_win_target_match(t, 4, IWAN_WIN_AF_V4, in_campus),
-	      "202.38.95.110 应命中集合");
+	      "202.38.95.110 should match the set");
 	CHECK(iwan_win_target_match(t, 4, IWAN_WIN_AF_V4, in_other),
-	      "202.38.100.1 应由 /16 命中");
+	      "202.38.100.1 should match via the /16");
 	CHECK(iwan_win_target_match(t, 4, IWAN_WIN_AF_V4, other),
-	      "8.8.8.8 命中 /32 自身");
-	/* 服务器地址只被 /16 覆盖；只留校园 /24 时它就不该命中 */
+	      "8.8.8.8 matches its own /32");
+	/* The server address is covered only by the /16; with only the campus /24 left it must not match */
 	CHECK(!iwan_win_target_match(t + 1, 1, IWAN_WIN_AF_V4, server),
-	      "服务器地址不应被校园 /24 命中");
+	      "server address must not match the campus /24");
 
-	/* 关键：即使集合里有覆盖服务器的宽前缀，服务器地址也绝不进隧道 */
+	/* Key point: even if the set contains a wide prefix covering the server, the outer server address never enters the tunnel */
 	CHECK(!iwan_win_should_tunnel4(t, 4, server, server),
-	      "外层服务器地址被错误地判为进隧道");
+	      "outer server address was wrongly judged as tunnel-bound");
 	CHECK(iwan_win_should_tunnel4(t, 4, server, in_campus),
-	      "校园地址应进隧道");
+	      "campus address should enter the tunnel");
 	CHECK(iwan_win_should_tunnel4(t, 4, server, other),
-	      "8.8.8.8/32 在集合内应进隧道");
+	      "8.8.8.8/32 in the set should enter the tunnel");
 
-	/* v6：/128 与 /64 */
+	/* v6: /128 and /64 */
 	{
 		IWAN_WIN_TARGET v6;
 		uint8_t net[16] = { 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0,
@@ -355,36 +355,36 @@ test_targets(void)
 		memcpy(v6.addr, net, 16);
 		v6.addr[4] = 0x80;	/* 2001:db8:8000::/33 */
 		CHECK(iwan_win_target_match(&v6, 1, IWAN_WIN_AF_V6, a3),
-		      "v6 /33 非整字节前缀匹配失败");
+		      "v6 /33 non-byte-aligned prefix match failed");
 		CHECK(!iwan_win_target_match(&v6, 1, IWAN_WIN_AF_V6, a1),
-		      "v6 越界地址被误判命中");
+		      "v6 out-of-range address wrongly matched");
 		CHECK(!iwan_win_target_match(&v6, 1, IWAN_WIN_AF_V6, a2),
-		      "v6 另一前缀被误判命中");
+		      "v6 another prefix wrongly matched");
 	}
 }
 
 
-/* ---- 5. 入向 M2：外层解析 / 帧分类 / 解封 ----------------------------- */
+/* ---- 5. Inbound M2: outer parse / frame classification / decap ---------- */
 
-/* 线上常量必须与 kernel/iwan.h、src/common/protocol.h 一致。数值本身是冻结的
- * 线上契约；下面第 6 组用用户态的 pkt_hdr() 造帧再喂给驱动侧解析，等价于
- * 对这份数值表再做一次交叉验证。 */
+/* Wire constants must match kernel/iwan.h and src/common/protocol.h. The values themselves are a frozen
+ * wire contract; group 6 below builds frames with user-space pkt_hdr() and feeds them to the driver-side
+ * parser, which is one more cross-check of this value table. */
 static void
 test_wire_constants(void)
 {
 	CHECK(PT_OPEN_REJECT == 0x11 && PT_OPEN_ACK == 0x12 && PT_OPEN == 0x13,
-	      "握手帧类型与线上不符");
+	      "handshake frame types do not match the wire");
 	CHECK(PT_DATA == 0x14 && PT_ECHO_REQ == 0x15 && PT_ECHO_RES == 0x16 &&
 	      PT_CLOSE == 0x17 && PT_DATA_ENC == 0x18,
-	      "数据/回声/关闭帧类型与线上不符");
+	      "data/echo/close frame types do not match the wire");
 	CHECK(PT_PING_REQ == 0x29 && PT_PING_RSP == 0x2A,
-	      "ping 帧类型与线上不符");
+	      "ping frame types do not match the wire");
 	CHECK(IWAN_PING_SID == 0xFFFF && IWAN_PING_TOK == 0xFFFFFFFFu,
-	      "ping 固定凭据与线上不符");
-	CHECK(IWAN_OUTER4_TOTAL == 36, "外层 IPv4 封装开销应为 36 字节");
+	      "fixed ping credentials do not match the wire");
+	CHECK(IWAN_OUTER4_TOTAL == 36, "outer IPv4 encapsulation overhead should be 36 bytes");
 }
 
-/* 造一个外层 IPv4 + UDP + 帧头 + 载荷的包（载荷由调用者填） */
+/* Build an outer IPv4 + UDP + frame header + payload packet (payload filled in by caller) */
 static size_t
 build_outer(uint8_t *buf, size_t inner_len, uint16_t sport, uint16_t dport,
 	    uint8_t type, uint8_t enc, uint16_t sid, uint32_t tok,
@@ -403,7 +403,7 @@ build_outer(uint8_t *buf, size_t inner_len, uint16_t sport, uint16_t dport,
 	ip[7] = (uint8_t)frag_off;
 	ip[8] = 64;
 	ip[9] = 17;
-	ip[12] = 202; ip[13] = 38; ip[14] = 64; ip[15] = 106;  /* 服务器 */
+	ip[12] = 202; ip[13] = 38; ip[14] = 64; ip[15] = 106;  /* server */
 	ip[16] = 10; ip[17] = 0; ip[18] = 0; ip[19] = 2;
 	udp[0] = (uint8_t)(sport >> 8); udp[1] = (uint8_t)sport;
 	udp[2] = (uint8_t)(dport >> 8); udp[3] = (uint8_t)dport;
@@ -435,7 +435,7 @@ test_inbound(void)
 	uint16_t sid = 0x030c;
 	uint32_t tok = 0xdeadbeef;
 
-	/* 内层 IPv4 包（20 字节头 + 8 字节 UDP 头 + 4 字节载荷） */
+	/* Inner IPv4 packet (20-byte header + 8-byte UDP header + 4-byte payload) */
 	memset(inner, 0, sizeof(inner));
 	inner[0] = 0x45;
 	inner[2] = 0; inner[3] = 32;
@@ -448,7 +448,7 @@ test_inbound(void)
 	inner[24] = 0; inner[25] = 12;
 	inner[28] = 'i'; inner[29] = 'w'; inner[30] = 'a'; inner[31] = 'n';
 
-	/* --- 加密帧：解析 + 分类 + 解封，还原出内层原样 --- */
+	/* --- Encrypted frame: parse + classify + decap, restoring the inner packet as-is --- */
 	{
 		uint8_t enc_inner[64];
 
@@ -457,32 +457,32 @@ test_inbound(void)
 		total = build_outer(outer, 32, 40000, 6001, PT_DATA_ENC, 1, sid, tok, 0);
 		memcpy(outer + 36, enc_inner, 32);
 
-		CHECK(iwan_win_outer_parse4(outer, total, &o), "合法外层包解析失败");
+		CHECK(iwan_win_outer_parse4(outer, total, &o), "valid outer packet failed to parse");
 		CHECK(o.type == PT_DATA_ENC && o.enc == 1 && o.sid == sid &&
-		      o.tok == tok, "帧头字段解析错位");
-		CHECK(o.inner_off == 36 && o.inner_len == 32, "内层偏移/长度算错");
+		      o.tok == tok, "frame header fields parsed out of place");
+		CHECK(o.inner_off == 36 && o.inner_len == 32, "inner offset/length miscalculated");
 		CHECK(iwan_win_inner_family(outer + 36, 32) == 4,
-		      "加密内层不该直接判协议族（应为 v4 首字节）");
+		      "encrypted inner packet must not be classified by protocol family directly (should be v4 first byte)");
 		CHECK(iwan_win_frame_classify(&o, sid, tok, TRUE, TRUE) ==
-		      IWAN_WIN_FRAME_DATA, "合法加密数据帧应判为 DATA");
+		      IWAN_WIN_FRAME_DATA, "valid encrypted data frame should classify as DATA");
 		n = iwan_win_decap(outer, total, &o, key, out, sizeof(out));
-		CHECK(n == 32, "解封长度错误");
-		CHECK(memcmp(out, inner, 32) == 0, "解封结果与内层原文不符");
-		CHECK(iwan_win_inner_family(out, n) == 4, "解封后应识别为内层 v4");
+		CHECK(n == 32, "decap length wrong");
+		CHECK(memcmp(out, inner, 32) == 0, "decap result differs from the original inner packet");
+		CHECK(iwan_win_inner_family(out, n) == 4, "decap result should be recognized as inner v4");
 	}
 
-	/* --- 明文帧 --- */
+	/* --- Plaintext frame --- */
 	{
 		total = build_outer(outer, 32, 40000, 6001, PT_DATA, 0, sid, tok, 0);
 		memcpy(outer + 36, inner, 32);
-		CHECK(iwan_win_outer_parse4(outer, total, &o), "明文外层包解析失败");
+		CHECK(iwan_win_outer_parse4(outer, total, &o), "plaintext outer packet failed to parse");
 		CHECK(iwan_win_frame_classify(&o, sid, tok, FALSE, TRUE) ==
-		      IWAN_WIN_FRAME_DATA, "合法明文数据帧应判为 DATA");
+		      IWAN_WIN_FRAME_DATA, "valid plaintext data frame should classify as DATA");
 		n = iwan_win_decap(outer, total, &o, key, out, sizeof(out));
-		CHECK(n == 32 && memcmp(out, inner, 32) == 0, "明文解封应原样返回");
+		CHECK(n == 32 && memcmp(out, inner, 32) == 0, "plaintext decap should return the packet as-is");
 	}
 
-	/* --- 内层 v6（外层仍是 v4）：注入时要用 v6 句柄 --- */
+	/* --- Inner v6 (outer is still v4): injection needs the v6 handle --- */
 	{
 		uint8_t in6[48];
 
@@ -494,53 +494,53 @@ test_inbound(void)
 		in6[8] = 0x20; in6[9] = 0x01;
 		total = build_outer(outer, 48, 40000, 6001, PT_DATA, 0, sid, tok, 0);
 		memcpy(outer + 36, in6, 48);
-		CHECK(iwan_win_outer_parse4(outer, total, &o), "v6-in-v4 解析失败");
+		CHECK(iwan_win_outer_parse4(outer, total, &o), "v6-in-v4 parse failed");
 		n = iwan_win_decap(outer, total, &o, key, out, sizeof(out));
 		CHECK(n == 48 && iwan_win_inner_family(out, n) == 6,
-		      "内层 v6 应识别为协议族 6");
+		      "inner v6 should be recognized as protocol family 6");
 	}
 
-	/* --- 凭据与类型闸门 --- */
+	/* --- Credentials and type gates --- */
 	{
 		total = build_outer(outer, 32, 40000, 6001, PT_DATA, 0, sid, tok, 0);
 		memcpy(outer + 36, inner, 32);
-		CHECK(iwan_win_outer_parse4(outer, total, &o), "解析失败");
+		CHECK(iwan_win_outer_parse4(outer, total, &o), "parse failed");
 		CHECK(iwan_win_frame_classify(&o, sid, tok + 1, FALSE, TRUE) ==
-		      IWAN_WIN_FRAME_BAD, "sid/tok 不符的数据帧必须丢弃");
+		      IWAN_WIN_FRAME_BAD, "data frame with mismatched sid/tok must be dropped");
 		CHECK(iwan_win_frame_classify(&o, sid, tok, TRUE, TRUE) ==
-		      IWAN_WIN_FRAME_BAD, "enc 模式不符的数据帧必须丢弃");
-		/* 数据帧不看会话闸门（kernel/iwan_rx.c 的 iwan_frame_check 只对
-		 * 控制帧查 dp->session）；"有没有会话"由调用点先判 —— 驱动里就是
-		 * 先看 s->valid，没有会话时整个 callout 直接放行不碰。 */
+		      IWAN_WIN_FRAME_BAD, "data frame with mismatched enc mode must be dropped");
+		/* Data frames do not look at the session gate (iwan_frame_check in kernel/iwan_rx.c checks dp->session
+		 * only for control frames); whether a session exists is decided first at the call site - in the driver
+		 * it checks s->valid first and lets the whole callout pass untouched when there is no session. */
 		CHECK(iwan_win_frame_classify(&o, sid, tok, FALSE, FALSE) ==
-		      IWAN_WIN_FRAME_DATA, "数据帧分类不应受会话闸门影响");
+		      IWAN_WIN_FRAME_DATA, "data frame classification must not depend on the session gate");
 	}
 
-	/* --- 类型与帧头 enc 必须自洽：否则加密会话可被降级成明文直通 ---
-	 * 解封那一侧（iwan_win_decap）是按帧里的 o->enc 决定要不要解密的，
-	 * 分类只看类型就留下了缺口：会话是加密的，攻击者发 type=PT_DATA_ENC
-	 * 但 enc=0（sid/tok 在帧头明文，照抄即可），decap 走明文分支，
-	 * 任意内层包直通。下面两组是"闸门必须拦住、而 decap 本身拦不住"的证据。 */
+	/* --- Type and frame-header enc must be consistent: otherwise an encrypted session can be downgraded to plaintext passthrough ---
+	 * The decap side (iwan_win_decap) decides whether to decrypt from the frame's o->enc; classification looking
+	 * only at type leaves a gap: the session is encrypted, an attacker sends type=PT_DATA_ENC but enc=0 (sid/tok are
+	 * plaintext in the frame header and can simply be copied), decap takes the plaintext branch and any inner packet
+	 * passes straight through. The two groups below are evidence that "the gate must stop it, while decap cannot". */
 	{
 		total = build_outer(outer, 32, 40000, 6001, PT_DATA_ENC, 0, sid, tok, 0);
 		memcpy(outer + 36, inner, 32);
-		CHECK(iwan_win_outer_parse4(outer, total, &o), "解析失败");
-		CHECK(o.type == PT_DATA_ENC && o.enc == 0, "帧头字段解析错位");
+		CHECK(iwan_win_outer_parse4(outer, total, &o), "parse failed");
+		CHECK(o.type == PT_DATA_ENC && o.enc == 0, "frame header fields parsed out of place");
 		CHECK(iwan_win_frame_classify(&o, sid, tok, TRUE, TRUE) ==
-		      IWAN_WIN_FRAME_BAD, "加密会话里 enc=0 的数据帧必须丢弃");
+		      IWAN_WIN_FRAME_BAD, "data frame with enc=0 in an encrypted session must be dropped");
 		CHECK(iwan_win_decap(outer, total, &o, key, out, sizeof(out)) == 32 &&
 		      memcmp(out, inner, 32) == 0,
-		      "对照：decap 确实按帧里的 enc 走明文分支，闸门只能在分类处");
+		      "control: decap really takes the plaintext branch from the frame's enc; only classification can gate it");
 
 		total = build_outer(outer, 32, 40000, 6001, PT_DATA, 1, sid, tok, 0);
 		memcpy(outer + 36, inner, 32);
-		CHECK(iwan_win_outer_parse4(outer, total, &o), "解析失败");
-		CHECK(o.enc == 1, "帧头 enc 解析错位");
+		CHECK(iwan_win_outer_parse4(outer, total, &o), "parse failed");
+		CHECK(o.enc == 1, "frame header enc parsed out of place");
 		CHECK(iwan_win_frame_classify(&o, sid, tok, FALSE, TRUE) ==
-		      IWAN_WIN_FRAME_BAD, "明文会话里 enc=1 的数据帧必须丢弃");
+		      IWAN_WIN_FRAME_BAD, "data frame with enc=1 in a plaintext session must be dropped");
 	}
 
-	/* --- 控制帧：ECHO/CLOSE 要凭据，握手帧一律转交；ping 接受固定凭据 --- */
+	/* --- Control frames: ECHO/CLOSE need credentials, handshake frames are always passed; ping accepts fixed credentials --- */
 	{
 		static const struct { uint8_t type; uint16_t sid; uint32_t tok;
 				      uint32_t want; } c[] = {
@@ -562,69 +562,69 @@ test_inbound(void)
 			total = build_outer(outer, 8, 40000, 6001, c[i].type, 0,
 					    c[i].sid, c[i].tok, 0);
 			CHECK(iwan_win_outer_parse4(outer, total, &o),
-			      "控制帧解析失败（type=%02x）", c[i].type);
+			      "control frame failed to parse (type=%02x)", c[i].type);
 			CHECK(iwan_win_frame_classify(&o, 0x030c, 0xdeadbeef,
 						      FALSE, TRUE) == c[i].want,
-			      "控制帧分类不符（type=%02x sid=%04x）",
+			      "control frame classification mismatch (type=%02x sid=%04x)",
 			      c[i].type, c[i].sid);
 		}
-		/* 未建会话时连握手帧都要丢（与内核侧 session 闸门一致） */
+		/* Even handshake frames are dropped when no session exists (matches the kernel-side session gate) */
 		total = build_outer(outer, 8, 40000, 6001, PT_OPEN_ACK, 0, 1, 2, 0);
-		CHECK(iwan_win_outer_parse4(outer, total, &o), "解析失败");
+		CHECK(iwan_win_outer_parse4(outer, total, &o), "parse failed");
 		CHECK(iwan_win_frame_classify(&o, 0x030c, 0xdeadbeef, FALSE, FALSE) ==
-		      IWAN_WIN_FRAME_BAD, "未建会话时握手帧也要丢弃");
+		      IWAN_WIN_FRAME_BAD, "handshake frame must also be dropped when no session exists");
 	}
 
-	/* --- 结构不合法：分片、截断、非 UDP、长度撒谎，都必须安全拒绝 --- */
+	/* --- Malformed structure: fragments, truncation, non-UDP, lying length must all be safely rejected --- */
 	{
 		total = build_outer(outer, 32, 40000, 6001, PT_DATA, 0, sid, tok,
-				    0x2000);      /* MF 置位 */
-		CHECK(!iwan_win_outer_parse4(outer, total, &o), "分片不应被解析");
+				    0x2000);      /* MF set */
+		CHECK(!iwan_win_outer_parse4(outer, total, &o), "fragment must not be parsed");
 		total = build_outer(outer, 32, 40000, 6001, PT_DATA, 0, sid, tok,
-				    100);         /* 非首片偏移 */
-		CHECK(!iwan_win_outer_parse4(outer, total, &o), "非首片不应被解析");
+				    100);         /* non-first-fragment offset */
+		CHECK(!iwan_win_outer_parse4(outer, total, &o), "non-first fragment must not be parsed");
 		total = build_outer(outer, 32, 40000, 6001, PT_DATA, 0, sid, tok, 0);
 		outer[9] = 6;                          /* TCP */
-		CHECK(!iwan_win_outer_parse4(outer, total, &o), "非 UDP 不应被解析");
+		CHECK(!iwan_win_outer_parse4(outer, total, &o), "non-UDP must not be parsed");
 		outer[9] = 17;
-		CHECK(!iwan_win_outer_parse4(outer, 30, &o), "截断包不应被解析");
-		CHECK(!iwan_win_outer_parse4(outer, 0, &o), "空包不应被解析");
-		/* UDP 长度大于实际：按实际长度兜底，仍能解析（与内核侧宽松口径一致） */
+		CHECK(!iwan_win_outer_parse4(outer, 30, &o), "truncated packet must not be parsed");
+		CHECK(!iwan_win_outer_parse4(outer, 0, &o), "empty packet must not be parsed");
+		/* UDP length larger than actual: fall back to the actual length, still parses (same lenient rule as kernel side) */
 		outer[24] = 0xff; outer[25] = 0xff;
-		CHECK(iwan_win_outer_parse4(outer, total, &o), "UDP 长度撒谎应兜底解析");
-		CHECK(o.inner_len == total - 36, "兜底后的内层长度不对");
-		/* 内层为 0 长度：拒绝 */
+		CHECK(iwan_win_outer_parse4(outer, total, &o), "lying UDP length should still parse via fallback");
+		CHECK(o.inner_len == total - 36, "inner length after fallback is wrong");
+		/* Zero-length inner: reject */
 		total = build_outer(outer, 0, 40000, 6001, PT_DATA, 0, sid, tok, 0);
-		CHECK(!iwan_win_outer_parse4(outer, total, &o), "零长内层应拒绝");
+		CHECK(!iwan_win_outer_parse4(outer, total, &o), "zero-length inner must be rejected");
 	}
 
-	/* --- 解封输出缓冲不够：必须拒绝而不是溢出 --- */
+	/* --- Decap output buffer too small: must reject rather than overflow --- */
 	{
 		total = build_outer(outer, 32, 40000, 6001, PT_DATA, 0, sid, tok, 0);
 		memcpy(outer + 36, inner, 32);
-		CHECK(iwan_win_outer_parse4(outer, total, &o), "解析失败");
+		CHECK(iwan_win_outer_parse4(outer, total, &o), "parse failed");
 		CHECK(iwan_win_decap(outer, total, &o, key, out, 16) == 0,
-		      "输出缓冲不足时必须拒绝");
+		      "must reject when the output buffer is too small");
 	}
 
-	/* --- 内层头自洽性（注入前的最后一道闸）--- */
+	/* --- Inner header sanity (the last gate before injection) --- */
 	{
-		CHECK(iwan_win_inner_sane(inner, 32), "合法内层 v4 包应通过");
-		CHECK(!iwan_win_inner_sane(inner, 12), "内层 v4 头不全应拒绝");
+		CHECK(iwan_win_inner_sane(inner, 32), "valid inner v4 packet should pass");
+		CHECK(!iwan_win_inner_sane(inner, 12), "incomplete inner v4 header must be rejected");
 		{
 			uint8_t bad[32];
 
 			memcpy(bad, inner, 32);
-			bad[3] = 200;           /* 声明的总长超过实际 */
+			bad[3] = 200;           /* declared total length exceeds actual */
 			CHECK(!iwan_win_inner_sane(bad, 32),
-			      "内层声明长度超过整帧应拒绝");
+			      "inner declared length exceeding the whole frame must be rejected");
 			memcpy(bad, inner, 32);
-			bad[0] = 0x35;          /* ihl=5 => 20，合法；改成 0x4f 试 */
+			bad[0] = 0x35;          /* ihl=5 => 20, valid; then try 0x4f */
 			bad[0] = 0x4f;          /* ihl=15 => 60 > len */
-			CHECK(!iwan_win_inner_sane(bad, 32), "内层 ihl 越界应拒绝");
+			CHECK(!iwan_win_inner_sane(bad, 32), "inner ihl out of range must be rejected");
 			memcpy(bad, inner, 32);
-			bad[0] = 0x70;          /* 版本 7 */
-			CHECK(!iwan_win_inner_sane(bad, 32), "未知内层版本应拒绝");
+			bad[0] = 0x70;          /* version 7 */
+			CHECK(!iwan_win_inner_sane(bad, 32), "unknown inner version must be rejected");
 		}
 		{
 			uint8_t in6[48];
@@ -633,16 +633,16 @@ test_inbound(void)
 			in6[0] = 0x60;
 			in6[4] = 0; in6[5] = 8;         /* payload len = 8 */
 			in6[6] = 17;
-			CHECK(iwan_win_inner_sane(in6, 48), "合法内层 v6 包应通过");
-			in6[5] = 200;                   /* 声明长度超过整帧 */
+			CHECK(iwan_win_inner_sane(in6, 48), "valid inner v6 packet should pass");
+			in6[5] = 200;                   /* declared length exceeds the whole frame */
 			CHECK(!iwan_win_inner_sane(in6, 48),
-			      "内层 v6 声明长度超过整帧应拒绝");
-			CHECK(!iwan_win_inner_sane(in6, 20), "内层 v6 头不全应拒绝");
+			      "inner v6 declared length exceeding the whole frame must be rejected");
+			CHECK(!iwan_win_inner_sane(in6, 20), "incomplete inner v6 header must be rejected");
 		}
 	}
 }
 
-/* ---- 5b. 解封按长度分块：每个长度都要与"逐字节拷贝再异或"等价 ------- */
+/* ---- 5b. Decap by length class: every length must match "byte-wise copy then XOR" --- */
 
 static void
 test_decap_lengths(void)
@@ -664,45 +664,45 @@ test_decap_lengths(void)
 		IWAN_WIN_OUTER o;
 		size_t total, got;
 
-		/* 加密帧：解封必须还原出明文 */
+		/* Encrypted frame: decap must recover the plaintext */
 		memcpy(enc, plain, n);
 		xor_crypt(enc, n, key, sizeof(key));
 		total = build_outer(outer, n, 40000, 6001, PT_DATA_ENC, 1, sid,
 				    tok, 0);
 		memcpy(outer + 36, enc, n);
 		CHECK(iwan_win_outer_parse4(outer, total, &o),
-		      "加密帧解析失败（len=%zu）", n);
+		      "encrypted frame failed to parse (len=%zu)", n);
 		got = iwan_win_decap(outer, total, &o, key, out, sizeof(out));
-		CHECK(got == n, "解封长度错误（len=%zu got=%zu）", n, got);
-		CHECK(memcmp(out, plain, n) == 0, "解封结果不符（len=%zu）", n);
+		CHECK(got == n, "decap length wrong (len=%zu got=%zu)", n, got);
+		CHECK(memcmp(out, plain, n) == 0, "decap result mismatch (len=%zu)", n);
 
-		/* 明文帧：解封必须原样拷贝 */
+		/* Plaintext frame: decap must copy it as-is */
 		total = build_outer(outer, n, 40000, 6001, PT_DATA, 0, sid, tok,
 				    0);
 		memcpy(outer + 36, plain, n);
 		CHECK(iwan_win_outer_parse4(outer, total, &o),
-		      "明文帧解析失败（len=%zu）", n);
+		      "plaintext frame failed to parse (len=%zu)", n);
 		memset(out, 0xA5, sizeof(out));
 		got = iwan_win_decap(outer, total, &o, key, out, sizeof(out));
-		CHECK(got == n, "明文解封长度错误（len=%zu got=%zu）", n, got);
-		CHECK(memcmp(out, plain, n) == 0, "明文解封结果不符（len=%zu）",
+		CHECK(got == n, "plaintext decap length wrong (len=%zu got=%zu)", n, got);
+		CHECK(memcmp(out, plain, n) == 0, "plaintext decap result mismatch (len=%zu)",
 		      n);
 
-		/* 输出缓冲不足：必须拒绝而不是截断写入 */
+		/* Output buffer too small: must reject rather than write a truncated result */
 		CHECK(iwan_win_decap(outer, total, &o, key, out,
 				     (ULONG)(n - 1)) == 0,
-		      "输出缓冲不足应拒绝（len=%zu）", n);
+		      "must reject when the output buffer is too small (len=%zu)", n);
 	}
 }
 
-/* ---- 5c. 失败路径的 out 参数必须被写成确定值 -------------------------
+/* ---- 5c. The out parameter on failure paths must be written to a defined value -------------------
  *
- * 四个解析函数（outer_parse4 / outer_parse6 / dgram_parse / decap）在返回
- * 失败时都不承诺填 out —— 调用者本不该读它。但“不承诺”与“栈上残留”在
- * 静态分析里无法区分，而真实的隐患是：调用者若在失败后仍然读了 out 的
- * 某个字段（比如拿 inner_len 去算长度），就会用到上一个包的数据。
- * 这里把 out 预先填成 0xCD，再喂各种坏包，要求函数**要么返回失败且
- * 不动 out 的语义字段，要么返回失败并把它们清成 0** —— 现在是后者。
+ * The four parse functions (outer_parse4 / outer_parse6 / dgram_parse / decap) do not promise to fill out on
+ * failure - callers should not read it. But "not promised" and "stack garbage" are indistinguishable to
+ * static analysis, and the real hazard is: if a caller still reads some field of out after failure (e.g.
+ * inner_len to compute a length), it will use data from the previous packet.
+ * Here out is pre-filled with 0xCD and fed all kinds of bad packets; the functions must **either fail
+ * without touching the semantic fields of out, or fail and clear them to 0** - currently the latter.
  */
 static void
 test_parse_failure_clears_out(void)
@@ -715,45 +715,45 @@ test_parse_failure_clears_out(void)
 
 	memset(shortpkt, 0x00, sizeof(shortpkt));
 	memset(badver, 0x00, sizeof(badver));
-	badver[0] = 0x65;	/* 版本 6 的包喂给 v4 解析器 */
+	badver[0] = 0x65;	/* a version-6 packet fed to the v4 parser */
 
-	/* v4 解析：长度不足 / 版本不符 */
+	/* v4 parse: too short / wrong version */
 	memset(&o, 0xCD, sizeof(o));
 	CHECK(!iwan_win_outer_parse4(shortpkt, sizeof(shortpkt), &o),
-	      "8 字节包不应被当成合法外层 v4");
+	      "8-byte packet must not be accepted as a valid outer v4");
 	CHECK(o.inner_len == 0 && o.inner_off == 0 && o.frame_len == 0,
-	      "失败后 out 的偏移字段应清零（inner_len=%u frame_len=%u）",
+	      "offset fields of out must be cleared after failure (inner_len=%u frame_len=%u)",
 	      o.inner_len, o.frame_len);
 
 	memset(&o, 0xCD, sizeof(o));
 	CHECK(!iwan_win_outer_parse4(badver, sizeof(badver), &o),
-	      "版本号 6 的包不应被 v4 解析器接受");
+	      "version-6 packet must not be accepted by the v4 parser");
 	CHECK(o.inner_len == 0 && o.type == 0 && o.enc == 0,
-	      "失败后 out 的类型字段应清零");
+	      "type fields of out must be cleared after failure");
 
-	/* 裸数据报解析：过短 */
+	/* Raw datagram parse: too short */
 	memset(&o, 0xCD, sizeof(o));
 	CHECK(!iwan_win_dgram_parse(shortpkt, sizeof(shortpkt), &o),
-	      "8 字节裸包不应被接受");
+	      "8-byte raw packet must not be accepted");
 	CHECK(o.inner_len == 0 && o.frame_off == 0,
-	      "失败后裸包解析的偏移字段应清零");
+	      "offset fields of out must be cleared after raw datagram parse failure");
 
-	/* 解封：输出缓冲不足 / 上下文非法 */
+	/* Decap: output buffer too small / invalid context */
 	memset(out, 0xCD, sizeof(out));
 	o.inner_len = 4;
 	o.inner_off = 0;
 	o.enc = 0;
 	CHECK(iwan_win_decap(shortpkt, sizeof(shortpkt), &o, key, out, 3) == 0,
-	      "outsz 小于 inner_len 必须拒绝");
-	CHECK(out[0] == 0xCD, "被拒绝的解封不应写输出缓冲");
+	      "outsz smaller than inner_len must reject");
+	CHECK(out[0] == 0xCD, "rejected decap must not write the output buffer");
 
 	memset(&o, 0, sizeof(o));
 	CHECK(iwan_win_decap(shortpkt, sizeof(shortpkt), &o, key, out,
 			     sizeof(out)) == 0,
-	      "inner_len 为 0 必须拒绝");
+	      "zero inner_len must reject");
 }
 
-/* ---- 5d. 两个解析器对同一条流必须给出一致的字段 ----------------------- */
+/* ---- 5d. Both parsers must yield identical fields for the same stream ----------------- */
 
 static void
 test_parse4_vs_dgram_agree(void)
@@ -766,29 +766,29 @@ test_parse4_vs_dgram_agree(void)
 	for (i = 0; i < sizeof(payload); i++)
 		payload[i] = (uint8_t)(i ^ 0x5A);
 
-	/* build_outer 造的是完整的 IPv4+UDP 外层；dgram_parse 对"仍带 IP 头"
-	 * 的输入应当解析出与 outer_parse4 完全相同的字段。两条入向路径
-	 * （协议边 / WFP 平面）各用一个，字段必须逐项相等，否则同一份报文
-	 * 在两条路径上会解出不同的内层边界。 */
+	/* build_outer builds a complete IPv4+UDP outer header; for input that "still carries an IP header"
+	 * dgram_parse should resolve exactly the same fields as outer_parse4. The two inbound paths (protocol
+	 * edge / WFP plane) use one each, and the fields must be equal item by item, otherwise the same packet
+	 * would resolve to different inner boundaries on the two paths. */
 	total = build_outer(outer, sizeof(payload), 40000, 6001, PT_DATA, 0,
 			    0x1234, 0x12345678, 0);
 	memcpy(outer + 36, payload, sizeof(payload));
 
-	CHECK(iwan_win_outer_parse4(outer, total, &a), "v4 解析失败");
-	CHECK(iwan_win_dgram_parse(outer, total, &b), "dgram 解析失败");
+	CHECK(iwan_win_outer_parse4(outer, total, &a), "v4 parse failed");
+	CHECK(iwan_win_dgram_parse(outer, total, &b), "dgram parse failed");
 	CHECK(a.frame_off == b.frame_off && a.frame_len == b.frame_len &&
 	      a.inner_off == b.inner_off && a.inner_len == b.inner_len,
-	      "两个解析器的偏移不一致（%u/%u/%u/%u vs %u/%u/%u/%u）",
+	      "the two parsers disagree on offsets (%u/%u/%u/%u vs %u/%u/%u/%u)",
 	      a.frame_off, a.frame_len, a.inner_off, a.inner_len,
 	      b.frame_off, b.frame_len, b.inner_off, b.inner_len);
 	CHECK(a.type == b.type && a.enc == b.enc && a.sid == b.sid &&
 	      a.tok == b.tok,
-	      "两个解析器的帧头字段不一致");
-	CHECK(a.inner_len == sizeof(payload), "内层长度应为 %zu（实得 %u）",
+	      "the two parsers disagree on frame header fields");
+	CHECK(a.inner_len == sizeof(payload), "inner length should be %zu (got %u)",
 	      sizeof(payload), a.inner_len);
 }
 
-/* ---- 6. 与用户态发送侧对拍：拿 pkt_hdr()/xor_crypt() 造的帧喂驱动解析 --- */
+/* ---- 6. Cross-check with the user-space send side: frames built by pkt_hdr()/xor_crypt() fed to the driver parser --- */
 
 static void
 test_inbound_crosscheck(void)
@@ -810,30 +810,30 @@ test_inbound_crosscheck(void)
 	for (size_t i = 20; i < sizeof(inner); i++)
 		inner[i] = (uint8_t)(i * 13 + 5);
 
-	/* 用户态发送侧就是这么干的：pkt_hdr() 造帧头、xor_crypt() 加密载荷 */
+	/* This is exactly what the user-space send side does: pkt_hdr() builds the header, xor_crypt() encrypts the payload */
 	pkt_hdr(PT_DATA_ENC, 1, sid, tok, hdr);
 	memcpy(enc, inner, sizeof(inner));
 	xor_crypt(enc, sizeof(enc), key, 8);
 
 	total = build_outer(outer, sizeof(inner), 40000, 6001, PT_DATA_ENC, 1,
 			    sid, tok, 0);
-	memcpy(outer + 28, hdr, 8);          /* 用用户态的帧头覆盖 */
+	memcpy(outer + 28, hdr, 8);          /* overwrite with the user-space frame header */
 	memcpy(outer + 36, enc, sizeof(enc));
 
-	CHECK(memcmp(outer + 28, hdr, 8) == 0, "帧头写回失败");
-	CHECK(iwan_win_outer_parse4(outer, total, &o), "用户态造的帧解析失败");
+	CHECK(memcmp(outer + 28, hdr, 8) == 0, "frame header write-back failed");
+	CHECK(iwan_win_outer_parse4(outer, total, &o), "user-space built frame failed to parse");
 	CHECK(iwan_win_frame_classify(&o, sid, tok, TRUE, TRUE) ==
-	      IWAN_WIN_FRAME_DATA, "用户态造的数据帧应判为 DATA");
+	      IWAN_WIN_FRAME_DATA, "user-space built data frame should classify as DATA");
 	n = iwan_win_decap(outer, total, &o, key, out, sizeof(out));
-	CHECK(n == sizeof(inner), "解封长度与用户态发送长度不符");
+	CHECK(n == sizeof(inner), "decap length differs from the user-space send length");
 	CHECK(memcmp(out, inner, sizeof(inner)) == 0,
-	      "解封结果与用户态加密前的明文不符");
+	      "decap result differs from the plaintext before user-space encryption");
 }
 
 
-/* ---- 7. 出向外层头构造（v4/v6）与 v6 目标判定 ------------------------- */
+/* ---- 7. Outbound outer header construction (v4/v6) and v6 target decision ------------- */
 
-/* 独立的一份校验和实现（不复用被测代码），用来交叉验证外层头里的校验和 */
+/* An independent checksum implementation (not reused from the code under test), to cross-check the outer header checksums */
 static uint32_t
 t_sum(const uint8_t *p, size_t n, uint32_t sum)
 {
@@ -868,27 +868,27 @@ test_outer_build4(void)
 
 	total = iwan_win_outer_build4(outer, sizeof(outer), frame, flen, src, dst,
 				      sport, dport);
-	CHECK(total == 36 - 8 + flen, "v4 外层总长不对");
-	CHECK(outer[0] == 0x45, "v4 版本/头长不对");
-	CHECK(outer[8] == 64, "v4 ttl 应为 64");
-	CHECK(outer[9] == 17, "v4 协议应为 UDP");
-	CHECK((outer[6] << 8 | outer[7]) == 0x4000, "v4 应置 DF");
-	CHECK(memcmp(outer + 12, "\x0a\x00\x00\x02", 4) == 0, "v4 源地址不对");
-	CHECK(memcmp(outer + 16, "\xca\x26\x40\x6a", 4) == 0, "v4 目的地址不对");
-	CHECK(memcmp(outer + 20, "\x9c\x40\x17\x71", 4) == 0, "v4 UDP 端口不对");
+	CHECK(total == 36 - 8 + flen, "v4 outer total length wrong");
+	CHECK(outer[0] == 0x45, "v4 version/header length wrong");
+	CHECK(outer[8] == 64, "v4 ttl should be 64");
+	CHECK(outer[9] == 17, "v4 protocol should be UDP");
+	CHECK((outer[6] << 8 | outer[7]) == 0x4000, "v4 should set DF");
+	CHECK(memcmp(outer + 12, "\x0a\x00\x00\x02", 4) == 0, "v4 source address wrong");
+	CHECK(memcmp(outer + 16, "\xca\x26\x40\x6a", 4) == 0, "v4 destination address wrong");
+	CHECK(memcmp(outer + 20, "\x9c\x40\x17\x71", 4) == 0, "v4 UDP ports wrong");
 	CHECK((size_t)((outer[24] << 8) | outer[25]) == 8 + flen,
-	      "v4 UDP 长度不对");
+	      "v4 UDP length wrong");
 
-	/* 独立验证 IP 头校验和 */
+	/* Independently verify the IP header checksum */
 	{
 		uint32_t sum = 0;
 
 		for (size_t i = 0; i < 20; i += 2)
 			sum += ((uint32_t)outer[i] << 8) | outer[i + 1];
-		CHECK(t_fin(sum) == 0, "v4 头校验和自校验应为 0");
+		CHECK(t_fin(sum) == 0, "v4 header checksum self-check should be 0");
 	}
 
-	/* 独立验证 UDP 校验和（伪头 + UDP 头 + 载荷） */
+	/* Independently verify the UDP checksum (pseudo-header + UDP header + payload) */
 	{
 		uint32_t sum = 0;
 
@@ -896,19 +896,19 @@ test_outer_build4(void)
 		sum = t_sum((const uint8_t *)"\x00\x11", 2, sum);
 		sum = t_sum(outer + 24, 2, sum);
 		sum = t_sum(outer + 20, 8 + flen, sum);
-		CHECK(t_fin(sum) == 0, "v4 UDP 校验和（含伪头）应为 0");
+		CHECK(t_fin(sum) == 0, "v4 UDP checksum (incl. pseudo-header) should be 0");
 		CHECK(((outer[26] << 8) | outer[27]) != 0 ||
 		      ((outer[26] << 8) | outer[27]) == 0xFFFF,
-		      "v4 UDP 校验和不应为 0（0 表示无校验和）");
+		      "v4 UDP checksum must not be 0 (0 means no checksum)");
 	}
 
-	/* 与入向解析对拍：构造 → 解析 → 解封 */
-	CHECK(iwan_win_outer_parse4(outer, total, &o), "构造出的 v4 外层解析失败");
-	CHECK(o.inner_off == 36 && o.inner_len == 40, "v4 内层偏移/长度不对");
+	/* Cross-check with inbound parse: build -> parse -> decap */
+	CHECK(iwan_win_outer_parse4(outer, total, &o), "constructed v4 outer failed to parse");
+	CHECK(o.inner_off == 36 && o.inner_len == 40, "v4 inner offset/length wrong");
 	CHECK(iwan_win_frame_classify(&o, 0x030c, 0xdeadbeef, FALSE, TRUE) ==
-	      IWAN_WIN_FRAME_DATA, "构造出的明文帧应判为 DATA");
+	      IWAN_WIN_FRAME_DATA, "constructed plaintext frame should classify as DATA");
 	n = iwan_win_decap(outer, total, &o, key, out, sizeof(out));
-	CHECK(n == 40 && memcmp(out, frame + 8, 40) == 0, "v4 解封与载荷不符");
+	CHECK(n == 40 && memcmp(out, frame + 8, 40) == 0, "v4 decap differs from payload");
 }
 
 static void
@@ -929,22 +929,22 @@ test_outer_build6(void)
 
 	total = iwan_win_outer_build6(outer, sizeof(outer), frame, flen, src6, dst6,
 				      sport, dport);
-	CHECK(total == 56 - 8 + flen, "v6 外层总长不对");
-	CHECK((outer[0] >> 4) == 6, "v6 版本不对");
+	CHECK(total == 56 - 8 + flen, "v6 outer total length wrong");
+	CHECK((outer[0] >> 4) == 6, "v6 version wrong");
 	CHECK((outer[0] & 0x0F) == 0 && outer[1] == 0 && outer[2] == 0 &&
-	      outer[3] == 0, "v6 traffic class / flow label 应为 0");
-	CHECK(outer[6] == 17, "v6 nexthdr 应为 UDP（不带扩展头）");
-	CHECK(outer[7] == 64, "v6 hop limit 应为 64");
+	      outer[3] == 0, "v6 traffic class / flow label should be 0");
+	CHECK(outer[6] == 17, "v6 nexthdr should be UDP (no extension header)");
+	CHECK(outer[7] == 64, "v6 hop limit should be 64");
 	CHECK((size_t)((outer[4] << 8) | outer[5]) == 8 + flen,
-	      "v6 payload_len 不对");
+	      "v6 payload_len wrong");
 	CHECK(memcmp(outer + 8, src6, 16) == 0 && memcmp(outer + 24, dst6, 16) == 0,
-	      "v6 地址不对");
-	CHECK(memcmp(outer + 40, "\x9c\x40\x17\x71", 4) == 0, "v6 UDP 端口不对");
+	      "v6 addresses wrong");
+	CHECK(memcmp(outer + 40, "\x9c\x40\x17\x71", 4) == 0, "v6 UDP ports wrong");
 	CHECK((size_t)((outer[44] << 8) | outer[45]) == 8 + flen,
-	      "v6 UDP 长度不对");
+	      "v6 UDP length wrong");
 
-	/* 独立验证 UDP 校验和：v6 伪头 = 16B 源 + 16B 目的 + 4B 长度 + 3B 零 +
-	 * 1B 下一头。RFC 8200 强制非零。 */
+	/* Independently verify the UDP checksum: v6 pseudo-header = 16B source + 16B destination + 4B length + 3B zero
+	 * + 1B next header. RFC 8200 mandates non-zero. */
 	{
 		uint32_t sum = 0;
 		uint8_t tail[4] = { 0, 0, 0, 17 };
@@ -958,30 +958,30 @@ test_outer_build6(void)
 		sum = t_sum(ulen, 4, sum);
 		sum = t_sum(tail, 4, sum);
 		sum = t_sum(outer + 40, 8 + flen, sum);
-		CHECK(t_fin(sum) == 0, "v6 UDP 校验和（含 v6 伪头）应为 0");
+		CHECK(t_fin(sum) == 0, "v6 UDP checksum (incl. v6 pseudo-header) should be 0");
 		CHECK(((outer[46] << 8) | outer[47]) != 0,
-		      "v6 UDP 校验和不得为 0（RFC 8200 强制）");
+		      "v6 UDP checksum must not be 0 (mandated by RFC 8200)");
 	}
 
-	/* 构造 → 解析 → 解封（v6 外层包 v6 内层） */
-	CHECK(iwan_win_outer_parse6(outer, total, &o), "构造出的 v6 外层解析失败");
-	CHECK(o.inner_off == 56 && o.inner_len == 40, "v6 内层偏移/长度不对");
+	/* build -> parse -> decap (v6 outer carrying v6 inner) */
+	CHECK(iwan_win_outer_parse6(outer, total, &o), "constructed v6 outer failed to parse");
+	CHECK(o.inner_off == 56 && o.inner_len == 40, "v6 inner offset/length wrong");
 	CHECK(iwan_win_frame_classify(&o, 0x030c, 0xdeadbeef, FALSE, TRUE) ==
-	      IWAN_WIN_FRAME_DATA, "v6 外层的明文帧应判为 DATA");
+	      IWAN_WIN_FRAME_DATA, "plaintext frame in a v6 outer should classify as DATA");
 	n = iwan_win_decap(outer, total, &o, NULL, out, sizeof(out));
-	CHECK(n == 40 && memcmp(out, frame + 8, 40) == 0, "v6 解封与载荷不符");
+	CHECK(n == 40 && memcmp(out, frame + 8, 40) == 0, "v6 decap differs from payload");
 
-	/* 结构不合法：截断 / 扩展头 / 非 UDP */
-	CHECK(!iwan_win_outer_parse6(outer, 40, &o), "截断的 v6 包不应被解析");
+	/* Invalid structure: truncation / extension header / non-UDP */
+	CHECK(!iwan_win_outer_parse6(outer, 40, &o), "truncated v6 packet must not be parsed");
 	{
 		uint8_t save = outer[6];
 
-		outer[6] = 0;                  /* 逐跳扩展头 */
+		outer[6] = 0;                  /* hop-by-hop extension header */
 		CHECK(!iwan_win_outer_parse6(outer, total, &o),
-		      "带扩展头的 v6 外层不应被解析");
+		      "v6 outer with an extension header must not be parsed");
 		outer[6] = 6;                  /* TCP */
 		CHECK(!iwan_win_outer_parse6(outer, total, &o),
-		      "非 UDP 的 v6 外层不应被解析");
+		      "non-UDP v6 outer must not be parsed");
 		outer[6] = save;
 	}
 }
@@ -1003,7 +1003,7 @@ test_should_tunnel6(void)
 	t[1].prefix_len = 48;                  /* 2001:da8:2::/48 */
 	t[1].addr[0] = 0x20; t[1].addr[1] = 0x01; t[1].addr[2] = 0xda;
 	t[1].addr[3] = 0x08; t[1].addr[4] = 0x02;
-	t[2].family = IWAN_WIN_AF_V4;          /* v4 条目对 v6 判定无影响 */
+	t[2].family = IWAN_WIN_AF_V4;          /* v4 entry has no effect on v6 decisions */
 	t[2].prefix_len = 0;
 
 	{
@@ -1013,20 +1013,20 @@ test_should_tunnel6(void)
 						   0, 0, 0, 0, 0, 0, 0, 1 };
 
 		CHECK(iwan_win_should_tunnel6(t, 3, outer6, in6),
-		      "校园 v6 地址应入隧道");
+		      "campus v6 address should enter the tunnel");
 		CHECK(!iwan_win_should_tunnel6(t, 3, outer6, other),
-		      "集合外的 v6 地址不应入隧道");
+		      "v6 address outside the set must not enter the tunnel");
 		CHECK(!iwan_win_should_tunnel6(t, 3, outer6, outer6),
-		      "外层服务器地址永不入隧道");
+		      "outer server address never enters the tunnel");
 	}
 	CHECK(!iwan_win_should_tunnel6(NULL, 0, outer6, outer6),
-	      "空目标集合不应入隧道");
+	      "empty target set must not enter the tunnel");
 }
 
 /*
- * 重组后的数据报形态（入向 callout 在 INBOUND_TRANSPORT_V4/V6）：
- * UDP 头在包首、IP 头已被协议栈摘掉。同一份字节按"裸数据报"与"仍带 IP 头"
- * 两种形态都必须解析出同样的结果。
+ * Reassembled datagram form (inbound callout at INBOUND_TRANSPORT_V4/V6):
+ * the UDP header is at the packet start, the IP header has been stripped by the stack. The same bytes in both
+ * the "raw datagram" and the "still carrying an IP header" form must parse to the same result.
  */
 static void
 test_dgram_parse(void)
@@ -1050,8 +1050,8 @@ test_dgram_parse(void)
 	inner[24] = 0; inner[25] = 12;
 	inner[28] = 'i'; inner[29] = 'w'; inner[30] = 'a'; inner[31] = 'n';
 
-	/* 裸数据报：这就是协议栈重组后交上来的形态。加密帧的载荷要先 XOR
-	 * 再放进去（线上是密文，decap 解出来才是明文）。 */
+	/* Raw datagram: this is exactly what the stack hands up after reassembly. The encrypted frame's payload
+	 * must be XORed first and then placed in (on the wire it is ciphertext; only decap yields plaintext). */
 	{
 		uint8_t enc_inner[64];
 
@@ -1061,69 +1061,69 @@ test_dgram_parse(void)
 		memcpy(outer + 36, enc_inner, 32);
 	}
 	CHECK(iwan_win_dgram_parse(outer + 20, total - 20, &o),
-	      "裸数据报形态解析失败");
-	CHECK(o.sport == 40000 && o.dport == 6001, "外层端口解析错");
+	      "raw datagram form failed to parse");
+	CHECK(o.sport == 40000 && o.dport == 6001, "outer port parse wrong");
 	CHECK(o.frame_off == 8 && o.inner_off == 16 && o.inner_len == 32,
-	      "裸数据报的偏移/长度算错");
+	      "raw datagram offset/length miscalculated");
 	CHECK(o.type == PT_DATA_ENC && o.enc == 1 && o.sid == sid && o.tok == tok,
-	      "裸数据报的帧头字段错位");
+	      "raw datagram frame header fields out of place");
 	n = iwan_win_decap(outer + 20, total - 20, &o, key, out, sizeof(out));
-	CHECK(n == 32 && memcmp(out, inner, 32) == 0, "裸数据报解封结果不符");
+	CHECK(n == 32 && memcmp(out, inner, 32) == 0, "raw datagram decap result mismatch");
 	CHECK(iwan_win_frame_classify(&o, sid, tok, TRUE, TRUE) ==
-	      IWAN_WIN_FRAME_DATA, "裸数据报应判为 DATA");
+	      IWAN_WIN_FRAME_DATA, "raw datagram should classify as DATA");
 
-	/* 仍带 IP 头：偏移整体后移 20，其余结论必须一致 */
+	/* Still carrying the IP header: all offsets shift by 20, all other conclusions must agree */
 	total = build_outer(outer, 32, 40000, 6001, PT_DATA, 0, sid, tok, 0);
 	memcpy(outer + 36, inner, 32);
-	CHECK(iwan_win_dgram_parse(outer, total, &o), "带 IP 头形态解析失败");
+	CHECK(iwan_win_dgram_parse(outer, total, &o), "IP-header form failed to parse");
 	CHECK(o.sport == 40000 && o.dport == 6001 && o.frame_off == 28 &&
 	      o.inner_off == 36 && o.inner_len == 32 && o.enc == 0,
-	      "带 IP 头的偏移/端口算错");
+	      "offsets/ports with IP header miscalculated");
 
-	/* 带 IP 头但分片位非 0：形态不对，拒绝（这一层永远只该见到重组完的包）*/
+	/* IP header present but fragment bit non-zero: wrong form, reject (this layer must only ever see reassembled packets) */
 	total = build_outer(outer, 32, 40000, 6001, PT_DATA, 0, sid, tok, 0x2000);
 	CHECK(!iwan_win_dgram_parse(outer, total, &o),
-	      "带分片位的包不该按完整数据报解析");
+	      "packet with a fragment bit must not be parsed as a complete datagram");
 
-	/* 裸数据报 + 源端口高半字节像版本号：必须回落到裸解析 */
+	/* Raw datagram + source port high nibble looking like a version: must fall back to raw parsing */
 	total = build_outer(outer, 32, 0x4a12, 6001, PT_DATA, 0, sid, tok, 0);
 	memcpy(outer + 36, inner, 32);
 	CHECK(iwan_win_dgram_parse(outer + 20, total - 20, &o),
-	      "源端口高半字节像版本号时回落失败");
+	      "fallback failed when the source port high nibble looks like a version");
 	CHECK(o.sport == 0x4a12 && o.frame_off == 8 && o.inner_len == 32,
-	      "回落后的偏移/长度错");
+	      "offset/length after fallback wrong");
 
-	/* UDP 长度撒谎（比实际大）：按实际长度兜底 */
+	/* UDP length lies (larger than actual): fall back to the actual length */
 	total = build_outer(outer, 32, 40000, 6001, PT_DATA, 0, sid, tok, 0);
 	memcpy(outer + 36, inner, 32);
 	outer[20 + 4] = 0xff; outer[20 + 5] = 0xff;
 	CHECK(iwan_win_dgram_parse(outer + 20, total - 20, &o),
-	      "UDP 长度撒谎应兜底解析");
-	CHECK(o.inner_len == 32, "兜底后的内层长度不对");
+	      "lying UDP length should parse via fallback");
+	CHECK(o.inner_len == 32, "inner length after fallback is wrong");
 
-	/* 拒绝路径 */
-	CHECK(!iwan_win_dgram_parse(outer + 20, 8, &o), "只有 UDP 头不该解析");
-	CHECK(!iwan_win_dgram_parse(outer + 20, 0, &o), "空包不该解析");
+	/* Rejection paths */
+	CHECK(!iwan_win_dgram_parse(outer + 20, 8, &o), "UDP header alone must not parse");
+	CHECK(!iwan_win_dgram_parse(outer + 20, 0, &o), "empty packet must not parse");
 	{
 		uint8_t only_hdr[16];
 
 		memset(only_hdr, 0, sizeof(only_hdr));
 		only_hdr[0] = 0x9c; only_hdr[1] = 0x40;	/* sport = 40000 */
-		only_hdr[4] = 0; only_hdr[5] = 16;	/* ulen = 16 = UDP 头 + 帧头 */
+		only_hdr[4] = 0; only_hdr[5] = 16;	/* ulen = 16 = UDP header + frame header */
 		CHECK(!iwan_win_dgram_parse(only_hdr, sizeof(only_hdr), &o),
-		      "内层零长不该解析");
+		      "zero-length inner must not parse");
 	}
 }
 
 /*
- * 线测脚手架的金标向量：tests/win_wire_peer.py 造出来的 57 字节外层数据报
- * （8 字节 UDP 头 + 8 字节帧头 + 41 字节内层包），原样喂给驱动侧的解析、
- * 判定、解封。宿主对端脚本是"验证的另一半"，它一旦与驱动对不上，现场表现
- * 只是客体侧计数不动、很难查；把它的输出固化成金标，脚本改坏线上格式时
- * 本机编译就能发现（不需要客体在场）。
+ * Golden vector for the wire-test harness: the 57-byte outer datagram built by tests/win_wire_peer.py
+ * (8-byte UDP header + 8-byte frame header + 41-byte inner packet), fed as-is to the driver-side parse,
+ * classification and decap. The host peer script is "the other half of the verification"; once it disagrees
+ * with the driver, the field symptom is just a guest-side counter that does not move, hard to chase; freezing
+ * its output as a golden vector lets a host build catch a script that breaks the wire format (no guest needed).
  *
- * 41 字节内层 = IPv4(20) + UDP(8) + "IWAN-INNER-OK"(13)，
- * 端口对 40001 -> 9999，内层目的 10.0.2.15。
+ * 41-byte inner = IPv4(20) + UDP(8) + "IWAN-INNER-OK"(13),
+ * port pair 40001 -> 9999, inner destination 10.0.2.15.
  */
 static void
 test_wire_harness_golden(void)
@@ -1153,33 +1153,33 @@ test_wire_harness_golden(void)
 	uint8_t out[64];
 	ULONG n;
 
-	CHECK(iwan_win_dgram_parse(good, sizeof(good), &o), "线测正常帧解析失败");
+	CHECK(iwan_win_dgram_parse(good, sizeof(good), &o), "wire-test normal frame failed to parse");
 	CHECK(o.sport == 45678 && o.dport == 40660,
-	      "外层端口对不上（脚本按大端字节写，驱动按大端整数比）");
+	      "outer ports do not match (script writes big-endian bytes, driver compares big-endian integers)");
 	CHECK(o.frame_off == 8 && o.inner_off == 16 && o.inner_len == 41,
-	      "帧/内层偏移或长度不符");
+	      "frame/inner offset or length mismatch");
 	CHECK(o.type == PT_DATA_ENC && o.enc == 1 && o.sid == 0x1234 &&
-	      o.tok == 0x12345678, "帧头字段与脚本不一致");
+	      o.tok == 0x12345678, "frame header fields differ from the script");
 	CHECK(iwan_win_frame_classify(&o, 0x1234, 0x12345678, TRUE, TRUE) ==
-	      IWAN_WIN_FRAME_DATA, "线测正常帧应判为数据帧");
+	      IWAN_WIN_FRAME_DATA, "wire-test normal frame should classify as a data frame");
 
 	n = iwan_win_decap(good, sizeof(good), &o, key, out, sizeof(out));
-	CHECK(n == 41, "解封长度应为 41（实得 %lu）", (unsigned long)n);
-	CHECK(out[0] == 0x45 && out[9] == 17, "解封出的内层不是 IPv4/UDP");
+	CHECK(n == 41, "decap length should be 41 (got %lu)", (unsigned long)n);
+	CHECK(out[0] == 0x45 && out[9] == 17, "decapped inner is not IPv4/UDP");
 	CHECK(out[16] == 10 && out[17] == 0 && out[18] == 2 && out[19] == 15,
-	      "解封出的内层目的地址不是 10.0.2.15");
-	CHECK(out[22] == 0x27 && out[23] == 0x0f, "解封出的内层目的端口不是 9999");
+	      "decapped inner destination address is not 10.0.2.15");
+	CHECK(out[22] == 0x27 && out[23] == 0x0f, "decapped inner destination port is not 9999");
 	CHECK(memcmp(out + 28, "IWAN-INNER-OK", 13) == 0,
-	      "解封出的载荷不是 IWAN-INNER-OK");
-	CHECK(sum16(out, 20) == 0xFFFF, "解封出的内层 IP 校验和无效（脚本算错）");
+	      "decapped payload is not IWAN-INNER-OK");
+	CHECK(sum16(out, 20) == 0xFFFF, "decapped inner IP checksum invalid (script computed it wrong)");
 
 	CHECK(iwan_win_dgram_parse(bad, sizeof(bad), &o),
-	      "坏凭据样本结构合法，应当能解析");
+	      "bad-credential sample is structurally valid and should parse");
 	CHECK(iwan_win_frame_classify(&o, 0x1234, 0x12345678, TRUE, TRUE) ==
-	      IWAN_WIN_FRAME_BAD, "令牌不匹配的帧必须判为 BAD");
+	      IWAN_WIN_FRAME_BAD, "frame with a mismatched token must classify as BAD");
 }
 
-/* ---- 16. 内层 IPv4 分片：与 Linux 协议栈分片对齐 ----------------------- */
+/* ---- 16. Inner IPv4 fragmentation: aligned with Linux stack fragmentation ------------- */
 
 static uint16_t
 mk_pkt4(uint8_t *pkt, size_t len, uint8_t ihl_words, uint16_t frag_off)
@@ -1214,23 +1214,23 @@ test_frag4(void)
 	uint16_t ihl;
 	int ok;
 
-	/* 短报文不分片 */
+	/* Short packet is not fragmented */
 	ihl = mk_pkt4(pkt, 1200, 5, 0);
 	CHECK(iwan_win_frag4_count(pkt, 1200, 1380) == 0,
-	      "1200 字节装得进 1380，不该分片（ihl=%u）", (unsigned)ihl);
+	      "1200 bytes fit in 1380, must not fragment (ihl=%u)", (unsigned)ihl);
 	CHECK(iwan_win_frag4_build(frag, sizeof(frag), pkt, 1200, 1380, 0,
 				   &out_len) == TRUE &&
-	      out_len == 1200, "不分片时 idx=0 也应能原样构造");
-	/* build 总会重算头校验和并规范 flags/offset（合成样本的校验和原本是 0），
-	 * 所以"不分片"只保证载荷逐字节相同、头变得自洽。 */
+	      out_len == 1200, "even idx=0 should build the packet as-is when not fragmenting");
+	/* build always recomputes the header checksum and normalizes flags/offset (the synthetic sample's checksum
+	 * was originally 0), so "no fragmentation" only guarantees a byte-identical payload and a self-consistent header. */
 	CHECK(memcmp(frag + 20, pkt + 20, 1180) == 0,
-	      "不分片时载荷必须逐字节相同");
-	CHECK(sum16(frag, 20) == 0xFFFF, "不分片时头校验和也必须自洽");
+	      "payload must be byte-identical when not fragmenting");
+	CHECK(sum16(frag, 20) == 0xFFFF, "header checksum must also be self-consistent when not fragmenting");
 
-	/* 3000 字节 / mtu 1380：载荷 2980，片载荷 1360 ⇒ 3 片 */
+	/* 3000 bytes / mtu 1380: payload 2980, per-fragment payload 1360 => 3 fragments */
 	ihl = mk_pkt4(pkt, 3000, 5, 0);
 	n = iwan_win_frag4_count(pkt, 3000, 1380);
-	CHECK(n == 3, "3000/mtu1380 应为 3 片（实得 %u）", (unsigned)n);
+	CHECK(n == 3, "3000/mtu1380 should be 3 fragments (got %u)", (unsigned)n);
 
 	total = 0;
 	for (i = 0; i < n; i++) {
@@ -1239,66 +1239,66 @@ test_frag4(void)
 
 		ok = iwan_win_frag4_build(frag, sizeof(frag), pkt, 3000, 1380,
 					  i, &out_len);
-		CHECK(ok == TRUE, "第 %u 片构造失败", (unsigned)i);
+		CHECK(ok == TRUE, "fragment %u failed to build", (unsigned)i);
 		if (!ok)
 			return;
 		off = i * 1360u;
 		want = (2980u - off > 1360u) ? 1380u : (20u + (2980u - off));
-		CHECK(out_len == want, "第 %u 片长度应为 %u（实得 %u）",
+		CHECK(out_len == want, "fragment %u length should be %u (got %u)",
 		      (unsigned)i, (unsigned)want, (unsigned)out_len);
 		CHECK(sum16(frag, 20) == 0xFFFF,
-		      "第 %u 片的 IP 头校验和无效（sum=%04x）", (unsigned)i,
+		      "fragment %u has an invalid IP header checksum (sum=%04x)", (unsigned)i,
 		      (unsigned)sum16(frag, 20));
 		fo = iwan_win_rd16(frag + 6);
-		CHECK((fo & 0x4000) == 0, "第 %u 片的 DF 必须清掉", (unsigned)i);
+		CHECK((fo & 0x4000) == 0, "fragment %u must clear DF", (unsigned)i);
 		CHECK((fo & 0x1FFF) == (off / 8),
-		      "第 %u 片的偏移字段应为 %u（实得 %u）", (unsigned)i,
+		      "fragment %u offset field should be %u (got %u)", (unsigned)i,
 		      (unsigned)(off / 8), (unsigned)(fo & 0x1FFF));
 		CHECK(((fo & 0x2000) != 0) == (off + 1360u < 2980u),
-		      "第 %u 片的 MF 与是否还有后续不一致", (unsigned)i);
+		      "fragment %u MF inconsistent with whether more fragments follow", (unsigned)i);
 		CHECK(iwan_win_rd16(frag + 2) == out_len,
-		      "第 %u 片的 IP 总长字段与实际长度不一致", (unsigned)i);
+		      "fragment %u IP total length field inconsistent with actual length", (unsigned)i);
 		memcpy(joined + total, frag + 20, out_len - 20);
 		total += out_len - 20;
 	}
-	CHECK(total == 2980, "分片载荷累计应为 2980（实得 %u）", (unsigned)total);
+	CHECK(total == 2980, "total fragment payload should be 2980 (got %u)", (unsigned)total);
 	CHECK(memcmp(joined, pkt + 20, 2980) == 0,
-	      "分片载荷拼回去必须与原报文逐字节相同");
+	      "reassembled fragment payload must be byte-identical to the original packet");
 
-	/* 边界与非法输入 */
+	/* Boundaries and invalid inputs */
 	CHECK(iwan_win_frag4_count(pkt, 3000, 24) == 0,
-	      "mtu=24 连 8 字节载荷都放不下，应拒绝分片");
+	      "mtu=24 cannot fit even 8 payload bytes, fragmentation must be rejected");
 	pkt[0] = 0x65;
-	CHECK(iwan_win_frag4_count(pkt, 3000, 1380) == 0, "非 v4 不分片");
+	CHECK(iwan_win_frag4_count(pkt, 3000, 1380) == 0, "non-v4 is not fragmented");
 	pkt[0] = 0x45;
 	CHECK(iwan_win_frag4_build(frag, sizeof(frag), pkt, 3000, 1380, 3,
-				   &out_len) == FALSE, "越界片号必须拒绝");
+				   &out_len) == FALSE, "out-of-range fragment index must be rejected");
 	CHECK(iwan_win_frag4_build(frag, 40, pkt, 3000, 1380, 0, &out_len) ==
-	      FALSE, "缓冲不足必须拒绝");
+	      FALSE, "insufficient buffer must be rejected");
 
-	/* ihl=24（带选项）：片载荷必须是 8 的倍数 ⇒ (1380-24)&~7 = 1352 */
+	/* ihl=24 (with options): fragment payload must be a multiple of 8 => (1380-24)&~7 = 1352 */
 	ihl = mk_pkt4(pkt, 1400, 6, 0);
-	CHECK(ihl == 24, "构造的 ihl 应为 24");
+	CHECK(ihl == 24, "constructed ihl should be 24");
 	n = iwan_win_frag4_count(pkt, 1400, 1380);
-	CHECK(n == 2, "ihl=24、1400 字节应为 2 片（实得 %u）", (unsigned)n);
+	CHECK(n == 2, "ihl=24, 1400 bytes should be 2 fragments (got %u)", (unsigned)n);
 	ok = iwan_win_frag4_build(frag, sizeof(frag), pkt, 1400, 1380, 0,
 				  &out_len);
 	CHECK(ok == TRUE && out_len == 24 + 1352,
-	      "ihl=24 的首片长度应为 1376（实得 %u）", (unsigned)out_len);
-	CHECK(sum16(frag, 24) == 0xFFFF, "ihl=24 的首片校验和无效");
+	      "first fragment with ihl=24 should be 1376 bytes (got %u)", (unsigned)out_len);
+	CHECK(sum16(frag, 24) == 0xFFFF, "first fragment with ihl=24 has an invalid checksum");
 
-	/* 源端置了 DF 的大包：驱动代劳分片后 DF 必须清掉，否则接收侧拒中间片 */
+	/* Large packet with DF set by the source: after the driver fragments it DF must be cleared, otherwise the receiver rejects middle fragments */
 	mk_pkt4(pkt, 2000, 5, 0x4000);
-	CHECK((iwan_win_rd16(pkt + 6) & 0x4000) != 0, "构造样本应带 DF");
+	CHECK((iwan_win_rd16(pkt + 6) & 0x4000) != 0, "constructed sample should carry DF");
 	ok = iwan_win_frag4_build(frag, sizeof(frag), pkt, 2000, 1380, 0,
 				  &out_len);
-	CHECK(ok == TRUE, "带 DF 的大包也应当能分片");
-	CHECK((iwan_win_rd16(frag + 6) & 0x4000) == 0, "分片后必须清掉 DF");
-	CHECK((iwan_win_rd16(frag + 6) & 0x2000) != 0, "首片必须置 MF");
-	CHECK(iwan_win_rd16(frag + 4) == 0x1234, "IP ID 必须保留");
+	CHECK(ok == TRUE, "large packet with DF should also be fragmentable");
+	CHECK((iwan_win_rd16(frag + 6) & 0x4000) == 0, "DF must be cleared after fragmentation");
+	CHECK((iwan_win_rd16(frag + 6) & 0x2000) != 0, "first fragment must set MF");
+	CHECK(iwan_win_rd16(frag + 4) == 0x1234, "IP ID must be preserved");
 }
 
-/* ---- 17. 外层分片重组：与 Linux 的 ip_defrag 对齐 ---------------------- */
+/* ---- 17. Outer fragment reassembly: aligned with Linux ip_defrag --------------------- */
 
 static size_t
 mk_ofrag4(uint8_t *pkt, uint32_t src, uint32_t dst, uint16_t id,
@@ -1341,38 +1341,38 @@ test_frag_reasm(void)
 	ULONG idx = 0, out_len = 0;
 	int r;
 
-	/* 分片偏移以 8 字节为单位，所以片长必须是 8 的倍数（末片除外）：
-	 * 3000 = 1384 + 1384 + 232。 */
+	/* Fragment offset is in 8-byte units, so fragment lengths must be multiples of 8 (except the last):
+	 * 3000 = 1384 + 1384 + 232. */
 	for (i = 0; i < sizeof(dat); i++)
 		dat[i] = (uint8_t)(i * 11u + 5u);
 	memset(slots, 0, sizeof(slots));
 
-	/* 非分片：PASS，不占槽 */
+	/* Non-fragment: PASS, occupies no slot */
 	len = mk_ofrag4(pkt, SRC, DST, 7, 0, 0, dat, 200);
 	r = iwan_win_frag_input(slots, IWAN_WIN_FRAG_SLOTS, pkt, (ULONG)len,
 				1000, 2000, &idx, &out_len);
-	CHECK(r == IWAN_WIN_FRAG_PASS, "非分片应 PASS（实得 %d）", r);
+	CHECK(r == IWAN_WIN_FRAG_PASS, "non-fragment should PASS (got %d)", r);
 
-	/* 乱序到达：末片、首片、中间片 */
+	/* Out-of-order arrival: last fragment, first fragment, middle fragment */
 	len = mk_ofrag4(pkt, SRC, DST, 0x4242, 2768, 0, dat + 2768, 232);
 	r = iwan_win_frag_input(slots, IWAN_WIN_FRAG_SLOTS, pkt, (ULONG)len,
 				1000, 2000, &idx, &out_len);
-	CHECK(r == IWAN_WIN_FRAG_STORED, "末片先到应暂存（实得 %d）", r);
+	CHECK(r == IWAN_WIN_FRAG_STORED, "last fragment arriving first should be stored (got %d)", r);
 	len = mk_ofrag4(pkt, SRC, DST, 0x4242, 0, 1, dat, 1384);
 	r = iwan_win_frag_input(slots, IWAN_WIN_FRAG_SLOTS, pkt, (ULONG)len,
 				1001, 2000, &idx, &out_len);
-	CHECK(r == IWAN_WIN_FRAG_STORED, "还缺中间片时应暂存（实得 %d）", r);
+	CHECK(r == IWAN_WIN_FRAG_STORED, "should store while the middle fragment is still missing (got %d)", r);
 	len = mk_ofrag4(pkt, SRC, DST, 0x4242, 1384, 1, dat + 1384, 1384);
 	r = iwan_win_frag_input(slots, IWAN_WIN_FRAG_SLOTS, pkt, (ULONG)len,
 				1002, 2000, &idx, &out_len);
-	CHECK(r == IWAN_WIN_FRAG_DONE, "三片齐了应完成（实得 %d）", r);
-	CHECK(out_len == 3000, "拼出的长度应为 3000（实得 %u）", (unsigned)out_len);
+	CHECK(r == IWAN_WIN_FRAG_DONE, "all three fragments present should complete (got %d)", r);
+	CHECK(out_len == 3000, "reassembled length should be 3000 (got %u)", (unsigned)out_len);
 	CHECK(idx < IWAN_WIN_FRAG_SLOTS &&
 	      memcmp(slots[idx].buf, dat, 3000) == 0,
-	      "拼出的内容必须与原数据报逐字节相同");
+	      "reassembled content must be byte-identical to the original datagram");
 	slots[idx].used = FALSE;
 
-	/* 重叠片：同一段重复到达只算一次，不影响拼齐 */
+	/* Overlapping fragments: the same range arriving twice is counted once and does not affect completion */
 	memset(slots, 0, sizeof(slots));
 	len = mk_ofrag4(pkt, SRC, DST, 0x5151, 0, 1, dat, 1384);
 	(void)iwan_win_frag_input(slots, IWAN_WIN_FRAG_SLOTS, pkt, (ULONG)len,
@@ -1380,15 +1380,15 @@ test_frag_reasm(void)
 	(void)iwan_win_frag_input(slots, IWAN_WIN_FRAG_SLOTS, pkt, (ULONG)len,
 				  2001, 2000, &idx, &out_len);
 	CHECK(slots[0].have == 1384u / 8u,
-	      "重叠片不能重复计数（实得 %u 块）", (unsigned)slots[0].have);
+	      "overlapping fragments must not be counted twice (got %u blocks)", (unsigned)slots[0].have);
 	len = mk_ofrag4(pkt, SRC, DST, 0x5151, 1384, 0, dat + 1384, 1616);
 	r = iwan_win_frag_input(slots, IWAN_WIN_FRAG_SLOTS, pkt, (ULONG)len,
 				2002, 2000, &idx, &out_len);
 	CHECK(r == IWAN_WIN_FRAG_DONE && out_len == 3000,
-	      "两片齐了应完成（r=%d len=%u）", r, (unsigned)out_len);
+	      "both fragments present should complete (r=%d len=%u)", r, (unsigned)out_len);
 	slots[idx].used = FALSE;
 
-	/* 长度矛盾：末片给出的总长比"已收到的内容"还短 ⇒ 作废 */
+	/* Contradictory length: the last fragment's total is shorter than the "content already received" => discard */
 	memset(slots, 0, sizeof(slots));
 	len = mk_ofrag4(pkt, SRC, DST, 0x6161, 0, 1, dat, 1384);
 	(void)iwan_win_frag_input(slots, IWAN_WIN_FRAG_SLOTS, pkt, (ULONG)len,
@@ -1396,17 +1396,17 @@ test_frag_reasm(void)
 	len = mk_ofrag4(pkt, SRC, DST, 0x6161, 800, 0, dat + 800, 400);
 	r = iwan_win_frag_input(slots, IWAN_WIN_FRAG_SLOTS, pkt, (ULONG)len,
 				3001, 2000, &idx, &out_len);
-	CHECK(r == IWAN_WIN_FRAG_DROP, "总长矛盾应丢弃（实得 %d）", r);
-	CHECK(slots[0].used == FALSE, "丢弃后槽必须释放");
+	CHECK(r == IWAN_WIN_FRAG_DROP, "contradictory total length should drop (got %d)", r);
+	CHECK(slots[0].used == FALSE, "slot must be released after a drop");
 
-	/* 超上限：单报文最多 9216 字节 */
+	/* Above the limit: a single datagram is at most 9216 bytes */
 	memset(slots, 0, sizeof(slots));
 	len = mk_ofrag4(pkt, SRC, DST, 0x7171, 8192, 1, dat, 2000);
 	r = iwan_win_frag_input(slots, IWAN_WIN_FRAG_SLOTS, pkt, (ULONG)len,
 				4000, 2000, &idx, &out_len);
-	CHECK(r == IWAN_WIN_FRAG_DROP, "超过单报文上限应丢弃（实得 %d）", r);
+	CHECK(r == IWAN_WIN_FRAG_DROP, "above the single-datagram limit should drop (got %d)", r);
 
-	/* 过期：同一标识的下一次分片必须从头开始（旧内容作废） */
+	/* Expiry: the next fragment of the same identifier must start over (old content discarded) */
 	memset(slots, 0, sizeof(slots));
 	len = mk_ofrag4(pkt, SRC, DST, 0x8181, 0, 1, dat, 1384);
 	(void)iwan_win_frag_input(slots, IWAN_WIN_FRAG_SLOTS, pkt, (ULONG)len,
@@ -1414,11 +1414,11 @@ test_frag_reasm(void)
 	len = mk_ofrag4(pkt, SRC, DST, 0x8181, 1384, 0, dat + 1384, 1616);
 	r = iwan_win_frag_input(slots, IWAN_WIN_FRAG_SLOTS, pkt, (ULONG)len,
 				7000, 1000, &idx, &out_len);
-	CHECK(r == IWAN_WIN_FRAG_STORED, "过期后应重新开始（实得 %d）", r);
+	CHECK(r == IWAN_WIN_FRAG_STORED, "should start over after expiry (got %d)", r);
 	CHECK(slots[idx].have == 1616u / 8u,
-	      "过期重开后只应有末片那些块（实得 %u）", (unsigned)slots[idx].have);
+	      "after expiry restart only the last fragment's blocks should exist (got %u)", (unsigned)slots[idx].have);
 
-	/* 槽满：4 个未拼齐的数据报占满后，新标识要能抢到最老的那个 */
+	/* Slots full: with 4 incomplete datagrams occupying the slots, a new identifier must be able to steal the oldest */
 	memset(slots, 0, sizeof(slots));
 	for (i = 0; i < IWAN_WIN_FRAG_SLOTS; i++) {
 		len = mk_ofrag4(pkt, SRC, DST, (uint16_t)(0x9000u + i), 0, 1,
@@ -1426,13 +1426,13 @@ test_frag_reasm(void)
 		r = iwan_win_frag_input(slots, IWAN_WIN_FRAG_SLOTS, pkt,
 					(ULONG)len, 8000 + (ULONG)i, 100000,
 					&idx, &out_len);
-		CHECK(r == IWAN_WIN_FRAG_STORED, "第 %u 个应暂存（实得 %d）",
+		CHECK(r == IWAN_WIN_FRAG_STORED, "fragment %u should be stored (got %d)",
 		      (unsigned)i, r);
 	}
 	len = mk_ofrag4(pkt, SRC, DST, 0xA0A0, 0, 1, dat, 1384);
 	r = iwan_win_frag_input(slots, IWAN_WIN_FRAG_SLOTS, pkt, (ULONG)len,
 				8100, 100000, &idx, &out_len);
-	CHECK(r == IWAN_WIN_FRAG_STORED, "槽满时应抢最老的一个（实得 %d）", r);
+	CHECK(r == IWAN_WIN_FRAG_STORED, "when slots are full the oldest should be stolen (got %d)", r);
 }
 
 int
@@ -1457,6 +1457,6 @@ main(void)
 	test_parse_failure_clears_out();
 	test_parse4_vs_dgram_agree();
 
-	printf("win_frame_test: 通过 %d 项，失败 %d 项\n", g_pass, g_fail);
+	printf("win_frame_test: %d passed, %d failed\n", g_pass, g_fail);
 	return g_fail == 0 ? 0 : 1;
 }

@@ -1,18 +1,18 @@
-﻿# 在 nano11 客体上安装 iwanmp（NDIS 微型端口 + 协议驱动）驱动包。
+# Install the iwanmp (NDIS miniport + protocol driver) driver package on the nano11 guest.
 #
-# 三道坎都在这里一次性解决（历史教训，任何一道没过 install 就报错）：
-#   1) 测试签名模式下 INF 包必须带**签过名的 .cat**，只给 .sys 签名不够；
-#   2) 重装必须重打 DriverVer，否则 SetupAPI 不会把新 .sys 拷进 System32\drivers；
-#   3) 包里必须显式写 CatalogFile=，否则报 "Driver package does not contain a
-#      catalog file" (0xE000022F)。
+# Three hurdles are solved here once and for all (historical lessons; if any is missed install fails):
+#   1) In test-signing mode the INF package must carry a **signed .cat**; signing only the .sys is not enough;
+#   2) Reinstall must rewrite DriverVer, otherwise SetupAPI will not copy the new .sys into System32\drivers;
+#   3) The package must explicitly set CatalogFile=, otherwise it reports "Driver package does not contain a
+#      catalog file" (0xE000022F).
 #
-# 本脚本额外做一件安全上的事：**在安装之前**就把保险丝合上
-# （HKLM\SYSTEM\CurrentControlSet\Services\iwanmp\Parameters\Disarm=1）。
-# 这样 root 枚举设备第一次被 PnP 启动时，DriverEntry 在任何 NDIS 调用之前
-# 就直接失败（设备停在 Code 10），用来证明"装载这条路径本身不会把机器弄挂"。
-# 要真正装载，用 vm-mp-arm.ps1 放开保险丝。
+# This script also does one safety thing: it closes the fuse **before install**
+# (HKLM\SYSTEM\CurrentControlSet\Services\iwanmp\Parameters\Disarm=1).
+# That way, when PnP first starts the root-enumerated device, DriverEntry fails
+# before any NDIS call (device stays at Code 10), proving the load path itself cannot crash the machine.
+# To actually load, open the fuse with vm-mp-arm.ps1.
 #
-# 用法：powershell -NoProfile -File vm-mp-install.ps1 -InfPath C:\iwan\iwanmp.inf -SysPath C:\iwan\iwanmp.sys
+# Usage: powershell -NoProfile -File vm-mp-install.ps1 -InfPath C:\iwan\iwanmp.inf -SysPath C:\iwan\iwanmp.sys
 param(
     [string]$InfPath = 'C:\iwan\iwanmp.inf',
     [string]$SysPath = 'C:\iwan\iwanmp.sys',
@@ -26,8 +26,8 @@ $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 function Sec($t) { "`n=== $t ===" }
 
-# 设备实例 ID 不是固定的：devcon install 按 INF 的 Class 建节点，实际落在
-# ROOT\NET\000x（早期脚本里写死 ROOT\IWANMP\0000 是猜的，一直没生效）。
+# The device instance ID is not fixed: devcon install creates a node per the INF Class, and it lands
+# in ROOT\NET\000x (early scripts hardcoded ROOT\IWANMP\0000, a guess that never worked).
 function Get-IwanmpInstanceId {
     $d = Get-PnpDevice -ErrorAction SilentlyContinue |
          Where-Object { $_.HardwareID -contains 'iwanmp' } |
@@ -37,16 +37,16 @@ function Get-IwanmpInstanceId {
 }
 if (-not $InstanceId) { $InstanceId = Get-IwanmpInstanceId }
 
-if (-not (Test-Path $InfPath)) { throw "找不到 $InfPath" }
-if (-not (Test-Path $SysPath)) { throw "找不到 $SysPath" }
-if (-not (Test-Path 'C:\iwan\devcon.exe')) { throw '找不到 C:\iwan\devcon.exe' }
+if (-not (Test-Path $InfPath)) { throw "not found: $InfPath" }
+if (-not (Test-Path $SysPath)) { throw "not found: $SysPath" }
+if (-not (Test-Path 'C:\iwan\devcon.exe')) { throw 'not found: C:\iwan\devcon.exe' }
 
-Sec '源文件'
+Sec 'source files'
 Get-Item $InfPath, $SysPath | Select-Object Name, Length, LastWriteTime | Format-Table -AutoSize
 Get-FileHash $SysPath -Algorithm MD5 | Select-Object Hash, Path | Format-List
 
-# 1) 证书（复用 vm-load.ps1 的那张自签代码签名证书）
-Sec '证书'
+# 1) Certificate (reuse the self-signed code-signing cert from vm-load.ps1)
+Sec 'certificate'
 $cert = Get-ChildItem Cert:\LocalMachine\My |
         Where-Object { $_.Subject -eq $CertSubject -and $_.NotAfter -gt (Get-Date) } |
         Select-Object -First 1
@@ -54,9 +54,9 @@ if (-not $cert) {
     $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject $CertSubject `
             -CertStoreLocation Cert:\LocalMachine\My -KeyUsage DigitalSignature `
             -KeyLength 2048 -HashAlgorithm SHA256 -NotAfter (Get-Date).AddYears(3)
-    '新建证书'
+    'creating new certificate'
 } else {
-    '复用已有证书'
+    'reusing existing certificate'
 }
 $cert | Select-Object Subject, Thumbprint | Format-List
 foreach ($store in 'Root', 'TrustedPublisher') {
@@ -67,21 +67,21 @@ foreach ($store in 'Root', 'TrustedPublisher') {
         $storeObj.Open('ReadWrite')
         $storeObj.Add($pub)
         $storeObj.Close()
-        "已把公钥加入 $store"
+        "public key added to $store"
     } else {
-        "$store 里已有"
+        "$store already has it"
     }
 }
 
-# 2) 暂存目录：只放包里的两个文件，目录文件才不会把无关文件也纳入成员表
-Sec '暂存目录'
+# 2) Staging dir: hold only the two package files so the catalog does not pull unrelated files into the member table
+Sec 'staging dir'
 if (Test-Path $Stage) { Remove-Item $Stage -Recurse -Force }
 New-Item -ItemType Directory -Path $Stage | Out-Null
 $stageInf = Join-Path $Stage 'iwanmp.inf'
 $stageSys = Join-Path $Stage 'iwanmp.sys'
 $stageCat = Join-Path $Stage 'iwanmp.cat'
 
-# 3) 重打 DriverVer + 补 CatalogFile（逐行重建，绝不用 -match 对数组做替换）
+# 3) Rewrite DriverVer + add CatalogFile (rebuild line by line, never use -match to replace an array)
 $stamp = (Get-Date).ToString('MM/dd/yyyy,HH:mm', [Globalization.CultureInfo]::InvariantCulture)
 $lines = [System.IO.File]::ReadAllLines($InfPath)
 $out = New-Object System.Collections.Generic.List[string]
@@ -99,33 +99,33 @@ foreach ($l in $lines) {
     }
 }
 if (-not $sawCat) {
-    if ($verAt -lt 0) { throw 'INF 里没有 DriverVer 行' }
+    if ($verAt -lt 0) { throw 'no DriverVer line in INF' }
     $out.Insert($verAt + 1, 'CatalogFile     = iwanmp.cat')
 }
 [System.IO.File]::WriteAllLines($stageInf, $out, (New-Object System.Text.ASCIIEncoding))
 Copy-Item $SysPath $stageSys -Force
-Sec '重打后的 [Version] 段'
+Sec 'rewritten [Version] section'
 Get-Content $stageInf | Select-Object -First 25 | Where-Object { $_ -match 'DriverVer|CatalogFile|Class|Provider' }
 
-# 4) 目录文件 + 签名
-Sec '目录文件与签名'
+# 4) Catalog file + signing
+Sec 'catalog file and signing'
 New-FileCatalog -Path $Stage -CatalogFilePath $stageCat -CatalogVersion 2 | Out-Null
 $r1 = Set-AuthenticodeSignature -FilePath $stageSys -Certificate $cert -HashAlgorithm SHA256
 "sys: $($r1.Status)"
 $r2 = Set-AuthenticodeSignature -FilePath $stageCat -Certificate $cert -HashAlgorithm SHA256
 "cat: $($r2.Status)"
 Get-AuthenticodeSignature $stageSys, $stageCat | Select-Object Status, Path | Format-Table -AutoSize
-if ((Get-AuthenticodeSignature $stageCat).Status -ne 'Valid') { throw '.cat 签名无效' }
+if ((Get-AuthenticodeSignature $stageCat).Status -ne 'Valid') { throw 'invalid .cat signature' }
 
-# 5) 合上保险丝（必须在安装之前：第一次启动就要被挡住）
-Sec '保险丝（安装前合上）'
+# 5) Close the fuse (must be before install: the first start must be blocked)
+Sec 'fuse (closed before install)'
 $pkey = 'HKLM:\SYSTEM\CurrentControlSet\Services\iwanmp\Parameters'
 if (-not (Test-Path $pkey)) { New-Item -Path $pkey -Force | Out-Null }
 New-ItemProperty -Path $pkey -Name 'Disarm' -PropertyType DWord -Value 1 -Force | Out-Null
 Get-ItemProperty $pkey | Format-List
 
-# 6) 清掉 DriverStore 里可能残留的旧 iwanmp 包（否则可能装回旧映像）
-Sec 'DriverStore 清理'
+# 6) Remove any stale old iwanmp package from the DriverStore (otherwise it may install the old image)
+Sec 'DriverStore cleanup'
 $enum = & pnputil.exe /enum-drivers | Out-String
 $blocks = $enum -split "`r?`n`r?`n"
 $stale = @()
@@ -136,20 +136,20 @@ foreach ($b in $blocks) {
     }
 }
 if ($stale.Count -eq 0) {
-    '没有残留包'
+    'no stale packages'
 } else {
     foreach ($oem in $stale) {
-        "删除 $oem"
+        "deleting $oem"
         & pnputil.exe /delete-driver $oem /uninstall /force 2>&1 | Out-String
     }
 }
 
-# 7) 安装
+# 7) Install
 Sec 'devcon install'
 $dev = & C:\iwan\devcon.exe install $stageInf $Hwid 2>&1 | Out-String
 $dev
 
-Sec '设备状态'
+Sec 'device state'
 $devs = @(Get-PnpDevice -ErrorAction SilentlyContinue |
           Where-Object { $_.HardwareID -contains 'iwanmp' })
 $devs | Select-Object Status, Class, FriendlyName, InstanceId, Problem, ProblemDescription |
@@ -160,11 +160,11 @@ foreach ($d in $devs) {
         Select-Object KeyName, Data | Format-Table -AutoSize
 }
 
-Sec '服务状态'
+Sec 'service state'
 Get-Service -Name iwanmp -ErrorAction SilentlyContinue |
     Select-Object Name, Status, ServiceType, StartType | Format-List
 
-Sec '分阶段 trace 键'
+Sec 'staged trace keys'
 $p = Get-ItemProperty $pkey -ErrorAction SilentlyContinue
 foreach ($n in 'Stage', 'Status', 'Disarm', 'NoProto') {
     if ($p.PSObject.Properties.Name -contains $n) { "  {0,-10} = 0x{1:X8} ({1})" -f $n, [uint32]$p.$n }
@@ -174,13 +174,13 @@ foreach ($n in ($tkeys | Sort-Object { [int]($_.Substring(1)) })) {
     "  {0,-10} = 0x{1:X8} ({1})" -f $n, [uint32]$p.$n
 }
 
-Sec '最近的 Kernel-PnP 事件'
+Sec 'recent Kernel-PnP events'
 Get-WinEvent -FilterHashtable @{ LogName = 'System'; StartTime = (Get-Date).AddMinutes(-5) } `
     -ErrorAction SilentlyContinue |
     Where-Object { $_.ProviderName -match 'Kernel-PnP' } |
     Select-Object -First 6 |
     ForEach-Object { "{0} [{1}] {2}" -f $_.TimeCreated, $_.Id, ($_.Message -replace '\s+', ' ') }
 
-Sec '结论提示'
-'保险丝是合上的（Disarm=1）：设备应停在 Code 10，T8=1、T9=0xC0000001，'
-'并且**没有** T10/T11/T30 之后的键 —— 这正说明 DriverEntry 在任何 NDIS 调用之前就退出了。'
+Sec 'conclusion hints'
+'fuse is closed (Disarm=1): device should stay at Code 10, T8=1, T9=0xC0000001,'
+'and there should be NO keys after T10/T11/T30 -- which proves DriverEntry exited before any NDIS call.'

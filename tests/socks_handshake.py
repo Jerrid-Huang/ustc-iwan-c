@@ -13,8 +13,8 @@ suffix is appended on Windows.
 The suite drives the REAL production SOCKS5 code paths (accept, RFC1929
 handshake, CONNECT, userspace netstack) through a loopback TCP listener.
 Each case opens a FRESH TCP connection and asserts exact wire bytes. The
-harness is run twice sequentially — once with no auth token (no-token
-cases) and once with --token (token cases) — unless --token is omitted,
+harness is run twice sequentially -- once with no auth token (no-token
+cases) and once with --token (token cases) -- unless --token is omitted,
 in which case only the no-token run happens. The rate-limit and
 connect-timeout knobs are passed through the environment
 (IWAN_AUTH_FAIL_MAX, IWAN_AUTH_FAIL_WINDOW_MS,
@@ -318,7 +318,7 @@ def run_token(port, token, fail_max, window_ms, connect_timeout_ms):
     cases.append(("wrongpass_xN", wrongpass_xN))
 
     # 8. blocked_after_lockout: after fail_max failures the source is
-    #    dropped at accept — NO reply bytes (EOF/reset/timeout all pass)
+    #    dropped at accept -- NO reply bytes (EOF/reset/timeout all pass)
     def blocked_after_lockout():
         def body(s):
             try:

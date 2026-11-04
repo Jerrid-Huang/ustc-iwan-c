@@ -87,7 +87,7 @@
 /* Initial TCP retransmission timeout: 1000ms (RFC 6298 fast-network
  * value) instead of lwIP's 3000ms default. A single lost inner segment
  * (UDP loss / local TX backpressure) would otherwise stall the flow for
- * a full 3s before the first retransmit — measured as multi-second
+ * a full 3s before the first retransmit -- measured as multi-second
  * "tail" stalls on small TLS/HTTP requests over the real line, where
  * there is no dupACK traffic to trigger fast retransmit. SYN retries
  * follow the same 1s cadence (6 retries -> ~6.5s connect timeout
@@ -108,7 +108,7 @@
 /* Low-water mark for the (unused) socket select() path. TCP_SNDLOWAT lives
  * in a u16_t context (sanity-checked against 0xFFFF - 4*MSS), so a 256KB
  * snd_buf cannot use the default SND_BUF/2; 32KB is an arbitrary valid
- * value — the bridge never reads it (raw API). */
+ * value -- the bridge never reads it (raw API). */
 #define TCP_SNDLOWAT      (32 * 1024)
 /* Out-of-order reassembly + SACK output (lwIP is a SACK *sender*: it
  * reports OOS holes so the peer selectively retransmits; recovery is
