@@ -54,6 +54,11 @@ SYS_PATH="${1:-/home/uker/iwan-sys/win-driver-x64/build/x64/Release/iwan.sys}"
 WINDOW="${2:-160}"
 PEER_IP="${3:-10.0.2.2}"
 PEER_PORT=45678
+# The guest is reached over an explicit host:port -- there is no "nano11" ssh-config alias any more.
+GUEST_USER="${GUEST_USER:-Administrator}"
+GUEST_HOST="${GUEST_HOST:-127.0.0.1}"
+GUEST_PORT="${GUEST_PORT:-2222}"
+GUEST="$GUEST_USER@$GUEST_HOST"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 OUT=/tmp/win_vm_wire
 mkdir -p "$OUT"
@@ -62,21 +67,21 @@ say() { echo "[wire] $*"; }
 die() { echo "[wire] FAIL: $*" >&2; exit 1; }
 
 [ -f "$SYS_PATH" ] || die "driver not found: $SYS_PATH (run gh run download first)"
-timeout 15 ssh -o ConnectTimeout=8 -o BatchMode=yes nano11 'echo ok' >/dev/null 2>&1 \
-    || die "guest nano11 unreachable (127.0.0.1:2222)"
+timeout 15 ssh -p "$GUEST_PORT" -o ConnectTimeout=8 -o BatchMode=yes "$GUEST" 'echo ok' >/dev/null 2>&1 \
+    || die "guest $GUEST:$GUEST_PORT unreachable"
 
 # The guest-side scripts are half of this verification and would be lost with the environment if left on the guest: archive them to tests/win_vm/ while at it
 if [ ! -d "$HERE/win_vm" ]; then
     mkdir -p "$HERE/win_vm"
-    timeout 120 scp -q 'nano11:C:/iwan/*.ps1' "$HERE/win_vm/" 2>/dev/null \
+    timeout 120 scp -q -P "$GUEST_PORT" "$GUEST:C:/iwan/*.ps1" "$HERE/win_vm/" 2>/dev/null \
         && say "archived guest scripts to tests/win_vm/ ($(ls -1 "$HERE/win_vm" | wc -l) files)"
 fi
 
 say "Swapping driver: $SYS_PATH ($(stat -c%s "$SYS_PATH") bytes)"
-timeout 60 ssh -o ConnectTimeout=12 nano11 'sc.exe stop iwan' >/dev/null 2>&1
+timeout 60 ssh -p "$GUEST_PORT" -o ConnectTimeout=12 "$GUEST" 'sc.exe stop iwan' >/dev/null 2>&1
 sleep 3
-timeout 150 scp -q "$SYS_PATH" 'nano11:C:/iwan/iwan.sys' || die "driver copy failed (guest disk full?)"
-timeout 200 ssh -o ConnectTimeout=12 nano11 \
+timeout 150 scp -q -P "$GUEST_PORT" "$SYS_PATH" "$GUEST:C:/iwan/iwan.sys" || die "driver copy failed (guest disk full?)"
+timeout 200 ssh -p "$GUEST_PORT" -o ConnectTimeout=12 "$GUEST" \
     'powershell -NoProfile -ExecutionPolicy Bypass -File C:\iwan\vm-load.ps1 -SysPath C:\iwan\iwan.sys' \
     2>&1 | tr -d '\r' 2>/dev/null | grep -q "State    : Running" || die "driver did not start (State is not Running)"
 say "driver State: Running"
@@ -87,21 +92,21 @@ say "driver State: Running"
 # of kernel dumps, evidence left by earlier hangs -- ask the user before deleting).
 # Only trust the real free-space line: fsutil also prints total capacity, quota free, and pool usage (some zeros),
 # so picking max/min by numeric value goes wrong (once treated 16 GB total capacity as free space).
-FREE=$(timeout 60 ssh -o ConnectTimeout=12 nano11 'fsutil volume diskfree C:' 2>/dev/null \
+FREE=$(timeout 60 ssh -p "$GUEST_PORT" -o ConnectTimeout=12 "$GUEST" 'fsutil volume diskfree C:' 2>/dev/null \
        | tr -d '\r' | grep -iE $'^(Total free bytes|\xe6\x80\xbb\xe5\x8f\xaf\xe7\x94\xa8\xe5\xad\x97\xe8\x8a\x82\xe6\x95\xb0)' \
        | grep -oE '[0-9][0-9,]{5,}' | tr -d ',' | head -1)
 if [ -n "$FREE" ] && [ "$FREE" -lt 209715200 ]; then
     die "guest C: insufficient free space (${FREE} bytes) -- clean C:\\Windows\\Temp etc. first"
 fi
 say "guest C: ${FREE:-unknown} bytes free"
-timeout 60 ssh -o ConnectTimeout=12 nano11 \
+timeout 60 ssh -p "$GUEST_PORT" -o ConnectTimeout=12 "$GUEST" \
     'netsh advfirewall firewall add rule name="iwan-wire-in" dir=in action=allow protocol=UDP localport=9999' \
     >/dev/null 2>&1 && say "added inbound UDP 9999 allow rule (removed after the run)"
 
 # Anti-"empty run": delete the guest output file first; it must reappear after the run -- once the script
 # never ran at all (driver not loaded, script exited silently) and we read the previous rx-out.txt, taking stale numbers
 # as a new conclusion.
-timeout 60 ssh -o ConnectTimeout=12 nano11 \
+timeout 60 ssh -p "$GUEST_PORT" -o ConnectTimeout=12 "$GUEST" \
     'powershell -NoProfile -Command "Remove-Item C:\\iwan\\rx-out.txt -Force -ErrorAction SilentlyContinue"' \
     >/dev/null 2>&1
 
@@ -112,7 +117,7 @@ timeout 60 ssh -o ConnectTimeout=12 nano11 \
 # are unaffected, but evidence readability is much worse).
 printf '\xef\xbb\xbf[Console]::OutputEncoding=[Text.Encoding]::UTF8\r\n& C:\\iwan\\vm-rx.ps1 -Inject -Wire -PeerIp %s -PeerPort %s -PingCount 0 -HoldSeconds 20\r\n' \
     "$PEER_IP" "$PEER_PORT" > "$OUT/vm-wire-run.ps1"
-timeout 90 scp -q "$OUT/vm-wire-run.ps1" 'nano11:C:/iwan/vm-wire-run.ps1' \
+timeout 90 scp -q -P "$GUEST_PORT" "$OUT/vm-wire-run.ps1" "$GUEST:C:/iwan/vm-wire-run.ps1" \
     || die "failed to upload the guest wrapper script"
 say "guest wrapper script: peer ${PEER_IP}:${PEER_PORT}"
 
@@ -122,7 +127,7 @@ PEER=$!
 sleep 3
 
 say "running guest wire test (-Inject -Wire, wrapper script at $OUT/vm-wire-run.ps1)"
-timeout $((WINDOW + 60)) ssh -o ConnectTimeout=12 nano11 \
+timeout $((WINDOW + 60)) ssh -p "$GUEST_PORT" -o ConnectTimeout=12 "$GUEST" \
     'powershell -NoProfile -ExecutionPolicy Bypass -File C:\iwan\vm-wire-run.ps1' \
     > "$OUT/guest.log" 2>&1
 
@@ -138,7 +143,7 @@ HELLOS=$(echo "$PEERLINE" | grep -oE 'hellos=[0-9]+' | cut -d= -f2)
 # Prefer the evidence dumped by the guest to rx-out.txt; without it fall back to the console log (same content: STATS lines and
 # ASCII payloads are both there; Chinese is lost to console encoding, which does not affect the criteria).
 EVID="$OUT/rx-out.txt"
-timeout 120 scp -q 'nano11:C:/iwan/rx-out.txt' "$EVID" 2>/dev/null || {
+timeout 120 scp -q -P "$GUEST_PORT" "$GUEST:C:/iwan/rx-out.txt" "$EVID" 2>/dev/null || {
     EVID="$OUT/guest.log"
     say "guest has no rx-out.txt; taking evidence from the console log instead ($EVID)"
 }
@@ -185,10 +190,10 @@ sys.exit(0 if ok else 1)
 PY
 RC=$?
 
-timeout 60 ssh -o ConnectTimeout=12 nano11 \
+timeout 60 ssh -p "$GUEST_PORT" -o ConnectTimeout=12 "$GUEST" \
     'netsh advfirewall firewall delete rule name="iwan-wire-in"' >/dev/null 2>&1
 
-timeout 15 ssh -o ConnectTimeout=8 -o BatchMode=yes nano11 'echo ok' >/dev/null 2>&1 \
+timeout 15 ssh -p "$GUEST_PORT" -o ConnectTimeout=8 -o BatchMode=yes "$GUEST" 'echo ok' >/dev/null 2>&1 \
     && say "network after wire test: up" || { say "network after wire test: down"; RC=1; }
 
 [ $RC -eq 0 ] && say "PASS (evidence in $OUT/)" || say "FAIL (evidence in $OUT/)"

@@ -1,0 +1,115 @@
+; iwancnt2.inf -- second identity of the counting NIC (same binary, new image name and service).
+; Needed when the old iwancnt image is already loaded: the loader refuses a new image under a name
+; that is still resident (STATUS_DRIVER_FAILED_PRIOR_UNLOAD), and only a reboot clears that.
+;
+; This INF is ASCII-only on purpose: setupapi parses INF files as ANSI or
+; UTF-16LE, so non-ASCII bytes in an UTF-8 file would be decoded as cp1252.
+;
+; Two device models are defined so that ONE guest can host both ends of a
+; virtual wire:
+;     devcon.exe install win-driver\iwancnt2.inf iwancnt2    ; side A
+;     devcon.exe install win-driver\iwancnt2.inf iwancnt22b   ; side B
+; Each model carries its own Parameters block (PeerIp, Mac); the driver reads
+; those from its device driver key, not from the shared service key, so the
+; two instances really do disagree about who the peer is.
+; Remove:
+;     devcon.exe remove iwancnt2
+;     devcon.exe remove iwancnt22b
+;
+; No CatalogFile directive: the .cat is generated on the guest with
+; New-FileCatalog + Set-AuthenticodeSignature. An INF that names a missing
+; catalog fails to install, and a .sys with only its own signature is not
+; enough for an INF package under test signing.
+
+[Version]
+Signature       = "$Windows NT$"
+Class           = Net
+ClassGUID       = {4D36E972-E325-11CE-BFC1-08002BE10318}
+Provider        = %ProviderName%
+DriverVer       = 10/26/2026,1.0.0.0
+PnpLockdown     = 1
+
+[ControlFlags]
+ExcludeFromSelect = iwancnt2, iwancnt22b
+
+[Manufacturer]
+%ManufacturerName% = iwancnt2, NTamd64
+
+[iwancnt2.NTamd64]
+%DeviceDesc%  = iwancnt2_Install,  iwancnt2
+%DeviceDescB% = iwancnt2_InstallB, iwancnt22b
+
+[iwancnt2_Install]
+; NCF_VIRTUAL: no hardware behind it, the driver fabricates the adapter.
+Characteristics    = 0x1
+; 802.3 media: the counting NIC is a plain ethernet segment with one peer.
+*IfType            = 6
+*MediaType         = 0
+*PhysicalMediaType = 0
+; Address and route are set by the measurement script (netsh / route add).
+EnableDhcp         = 0
+CopyFiles          = iwancnt2_CopyFiles
+AddReg             = iwancnt2_Reg
+
+[iwancnt2_InstallB]
+Characteristics    = 0x1
+*IfType            = 6
+*MediaType         = 0
+*PhysicalMediaType = 0
+EnableDhcp         = 0
+CopyFiles          = iwancnt2_CopyFiles
+AddReg             = iwancnt2_RegB
+
+[iwancnt2_Install.Services]
+AddService = iwancnt2, 0x00000002, iwancnt2_Service
+
+[iwancnt2_InstallB.Services]
+AddService = iwancnt2, 0x00000002, iwancnt2_Service
+
+[iwancnt2_Reg]
+; HKR is the device instance key (Enum\ROOT\NET\NNNN): present ndis5 upward,
+; bind nothing below (the adapter is fabric, not a child of another adapter).
+; LowerRange "ethernet" tells NDIS which medium this miniport's lower edge is.
+HKR, Ndi,            Service,    0, "iwancnt2"
+HKR, Ndi\Interfaces, UpperRange, 0, "ndis5"
+HKR, Ndi\Interfaces, LowerRange, 0, "ethernet"
+
+; Measurement parameters. Disarm = 1 by default: the adapter installs but
+; InitializeEx refuses to run until the fuse is released, because one bad
+; bring-up is enough to make the machine unbootable.
+HKR, Parameters, Disarm,   0x00010001, 1
+HKR, Parameters, Bridge,   0x00010001, 1
+HKR, Parameters, PeerIp,   0x00000000, "10.200.0.1"
+HKR, Parameters, Mac,      0x00000000, "02-00-49-57-41-4e"
+
+[iwancnt2_RegB]
+HKR, Ndi,            Service,    0, "iwancnt2"
+HKR, Ndi\Interfaces, UpperRange, 0, "ndis5"
+HKR, Ndi\Interfaces, LowerRange, 0, "ethernet"
+
+HKR, Parameters, Disarm,   0x00010001, 1
+HKR, Parameters, Bridge,   0x00010001, 1
+HKR, Parameters, PeerIp,   0x00000000, "10.200.0.2"
+HKR, Parameters, Mac,      0x00000000, "02-00-49-57-41-4f"
+
+[DestinationDirs]
+DefaultDestDir    = 12
+iwancnt2_CopyFiles = 12
+
+[iwancnt2_CopyFiles]
+iwancnt2.sys
+
+[iwancnt2_Service]
+DisplayName   = %ServiceDesc%
+; ServiceType 1 = kernel driver, StartType 3 = demand (PnP starts it), ErrorControl 1.
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %12%\iwancnt2.sys
+
+[Strings]
+ProviderName     = "iWAN"
+ManufacturerName = "iWAN"
+DeviceDesc       = "iWAN Counting NIC 2A"
+DeviceDescB      = "iWAN Counting NIC 2B"
+ServiceDesc      = "iWAN Counting NIC Driver 2"

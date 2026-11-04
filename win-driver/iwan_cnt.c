@@ -32,8 +32,10 @@
 #define IWAN_CNT_MTU            1500u
 #define IWAN_CNT_NBL_CTX_SIZE   16u
 #define IWAN_CNT_LINK_SPEED     10000000000ULL
-#define IWAN_CNT_PARAM_PATH \
-	L"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\iwancnt\\Parameters"
+/* Diagnostic key, resolved from the registry path DriverEntry was given: a hard-wired
+ * Services\iwancnt\Parameters made a second instance (iwancnt2) write its stages into the
+ * first instance's key, which reads as "the new image never ran" when it did. */
+static UNICODE_STRING g_cnt_param_path;
 
 #define IWAN_CNT_ETH_HDR        14u
 #define IWAN_CNT_ETH_IPV4       0x0800u
@@ -155,11 +157,32 @@ iwan_cnt_open_params(_In_ NDIS_HANDLE adapter_handle, _Out_ HANDLE *key)
 	if (pdo != NULL) {
 		st = IoOpenDeviceRegistryKey(pdo, PLUGPLAY_REGKEY_DRIVER,
 					     KEY_READ, key);
-		if (NT_SUCCESS(st))
+		if (NT_SUCCESS(st)) {
+			/* The INF puts Disarm/Bridge/PeerIp/Mac under the "Parameters" subkey of the
+			 * driver key (same shape as Services\<name>\Parameters); open that, and fall
+			 * back to the key root when it is absent. Reading only the root made the fuse
+			 * unfixable: the INF wrote into Parameters, the driver looked at the root, saw
+			 * nothing and kept its "disarmed" default forever (device stayed at Code 10). */
+			HANDLE sub = NULL;
+			UNICODE_STRING pn;
+			OBJECT_ATTRIBUTES sa;
+
+			RtlInitUnicodeString(&pn, L"Parameters");
+			InitializeObjectAttributes(&sa, &pn,
+						   OBJ_CASE_INSENSITIVE |
+							   OBJ_KERNEL_HANDLE,
+						   *key, NULL);
+			if (NT_SUCCESS(ZwOpenKey(&sub, KEY_READ, &sa))) {
+				ZwClose(*key);
+				*key = sub;
+			}
 			return TRUE;
+		}
 	}
 
-	RtlInitUnicodeString(&path, IWAN_CNT_PARAM_PATH);
+	if (g_cnt_param_path.Buffer == NULL)
+		return FALSE;
+	path = g_cnt_param_path;
 	InitializeObjectAttributes(&oa, &path,
 				   OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
 				   NULL, NULL);
@@ -301,7 +324,9 @@ iwan_cnt_trace(_In_ ULONG stage, _In_ LONG status)
 	ULONG n = stage, t = 0, i = 0;
 	ULONG v = (ULONG)status;
 
-	RtlInitUnicodeString(&path, IWAN_CNT_PARAM_PATH);
+	if (g_cnt_param_path.Buffer == NULL)
+		return;
+	path = g_cnt_param_path;
 	InitializeObjectAttributes(&oa, &path,
 				   OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
 				   NULL, NULL);
@@ -1156,15 +1181,41 @@ iwan_cnt_halt(_In_ NDIS_HANDLE MiniportAdapterContext,
 
 /* ---- Driver entry -------------------------------------------------------- */
 
+typedef struct {
+	UCHAR minor;	/* 0xFF = use the runtime minor version */
+	UCHAR rev;
+} IWAN_CNT_CH_CAND;
+
+static const IWAN_CNT_CH_CAND iwan_cnt_ch_cands[] = {
+	{ 0xFF, NDIS_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_3 },
+	{ 0xFF, NDIS_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_2 },
+	{ 0xFF, NDIS_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_1 },
+	{ 80,   NDIS_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_1 },
+	{ 60,   NDIS_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_1 },
+	{ 20,   NDIS_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_1 }
+};
+
 static VOID
 iwan_cnt_fill_ch(_Out_ PNDIS_MINIPORT_DRIVER_CHARACTERISTICS ch,
-		 _In_ UCHAR minor)
+		 _In_ UCHAR minor, _In_ UCHAR revision)
 {
 	RtlZeroMemory(ch, sizeof(*ch));
 	ch->Header.Type = NDIS_OBJECT_TYPE_MINIPORT_DRIVER_CHARACTERISTICS;
-	ch->Header.Revision = NDIS_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_1;
-	ch->Header.Size =
-		NDIS_SIZEOF_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_1;
+	ch->Header.Revision = revision;
+	switch (revision) {
+	case NDIS_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_3:
+		ch->Header.Size =
+			NDIS_SIZEOF_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_3;
+		break;
+	case NDIS_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_2:
+		ch->Header.Size =
+			NDIS_SIZEOF_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_2;
+		break;
+	default:
+		ch->Header.Size =
+			NDIS_SIZEOF_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_1;
+		break;
+	}
 	ch->MajorNdisVersion = 6;
 	ch->MinorNdisVersion = minor;
 	ch->MajorDriverVersion = 1;
@@ -1190,23 +1241,56 @@ DriverEntry(_In_ PDRIVER_OBJECT DriverObject,
 	NDIS_MINIPORT_DRIVER_CHARACTERISTICS ch;
 	NDIS_HANDLE handle = NULL;
 	NDIS_STATUS st;
-	UCHAR minor;
+	UCHAR runtime;
+	ULONG i;
 
 	ExInitializeDriverRuntime(DrvRtPoolNxOptIn);
+	/* <RegistryPath>\Parameters, so every instance traces into its own key. Freed never: the
+	 * driver lives as long as the machine, and a dangling UNICODE_STRING is worse than a leak. */
+	if (g_cnt_param_path.Buffer == NULL && RegistryPath != NULL &&
+	    RegistryPath->Buffer != NULL && RegistryPath->Length > 0) {
+		static const WCHAR tail[] = L"\\Parameters";
+		USHORT total = (USHORT)(RegistryPath->Length + sizeof(tail) - sizeof(WCHAR));
+		PWCH buf = (PWCH)ExAllocatePool2(POOL_FLAG_NON_PAGED, total,
+						 IWAN_CNT_TAG);
+
+		if (buf != NULL) {
+			RtlCopyMemory(buf, RegistryPath->Buffer, RegistryPath->Length);
+			RtlCopyMemory((PUCHAR)buf + RegistryPath->Length, tail,
+				      sizeof(tail) - sizeof(WCHAR));
+			g_cnt_param_path.Buffer = buf;
+			g_cnt_param_path.Length = (USHORT)(total - sizeof(WCHAR));
+			g_cnt_param_path.MaximumLength = total;
+		}
+	}
 	/* The instance table must be ready before any NIC's InitializeEx runs: bridgers walk it. */
 	InitializeListHead(&g_cnt_list);
 	KeInitializeSpinLock(&g_cnt_lock);
 	g_cnt_list_ready = TRUE;
 	iwan_cnt_trace(30, (LONG)NdisGetVersion());
 
-	minor = (UCHAR)(NdisGetVersion() & 0xFFu);
-	if (minor < 20)
-		minor = 20;
-	iwan_cnt_fill_ch(&ch, minor);
+	/* Miniport registration: try the highest characteristics revision first, then fall back.
+	 * A hard-wired REVISION_1 at the runtime minor version is rejected on a current NDIS (the
+	 * first bring-up came back as 0xC0000365, "a previous version is still in memory", which is
+	 * not what happened -- nothing had ever been loaded); iwanmp found the same thing and is
+	 * registered as runtime minor + REVISION_3. */
+	runtime = (UCHAR)(NdisGetVersion() & 0xFFu);
+	st = NDIS_STATUS_BAD_CHARACTERISTICS;
+	for (i = 0; i < RTL_NUMBER_OF(iwan_cnt_ch_cands); i++) {
+		UCHAR minor = iwan_cnt_ch_cands[i].minor;
+		UCHAR rev = iwan_cnt_ch_cands[i].rev;
 
-	st = NdisMRegisterMiniportDriver(DriverObject, RegistryPath, NULL, &ch,
-					 &handle);
-	iwan_cnt_trace(31, (LONG)st);
+		if (minor == 0xFFu)
+			minor = (runtime < 20) ? 20 : runtime;
+		iwan_cnt_fill_ch(&ch, minor, rev);
+		st = NdisMRegisterMiniportDriver(DriverObject, RegistryPath,
+						 NULL, &ch, &handle);
+		iwan_cnt_trace(31, (LONG)st);
+		if (st == NDIS_STATUS_SUCCESS) {
+			iwan_cnt_trace(32, (LONG)(((ULONG)minor << 8) | rev));
+			break;
+		}
+	}
 	if (st != NDIS_STATUS_SUCCESS) {
 		/* Registration failed: the image will be unloaded, so returning failure is safe. */
 		return st;
@@ -1214,6 +1298,5 @@ DriverEntry(_In_ PDRIVER_OBJECT DriverObject,
 	/* After successful registration never return failure and never unregister again: otherwise NDIS would hold callbacks
 	 * pointing into an unloaded image and the machine would not boot (a pit iwanmp already fell into). */
 	DriverObject->DriverUnload = NULL;
-	iwan_cnt_trace(32, 0);
 	return NDIS_STATUS_SUCCESS;
 }
