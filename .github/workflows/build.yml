@@ -208,7 +208,7 @@ jobs:
           python3 tests/relay_socks_harness.py
           # Panabit SD-WAN extension surface: fragment reassembly, SEGRT header,
           # SR key derivation (incl. reference jhash/key vectors), 36-byte ECHO payload; pure logic, no root.
-          ./build-sanitize/sdwan_ext_test
+          ./bin/sdwan_ext_test
 
       # Root-free data-plane test: the lwIP bridge uploads a pattern through
       # the readv/commit path against an in-process fake TCP peer and verifies

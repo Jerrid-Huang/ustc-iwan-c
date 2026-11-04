@@ -43,7 +43,7 @@ static int open_tun_flags(const char *name, int extra_flags) {
      * arithmetic value: TUNSETIFF only tests its bits, and IFF_TUN_EXCL
      * (0x8000) deliberately sets the top one, so the combined value 0x9101
      * exceeds SHRT_MAX. Build the mask in unsigned, refuse anything that
-     * does not fit the 16-bit field (defence in depth — today's only
+     * does not fit the 16-bit field (defence in depth -- today's only
      * callers pass IFF_TUN_EXCL or 0), then copy the exact bit pattern in,
      * instead of an implementation-defined int->short conversion. */
     _Static_assert(sizeof(uint16_t) == sizeof ifr.ifr_flags,
@@ -70,7 +70,7 @@ static int open_tun_flags(const char *name, int extra_flags) {
 
 int open_tun(const char *name) {
     /* IFF_TUN_EXCL: main-device creation must never silently attach to
-     * an interface created by someone else — TUNSETIFF fails EBUSY if
+     * an interface created by someone else -- TUNSETIFF fails EBUSY if
      * `name` is already in use, instead of joining it (and then
      * setup_tun flushing its addresses). */
     return open_tun_flags(name, IFF_TUN_EXCL);
@@ -81,7 +81,7 @@ int open_tun(const char *name) {
  * we own and EXCL would make TUNSETIFF fail EBUSY, so extra queues
  * would be impossible. (A legacy SO_RCVBUF setsockopt was removed here:
  * a tun device fd is a character device, so setsockopt always returns
- * ENOTSOCK and never did anything — the receive-side buffering is the
+ * ENOTSOCK and never did anything -- the receive-side buffering is the
  * device packet queue, not a socket rcvbuf.) */
 int tun_attach(const char *name) {
     return open_tun_flags(name, 0);
@@ -96,7 +96,7 @@ void tun_detach(int fd) {
      * bare flag integer as the ioctl arg made the kernel fail with
      * EFAULT, silently masked by the close() that followed (the close
      * does detach the queue regardless). The real detach still happens
-     * on close, so failure here is non-fatal — log it for diagnosis. */
+     * on close, so failure here is non-fatal -- log it for diagnosis. */
     if (ioctl(fd, TUNSETQUEUE, &ifr) < 0)
         log_debug("tun_detach: TUNSETQUEUE: %s (close will detach)",
                   strerror(errno));
@@ -124,39 +124,78 @@ const char *tun_ifname(const char *name)
  * flow hash; the kernel maps the return value via ret % numqueues.
  * The program is embedded (steer_bpf.o -> steer_bpf_data.c, see
  * CMakeLists.txt). When the build cannot produce a BPF object
- * (IWAN_NO_STEER_BPF: no clang bpf target or no linux/bpf.h — e.g.
+ * (IWAN_NO_STEER_BPF: no clang bpf target or no linux/bpf.h -- e.g.
  * cross builds without kernel headers), tun_steering_attach degrades
  * to the kernel automq steering, like the Windows backend. */
 
 #ifndef IWAN_NO_STEER_BPF
+/* bpf_prog_load_steer: load the steering classifier, treating the
+ * verifier log as purely diagnostic.
+ *
+ * Kernel rule (bpf_verifier_log_attr_valid() in kernel/bpf/log.c; also
+ * documented in man 2 bpf): a load that passes log_buf/log_size while
+ * log_level == 0 is rejected outright with EINVAL.  The first attempt
+ * below therefore leaves both fields at 0 (from the memset) and only
+ * the failure path enables logging.
+ *
+ * A log buffer too small for the verifier trace makes the whole load
+ * fail with ENOSPC and the kernel overwrites the real error code, so
+ * the size of a diagnostic buffer can hide the actual reason a valid
+ * program was rejected.  Measured on kernel 7.0.0-31-generic: the
+ * trace for the embedded 59-instruction socket-filter classifier is
+ * 4194 bytes, which is why the former 4096-byte buffer failed to load
+ * a valid program and why the buffer below is 64 KiB.
+ *
+ * static, never on the stack: the trace is several KiB and grows with
+ * kernel verbosity, while the caller may run on a small-stack thread.
+ * A concurrent caller could only garble this diagnostic text, never
+ * the fd returned below. */
 static int bpf_prog_load_steer(const struct bpf_insn *insns,
                                    unsigned int cnt, const char *license)
 {
-    /* Zero the log before use: the first load runs with log_level=0
-     * (the kernel need not write anything); if the retry with the
-     * verifier log enabled also fails before filling it, the log_err
-     * below would otherwise print uninitialized stack garbage. */
-    char log[4096] = {0};
+    static char log[64 * 1024];
     union bpf_attr attr;
-    int fd;
+    int first_errno, fd;
 
     memset(&attr, 0, sizeof attr);
     attr.prog_type = BPF_PROG_TYPE_SOCKET_FILTER;
     attr.insn_cnt = cnt;
     attr.insns = (unsigned long)insns;
     attr.license = (unsigned long)license;
+    /* No log buffer here: log_buf != 0 with log_level == 0 is EINVAL. */
+    fd = (int)syscall(__NR_bpf, BPF_PROG_LOAD, &attr, sizeof attr);
+    if (fd >= 0)
+        return fd;
+    first_errno = errno;
+
+    /* Retry with the verifier log for diagnostics. */
+    log[0] = '\0';
     attr.log_buf = (unsigned long)log;
     attr.log_size = sizeof log;
+    attr.log_level = 1;
     fd = (int)syscall(__NR_bpf, BPF_PROG_LOAD, &attr, sizeof attr);
-    if (fd < 0) {
-        /* retry with the verifier log for diagnostics */
-        attr.log_level = 1;
+    if (fd >= 0)
+        return fd;
+    /* The kernel may have filled the buffer without terminating it. */
+    log[sizeof log - 1] = '\0';
+    if (errno == ENOSPC) {
+        log_err("tun steering: bpf load: %s", log);
+        /* Only the log buffer was too small, not the program, so
+         * reload without diagnostics instead of losing steering. */
+        attr.log_buf = 0;
+        attr.log_size = 0;
+        attr.log_level = 0;
         fd = (int)syscall(__NR_bpf, BPF_PROG_LOAD, &attr, sizeof attr);
-        if (fd < 0)
-            log_err("tun steering: bpf load: %s", log);
+        if (fd >= 0) {
+            log_err("tun steering: verifier log did not fit in the "
+                    "64 KiB buffer; program loaded without it");
+            return fd;
+        }
+    } else {
+        log_err("tun steering: bpf load: %s", log);
     }
-    if (fd < 0)
-        log_err("tun steering: bpf load failed: %s", strerror(errno));
+    log_err("tun steering: bpf load failed: %s (first attempt: %s)",
+            strerror(errno), strerror(first_errno));
     return fd;
 }
 #endif /* !IWAN_NO_STEER_BPF */
@@ -200,7 +239,7 @@ int tun_steering_attach(int tun_fd)
 
         if (sh[i].sh_offset > olen || sh[i].sh_size > olen - sh[i].sh_offset)
             continue;
-        /* R21b: sh_name is an offset into the string table — bound it to
+        /* R21b: sh_name is an offset into the string table -- bound it to
          * the table and require a NUL within it before strcmp can read
          * past the embedded blob */
         if (sh[i].sh_name >= shstr->sh_size)
@@ -210,7 +249,7 @@ int tun_steering_attach(int tun_fd)
             continue;
         if (strcmp(name, "classifier") == 0) {
             /* the kernel reads insns as (cnt * sizeof insn) bytes; a
-             * trailing partial instruction would be loaded silently —
+             * trailing partial instruction would be loaded silently --
              * reject it explicitly instead of truncating */
             if (sh[i].sh_size % sizeof(struct bpf_insn) != 0) {
                 log_err("tun steering: classifier section is %zu bytes, "
@@ -369,7 +408,7 @@ int tun_write_retry(int fd, const uint8_t *pkt, size_t len, int max_ms,
             /* R37 WG-E2 (R3-L8): this retry used to `continue` past the
              * max_ms budget check below, so a permanent EINTR made the
              * 50ms bound (and its "still full after the bound: dropped"
-             * contract) unenforceable — measured >3s for a 50ms budget
+             * contract) unenforceable -- measured >3s for a 50ms budget
              * with a reader keeping the pipe drained. Check the same
              * budget here. */
             if (max_ms > 0 && now_ms() - t0 >= (uint64_t)max_ms)
@@ -469,7 +508,7 @@ struct tun_pool {
                             * cannot even start until every writer that
                             * selected the queue has released its read
                             * lock. Always taken by the pool owner thread
-                            * (tick) or by writers — never by reader
+                            * (tick) or by writers -- never by reader
                             * threads, whose exit path does not touch it. */
     int maxq;
     int slow_start;   /* AIMD state: slow-start phase flag */
@@ -548,7 +587,7 @@ static void *tun_reader_main(void *ud)
             if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
                 log_debug("tun reader q=%ld: fd gone (%s)",
                           (long)(q - pool->qs), strerror(errno));
-            /* R54-WG3-1: this exit has NO pool-owner stop — the queue's
+            /* R54-WG3-1: this exit has NO pool-owner stop -- the queue's
              * device fd died under us, which for a pool-owned tun means
              * external deletion (`ip link del`, netns teardown, driver
              * unload). Publish dead BEFORE leaving so tun_pool_tick can
@@ -592,7 +631,7 @@ static void *tun_reader_main(void *ud)
 /* start a reader thread on an already-open queue fd and publish it as
  * the newest pool queue. On success the pool owns `fd` (as an extra
  * queue, later closed by tun_pool_destroy/del). On failure `fd` is NOT
- * closed here — the caller keeps ownership and must close it (this keeps
+ * closed here -- the caller keeps ownership and must close it (this keeps
  * the pre-opened-fd path free of double-close when create_pre bins the
  * leftovers). */
 static int tun_pool_add_fd(struct tun_pool *pool, int fd)
@@ -666,8 +705,8 @@ static void tun_pool_del(struct tun_pool *pool)
      * uplink writer can select queue i (writers spread across tid % nq
      * and i is now out of range). A writer that had already read the old
      * nq and selected i is either (a) still writing under the pool's
-     * read lock — the write lock below waits for it, so its write lands
-     * on the still-open fd and only then do we close — or (b) already
+     * read lock -- the write lock below waits for it, so its write lands
+     * on the still-open fd and only then do we close -- or (b) already
      * dropped on stop==1. Under this ordering the close can never be
      * followed by a stale writer write to a recycled fd number: the
      * detach/close hold the write lock, and every writer holds the read
@@ -730,7 +769,7 @@ struct tun_pool *tun_pool_create_pre(const char *name, int fd0, int maxq,
     /* eager start: reach initq-1 extra queues up front (used by the
      * client pump, whose bulk uplink would otherwise make the AIMD hunt
      * between the single-queue and multi-queue capacities). Prefer the
-     * caller's pre-opened queue fds (taken, not attached) — the server
+     * caller's pre-opened queue fds (taken, not attached) -- the server
      * opened them while still root so the unprivileged child can keep a
      * real multi-queue fan-out; any shortfall then falls back to
      * tun_attach for deployments that still have the capability at pool
@@ -779,16 +818,16 @@ int tun_pool_queues(const struct tun_pool *pool)
 int tun_pool_write_fd(const struct tun_pool *pool, unsigned tid)
 {
     /* R30-f2E: tun_pool_del marks the last queue stop==1 BEFORE publishing
-     * the smaller nq and closing it — retrying with the fresh nq closes the
+     * the smaller nq and closing it -- retrying with the fresh nq closes the
      * classic "loaded old nq then used the just-removed fd" TOCTOU window.
      * (The stop flag is atomic; a reader that raced a del can still get an
      * EBADF in the tiny gap before close, which the caller treats as a
-     * transient drop — this removes the deterministic reuse-of-removed-fd.)
+     * transient drop -- this removes the deterministic reuse-of-removed-fd.)
      * R54-WG3-3: this API returns a raw fd, so it CANNOT hold the pool's
      * read lock across the caller's write; the residual window (del closes
      * the fd after we return it, the fd number is recycled by a concurrent
      * open, and our write lands on an unrelated socket) is real. The
-     * server no longer calls it — uplink writes go through tun_pool_write,
+     * server no longer calls it -- uplink writes go through tun_pool_write,
      * which performs the write under the pool lock and makes that window
      * unreachable. Kept for callers that need the raw fd and accept the
      * documented transient-drop contract. */
@@ -803,7 +842,7 @@ int tun_pool_write_fd(const struct tun_pool *pool, unsigned tid)
     return -1;   /* still pointing at a queue being removed: caller drops */
 }
 
-/* R54-WG3-3: lock-protected uplink write — the server's ONLY pool write
+/* R54-WG3-3: lock-protected uplink write -- the server's ONLY pool write
  * path. Selects the queue fd for uplink writer `tid` exactly like
  * tun_pool_write_fd, but performs the whole tun_write_retry while holding
  * the pool's read lock, and tun_pool_del / tun_pool_destroy close queue
@@ -811,7 +850,7 @@ int tun_pool_write_fd(const struct tun_pool *pool, unsigned tid)
  * never hit a closed-and-recycled fd number:
  *   - while the write runs, del's close cannot even start (write lock
  *     acquisition blocks until we release the read lock), so the fd is
- *     open for the whole write — the byte we write goes to the tun device
+ *     open for the whole write -- the byte we write goes to the tun device
  *     and nothing else;
  *   - once del's close has run, every writer that selected that queue has
  *     already released its read lock (that is the only way del obtained
@@ -822,7 +861,7 @@ int tun_pool_write_fd(const struct tun_pool *pool, unsigned tid)
  * itself as a window in which the fd could be closed+reused; mutual
  * exclusion is the only way to bind fd validity to the write itself.
  * Returns tun_write_retry's result: 0 fully written, -1 transient drop
- * (persistent EAGAIN past max_ms, or EBADF-class fd death — serving the
+ * (persistent EAGAIN past max_ms, or EBADF-class fd death -- serving the
  * same "drop, the client retransmits" contract as before). */
 int tun_pool_write(struct tun_pool *pool, unsigned tid,
                    const uint8_t *pkt, size_t len, int max_ms)
@@ -841,7 +880,7 @@ int tun_pool_write(struct tun_pool *pool, unsigned tid,
     if (atomic_load_explicit(&q->stop, memory_order_acquire)) {
         /* Defensive only: under the read lock a completed del already
          * excluded this queue from nq (del publishes nq before taking the
-         * write lock), so a stop==1 queue inside [0, nq) is unobservable —
+         * write lock), so a stop==1 queue inside [0, nq) is unobservable --
          * this guards against future ownership patterns, not today's. */
         pthread_rwlock_unlock(&pool->rw);
         return -1;
@@ -855,7 +894,7 @@ int tun_pool_write(struct tun_pool *pool, unsigned tid,
  * mark set). The server's fail-fast probe reads this once per second as
  * an INDEPENDENT death signal: after an external device deletion every
  * reader gets POLLHUP and exits with stop==0, so this is >0 even in the
- * sub-second window before if_nametoindex runs — and, crucially, even if
+ * sub-second window before if_nametoindex runs -- and, crucially, even if
  * a racing tun_pool_tick grow already re-created the same-named device
  * (the dead reader marks stay in the pool, so the recreation cannot hide
  * the loss from this probe). Normal pool death (del/destroy stop, then
@@ -923,18 +962,18 @@ void tun_pool_tick(struct tun_pool *pool)
     int nq = atomic_load(&pool->nq);
 
     /* R54-WG3-1: unexpected reader exits (dead marks) mean the device fds
-     * died without a pool-owner stop — external `ip link del`, netns
+     * died without a pool-owner stop -- external `ip link del`, netns
      * teardown, driver unload. The wait-based busy signal then reads
      * "no poll ever timed out" as busy=1.0 and would GROW: tun_pool_add ->
      * tun_attach would re-create a fresh device with the same name, attach
      * a new reader, and the caller's if_nametoindex dead-tunnel probe
-     * would see a live index again — the deleted tunnel "resurrects" as a
+     * would see a live index again -- the deleted tunnel "resurrects" as a
      * nameless, route-less device while keepalives still look alive,
      * masking the R43-C1-L1 fail-fast. Refuse BOTH grow and shrink while
      * any in-range reader is dead: growing would mask the loss, shrinking
      * would merely drop queues whose fd is already gone, and every
      * legitimate queue death sets stop (del/destroy) and never reaches
-     * this branch — so AIMD grow under load (all readers alive polling)
+     * this branch -- so AIMD grow under load (all readers alive polling)
      * is untouched. The server's probe exits the process promptly; this
      * guard is what prevents the rebuild in the window before that. */
     {

@@ -1641,7 +1641,7 @@ static void handle_segrt(struct server_ctx *ctx, const struct server_user *users
          * plus padlen bytes of trailing padding. The key comes from --sr-password +
          * link-table hash (same construction as the official client's set_sr_encrypt).
          * Decrypt must be whole-block, in place; any failure may only drop the frame -- never deliver ciphertext as plaintext. */
-        static _Thread_local uint8_t sbuf[IWAN_SR_BUF_MAX];
+        static _Thread_local uint8_t srbuf[IWAN_SR_BUF_MAX];
         uint8_t key[32];
         size_t klen, clen;
 
@@ -1650,19 +1650,19 @@ static void handle_segrt(struct server_ctx *ctx, const struct server_user *users
             atomic_fetch_add_explicit(&g_up[tid].h1, 1, memory_order_relaxed);
             return;
         }
-        if (len <= hl + IWAN_HDR_LEN + sr.padlen || len > sizeof sbuf)
+        if (len <= hl + IWAN_HDR_LEN + sr.padlen || len > sizeof srbuf)
             return;
         klen = iwan_sr_key(g_sr_password, sr.links, sr.linkcnt, sr.algo, key);
         clen = len - hl - IWAN_HDR_LEN - sr.padlen;
         if (clen == 0 || clen % 16 != 0)
             return;
-        memcpy(sbuf, raw, len);
-        if (!iwan_sr_crypt(sbuf + hl + IWAN_HDR_LEN, clen, key, (unsigned)klen * 8,
+        memcpy(srbuf, raw, len);
+        if (!iwan_sr_crypt(srbuf + hl + IWAN_HDR_LEN, clen, key, (unsigned)klen * 8,
                            false))
             return;
-        if (!frag_type_dispatchable(sbuf[hl]))
+        if (!frag_type_dispatchable(srbuf[hl]))
             return;
-        handle_udp(ctx, users, nusers, sbuf + hl, len - hl - sr.padlen, peer,
+        handle_udp(ctx, users, nusers, srbuf + hl, len - hl - sr.padlen, peer,
                    sockfd, tid);
         return;
     }

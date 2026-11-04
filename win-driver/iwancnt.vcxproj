@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  iwancnt.vcxproj -- project for a counting, echo-capable virtual Ethernet adapter.
+  iwancnt.vcxproj - project for a counting, echo-capable virtual Ethernet adapter.
 
   It belongs to no data plane: neither the WFP plane (iwan.sys) nor the NDIS plane
   (iwanmp.sys); it is the peer adapter for both, so a tunnel can saturate on one machine

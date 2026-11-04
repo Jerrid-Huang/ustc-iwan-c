@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  iwanmp.vcxproj -- project for the NDIS miniport + protocol driver (second Windows data plane).
+  iwanmp.vcxproj - project for the NDIS miniport + protocol driver (second Windows data plane).
 
   Relation to iwan.vcxproj (the WFP plane): two binaries, one control plane. iwanmp.sys
   is itself the inner virtual adapter (miniport) and also registers a protocol driver that
@@ -111,7 +111,7 @@
          NDIS630: the two families (NDISnnn and NDISnnn_MINIPORT) must not appear in one unit.
          The 683 level is used (as in the Wintun reference) because
          NDIS_SUPPORT_NDIS680 is only set when declaring 6.80+, and both REVISION_3 of the
-         characteristics table and SynchronousOidRequestHandler sit behind that gate -- registration
+         characteristics table and SynchronousOidRequestHandler sit behind that gate - registration
          must pick the newest revision at runtime, so it has to be visible at compile time. -->
     <ClCompile Include="iwan_win_mp.c">
       <PreprocessorDefinitions>NDIS_MINIPORT_DRIVER;NDIS620_MINIPORT;NDIS683_MINIPORT;NDIS_WDM;IWAN_WIN_PLANE_MP;%(PreprocessorDefinitions)</PreprocessorDefinitions>

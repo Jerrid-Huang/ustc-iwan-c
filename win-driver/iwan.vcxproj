@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  iwan.vcxproj -- MSBuild project for the Windows kernel data-plane driver (WFP callout).
+  iwan.vcxproj - MSBuild project for the Windows kernel data-plane driver (WFP callout).
 
   This is a WDM driver (no KMDF: one less framework dependency, easier to test-sign); it links
   fwpkclnt.lib (WFP kernel API) + ndis.lib (NBL helpers) + wdmsec.lib (device ACL).
@@ -71,7 +71,7 @@
     <ClCompile>
       <!-- Sources are pure ASCII. /utf-8 is kept as a guard: if a non-ASCII literal ever
            comes back, the default execution charset (1252) would raise C4566, which under
-           TreatWarningAsError becomes C2220 -- a failure that once reported build success
+           TreatWarningAsError becomes C2220 - a failure that once reported build success
            while iwan.sys was missing from the artifacts. -->
       <AdditionalOptions>/source-charset:utf-8 /execution-charset:utf-8 %(AdditionalOptions)</AdditionalOptions>
       <AdditionalIncludeDirectories>$(ProjectDir)..\src\common;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>

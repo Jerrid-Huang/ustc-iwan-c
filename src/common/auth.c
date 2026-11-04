@@ -304,7 +304,11 @@ static bool parse_ack(const uint8_t *buf, size_t len, uint32_t expect_nonce,
 
         while (remain >= 2) {
             uint8_t lt = p[0], ll = p[1];
-            char hex[3 * 32 + 1];
+            /* 3 bytes per input byte plus NUL, and 3 more for the "..." ellipsis in the
+             * truncated case: the ellipsis is a 3-character string written at hex + 3 * 32,
+             * so the old 3 * 32 + 1 buffer left it writing past the end (clang reports
+             * 'strcpy will always overflow'). */
+            char hex[3 * 32 + 1 + 3];
             size_t vn;
 
             if (ll < 2 || (size_t)ll > remain)
