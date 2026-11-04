@@ -211,7 +211,11 @@ iwan_win_reg_read_mac(_Out_writes_(6) UINT8 *out)
 
 /* Read a REG_DWORD diagnostic switch from the Parameters subkey of this image's service key.
  * Returns TRUE = read (value is stored in *out), FALSE = not set / wrong shape (the caller keeps its default).
- * Only called from IOCTL_SESSION_OPEN (PASSIVE). */
+ * Only called from IOCTL_SESSION_OPEN (PASSIVE).
+ * _Success_(return != 0) is not decoration: FALSE is a normal outcome here ("value absent"), and without the
+ * annotation PREfast reads the _Out_ contract literally and reports C6101 "returning uninitialized memory" on the
+ * FALSE paths (every early return). The annotation is exactly what the analyzer asks for. */
+_Success_(return != 0)
 static BOOLEAN
 iwan_win_reg_read_dword(_In_ PCWSTR name, _Out_ UINT32 *out)
 {
