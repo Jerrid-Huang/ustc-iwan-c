@@ -230,3 +230,44 @@ v6 包按"不是我们的包"交回协议栈，不做扩展头链遍历。外层
 
 前两项与"回程"这项如果要做，建议顺序是：flow context（回程）→ 外层重组 →
 大段软件切分。
+
+## 诊断开关：`Parameters\PassThrough`（透传税测量）
+
+两个平面各自从**自己的服务键**读 `Parameters\PassThrough`（REG_DWORD），每次
+`SESSION_OPEN` 时读一次，缺省 0 = 正常转发。位定义与 Linux 模块的 `pass_through`
+完全一致，计数器复用现有 `tx_pkts/tx_bytes/rx_outer`，不新增 ABI 字段：
+
+| 位 | 名字 | 出向 | 入向 |
+|---|---|---|---|
+| 1 | `IWAN_WIN_PASS_TX` | 命中目标集合的包只计数、不封装不注入 | — |
+| 2 | `IWAN_WIN_PASS_RX` | — | 已过固定字段门的本会话外层帧只计数、不解析不解封 |
+
+WFP 平面：出向在"马上就要调 `iwan_win_encap_send_pkt`/`iwan_win_encap_inject`
+之前"判，入向在"已确认是本会话外层帧"之后立刻判，行为对齐 Linux 的
+`NF_ACCEPT`（包继续走，什么都不做）。iwanmp 平面：出向在引擎入口判，入向在
+协议边认领该帧之后判，`return FALSE` 即"不认领、原样交给常规绑定"。
+
+设置方法（驱动已加载时改完**重新 OPEN 会话**即可生效，不用重启）：
+
+```powershell
+Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\iwan\Parameters' `
+                 -Name PassThrough -Type DWord -Value 1     # WFP 平面，出向透传
+# iwanmp 平面把 Services\iwan 换成 Services\iwanmp 即可
+```
+
+用它测"封装税"：同一负载先把 `PassThrough=1` 跑一遍，再把值删掉跑一遍，两个
+`tx_pkts` 速率之差就是封装 + 注入的每包成本；入向同理用 `PassThrough=2` 与 0
+的 `rx_outer` 速率之差。
+
+## iwanmp 平面的内层 IPv6
+
+内层 **v4 与 v6 双向都支持**（帧类型仍是 `PT_DATA`/`PT_DATA_ENC`，与 Linux 侧
+`iwan_tx.c` 只按 `dp.enc` 选类型一致，不因内层版本换类型）。历史上这条路上行
+只放行 v4（`(inner[0] >> 4) != 4` 直接判坏包），而指示侧一直支持 v6，表现为
+"下行 v6 正常、上行 v6 被判格式错"，很容易误判成 v6 路由问题，所以两个门槛
+（`iwan_win_mp.c` 的 miniport 发送入口与 `iwan_win_mpdata.c` 的引擎入口）都改成
+按 `iwan_win_inner_family()`/`iwan_win_inner_sane()` 判族。
+
+仍然**只有外层 v4**：外层 v6 需要承载网卡上的邻居发现（NS/NA），属于下一阶段，
+现在显式拒绝并计 `tx_bad_state`（`IWAN_WIN_DIAG_TX_V6_NOT_IMPL`），不会退化成
+明文。

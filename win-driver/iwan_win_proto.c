@@ -1,109 +1,109 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * iwan_win_proto.c — NDIS 协议边：把外层 UDP 放到承载网卡上收发。
+ * iwan_win_proto.c -- NDIS protocol edge: move outer UDP over a carrier NIC.
  *
- * 这一半负责"外层怎么出去、怎么进来"：
+ * This half owns "how the outer layer goes out and comes back in":
  *
- *   发送：iwan_win_proto_send_outer4() 把引擎装好的整帧（含以太头）交给
- *         该会话选定的那张承载网卡，走 NdisSendNetBufferLists；完成回调
- *         只负责归还缓冲、递减在途计数。
- *   接收：注册的 ReceiveNetBufferLists 在每个绑定的网卡上收到**全部**帧，
- *         逐帧过滤 —— 只有"目的 IP = 会话外层源地址、目的端口 = 会话源
- *         端口、UDP"的才交给引擎，其余只读一眼就归还给 NDIS。
+ *   Send: iwan_win_proto_send_outer4() hands the whole frame (Ethernet header
+ *         included) assembled by the engine to the session's carrier NIC via
+ *         NdisSendNetBufferLists; completion only frees buffer, decrements in-flight.
+ *   Receive: the registered ReceiveNetBufferLists gets **every** frame on each
+ *         bound NIC and filters per frame -- only "dest IP = session outer src,
+ *         dest port = session sport, UDP" goes to the engine, rest read-only to NDIS.
  *
- * 三条与 WFP 平面不同的地方，都是"位置不同"带来的，不是设计取舍：
+ * Three differences from the WFP plane, all due to "being elsewhere", not design:
  *
- * ① 下一跳地址由控制面给（sess.outer_hop），不是驱动自己查路由：Windows
- *    没有给协议驱动用的内核态路由查询接口（netioapi.h 那族只对用户态导出
- *    GetBestRoute2；内核态只导出 Convert* 转换函数）。控制面建会话时本来
- *    就要为 carrier_mtu 查一次路由（src/common/kdp_win.c），顺手把接口索引
- *    与下一跳填进 SESSION_OPEN 即可。查不到就退回"对端在链路上"（下一跳
- *    等于外层目的地址），这是隧道的默认拓扑。
- * ② 邻居（ARP）自己做：本平面不走主机 IP 栈，协议驱动也不会替我们解析。
- *    请求按 IWAN_MP_ARP_RETRY_MS 限速、缓存按 IWAN_MP_ARP_HOLD_MS 老化，
- *    全部用时间戳判断，不引入定时器/DPC/工作项（与整个驱动同一约定）。
- * ③ 控制帧刻意不吸收：承载网卡的常规 TCP/IP 绑定是**另一个**协议驱动，
- *    它照样会把同一批外层 UDP 交给用户态套接字，所以 PT_OPEN_ACK、ECHO、
- *    CLOSE 的控制面在用户态原样可用。本边只记账（rx_ctrl_frame、mark_rx/
- *    mark_close），不截断、不向上指示任何东西 —— 协议驱动也没有"向上指示"
- *    这一说，帧要么自己用掉、要么还给 NDIS。
+ * (1) Next hop is given by the control plane (sess.outer_hop), not from a
+ *     driver lookup: Windows has no kernel-mode route query API for protocol
+ *     drivers (netioapi.h exports GetBestRoute2 user-mode only; kernel only
+ *     Convert*). The control plane already looks up a route for carrier_mtu
+ *     at session open (src/common/kdp_win.c), so it fills ifindex+next hop
+ *     into SESSION_OPEN; else "peer on link" (next hop = outer dst), the default tunnel topology.
+ * (2) ARP is ours: this plane does not use the host IP stack and the protocol
+ *     driver will not resolve for us. Requests are rate-limited by IWAN_MP_ARP_RETRY_MS,
+ *     the cache aged by IWAN_MP_ARP_HOLD_MS; all timestamp-based, no timer/DPC/work item (whole-driver convention).
+ * (3) Control frames are deliberately not absorbed: the regular TCP/IP binding on
+ *     the carrier NIC is **another** protocol driver, and it still hands the same
+ *     outer UDP to the user-mode socket, so the PT_OPEN_ACK, ECHO, CLOSE control
+ *     plane stays usable as-is in user mode. This edge only accounts (rx_ctrl_frame, mark_rx/mark_close), truncates nothing
+ *     and indicates nothing up -- a protocol driver has no "indicate up"; a frame is either consumed or returned to NDIS.
  *
- * 并发：回调可能在 DISPATCH_LEVEL（ReceiveNetBufferLists 带
- * NDIS_RECEIVE_FLAGS_DISPATCH_LEVEL、发送完成回调亦然）。本文件不等待、
- * 不加互斥、不碰可分页内存；绑定表由 g_bind_lock 保护，会话相关的
- * active/下一跳/邻居缓存由 mp.lock 保护，临界区都只有几条赋值。
+ * Concurrency: callbacks may run at DISPATCH_LEVEL (ReceiveNetBufferLists passes
+ * NDIS_RECEIVE_FLAGS_DISPATCH_LEVEL, and so does the send completion callback).
+ * This file never waits, takes no mutex, touches no paged memory; the binding table
+ * is guarded by g_bind_lock, the session active/next-hop/neighbor cache by mp.lock; every critical section is a few assignments.
  */
 #include "iwan_win.h"
 
-/* ARP 请求的最小间隔与缓存有效期 */
+/* Minimum interval between ARP requests and cache lifetime */
 #define IWAN_MP_ARP_RETRY_MS	1000u
 #define IWAN_MP_ARP_HOLD_MS	60000u
 
-/* 收到的 NBL 允许的最大单包长度：外层数据报 = 承载 MTU 上限 + 余量。
- * 超过这个长度的帧不可能是本会话的。 */
+/* Maximum single-packet length accepted on receive: an outer datagram = carrier
+ * MTU ceiling + slack. A frame longer than this cannot belong to this session. */
 #define IWAN_MP_RECV_MAX	2048u
 
-/* 一个承载绑定（一张以太网卡）。生命周期：BindAdapter → UnbindAdapter。 */
+/* One carrier binding (one Ethernet NIC). Lifetime: BindAdapter -> UnbindAdapter. */
 typedef struct _IWAN_MP_BINDING {
 	LIST_ENTRY		link;
-	IWAN_WIN_DEVICE_EXTENSION *ext;	/* 控制设备扩展（协议驱动上下文） */
+	IWAN_WIN_DEVICE_EXTENSION *ext;	/* control device extension (protocol driver context) */
 	NDIS_HANDLE		binding;	/* NdisBindingHandle */
-	NDIS_HANDLE		bind_context;	/* BindAdapterEx 的完成句柄 */
-	NDIS_HANDLE		unbind_context;	/* UnbindAdapterEx 的完成句柄 */
-	/* 两种完成句柄必须分开存：bind 返回 PENDING 之后设备被拔掉时 NDIS 会先
-	 * 调 unbind，一个字段被覆写后 open_complete 就会把 unbind 的句柄交给
-	 * NdisCompleteBindAdapterEx（绑定状态机/引用计数错乱）。 */
+	NDIS_HANDLE		bind_context;	/* completion handle of BindAdapterEx */
+	NDIS_HANDLE		unbind_context;	/* completion handle of UnbindAdapterEx */
+	/* The two completion handles must be stored separately: if the device is
+	 * pulled after bind returns PENDING, NDIS calls unbind first, and a single
+	 * overwritten field makes open_complete pass the unbind handle to NdisCompleteBindAdapterEx (state machine/refcount corruption). */
 	UINT32			ifindex;
 	UINT8			mac[6];
 	ULONG			mac_len;
-	volatile LONG		opened;		/* 1=打开成功，可收发 */
-	volatile LONG		closed;		/* 1=已关闭，不可再选作出向承载 */
-	volatile LONG		outstanding;	/* 已发出、未完成的 NBL 数 */
-	/* 同一个承载可能有两种"接口索引"：NDIS_BIND_PARAMETERS.BoundIfIndex
-	 * 与用户态（GetBestRoute2 的 MIB_IPFORWARD_ROW2.InterfaceIndex）理论上
-	 * 同属 NDIS 接口索引空间，但控制面拿到的那个数没有在客体上被独立验证
-	 * 过，而"绑定明明有、OPEN 一律 DEVICE_NOT_READY"恰恰是最难查的症状。
-	 * 所以这里把 BoundIfNetluid 再换算一次留作第二判据，查表时任一口径
-	 * 命中即算命中；两个数各落一个键（T74/T75 与 T84/T85），一次装机就能
-	 * 看出它们到底是否相同，不用再猜。 */
-	UINT32			ifindex_net;	/* BoundIfNetluid 换算出的 netio 索引 */
-	/* 承载网卡的接口 GUID：从 NDIS_BIND_PARAMETERS.AdapterName（形如
-	 * "\DEVICE\{GUID}"）解析出来。控制面用 ConvertInterfaceLuidToGuid
-	 * 从 GetBestRoute2 的 InterfaceLuid 取同一份 GUID 送下来。
-	 * 两套接口索引口径在客体上实测并不一致（以太网 netio=7、绑定报
-	 * 23/26），按索引挑承载等于猜；GUID 没有这个问题。 */
-	UINT8			guid[16];	/* 全 0 = 没解析出来 */
-	ULONG			guid_valid;	/* 1 = guid 可信 */
+	volatile LONG		opened;		/* 1 = open succeeded, RX/TX allowed */
+	volatile LONG		closed;		/* 1 = closed, cannot be picked as TX carrier */
+	volatile LONG		outstanding;	/* NBLs sent but not yet completed */
+	/* One carrier may expose two "interface indexes": the
+	 * NDIS_BIND_PARAMETERS.BoundIfIndex and the user-mode
+	 * MIB_IPFORWARD_ROW2.InterfaceIndex (GetBestRoute2) nominally share the
+	 * NDIS index space, but the control plane's number was never verified on
+	 * the target, and "binding present but OPEN always DEVICE_NOT_READY" is
+	 * the hardest symptom to chase. So BoundIfNetluid is converted again as
+	 * a second criterion; either match counts on lookup, both numbers get a key (T74/T75, T84/T85), so one install settles whether they match. */
+	UINT32			ifindex_net;	/* netio index converted from BoundIfNetluid */
+	/* Carrier NIC interface GUID: parsed from NDIS_BIND_PARAMETERS.AdapterName
+	 * (of the form "\DEVICE\{GUID}"). The control plane uses
+	 * ConvertInterfaceLuidToGuid on the InterfaceLuid from GetBestRoute2 to
+	 * send the same GUID down. The two interface index spaces measured
+	 * differently on the target (Ethernet netio=7, binding reports 23/26); picking a carrier by index is guessing, GUID has no such problem. */
+	UINT8			guid[16];	/* all zero = not parsed */
+	ULONG			guid_valid;	/* 1 = guid is trustworthy */
 } IWAN_MP_BINDING;
 
-/* 绑定表是驱动级的：协议驱动在 DriverEntry 注册，早于小型端口（PnP）出现，
- * 也晚于它消失，所以不能挂在设备扩展里。 */
+/* The binding table is driver-level: the protocol driver registers in DriverEntry,
+ * before the miniport (PnP) appears and after it is gone; it cannot live in the device extension. */
 static LIST_ENTRY	g_bindings;
 static KSPIN_LOCK	g_bind_lock;
-static volatile LONG	g_proto_started;	/* g_bindings/g_bind_lock 已初始化 */
-static volatile LONG	g_bind_table_broken;	/* 表头读到 NULL（只诊断用） */
-/* open_complete 的成败次数：T72/T73。绑定进了表却打不开时，这两个数
- * 就是"NDIS 到底有没有回调我们"的唯一证据。 */
+static volatile LONG	g_proto_started;	/* g_bindings/g_bind_lock initialized */
+static volatile LONG	g_bind_table_broken;	/* list head read NULL (diagnostics only) */
+/* Success/failure counts of open_complete: T72/T73. When a binding entered the
+ * table but cannot open, these two are the only proof that NDIS called us at all. */
 static volatile LONG	g_open_ok;
 static volatile LONG	g_open_fail;
-/* 最近一次打开失败的 NTSTATUS 原值（T76）与 bind 里 NdisOpenAdapterEx 当场
- * 返回的错误（T77）。只有次数看不出"为什么打不开"，而这一条决定了改哪里。 */
+/* Raw NTSTATUS of the last open failure (T76) and the error NdisOpenAdapterEx
+ * returned in bind (T77). Counts alone cannot show why it will not open, and that decides where to fix. */
 static volatile LONG	g_open_status;
 static volatile LONG	g_bind_status;
-/* NDIS 到底给我们调过几次 BindAdapterEx、其中几次因为介质/MAC 长度被拒。
- * T71 只数"进了表的节点"，分不清"NDIS 没叫我们"与"叫了但被我们拒了"——这
- * 一条正是客体上一直判不出来的那个岔口。 */
+/* How many times NDIS called BindAdapterEx for us, and how many of those were
+ * rejected for medium/MAC length. T71 only counts "nodes that got into the
+ * table" and cannot split "NDIS never called us" from "called but rejected" -- the exact fork the target never resolves. */
 static volatile LONG	g_bind_calls;
 static volatile LONG	g_bind_rejected;
 
 
-/* 发送在途上下文（IWAN_MP_TX_CTX）定义在 iwan_win.h：入向指示也用它。 */
-/* 池的 context 区必须放得下它（池在 iwan_win_mp.c 里按 IWAN_MP_NBL_CTX_SIZE
- * 建；这个断言是两侧唯一的耦合点）。 */
+/* The TX in-flight context (IWAN_MP_TX_CTX) is defined in iwan_win.h; RX uses it too. */
+/* The pool context area must hold it (the pool is built in iwan_win_mp.c from
+ * IWAN_MP_NBL_CTX_SIZE; this assert is the only coupling between the two sides). */
 C_ASSERT(sizeof(IWAN_MP_TX_CTX) <= IWAN_MP_NBL_CTX_SIZE);
 
-/* 链上节点数（含已关闭的），只给诊断用。自己取锁：绑定可以被 bind/unbind
- * 随时插拔，不持锁遍历读到半个指针就是自己制造的那类崩溃。 */
+/* Number of nodes on the list (closed ones included), diagnostics only. It takes
+ * the lock itself: bindings come and go, and an unlocked walk reading half a pointer is a crash you made. */
 static LONG
 iwan_win_proto_binding_count(VOID)
 {
@@ -123,14 +123,14 @@ iwan_win_proto_binding_count(VOID)
 	return n;
 }
 
-/* 诊断用：把链上第 n 个绑定的 (ifindex, opened, closed) 压进一个 LONG：
- *   bit0..13 = ifindex（-1 = 没有这个节点）
+/* Diagnostics: pack the n-th binding's (ifindex, opened, closed) into a LONG:
+ *   bit0..13 = ifindex (-1 = no such node)
  *   bit14    = opened
  *   bit15    = closed
- * 会话里的 oif_index 是用户态挑的承载，一旦挑错查表必然落空；而"表里有节点
- * 但 opened=0"说明 NdisOpenAdapterEx 还是 PENDING、open_complete 没回来 ——
- * 两种病因处置完全不同，所以把三个数一起带出去。自己取锁：绑定随时被插拔，
- * 不持锁遍历读到半个指针就是自己制造的那类崩溃。 */
+ * The session's oif_index is the carrier picked by user mode; if it is wrong the
+ * lookup must miss. "There is a node but opened=0" means NdisOpenAdapterEx is
+ * still PENDING and open_complete has not come back -- two completely different
+ * causes, so all three numbers go out together. It locks itself; an unlocked walk that reads half a pointer is a self-made crash. */
 #define IWAN_MP_BIND_INFO_NONE	(0x3FFF)
 
 static LONG
@@ -162,8 +162,8 @@ iwan_win_proto_bind_info(_In_ ULONG nth)
 	return v;
 }
 
-/* 同 bind_info，但报 netio 口径的索引：T74/T75 与 T84/T85 一起看，就能
- * 分辨"会话的 oif_index 与 NDIS 口径对不上"还是"压根没有这条绑定"。 */
+/* Same as bind_info but reports the netio-style index: reading T74/T75 against
+ * T84/T85 separates "session oif_index does not match NDIS numbering" from "no such binding at all". */
 static LONG
 iwan_win_proto_bind_info_net(_In_ ULONG nth)
 {
@@ -193,7 +193,7 @@ iwan_win_proto_bind_info_net(_In_ ULONG nth)
 	return v;
 }
 
-/* 会话里没有 GUID 时用全零表示"按索引查"。 */
+/* An all-zero GUID in the session means "look up by index". */
 static BOOLEAN
 iwan_win_proto_guid_zero(_In_reads_(16) const UINT8 *guid)
 {
@@ -218,11 +218,11 @@ iwan_win_proto_hexval(WCHAR c)
 	return -1;
 }
 
-/* 从 "\DEVICE\{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}" 解析 GUID。
+/* Parse a GUID out of "\DEVICE\{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}".
  *
- * 为什么不用 RtlStringFromGUID 的反向：内核没有 UuidFromString。手工解析
- * 只有二十行，而且解析失败必须返回 FALSE —— 猜错 GUID 就等于把会话钉到
- * 错误的网卡上，那是最难从计数上看出来的一种错。 */
+ * Why not the inverse of RtlStringFromGUID: the kernel has no UuidFromString.
+ * Hand parsing is only twenty lines, and it must return FALSE on failure -- a
+ * wrong GUID guess pins the session to the wrong NIC, the hardest error to read from counters. */
 _Success_(return != 0)
 static BOOLEAN
 iwan_win_proto_parse_guid(_In_opt_ const NDIS_STRING *name,
@@ -237,7 +237,7 @@ iwan_win_proto_parse_guid(_In_opt_ const NDIS_STRING *name,
 
 	if (name == NULL || name->Buffer == NULL || name->Length < 38 * 2)
 		return FALSE;
-	/* 跳过 \DEVICE\ 找到 '{'：名字里只有一处 '{'。 */
+	/* Skip \DEVICE\ to find '{': the name contains exactly one '{'. */
 	while (k < (ULONG)(name->Length / sizeof(WCHAR)) &&
 	       name->Buffer[k] != L'{')
 		k++;
@@ -258,7 +258,7 @@ iwan_win_proto_parse_guid(_In_opt_ const NDIS_STRING *name,
 		}
 		if (iwan_win_proto_hexval(c) < 0)
 			return FALSE;
-		/* 下标的减 d 就是"扣掉已经跳过的连字符"。 */
+		/* Subtracting d from the index "removes the hyphens already skipped". */
 		digits[i - d] = c;
 	}
 	if (d != 4)
@@ -269,10 +269,10 @@ iwan_win_proto_parse_guid(_In_opt_ const NDIS_STRING *name,
 
 		t[i] = (UINT8)((hi << 4) | lo);
 	}
-	/* 字符串里的顺序是大端书写，内存里的 GUID 前三个字段是小端。
-	 * 16 个字节全部逐下标写满、不用尾循环也不用 RtlCopyMemory：PREfast
-	 * 只认"所有成功路径都完整写出 _Out_ 参数"，尾循环与 memcpy 都会被
-	 * 判 C6101（未初始化返回），而这里每次 return TRUE 前确实必须写满。 */
+	/* The string order is big-endian text; the first three GUID fields in memory
+	 * are little-endian. All 16 bytes are written index by index, with no tail
+	 * loop and no RtlCopyMemory: PREfast only accepts "every success path fully
+	 * writes the _Out_ param"; a tail loop or memcpy gets C6101 (uninitialized return), and every return TRUE here does fill it. */
 	out[0] = t[3]; out[1] = t[2]; out[2] = t[1]; out[3] = t[0];
 	out[4] = t[5]; out[5] = t[4];
 	out[6] = t[7]; out[7] = t[6];
@@ -281,10 +281,10 @@ iwan_win_proto_parse_guid(_In_opt_ const NDIS_STRING *name,
 	return TRUE;
 }
 
-/* 该接口上是否有一条"已在表里但还没打开完"的绑定。NdisOpenAdapterEx 返回
- * PENDING 时 open_complete 是异步回来的；控制面在建会话的瞬间恰好处在这个
- * 窗口里，就会看到 T71>0 却查不到可用绑定，OPEN 直接失败。判据必须窄：
- * 只对"同一个 ifindex、没关闭、还没打开"的节点等，别的失败一概不掩饰。 */
+/* Is there a binding on this interface that is "already in the table but not
+ * fully open"? When NdisOpenAdapterEx returns PENDING, open_complete comes back
+ * asynchronously; if the control plane creates a session right inside that
+ * window it sees T71>0 but no usable binding and OPEN fails at once. The test must stay narrow: wait only for the same ifindex, not closed, not open; no other failure is masked. */
 static LONG
 iwan_win_proto_binding_pending(_In_reads_(16) const UINT8 *guid,
 			       _In_ UINT32 ifindex)
@@ -302,8 +302,8 @@ iwan_win_proto_binding_pending(_In_reads_(16) const UINT8 *guid,
 
 			if (b->closed != 0 || b->opened != 0)
 				continue;
-			/* 判据必须与 lookup 逐字一致，否则会出现"在等一个
-			 * 永远查不到的节点"这种两秒空转。 */
+			/* The test must match lookup literally, or we end up "waiting for
+			 * a node that can never be found" and spin for two seconds. */
 			if (iwan_win_proto_guid_zero(guid)) {
 				if (b->ifindex == ifindex ||
 				    b->ifindex_net == ifindex)
@@ -320,9 +320,9 @@ iwan_win_proto_binding_pending(_In_reads_(16) const UINT8 *guid,
 	return found;
 }
 
-/* 诊断：链上 guid 解析成功的节点数（低 8 位）与 equal 命中数（高 8 位）。
- * T87=1（会话给了 GUID）而命中数为 0 时，只有两种可能：解析没成功，或者
- * 控制面算错了 GUID —— 这两个数正好把它们分开。 */
+/* Diagnostics: number of nodes whose guid parsed (low 8 bits) and number of
+ * equal hits (high 8 bits). When T87=1 (session gave a GUID) and hits are 0
+ * there are only two options: parsing failed, or the control plane got the wrong GUID -- these two numbers separate exactly those cases. */
 static LONG
 iwan_win_proto_binding_guid_stat(_In_reads_(16) const UINT8 *want)
 {
@@ -353,32 +353,32 @@ iwan_win_proto_binding_guid_stat(_In_reads_(16) const UINT8 *want)
 	return (hits << 8) | valid;
 }
 
-/* 绑定表查找：按接口 GUID 或接口索引找一张已打开的承载。
+/* Binding lookup: find an opened carrier by interface GUID or interface index.
  *
- * GUID 优先：只要会话给了 GUID 就只按 GUID 匹配，索引完全不参与 ——
- * "两种索引都试试"在索引口径确实不同的时候会把会话钉到错误的网卡上，
- * 而且从计数上完全看不出来。调用者需持有 g_bind_lock。 */
+ * GUID first: if the session gave a GUID, match on GUID only, the index plays
+ * no part at all -- "try both indexes" pins the session to the wrong NIC when
+ * the index spaces really differ, and counters never show it. Caller holds g_bind_lock. */
 static IWAN_MP_BINDING *
 iwan_win_proto_lookup_locked(_In_reads_(16) const UINT8 *guid,
 			     _In_ UINT32 ifindex)
 {
 	PLIST_ENTRY e;
 
-	/* 旗子先查，再碰链表：两者在同一把锁内读到，才叫"表可用"。 */
+	/* Check the flag before touching the list: only reading both under the same lock makes the table usable. */
 	if (InterlockedCompareExchange(&g_proto_started, 1, 1) == 0)
 		return NULL;
 
-	/* 表头必须指向自己（空表）或某个真节点。Flink 为 NULL 说明这张表
-	 * 从来没被 InitializeListHead 初始化过 —— 客体上真实发生过：0xD1，
-	 * 出错指令正是这里内联出来的 `cmpl %ecx,0x30(%r14)`，r14=0 而 0x30
-	 * 是 IWAN_MP_BINDING.ifindex，访问地址恰好 0x30，IRQL=DISPATCH。
-	 * 查表是最不该崩的一步：找不到就返回 NULL，调用者回
-	 * STATUS_DEVICE_NOT_READY，数据面 fail-closed。 */
+	/* The head must point to itself (empty list) or to a real node. A NULL
+	 * Flink means this list was never initialized by InitializeListHead --
+	 * this really happened on the target: 0xD1, the faulting instruction being
+	 * the `cmpl %ecx,0x30(%r14)` inlined right here, r14=0 and 0x30 =
+	 * IWAN_MP_BINDING.ifindex, the address accessed exactly 0x30, IRQL=DISPATCH.
+	 * Lookup is the last step that may crash: a miss returns NULL, the caller returns STATUS_DEVICE_NOT_READY, data plane fail-closed. */
 	if (g_bindings.Flink == NULL || g_bindings.Blink == NULL) {
-		DbgPrint("iwanmp: 绑定表未初始化（Flink=%p），拒绝查表\n",
+		DbgPrint("iwanmp: binding table uninitialized (Flink=%p), lookup refused\n",
 			 (void *)g_bindings.Flink);
-		/* 只置一个内存旗子：本函数在自旋锁内被调用，而写注册表要在
-		 * PASSIVE_LEVEL。调用者放锁之后再落 T70。 */
+		/* Only set an in-memory flag: this function is called under a spinlock,
+		 * while writing the registry needs PASSIVE_LEVEL; the caller records T70 after unlocking. */
 		InterlockedExchange(&g_bind_table_broken, 1);
 		return NULL;
 	}
@@ -398,15 +398,15 @@ iwan_win_proto_lookup_locked(_In_reads_(16) const UINT8 *guid,
 	return NULL;
 }
 
-/* 关闭一条绑定：只打标记 + 撤掉"会话正选着它"的引用，**绝不释放**。
+/* Close one binding: only set flags + drop the "session selected it" reference, **never free**.
  *
- * 绑定对象同时被三条异步路径引用：bind 的完成（open_complete）、unbind 的
- * 完成（close_complete）、以及已经交给 NDIS、还没回调的发送（send_complete
- * 要减在途数）。早期版本在 bind/unbind 返回 NDIS_STATUS_PENDING 时就
- * ExFreePoolWithTag，完成回调再来就是释放后使用 —— 蓝屏的经典形状。
- * 现在 g_bindings 挂着"曾经分配过的全部绑定"，关闭只是打 closed 标记，
- * 真正的释放推迟到 iwan_win_proto_fini：那时 NdisDeregisterProtocolDriver
- * 已经返回，NDIS 保证不会再有任何回调进来。 */
+ * The binding is referenced by three async paths: bind completion
+ * (open_complete), unbind completion (close_complete), and a send already given
+ * to NDIS with no callback yet (send_complete must drop the in-flight count).
+ * An early version called ExFreePoolWithTag as soon as bind/unbind returned
+ * NDIS_STATUS_PENDING; the completion callback then hit a use-after-free --
+ * the classic blue-screen shape. Now g_bindings holds every binding ever
+ * allocated; close only sets closed, and the real free is deferred to iwan_win_proto_fini (no callback can arrive after NdisDeregisterProtocolDriver returns). */
 static VOID
 iwan_win_proto_binding_close(_Inout_ IWAN_MP_BINDING *b)
 {
@@ -416,8 +416,8 @@ iwan_win_proto_binding_close(_Inout_ IWAN_MP_BINDING *b)
 	InterlockedExchange(&b->opened, 0);
 	InterlockedExchange(&b->closed, 1);
 
-	/* 会话若正选着这张卡，立刻放掉：否则出向会继续往一个已经关闭的
-	 * 绑定上发（NdisSendNetBufferLists 拿一个关掉的句柄没有好下场）。 */
+	/* If the session currently picks this NIC, drop it now: otherwise egress keeps
+	 * sending on an already closed binding (NdisSendNetBufferLists with a closed handle ends badly). */
 	KeAcquireSpinLock(&mp->lock, &old);
 	if (mp->active == b) {
 		mp->active = NULL;
@@ -431,16 +431,16 @@ iwan_win_proto_binding_close(_Inout_ IWAN_MP_BINDING *b)
 	KeReleaseSpinLock(&mp->lock, old);
 }
 
-/* ---- 邻居（ARP） ------------------------------------------------------- */
+/* ---- neighbor (ARP) ---------------------------------------------------- */
 
-/* ARP 报文净长（不带以太头）：硬件类型 2 + 协议类型 2 + 长度 2 + 操作 2
- * + 发送方 MAC 6 + 发送方 IP 4 + 目标 MAC 6 + 目标 IP 4。 */
+/* ARP message length without the Ethernet header: hw type 2 + proto type 2 +
+ * lengths 2 + op 2 + sender MAC 6 + sender IP 4 + target MAC 6 + target IP 4. */
 #define IWAN_MP_ARP_LEN 28u
 
-/* 组一个 ARP 请求：who-has next_hop tell local_mac。返回帧长（以太+ARP）。 */
-/* bufsz 先判后写：以太头 14 + ARP 28 全在下面逐字节写。注解里的
- * _Out_writes_bytes_(bufsz) 是这条约定的书面形式（原来只写 _Out_，
- * 分析器就只能按 1 字节算，报的是注解缺口不是越界）。 */
+/* Build an ARP request: who-has next_hop tell local_mac. Returns frame length (Ethernet+ARP). */
+/* Check bufsz before writing: the 14-byte Ethernet header + 28-byte ARP follow,
+ * all written byte by byte. The _Out_writes_bytes_(bufsz) annotation is that
+ * contract in writing (with only _Out_ the analyzer assumes 1 byte and reports a missing annotation, not an overrun). */
 _Success_(return != 0)
 static ULONG
 iwan_win_proto_build_arp4(_In_ IWAN_WIN_DEVICE_EXTENSION *ext,
@@ -454,12 +454,12 @@ iwan_win_proto_build_arp4(_In_ IWAN_WIN_DEVICE_EXTENSION *ext,
 
 	if (bufsz < IWAN_MP_ETH_HDR_LEN + IWAN_MP_ARP_LEN)
 		return 0;
-	/* 下面两个下标的静态上界：eth 的写入落在 [0,14)、a 的写入落在
-	 * [14, 14+28)。两者相加正好是上面这条闸门，分析器需要这一句才
-	 * 知道 a[27] 不是越界写（C6386）。 */
+	/* Static upper bounds for the two indexes below: writes to eth land in [0,14),
+	 * writes to a land in [14, 14+28). Their sum is exactly the gate above; the
+	 * analyzer needs this line to know a[27] is not an out-of-bounds write (C6386). */
 	__analysis_assume(bufsz >= IWAN_MP_ETH_HDR_LEN + IWAN_MP_ARP_LEN);
 
-	/* 以太头：广播 */
+	/* Ethernet header: broadcast */
 	for (i = 0; i < 6; i++)
 		eth[i] = 0xFFu;
 	RtlCopyMemory(eth + 6, mp->local_mac, 6);
@@ -467,22 +467,22 @@ iwan_win_proto_build_arp4(_In_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	eth[13] = (UINT8)(IWAN_MP_ETH_TYPE_ARP & 0xFFu);
 
 	a = eth + IWAN_MP_ETH_HDR_LEN;
-	a[0] = 0x00; a[1] = 0x01;	/* 以太网 */
+	a[0] = 0x00; a[1] = 0x01;	/* Ethernet */
 	a[2] = 0x08; a[3] = 0x00;	/* IPv4 */
-	a[4] = 6;			/* 硬件地址长度 */
-	a[5] = 4;			/* 协议地址长度 */
-	a[6] = 0x00; a[7] = 0x01;	/* 请求 */
+	a[4] = 6;			/* hardware address length */
+	a[5] = 4;			/* protocol address length */
+	a[6] = 0x00; a[7] = 0x01;	/* request */
 	RtlCopyMemory(a + 8, mp->local_mac, 6);
-	/* 发送方协议地址必须是本机在承载网上的 IPv4 地址。填 0 会被 QEMU 的
-	 * slirp 直接丢掉（它要求 ar_sip 落在客户端网段内），于是永远收不到
-	 * 应答 —— 现场表现是每个出向包都以 NO_NEIGHBOR 丢弃，而 ARP 请求
-	 * 看上去"发了"。地址取会话的 outer_src，与封装外层头用的是同一个值。 */
+	/* The sender protocol address must be the local IPv4 address on the carrier
+	 * network: QEMU slirp drops 0 outright (it requires ar_sip inside the client
+	 * subnet), so no reply ever comes and every egress packet is dropped with
+	 * NO_NEIGHBOR while ARP looked "sent". Address = session outer_src (same as the outer header). */
 	spa = ext->sess.outer_src;
 	a[14] = (UINT8)(spa >> 24);
 	a[15] = (UINT8)(spa >> 16);
 	a[16] = (UINT8)(spa >> 8);
 	a[17] = (UINT8)(spa);
-	/* 目标硬件地址未知：填 0（与以太头广播一致） */
+	/* Target hardware address unknown: fill 0 (matching the broadcast Ethernet header) */
 	a[18] = a[19] = a[20] = a[21] = a[22] = a[23] = 0;
 	a[24] = (UINT8)(mp->next_hop_be >> 24);
 	a[25] = (UINT8)(mp->next_hop_be >> 16);
@@ -492,7 +492,7 @@ iwan_win_proto_build_arp4(_In_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	return IWAN_MP_ETH_HDR_LEN + IWAN_MP_ARP_LEN;
 }
 
-/* 收到 ARP：把"发送方协议地址 = 下一跳"的回复记下来。 */
+/* ARP received: record a reply whose sender protocol address == the next hop. */
 static BOOLEAN
 iwan_win_proto_learn_arp4(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 			  _In_reads_bytes_(len) const UINT8 *a, _In_ ULONG len)
@@ -505,14 +505,14 @@ iwan_win_proto_learn_arp4(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	if (len < 28u || a[0] != 0x00 || a[1] != 0x01 || a[2] != 0x08 ||
 	    a[3] != 0x00 || a[4] != 6 || a[5] != 4)
 		return FALSE;
-	if (a[6] != 0x00)		/* 以太网/IPv4 */
+	if (a[6] != 0x00)		/* Ethernet/IPv4 */
 		return FALSE;
-	if (a[7] != 0x02)		/* 只从回复学：请求的 spa 谁都能伪造 */
+	if (a[7] != 0x02)		/* learn from replies only: anyone can forge a request's spa */
 		return FALSE;
 
 	spa = ((UINT32)a[14] << 24) | ((UINT32)a[15] << 16) |
 	      ((UINT32)a[16] << 8) | (UINT32)a[17];
-	if (spa == 0)			/* 发方地址为 0 的探测包不作数 */
+	if (spa == 0)			/* a probe with sender address 0 does not count */
 		return FALSE;
 
 	KeAcquireSpinLock(&mp->lock, &old);
@@ -528,7 +528,7 @@ iwan_win_proto_learn_arp4(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	return ok;
 }
 
-/* 发 ARP 请求。调用者不得持有 mp.lock。 */
+/* Send an ARP request. The caller must not hold mp.lock. */
 static VOID
 iwan_win_proto_send_arp4(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 {
@@ -545,19 +545,19 @@ iwan_win_proto_send_arp4(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 		ExFreePoolWithTag(buf, IWAN_TAG_PKT);
 		return;
 	}
-	/* 走同一条发送路径：send_outer4 只管把帧交给网卡，不看以太类型。
-	 * 它 TRUE 时所有权已随 NBL 转移（完成回调释放）、FALSE 时已经自己
-	 * 释放 —— 两种结局都不该在这里再动 buf，所以这里没有 else 释放。 */
+	/* Use the same TX path: send_outer4 only hands the frame to the NIC and does
+	 * not look at the EtherType. On TRUE ownership moved with the NBL (freed by
+	 * the completion callback); on FALSE it already freed the buffer -- either way buf must not be touched here, hence no else-branch free. */
 	if (!iwan_win_proto_send_outer4(ext, buf, len))
 		IWAN_MP_STAT_INC(ext, tx_err);
 	else
 		InterlockedIncrement(&ext->mp.arp_sent);
 }
 
-/* ---- 引擎的出口 ------------------------------------------------------- */
+/* ---- engine egress ----------------------------------------------------- */
 
-/* 填以太头。TRUE = 已填好；FALSE = 邻居未解析（已按限速发过 ARP），本包该丢。
- * 缓冲所有权不动：调用者（引擎）在 FALSE 时自己释放。 */
+/* Fill the Ethernet header. TRUE = done; FALSE = neighbor unresolved (ARP sent
+ * under the rate limit), this packet should be dropped. Buffer ownership unchanged: the engine frees on FALSE. */
 BOOLEAN
 iwan_win_proto_fill_eth4(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext, _Inout_ UINT8 *buf)
 {
@@ -567,8 +567,8 @@ iwan_win_proto_fill_eth4(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext, _Inout_ UINT8 *
 	KIRQL old;
 
 	now = iwan_win_now_ms();
-	/* 测试旋钮优先：会话带了固化 MAC 就不再解析邻居，也不需要老化
-	 * （arp_ts_ms 置 0 = 永不过期）。生产路径不带这个键，行为不变。 */
+	/* Test knob wins: if the session carries a fixed MAC, no neighbor resolution
+	 * and no aging is needed (arp_ts_ms = 0 means never expire). Production paths do not set this key; behavior unchanged. */
 	if (ext->sess.peer_mac_fixed_valid != 0) {
 		KeAcquireSpinLock(&mp->lock, &old);
 		RtlCopyMemory(mp->peer_mac, ext->sess.peer_mac_fixed, 6);
@@ -581,13 +581,13 @@ iwan_win_proto_fill_eth4(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext, _Inout_ UINT8 *
 	valid = mp->peer_mac_valid != 0;
 	if (valid && mp->arp_ts_ms != 0 &&
 	    now - mp->arp_ts_ms > IWAN_MP_ARP_HOLD_MS) {
-		InterlockedExchange(&mp->peer_mac_valid, 0);	/* 老化 */
+		InterlockedExchange(&mp->peer_mac_valid, 0);	/* aging */
 		valid = FALSE;
 	}
-	/* pending 只表示"已发过一次、还没学到"，不是"永不再发"：应答丢了、
-	 * 或对方的 spa 与本会话下一跳不一致（代理 ARP、下一跳选错）时，必须能
-	 * 重发，否则出向每个包都在这里被丢、会话永久不通，重试逻辑成了死代码。
-	 * 限速仍由 arp_last_ms 负责。 */
+	/* pending only means "sent once, not learned yet", not "never send again": a
+	 * lost reply, or a peer spa that differs from this session's next hop (proxy
+	 * ARP, wrong next hop), must allow a retry, or every egress packet is dropped
+	 * here, the session never comes up and the retry logic is dead code. arp_last_ms still limits the rate. */
 	if (!valid && mp->active != NULL &&
 	    (mp->peer_mac_pending == 0 ||
 	     (mp->arp_last_ms != 0 &&
@@ -609,8 +609,8 @@ iwan_win_proto_fill_eth4(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext, _Inout_ UINT8 *
 	return valid;
 }
 
-/* 把整帧交给选定的承载网卡。TRUE = 所有权已转移（完成回调释放）；
- * FALSE = 未发出且缓冲已被本函数释放。 */
+/* Hand the whole frame to the selected carrier NIC. TRUE = ownership moved (freed
+ * by the completion callback); FALSE = not sent and the buffer was freed here. */
 BOOLEAN
 iwan_win_proto_send_outer4(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 			   __drv_freesMem(_Out_) UINT8 *eth, _In_ ULONG len)
@@ -626,7 +626,7 @@ iwan_win_proto_send_outer4(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		ExFreePoolWithTag(eth, IWAN_TAG_PKT);
 		return FALSE;
 	}
-	/* 在途上限由引擎把关（IWAN_MP_MAX_OUTER_INFLIGHT），这里只记账与兜底 */
+	/* The engine enforces the in-flight cap (IWAN_MP_MAX_OUTER_INFLIGHT); this only accounts and backstops */
 	if ((ULONG)InterlockedIncrement(&mp->outer_outstanding) >
 	    IWAN_MP_MAX_OUTER_INFLIGHT) {
 		InterlockedDecrement(&mp->outer_outstanding);
@@ -672,7 +672,7 @@ iwan_win_proto_send_outer4(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	return TRUE;
 }
 
-/* 发送完成：归还缓冲、清在途。可能在 DISPATCH_LEVEL。 */
+/* Send completion: return the buffer, clear in-flight. May run at DISPATCH_LEVEL. */
 static
 _Function_class_(PROTOCOL_SEND_NET_BUFFER_LISTS_COMPLETE)
 VOID
@@ -706,18 +706,18 @@ iwan_win_proto_send_complete(_In_ NDIS_HANDLE ProtocolBindingContext,
 	}
 }
 
-/* ---- 接收 ------------------------------------------------------------- */
+/* ---- receive ---------------------------------------------------------- */
 
-/* 取一个 NB 的连续视图。need 字节；stor/stor_sz 非空时优先用调用者的缓冲
- * （NDIS 会按需拷进去）。返回 NULL = 取不到或超长。调用期间数据有效。 */
+/* Get a contiguous view of one NB. need bytes; if stor/stor_sz are non-NULL use
+ * the caller's buffer first (NDIS copies into it on demand). NULL = unavailable or too long. Data stays valid during the call. */
 _Success_(return != NULL)
 static const UINT8 *
 iwan_win_proto_view(_In_ NET_BUFFER *nb, _In_ ULONG need,
 		    _Inout_opt_ UINT8 *stor, _In_ ULONG stor_sz)
 {
-	/* 与 NB 的实际长度比一次：NdisGetDataBuffer 对超长请求的行为不写进
-	 * 契约，ARP 分支按 42 字节取、帧却可能只有 34..41 字节（下限由调用者
-	 * 保证），靠"它会返回 NULL"是运气而不是设计。 */
+	/* Compare against the real NB length first: NdisGetDataBuffer's behavior on an
+	 * oversized request is not in the contract; the ARP branch asks for 42 bytes
+	 * while the frame may be only 34..41 bytes (the caller guarantees the lower bound); trusting "it returns NULL" is luck, not design. */
 	if (need == 0 || need > IWAN_MP_RECV_MAX ||
 	    need > NET_BUFFER_DATA_LENGTH(nb))
 		return NULL;
@@ -726,8 +726,8 @@ iwan_win_proto_view(_In_ NET_BUFFER *nb, _In_ ULONG need,
 	return (const UINT8 *)NdisGetDataBuffer(nb, need, NULL, 1, 0);
 }
 
-/* 命中判定：帧内 IPv4 目的地址 = 会话外层源地址、UDP 目的端口 = 会话源端口。
- * 与 WFP 平面入向闸门同一口径（那边地址取自固定字段，这边从帧里读）。 */
+/* Match test: in-frame IPv4 destination = session outer source address, UDP dst port = session source port.
+ * Same rule as the WFP plane ingress gate (there the address comes from fixed fields, here it is read from the frame). */
 _Success_(return != FALSE)
 static BOOLEAN
 iwan_win_proto_is_ours(_In_ const IWAN_WIN_SESSION *s,
@@ -751,8 +751,8 @@ iwan_win_proto_is_ours(_In_ const IWAN_WIN_SESSION *s,
 	return iwan_win_rd16(ip + ihl + 2) == s->sport;
 }
 
-/* 一个 NB 就是一帧（NdisMedium802_3）。返回 TRUE 表示是本会话的外层帧、
- * 已交给引擎（这就是"读走了"）。 */
+/* One NB is one frame (NdisMedium802_3). TRUE means it is this session's outer
+ * frame and was handed to the engine (i.e. "consumed"). */
 static BOOLEAN
 iwan_win_proto_recv_one(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 			_In_ NET_BUFFER *nb)
@@ -763,8 +763,8 @@ iwan_win_proto_recv_one(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	ULONG len, iplen, need;
 	UINT16 eth_type;
 
-	/* hdr 只在“NdisGetDataBuffer 把数据拷进来”之后才被读（iwan_win_proto_view
-	 * 的契约）。清零是给静态分析的确定值，也让任何契约破坏读到零而不是栈残留。 */
+	/* hdr is only read after "NdisGetDataBuffer copied the data in" (the
+	 * iwan_win_proto_view contract). Zeroing gives static analysis a defined value and makes any contract violation read zero instead of stack garbage. */
 	RtlZeroMemory(hdr, sizeof(hdr));
 	len = NET_BUFFER_DATA_LENGTH(nb);
 	if (len < IWAN_MP_ETH_HDR_LEN + 20u)
@@ -782,15 +782,15 @@ iwan_win_proto_recv_one(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 			return FALSE;
 		iwan_win_proto_learn_arp4(ext, p + IWAN_MP_ETH_HDR_LEN,
 					  len - IWAN_MP_ETH_HDR_LEN);
-		return FALSE;	/* ARP 不是"本会话的数据帧"，但也不留给谁 */
+		return FALSE;	/* ARP is not a "session data frame", but it is not left to anyone either */
 	}
 	if (eth_type != IWAN_MP_ETH_TYPE_IP4)
 		return FALSE;
 	if (s->valid == 0 || s->outer_src == 0 || ext->mp.active == NULL)
 		return FALSE;
 
-	/* IPv4 首部可能带选项（IHL 最大 60），取到"以太头 + 最大首部 + UDP
-	 * 首部"为止再判定，免得读越过栈缓冲；帧短于这么多就按实际长度取。 */
+	/* The IPv4 header may carry options (IHL up to 60); fetch up to "Ethernet +
+	 * max header + UDP header" before deciding, so we never read past the stack buffer; if the frame is shorter, use its real length. */
 	need = len < sizeof(hdr) ? len : (ULONG)sizeof(hdr);
 	p = iwan_win_proto_view(nb, need, hdr, sizeof(hdr));
 	if (p == NULL)
@@ -799,14 +799,23 @@ iwan_win_proto_recv_one(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 				    len - IWAN_MP_ETH_HDR_LEN, &iplen))
 		return FALSE;
 
-	/* 命中：整包交给引擎。短包直接用栈缓冲；长的先试零拷贝（同一块内存
-	 * 时 NdisGetDataBuffer 直接给指针），取不到就让 NDIS 拷进临时缓冲。 */
+	/* Diagnostic pass-through: count the frame as "would have been decapsulated" and leave it alone --
+	 * returning FALSE means "not mine, do not touch", so NDIS hands it on to the regular binding, which is
+	 * exactly the Linux plane's NF_ACCEPT. Nothing is parsed, nothing is copied, no session state is touched:
+	 * the difference from the normal path is the decapsulation cost. */
+	if ((ext->pass_through & IWAN_WIN_PASS_RX)) {
+		IWAN_MP_STAT_INC(ext, rx_outer);
+		return FALSE;
+	}
+
+	/* Hit: hand the whole packet to the engine. Short packets use the stack
+	 * buffer; for long ones try zero-copy first (NdisGetDataBuffer returns a direct pointer when the data is in one chunk), otherwise let NDIS copy into a temp buffer. */
 	if (iplen <= sizeof(hdr) - IWAN_MP_ETH_HDR_LEN) {
 		p = iwan_win_proto_view(nb, IWAN_MP_ETH_HDR_LEN + iplen, hdr,
 					sizeof(hdr));
 		if (p == NULL) {
-			/* 已判为本会话的帧却取不到连续首部：吃掉，但必须计数
-			 * —— 数据面不许有静默的丢弃通道。 */
+			/* A frame already judged ours but no contiguous header: eat it, but
+			 * it must be counted -- the data plane may not have a silent drop path. */
 			IWAN_MP_STAT_INC(ext, rx_bad_hdr);
 			return TRUE;
 		}
@@ -819,7 +828,7 @@ iwan_win_proto_recv_one(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 
 		if (tmp == NULL) {
 			IWAN_MP_STAT_INC(ext, rx_nomem);
-			return TRUE;	/* 命中但放不下：吃掉，不重复投递 */
+			return TRUE;	/* hit but cannot allocate: eat it, do not re-deliver */
 		}
 		p = iwan_win_proto_view(nb, pktlen, tmp, pktlen);
 		if (p != NULL)
@@ -831,8 +840,8 @@ iwan_win_proto_recv_one(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	}
 }
 
-/* 收到一批 NBL。本边一枚都不向上指示：同一条链路上的常规 TCP/IP 绑定是
- * 另一个协议驱动，它自己会收；我们只挑走本会话的外层帧，其余原样归还。 */
+/* A batch of NBLs arrived. This side indicates none of them up: the regular
+ * TCP/IP binding on the same link is a different protocol driver and receives its own; we only pick out this session's outer frames and return the rest unchanged. */
 static
 _Function_class_(PROTOCOL_RECEIVE_NET_BUFFER_LISTS)
 VOID
@@ -860,9 +869,9 @@ iwan_win_proto_recv_nbls(_In_ NDIS_HANDLE ProtocolBindingContext,
 			iwan_win_proto_recv_one(ext, nb);
 		}
 	}
-	/* 带 RESOURCES 时这批 NBL 只是**借用**，所有权还在下层：既不能保留，
-	 * 更不能归还（归还一个不属于自己的 NBL 是蓝屏的经典入口）。本边本来
-	 * 就不留 NBL，所以这里只是跳过归还。 */
+	/* With RESOURCES set this batch of NBLs is only **borrowed**, ownership stays
+	 * below: it must not be kept, and certainly not returned (returning an NBL
+	 * you do not own is a classic blue-screen entry). This side keeps no NBLs anyway, so this just skips the return. */
 	if ((ReceiveFlags & NDIS_RECEIVE_FLAGS_RESOURCES) == 0) {
 		NdisReturnNetBufferLists(b->binding, NetBufferLists,
 					 (KeGetCurrentIrql() == DISPATCH_LEVEL) ?
@@ -870,38 +879,38 @@ iwan_win_proto_recv_nbls(_In_ NDIS_HANDLE ProtocolBindingContext,
 	}
 }
 
-/* ---- 接收过滤器 ------------------------------------------------------- */
+/* ---- receive filter --------------------------------------------------- */
 
-/* 协议驱动收帧之前必须先把 OID_GEN_CURRENT_PACKET_FILTER 设到绑定上 ——
- * 不设就是 0（一个包都不收）。这是"外层帧到底有没有进来"的分水岭：同一张
- * 承载网卡上的常规 TCP/IP 绑定是**另一个**协议驱动，它自己会设自己的；
- * 我们这一份必须自己设，否则用户态 socket 能完成 OPEN/OPEN_ACK（那是它自己
- * 的绑定收的包），而驱动侧 rx_* 恒为零、每包死在 DIAG_TX_NO_NEIGHBOR。
+/* A protocol driver must set OID_GEN_CURRENT_PACKET_FILTER on the binding
+ * before it receives: unset is 0 (no packets). This is the divide for "did
+ * outer frames come in at all": the regular TCP/IP binding on the same carrier
+ * is a **different** protocol driver and sets its own; ours must set its own, or
+ * user-mode sockets finish OPEN/OPEN_ACK (its binding got those packets) while the driver's rx_* stays 0 and every packet dies at DIAG_TX_NO_NEIGHBOR.
  *
- * 请求必须活到 NDIS 回调为止（可能回 PENDING），所以请求与 4 字节信息缓冲
- * 一起从非分页池分配，缓冲紧跟结构体后面。done 字段让两条路径（同步返回、
- * 完成回调）恰好释放一次 —— 两种结束方式都要能安全落地，才不用去赌
- * "非 PENDING 时回调到底来不来"。 */
+ * The request must live until the NDIS callback (it may return PENDING), so the
+ * request and its 4-byte info buffer are allocated together from non-paged pool,
+ * buffer right after the struct. The done field lets both paths (sync return,
+ * completion callback) free exactly once -- both endings must land safely instead of betting on whether the callback comes for non-PENDING. */
 #define IWAN_MP_FILTER_FLAGS						\
 	(NDIS_PACKET_TYPE_DIRECTED | NDIS_PACKET_TYPE_MULTICAST |	\
 	 NDIS_PACKET_TYPE_ALL_MULTICAST | NDIS_PACKET_TYPE_BROADCAST)
 
-/* 26100 的 ntddndis.h 里只剩 deprecated 的 NDIS_OBJECT_TYPE_REQUEST_EX(0x96)，
- * 而 ndis/oidrequest.h 的示例注释用的仍是 NDIS_OBJECT_TYPE_OID_REQUEST ——
- * 同一个值，NDIS 5 以来没变。带上兜底，免得为一个整数常量白跑一轮 CI。 */
+/* Build 26100's ntddndis.h only has the deprecated NDIS_OBJECT_TYPE_REQUEST_EX (0x96),
+ * while the sample comment in ndis/oidrequest.h still uses NDIS_OBJECT_TYPE_OID_REQUEST --
+ * the same value, unchanged since NDIS 5. Add the fallback so we do not run a CI round for one integer constant. */
 #ifndef NDIS_OBJECT_TYPE_OID_REQUEST
 #define NDIS_OBJECT_TYPE_OID_REQUEST 0x96
 #endif
 
 typedef struct _IWAN_MP_OID_SET {
 	NDIS_OID_REQUEST	req;
-	ULONG			value;		/* 过滤器位图（请求的信息缓冲） */
-	volatile LONG		done;		/* 1=已释放，防两条路径二次释放 */
+	ULONG			value;		/* filter bitmap (the request's information buffer) */
+	volatile LONG		done;		/* 1 = freed; stops the two paths from double freeing */
 } IWAN_MP_OID_SET;
 
-static volatile LONG	g_oid_pending;	/* 已交给 NDIS、未收尾的请求数 */
+static volatile LONG	g_oid_pending;	/* requests handed to NDIS and not yet finished */
 
-/* 完成回调：只记账 + 归还那块池内存。 */
+/* Completion callback: only account + return the pool memory. */
 static
 _Function_class_(PROTOCOL_OID_REQUEST_COMPLETE)
 VOID
@@ -923,22 +932,22 @@ iwan_win_proto_oid_complete(_In_ NDIS_HANDLE ProtocolBindingContext,
 	}
 }
 
-/* 设接收过滤器。失败只记账不致命：收不到外层帧时会话只能发不能收，
- * 症状可辨（rx_outer 恒 0）；承载重启后 open_complete 会再设一次。 */
+/* Set the receive filter. Failure is only accounted, not fatal: without outer
+ * frames the session can only send, not receive, a recognizable symptom (rx_outer stays 0); after a carrier restart open_complete sets it again. */
 static VOID
 iwan_win_proto_set_packet_filter(_Inout_ IWAN_MP_BINDING *b)
 {
 	IWAN_MP_OID_SET *o;
 	NDIS_STATUS st;
 
-	/* 两条结束路径各释放一次：同步返回（下面 if 的另一半）与 NDIS 的
-	 * OidRequestCompleteHandler 回调（PENDING 时才会来）。分析器看不到
-	 * NdisOidRequest 会持有指针、更看不到回调，按"分配后没有在本函数里
-	 * 每条路径都释放"报 C6014 —— 与 WFP 注入的 ctx/buf 同一类误报。 */
+	/* The two completion paths free once each: the sync return (the other half
+	 * of the if below) and NDIS's OidRequestCompleteHandler callback (only on
+	 * PENDING). The analyzer sees neither that NdisOidRequest holds the pointer
+	 * nor the callback, so it reports C6014 -- same false-positive class as the WFP ctx/buf. */
 #pragma warning(suppress: 6014)
 	o = (IWAN_MP_OID_SET *)IWAN_ALLOC(sizeof(*o), IWAN_TAG_PKT);
 	if (o == NULL) {
-		DbgPrint("iwanmp: 过滤器请求分配失败（if%u）\n",
+		DbgPrint("iwanmp: filter request allocation failed (if%u)\n",
 			 (unsigned)b->ifindex);
 		return;
 	}
@@ -957,20 +966,20 @@ iwan_win_proto_set_packet_filter(_Inout_ IWAN_MP_BINDING *b)
 	InterlockedIncrement(&g_oid_pending);
 	st = NdisOidRequest(b->binding, &o->req);
 	if (st != NDIS_STATUS_PENDING) {
-		/* 同步结束：请求没被 NDIS 接管，自己收尾 */
+		/* sync completion: NDIS did not take the request, finish it here */
 		InterlockedDecrement(&g_oid_pending);
 		if (InterlockedExchange(&o->done, 1) == 0)
 			ExFreePoolWithTag(o, IWAN_TAG_PKT);
-		DbgPrint("iwanmp: 绑定 if%u 接收过滤器 0x%08x -> 0x%08lx\n",
+		DbgPrint("iwanmp: binding if%u receive filter 0x%08x -> 0x%08lx\n",
 			 (unsigned)b->ifindex, (unsigned)IWAN_MP_FILTER_FLAGS,
 			 (unsigned long)st);
 	} else {
-		DbgPrint("iwanmp: 绑定 if%u 接收过滤器 0x%08x（PENDING）\n",
+		DbgPrint("iwanmp: binding if%u receive filter 0x%08x (PENDING)\n",
 			 (unsigned)b->ifindex, (unsigned)IWAN_MP_FILTER_FLAGS);
 	}
 }
 
-/* ---- 绑定生命周期 ----------------------------------------------------- */
+/* ---- binding lifecycle ------------------------------------------------- */
 
 static
 _Function_class_(PROTOCOL_OPEN_ADAPTER_COMPLETE_EX)
@@ -981,35 +990,35 @@ iwan_win_proto_open_complete(_In_ NDIS_HANDLE ProtocolBindingContext,
 	IWAN_MP_BINDING *b = (IWAN_MP_BINDING *)ProtocolBindingContext;
 
 	if (Status == NDIS_STATUS_SUCCESS) {
-		/* 打开完成时可能已经解绑（拔卡/禁用网卡的时序）：此时绑定句柄
-		 * 正在被 NdisCloseAdapterEx 收走，再去下发过滤器就是对一个正在
-		 * 关闭的句柄发 OID。只判 closed 就够 —— unbind 是先置 closed
-		 * 再等中继归零、最后才关句柄。 */
+		/* The binding may already be unbound when open completes (eject/disable
+		 * timing): the binding handle is being taken away by NdisCloseAdapterEx,
+		 * so setting a filter now sends an OID to a closing handle. Checking
+		 * closed alone suffices -- unbind sets closed first, waits for refs to drop, then closes the handle. */
 		if (InterlockedCompareExchange(&b->closed, 1, 1) != 0) {
 			InterlockedIncrement(&g_open_fail);
 			InterlockedExchange(&g_open_status,
 					    (LONG)STATUS_INVALID_DEVICE_STATE);
-			DbgPrint("iwanmp: 绑定 if%u 打开完成时已解绑，不再设过滤器\n",
+			DbgPrint("iwanmp: binding if%u already unbound when open completed, not setting the filter\n",
 				 (unsigned)b->ifindex);
 			NdisCompleteBindAdapterEx(b->bind_context, Status);
 			return;
 		}
 		InterlockedIncrement(&g_open_ok);
 		InterlockedExchange(&b->opened, 1);
-		/* 先把过滤器设上再算"可用"：opened 只表示句柄打开成功，
-		 * 收不收得到帧由过滤器决定。这一句放这里是因为 open_complete
-		 * 是唯一保证 b->binding 已经可用的时刻。 */
+		/* Set the filter first, only then count as usable: opened only means the
+		 * handle opened; whether frames arrive is up to the filter. This is here
+		 * because open_complete is the only moment b->binding is guaranteed usable. */
 		iwan_win_proto_set_packet_filter(b);
 	} else {
-		/* 打开失败：这条绑定不能用，打关闭标记（不释放 —— bind 的
-		 * 返回路径可能还在用它，而且 NDIS 可能已经在往上指示/发送）。 */
+		/* Open failed: this binding is unusable, set the closed flag (do not free --
+		 * the bind return path may still use it, and NDIS may already be indicating/sending on it). */
 		InterlockedIncrement(&g_open_fail);
 		InterlockedExchange(&g_open_status, (LONG)Status);
-		DbgPrint("iwanmp: 绑定 if%u 打开失败 0x%08lx\n",
+		DbgPrint("iwanmp: binding if%u open failed 0x%08lx\n",
 			 (unsigned)b->ifindex, (unsigned long)Status);
 		iwan_win_proto_binding_close(b);
 	}
-	/* bind 的完成回执：BindAdapterEx 返回 PENDING 时由这里收尾 */
+	/* bind completion receipt: finishes the bind when BindAdapterEx returned PENDING */
 	NdisCompleteBindAdapterEx(b->bind_context, Status);
 }
 
@@ -1041,11 +1050,11 @@ iwan_win_proto_bind(_In_ NDIS_HANDLE ProtocolDriverContext,
 	KIRQL old;
 
 	InterlockedIncrement(&g_bind_calls);
-	/* 只关心以太承载。别的介质（回环、隧道伪接口等）本平面不管。 */
+	/* Only Ethernet carriers matter. Other media (loopback, tunnel pseudo-interfaces) are not this plane's business. */
 	if (BindParameters->MediaType != NdisMedium802_3 ||
 	    BindParameters->MacAddressLength != 6) {
 		InterlockedIncrement(&g_bind_rejected);
-		DbgPrint("iwanmp: 拒绝绑定介质 %u / MAC 长度 %u（if%u）\n",
+		DbgPrint("iwanmp: rejecting binding, medium %u / MAC length %u (if%u)\n",
 			 (unsigned)BindParameters->MediaType,
 			 (unsigned)BindParameters->MacAddressLength,
 			 (unsigned)BindParameters->BoundIfIndex);
@@ -1059,9 +1068,9 @@ iwan_win_proto_bind(_In_ NDIS_HANDLE ProtocolDriverContext,
 	b->ext = ext;
 	b->bind_context = BindContext;
 	b->ifindex = BindParameters->BoundIfIndex;
-	/* BoundIfIndex 的口径与用户态 oif_index 不一定相同，这里再用
-	 * BoundIfNetluid 换算一次（PASSIVE，bind 回调正是 PASSIVE）。换算
-	 * 失败就把 net 域留 0，查表只按 BoundIfIndex 匹配，退化成旧行为。 */
+	/* BoundIfIndex may not match the user-mode oif_index, so convert it again
+	 * from BoundIfNetluid (PASSIVE; the bind callback is PASSIVE). If the
+	 * conversion fails, net stays 0 and the lookup matches on BoundIfIndex only, the old behavior. */
 	{
 		NET_IFINDEX nidx = 0;
 
@@ -1072,12 +1081,12 @@ iwan_win_proto_bind(_In_ NDIS_HANDLE ProtocolDriverContext,
 	}
 	b->mac_len = 6;
 	RtlCopyMemory(b->mac, BindParameters->CurrentMacAddress, 6);
-	/* AdapterName 是设备路径加 GUID，形如 反斜杠 DEVICE 反斜杠 {GUID}。
-	 * 查表退回索引口径（旧行为），但 T88 会把"没解析出来"显式暴露。 */
+	/* AdapterName is a device path plus GUID, of the form \DEVICE\{GUID}.
+	 * The lookup falls back to indexes (old behavior), but T88 exposes "not parsed" explicitly. */
 	if (iwan_win_proto_parse_guid(BindParameters->AdapterName, b->guid))
 		b->guid_valid = 1;
 	else
-		DbgPrint("iwanmp: 绑定 %lu 的 AdapterName 解析不出 GUID\n",
+		DbgPrint("iwanmp: cannot parse a GUID from AdapterName of binding %lu\n",
 			 (unsigned long)b->ifindex);
 
 	RtlZeroMemory(&op, sizeof(op));
@@ -1087,9 +1096,9 @@ iwan_win_proto_bind(_In_ NDIS_HANDLE ProtocolDriverContext,
 	op.AdapterName = BindParameters->AdapterName;
 	op.MediumArray = &medium;
 	op.MediumArraySize = 1;
-	/* SelectedMediumIndex 的类型是 PUINT（出参指针），不是索引值本身。
-	 * 原来写 0 等于给 NULL：只有 MediumArraySize == 1 时 NDIS 才容忍省略，
-	 * 一旦将来数组里多一种介质就会解引用空指针。这里给一个真实变量。 */
+	/* SelectedMediumIndex is a PUINT (an out pointer), not the index value.
+	 * Writing 0 meant NULL: NDIS tolerates omission only when MediumArraySize == 1,
+	 * and once the array holds another medium it would dereference NULL. Use a real variable here. */
 	op.SelectedMediumIndex = &sel_medium;
 	op.FrameTypeArray = NULL;
 	op.FrameTypeArraySize = 0;
@@ -1102,25 +1111,25 @@ iwan_win_proto_bind(_In_ NDIS_HANDLE ProtocolDriverContext,
 			       &b->binding);
 	InterlockedExchange(&g_bind_status, (LONG)st);
 	if (st == NDIS_STATUS_SUCCESS) {
-		/* 同步打开成功也要设接收过滤器，而且要在 opened=1 之后：
-		 * open_complete 走的是同一条路（那里有 set_packet_filter），
-		 * 但同步返回时**根本没有 open_complete 回调** —— 曾经只在
-		 * 异步分支设过滤器，于是"绑定在表里、opened=1、一个外层帧都
-		 * 收不到"，症状与会话没绑承载一模一样（rx_outer 恒 0）。
-		 * 打开成功即设，两条路径用同一句，别再分成两份。 */
+		/* A sync open success must also set the receive filter, and after opened=1:
+		 * open_complete goes the same way (it calls set_packet_filter), but on a
+		 * sync return there is **no open_complete callback at all** -- we once set
+		 * the filter only in the async branch, so "binding in the table, opened=1,
+		 * not one outer frame received", identical to a session with no carrier (rx_outer stays 0).
+		 * Set it on every open success, one call for both paths, never split in two. */
 		InterlockedIncrement(&g_open_ok);
 		InterlockedExchange(&b->opened, 1);
 		iwan_win_proto_set_packet_filter(b);
-		/* 同步打开成功 ⇒ bind 不返回 PENDING ⇒ 不需要
-		 * NdisCompleteBindAdapterEx，直接回 SUCCESS 即完成绑定。 */
+		/* Sync open success => bind does not return PENDING => no
+		 * NdisCompleteBindAdapterEx needed; returning SUCCESS completes the bind. */
 		return NDIS_STATUS_SUCCESS;
 	}
 	if (st == NDIS_STATUS_PENDING) {
-		/* 异步打开：完成由 open_complete 收尾。这里**不能**动这条绑定
-		 * （曾经在这里释放，等 open_complete 回来就是释放后使用）。 */
+		/* Async open: open_complete finishes it. Do **not** touch this binding
+		 * here (we once freed it, and the later open_complete was a use-after-free). */
 		return NDIS_STATUS_PENDING;
 	}
-	/* 硬失败：打关闭标记即可，内存留到 fini 统一释放 */
+	/* Hard failure: just set closed; memory is freed at fini */
 	iwan_win_proto_binding_close(b);
 	return st;
 }
@@ -1136,29 +1145,29 @@ iwan_win_proto_unbind(_In_ NDIS_HANDLE UnbindContext,
 	ULONG i;
 
 	b->unbind_context = UnbindContext;
-	/* 顺序是"摘绑定 → 等在途归零 → 关句柄"，三步都不能换：
-	 * ① 先摘：binding_close 在 mp->lock 里置 closed、清 mp->active，新的发送
-	 *    从此拿不到它（出向在锁内复核 opened/closed）；
-	 * ② 再等：已经拿到引用的发送在锁外分配 MDL/池之后才调
-	 *    NdisSendNetBufferLists，只有等 b->outstanding 归零，才能保证没人还
-	 *    攥着这个绑定句柄（窗口里有两次分配，不是几条指令）；
-	 * ③ 最后关：NdisCloseAdapterEx 返回后句柄即失效，此时已无人可用它。
-	 * 反过来（先关再等）会在关闭期间允许对失效句柄发送 —— DISPATCH 上的
-	 * 0xD1，或绑定引用计数失衡。 */
+	/* The order is "unlink -> wait for in-flight to reach zero -> close the handle";
+	 * (1) unlink first: binding_close sets closed and clears mp->active under
+	 *     mp->lock, so new sends cannot get it (egress rechecks opened/closed under the lock);
+	 * (2) then wait: a send that already got a reference allocates MDL/pool outside
+	 *     the lock before calling NdisSendNetBufferLists; only when b->outstanding hits 0 is no one
+	 *     still holding this binding handle (two allocations in that window, not a few instructions);
+	 * (3) close last: the handle dies when NdisCloseAdapterEx returns, and no one can use it then.
+	 * The reverse (close then wait) allows sends to a dead handle during close --
+	 * 0xD1 at DISPATCH, or a binding refcount imbalance. */
 	iwan_win_proto_binding_close(b);
 	for (i = 0; i < 1000 && b->outstanding > 0; i++)
 		KeStallExecutionProcessor(1000);
 	if (b->outstanding > 0)
-		DbgPrint("iwanmp: unbind 时仍有 %ld 条发送未完成，仍继续关闭\n",
+		DbgPrint("iwanmp: %ld sends still in flight at unbind, closing anyway\n",
 			 (long)b->outstanding);
 	st = NdisCloseAdapterEx(b->binding);
 	if (st == NDIS_STATUS_PENDING) {
-		/* 异步关闭：close_complete 收尾（同步路径不能替它完成 unbind） */
+		/* async close: close_complete finishes it (the sync path must not complete the unbind) */
 		return NDIS_STATUS_PENDING;
 	}
-	/* 同步关闭（成功或失败）：unbind 不返回 PENDING，NDIS 认为它已经完成，
-	 * **不得**再调 NdisCompleteUnbindAdapterEx —— 那个 API 只用于给返回过
-	 * PENDING 的 unbind 收尾，多调一次就是 unbind 记账失衡。 */
+	/* Sync close (success or failure): unbind does not return PENDING, NDIS considers
+	 * it done, and we must **not** call NdisCompleteUnbindAdapterEx -- that API only
+	 * finishes an unbind that returned PENDING; one extra call unbalances the unbind accounting. */
 	return NDIS_STATUS_SUCCESS;
 }
 
@@ -1194,13 +1203,13 @@ iwan_win_proto_pnp_event(_In_ NDIS_HANDLE ProtocolBindingContext,
 	return NDIS_STATUS_SUCCESS;
 }
 
-/* ---- 承载选择（会话 ↔ 网卡） ----------------------------------------- */
+/* ---- carrier selection (session <-> NIC) ------------------------------ */
 
-/* 由 IOCTL_OPEN 在会话建立后调用。判据：会话里的 oif_index 必须命中一张
- * 已打开的以太承载；下一跳取会话里的 outer_hop，为 0 就是"对端在链路上"。 */
-/* 把 ARP 诊断计数落到注册表（只能 PASSIVE 调：控制设备 GET 路径）。
- * T93 已发请求 / T94 收到 ARP 帧 / T95 学到邻居 / T96 peer_mac_valid。
- * 三个数一起看才分得清"没发出去""发了没回""回了但没认"。 */
+/* Called by IOCTL_OPEN after the session is set up. Criterion: the session's
+ * oif_index must hit an opened Ethernet carrier; the next hop is the session's outer_hop, 0 meaning "peer is on-link". */
+/* Publish the ARP diagnostic counters to the registry (PASSIVE only: control-device GET path).
+ * T93 requests sent / T94 ARP frames received / T95 neighbors learned / T96 peer_mac_valid.
+ * Only all three together distinguish "never sent", "sent but no reply" and "reply came but not accepted". */
 VOID
 iwan_win_mp_trace_arp(_In_ IWAN_WIN_DEVICE_EXTENSION *ext)
 {
@@ -1221,25 +1230,25 @@ iwan_win_mp_select_carrier(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 	KIRQL old;
 
 	if (s->oif_index == 0) {
-		DbgPrint("iwanmp: 会话没有指定承载接口（oif_index=0），拒绝建立\n");
+		DbgPrint("iwanmp: session specifies no carrier interface (oif_index=0), refusing to set up\n");
 		return STATUS_INVALID_PARAMETER;
 	}
 
-	/* 旗子（g_proto_started）只在"表与锁都已初始化"之后才立起来，所以
-	 * 它为 0 就等价于"这张表不可读"。NoProto=1、协议边注册全败、或者
-	 * 卸载后再开会话，都会走到这里 —— 必须在这里拒绝，而不是让查表去
-	 * 解引用一张全零的表。 */
+	/* The flag (g_proto_started) is only raised after "table and lock are initialized",
+	 * so 0 is equivalent to "the table is unreadable". NoProto=1, total protocol
+	 * registration failure, or opening a session after unload all land here --
+	 * reject here instead of letting the lookup dereference an all-zero table. */
 	if (InterlockedCompareExchange(&g_proto_started, 1, 1) == 0) {
-		DbgPrint("iwanmp: 协议边未启动（g_proto_started=0），拒绝建立\n");
+		DbgPrint("iwanmp: protocol side not started (g_proto_started=0), refusing to set up\n");
 		return STATUS_DEVICE_NOT_READY;
 	}
 
-	/* T86 = 会话点名要的接口索引。没有这个键，T74/T84 里的绑定索引就没有
-	 * 对照物 —— "查不到"和"索引不一样"在日志里长得一模一样。 */
+	/* T86 = the interface index the session asked for. Without this key the binding
+	 * indexes in T74/T84 have no reference: "not found" and "different index" look identical in the log. */
 	iwan_win_mp_trace(86, (LONG)s->oif_index);
-	/* T87 = 控制面有没有送 GUID 下来（1 = 有，只按 GUID 查表）。
-	 * T88 = (命中数 << 8) | 解析成功的节点数。T87=1 而命中数为 0，
-	 * 说明要么 AdapterName 没解析出来，要么控制面算错了 GUID。 */
+	/* T87 = whether the control plane sent a GUID down (1 = yes, lookup by GUID only).
+	 * T88 = (hits << 8) | nodes parsed OK. T87=1 with 0 hits means either
+	 * AdapterName did not parse or the control plane computed the wrong GUID. */
 	if (!iwan_win_proto_guid_zero(s->outer_if_guid)) {
 		iwan_win_mp_trace(87, 1);
 		iwan_win_mp_trace(88,
@@ -1251,11 +1260,11 @@ iwan_win_mp_select_carrier(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 	KeAcquireSpinLock(&g_bind_lock, &old);
 	b = iwan_win_proto_lookup_locked(s->outer_if_guid, s->oif_index);
 	KeReleaseSpinLock(&g_bind_lock, old);
-	/* 打开还在飞就先等一会儿：控制面（kdp_win）建会话只发一次 OPEN，NDIS
-	 * 的 open_complete 若晚到几十毫秒，会话就整条建立失败。只在这一种情况
-	 * 下等 —— 表里有该接口的节点、没关闭、还没 opened。最多 2 秒，超时照
-	 * 旧返回 DEVICE_NOT_READY。KeStallExecutionProcessor 在 PASSIVE（IOCTL
-	 * 路径）下可用，也刻意不去用定时器等内核对象。 */
+	/* If the open is still in flight, wait a bit: the control plane (kdp_win) sends
+	 * OPEN once when setting up a session, and if NDIS's open_complete is tens of
+	 * ms late the whole session setup fails. Wait only in this case: a node for
+	 * that interface in the table, not closed, not opened yet. At most 2 s, then
+	 * return DEVICE_NOT_READY as before. KeStallExecutionProcessor is usable at PASSIVE (IOCTL path), and we deliberately avoid timers or other kernel objects. */
 	{
 		ULONG spins = 0;
 
@@ -1263,14 +1272,14 @@ iwan_win_mp_select_carrier(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 		       iwan_win_proto_binding_pending(s->outer_if_guid,
 						      s->oif_index) &&
 		       spins < 200) {
-			/* 在 PASSIVE 上就让出 CPU：这是控制面 IRP 线程，忙等
-			 * 两秒会白烧一个核。KeDelayExecutionThread 不创建任何
-			 * 内核对象，与"驱动里没有定时器/线程"的约束不冲突。
-			 * 万一被抬到 DISPATCH（不该发生）则退回停顿等待。 */
+			/* Yield the CPU at PASSIVE: this is a control-plane IRP thread and
+			 * busy-waiting for 2 s burns a core. KeDelayExecutionThread creates no
+			 * kernel object, so it does not violate "no timers/threads in the driver".
+			 * If we somehow get raised to DISPATCH (should not happen), fall back to stall-waiting. */
 			if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
 				LARGE_INTEGER iv;
 
-				iv.QuadPart = -10 * 10000;	/* 10 ms，相对 */
+				iv.QuadPart = -10 * 10000;	/* 10 ms, relative */
 				KeDelayExecutionThread(KernelMode, FALSE, &iv);
 			} else {
 				KeStallExecutionProcessor(10000);
@@ -1283,52 +1292,52 @@ iwan_win_mp_select_carrier(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 		}
 		iwan_win_mp_trace(83, (LONG)spins);
 	}
-	/* 放锁之后才落诊断：T70=1 ⇒ 表从来没被 InitializeListHead 过；
-	 * T71=链上节点数，T70 不出现而 T71=0 ⇒ 表是好的但 NDIS 一条绑定都没
-	 * 给过（协议边绑不上承载）。两种病因的处置完全不同。 */
+	/* Publish diagnostics only after unlocking: T70=1 => the table was never InitializeListHead'ed;
+	 * T71 = node count. T70 absent with T71=0 => the table is fine but NDIS never
+	 * gave one binding (the protocol side cannot bind a carrier). The two causes need completely different handling. */
 	iwan_win_mp_trace(70,
 			  InterlockedCompareExchange(&g_bind_table_broken, 1, 1));
 	iwan_win_mp_trace(71, (LONG)iwan_win_proto_binding_count());
-	/* T72/T73：open_complete 的成败次数。绑定在表里却打不开（T73>0）与
-	 * NDIS 根本没回调（两者皆 0）是两回事，处置完全不同。T74/T75：链上前
-	 * 两个绑定压成 ifindex|opened<<14|closed<<15，与 T71 一起就能分辨
-	 * "索引挑错了"与"绑上了但没打开"。 */
+	/* T72/T73: open_complete success/failure counts. A binding in the table that
+	 * cannot open (T73>0) and no NDIS callback at all (both 0) are different issues.
+	 * T74/T75: the first two bindings packed as ifindex|opened<<14|closed<<15; with T71
+	 * they distinguish "wrong index picked" from "bound but not opened". */
 	iwan_win_mp_trace(72, InterlockedCompareExchange(&g_open_ok, 0, 0));
 	iwan_win_mp_trace(73, InterlockedCompareExchange(&g_open_fail, 0, 0));
 	iwan_win_mp_trace(74, iwan_win_proto_bind_info(0));
 	iwan_win_mp_trace(75, iwan_win_proto_bind_info(1));
-	/* T76 = open_complete 报的 NTSTATUS 原值、T77 = bind 里 NdisOpenAdapterEx
-	 * 当场返回的错误。两者都是 0 而 T74/T75 的 opened 位为 0 ⇒ 打开还在飞
-	 *（PENDING 迟迟不回），而不是失败。T78 = NDIS 调过几次 BindAdapterEx、
-	 * T79 = 其中被我们按介质/MAC 拒掉几次：T71=0 时，78=0 是"NDIS 根本没
-	 * 叫我们"，78>0 而 79=78 是"叫了全拒了"，两条病因的修法完全不同。 */
+	/* T76 = the raw NTSTATUS open_complete reported, T77 = the error
+	 * NdisOpenAdapterEx returned on the spot in bind. Both 0 with the opened bit 0 in
+	 * T74/T75 => the open is still in flight (PENDING never returns), not a failure.
+	 * T78 = how many times NDIS called BindAdapterEx, T79 = how many we rejected on
+	 * medium/MAC: with T71=0, 78=0 means "NDIS never called us", 78>0 with 79=78 means "called, all rejected"; the fixes are completely different. */
 	iwan_win_mp_trace(76, InterlockedCompareExchange(&g_open_status, 0, 0));
 	iwan_win_mp_trace(77, InterlockedCompareExchange(&g_bind_status, 0, 0));
 	iwan_win_mp_trace(78, InterlockedCompareExchange(&g_bind_calls, 0, 0));
 	iwan_win_mp_trace(79, InterlockedCompareExchange(&g_bind_rejected, 0, 0));
-	/* T84/T85 = 前两个绑定按 BoundIfNetluid 换算出的第二个索引（含
-	 * opened/closed 位）。与 T74/T75 的 BoundIfIndex 并排看：两个键相等
-	 * 说明两套编号一致（那就该查别处），不等说明查表口径选错了。 */
+	/* T84/T85 = the second index of the first two bindings converted from BoundIfNetluid
+	 * (with opened/closed bits). Compare with BoundIfIndex in T74/T75: equal keys
+	 * mean the two numbering schemes agree (look elsewhere), different means the lookup chose the wrong one. */
 	iwan_win_mp_trace(84, iwan_win_proto_bind_info_net(0));
 	iwan_win_mp_trace(85, iwan_win_proto_bind_info_net(1));
 	if (b == NULL) {
-		/* 三种结局各留一个键：Stage/Status 只能记最后一次调用，而这里
-		 * 有两条都返回 DEVICE_NOT_READY 的路径，靠 Stage 分辨不出来。 */
+		/* One key for each of the three outcomes: Stage/Status only records the last
+		 * call, and two paths here both return DEVICE_NOT_READY, indistinguishable by Stage. */
 		iwan_win_mp_trace(80, 1);
-		DbgPrint("iwanmp: 接口 %lu 上没有可用的以太承载，拒绝建立\n",
+		DbgPrint("iwanmp: no usable Ethernet carrier on interface %lu, refusing to set up\n",
 			 (unsigned long)s->oif_index);
 		return STATUS_DEVICE_NOT_READY;
 	}
 
 	KeAcquireSpinLock(&mp->lock, &old);
-	/* 查表（g_bind_lock）与这里赋值之间有窗口：若该绑定正好被 unbind，
-	 * binding_close 的清理判据 `mp->active == b` 当时还不成立，于是 active
-	 * 会停在一条已关闭的绑定上 —— 发包虽然会被 opened 复核挡住，但会话看
-	 * 起来建立成功却一个字节都出不去。这里在同一个锁内复核一次。 */
+	/* There is a window between the lookup (g_bind_lock) and the assignment here:
+	 * if the binding is unbound right now, binding_close's cleanup test "mp->active == b" is
+	 * still false, so mp->active stays on a closed binding -- sends are blocked by the
+	 * opened recheck, but the session looks set up while not one byte can leave. Recheck under the same lock. */
 	if (b->opened == 0 || b->closed != 0) {
 		KeReleaseSpinLock(&mp->lock, old);
 		iwan_win_mp_trace(81, 1);
-		DbgPrint("iwanmp: 承载接口 %lu 在选中瞬间被解绑，拒绝建立会话\n",
+		DbgPrint("iwanmp: carrier interface %lu was unbound the moment it was selected, refusing session setup\n",
 			 (unsigned long)s->oif_index);
 		return STATUS_DEVICE_NOT_READY;
 	}
@@ -1342,8 +1351,8 @@ iwan_win_mp_select_carrier(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 	mp->arp_last_ms = 0;
 	KeReleaseSpinLock(&mp->lock, old);
 
-	DbgPrint("iwanmp: 承载 = 接口 %lu（%02x-%02x-%02x-%02x-%02x-%02x），"
-		 "下一跳 %lu.%lu.%lu.%lu\n", (unsigned long)b->ifindex,
+	DbgPrint("iwanmp: carrier = interface %lu (%02x-%02x-%02x-%02x-%02x-%02x),"
+		 "next hop %lu.%lu.%lu.%lu\n", (unsigned long)b->ifindex,
 		 b->mac[0], b->mac[1], b->mac[2], b->mac[3], b->mac[4], b->mac[5],
 		 (unsigned long)((mp->next_hop_be >> 24) & 0xFFu),
 		 (unsigned long)((mp->next_hop_be >> 16) & 0xFFu),
@@ -1370,20 +1379,20 @@ iwan_win_mp_release_carrier(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 	KeReleaseSpinLock(&mp->lock, old);
 }
 
-/* ---- 注册与注销 ------------------------------------------------------- */
+/* ---- register and deregister ------------------------------------------ */
 
 NTSTATUS
 iwan_win_proto_init(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 {
-	/* 单次注册被客体实测拒绝（小型端口侧 0xC0010005 = NDIS_STATUS_BAD_
-	 * CHARACTERISTICS，见 mp.c 的说明），而且旧实验里"版本第一档就命中"是读到了
-	 * 陈旧键。这里因此恢复候选表：每档落 T60+i，命中落 T69（值是声明
-	 * 的次版本），全部失败落 T58 = 尝试次数。第一档没成功就继续试的前提是
-	 * "没成功就不留句柄"：只有成功那一档会写 proto_handle。 */
+	/* A single registration was rejected on the target (miniport side 0xC0010005 = NDIS_STATUS_BAD_
+	 * CHARACTERISTICS, see the note in mp.c), and in the old experiment "the first version candidate hit" was reading a
+	 * stale key. So restore the candidate table here: each candidate logs T60+i, the hit logs T69 (value = declared
+	 * minor version), all failures log T58 = attempt count. Trying further after the first fails assumes
+	 * "no handle is kept unless it succeeds": only the successful candidate writes proto_handle. */
 	NDIS_PROTOCOL_DRIVER_CHARACTERISTICS ch;
 	NDIS_STATUS last = NDIS_STATUS_BAD_CHARACTERISTICS;
 	UCHAR runtime = (UCHAR)(NdisGetVersion() & 0xFFu);
-	/* 0xFF = 用运行时次版本；后面几档是保守声明 */
+	/* 0xFF = use the runtime minor version; later candidates are conservative declarations */
 	static const UCHAR cand_minor[] = { 0xFF, 0xFF, 0, 0, 80, 60, 30 };
 	static const UCHAR cand_rev[] = {
 		NDIS_PROTOCOL_DRIVER_CHARACTERISTICS_REVISION_1,
@@ -1396,17 +1405,17 @@ iwan_win_proto_init(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 	};
 	ULONG ci;
 
-	/* 旗子 = "绑定表可读、出向池可用"，所以它必须最后由成功路径立起来。
-	 * 反过来（先立旗、后初始化）就是客体上那次 0xD1：任何看到旗子的读者
-	 * 都可能读到一张全零的表 —— BSS 里的 LIST_ENTRY 是 16 个零字节，不是
-	 * 指向自己的空表，遍历到它就是把 0x30 当 ifindex 读。 */
+	/* The flag means "binding table readable, egress pool usable", so only the success path may raise it at the end.
+	 * The reverse (raise first, initialize later) is that 0xD1 on the target: any reader
+	 * that sees the flag may read an all-zero table -- a LIST_ENTRY in BSS is 16 zero
+	 * bytes, not an empty list pointing at itself; walking it reads 0x30 as an ifindex. */
 	if (InterlockedCompareExchange(&g_proto_started, 0, 0) != 0)
 		return STATUS_SUCCESS;
 
 	InterlockedExchange(&g_bind_table_broken, 0);
-	/* 计数器只在"驱动级首次初始化"时清零：注册成功后 NDIS 会陆续回调
-	 * bind，若这些数在别处被重置，T72..T79 就会把"没回调"读成"回调了"。
-	 * 这里与旗子取值在同一段、同一线程，不会再被走到第二次。 */
+	/* The counters are cleared only at "first driver-level init": after registration
+	 * NDIS calls bind over time; resetting these numbers elsewhere makes T72..T79 read "no callback" as "called back".
+	 * This is in the same section and thread as the flag read and cannot be reached twice. */
 	g_open_ok = 0;
 	g_open_fail = 0;
 	g_open_status = 0;
@@ -1450,11 +1459,11 @@ iwan_win_proto_init(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 		last = st;
 		if (st == NDIS_STATUS_SUCCESS) {
 			iwan_win_mp_trace(69, (LONG)minor);
-			DbgPrint("iwanmp: 协议边已注册（NDIS 6.%u, rev %u）\n",
+			DbgPrint("iwanmp: protocol side registered (NDIS 6.%u, rev %u)\n",
 				 (unsigned)minor, (unsigned)cand_rev[ci]);
-			/* 出向 NBL 池归协议边所有：生命周期必须包住所有在途外层
-			 * 发送（完成回调里 NdisFreeNetBufferList），所以不能建在小型
-			 * 端口里 —— 那条池会被 MiniportHaltEx 在设备重启时销毁。 */
+			/* The egress NBL pool is owned by the protocol side: its lifetime must cover all
+			 * in-flight outer sends (NdisFreeNetBufferList in the completion callback), so it cannot be created in the miniport --
+			 * that pool is destroyed by MiniportHaltEx on device restart. */
 			{
 				NET_BUFFER_LIST_POOL_PARAMETERS pp;
 
@@ -1472,24 +1481,24 @@ iwan_win_proto_init(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 					ext->mp.proto_handle, &pp);
 			}
 			if (ext->mp.tx_pool == NULL) {
-				/* 池建不出来就地注销：小型端口还没注册，失败是干净的。 */
+				/* Pool creation failed, deregister on the spot: the miniport is not registered yet, failure is clean. */
 				iwan_win_mp_trace(57, NDIS_STATUS_RESOURCES);
 				NdisDeregisterProtocolDriver(ext->mp.proto_handle);
 				ext->mp.proto_handle = NULL;
 				InterlockedExchange(&g_proto_started, 0);
 				return STATUS_INSUFFICIENT_RESOURCES;
 			}
-			/* 到这里"表可读、池可用"才同时成立，旗子此刻立起来。
-			 * 在此之前到达的会话请求都会被 select_carrier 挡掉。 */
+			/* Only now are "table readable, pool usable" both true; raise the flag at this point.
+			 * Session requests arriving before this are rejected by select_carrier. */
 			InterlockedExchange(&g_proto_started, 1);
 			return STATUS_SUCCESS;
 		}
 	}
-	/* 一档都没成功：不留半个句柄 */
+	/* No candidate succeeded: keep no half handle */
 	ext->mp.proto_handle = NULL;
 	InterlockedExchange(&g_proto_started, 0);
 	iwan_win_mp_trace(58, (LONG)RTL_NUMBER_OF(cand_minor));
-	DbgPrint("iwanmp: NdisRegisterProtocolDriver 全部候选失败 0x%08lx\n",
+	DbgPrint("iwanmp: NdisRegisterProtocolDriver all candidates failed 0x%08lx\n",
 		 (unsigned long)last);
 	return last;
 }
@@ -1503,21 +1512,21 @@ iwan_win_proto_fini(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 
 	if (ext->mp.proto_handle == NULL)
 		return;
-	/* NdisDeregisterProtocolDriver 是 VOID（ndis.h:7975-7978），没有返回值
-	 * 可查。真正兜住"回调已停"的是下面的在途计数排空：排不空就不放内存。
-	 * 它会等所有回调返回，之后绑定表不再变化 —— 这是唯一安全的释放点。 */
+	/* NdisDeregisterProtocolDriver is VOID (ndis.h:7975-7978), there is no return value
+	 * to check. What really guarantees "callbacks stopped" is draining the in-flight counts below: if it does not drain, no memory is freed.
+	 * It waits for all callbacks to return; after that the binding table stops changing -- the only safe free point. */
 	NdisDeregisterProtocolDriver(ext->mp.proto_handle);
 	ext->mp.proto_handle = NULL;
 	InterlockedExchange(&g_proto_started, 0);
 	iwan_win_mp_release_carrier(ext);
-	/* 在途外层发送归零之后才动内存：完成回调会解引用 b->ext/b->outstanding
-	 * 并 NdisFreeNetBufferList。排不空就整体泄漏（驱动马上卸载）。 */
+	/* Touch memory only after in-flight outer sends reach zero: the completion callback dereferences b->ext/b->outstanding
+	 * and calls NdisFreeNetBufferList. If it does not drain, leak everything (the driver is about to unload). */
 	for (i = 0; i < 1000 &&
 	     (ext->mp.outer_outstanding > 0 || g_oid_pending > 0); i++)
 		KeStallExecutionProcessor(1000);
 	if (ext->mp.outer_outstanding > 0 || g_oid_pending > 0) {
-		DbgPrint("iwanmp: 注销时仍有 %ld 条外层发送、%ld 个 OID 未完成，"
-			 "绑定与池都不释放\n",
+		DbgPrint("iwanmp: %ld outer sends, %ld OIDs still incomplete at deregistration,"
+			 "bindings and pool are not freed\n",
 			 (long)ext->mp.outer_outstanding, (long)g_oid_pending);
 		return;
 	}
@@ -1526,16 +1535,16 @@ iwan_win_proto_fini(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 		ext->mp.tx_pool = NULL;
 	}
 
-	/* 只摘链，不释放：节点一旦 ExFreePoolWithTag，任何还在用 b 的路径
-	 * （select_carrier 取到 b 之后放掉 g_bind_lock、再在 mp->lock 里复核
-	 * b->opened/b->closed）就变成读已释放内存。驱动正在卸载，几个几十字节
-	 * 的绑定泄漏远便宜于一次 bugcheck；而节点留着，链表指针永远指向有效
-	 * 内存，即便有人拿着过期指针也只会走到表头自然终止。
-	 * 曾经这里先置 b->link.Flink=NULL 再释放 —— 那正是 0xD1 的另一个触发
-	 * 形态：遍历读到 Flink=NULL，随后 cmpl 0x30(%r14) 打在 0x30 上。 */
+	/* Unlink only, do not free: once a node is ExFreePoolWithTag'ed, any path still using b
+	 * (select_carrier gets b, drops g_bind_lock, then rechecks
+	 * b->opened/b->closed under mp->lock) reads freed memory. The driver is unloading; a few tens of
+	 * bytes of leaked binding are far cheaper than a bugcheck; and with the nodes kept, the list pointers always point at valid
+	 * memory, so even a stale pointer just walks to the list head and stops.
+	 * We once set b->link.Flink=NULL before freeing -- that was the other trigger
+	 * shape of 0xD1: the walk read Flink=NULL, then cmpl 0x30(%r14) hit 0x30. */
 	KeAcquireSpinLock(&g_bind_lock, &old);
-	/* 表头也要当不可信数据：卸载路径上这张表的值可能来自一次没走完的
-	 * 初始化（Flink=NULL）。摘链前先确认它指向自己或一个真节点。 */
+	/* Treat the list head as untrusted data too: on the unload path its value may come from an incomplete
+	 * initialization (Flink=NULL). Before unlinking, make sure it points at itself or a real node. */
 	if (g_bindings.Flink == NULL)
 		InitializeListHead(&g_bindings);
 	for (e = g_bindings.Flink; e != NULL && e != &g_bindings; e = n) {

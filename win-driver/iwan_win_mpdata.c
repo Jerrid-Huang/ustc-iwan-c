@@ -1,52 +1,52 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * iwan_win_mpdata.c — NDIS 小型端口 + 协议驱动平面的隧道引擎。
+ * iwan_win_mpdata.c - tunnel engine for the NDIS miniport + protocol driver plane.
  *
- * 与 WFP 平面（iwan_win_wfp.c）的关系：线上字节必须逐字节一致 —— 帧头、
- * 异或、内层校验和、外层首部全部走同一套 iwan_win_frame.c；会话参数与统计
- * 口径也同一套（同名同义的 sess.stats）。差别只在"报文怎么进出"：
+ * Relation to the WFP plane (iwan_win_wfp.c): on-wire bytes must match byte for byte -- frame header,
+ * XOR, inner checksum and outer header all use the same iwan_win_frame.c; session params and stat
+ * accounting are the same set too (same names and meanings in sess.stats). Only the packet in/out path differs:
  *
- *   出向（内层 → 外层）
- *     WFP 平面：OUTBOUND_IPPACKET 处截获 → 封装 → FwpsInjectNetworkSendAsync
- *     本平面　：小型端口收到协议栈交下来的内层数据报 → 封装 →
- *               NdisSendNetBufferLists（协议边，绑在承载网卡上）
- *   入向（外层 → 内层）
- *     WFP 平面：INBOUND_TRANSPORT 处截获 → 解封 → FwpsInjectNetworkReceiveAsync
- *     本平面　：协议边从承载网卡收外层 UDP → 解封 →
- *               NdisMIndicateReceiveNetBufferLists（小型端口指示向上）
+ *   TX path (inner -> outer)
+ *     WFP plane: intercept at OUTBOUND_IPPACKET -> encapsulate -> FwpsInjectNetworkSendAsync
+ *     this plane: miniport gets the inner datagram handed down by the stack -> encapsulate ->
+ *               NdisSendNetBufferLists (protocol edge, bound to the carrier NIC)
+ *   RX path (outer -> inner)
+ *     WFP plane: intercept at INBOUND_TRANSPORT -> decapsulate -> FwpsInjectNetworkReceiveAsync
+ *     this plane: protocol edge receives outer UDP from the carrier NIC -> decapsulate ->
+ *               NdisMIndicateReceiveNetBufferLists (miniport indicates upward)
  *
- * 因此三处更简单：① 出向只处理"路由指向本适配器"的报文，不需要目标集合
- * 匹配；② 入向直接指示向上，不像注入那样再走一遍协议栈入口；③ 不需要注入
- * 完成前的"缓冲必须存活"约束，但要保留在途上限（见下）。
+ * So three things are simpler: (1) TX only handles packets whose route points to this adapter, no
+ * destination-set match; (2) RX indicates upward directly, unlike injection it does not re-enter the stack; (3) no
+ * 'buffer must stay alive until injection completes' constraint, but the in-flight cap is kept (see below).
  *
- * 控制帧（OPEN/ECHO/CLOSE）本平面只记账、不指示向上：承载网卡的常规
- * TCP/IP 绑定本来就会把这些 UDP 交给用户态套接字（原客户端进程收到
- * PT_OPEN_ACK 比驱动更早），所以控制面天然继续可用。数据帧则不同 —— 它们
- * 到了用户态套接字只是噪声，必须由引擎吸收（外层不进主机栈）。
+ * Control frames (OPEN/ECHO/CLOSE) are only accounted here, not indicated upward: the carrier NIC's normal
+ * TCP/IP binding already delivers these UDP packets to user-mode sockets (the original client process receives
+ * PT_OPEN_ACK earlier than the driver), so the control plane naturally keeps working. Data frames differ -- they
+ * are just noise at the user-mode socket and must be absorbed by the engine (outer never enters the host stack).
  *
- * 并发：本文件全部在 <= DISPATCH_LEVEL 被调用（小型端口发送、协议边接收），
- * 不等待、不加锁、不碰可分页内存。会话参数按 WFP 平面的同一约定用 rundown
- * 保护读取。
+ * Concurrency: everything in this file is called at <= DISPATCH_LEVEL (miniport send, protocol-edge receive),
+ * no waiting, no locking, no pageable memory. Session params are read under rundown protection per the same
+ * convention as the WFP plane.
  */
 #include "iwan_win.h"
 
-/* 外层在途上限：每个在途外层 NBL 都占着非分页池，要等 NDIS 发送完成回调
- * 才归还。内层可能远比承载快（10 Gbps 的内层灌一条 100 Mbps 的承载），
- * 没有上限就会以 GB/s 量级净增长、秒级耗尽非分页池 —— 这正是 WFP 平面
- * 硬挂的机制（Kernel-Power 41 + 6008），同一个坑不能踩第二次。
- * 超限丢当前包并计 ev_dropped（队列溢出丢弃），但**对协议栈报成功**：
- * 报失败会被翻成 sendto() 的 WSAEINVAL，把"承载来不及取"伪装成"应用参数
- * 非法"。丢包是 UDP 的正常结局，计数才是唯一的诊断通道。 */
+/* Outer in-flight cap: each in-flight outer NBL holds non-paged pool and is returned only after the
+ * NDIS send completion callback. The inner can be far faster than the carrier (10 Gbps inner feeding a 100 Mbps carrier);
+ * without a cap it would grow net at GB/s and exhaust non-paged pool within seconds -- this is exactly how the WFP plane
+ * hard-hung (Kernel-Power 41 + 6008); do not step into the same pit twice.
+ * Over the cap, drop the current packet and count ev_dropped (queue overflow drop), but **report success to the stack**:
+ * reporting failure gets translated into WSAEINVAL from sendto(), disguising 'carrier cannot keep up' as 'invalid
+ * application arguments'. Packet loss is a normal UDP outcome; counters are the only diagnostic channel. */
 
-/* "这帧是本会话的什么"，与 WFP 平面 iwan_win_inbound_kind 同义 */
-#define IWAN_MP_IN_NONE		0u	/* 不是本会话的帧（端口不成对） */
-#define IWAN_MP_IN_DROP		1u	/* 是本会话的帧但结构或凭据不合法 */
+/* 'What is this frame to this session', same meaning as WFP plane iwan_win_inbound_kind */
+#define IWAN_MP_IN_NONE		0u	/* not a frame of this session (ports not paired) */
+#define IWAN_MP_IN_DROP		1u	/* is this session's frame but structure or credential is invalid */
 #define IWAN_MP_IN_DATA		2u
 #define IWAN_MP_IN_CTRL		3u
 
-/* 端口成对 + 凭据 + 类型三分：判据必须与 WFP 平面逐条一致，否则同一个包
- * 在两个平面上会得到不同结论。地址那一半由协议边在调用前卡（外层目的地址
- * 必须等于 outer_src），这里只管传输层与隧道层。 */
+/* Port pairing + credential + type: the criteria must match the WFP plane item by item, otherwise the same packet
+ * would get a different verdict on the two planes. The address half is gated by the protocol edge before the call (outer
+ * dest address must equal outer_src); here only the transport and tunnel layers are handled. */
 static UINT32
 iwan_win_mp_outer_kind(_In_ const IWAN_WIN_SESSION *s,
 		       _In_ const IWAN_WIN_OUTER *o)
@@ -64,7 +64,7 @@ iwan_win_mp_outer_kind(_In_ const IWAN_WIN_SESSION *s,
 	}
 }
 
-/* ---- 出向：内层数据报 → 外层帧 ---------------------------------------- */
+/* ---- TX path: inner datagram -> outer frame ---------------------------- */
 
 UINT32
 iwan_win_mp_encap_send(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
@@ -78,24 +78,24 @@ iwan_win_mp_encap_send(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	BOOLEAN sent;
 
 	if (!ExAcquireRundownProtection(&ext->rundown))
-		return IWAN_MP_TX_DROP;	/* 会话正在拆除：本包丢弃，不报错 */
+		return IWAN_MP_TX_DROP;	/* session is being torn down: drop this packet, do not report an error */
 
 	if (s->valid == 0) {
-		/* 没有会话：本适配器唯一的存在理由就是隧道，报文到此为止。
-		 * 明确失败（小型端口把状态回给协议栈）并计数 —— 静默丢弃是
-		 * WFP 平面吃过亏的地方。
+		/* No session: the only reason this adapter exists is the tunnel, so the packet stops here.
+		 * Fail explicitly (the miniport returns the status to the stack) and count -- silent drop is
+		 * where the WFP plane got burned.
 		 *
-		 * 这里**刻意不看** s->inner_ip：WFP 平面用它做"哪些报文该进
-		 * 隧道"的判据，本平面的判据是路由（报文能到本适配器就说明
-		 * 该进隧道），内层身份由控制面用 netsh 设在适配器上。真实的
-		 * 控制面（kdp_win.c）从不填 SESSION_OPEN 里的 inner_ip，若在这里
-		 * 也要求它非零，结果会是"会话建立了、一个字节都出不去"。 */
+		 * **Deliberately ignore** s->inner_ip here: the WFP plane uses it as the criterion for 'which packets should
+		 * enter the tunnel', while this plane's criterion is routing (a packet that reaches this adapter means
+		 * it should enter the tunnel); the inner identity is set on the adapter by the control plane with netsh. The real
+		 * control plane (kdp_win.c) never fills inner_ip in SESSION_OPEN; if it were also
+		 * required to be non-zero here, the result would be 'session established, not a byte gets out'. */
 		IWAN_MP_STAT_INC(ext, tx_bad_state);
 		ExReleaseRundownProtection(&ext->rundown);
 		return IWAN_MP_TX_DROP;
 	}
-	/* 外层 v6 的邻居发现（NS/NA）留到第二阶段：现在直接拒绝，绝不降级成
-	 * 明文或"猜一个网关 MAC"。 */
+	/* Outer v6 neighbor discovery (NS/NA) is left to phase 2: reject outright now, never fall back to
+	 * plaintext or 'guess a gateway MAC'. */
 	if (iwan_win_session_is_v6(s)) {
 		iwan_win_diag_tx(s, IWAN_WIN_DIAG_TX_V6_NOT_IMPL, len, len,
 				 len > 0 ? (ULONG)inner[0] : 0xFFFFu, inner);
@@ -103,9 +103,14 @@ iwan_win_mp_encap_send(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		ExReleaseRundownProtection(&ext->rundown);
 		return IWAN_MP_TX_DROP;
 	}
-	/* 内层自洽：调用者（小型端口）已经从首部读出总长，这里独立复核一次 */
-	if (len < IWAN_INNER_IP4_LEN || (inner[0] >> 4) != 4 ||
-	    iwan_win_rd16(inner + 2) > len) {
+	/* Inner sanity: the caller (miniport) already read the total length from the header; re-check independently here.
+	 * Both inner versions are accepted (v4 and v6): this plane used to require (inner[0] >> 4) == 4 and read the
+	 * total length from the v4 header unconditionally, while the indication side has always handled v6 -- the result was
+	 * "downlink v6 works, uplink v6 is dropped as malformed", which looks like a v6 routing problem rather than a version gate.
+	 * The frame type on the wire is PT_DATA / PT_DATA_ENC for either inner version (same as the Linux plane:
+	 * iwan_tx.c writes fh[0] from dp.enc only and never looks at the inner version), so nothing else changes. */
+	if (len < IWAN_INNER_IP4_LEN || iwan_win_inner_family(inner, len) == 0 ||
+	    !iwan_win_inner_sane(inner, len)) {
 		iwan_win_diag_tx(s, IWAN_WIN_DIAG_TX_LEN_BAD, len, len,
 				 len > 0 ? (ULONG)inner[0] : 0xFFFFu, inner);
 		IWAN_MP_STAT_INC(ext, tx_bad_inner);
@@ -113,10 +118,10 @@ iwan_win_mp_encap_send(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		return IWAN_MP_TX_FAIL;
 	}
 
-	/* 先判再加：无符号回绕会让超长 len（如 0xFFFFFFF0）算出的 total 变小，
-	 * 0xFFFF、承载 MTU、在途上限三道理就全部放行，而拷贝仍按 len 抄。
-	 * 调用者今天给不出这种长度（NET_BUFFER_DATA_LENGTH 到不了 4G），
-	 * 但数据面的长度闸门不该建立在调用者的善意上。 */
+	/* Check before adding: unsigned wrap makes the total computed from an oversized len (e.g. 0xFFFFFFF0) smaller,
+	 * so the 0xFFFF, carrier MTU and in-flight cap checks all pass, while the copy still uses len.
+	 * The caller cannot produce such a length today (NET_BUFFER_DATA_LENGTH cannot reach 4G),
+	 * but a data-plane length gate should not rest on the caller's good faith. */
 	if (overhead > 0xFFFFu || len > 0xFFFFu - overhead) {
 		iwan_win_diag_tx(s, IWAN_WIN_DIAG_TX_LEN_BAD, len, len,
 				 (ULONG)inner[0], inner);
@@ -133,8 +138,8 @@ iwan_win_mp_encap_send(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		ExReleaseRundownProtection(&ext->rundown);
 		return IWAN_MP_TX_FAIL;
 	}
-	/* 承载网卡 MTU：外层 IP 数据报不能超过它（外层不分片，装不下就是丢）。
-	 * 与 WFP 平面同一判据、同一计数器。 */
+	/* Carrier NIC MTU: the outer IP datagram must not exceed it (outer is not fragmented; if it does not fit, drop).
+	 * Same criterion and same counter as the WFP plane. */
 	if (total > s->carrier_mtu) {
 		iwan_win_diag_tx(s, IWAN_WIN_DIAG_TX_MTU, len, total,
 				 (ULONG)inner[0], inner);
@@ -142,9 +147,9 @@ iwan_win_mp_encap_send(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		ExReleaseRundownProtection(&ext->rundown);
 		return IWAN_MP_TX_DROP;
 	}
-	/* 在途上限就是"发送队列溢出"：语义上属于 ev_dropped（队列溢出丢弃），
-	 * 不是 tx_bad_state（状态坏了）。两者混用会让"驱动坏了"和"承载跟不上"
-	 * 在计数里长得一样。 */
+	/* The in-flight cap means 'send queue overflow': semantically it belongs to ev_dropped (queue overflow drop),
+	 * not tx_bad_state (state is broken). Mixing the two makes 'driver broken' and 'carrier cannot keep up'
+	 * look identical in the counters. */
 	if ((ULONG)ext->mp.outer_outstanding >= IWAN_MP_MAX_OUTER_INFLIGHT) {
 		iwan_win_diag_tx(s, IWAN_WIN_DIAG_TX_INFLIGHT, len, total,
 				 (ULONG)inner[0], inner);
@@ -153,7 +158,17 @@ iwan_win_mp_encap_send(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		return IWAN_MP_TX_DROP;
 	}
 
-	/* 缓冲一次分配到位：以太头(14) + 外层 IP+UDP(28) + 帧头(8) + 载荷 */
+	/* Diagnostic pass-through: account the datagram as "would have been encapsulated" and drop it. No encryption, no
+	 * outer header, no send to the carrier -- the difference from the normal path is exactly the encapsulation cost.
+	 * The counters are the ones the meters already read (tx_pkts / tx_bytes), the same convention as the Linux plane's
+	 * pass_through, so a run needs no new tooling and no ABI change. */
+	if ((ext->pass_through & IWAN_WIN_PASS_TX)) {
+		IWAN_MP_STAT_INC(ext, tx_pkts);
+		IWAN_MP_STAT_ADD(ext, tx_bytes, (LONG64)len);
+		ExReleaseRundownProtection(&ext->rundown);
+		return IWAN_MP_TX_OK;
+	}
+	/* Buffer allocated in one shot: Ethernet header (14) + outer IP+UDP (28) + frame header (8) + payload */
 	buf = (UINT8 *)IWAN_ALLOC(IWAN_MP_ETH_HDR_LEN + total, IWAN_TAG_PKT);
 	if (buf == NULL) {
 		IWAN_MP_STAT_INC(ext, tx_err);
@@ -163,11 +178,11 @@ iwan_win_mp_encap_send(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	ip = buf + IWAN_MP_ETH_HDR_LEN;
 	fh = ip + overhead - IWAN_FRAME_HDR_LEN;
 
-	/* 会话参数在这一段内被读走；写完帧头与载荷后即可放行 rundown */
+	/* Session params are read within this section; release rundown once header and payload are written */
 	iwan_win_build_frame_hdr(fh, s->enc ? PT_DATA_ENC : PT_DATA, s->enc,
 				 s->sid, s->tok);
 	RtlCopyMemory(fh + IWAN_FRAME_HDR_LEN, inner, len);
-	/* 内层校验和必须在异或之前补算（网卡再也补不了被 XOR 过的内层） */
+	/* Inner checksum must be fixed up before XOR (the NIC can no longer fix an XORed inner) */
 	iwan_win_inner_fix_csum(fh + IWAN_FRAME_HDR_LEN, len, l4_offloaded);
 	if (s->enc)
 		iwan_win_xor(fh + IWAN_FRAME_HDR_LEN, len, s->key, 0);
@@ -180,14 +195,14 @@ iwan_win_mp_encap_send(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		ExFreePoolWithTag(buf, IWAN_TAG_PKT);
 		return IWAN_MP_TX_DROP;
 	}
-	/* rundown 一直持到本函数结束：诊断（iwan_win_diag_tx 会解引用 s->shm
-	 * 并写 40 字节）必须落在 rundown 内。否则并发的 IOCTL_CLOSE 走
-	 * session_reset → shm_destroy → ExFreePoolWithTag 之后，数据面还在
-	 * DISPATCH_LEVEL 往已释放的非分页池里写。WFP 平面同一口径：取 rundown
-	 * 之后所有 diag 都在释放之前。 */
+	/* rundown is held until this function returns: diagnostics (iwan_win_diag_tx dereferences s->shm
+	 * and writes 40 bytes) must fall inside rundown. Otherwise a concurrent IOCTL_CLOSE takes
+	 * session_reset -> shm_destroy -> ExFreePoolWithTag, while the data plane is still
+	 * at DISPATCH_LEVEL writing into freed non-paged pool. Same rule on the WFP plane: after taking rundown
+	 * all diag runs before the release. */
 
-	/* 以太头：源 = 选定承载的 MAC，目的 = 下一跳 MAC。下一跳还没解析出来
-	 * 时本函数发 ARP 并返回 FALSE（本包丢，计 tx_bad_state + 诊断）。 */
+	/* Ethernet header: src = MAC of the selected carrier, dst = next-hop MAC. When the next hop is not yet resolved
+	 * this function sends ARP and returns FALSE (packet dropped, tx_bad_state counted + diagnostic). */
 	if (!iwan_win_proto_fill_eth4(ext, buf)) {
 		iwan_win_diag_tx(s, IWAN_WIN_DIAG_TX_NO_NEIGHBOR, len, total,
 				 (ULONG)inner[0], inner);
@@ -197,14 +212,14 @@ iwan_win_mp_encap_send(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		return IWAN_MP_TX_DROP;
 	}
 
-	/* send_outer4 的两种结局都不留 buf 给我们：TRUE = 所有权随 NBL 转移
-	 * （完成回调 ExFreePoolWithTag），FALSE = 它已经在内部释放。这里是
-	 * 唯一一处“交出即撒手”的缓冲，所以显式置空，别让后面的人以为还能用。 */
+	/* Both outcomes of send_outer4 leave no buf to us: TRUE = ownership transfers with the NBL
+	 * (completion callback does ExFreePoolWithTag), FALSE = it has already freed it internally. This is
+	 * the only 'hand it over and let go' buffer, so clear it explicitly; do not let later readers think it is still usable. */
 	sent = iwan_win_proto_send_outer4(ext, buf, IWAN_MP_ETH_HDR_LEN + total);
 	buf = NULL;
 	if (sent) {
-		/* 与 WFP 平面同一口径：tx_bytes 记外层字节（含外层 IP+UDP），
-		 * 不含以太头 —— 那是承载的链路层开销，不属隧道开销。 */
+		/* Same rule as the WFP plane: tx_bytes records outer bytes (including outer IP+UDP),
+		 * excluding the Ethernet header -- that is the carrier's link-layer overhead, not tunnel overhead. */
 		IWAN_MP_STAT_INC(ext, tx_pkts);
 		IWAN_MP_STAT_ADD(ext, tx_bytes, total);
 	} else {
@@ -217,15 +232,15 @@ iwan_win_mp_encap_send(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 }
 
 /*
- * 出向入口：超长内层报文先按声明的内层 MTU 分片，再逐片封装。
+ * TX entry: oversized inner packets are first fragmented by the declared inner MTU, then encapsulated fragment by fragment.
  *
- * 与 Linux 对齐的口径：Linux 侧由协议栈在 ndo_start_xmit 之前按设备 MTU 分好片、
- * 驱动只逐片封装。本平面拦截在小小型端口的发送入口（同样是发之前），所以补上
- * 这一步。阈值取 s->inner_mtu（= min(服务器协商值, 承载 MTU - 开销)），每片因此
- * 必然装得进承载，外层仍 DF=1。
+ * Alignment with Linux: on Linux the stack fragments by device MTU before ndo_start_xmit and
+ * the driver only encapsulates each fragment. This plane intercepts at the miniport send entry (also before sending), so
+ * add this step. The threshold is s->inner_mtu (= min(server negotiated value, carrier MTU - overhead)), so each fragment
+ * necessarily fits into the carrier, and the outer still has DF=1.
  *
- * 只要有一片发不出去就整体放弃（半条数据报到不了对端，等价于丢一个报文）；
- * 已注入的片各自计过 tx_pkts，不需要在这里补账。
+ * If any fragment cannot be sent, abandon everything (half a datagram cannot reach the peer; it equals dropping one packet);
+ * fragments already sent each counted tx_pkts, no need to settle accounts here.
  */
 UINT32
 iwan_win_mp_encap_send_pkt(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
@@ -237,7 +252,7 @@ iwan_win_mp_encap_send_pkt(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	ULONG mtu, n, i, flen = 0;
 	UINT32 rc;
 
-	/* 没有会话时不要读 inner_mtu：交给封装层去报失败并计数 */
+	/* Do not read inner_mtu without a session: let the encap layer report failure and count */
 	if (s->valid == 0)
 		return iwan_win_mp_encap_send(ext, inner, len, l4_offloaded);
 	mtu = s->inner_mtu;
@@ -256,7 +271,7 @@ iwan_win_mp_encap_send_pkt(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		return IWAN_MP_TX_DROP;
 	}
 	RtlCopyMemory(copy, inner, len);
-	/* L4 校验和必须在切之前修好：只有首片带 L4 头 */
+	/* L4 checksum must be fixed before splitting: only the first fragment carries the L4 header */
 	iwan_win_inner_fix_csum(copy, len, l4_offloaded);
 
 	rc = IWAN_MP_TX_OK;
@@ -275,17 +290,17 @@ iwan_win_mp_encap_send_pkt(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	return rc;
 }
 
-/* ---- 入向：外层帧 → 内层数据报 ---------------------------------------- */
+/* ---- RX path: outer frame -> inner datagram ---------------------------- */
 
 /*
- * 入向入口：先做外层分片重组，再把完整数据报交给解析体。
+ * RX entry: reassemble outer fragments first, then hand the complete datagram to the parser body.
  *
- * 口径三面对齐：Linux 侧外层走 ip_defrag()（kernel/iwan.mod.c 导入 ip_defrag，
- * hookprio 默认 -300 就在 defrag 之后），WFP 平面收到的是 INBOUND_TRANSPORT
- * （tcpip 已经重组过），只有 MP 平面在协议边拿到的还是分片。两端默认 DF=1，
- * 平时走不到这里；但"内外层都被分片的流也要能收"是能力要求，不能靠对端守规矩。
+ * Aligned across three planes: on Linux the outer goes through ip_defrag() (kernel/iwan.mod.c imports ip_defrag,
+ * default hookprio -300 is right after defrag), the WFP plane receives INBOUND_TRANSPORT
+ * (tcpip has already reassembled), and only the MP plane still gets fragments at the protocol edge. Both ends default DF=1,
+ * so this path is usually not taken; but 'flows with both inner and outer fragmented must also be received' is a capability requirement, not something to rely on the peer obeying the rules.
  */
-/* 解析体在下面定义；重组壳先用，所以先声明。 */
+/* The parser body is defined below; the reassembly wrapper uses it first, so declare it here. */
 static VOID
 iwan_win_mp_outer_frame(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 			_In_reads_bytes_(len) const UINT8 *ip, _In_ ULONG len);
@@ -309,18 +324,18 @@ iwan_win_mp_outer_recv(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		return;
 	}
 	if (fr != IWAN_WIN_FRAG_DONE || idx >= IWAN_WIN_FRAG_SLOTS) {
-		/* 拼不成（超上限/长度矛盾/参数非法）：当作坏头吃掉并计数，
-		 * 数据面不许有静默的丢弃通道。 */
+		/* Cannot reassemble (over cap / length contradiction / invalid args): swallow as a bad header and count,
+		 * the data plane must not have silent drop channels. */
 		IWAN_MP_STAT_INC(ext, rx_bad_hdr);
 		return;
 	}
 	IWAN_MP_STAT_INC(ext, rx_reasm);
 	iwan_win_mp_outer_frame(ext, ext->mp.frag[idx].buf, flen);
-	/* DONE 的槽归调用方所有：解析完必须还回去，否则永不回收 */
+	/* A DONE slot belongs to the caller: it must be returned after parsing, otherwise it is never reclaimed */
 	ext->mp.frag[idx].used = FALSE;
 }
 
-/* 一个完整外层数据报（或重组完成后的整包）的解析与投递。 */
+/* Parse and deliver one complete outer datagram (or the whole packet after reassembly). */
 static VOID
 iwan_win_mp_outer_frame(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 			_In_reads_bytes_(len) const UINT8 *ip, _In_ ULONG len)
@@ -338,8 +353,8 @@ iwan_win_mp_outer_frame(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		return;
 	}
 
-	/* 地址闸门（外层目的地址 == outer_src）由协议边在调用前卡掉；这里
-	 * 解析隧道层并分类。解析失败说明是本会话五元组的包但结构不合法。 */
+	/* The address gate (outer dest address == outer_src) is gated by the protocol edge before the call; here
+	 * we parse the tunnel layer and classify. Parse failure means a packet of this session's 5-tuple but structurally invalid. */
 	if (!iwan_win_dgram_parse(ip, len, &o)) {
 		IWAN_MP_STAT_INC(ext, rx_bad_hdr);
 		ExReleaseRundownProtection(&ext->rundown);
@@ -347,8 +362,8 @@ iwan_win_mp_outer_frame(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	}
 	kind = iwan_win_mp_outer_kind(s, &o);
 	if (kind == IWAN_MP_IN_NONE || kind == IWAN_MP_IN_DROP) {
-		/* IN_NONE 说明协议边的端口判据与本函数不一致（不该发生）；
-		 * IN_DROP 是本会话的帧但凭据/类型不合法。两者都吞掉并计数。 */
+		/* IN_NONE means the protocol edge's port criterion disagrees with this function (should not happen);
+		 * IN_DROP is this session's frame but its credential/type is invalid. Swallow and count both. */
 		if (kind == IWAN_MP_IN_DROP)
 			IWAN_MP_STAT_INC(ext, rx_bad_hdr);
 		ExReleaseRundownProtection(&ext->rundown);
@@ -356,8 +371,8 @@ iwan_win_mp_outer_frame(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	}
 
 	if (kind == IWAN_MP_IN_CTRL) {
-		/* 控制帧：只记账，不指示向上（承载网卡的常规绑定已把同一份
-		 * UDP 交给用户态套接字，控制面在那里）。 */
+		/* Control frame: only account, do not indicate upward (the carrier NIC's normal binding has already
+		 * handed the same UDP to a user-mode socket; the control plane is there). */
 		iwan_win_session_mark_rx(s, 1);
 		if (o.type == PT_CLOSE)
 			iwan_win_session_mark_close(s);
@@ -366,7 +381,7 @@ iwan_win_mp_outer_frame(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		return;
 	}
 
-	/* 数据帧 */
+	/* Data frame */
 	iwan_win_session_mark_rx(s, 0);
 	IWAN_MP_STAT_INC(ext, rx_outer);
 	IWAN_MP_STAT_INC(ext, rx_frames);
@@ -381,16 +396,16 @@ iwan_win_mp_outer_frame(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	ilen = iwan_win_decap(ip, len, &o, s->key, inner, o.inner_len);
 	fam = ilen != 0 ? iwan_win_inner_family(inner, ilen) : 0;
 	if (ilen == 0 || fam == 0 || !iwan_win_inner_sane(inner, ilen)) {
-		/* 结构不合法就不指示向上：宁可丢这一个内层包，也不让畸形包
-		 * 进入本机协议栈。判据与 WFP 平面逐条一致。 */
+		/* If structurally invalid, do not indicate upward: better to drop this one inner packet than let a malformed packet
+		 * enter the local stack. Criteria match the WFP plane item by item. */
 		IWAN_MP_STAT_INC(ext, rx_bad_inner);
 		ExFreePoolWithTag(inner, IWAN_TAG_PKT);
 		ExReleaseRundownProtection(&ext->rundown);
 		return;
 	}
 
-	/* 与出向同一约定：indicate_inner 要么把内层缓冲连 NBL 一起交给 NDIS
-	 * （TRUE），要么自己释放后回 FALSE。两种结局这里都不再持有。 */
+	/* Same convention as TX: indicate_inner either hands the inner buffer plus the NBL to NDIS
+	 * (TRUE), or frees it itself and returns FALSE. Either way we no longer own it here. */
 	if (iwan_win_mp_indicate_inner(ext, inner, ilen))
 		IWAN_MP_STAT_INC(ext, rx_delivered);
 	else

@@ -1,46 +1,46 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * iwan_win_wfp.c — WFP callout 数据面：出向封装 +（M2）入向解封。
+ * iwan_win_wfp.c - WFP callout data plane: outbound encapsulation + (M2) inbound decapsulation.
  *
- * 两层的位置（入向这一层是特意选的）：
- *   · 出向：FWPS_LAYER_OUTBOUND_IPPACKET_V4/V6 —— IP 头已组好、还没分片；
- *   · 入向：FWPS_LAYER_INBOUND_TRANSPORT_V4/V6 —— **协议栈重组之后**：外层分片
- *     已经拼好、IP 头已被摘掉，layerData 从 UDP 头开始，地址由 WFP 固定字段给。
- *     Linux 侧是站在"两次重组之间"自己补一次 ip_defrag（见 kernel/iwan_rx.c 的
- *     注释），Windows 侧把这一步交给协议栈，换来的是不必自己处理分片。
- *   · 注入仍然回到**重组之前**（网络层 FwpsInjectNetworkReceiveAsync）：内层包
- *     照常走完整的 IP 解析、重组与分流 —— 与 Linux 侧解封后 NF_ACCEPT/netif_rx
- *     回到 ip_defrag 之前同一语义。
+ * The placement of the two layers (the inbound layer is chosen deliberately):
+ *   - outbound: FWPS_LAYER_OUTBOUND_IPPACKET_V4/V6 -- the IP header is already built, not yet fragmented;
+ *   - inbound: FWPS_LAYER_INBOUND_TRANSPORT_V4/V6 -- **after protocol-stack reassembly**: outer fragments
+ *     are already reassembled and the IP header is stripped; layerData starts at the UDP header, and the addresses come from WFP fixed fields.
+ *     Linux side sits "between the two reassembly passes" and does its own ip_defrag (see the
+ *     comment in kernel/iwan_rx.c); Windows hands this step to the protocol stack, in exchange for not having to handle fragments itself.
+ *   - injection still goes back to **before reassembly** (network layer FwpsInjectNetworkReceiveAsync): inner packets
+ *     go through the full IP parse, reassembly and dispatch as usual -- the same semantics as NF_ACCEPT/netif_rx on the Linux side after decap
+ *     returning to before ip_defrag.
  *
- * 对应 Linux 侧 kernel/iwan_tx.c 的 iwan_xmit（出向）与 kernel/iwan_rx.c 的
- * 钩子（入向）。线上格式与 Linux 模块**逐字节一致**，这是互通的硬前提：
+ * Corresponds to iwan_xmit (outbound) in kernel/iwan_tx.c and the
+ * hooks (inbound) in kernel/iwan_rx.c. The on-wire format is **byte-for-byte identical** to the Linux module; this is the hard prerequisite for interoperability:
  *
- *   外层 IPv4(20) | 外层 UDP(8) | iWAN 帧头(8) | [XOR 后的内层 IP 包]
- *   iWAN 帧头：fh[0] = PT_DATA(0x14) 或 PT_DATA_ENC(0x18)
- *              fh[1] = enc 标志（1/0）
- *              fh[2..3] = sid（大端）
- *              fh[4..7] = tok（大端）
- *   XOR：内层包（含它自己的 IP 头）从偏移 0 起按 key[i & 7] 逐字节异或；
- *        内层校验和必须在 XOR **之前**是明文校验和（Linux 侧同一注释：
- *        "此刻校验和已是明文校验和，XOR 后仍自洽"）。
+ *   outer IPv4(20) | outer UDP(8) | iWAN frame header(8) | [inner IP packet after XOR]
+ *   iWAN frame header: fh[0] = PT_DATA(0x14) or PT_DATA_ENC(0x18)
+ *              fh[1] = enc flag (1/0)
+ *              fh[2..3] = sid (big-endian)
+ *              fh[4..7] = tok (big-endian)
+ *   XOR: the inner packet (including its own IP header) is XORed byte by byte with key[i & 7] starting at offset 0;
+ *        the inner checksum must be the plaintext checksum **before** XOR (same comment on the Linux side:
+ *        "at this point the checksum is already the plaintext checksum and stays self-consistent after XOR").
  *
- * 与 Linux 侧的关键差别（都是平台差异，不是语义差异）：
- *   · Linux 靠"路由到 iwan0"决定哪些包进隧道；这里靠会话下发的目标集合做
- *     最长前缀匹配（WFP 出向在路由之后，拿不到用户意图）；
- *   · 必须显式排除外层服务器地址（对应 Linux 侧"服务器 /32 钉在物理网卡"），
- *     否则目标集合里的宽前缀会把隧道自己的外层包也吸进来；
- *   · 内层报文可能带着"校验和卸载"标记到达（Linux 侧此刻校验和已就绪，
- *     Windows 侧不一定），所以这里在 XOR 之前按需用软件补齐内层校验和。
+ * Key differences from the Linux side (all platform differences, not semantic differences):
+ *   - Linux decides which packets enter the tunnel by "routing to iwan0"; here the target set issued with the session does
+ *     longest-prefix matching (WFP outbound runs after routing and cannot see user intent);
+ *   - the outer server address must be excluded explicitly (equivalent to Linux' "server /32 pinned to the physical NIC"),
+ *     otherwise a broad prefix in the target set would pull in the tunnel's own outer packets too;
+ *   - inner packets may arrive carrying the "checksum offload" flag (on the Linux side the checksum is ready at this point,
+ *     Windows side may not have it), so here the inner checksum is completed in software as needed before XOR.
  *
- * M1 边界（明确不做的事，全部 fail-closed 并计数，绝不把明文放出去）：
- *   · 分段卸载的大段（内层长度 > 内层 MTU）暂不封装：计数后**丢弃**；
- *     不实现"透传"，避免明文泄漏；软件分段见 README 的 M1.1；
- *   · 非线性（数据跨多个 MDL）的报文暂不处理：计数后放行（不吸收）。
+ * M1 boundaries (what is explicitly not done; everything fails closed and is counted, plaintext is never let out):
+ *   - large segments from segmentation offload (inner length > inner MTU) are not encapsulated for now: counted and then **dropped**;
+ *     no "pass-through" is implemented, to avoid plaintext leaks; for software segmentation see README M1.1;
+ *   - non-linear packets (data spanning multiple MDLs) are not handled for now: counted and passed (not absorbed).
  */
 #include "iwan_win.h"
 
-/* 每个 callout 用固定 GUID；用静态对象而不是 DEFINE_GUID，避免 initguid.h
- * 的实例化规则在驱动里引发重复定义。 */
+/* Each callout uses a fixed GUID; static objects are used instead of DEFINE_GUID, to avoid initguid.h
+ * instantiation rules causing duplicate definitions in the driver. */
 static const GUID IWAN_CALLOUT_OUT4 = {
 	0x7f3c1a10, 0x2b41, 0x4c8e, { 0x9a, 0x01, 0x11, 0x22, 0x33, 0x44, 0x55, 0x01 }
 };
@@ -57,46 +57,46 @@ static const GUID IWAN_CALLOUT_IN6 = {
 #define IWAN_STAT_INC(ext, field) \
 	InterlockedIncrement64((volatile LONG64 *)&(ext)->sess.stats.field)
 
-/* 字节数累加：与 IWAN_STAT_INC 同一套约定（数据面只做互锁加法，
- * 用户态只读；统计不参与任何判定，允许读到略旧的值）。 */
+/* Byte-count accumulation: same convention as IWAN_STAT_INC (the data plane only does interlocked adds,
+ * user mode is read-only; statistics never take part in any decision, reading slightly stale values is allowed). */
 #define IWAN_STAT_ADD(ext, field, v) \
 	InterlockedAdd64((volatile LONG64 *)&(ext)->sess.stats.field, (LONG64)(v))
 
-/* ---- 出向封装 --------------------------------------------------------- */
+/* ---- outbound encapsulation --------------------------------------- */
 
 /*
- * 关于静态分析里的 C6014（"Leaking memory 'ctx' / 'buf' / 'nbl' / 'stor'"）：
- * 本文件里这类告警全部是误报，判读依据写在这里，免得下一轮有人照着告警
- * 去"修"一处本来就正确的所有权转移。
+ * About C6014 in static analysis ("Leaking memory 'ctx' / 'buf' / 'nbl' / 'stor'"):
+ * in this file all warnings of this kind are false positives; the rationale is written here so that next time nobody follows the warnings and
+ * goes off to "fix" an ownership transfer that was correct in the first place.
  *
- *   · ctx / ctx->buf：分配之后交给 FwpsInject*Async 的完成回调
- *     iwan_win_inject_complete 释放（同一文件 :96-101）。WFP 的注入接口
- *     没有 SAL 注解说明这条转移，分析器只看见"分配了、函数返回前没释放"。
- *     真实现上两条失败路径（同步失败 goto fail、异步失败回调）都各释放
- *     一次，成功路径恰好一次 —— 已在客体上按逐包对账验证过（1,375,401 帧
- *     100% 投递、无泄漏性硬挂）。
- *   · nbl（iwan_win_mp.c 的 indicate_inner）：交给
- *     NdisMIndicateReceiveNetBufferLists 之后归 NDIS，归还时由
- *     MiniportReturnNetBufferLists 释放，这是 NDIS 的池所有权约定。
- *   · stor（classify_out6）：循环体内的临时拼接缓冲，本文件内三处
- *     ExFreePoolWithTag + 置空，每条 continue 前都已归还。
- *   · ext / devobj（DriverEntry）：驱动生命周期资产，随设备对象与卸载路径
- *     释放，不随函数返回释放。
+ *   - ctx / ctx->buf: after allocation handed to the completion callback of FwpsInject*Async,
+ *     iwan_win_inject_complete is what frees them (same file :96-101). WFP's injection API
+ *     has no SAL annotation describing this transfer, so the analyzer only sees "allocated, not freed before the function returns".
+ *     In reality both failure paths (synchronous failure goto fail, asynchronous failure callback) each free exactly
+ *     once, and the success path exactly once too -- verified by per-packet accounting on the target (1,375,401 frames
+ *     100% delivered, no leak-related hard hang).
+ *   - nbl (indicate_inner in iwan_win_mp.c): after it is handed to
+ *     NdisMIndicateReceiveNetBufferLists -- once handed to it, it belongs to NDIS, and on return it is freed by
+ *     MiniportReturnNetBufferLists -- that is NDIS's pool ownership convention.
+ *   - stor (classify_out6): a temporary coalescing buffer inside the loop body; in this file there are three
+ *     ExFreePoolWithTag + NULL assignments, and it is returned before every continue.
+ *   - ext / devobj (DriverEntry): driver lifetime assets, freed with the device object and the unload path,
+ *     not freed when a function returns.
  *
- * 判据：只要"分配点"与"释放点"在同一个函数的两条互斥路径上，且每条路径
- * 恰好释放一次，这条告警就是误报。上面四类都逐条核对过。
+ * Rationale: as long as the "allocation point" and the "free point" are on two mutually exclusive paths of the same function, and each path
+ * frees exactly once, this warning is a false positive. All four categories above were checked one by one.
  *
- * 处置：分析与构建都带 /FI shared\warning.h，但 C6014 是分析器对"所有权
- * 转移不在它能读懂的契约里"的判断，不随头部告警一起消失，因此在每个分配点
- * 上方放一行 `#pragma warning(suppress: 6014)`，并就地写明判据。这么做不是
- * 为了把日志刷干净 —— 只有把已知误报逐个压掉，下一次新出现的 C6014 才有
- * 可能被看见。改这些抑制时请先读对应注释，再读那段代码。
+ * Handling: both analysis and build use /FI shared\warning.h, but C6014 is the analyzer's judgment that "ownership
+ * transfer is not in a contract it can understand", and it does not go away with the header warnings; so at every allocation point
+ * a line `#pragma warning(suppress: 6014)` is placed above it, with the rationale written on the spot. This is not
+ * to scrub the log clean -- only by suppressing the known false positives one by one does the next newly appearing C6014
+ * have any chance of being seen. When changing these suppressions, read the corresponding comment first, then read that code.
  */
 
 typedef struct _IWAN_INJECT_CTX {
-	PVOID	buf;		/* 数据缓冲（注入完成后释放） */
-	PMDL	mdl;		/* 数据缓冲的 MDL */
-	IWAN_WIN_DEVICE_EXTENSION	*ext;	/* 用于在途注入计数 */
+	PVOID	buf;		/* data buffer (freed after injection completes) */
+	PMDL	mdl;		/* MDL of the data buffer */
+	IWAN_WIN_DEVICE_EXTENSION	*ext;	/* used for the in-flight injection counter */
 } IWAN_INJECT_CTX;
 
 static VOID NTAPI
@@ -106,10 +106,10 @@ iwan_win_inject_complete(_In_ VOID *context, _Inout_ NET_BUFFER_LIST *nbl,
 	IWAN_INJECT_CTX *ctx = (IWAN_INJECT_CTX *)context;
 
 	UNREFERENCED_PARAMETER(dispatch_level);
-	/* "排队成功"不等于"送出去成功"：完成回调里的 NET_BUFFER_LIST_STATUS
-	 * 才是 WFP 的最终裁决。失败必须落到一个名字对得上的计数器上
-	 * （tx_err = 封装/注入失败），不能借用入向的 rx_* —— 借来的计数器会让
-	 * 两个平面共用同一份 STATS 时读数没法解释。 */
+	/* "queued successfully" is not the same as "sent successfully": NET_BUFFER_LIST_STATUS in the completion callback
+	 * is WFP's final verdict. A failure must land on a counter whose name matches
+	 * (tx_err = encapsulation/injection failure); it must not borrow the inbound rx_* -- a borrowed counter makes
+	 * the readings unexplainable when both planes share the same STATS. */
 	if (ctx != NULL && ctx->ext != NULL) {
 		ULONG ist = nbl != NULL ? NET_BUFFER_LIST_STATUS(nbl)
 					: (ULONG)0xC0000001L;
@@ -131,8 +131,8 @@ iwan_win_inject_complete(_In_ VOID *context, _Inout_ NET_BUFFER_LIST *nbl,
 }
 
 /*
- * 给一块非分页缓冲套上 NBL（数据不算在 NBL 池里，由 ctx 负责释放）。
- * 出向封装与入向解封注入共用：两条路都是"自己的缓冲 + 自己的 MDL"。
+ * Wrap a non-paged buffer in an NBL (the data is not counted in the NBL pool; ctx is responsible for freeing it).
+ * Shared by outbound encapsulation and inbound decapsulation injection: both paths are "their own buffer + their own MDL".
  */
 static NTSTATUS
 iwan_win_nbl_wrap(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
@@ -147,12 +147,12 @@ iwan_win_nbl_wrap(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		return STATUS_INSUFFICIENT_RESOURCES;
 	MmBuildMdlForNonPagedPool(ctx->mdl);
 
-	/* MDL 直接交给分配器，而不是事后再往 NET_BUFFER_FIRST_MDL 上塞：
-	 * NBL 从出生那一刻就是完整形态，不依赖“分配完再改内部字段”这种
-	 * 未文档化的用法。MDL 的所有权仍在调用者（ctx->mdl 由完成回调或
-	 * 失败路径 IoFreeMdl 释放），这里只是借给 NBL 描述数据。
-	 * 池句柄由 iwan_win_wfp_init 预建：FwpsAllocateNetBufferAndNetBufferList0
-	 * 要的是池句柄，不是在栈上摆一份池参数。 */
+	/* MDL is handed to the allocator directly instead of being stuffed into NET_BUFFER_FIRST_MDL afterwards:
+	 * NBL is in complete form from the moment it is born, and does not rely on this kind of
+	 * undocumented usage: "allocate first, then modify internal fields". MDL ownership stays with the caller (ctx->mdl is freed by the completion callback or
+	 * by the failure path IoFreeMdl); here it is only lent to the NBL to describe the data.
+	 * The pool handle is prebuilt by iwan_win_wfp_init: FwpsAllocateNetBufferAndNetBufferList0
+	 * wants a pool handle, not a stack copy of the pool parameters. */
 	st = FwpsAllocateNetBufferAndNetBufferList(ext->nbl_pool, 0, 0, ctx->mdl,
 						   0, len, &nbl);
 	if (!NT_SUCCESS(st))
@@ -163,27 +163,27 @@ iwan_win_nbl_wrap(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 }
 
 /*
- * 把内层 IPv4 包封装成外层 UDP 并注入协议栈。
- * inner 指向**只读**的内层报文；本函数自己复制一份再变换，
- * 绝不改动协议栈正在用的缓冲（Linux 侧是独占 skb 才原地改）。
+ * Encapsulate an inner IPv4 packet into an outer UDP packet and inject it into the protocol stack.
+ * inner points at a **read-only** inner packet; this function copies it first and then transforms the copy,
+ * and never touches the buffer the protocol stack is using (on Linux the skb is exclusively owned, so it can be modified in place).
  */
 
 /*
- * 出向封装 + 注入。外层用 v4 还是 v6 由**会话**决定（outer_v6），与内层版本
- * 无关 —— 这一点照 Linux 侧：内层版本由 iwan_inner_hdr_check() 判，外层版本
- * 由承载网卡决定，所以 v6-in-v4 与 v4-in-v6 都成立。
+ * Outbound encapsulation + injection. Whether the outer is v4 or v6 is decided by the **session** (outer_v6), independent of the inner
+ * version -- this follows the Linux side: the inner version is determined by iwan_inner_hdr_check(), the outer version
+ * by the carrier NIC, so both v6-in-v4 and v4-in-v6 are valid.
  *
- * 失败一律自己回收，绝不让"半封装"的缓冲流出去。
+ * Failures are always reclaimed locally; a "half-encapsulated" buffer is never allowed to flow out.
  */
-/* 在途注入上限（每个在途包约占 2 KB 非分页池：缓冲 + MDL + NBL，要等完成
- * 回调才归还）。没有上限的现场是：洪泛速率远高于承载通道（实测 21k pps），
- * 出向吸收又同时取消了发送端的反压 —— 池以 GB/s 量级净增长，秒级耗尽非分页
- * 池，整机硬挂且来不及写 BugCheck（对应 Kernel-Power 41 + 6008）。
- * 超限就丢当前包并计 tx_bad_state，把背压还给协议栈。 */
+/* In-flight injection limit (each in-flight packet occupies about 2 KB of non-paged pool: buffer + MDL + NBL, and is only returned
+ * when the completion callback runs). What happens without a limit: the flood rate is far above the carrier channel (measured 21k pps),
+ * outbound absorption also removes the sender's backpressure -- the pool grows net at GB/s scale and exhausts the non-paged
+ * pool within seconds; the whole machine hard-hangs and there is no time to write a BugCheck (matches Kernel-Power 41 + 6008).
+ * Over the limit, drop the current packet and count tx_bad_state, returning backpressure to the protocol stack. */
 #define IWAN_WIN_MAX_INFLIGHT 1024u
 
-/* 出向被拒/被丢的原因记录：实现在 iwan_win_session.c（两个数据面共用），
- * 这里只剩调用点。 */
+/* Record of outbound rejection/drop reasons: implemented in iwan_win_session.c (shared by both data planes),
+ * only the call sites remain here. */
 
 static NTSTATUS
 iwan_win_encap_inject(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
@@ -205,8 +205,8 @@ iwan_win_encap_inject(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	}
 
 	if (ext->inject_outstanding >= IWAN_WIN_MAX_INFLIGHT) {
-		/* 在途窗口满 = 主动限流，不是封装失败。诊断区必须分开记，
-		 * 否则现场会把"背压丢包"读成"报文畸形"。 */
+		/* The in-flight window is full = deliberate throttling, not an encapsulation failure. The diagnostics area must record them separately,
+		 * otherwise in the field "backpressure drop" gets read as "malformed packet". */
 		iwan_win_diag_tx(s, IWAN_WIN_DIAG_TX_INFLIGHT, inner_len,
 				 total, inner_len > 0 ? (ULONG)inner[0] : 0xFFFFu,
 				 inner);
@@ -214,17 +214,17 @@ iwan_win_encap_inject(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		return STATUS_DEVICE_BUSY;
 	}
 
-	/* C6014 误报：ctx 与 buf 的所有权随 NBL 一起交给
-	 * FwpsInjectNetworkSendAsync0，由完成回调 iwan_win_inject_complete
-	 * 释放。WFP 的注入接口没有"所有权转移"的 SAL 注解，分析器只看得见
-	 * "分配了、返回前没释放"，此处的抑制是判读结论而非免责。 */
+	/* C6014 false positive: ownership of ctx and buf is handed to
+	 * FwpsInjectNetworkSendAsync0, and the completion callback iwan_win_inject_complete
+	 * frees them. WFP's injection API has no "ownership transfer" SAL annotation, so the analyzer only sees
+	 * "allocated but not freed before return"; the suppression here is a judgment call, not a waiver. */
 #pragma warning(suppress: 6014)
 	ctx = (IWAN_INJECT_CTX *)IWAN_ALLOC(sizeof(*ctx), IWAN_TAG_PKT);
 	if (ctx == NULL) {
 		return STATUS_INSUFFICIENT_RESOURCES;
 	}
 
-	/* 同上：buf 由完成回调释放。 */
+	/* Same as above: buf is freed by the completion callback. */
 #pragma warning(suppress: 6014)
 	buf = (UINT8 *)IWAN_ALLOC(total, IWAN_TAG_PKT);
 	if (buf == NULL) {
@@ -233,18 +233,18 @@ iwan_win_encap_inject(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	}
 	ctx->buf = buf;
 	ctx->ext = ext;
-	/* 池分配不保证清零（见 iwan_win.h 的 IWAN_ALLOC 注释）：外层首部构造失败
-	 * 时也会走 fail，那时 mdl 还没被 nbl_wrap 赋值，不初始化就会读到野指针
-	 * 并把它交给 IoFreeMdl。 */
+	/* Pool allocation is not guaranteed to be zeroed (see the IWAN_ALLOC comment in iwan_win.h): when building the outer header fails,
+	 * the failure path is taken as well, and at that point mdl has not been assigned by nbl_wrap; without initialization it would read a wild pointer
+	 * and hand it to IoFreeMdl. */
 	ctx->mdl = NULL;
 
-	/* 帧紧跟在 IP + UDP 之后：overhead 是"封装总开销"，比帧的起始偏移多出
-	 * 一个帧头长度。先摆帧，再让 portable 层去写外层头（两个校验和都在那里）。 */
+	/* The frame sits right after IP + UDP: overhead is the "total encapsulation overhead", one frame header length more than
+	 * the frame's start offset. Lay the frame down first, then let the portable layer write the outer header (both checksums are there). */
 	fh = buf + overhead - IWAN_FRAME_HDR_LEN;
 	iwan_win_build_frame_hdr(fh, s->enc ? PT_DATA_ENC : PT_DATA, s->enc,
 				 s->sid, s->tok);
 	RtlCopyMemory(fh + IWAN_FRAME_HDR_LEN, inner, inner_len);
-	/* 明文校验和 -> XOR（顺序不能颠倒：接收侧解出明文时校验和必须已经正确） */
+	/* Plaintext checksum -> XOR (the order must not be reversed: when the receive side recovers the plaintext, the checksum must already be correct) */
 	iwan_win_inner_fix_csum(fh + IWAN_FRAME_HDR_LEN, inner_len, l4_offloaded);
 	if (s->enc)
 		iwan_win_xor(fh + IWAN_FRAME_HDR_LEN, inner_len, s->key, 0);
@@ -268,27 +268,27 @@ iwan_win_encap_inject(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		goto fail;
 	}
 
-	/* 在途注入计数：注销/卸载时必须等它归零，才谈得上销毁注入句柄与池 */
+	/* In-flight injection count: unregister/unload must wait for it to reach zero before the injection handles and pool can be destroyed */
 	InterlockedIncrement(&ext->inject_outstanding);
-	/* 注入句柄可能同步失败，也可能异步失败（完成回调里报 NTSTATUS）。
-	 * 两种失败都由完成回调统一释放 ctx->buf / ctx->mdl / ctx，
-	 * 也就是"交出去之后本函数不再拥有它们"。 */
+	/* The injection handle may fail synchronously or asynchronously (the completion callback reports an NTSTATUS).
+	 * Both failures are handled by the completion callback, which frees ctx->buf / ctx->mdl / ctx uniformly,
+	 * that is, "after handing them over this function no longer owns them". */
 	st = FwpsInjectNetworkSendAsync(outer_v6 ? ext->inj_send6 : ext->inj_send4,
 					NULL, 0, compartment, nbl,
 					iwan_win_inject_complete, ctx);
 	if (!NT_SUCCESS(st)) {
-		/* 注入失败：注入所有权没有转移，自己收回 */
+		/* Injection failed: injection ownership was not transferred, reclaim locally */
 		InterlockedDecrement(&ext->inject_outstanding);
 		FwpsFreeNetBufferList(nbl);
-		/* 必须置空：fail 分支还会判一次 nbl，不置空就是同一个 NBL 被释放
-		 * 两次 —— 空闲链同一节点挂两遍，两个分配者拿到同一块内存，属于
-		 * 静默的池损坏/随机硬挂（未开 Verifier 不会当场抓）。 */
+		/* Must be set to NULL: the fail branch checks nbl once more; without NULLing it the same NBL would be freed
+		 * twice -- the same node linked twice on the free list, two allocators getting the same memory, which is
+		 * silent pool corruption / random hard hang (not caught on the spot unless Verifier is enabled). */
 		nbl = NULL;
 		goto fail;
 	}
-	/* 注入成功：ctx 与 buf 的所有权已随 NBL 交给 WFP，完成回调
-	 * （iwan_win_inject_complete）里释放。两个局部指针就地作废 —— 这是
-	 * "所有权已转移"的唯一记号，也免得静态分析把它读成泄漏（C6014）。 */
+	/* Injection succeeded: ownership of ctx and buf has been handed to WFP together with the NBL; the completion callback
+	 * (iwan_win_inject_complete) frees them. Both local pointers are invalidated here; this is the only marker of
+	 * "ownership has been transferred", and it also keeps static analysis from reading it as a leak (C6014). */
 	ctx = NULL;
 	buf = NULL;
 	return STATUS_SUCCESS;
@@ -304,13 +304,13 @@ fail:
 }
 
 /*
- * 这个 NBL 是不是我们自己注入进去的？
+ * Is this NBL one that we injected ourselves?
  *
- * 注入不是“绕过协议栈”：注进去的包会重新走一遍同一层，于是又进我们的
- * classify。认不出来就会二次封装（外层套外层），所以出向必须放行自己注入
- * 的外层包、入向必须放行自己注入的内层包。用 WFP 自己的记账
- * （FwpsQueryPacketInjectionState0）判断，而不是靠“目的地址不在目标集合里”
- * 这种巧合。
+ * Injection is not "bypassing the protocol stack": an injected packet walks the same layer again, so it enters our
+ * classify. If it is not recognized it would be encapsulated twice (outer around outer), so outbound must pass its own injected
+ * outer packets, and inbound must pass its own injected inner packets. WFP's own accounting
+ * (FwpsQueryPacketInjectionState0) is used for the decision, rather than relying on such a coincidence as
+ * "the destination address is not in the target set".
  */
 static BOOLEAN
 iwan_win_nbl_from_self(_In_ HANDLE handle, _In_ const NET_BUFFER_LIST *nbl)
@@ -319,26 +319,26 @@ iwan_win_nbl_from_self(_In_ HANDLE handle, _In_ const NET_BUFFER_LIST *nbl)
 
 	if (handle == NULL || nbl == NULL)
 		return FALSE;
-	/* 第三个参数是 [out, optional]，这里传 NULL，只取返回值 —— 返回值本身
-	 * 就是注入状态。原因：WDK 10.0.26100 的 fwpsk.h 把它声明成 HANDLE *
-	 * （文档写的是 FWPS_PACKET_INJECTION_STATE *），/WX 下 C4022 直接当错误。
-	 * 传 NULL 后两种声明都能编过，语义也不依赖那个出参。
+	/* The third parameter is [out, optional]; NULL is passed here and only the return value is used -- the return value itself
+	 * is the injection state. Reason: in WDK 10.0.26100 fwpsk.h declares it as HANDLE *
+	 * (the docs say FWPS_PACKET_INJECTION_STATE *), and under /WX C4022 is treated as an error.
+	 * With NULL both declarations compile, and the semantics do not depend on that out parameter.
 	 *
-	 * 另外说明：即使这个判断因为声明差异失灵，也不会造成外层套外层 ——
-	 * 目标集合判定时我们显式把对端地址（s->outer_dst）排除在外，自己注入
-	 * 的外层包本来就不会命中目标。这里是第二道保险，不是唯一防线。 */
+	 * Also note: even if this check fails due to the declaration mismatch, it will not cause outer-around-outer --
+	 * when judging the target set we explicitly exclude the peer address (s->outer_dst), so our own injected
+	 * outer packets would never match the target anyway. This is a second safety net, not the only line of defense. */
 	st = FwpsQueryPacketInjectionState0(handle, nbl, NULL);
 	return st == FWPS_PACKET_INJECTED_BY_SELF ||
 	       st == FWPS_PACKET_PREVIOUSLY_INJECTED_BY_SELF;
 }
 
 /*
- * 整条链里有没有"本会话该进隧道"的包。
+ * Is there any packet in the whole chain that "belongs to this session and should enter the tunnel"?
  *
- * 只在"整链不是全都该进隧道"时才调用：WFP 的裁决粒度是整条 NBL 链，没有
- * "吸收一半"的选项。一个都不是就原样放行（绝大多数情况），只要有一个是，
- * 就整链接管——放行会让本会话的明文漏到承载网，这条规矩比"顺手放走别人的
- * 包"重要。被牵连的其他包在这里计入 ev_dropped。
+ * Only called when "the whole chain should not all enter the tunnel": WFP's decision granularity is the whole NBL chain, there is no
+ * "absorb half" option. If none is ours, pass it unchanged (the vast majority of cases); if at least one is,
+ * take over the whole chain -- passing it would leak this session's plaintext to the carrier, and this rule matters more than
+ * "letting other people's packets through". The other affected packets are counted into ev_dropped here.
  */
 static BOOLEAN
 iwan_win_chain_has_ours(_In_ IWAN_WIN_SESSION *s,
@@ -372,15 +372,15 @@ iwan_win_chain_has_ours(_In_ IWAN_WIN_SESSION *s,
 }
 
 /*
- * 出向入口：超长内层报文先按声明的内层 MTU 分片，再逐片封装。
+ * Outbound entry: oversized inner packets are first fragmented according to the declared inner MTU, then encapsulated fragment by fragment.
  *
- * 口径与 Linux 对齐：Linux 侧是协议栈在 ndo_start_xmit 之前按外层设备 MTU 分好
- * 片、驱动只逐片封装；我们在 OUTBOUND_IPPACKET 拦截（那时还没分片），所以要
- * 自己补这一步。分片阈值取声明的内层 MTU（= min(服务器协商值, 承载 MTU - 开销)），
- * 因此每一片必然装得进承载，外层仍然 DF=1、永不分片。
+ * Same convention as Linux: on the Linux side the protocol stack fragments before ndo_start_xmit according to the outer device MTU
+ * and the driver only encapsulates per fragment; we intercept at OUTBOUND_IPPACKET (before fragmentation), so we must
+ * fill in this step ourselves. The fragment threshold is the declared inner MTU (= min(server negotiated value, carrier MTU - overhead)),
+ * so every fragment necessarily fits into the carrier, and the outer still has DF=1 and never fragments.
  *
- * frames/bytes 回填"真正注入了几个外层帧、多少外层字节"：计数器必须按帧记，
- * 按原始报文记会让 tx_pkts 在分片场景下与网卡计数对不上。
+ * frames/bytes report back "how many outer frames were actually injected and how many outer bytes": counters must be per frame;
+ * recording per original packet would make tx_pkts mismatch the NIC counters in fragmented scenarios.
  */
 static NTSTATUS
 iwan_win_encap_send_pkt(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
@@ -419,8 +419,8 @@ iwan_win_encap_send_pkt(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		return STATUS_INSUFFICIENT_RESOURCES;
 	}
 	RtlCopyMemory(copy, inner, len);
-	/* L4 校验和必须在切之前修好：只有首片带 L4 头，切完再逐片修是不可能的。
-	 * 修好之后每片都按"校验和已正确"封装（l4_offloaded = FALSE）。 */
+	/* L4 checksum must be fixed up before splitting: only the first fragment carries the L4 header, and fixing it per fragment afterwards is impossible.
+	 * After the fix-up every fragment is encapsulated with "checksum already correct" (l4_offloaded = FALSE). */
 	iwan_win_inner_fix_csum(copy, len, l4_offloaded);
 
 	st = STATUS_SUCCESS;
@@ -467,37 +467,37 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 	UNREFERENCED_PARAMETER(classifyContext);
 	UNREFERENCED_PARAMETER(flowContext);
 
-	/* 先把"放行"写进结论，再谈别的。
+	/* Write "permit" into the verdict first, then talk about anything else.
 	 *
-	 * 本层挂的是**终止型**过滤器：终止型没有"下一条"可继续，结论只能是 PERMIT
-	 * 或 BLOCK。写 CONTINUE（"不表态"）的现场是：会话一建立、全机流量两个方向
-	 * 立刻中断 —— 出向 callout 明明被调用了 233 次、每次都返回放行，包却一个都
-	 * 没出去；客体本身活得好好的，CLOSE 一返回立刻恢复。
-	 * 写权限（FWPS_RIGHT_ACTION_WRITE）管的是"能不能收紧成 BLOCK"，不是"能不能
-	 * 放行"：拿不到就只放行、不再收紧。 */
+	 * The filter installed at this layer is a **terminating** filter: terminating means there is no "next" to continue to, so the verdict can only be PERMIT
+	 * or BLOCK. Writing CONTINUE ("no opinion") produced this: as soon as the session is established, machine-wide traffic in both directions
+	 * stops immediately -- the outbound callout was clearly called 233 times and returned permit every time, yet not a single packet
+	 * went out; the target itself stayed perfectly alive, and everything recovered as soon as CLOSE returned.
+	 * The write right (FWPS_RIGHT_ACTION_WRITE) governs "can we tighten to BLOCK", not "can we
+	 * permit": without it, only permit, never tighten. */
 	classifyOut->actionType = FWP_ACTION_PERMIT;
 
 	if (ext == NULL || nbl == NULL)
 		return;
 
-	/* 放行本身不是失败，但**必须留痕**：否则"会话在、包却一个没进隧道"会
-	 * 表现为 17 个计数器全零，和"callout 压根没被调用"完全无法区分。 */
+	/* Permitting is not a failure in itself, but it **must leave a trace**: otherwise "the session exists but not one packet entered the tunnel"
+	 * shows up as 17 counters all zero, completely indistinguishable from "the callout was not called at all". */
 	if ((classifyOut->rights & FWPS_RIGHT_ACTION_WRITE) == 0) {
 		IWAN_STAT_INC(ext, tx_bad_state);
 		return;
 	}
 
-	/* 快速路径：没有会话时一个 volatile 读就返回（Linux 侧同样先看开关） */
+	/* Fast path: with no session, a single volatile read returns (the Linux side also checks the switch first) */
 	s = &ext->sess;
 	if (s->valid == 0 || s->inner_ip == 0) {
-		/* inner_ip 由客户端填。真实客户端曾经长期不填它 —— 这一支会放行
-		 * 全部出向流量、一个包都不封装，而计数器全零（kdp_win.c:350 有
-		 * 同样的记录）。所以这里必须计数。 */
+		/* inner_ip is filled in by the client. A real client once left it unset for a long time -- this branch permitted
+		 * all outbound traffic, encapsulated not a single packet, and all counters stayed zero (kdp_win.c:350 has
+		 * the same record). So counting here is mandatory. */
 		IWAN_STAT_INC(ext, tx_bad_state);
 		return;
 	}
 
-	/* 自己注入的外层包：放行，绝不再封装一层 */
+	/* Outer packet injected by ourselves: permit, never encapsulate another layer */
 	if (iwan_win_nbl_from_self(ext->inj_send4, nbl) ||
 	    iwan_win_nbl_from_self(ext->inj_send6, nbl))
 		return;
@@ -505,7 +505,7 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 	if (!ExAcquireRundownProtection(&ext->rundown))
 		return;
 
-	if (s->valid == 0)			/* 取得保护后再确认一次 */
+	if (s->valid == 0)			/* confirm once more after taking the protection */
 		goto done;
 
 	if (inMetaValues != NULL &&
@@ -513,9 +513,9 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 					   FWPS_METADATA_FIELD_COMPARTMENT_ID))
 		compartment = (UINT16)inMetaValues->compartmentId;
 
-	/* 先整块判定：整链都该进隧道是常见情况（WFP 在本层通常一链一包）。
-	 * 出现混链时不做"吸收一半"这种不可能的裁决 —— 见下面的两条分支：
-	 * 有本会话的包就整链接管，一个都没有才整链放行。 */
+	/* Judge the whole block first: the whole chain should enter the tunnel in the common case (WFP usually has one packet per chain at this layer).
+	 * When a mixed chain appears, do not attempt the impossible verdict of "absorb half" -- see the two branches below:
+	 * if any packet belongs to this session, take over the whole chain; only when none does, pass the whole chain. */
 	for (cur = nbl; cur != NULL; cur = NET_BUFFER_LIST_NEXT_NBL(cur)) {
 		NET_BUFFER *nb = NET_BUFFER_LIST_FIRST_NB(cur);
 		UINT8 hdr[IWAN_OUTER_IP4_LEN];
@@ -528,14 +528,14 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 			break;
 		}
 		len = NET_BUFFER_DATA_LENGTH(nb);
-		/* 头部可能跨 MDL（UDP 走校验和卸载时就是这样：首部与载荷分属
-		 * 不同的内存块）。给一块 20 字节的栈缓冲让 NDIS 把头部拼进来，
-		 * 不能像以前那样"取不到连续指针就判 HDR_BAD"——那样凡是不连续的
-		 * 出向报文都被放行到承载网，现场表现就是隧道没有吞吐。
-		 * 缓冲只有 20 字节且在栈上，不跨调用、不涉及非分页池。 */
+		/* The header may span MDLs (this happens when UDP uses checksum offload: header and payload are in
+		 * different memory blocks). Give NDIS a 20-byte stack buffer to assemble the header into;
+		 * do not behave as before, "if a contiguous pointer cannot be obtained, declare HDR_BAD" -- that way every non-contiguous
+		 * outbound packet was passed to the carrier, and the field symptom was that the tunnel had no throughput.
+		 * The buffer is only 20 bytes and on the stack, does not cross calls, and does not involve the non-paged pool. */
 		pkt = (UINT8 *)NdisGetDataBuffer(nb, IWAN_OUTER_IP4_LEN, hdr, 1, 0);
 		if (pkt == NULL || (pkt[0] >> 4) != 4) {
-			/* pkt == NULL 只可能是报文短于 20 字节（拼不出来） */
+			/* pkt == NULL can only mean the packet is shorter than 20 bytes (cannot be assembled) */
 			iwan_win_diag_tx(s, IWAN_WIN_DIAG_TX_HDR_BAD, len, 0,
 					 pkt != NULL ? (ULONG)pkt[0] : 0xFFFFu, pkt);
 			IWAN_STAT_INC(ext, tx_bad_inner);
@@ -550,15 +550,15 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 			all_hit = FALSE;
 			break;
 		}
-		iwan_win_wr32(od, s->outer_dst);	/* 会话里是大端整数，这里要字节 */
+		iwan_win_wr32(od, s->outer_dst);	/* the session stores a big-endian integer, bytes are needed here */
 		if (!iwan_win_should_tunnel4(s->targets, s->target_count,
 						  od, pkt + 16)) {
 			all_hit = FALSE;
 			break;
 		}
-		/* 超长不再直接丢：v4 交给分片层（与 Linux 协议栈在 ndo_start_xmit
-		 * 之前按设备 MTU 分片同口径）。只有在"连 8 字节片载荷都放不下"
-		 * 的畸形阈值下才 fail-closed —— 绝不透传明文，也不让网卡去分。 */
+		/* Oversized is no longer dropped outright: v4 is handed to the fragmentation layer (same convention as the Linux protocol stack which fragments
+		 * before ndo_start_xmit by device MTU). Only under the malformed threshold of "not even an 8-byte fragment payload fits"
+		 * does it fail closed -- never pass plaintext through, and never let the NIC fragment either. */
 		if (tot + IWAN_OUTER4_TOTAL > s->carrier_mtu &&
 		    iwan_win_frag4_count(pkt, tot, s->inner_mtu) == 0) {
 			iwan_win_diag_tx(s, IWAN_WIN_DIAG_TX_MTU, len, tot, pkt[0], pkt);
@@ -570,10 +570,10 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 	}
 
 	if (!all_hit) {
-		/* 混链：整链不是全都该进隧道。只要链里有任意一个是本会话的，
-		 * 就整链吸收（本会话的照常封装，其余的在下面按包丢弃并计数）；
-		 * 一个都不是就原样放行。逐包回注（把别人的包重新注入
-		 * OUTBOUND_IPPACKET）需要额外的注入状态与防回环判据，留作后续。 */
+		/* Mixed chain: the whole chain should not all enter the tunnel. As long as any one packet in the chain belongs to this session,
+		 * absorb the whole chain (this session's packets are encapsulated as usual, the rest are dropped per packet below and counted);
+		 * if none does, pass it unchanged. Per-packet re-injection (re-injecting other people's packets into
+		 * OUTBOUND_IPPACKET) requires extra injection state and loop-prevention criteria, left for later. */
 		if (!iwan_win_chain_has_ours(s, nbl))
 			goto done;
 	}
@@ -588,13 +588,13 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 		ULONG nblen, tot, frames, fbytes;
 
 		nblen = NET_BUFFER_DATA_LENGTH(nb);
-		/* 判定只需要前 20 字节连续，封装却需要**整包**连续：大包一跨 MDL，
-		 * NdisGetDataBuffer(tot, NULL) 就返回 NULL —— 现场表现是"805 B ICMP
-		 * 进得了隧道、1228 B UDP 一个都进不去"，也就是隧道没有吞吐。
-		 * 这里给一块 tot 大小的非分页缓冲让 NDIS 把散块拼进来；拼好的内容紧
-		 * 接着被封装层整块拷走，所以即用即还，不跨迭代持有。
-		 * tot 上限由上面"装不下就丢"的分支保证（<= carrier_mtu），不会出现
-		 * 巨帧级别的分配。*/
+		/* The decision only needs the first 20 contiguous bytes, but encapsulation needs the **whole packet** contiguous: once a large packet spans MDLs,
+		 * NdisGetDataBuffer(tot, NULL) returns NULL -- the field symptom was "805 B ICMP
+		 * gets into the tunnel, 1228 B UDP not a single one does", that is, the tunnel had no throughput.
+		 * A non-paged buffer of size tot is provided here so NDIS can coalesce the scattered blocks; the coalesced content is immediately
+		 * copied wholesale by the encapsulation layer, so it is returned right after use and not held across iterations.
+		 * tot is bounded by the "drop if it does not fit" branch above (<= carrier_mtu), so no
+		 * jumbo-frame-sized allocation.*/
 		pkt = (UINT8 *)NdisGetDataBuffer(nb, IWAN_OUTER_IP4_LEN, hdr, 1, 0);
 		if (pkt == NULL || nblen < IWAN_OUTER_IP4_LEN) {
 			iwan_win_diag_tx(s, IWAN_WIN_DIAG_TX_COALESCE, nblen, 0,
@@ -611,7 +611,7 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 		if (pkt == NULL) {
 			stor = (UINT8 *)IWAN_ALLOC(tot, IWAN_TAG_PKT);
 			if (stor == NULL) {
-				/* 池压力下不能默默放明文出去 */
+				/* Under pool pressure plaintext must not be let out silently */
 				IWAN_STAT_INC(ext, tx_err);
 				classifyOut->actionType = FWP_ACTION_BLOCK;
 				classifyOut->flags |= FWPS_CLASSIFY_OUT_FLAG_ABSORB;
@@ -627,12 +627,12 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 			}
 		}
 		if (!all_hit) {
-			/* 混链：这一包不是本会话的就丢掉（整链已被吸收）。
-			 * 计数落在 ev_dropped，别借用 tx_*：那些是隧道自己的
-			 * 收发账，混进来就再也对不上网卡计数。
-			 * od 在这里现填：第一遍遇到不合法报文会提前跳出，那时 od
-			 * 可能还没写过（C6001）；stor 也必须先归还，continue 会跳过
-			 * 循环末尾那次释放（C6014，真实泄漏）。 */
+			/* Mixed chain: this packet does not belong to this session, drop it (the whole chain has already been absorbed).
+			 * Count it in ev_dropped, do not borrow tx_*: those are the tunnel's own
+			 * send/receive accounting; once mixed in, they can never be reconciled with the NIC counters again.
+			 * od is filled in here on the spot: when the first pass hits an illegal packet it breaks out early, and at that time od
+			 * may not have been written (C6001); stor must also be returned first, because continue skips
+			 * the free at the end of the loop (C6014, a real leak). */
 			iwan_win_wr32(od, s->outer_dst);
 			if (!iwan_win_should_tunnel4(s->targets, s->target_count,
 						     od, pkt + 16)) {
@@ -642,8 +642,21 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 				continue;
 			}
 		}
-		/* 出向 IP 包层拿到的报文可能仍带"校验和由网卡补"的标记：
-		 * 内层一旦被 XOR，网卡就再也补不了，所以必须先自己算。 */
+		/* Diagnostic pass-through (egress): this packet matched the target set and would be encapsulated
+		 * right here -- account it as such and swallow it. Nothing enters the tunnel, so the gap to the
+		 * normal path is exactly the encapsulation + injection cost. Counters are the ones the meters
+		 * already read, the same convention as the Linux plane's pass_through. */
+		if ((ext->pass_through & IWAN_WIN_PASS_TX)) {
+			IWAN_STAT_INC(ext, tx_pkts);
+			IWAN_STAT_ADD(ext, tx_bytes, (LONG64)tot);
+			if (stor != NULL) {
+				ExFreePoolWithTag(stor, IWAN_TAG_PKT);
+				stor = NULL;
+			}
+			continue;
+		}
+		/* Packets received at the outbound IP packet layer may still carry the "checksum to be filled by the NIC" flag:
+		 * once the inner packet is XORed, the NIC can no longer fill it, so it must be computed here first. */
 		ci.Value = NET_BUFFER_LIST_INFO(cur, TcpIpChecksumNetBufferListInfo);
 		if (ci.Transmit.TcpChecksum || ci.Transmit.UdpChecksum)
 			l4_offloaded = TRUE;
@@ -652,18 +665,18 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 					     iwan_win_session_is_v6(s),
 					     &frames, &fbytes);
 		if (stor != NULL) {
-			/* 封装层已整块拷走，这里即用即还 */
+			/* The encapsulation layer already copied it wholesale, so return it now */
 			ExFreePoolWithTag(stor, IWAN_TAG_PKT);
-			/* 必须置空：下一轮若走零拷贝分支不再分配 stor，而循环末尾
-			 * 还会判一次 stor —— 不置空就是同一块缓冲释放两次。 */
+			/* Must be set to NULL: if the next iteration takes the zero-copy branch it will not allocate stor, but the end of the loop
+			 * checks stor once more -- without NULLing, the same buffer would be freed twice. */
 			stor = NULL;
 		}
 		if (!NT_SUCCESS(st)) {
-			/* 命中目标集合的包没能进隧道 = 明文会漏到承载网。与"装不下
-			 * 就丢"、以及 v6 侧 done: 的无条件吸收同一条规矩：宁可丢，
-			 * 绝不透传。v4 这里原来只 goto done，动作还是 PERMIT。
-			 * 在途窗口满（DEVICE_BUSY）已在 encap_inject 里记过
-			 * INFLIGHT，这里不能再覆盖成 ENCAP_FAIL。 */
+			/* A packet that matched the target set failed to enter the tunnel = plaintext will leak to the carrier. Same rule as "drop if
+			 * it does not fit" and the unconditional absorb at done: on the v6 side, rather drop
+			 * than ever pass plaintext through. v4 here used to just goto done, and the action was still PERMIT.
+			 * The in-flight window being full (DEVICE_BUSY) was already recorded as
+			 * INFLIGHT, and must not be overwritten as ENCAP_FAIL here. */
 			if (st != STATUS_DEVICE_BUSY)
 				iwan_win_diag_tx(s, IWAN_WIN_DIAG_TX_ENCAP_FAIL,
 						 nblen, tot, pkt[0], pkt);
@@ -672,15 +685,15 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 			classifyOut->flags |= FWPS_CLASSIFY_OUT_FLAG_ABSORB;
 			goto done;
 		}
-		/* 按帧记账：一个内层报文被分成 N 片时，网卡上看到的是 N 个外层
-		 * 帧，tx_pkts/tx_bytes 必须与它逐帧对得上。 */
+		/* Account per frame: when one inner packet is split into N fragments, the NIC sees N outer
+		 * frames, and tx_pkts/tx_bytes must match them frame by frame. */
 		IWAN_STAT_ADD(ext, tx_pkts, (LONG64)frames);
-		/* tx_bytes 记的是送出承载网卡的外层字节（含封装开销），
-		 * 便于与网卡计数直接对照 —— 与 Linux 侧口径注释一致。 */
+		/* tx_bytes records the outer bytes sent to the carrier NIC (including encapsulation overhead),
+		 * so it can be compared directly with the NIC counters -- consistent with the convention comment on the Linux side. */
 		IWAN_STAT_ADD(ext, tx_bytes, (LONG64)fbytes);
 	}
 
-	/* 全部封装完成：吸收原报文，让它不再走正常出向路径 */
+	/* All encapsulation done: absorb the original packet so it no longer takes the normal outbound path */
 	classifyOut->actionType = FWP_ACTION_BLOCK;
 	classifyOut->flags |= FWPS_CLASSIFY_OUT_FLAG_ABSORB;
 
@@ -688,37 +701,37 @@ done:
 	ExReleaseRundownProtection(&ext->rundown);
 }
 
-/* ---- callout：入向（M2 才解封，M1 只匹配并计数） ---------------------- */
+/* ---- callout: inbound (M2 decapsulates, M1 only matches and counts) -------- */
 
 /*
- * 入向判定：这个包是不是"本隧道的、我们能处理的数据帧"。
- * 五元组里的地址那一半（协议必须是 UDP、源地址必须是外层服务器）由 worker 用
- * WFP 固定字段判 —— 传输层 IP 头已被摘掉，包上没得比；端口这一半在这里判，
- * 取自 UDP 头本身（iwan_win_dgram_parse 顺手填进 IWAN_WIN_OUTER）。
- * 命中之后，
- * 处理不了的一律吞掉（绝不放给本机协议栈，否则残缺/伪造的隧道内容会被
- * 当成正常入站流量）；只有校验通过的控制帧才原样放行给用户态套接字 ——
- * 与 kernel/iwan_rx.c 同一策略：数据帧内核收，控制帧转用户态。
+ * Inbound decision: is this packet one of "this tunnel's data frames that we can handle"?
+ * The address half of the five-tuple (protocol must be UDP, source address must be the outer server) is decided by the worker using
+ * WFP fixed fields -- the transport-layer IP header has been stripped, nothing on the packet can be compared; the port half is decided here,
+ * taken from the UDP header itself (iwan_win_dgram_parse fills it into IWAN_WIN_OUTER along the way).
+ * After a hit,
+ * anything we cannot handle is swallowed (never passed to the local protocol stack, otherwise corrupted/forged tunnel content would be
+ * treated as normal inbound traffic); only control frames that pass verification are passed as-is to the user-mode socket --
+ * same policy as kernel/iwan_rx.c: data frames are taken by the kernel, control frames are forwarded to user mode.
  */
-/* 一个 NBL 链上最多按这么多报文做判定：WFP 通常一个链一个报文，批量是
- * 可能出现的形态。超出上限时整块吞掉（隧道流量宁可丢弃，也不漏给本机
- * 协议栈），并计入 ev_dropped。 */
+/* At most this many packets per NBL chain are judged: WFP usually has one packet per chain, but batching is
+ * a possible shape. Beyond the limit the whole block is swallowed (tunnel traffic may rather be dropped than leak to the local
+ * protocol stack), and ev_dropped is counted. */
 #define IWAN_WIN_MAX_BATCH	64u
 
-#define IWAN_WIN_IN_NONE	0u	/* 不是我们的包：放行 */
-#define IWAN_WIN_IN_CTRL	1u	/* 控制帧：记账后放行给用户态 */
-#define IWAN_WIN_IN_DATA	2u	/* 数据帧：解封后注入本机协议栈 */
-#define IWAN_WIN_IN_DROP	3u	/* 是我们的包但处理不了：吞掉 */
+#define IWAN_WIN_IN_NONE	0u	/* not our packet: permit */
+#define IWAN_WIN_IN_CTRL	1u	/* control frame: account, then pass to user mode */
+#define IWAN_WIN_IN_DATA	2u	/* data frame: decapsulate, then inject into the local protocol stack */
+#define IWAN_WIN_IN_DROP	3u	/* our packet but unhandleable: swallow */
 
 static UINT32
 iwan_win_inbound_kind(_In_ const IWAN_WIN_SESSION *s,
 		      _In_reads_bytes_(len) const UINT8 *pkt, _In_ ULONG len,
 		      _Out_ IWAN_WIN_OUTER *o)
 {
-	/* 端口成对：源端口 = 服务端端口，目的端口 = 本会话端口（客户端套接字
-	 * 绑在它上面）。地址那一半已经在 worker 的固定字段闸门里过了。 */
+	/* Ports come in pairs: source port = server port, destination port = this session's port (the client socket
+	 * is bound to it). The address half has already passed the worker's fixed-field gate. */
 	if (!iwan_win_dgram_parse(pkt, len, o))
-		return IWAN_WIN_IN_DROP;	/* 是本会话的包但结构不合法：吞 */
+		return IWAN_WIN_IN_DROP;	/* this session's packet but structurally invalid: swallow */
 	if (o->sport != s->dport || o->dport != s->sport)
 		return IWAN_WIN_IN_NONE;
 
@@ -732,7 +745,7 @@ iwan_win_inbound_kind(_In_ const IWAN_WIN_SESSION *s,
 	}
 }
 
-/* 解封后的内层包重新交给网络层（v4/v6 各一个句柄） */
+/* Decapsulated inner packet handed back to the network layer (one handle each for v4/v6) */
 static NTSTATUS
 iwan_win_inject_net_recv(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 			 _In_reads_bytes_(len) const UINT8 *inner, _In_ ULONG len,
@@ -746,17 +759,17 @@ iwan_win_inject_net_recv(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 
 	handle = (family == 6) ? ext->inj_recv6 : ext->inj_recv4;
 
-	/* C6014 误报：ctx/ctx->buf 交给 FwpsInjectNetworkReceiveAsync0，
-	 * 由同一个完成回调释放。 */
+	/* C6014 false positive: ctx/ctx->buf are handed to FwpsInjectNetworkReceiveAsync0,
+	 * and freed by the same completion callback. */
 #pragma warning(suppress: 6014)
 	ctx = (IWAN_INJECT_CTX *)IWAN_ALLOC(sizeof(*ctx), IWAN_TAG_PKT);
 	if (ctx == NULL)
 		return STATUS_INSUFFICIENT_RESOURCES;
-	/* 同上。 */
+	/* Same as above. */
 #pragma warning(suppress: 6014)
 	ctx->buf = IWAN_ALLOC(len, IWAN_TAG_PKT);
 	ctx->ext = ext;
-	ctx->mdl = NULL;		/* 池分配不清零，见 encap 侧同样处理 */
+	ctx->mdl = NULL;		/* pool allocation is not zeroed, see the same handling on the encap side */
 	if (ctx->buf == NULL) {
 		ExFreePoolWithTag(ctx, IWAN_TAG_PKT);
 		return STATUS_INSUFFICIENT_RESOURCES;
@@ -773,11 +786,11 @@ iwan_win_inject_net_recv(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	}
 
 	InterlockedIncrement(&ext->inject_outstanding);
-	/* 参数表就是 9 个：handle, context, flags, compartment, interfaceIndex,
-	 * subInterfaceIndex, nbl, complete, completeContext。
-	 * 上一次我"照文档补了个 addressFamily"其实是错的 —— 编译器把真原型
-	 * 打了出来（C2197），按它改回来才是对的：这个 API 没有地址族参数，
-	 * 地址族由注入句柄自己带（inj_recv4 / inj_recv6 分开注册）。 */
+	/* The parameter list is exactly 9 entries: handle, context, flags, compartment, interfaceIndex,
+	 * subInterfaceIndex, nbl, complete, completeContext.
+	 * Last time I "added an addressFamily following the docs", which was actually wrong -- the compiler printed the real prototype
+	 * (C2197), and changing it back to match was correct: this API has no address family parameter,
+	 * the address family is carried by the injection handle itself (inj_recv4 / inj_recv6 registered separately). */
 	st = FwpsInjectNetworkReceiveAsync(handle, NULL, 0, compartment,
 					   (IF_INDEX)ifindex,
 					   (IF_INDEX)sub_ifindex, nbl,
@@ -790,14 +803,14 @@ iwan_win_inject_net_recv(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 		ExFreePoolWithTag(ctx, IWAN_TAG_PKT);
 		return st;
 	}
-	/* 注入成功：ctx（连 buf/mdl）由 iwan_win_inject_complete 释放，
-	 * 本函数一个都不再持有。 */
+	/* Injection succeeded: ctx (together with buf/mdl) is freed by iwan_win_inject_complete,
+	 * and this function no longer owns any of it. */
 	ctx = NULL;
 	return st;
 }
 
-/* 前向声明：in4/in6 是薄封装，worker 的实体在它们后面（第一次真编译在这里
- * 报"undefined; assuming extern returning int" + 重定义） */
+/* Forward declarations: in4/in6 are thin wrappers, the worker body comes after them (the first real compile reported here
+ * "undefined; assuming extern returning int" + redefinition) */
 static VOID NTAPI
 iwan_win_inbound_worker(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 			_In_ const FWPS_INCOMING_METADATA_VALUES *inMetaValues,
@@ -857,21 +870,21 @@ iwan_win_inbound_worker(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 	BOOLEAN all_ours = TRUE, overflow = FALSE;
 	UINT32 kinds[IWAN_WIN_MAX_BATCH];
 	ULONG lens[IWAN_WIN_MAX_BATCH];
-	ULONG n = 0;			/* 本批报文数 */
+	ULONG n = 0;			/* number of packets in this batch */
 	ULONG i;
 	UINT32 fidx;
 
 	UNREFERENCED_PARAMETER(classifyContext);
 	UNREFERENCED_PARAMETER(flowContext);
 
-	/* 先把"放行"写进结论，再谈别的。
+	/* Write "permit" into the verdict first, then talk about anything else.
 	 *
-	 * 本层挂的是**终止型**过滤器：终止型没有"下一条"可继续，结论只能是 PERMIT
-	 * 或 BLOCK。写 CONTINUE（"不表态"）的现场是：会话一建立、全机流量两个方向
-	 * 立刻中断 —— 出向 callout 明明被调用了 233 次、每次都返回放行，包却一个都
-	 * 没出去；客体本身活得好好的，CLOSE 一返回立刻恢复。
-	 * 写权限（FWPS_RIGHT_ACTION_WRITE）管的是"能不能收紧成 BLOCK"，不是"能不能
-	 * 放行"：拿不到就只放行、不再收紧。 */
+	 * The filter installed at this layer is a **terminating** filter: terminating means there is no "next" to continue to, so the verdict can only be PERMIT
+	 * or BLOCK. Writing CONTINUE ("no opinion") produced this: as soon as the session is established, machine-wide traffic in both directions
+	 * stops immediately -- the outbound callout was clearly called 233 times and returned permit every time, yet not a single packet
+	 * went out; the target itself stayed perfectly alive, and everything recovered as soon as CLOSE returned.
+	 * The write right (FWPS_RIGHT_ACTION_WRITE) governs "can we tighten to BLOCK", not "can we
+	 * permit": without it, only permit, never tighten. */
 	classifyOut->actionType = FWP_ACTION_PERMIT;
 	if ((classifyOut->rights & FWPS_RIGHT_ACTION_WRITE) == 0)
 		return;
@@ -880,10 +893,10 @@ iwan_win_inbound_worker(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 	s = &ext->sess;
 	if (s->valid == 0 || iwan_win_session_is_v6(s) != outer_v6)
 		return;
-	/* 传输层没有 IP 头可看：协议与外层对端地址只能问 WFP 固定字段。
-	 * 取值前先断言类型（类型不符读到的是垃圾），拿不到就放行 —— 判不了
-	 * 归属就不该动这个包。索引先卡上界：固定字段数组是按层实际字段数
-	 * 分配的，越界读就是读别人的内存。 */
+	/* The transport layer has no IP header to look at: the protocol and the outer peer address can only be asked from WFP fixed fields.
+	 * Assert the type before reading the value (a type mismatch yields garbage); if it cannot be obtained, permit -- if ownership
+	 * cannot be determined, the packet should not be touched. Check the index against the upper bound first: the fixed-field array is allocated
+	 * per the actual number of fields at the layer, and an out-of-bounds read reads someone else's memory. */
 	if (inFixedValues == NULL)
 		return;
 	fidx = outer_v6 ? FWPS_FIELD_INBOUND_TRANSPORT_V6_IP_PROTOCOL
@@ -910,7 +923,7 @@ iwan_win_inbound_worker(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 			return;
 	}
 
-	/* 自己注入的内层包：放行，让它正常往上交付 */
+	/* Inner packet injected by ourselves: permit, let it be delivered upwards normally */
 	if (iwan_win_nbl_from_self(ext->inj_recv4, nbl) ||
 	    iwan_win_nbl_from_self(ext->inj_recv6, nbl))
 		return;
@@ -918,17 +931,28 @@ iwan_win_inbound_worker(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 		return;
 	if (s->valid == 0)
 		goto done;
+	/* Diagnostic pass-through (ingress): the packet has already passed the fixed-field gate, i.e. it is
+	 * "this session's outer frame" and nothing else -- account it and let it continue untouched. No parsing,
+	 * no decapsulation, no injection: the difference from the normal path is the decapsulation cost.
+	 * The verdict is still PERMIT from the top of this function, so returning here is the whole action. */
+	if ((ext->pass_through & IWAN_WIN_PASS_RX)) {
+		for (cur = nbl; cur != NULL; cur = NET_BUFFER_LIST_NEXT_NBL(cur)) {
+			if (NET_BUFFER_LIST_FIRST_NB(cur) != NULL)
+				IWAN_STAT_INC(ext, rx_outer);
+		}
+		goto done;
+	}
 
-	/* 入向注入必须告诉 WFP"这个包是从哪张网卡、哪个子接口收到的"，而入向
-	 * 的权威来源是**固定字段**（值本身随层而定，见 fwpsk.h 的
-	 * FWPS_FIELDS_INBOUND_TRANSPORT_V4：INTERFACE_INDEX / SUB_INTERFACE_INDEX）。
-	 * 之前只从元数据取 sourceInterfaceIndex，在 INBOUND_TRANSPORT 上拿不到
-	 * 真值，等于给注入 API 传 interfaceIndex = 0 —— 报文能排进队列（调用返回
-	 * 成功、rx_delivered 照涨），随后被 WFP 异步退回：完成回调里
-	 * NET_BUFFER_LIST_STATUS 全是 0xC000000D（STATUS_INVALID_PARAMETER），
-	 * 33 个包 33 次失败、一次都没上栈。出向注入不需要网卡索引，所以出向
-	 * 一直是通的 —— 这条不对称就是当时的线索。
-	 * 取值前照例卡上界与类型：固定字段按层分配，越界就是读别人的内存。 */
+	/* Inbound injection must tell WFP "which NIC and which sub-interface this packet was received on", while the authoritative
+	 * source for inbound is the **fixed fields** (the values themselves depend on the layer, see
+	 * FWPS_FIELDS_INBOUND_TRANSPORT_V4: INTERFACE_INDEX / SUB_INTERFACE_INDEX).
+	 * Previously sourceInterfaceIndex was taken only from metadata, and on INBOUND_TRANSPORT that does not give
+	 * the true value, which amounted to passing interfaceIndex = 0 to the injection API -- packets could be queued (the call returned
+	 * success and rx_delivered kept rising), and were then returned asynchronously by WFP: in the completion callback
+	 * NET_BUFFER_LIST_STATUS was always 0xC000000D (STATUS_INVALID_PARAMETER),
+	 * 33 packets, 33 failures, not one of them reached the stack. Outbound injection does not need an interface index, so outbound
+	 * was always working -- that asymmetry was the clue at the time.
+	 * As usual, check upper bound and type before reading: fixed fields are allocated per layer, out of bounds is reading someone else's memory. */
 	fidx = outer_v6 ? FWPS_FIELD_INBOUND_TRANSPORT_V6_INTERFACE_INDEX
 			: FWPS_FIELD_INBOUND_TRANSPORT_V4_INTERFACE_INDEX;
 	if (inFixedValues != NULL && fidx < inFixedValues->valueCount &&
@@ -944,9 +968,9 @@ iwan_win_inbound_worker(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 		if (FWPS_IS_METADATA_FIELD_PRESENT(
 			    inMetaValues, FWPS_METADATA_FIELD_COMPARTMENT_ID))
 			compartment = (UINT16)inMetaValues->compartmentId;
-		/* 兜底：元数据里的 sourceInterfaceIndex。注意它在头文件里紧挨着
-		 * destinationInterfaceIndex，是**出向语义**的成员，入向上通常取不到
-		 * 真值 —— 权威来源是下面那段固定字段。 */
+		/* Fallback: sourceInterfaceIndex from metadata. Note that in the header it sits right next to
+		 * destinationInterfaceIndex and is an **outbound-semantics** member; inbound usually cannot get the
+		 * true value -- the authoritative source is the fixed-field block below. */
 		if (FWPS_IS_METADATA_FIELD_PRESENT(
 			    inMetaValues,
 			    FWPS_METADATA_FIELD_SOURCE_INTERFACE_INDEX) &&
@@ -954,19 +978,19 @@ iwan_win_inbound_worker(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 			ifindex = (UINT32)inMetaValues->sourceInterfaceIndex;
 	}
 
-	/* 这里曾经临时把 ifindex / compartment / 元数据掩码累加进
-	 * tx_bad_state / tx_bad_inner / tx_err，用来定位"每个包都被退
-	 * STATUS_INVALID_PARAMETER"。线测实测结论（诊断值 = 原值 × 注入次数）：
-	 *   tx_bad_state/12 = 7   —— 网卡索引取自固定字段 INTERFACE_INDEX，是
-	 *                            NDIS 索引（7），与会话里那个 MIB 索引（6）
-	 *                            不是同一套编号；拿错了 WFP 就整批退包；
-	 *   tx_bad_inner/12 = 1   —— 隔离舱 1；
-	 *   tx_err/12       = 15  —— 元数据四项俱全（1|2|4|8）。
-	 * 改对之后 12 个包 12 次注入全部成功（rx_batch_skip=12、rx_batch=0）。
-	 * 这三个计数器已归还给原语义，别再借用 —— 借来的计数器会污染后续测量。 */
+	/* There was a temporary experiment here that accumulated ifindex / compartment / metadata mask into
+	 * tx_bad_state / tx_bad_inner / tx_err, used to locate "every packet is rejected with
+	 * STATUS_INVALID_PARAMETER". Wire-test measurements (diagnostic value = original value x injection count):
+	 *   tx_bad_state/12 = 7   -- the NIC index is taken from the fixed field INTERFACE_INDEX, which is
+	 *                            NDIS index (7), which uses a different numbering scheme from the MIB index (6)
+	 *                            stored in the session; with the wrong one WFP rejects the whole batch;
+	 *   tx_bad_inner/12 = 1   -- compartment 1;
+	 *   tx_err/12       = 15  -- all four metadata fields present (1|2|4|8).
+	 * After the fix, 12 packets, 12 injections all succeeded (rx_batch_skip=12, rx_batch=0).
+	 * These three counters are back to their original semantics; do not borrow them again -- borrowed counters pollute later measurements. */
 
-	/* 第一遍：整块判定。只要有一个包不是我们的（或超出批缓冲），
-	 * 就整块放行 —— 绝不做"吸收一半"。 */
+	/* First pass: judge the whole block. If even one packet is not ours (or exceeds the batch buffer),
+	 * pass the whole block -- never "absorb half". */
 	for (cur = nbl; cur != NULL; cur = NET_BUFFER_LIST_NEXT_NBL(cur)) {
 		NET_BUFFER *nb = NET_BUFFER_LIST_FIRST_NB(cur);
 		UINT8 *pkt;
@@ -975,14 +999,14 @@ iwan_win_inbound_worker(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 		UINT32 kind;
 
 		if (nb == NULL || n >= IWAN_WIN_MAX_BATCH) {
-			/* 结构异常（空 NB）或批过大：整块吞掉 */
+			/* structural anomaly (empty NB) or batch too large: swallow the whole block */
 			overflow = TRUE;
 			break;
 		}
 		len = NET_BUFFER_DATA_LENGTH(nb);
 		pkt = (UINT8 *)NdisGetDataBuffer(nb, len, NULL, 1, 0);
 		if (pkt == NULL) {
-			/* 非线性：不处理也不吸收 */
+			/* non-linear: do not handle and do not absorb */
 			all_ours = FALSE;
 			break;
 		}
@@ -1005,7 +1029,7 @@ iwan_win_inbound_worker(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 	if (!all_ours || n == 0)
 		goto done;
 
-	/* 第二遍：逐包处理。控制帧放行（不吸收），其余吞掉。 */
+	/* Second pass: process packet by packet. Control frames are passed (not absorbed), everything else is swallowed. */
 	{
 		BOOLEAN absorb = FALSE;
 
@@ -1024,9 +1048,9 @@ iwan_win_inbound_worker(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 
 			switch (kinds[i]) {
 			case IWAN_WIN_IN_CTRL:
-				/* 有效控制帧 ⇒ 对端活着；PT_CLOSE 再把时间戳归零
-				 * （用户态见到 0 即判断开，与 Linux 同语义）。
-				 * 帧本身不吸收：用户态套接字要收到它。 */
+				/* Valid control frame => peer is alive; PT_CLOSE then resets the timestamp to zero
+				 * (user mode sees 0 and judges a disconnect, same semantics as Linux).
+				 * The frame itself is not absorbed: the user-mode socket must receive it. */
 				iwan_win_session_mark_rx(s, 1);
 				if (o.type == PT_CLOSE)
 					iwan_win_session_mark_close(s);
@@ -1055,8 +1079,8 @@ iwan_win_inbound_worker(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 						: 0;
 				if (ilen == 0 || fam == 0 ||
 				    !iwan_win_inner_sane(inner, ilen)) {
-					/* 结构不合法就不注入：宁可丢这一个内层包，
-					 * 也不让畸形包进入本机协议栈 */
+					/* structurally invalid, do not inject: rather drop this one inner packet
+					 * than let a malformed packet enter the local protocol stack */
 					IWAN_STAT_INC(ext, rx_bad_inner);
 					ExFreePoolWithTag(inner, IWAN_TAG_PKT);
 					absorb = TRUE;
@@ -1070,7 +1094,7 @@ iwan_win_inbound_worker(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 					IWAN_STAT_INC(ext, rx_delivered);
 				}
 				ExFreePoolWithTag(inner, IWAN_TAG_PKT);
-				absorb = TRUE;	/* 内层已交付，外层不再上栈 */
+				absorb = TRUE;	/* inner delivered, outer no longer goes up the stack */
 				break;
 			}
 			default:
@@ -1091,11 +1115,11 @@ done:
 }
 
 /*
- * 出向 v6：判定完全用 v6 目标集合（最长前缀 + 服务器外层地址除外），封装时
- * 外层族由会话决定 —— 所以 v6-in-v4（外层 v4 会话承载内层 v6）与 v6-in-v6
- * 都走这里，正如 Linux 侧 iwan_tx_outer4/6 与内层版本无关。
+ * Outbound v6: the decision uses the v6 target set entirely (longest prefix + excluding the server outer addresses); at encapsulation time
+ * the outer family is decided by the session -- so v6-in-v4 (outer v4 session carrying inner v6) and v6-in-v6
+ * go through here, just as Linux-side iwan_tx_outer4/6 are independent of the inner version.
  *
- * 大小闸门：内层 + 外层封装开销不得越过 65535（外层 v6 不分片，超了只能丢）。
+ * Size gate: inner + outer encapsulation overhead must not exceed 65535 (outer v6 never fragments, so anything larger can only be dropped).
  */
 static VOID NTAPI
 iwan_win_classify_out6(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
@@ -1120,14 +1144,14 @@ iwan_win_classify_out6(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 	UNREFERENCED_PARAMETER(classifyContext);
 	UNREFERENCED_PARAMETER(flowContext);
 
-	/* 先把"放行"写进结论，再谈别的。
+	/* Write "permit" into the verdict first, then talk about anything else.
 	 *
-	 * 本层挂的是**终止型**过滤器：终止型没有"下一条"可继续，结论只能是 PERMIT
-	 * 或 BLOCK。写 CONTINUE（"不表态"）的现场是：会话一建立、全机流量两个方向
-	 * 立刻中断 —— 出向 callout 明明被调用了 233 次、每次都返回放行，包却一个都
-	 * 没出去；客体本身活得好好的，CLOSE 一返回立刻恢复。
-	 * 写权限（FWPS_RIGHT_ACTION_WRITE）管的是"能不能收紧成 BLOCK"，不是"能不能
-	 * 放行"：拿不到就只放行、不再收紧。 */
+	 * The filter installed at this layer is a **terminating** filter: terminating means there is no "next" to continue to, so the verdict can only be PERMIT
+	 * or BLOCK. Writing CONTINUE ("no opinion") produced this: as soon as the session is established, machine-wide traffic in both directions
+	 * stops immediately -- the outbound callout was clearly called 233 times and returned permit every time, yet not a single packet
+	 * went out; the target itself stayed perfectly alive, and everything recovered as soon as CLOSE returned.
+	 * The write right (FWPS_RIGHT_ACTION_WRITE) governs "can we tighten to BLOCK", not "can we
+	 * permit": without it, only permit, never tighten. */
 	classifyOut->actionType = FWP_ACTION_PERMIT;
 	if ((classifyOut->rights & FWPS_RIGHT_ACTION_WRITE) == 0)
 		return;
@@ -1138,7 +1162,7 @@ iwan_win_classify_out6(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 	if (s->valid == 0)
 		return;
 
-	/* 自己注入的外层包：放行，绝不再封装一层 */
+	/* Outer packet injected by ourselves: permit, never encapsulate another layer */
 	if (iwan_win_nbl_from_self(ext->inj_send4, nbl) ||
 	    iwan_win_nbl_from_self(ext->inj_send6, nbl))
 		return;
@@ -1160,22 +1184,22 @@ iwan_win_classify_out6(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 				break;
 			}
 			len = NET_BUFFER_DATA_LENGTH(nb);
-			/* 判定只需要内层 v6 首部那 40 字节：给一块栈缓冲让 NDIS
-			 * 跨 MDL 拼出来。原先这里要求**整包**连续
-			 * （NdisGetDataBuffer(nb, len, NULL, ...)），而校验和卸载
-			 * 下的常规报文首部与载荷分属不同 MDL，于是这些包被判成
-			 * “不是我们的”、明文走上承载网 —— 与出向 v4 修掉的是同一
-			 * 个错，v6 侧一直漏着。 */
+			/* The decision only needs the 40 bytes of the inner v6 header: give a stack buffer so NDIS
+			 * can assemble it across MDLs. Previously this required the **whole packet** to be contiguous
+			 * (NdisGetDataBuffer(nb, len, NULL, ...)), but under checksum offload
+			 * normal packets have header and payload in different MDLs, so these packets were judged
+			 * "not ours" and plaintext walked onto the carrier -- the same bug that outbound v4 fixed
+			 * was still leaking on the v6 side. */
 			pkt = (UINT8 *)NdisGetDataBuffer(nb, IWAN_INNER_IP6_LEN,
 							 hdr6, 1, 0);
 			if (pkt == NULL || len < IWAN_INNER_IP6_LEN ||
 			    iwan_win_inner_family(pkt, len) != 6) {
-				/* 短于首部或不是 v6：不是本会话的包，放行 */
+				/* shorter than the header or not v6: not this session's packet, permit */
 				all_ours = FALSE;
 				break;
 			}
 			if (!iwan_win_inner_sane(pkt, len)) {
-				/* 是我们的包但声明长度与整帧矛盾：丢，绝不放明文 */
+				/* our packet but the declared length contradicts the whole frame: drop, never let plaintext out */
 				iwan_win_diag_tx(s, IWAN_WIN_DIAG_TX_LEN_BAD, len,
 						 (ULONG)IWAN_INNER_IP6_LEN +
 						 iwan_win_rd16(pkt + 4), pkt[0], pkt);
@@ -1189,8 +1213,8 @@ iwan_win_classify_out6(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 				break;
 			}
 			if ((ULONG)(overhead + len) > 0xFFFF) {
-				/* 外层总长越过 16 位：装不下就丢（与 v4 的 MTU
-				 * 闸门同一规矩），不透传 */
+				/* outer total length crosses 16 bits: drop if it does not fit (same rule as the v4 MTU
+				 * gate), no pass-through */
 				iwan_win_diag_tx(s, IWAN_WIN_DIAG_TX_MTU, len,
 						 (ULONG)IWAN_INNER_IP6_LEN +
 						 iwan_win_rd16(pkt + 4), pkt[0], pkt);
@@ -1210,8 +1234,8 @@ iwan_win_classify_out6(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 		return;
 	}
 	if (fail_closed) {
-		/* 是我们的包、但封装不了：丢。计数器在判定处已经计过，
-		 * 这里只落结论，避免同一原因被记两次。 */
+		/* our packet, but it cannot be encapsulated: drop. The counter was already incremented at the decision point,
+		 * so only the verdict is set here, avoiding the same reason being counted twice. */
 		classifyOut->actionType = FWP_ACTION_BLOCK;
 		classifyOut->flags |= FWPS_CLASSIFY_OUT_FLAG_ABSORB;
 		return;
@@ -1244,10 +1268,10 @@ iwan_win_classify_out6(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 			NTSTATUS st;
 
 			nblen = NET_BUFFER_DATA_LENGTH(nb);
-			/* 与出向 v4 同一口径：判定只用首部那 40 字节，给栈缓冲让
-			 * NDIS 跨 MDL 拼；整包连续性单独探一次，不连续就拼进临时
-			 * 缓冲。原来这里一次取整包，取不到就丢，等于把校验和
-			 * 卸载下的常规 v6 报文全挡在隧道外。 */
+			/* Same convention as outbound v4: the decision only uses the 40 header bytes; give a stack buffer so
+			 * NDIS assembles across MDLs; probe whole-packet contiguity separately, and if not contiguous, coalesce into a temporary
+			 * buffer. Previously the whole packet was fetched at once and dropped if unavailable, which kept all normal v6
+			 * packets under checksum offload out of the tunnel. */
 			pkt = (UINT8 *)NdisGetDataBuffer(nb, IWAN_INNER_IP6_LEN,
 							 hdr6, 1, 0);
 			if (pkt == NULL || nblen < IWAN_INNER_IP6_LEN) {
@@ -1267,13 +1291,13 @@ iwan_win_classify_out6(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 			}
 			pkt = (UINT8 *)NdisGetDataBuffer(nb, tot, NULL, 1, 0);
 			if (pkt == NULL) {
-			/* C6014 误报：stor 是本轮拼接缓冲，下面每条出口
-			 * （取缓冲失败、MTU 装不下、封装后即用即还）都已释放并
-			 * 置空；分析器按循环回边把已释放路径也算进去。 */
+			/* C6014 false positive: stor is this iteration's coalescing buffer; every exit below
+			 * (buffer fetch failure, does not fit the MTU, returned right after encapsulation) has freed and
+			 * NULLed it; the analyzer counts the already-freed path again via the loop back edge. */
 #pragma warning(suppress: 6014)
 				stor = (UINT8 *)IWAN_ALLOC(tot, IWAN_TAG_PKT);
 				if (stor == NULL) {
-					/* 池压力下不能默默放明文出去 */
+					/* under pool pressure, do not silently let plaintext out */
 					IWAN_STAT_INC(ext, tx_err);
 					continue;
 				}
@@ -1283,10 +1307,10 @@ iwan_win_classify_out6(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 							 IWAN_WIN_DIAG_TX_COALESCE,
 							 nblen, tot, 0xFFFFu, NULL);
 					ExFreePoolWithTag(stor, IWAN_TAG_PKT);
-					/* 必须置空：stor 声明在循环体内，不置空就是
-					 * 下一轮仍持有已释放指针 —— 那条路径若走零
-					 * 拷贝成功，末尾的 `if (stor != NULL)`
-					 * 会把同一块缓冲再释放一次（池损坏）。 */
+					/* Must be set to NULL: stor is declared inside the loop body, and without NULLing
+					 * the next iteration would still hold a freed pointer -- if that path succeeds at zero-
+					 * copy, the trailing `if (stor != NULL)`
+					 * would free the same buffer again (pool corruption). */
 					stor = NULL;
 					IWAN_STAT_INC(ext, tx_bad_inner);
 					continue;
@@ -1296,43 +1320,54 @@ iwan_win_classify_out6(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 							TcpIpChecksumNetBufferListInfo);
 			if (ci.Transmit.TcpChecksum || ci.Transmit.UdpChecksum)
 				l4_offloaded = TRUE;
-			/* 校验和卸载不等于大段：多数 TCP/UDP 都带这个标记，而网卡
-			 * 补不了已经被 XOR 过的内层，只能自己算。这里与出向 v4 走
-			 * 同一条路 —— l4_offloaded 交给封装层，由
-			 * iwan_win_inner_fix_csum() 补算 L4 校验和。曾经把这一类
-			 * 整批丢弃，等于把绝大多数 v6 流量挡在隧道外。
+			/* Checksum offload does not mean a large segment: most TCP/UDP carries this flag, and the NIC
+			 * cannot fill in an inner packet that has already been XORed, so it must be computed here. This takes the same
+			 * path as outbound v4 -- l4_offloaded is handed to the encapsulation layer, and
+			 * iwan_win_inner_fix_csum() computes the L4 checksum. There was a time when this whole class
+			 * was dropped in bulk, which kept the vast majority of v6 traffic out of the tunnel.
 			 *
-			 * 真正装不下的大段（LSO/巨帧）仍然 fail-closed：外层 v6
-			 * 不参与分片，内层加封装开销越过承载 MTU 就丢，绝不让网卡
-			 * 再去分。Linux 参考实现遇到 GSO 同样是丢（记
-			 * tx_bad_state），并不做软件分段 —— 所以这里不是缺陷，
-			 * 是两侧一致的选择。 */
+			 * Segments that truly do not fit (LSO/jumbo frames) still fail closed: outer v6
+			 * does not take part in fragmentation, so if inner plus encapsulation overhead exceeds the carrier MTU it is dropped, never letting the NIC
+			 * fragment it again. The Linux reference implementation also drops on GSO (recording
+			 * tx_bad_state), does not do software segmentation either -- so this is not a defect,
+			 * it is a choice both sides make identically. */
 			if (tot + IWAN_OUTER6_TOTAL > s->carrier_mtu) {
 				iwan_win_diag_tx(s, IWAN_WIN_DIAG_TX_MTU, nblen,
 						 tot, pkt[0], pkt);
 				IWAN_STAT_INC(ext, tx_bad_state);
 				if (stor != NULL) {
 					ExFreePoolWithTag(stor, IWAN_TAG_PKT);
-					/* 必须置空：stor 声明在循环体内，但分析器
-					 * 按"循环回边仍持有已释放指针"报 C6014；更
-					 * 要紧的是真语义 —— 置空是"本轮这块缓冲已
-					 * 归还"的唯一记号，下一轮重新分配。 */
+					/* Must be set to NULL: stor is declared inside the loop body, but the analyzer
+					 * flags C6014 as "the loop back edge still holds a freed pointer"; what matters
+					 * more is the real semantics -- NULLing is the only marker that "this iteration's buffer has
+					 * been returned", and the next iteration allocates it again. */
 					stor = NULL;
 				}
 				continue;
 			}
 
+			/* Diagnostic pass-through (egress), same as v4: matched the target set and passed every
+			 * validity gate, so this is exactly the point where the encapsulation cost would be paid. */
+			if ((ext->pass_through & IWAN_WIN_PASS_TX)) {
+				IWAN_STAT_INC(ext, tx_pkts);
+				IWAN_STAT_ADD(ext, tx_bytes, (LONG64)tot);
+				if (stor != NULL) {
+					ExFreePoolWithTag(stor, IWAN_TAG_PKT);
+					stor = NULL;
+				}
+				continue;
+			}
 			st = iwan_win_encap_inject(ext, pkt, tot, l4_offloaded,
 						   compartment,
 						   iwan_win_session_is_v6(s));
 			if (stor != NULL) {
-				/* 封装层已整块拷走，即用即还 */
+				/* The encapsulation layer already copied it wholesale, return it right away */
 				ExFreePoolWithTag(stor, IWAN_TAG_PKT);
 				stor = NULL;
 			}
 			if (!NT_SUCCESS(st)) {
-				/* 在途窗口满已在 encap_inject 里记过 INFLIGHT，
-				 * 这里不能再覆盖成 ENCAP_FAIL */
+				/* The in-flight window being full was already recorded as INFLIGHT in encap_inject,
+				 * and must not be overwritten as ENCAP_FAIL here. */
 				if (st != STATUS_DEVICE_BUSY)
 					iwan_win_diag_tx(s,
 							 IWAN_WIN_DIAG_TX_ENCAP_FAIL,
@@ -1347,8 +1382,8 @@ iwan_win_classify_out6(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 
 done:
 	ExReleaseRundownProtection(&ext->rundown);
-	/* 能走到这里说明整批都命中目标集合：一律吸收（已经封装并注入外层包）。
-	 * 单包注入失败也在上面计了 tx_err —— 宁可丢这一个包，也绝不放明文出去。 */
+	/* Reaching here means the whole batch matched the target set: absorb everything (already encapsulated and injected as outer packets).
+	 * A single-packet injection failure also counted tx_err above -- rather drop this one packet than ever let plaintext out. */
 	classifyOut->actionType = FWP_ACTION_BLOCK;
 	classifyOut->flags |= FWPS_CLASSIFY_OUT_FLAG_ABSORB;
 }
@@ -1363,7 +1398,7 @@ iwan_win_notify(_In_ FWPS_CALLOUT_NOTIFY_TYPE notifyType,
 	return STATUS_SUCCESS;
 }
 
-/* ---- 注册/注销 -------------------------------------------------------- */
+/* ---- registration/unregistration ---------------------------------- */
 
 static NTSTATUS
 iwan_win_add_callout(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
@@ -1392,43 +1427,43 @@ iwan_win_add_callout(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	RtlZeroMemory(&mcallout, sizeof(mcallout));
 	mcallout.calloutKey = *key;
 	mcallout.displayData.name = (PWSTR)name;
-	mcallout.flags = 0;		/* 动态会话下不持久化：句柄一关即清 */
+	mcallout.flags = 0;		/* not persistent in a dynamic session: cleared as soon as the handle is closed */
 	mcallout.applicableLayer = *layer;
 	st = FwpmCalloutAdd(ext->engine, &mcallout, NULL, NULL);
 	if (!NT_SUCCESS(st))
 		return st;
 
 	RtlZeroMemory(&filter, sizeof(filter));
-	/* 过滤器也用 callout 的 GUID 做键：注销时按 key 删即可（filterKey 与
-	 * calloutKey 是两个独立命名空间，同一 GUID 不冲突），省掉保存
-	 * FwpmFilterAdd 回填 id 的那套状态。 */
+	/* The filter also uses the callout's GUID as its key: deletion at unregister time is by key (filterKey and
+	 * calloutKey are two independent namespaces, the same GUID does not conflict), so there is no need to remember what
+	 * FwpmFilterAdd returns. */
 	filter.filterKey = *key;
 	filter.layerKey = *layer;
 	filter.displayData.name = (PWSTR)name;
 	filter.action.type = action;
 	filter.action.calloutKey = *key;
-	filter.weight.type = FWP_EMPTY;		/* 由 BFE 自动分配权重 */
-	filter.numFilterConditions = 0;		/* 全部报文进 callout，由我们判断 */
+	filter.weight.type = FWP_EMPTY;		/* weight assigned automatically by BFE */
+	filter.numFilterConditions = 0;		/* all packets enter the callout, we decide */
 	filter.filterCondition = NULL;
-	/* FWPM_FILTER0 里放用户上下文用的成员叫 rawContext；classify 回调
-	 * 通过 FWPS_FILTER0.context 读到的就是它（名字不一样，别想当然）。 */
+	/* FWPM_FILTER0 has a member for user context called rawContext; the classify callback
+	 * reads exactly that through FWPS_FILTER0.context (different names, do not assume). */
 	filter.rawContext = (UINT64)(ULONG_PTR)ext;
 	return FwpmFilterAdd(ext->engine, &filter, NULL, NULL);
 }
 
 /*
- * 四个内建层的层键（layerKey）—— 写死的公开常量。
+ * The layer keys (layerKey) of the four built-in layers -- hard-coded public constants.
  *
- * 数值来源：WDK 用户态的 fwpuclnt.lib（用户态能链到这些符号）。内核态的
- * fwpkclnt.lib / fwpuclnt.lib / netio.lib 都不导出它们，链接期直接报
- * unresolved external，所以只能把数值抄进来。
+ * Value source: user-mode fwpuclnt.lib from the WDK (user mode can link against these symbols). The kernel-mode
+ * fwpkclnt.lib / fwpuclnt.lib / netio.lib do not export them, the link step reports
+ * unresolved external, so the values can only be copied in by hand.
  *
- * 曾经的做法是运行时用 FwpmLayerGetById0(engine, FWPS_LAYER_* 枚举值) 反查，
- * 那个 id 空间与 FWPM 的层 ID 不是一回事：查出来的层键指向别处（很可能落在
- * ALE 授权层），过滤器装上去之后 callout 的判定根本无法解析 —— 表现为
- * "会话一开，全机流量立刻中断，两个方向都断，而客体本身活得好好的；callout
- * 一次都没被调用（所有计数器全 0）；CLOSE 一返回网络立刻恢复"。层键是稳定
- * 常量，抄数值比隔着 id 空间猜要可靠。
+ * The former approach was to look them up at run time with FwpmLayerGetById0(engine, FWPS_LAYER_* enum value);
+ * that id space is not the same as the FWPM layer IDs: the returned layer key points elsewhere (most likely landing on
+ * ALE (an authorization layer), and once the filter was installed the callout verdict could not be resolved at all -- the symptom was
+ * "as soon as the session opens, machine-wide traffic is cut off at once in both directions while the target itself is alive and well; the callout
+ * was never called even once (all counters zero); the network recovers immediately as soon as CLOSE returns". Layer keys are stable
+ * constants; copying the values is more reliable than guessing across an id space.
  */
 static const GUID IWAN_LAYER_OUT4 = {
 	0x1E5C9FAE, 0x8A84, 0x4135,
@@ -1454,18 +1489,18 @@ iwan_win_wfp_init(_In_ PDEVICE_OBJECT devobj,
 	FWPM_SESSION session;
 	NTSTATUS st;
 
-	ext->devobj = devobj;	/* callout 注册推迟到会话建立，那时要用它 */
+	ext->devobj = devobj;	/* callout registration is deferred until the session is established, that is when it is needed */
 
 	RtlZeroMemory(&session, sizeof(session));
-	/* 动态会话：引擎句柄一关，本驱动加进去的 callout 与过滤器全部消失
-	 * （即使驱动崩溃也不会留下半套规则），与 Linux 侧模块卸载即摘钩子等价。 */
+	/* Dynamic session: once the engine handle is closed, the callouts and filters added by this driver all disappear
+	 * (even a driver crash leaves no half-installed rule set), equivalent to removing the hooks when the Linux module unloads. */
 	session.flags = FWPM_SESSION_FLAG_DYNAMIC;
 
 	st = FwpmEngineOpen(NULL, RPC_C_AUTHN_WINNT, NULL, &session, &ext->engine);
 	if (!NT_SUCCESS(st))
 		return st;
 
-	/* 注入用的 NBL 池：整驱动一个，报文缓冲另行分配 */
+	/* NBL pool for injection: one per driver, packet buffers are allocated separately */
 	{
 		NET_BUFFER_LIST_POOL_PARAMETERS pp;
 
@@ -1476,9 +1511,9 @@ iwan_win_wfp_init(_In_ PDEVICE_OBJECT devobj,
 			NDIS_SIZEOF_NET_BUFFER_LIST_POOL_PARAMETERS_REVISION_1;
 		pp.fAllocateNetBuffer = TRUE;
 		pp.PoolTag = IWAN_TAG_PKT;
-		/* 池句柄是**返回值**，不是出参：NdisAllocateNetBufferListPool(
-		 * NDIS_HANDLE, const NET_BUFFER_LIST_POOL_PARAMETERS *) -> NDIS_HANDLE。
-		 * 非 NDIS 驱动第一个参数传 NULL。 */
+		/* The pool handle is a **return value**, not an out parameter: NdisAllocateNetBufferListPool(
+		 * NDIS_HANDLE, const NET_BUFFER_LIST_POOL_PARAMETERS *) -> NDIS_HANDLE.
+		 * A non-NDIS driver passes NULL as the first parameter. */
 		ext->nbl_pool = NdisAllocateNetBufferListPool(NULL, &pp);
 		if (ext->nbl_pool == NULL)
 			return STATUS_INSUFFICIENT_RESOURCES;
@@ -1492,9 +1527,9 @@ iwan_win_wfp_init(_In_ PDEVICE_OBJECT devobj,
 				       &ext->inj_send6);
 	if (!NT_SUCCESS(st))
 		return st;
-	/* 入向解封后要把内层 IP 包重新交给网络层（FwpsInjectNetworkReceiveAsync0），
-	 * 所以这里同样是 NETWORK 类型，而不是 TRANSPORT —— 传输层注入拿到的是
-	 * "传输载荷"，而我们要交回去的是完整的内层 IP 包。 */
+	/* After inbound decapsulation the inner IP packet must be handed back to the network layer (FwpsInjectNetworkReceiveAsync0),
+	 * so the type here is NETWORK as well, not TRANSPORT -- transport-layer injection receives
+	 * "transport payload", but what we hand back is a complete inner IP packet. */
 	st = FwpsInjectionHandleCreate(AF_INET, FWPS_INJECTION_TYPE_NETWORK,
 				       &ext->inj_recv4);
 	if (!NT_SUCCESS(st))
@@ -1504,22 +1539,22 @@ iwan_win_wfp_init(_In_ PDEVICE_OBJECT devobj,
 	if (!NT_SUCCESS(st))
 		return st;
 
-	/* 到这里只是“工具就绪”：引擎、NBL 池、四个注入句柄都不会拦截任何
-	 * 报文。四个 callout 与过滤器由 iwan_win_wfp_start 在会话建立时装上
-	 * —— 于是 sc start 只验证“驱动能加载、设备能打开”。 */
+	/* At this point it is only "tools ready": the engine, NBL pool and four injection handles do not intercept any
+	 * packet. The four callouts and filters are installed by iwan_win_wfp_start when the session is established
+	 * -- so sc start only verifies "the driver can load, the device can open". */
 	InterlockedExchange(&ext->wfp_started, 0);
 	return STATUS_SUCCESS;
 }
 
 /*
- * 装上数据面：向 BFE 取四个层的层键，然后逐层注册 callout + 过滤器。
- * 出向两层在 IP 包层；入向两层在**传输层**（协议栈重组之后，见文件头说明）。
+ * Install the data plane: fetch the layer keys of the four layers from BFE, then register callout + filter layer by layer.
+ * The two outbound layers are at the IP packet layer; the two inbound layers are at the **transport layer** (after protocol-stack reassembly, see the file header).
  *
- * 为什么不在 DriverEntry 里做：一注册就等于全机每一个出向/入向 IP 包都要
- * 先过我们的 classify，而“能不能加载驱动”和“接管流量”应该分开验证。放到
- * 这里之后，加载失败的排查范围只剩 DriverEntry 与控制面。
+ * Why not do it in DriverEntry: as soon as something is registered, every outbound/inbound IP packet on the machine has to
+ * pass through our classify first, and "can the driver load" and "take over traffic" should be verified separately. With it placed
+ * here, the scope for debugging a load failure is only DriverEntry and the control plane.
  *
- * 幂等：wfp_started 做一次性闸门，并发 OPEN 只有一个真正注册。
+ * Idempotent: wfp_started is a one-shot gate, so among concurrent OPENs only one really registers.
  */
 NTSTATUS
 iwan_win_wfp_start(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
@@ -1527,13 +1562,13 @@ iwan_win_wfp_start(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 	NTSTATUS st;
 
 	if (InterlockedCompareExchange(&ext->wfp_started, 1, 0) != 0)
-		return STATUS_SUCCESS;		/* 已装好，或有人正在装 */
+		return STATUS_SUCCESS;		/* already installed, or someone is installing it */
 	if (ext->engine == NULL || ext->devobj == NULL) {
 		InterlockedExchange(&ext->wfp_started, 0);
 		return STATUS_INVALID_DEVICE_STATE;
 	}
 
-	/* 层键是写死的公开常量（见上面四个 GUID 的说明）：不再运行时向 BFE 反查 */
+	/* The layer keys are hard-coded public constants (see the notes on the four GUIDs above): no more run-time lookups from BFE */
 	st = iwan_win_add_callout(ext, ext->devobj, &IWAN_CALLOUT_OUT4,
 				  iwan_win_classify_out4,
 				  FWP_ACTION_CALLOUT_TERMINATING,
@@ -1561,7 +1596,7 @@ iwan_win_wfp_start(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 					  &ext->callout_id_in6);
 	}
 	if (!NT_SUCCESS(st)) {
-		iwan_win_wfp_stop(ext);		/* 半个数据面比不装更危险 */
+		iwan_win_wfp_stop(ext);		/* half a data plane is more dangerous than none */
 		return st;
 	}
 
@@ -1570,19 +1605,19 @@ iwan_win_wfp_start(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 }
 
 /*
- * 摘掉数据面。顺序不能颠倒：先删过滤器，再注销 callout —— 反过来会留下
- * 引用“已注销 callout”的终止型过滤器，那是全机流量的黑洞（动作无法解析
- * 时协议栈只能丢包），比根本不装还危险。
+ * Remove the data plane. The order must not be reversed: delete the filters first, then unregister the callouts -- the reverse would leave
+ * terminating filters referencing "already unregistered callouts", which is a black hole for machine-wide traffic (the protocol stack can only drop
+ * packets when the action cannot be resolved), more dangerous than not installing at all.
  *
- * 按 key 删而不是按 id 删：filterKey 在 iwan_win_add_callout 里显式设成了
- * 每个 callout 自己的 GUID，因此不必再保存 FwpmFilterAdd 回填的 id。
- * 调用方都在控制面串行路径上（IOCTL 或卸载），这里的闸门只防重复与重入。
+ * Delete by key instead of by id: filterKey is explicitly set to
+ * each callout's own GUID in iwan_win_add_callout, so there is no need to save the id filled back by FwpmFilterAdd.
+ * All callers are on the control-plane serial path (IOCTL or unload); the gate here only guards against duplicates and re-entry.
  */
 VOID
 iwan_win_wfp_stop(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 {
 	if (InterlockedCompareExchange(&ext->wfp_started, 1, 2) != 2)
-		return;				/* 本来就没装，或有人正在装/摘 */
+		return;				/* was never installed, or someone is installing/removing it */
 
 	if (ext->engine != NULL) {
 		FwpmFilterDeleteByKey0(ext->engine, &IWAN_CALLOUT_OUT4);
@@ -1618,20 +1653,20 @@ iwan_win_wfp_fini(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 {
 	ULONG spin;
 
-	iwan_win_wfp_stop(ext);		/* 先停数据面（幂等） */
+	iwan_win_wfp_stop(ext);		/* stop the data plane first (idempotent) */
 
-	/* 排空在途注入：完成回调要归还 NBL 到池、释放报文缓冲。注销 callout
-	 * 已保证不再有新的注入进来，这里只等已发出的那批回完。有界等待后仍
-	 * 不归零，说明有注入卡在协议栈里；此时宁可留下句柄与池不释放
-	 * （内存泄漏），也不冒释放后仍被引用的风险 —— 卸载路径上，泄漏比
-	 * 蓝屏可接受。 */
+	/* Drain in-flight injections: the completion callback must return NBLs to the pool and free packet buffers. Unregistering the callouts
+	 * already guarantees no new injections come in; here we only wait for the batch already sent out to come back. After the bounded wait it still
+	 * does not reach zero, which means an injection is stuck inside the protocol stack; at that point, rather leave the handles and pool unfreed
+	 * (a memory leak) than risk a use-after-free -- on the unload path, a leak is more acceptable
+	 * than a blue screen. */
 	for (spin = 0; spin < 20000; spin++) {
 		if (ext->inject_outstanding == 0)
 			break;
 		KeStallExecutionProcessor(100);
 	}
 	if (ext->inject_outstanding != 0) {
-		DbgPrint("iwan-win: 仍有过期注入 %ld 个，保留注入句柄与 NBL 池不释放\n",
+		DbgPrint("iwan-win: %ld stale injections remain; keeping the injection handles and NBL pool allocated\n",
 			 ext->inject_outstanding);
 		ext->engine = NULL;
 		InterlockedExchange(&ext->wfp_started, 0);

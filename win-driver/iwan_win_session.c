@@ -1,20 +1,20 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * iwan_win_session.c — 会话、目标集合、统计与共享内存页。
+ * iwan_win_session.c - session, target set, statistics and shared memory page.
  *
- * 对应 Linux 侧的：struct iwan_session（kernel/iwan.h）、genetlink 的
- * SESSION_UP/SESSION_DOWN/GET_STATS，以及 /dev/iwan 那一页（kernel/iwan_shm.c）。
+ * Corresponds to the Linux side: struct iwan_session (kernel/iwan.h), the genetlink
+ * SESSION_UP/SESSION_DOWN/GET_STATS, and the /dev/iwan page (kernel/iwan_shm.c).
  *
- * 并发模型见 iwan_win.h 顶部注释：控制面（本文件）在 PASSIVE_LEVEL 用
- * ctrl_mutex 串行化；数据面先取得 rundown 保护再读会话状态。两者之间靠
- * ExWaitForRundownProtectionRelease / ExReInitializeRundownProtection 交接，
- * 因此本文件里可以放心做池分配、用户地址映射与解映射、等待进程退出状态。
+ * Concurrency model, see the top comment of iwan_win.h: the control plane (this file) at PASSIVE_LEVEL
+ * serializes with ctrl_mutex; the data plane takes rundown protection before reading session state. The two hand over via
+ * ExWaitForRundownProtectionRelease / ExReInitializeRundownProtection,
+ * so this file can safely do pool allocation, user address map/unmap and waiting on process exit status.
  */
 #include "iwan_win.h"
 
-/* 封装开销与内层 MTU 上下界：常量已上移到 src/common/iwan_win_abi.h，客户端与
- * 驱动只需一套定义 —— 两处各写一份的结果是"客户端按 36 算、驱动按 38 校验"，
- * 最后表现为偶发的会话建立失败或大包黑洞，而不是一眼可见的编译错误。 */
+/* Encapsulation overhead and inner MTU bounds: constants moved up to src/common/iwan_win_abi.h, client and
+ * driver need only one definition -- with a copy in each place the result is 'client computes 36, driver validates 38',
+ * ending up as occasional session setup failures or big-packet black holes, not a compile error visible at a glance. */
 
 static __inline BOOLEAN
 iwan_win_is_zero16(_In_reads_bytes_(16) const UINT8 *p)
@@ -33,13 +33,13 @@ iwan_win_session_is_v6(_In_ const IWAN_WIN_SESSION *s)
 	return !iwan_win_is_zero16(s->outer_dst6);
 }
 
-/* ---- 出向拒绝样本（共享页诊断区） ------------------------------------- */
+/* ---- TX rejection samples (shared page diagnostic area) ----------------- */
 
 /*
- * 只写不判，用户态经 SHM_QUERY 读（布局见 src/common/iwan_win_abi.h）。
- * 两个数据面（WFP 平面 iwan.sys 与 NDIS 平面 iwanmp.sys）共用这一份实现：
- * 记录的字段布局与写入顺序是现场诊断的唯一依据，任何一处分叉都会让两边的
- * 读数不可比。只在拒绝路径上写，正常路径零开销。
+ * Write only, never decide; user mode reads them via SHM_QUERY (layout in src/common/iwan_win_abi.h).
+ * Both data planes (WFP plane iwan.sys and NDIS plane iwanmp.sys) share this one implementation:
+ * the field layout and write order of a record are the only basis for field diagnostics; any divergence makes the two
+ * readings incomparable. Written only on rejection paths, zero cost on the normal path.
  */
 VOID
 iwan_win_diag_tx(_Inout_ IWAN_WIN_SESSION *s, _In_ UINT32 reason,
@@ -62,22 +62,22 @@ iwan_win_diag_tx(_Inout_ IWAN_WIN_SESSION *s, _In_ UINT32 reason,
 		n = len < sizeof(d->first) ? len : sizeof(d->first);
 		RtlCopyMemory(d->first, pkt, n);
 	}
-	/* 字段全部写完再自增序号：读者据此判断记录已更新（先写后记是约定） */
+	/* Increment the sequence only after all fields are written: readers use it to tell the record was updated (write-then-mark is the convention) */
 	InterlockedIncrement((volatile LONG *)&d->seq);
 }
 
-/* ---- 控制面基础设施 --------------------------------------------------- */
+/* ---- Control plane infrastructure --------------------------------------- */
 
 #ifdef IWAN_WIN_PLANE_MP
 /*
- * DriverEntry 阶段的失败诊断。
+ * Failure diagnostics for the DriverEntry stage.
  *
- * 驱动加载失败时没有任何用户态通道可用：控制设备还没建起来，事件日志要走
- * IoAllocateErrorLogEntry，客体上也没有内核调试器。退而求其次，把"走到第几步、
- * 这一步的状态码"写进服务键的 Parameters 子键（两个 REG_DWORD），客体上一条
- * reg query 就能读到，重启也不丢。
+ * When driver loading fails there is no user-mode channel at all: the control device is not created yet, the event log would need
+ * IoAllocateErrorLogEntry, and there is no kernel debugger on the guest either. As a fallback, write 'which step was reached,
+ * and the status code of that step' into the Parameters subkey of the service key (two REG_DWORDs), so a single
+ * reg query on the guest reads it, and it survives a reboot.
  *
- * 只在注册与初始化路径上调用，数据面不碰它。
+ * Called only on the registration and init paths; the data plane does not touch it.
  */
 VOID
 iwan_win_mp_trace(_In_ ULONG stage, _In_ LONG status)
@@ -96,10 +96,10 @@ iwan_win_mp_trace(_In_ ULONG stage, _In_ LONG status)
 		NTSTATUS ks = ZwCreateKey(&key, KEY_SET_VALUE, &oa, 0, NULL,
 					  REG_OPTION_NON_VOLATILE, NULL);
 
-		/* 静默的诊断通道等于没有诊断：键建不出来（路径/权限）时至少让
-		 * DbgPrint 留一句，否则现场看起来"什么都没发生"。 */
+		/* A silent diagnostic channel equals no diagnostics: when the key cannot be created (path/permission), at least let
+		 * DbgPrint leave one line, otherwise the field looks like 'nothing happened'. */
 		if (!NT_SUCCESS(ks)) {
-			DbgPrint("iwanmp: trace 键打不开 0x%08lx（stage=%ld）\n",
+			DbgPrint("iwanmp: cannot open trace key 0x%08lx (stage=%ld)\n",
 				 (unsigned long)ks, (long)stage);
 			return;
 		}
@@ -110,12 +110,12 @@ iwan_win_mp_trace(_In_ ULONG stage, _In_ LONG status)
 	RtlInitUnicodeString(&vn, L"Status");
 	if (!NT_SUCCESS(ZwSetValueKey(key, &vn, 0, REG_DWORD, &status,
 				      sizeof(status))))
-		DbgPrint("iwanmp: trace 写失败（stage=%ld）\n", (long)stage);
+		DbgPrint("iwanmp: trace write failed (stage=%ld)\n", (long)stage);
 
-	/* 每个阶段再各写一个不会互相覆盖的键（T<十进制阶段号>）：Stage/Status
-	 * 只留最后一次，而"哪一步失败"往往要靠更早的那一次才能判读。键名现拼
-	 * 而不是写死 switch——阶梯实验会一次写下十几个阶段，写死的表只会让没
-	 * 列进去的阶段静默消失，那一轮装机读数就白跑了（踩过）。 */
+	/* Each stage also writes its own non-overlapping key (T<decimal stage number>): Stage/Status
+	 * keep only the last one, while 'which step failed' often requires an earlier one to interpret. Key names are composed
+	 * on the fly instead of a hard-coded switch -- a stepwise experiment writes a dozen stages at once, and a hard-coded table would make
+	 * unlisted stages silently disappear; that install round's readings would be wasted (been there). */
 	{
 		WCHAR name[16], digits[12];
 		ULONG n = stage, i = 0, t = 0;
@@ -140,12 +140,12 @@ VOID
 iwan_win_ctrl_init(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 {
 	KeInitializeMutex(&ext->ctrl_mutex, 0);
-	/* 初始为"已放行"状态：数据面会取得保护、看到 valid == 0、立刻放回 */
+	/* Initially in the 'released' state: the data plane takes protection, sees valid == 0, and returns immediately */
 	ExInitializeRundownProtection(&ext->rundown);
-	/* 控制设备的在途 IRP 排空：分发入口 IoAcquireRemoveLock、卸载路径
-	 * IoReleaseRemoveLockAndWait。没有它，扩展可能在某个 IOCTL 正用着
-	 * &ext->ctrl_mutex / session_open 的时候被 ExFreePoolWithTag 掉
-	 * —— IoDeleteDevice/NdisDeregisterDeviceEx 都**不等待**在途 IRP。 */
+	/* Drain in-flight IRPs of the control device: dispatch entry does IoAcquireRemoveLock, unload path
+	 * IoReleaseRemoveLockAndWait. Without it, the extension could be ExFreePoolWithTag'd while some IOCTL is still using
+	 * &ext->ctrl_mutex / session_open
+	 * -- IoDeleteDevice/NdisDeregisterDeviceEx both **do not wait** for in-flight IRPs. */
 	IoInitializeRemoveLock(&ext->ctrl_remove_lock, IWAN_TAG_SESS, 0, 0);
 	InterlockedExchange(&ext->ctrl_remove_init, 1);
 }
@@ -153,20 +153,32 @@ iwan_win_ctrl_init(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 VOID
 iwan_win_ctrl_fini(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 {
-	/* 排空数据面读者后不再放行：卸载路径上调用，之后不会再有人进来 */
+	/* After draining data-plane readers, block further entry: called on the unload path, nobody comes in afterwards */
 	ExWaitForRundownProtectionRelease(&ext->rundown);
 }
 
-/* 读服务键下的下一跳 MAC 固化值（REG_BINARY 6 字节）。返回 6 = 读到，
- * 其余 = 未设置/形状不对。只在 IOCTL_SESSION_OPEN（PASSIVE）调用。 */
+/* The Parameters subkey of this image's own service, i.e. where the diagnostics below are read from.
+ * It must follow the plane: iwan.sys (WFP) lives under Services\iwan and iwanmp.sys under Services\iwanmp. Reading the
+ * other image's key is a silent failure mode by construction -- the knob exists, the driver starts, and the value simply
+ * never takes effect -- so the path is not spelled out twice in the code. */
+#ifdef IWAN_WIN_PLANE_MP
+#define IWAN_WIN_PARAM_KEY \
+	L"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\iwanmp\\Parameters"
+#else
+#define IWAN_WIN_PARAM_KEY \
+	L"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\iwan\\Parameters"
+#endif
+
+/* Read the pinned next-hop MAC from the service key (REG_BINARY 6 bytes). Returns 6 = read,
+ * anything else = not set / bad shape. Only called from IOCTL_SESSION_OPEN (PASSIVE). */
 _Success_(return != 0)
 static ULONG
 iwan_win_reg_read_mac(_Out_writes_(6) UINT8 *out)
 {
-	/* 缓冲必须放进结构体里：KEY_VALUE_PARTIAL_INFORMATION 的 Data 是
-	 * UCHAR[1]，结构体自身只容得下 12+1 字节，而内核会把 12+DataLength
-	 * 都写进调用者的缓冲；用裸 UINT8[] 再强转既不安全（边界靠 sizeof
-	 * 撑着）又让分析器认为读的是未初始化内存（C28199）。 */
+	/* The buffer must live inside the struct: KEY_VALUE_PARTIAL_INFORMATION's Data is
+	 * UCHAR[1], the struct itself holds only 12+1 bytes, while the kernel writes 12+DataLength
+	 * into the caller's buffer; casting a naked UINT8[] is both unsafe (bounds rest on sizeof)
+	 * and makes the analyzer think uninitialized memory is read (C28199). */
 	typedef struct {
 		KEY_VALUE_PARTIAL_INFORMATION hdr;
 		UINT8 tail[16];
@@ -179,9 +191,7 @@ iwan_win_reg_read_mac(_Out_writes_(6) UINT8 *out)
 	NTSTATUS st;
 
 	RtlZeroMemory(&kv, sizeof(kv));
-	RtlInitUnicodeString(&path,
-			     L"\\Registry\\Machine\\System\\CurrentControlSet"
-			     L"\\Services\\iwanmp\\Parameters");
+	RtlInitUnicodeString(&path, IWAN_WIN_PARAM_KEY);
 	InitializeObjectAttributes(&oa, &path,
 				   OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
 				   NULL, NULL);
@@ -199,7 +209,42 @@ iwan_win_reg_read_mac(_Out_writes_(6) UINT8 *out)
 	return 6;
 }
 
-/* ---- 共享内存页（对应 /dev/iwan mmap 的那一页） ----------------------- */
+/* Read a REG_DWORD diagnostic switch from the Parameters subkey of this image's service key.
+ * Returns TRUE = read (value is stored in *out), FALSE = not set / wrong shape (the caller keeps its default).
+ * Only called from IOCTL_SESSION_OPEN (PASSIVE). */
+static BOOLEAN
+iwan_win_reg_read_dword(_In_ PCWSTR name, _Out_ UINT32 *out)
+{
+	typedef struct {
+		KEY_VALUE_PARTIAL_INFORMATION hdr;
+		UINT8 tail[8];
+	} IWAN_WIN_KV_DWORD;
+	UNICODE_STRING path, vn;
+	OBJECT_ATTRIBUTES oa;
+	HANDLE key = NULL;
+	IWAN_WIN_KV_DWORD kv;
+	ULONG len = 0;
+	NTSTATUS st;
+
+	RtlZeroMemory(&kv, sizeof(kv));
+	RtlInitUnicodeString(&path, IWAN_WIN_PARAM_KEY);
+	InitializeObjectAttributes(&oa, &path,
+				   OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+				   NULL, NULL);
+	if (!NT_SUCCESS(ZwOpenKey(&key, KEY_READ, &oa)))
+		return FALSE;
+	RtlInitUnicodeString(&vn, name);
+	st = ZwQueryValueKey(key, &vn, KeyValuePartialInformation, &kv,
+			     sizeof(kv), &len);
+	ZwClose(key);
+	if (!NT_SUCCESS(st) || kv.hdr.Type != REG_DWORD ||
+	    kv.hdr.DataLength != sizeof(UINT32))
+		return FALSE;
+	RtlCopyMemory(out, kv.hdr.Data, sizeof(UINT32));
+	return TRUE;
+}
+
+/* ---- Shared memory page (the page corresponding to /dev/iwan mmap) ------ */
 
 static NTSTATUS
 iwan_win_shm_create(_Inout_ IWAN_WIN_SESSION *s)
@@ -211,16 +256,16 @@ iwan_win_shm_create(_Inout_ IWAN_WIN_SESSION *s)
 	RtlZeroMemory(s->shm, PAGE_SIZE);
 	s->shm->version = IWAN_WIN_SHM_VERSION;
 	s->shm->pad = 0;
-	s->shm->last_rx_ms = 0;			/* 0 = 从未收到 */
+	s->shm->last_rx_ms = 0;			/* 0 = never received */
 	s->shm->peer_state = IWAN_WIN_PEER_UNKNOWN;
 	s->shm->enabled = 1;
 	return STATUS_SUCCESS;
 }
 
 /*
- * 撤销用户态映射。映射只在属主进程的地址空间里存在，所以必须切到它的上下文
- * 里解映射；属主已经退出时地址空间随之销毁，这里只需释放 MDL。
- * 属主进程对象在建立映射时已持引用（见 shm_map_user），所以不受 PID 复用影响。
+ * Revoke the user-mode mapping. The mapping exists only in the owner process's address space, so we must switch to its context
+ * to unmap; when the owner has already exited the address space is destroyed with it and only the MDL needs freeing.
+ * The owner process object was referenced when the mapping was created (see shm_map_user), so PID reuse does not matter.
  */
 static VOID
 iwan_win_shm_unmap_user(_Inout_ IWAN_WIN_SESSION *s)
@@ -252,7 +297,7 @@ iwan_win_shm_unmap_user(_Inout_ IWAN_WIN_SESSION *s)
 static VOID
 iwan_win_shm_destroy(_Inout_ IWAN_WIN_SESSION *s)
 {
-	iwan_win_shm_unmap_user(s);		/* 先撤映射，再放页 */
+	iwan_win_shm_unmap_user(s);		/* unmap first, then free the page */
 	if (s->shm != NULL) {
 		ExFreePoolWithTag(s->shm, IWAN_TAG_SHM);
 		s->shm = NULL;
@@ -269,7 +314,7 @@ iwan_win_shm_map_user(_Inout_ IWAN_WIN_SESSION *s)
 	if (s->shm == NULL)
 		return STATUS_INVALID_DEVICE_STATE;
 	if (s->shm_mdl != NULL) {
-		/* 同一页只映射给一个进程：映射地址在别的进程里没有意义 */
+		/* One page is mapped to only one process: a mapping address is meaningless in another process */
 		if (s->shm_owner != owner)
 			return STATUS_DEVICE_BUSY;
 		return STATUS_SUCCESS;
@@ -282,12 +327,12 @@ iwan_win_shm_map_user(_Inout_ IWAN_WIN_SESSION *s)
 	MmBuildMdlForNonPagedPool(mdl);
 	mdl->MdlFlags |= MDL_MAPPING_CAN_FAIL;
 
-	/* UserMode 映射是只读的（对应 Linux 侧 mmap 只给 PROT_READ）：
-	 * 用户态能轮询时间戳，但改不了内核写的任何字段。
+	/* The UserMode mapping is read-only (matching the Linux mmap that grants PROT_READ only):
+	 * user mode can poll the timestamp but cannot change any field written by the kernel.
 	 *
-	 * MmMapLockedPagesSpecifyCache 的 UserMode 变体在映射失败时可以抛异常
-	 * （KE 文档与 PREfast C28125 都要求放在 try/except 里）。异常里把 MDL
-	 * 收回来：异常路径不能继续持有它，否则每次失败都漏一个 MDL。 */
+	 * The UserMode variant of MmMapLockedPagesSpecifyCache can raise on mapping failure
+	 * (KE docs and PREfast C28125 both require wrapping it in try/except). In the exception path take the MDL
+	 * back: the exception path must not keep holding it, otherwise every failure leaks one MDL. */
 	va = NULL;
 	__try {
 		va = MmMapLockedPagesSpecifyCache(mdl, UserMode, MmCached, NULL,
@@ -297,8 +342,8 @@ iwan_win_shm_map_user(_Inout_ IWAN_WIN_SESSION *s)
 	} __except (GetExceptionCode() == STATUS_ACCESS_VIOLATION ||
 		    GetExceptionCode() == STATUS_INVALID_PARAMETER
 		    ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
-		/* 只吞这两族：它们是“这一个用户 VA 不可用”的确定答复，别的异常
-		 * （栈溢出、页错误链断掉等）属于本函数不该承担的故障，往上抛。 */
+		/* Swallow only these two families: they are the definite answer that 'this one user VA is unusable'; other exceptions
+		 * (stack overflow, broken page-fault chain, etc.) are failures this function should not own, so throw them up. */
 		va = NULL;
 	}
 	if (va == NULL) {
@@ -313,7 +358,7 @@ iwan_win_shm_map_user(_Inout_ IWAN_WIN_SESSION *s)
 	return STATUS_SUCCESS;
 }
 
-/* ---- 数据面记账（只在这里写共享内存页） ------------------------------- */
+/* ---- Data plane accounting (only place that writes the shared memory page) */
 
 VOID
 iwan_win_session_mark_rx(_Inout_ IWAN_WIN_SESSION *s, _In_ UINT32 is_ctrl)
@@ -324,8 +369,8 @@ iwan_win_session_mark_rx(_Inout_ IWAN_WIN_SESSION *s, _In_ UINT32 is_ctrl)
 		return;
 
 	/*
-	 * 不取锁：只有驱动在写，用户态只读。时间戳是单个 8 字节写（x64 上原子），
-	 * 计数器用互锁自增，因此数据面每报文没有锁开销 —— 与 Linux 模块同一取向。
+	 * No lock: only the driver writes, user mode only reads. The timestamp is a single 8-byte write (atomic on x64),
+	 * counters use interlocked increment, so the data plane has no per-packet lock cost -- same direction as the Linux module.
 	 */
 	s->shm->last_rx_ms = iwan_win_now_ms();
 	s->shm->peer_state = IWAN_WIN_PEER_UP;
@@ -335,10 +380,10 @@ iwan_win_session_mark_rx(_Inout_ IWAN_WIN_SESSION *s, _In_ UINT32 is_ctrl)
 }
 
 /*
- * 对端 PT_CLOSE：把共享内存页的时间戳归零并把 peer_state 置为已关闭。
- * 用户态的判活只看时间戳（归零 = 断线），所以这一笔必须在放行 CLOSE 帧
- * 之前写下去 —— 与 kernel/iwan_rx.c 的 iwan_ev_peer_close 同语义
- * （内核把 PT_CLOSE 的时间戳覆盖成 0）。
+ * Peer PT_CLOSE: zero the shared page timestamp and set peer_state to closed.
+ * User-mode liveness only looks at the timestamp (zero = disconnected), so this write must land before the CLOSE frame
+ * is released -- same semantics as iwan_ev_peer_close in kernel/iwan_rx.c
+ * (the kernel overwrites the PT_CLOSE timestamp with 0).
  */
 VOID
 iwan_win_session_mark_close(_Inout_ IWAN_WIN_SESSION *s)
@@ -348,13 +393,13 @@ iwan_win_session_mark_close(_Inout_ IWAN_WIN_SESSION *s)
 	s->shm->last_rx_ms = 0;
 	s->shm->peer_state = IWAN_WIN_PEER_CLOSED;
 	KeMemoryBarrier();
-	/* 不在这里计数：调用点已经走过 mark_rx(s, 1)（共享内存页的镜像计数）
-	 * 并各自记了驱动侧统计，这里只负责"把时间戳归零 + 置已关闭"。 */
+	/* Do not count here: the call site has already gone through mark_rx(s, 1) (mirror counting on the shared page)
+	 * and recorded driver-side stats separately; this only handles 'zero the timestamp + mark closed'. */
 }
 
-/* ---- 目标集合：最长前缀匹配 ------------------------------------------- */
+/* ---- Target set: longest prefix match ----------------------------------- */
 
-/* ---- 会话生命周期 ----------------------------------------------------- */
+/* ---- Session lifecycle -------------------------------------------------- */
 
 static VOID
 iwan_win_session_reset(_Inout_ IWAN_WIN_SESSION *s)
@@ -373,13 +418,13 @@ VOID
 iwan_win_session_teardown(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 {
 	KeWaitForSingleObject(&ext->ctrl_mutex, Executive, KernelMode, FALSE, NULL);
-	ExWaitForRundownProtectionRelease(&ext->rundown);	/* 排空数据面 */
+	ExWaitForRundownProtectionRelease(&ext->rundown);	/* drain the data plane */
 	iwan_win_session_reset(&ext->sess);
-	ExReInitializeRundownProtection(&ext->rundown);		/* 重新放行（此时无会话） */
+	ExReInitializeRundownProtection(&ext->rundown);		/* allow entry again (no session at this point) */
 	KeReleaseMutex(&ext->ctrl_mutex, FALSE);
 }
 
-/* 把请求里的目标集合复制并规范化；失败返回错误码，成功返回数组（可为 NULL） */
+/* Copy and normalize the target set in the request; on failure return an error code, on success return the array (may be NULL) */
 static NTSTATUS
 iwan_win_targets_import(_In_reads_bytes_(in_len) const IWAN_WIN_SESSION_OPEN *req,
 			_In_ ULONG in_len, _Out_ IWAN_WIN_TARGET **out, _Out_ ULONG *out_count)
@@ -395,9 +440,9 @@ iwan_win_targets_import(_In_reads_bytes_(in_len) const IWAN_WIN_SESSION_OPEN *re
 	if (req->target_count > IWAN_WIN_MAX_TARGETS)
 		return STATUS_INVALID_PARAMETER;
 
-	/* 逐条 sizeof(IWAN_WIN_TARGET) 字节、条数上限 IWAN_WIN_MAX_TARGETS。
-	 * 分配与拷贝都只用同一个局部量 bytes：这样“分配了多少”与“拷了多少”
-	 * 在源码上就是同一个数（C6385 的成因正是二者被当成两个表达式）。 */
+	/* sizeof(IWAN_WIN_TARGET) bytes each, count capped at IWAN_WIN_MAX_TARGETS.
+	 * Both allocation and copy use the same local variable bytes: thus 'how much was allocated' and 'how much was copied'
+	 * are the same number in the source (the cause of C6385 is exactly that they were treated as two expressions). */
 	cnt = req->target_count;
 	bytes = cnt * (ULONG)sizeof(IWAN_WIN_TARGET);
 	need = req->target_offset + bytes;
@@ -411,12 +456,12 @@ iwan_win_targets_import(_In_reads_bytes_(in_len) const IWAN_WIN_SESSION_OPEN *re
 
 	RtlCopyMemory(targets, (const UINT8 *)req + req->target_offset, bytes);
 
-	/* 按字节偏移走，而不是按条数下标走：循环条件直接就是
-	 *   off + 一条 <= bytes
-	 * 与下面每次读写的上界是同一个表达式，静态分析不必再自己把
-	 * "cnt 条 × 每条的字节数" 乘回去（C6385 报的就是它乘不动）。
-	 * off 每次加 sizeof(IWAN_WIN_TARGET)（24 字节），池分配 16 字节对齐，
-	 * 所以每个 t 都是对齐的。 */
+	/* Walk by byte offset rather than by item index: the loop condition is directly
+	 *   off + one item <= bytes
+	 * which is the same expression as the upper bound of every read/write below, so static analysis need not multiply
+	 * 'cnt items x bytes per item' back itself (C6385 reports exactly that it cannot do the multiplication).
+	 * off advances by sizeof(IWAN_WIN_TARGET) (24 bytes) each time; pool allocation is 16-byte aligned,
+	 * so every t is aligned. */
 	for (off = 0; off + sizeof(IWAN_WIN_TARGET) <= bytes;
 	     off += sizeof(IWAN_WIN_TARGET)) {
 		IWAN_WIN_TARGET *t = (IWAN_WIN_TARGET *)((UINT8 *)targets + off);
@@ -426,8 +471,8 @@ iwan_win_targets_import(_In_reads_bytes_(in_len) const IWAN_WIN_SESSION_OPEN *re
 				ExFreePoolWithTag(targets, IWAN_TAG_TARGET);
 				return STATUS_INVALID_PARAMETER;
 			}
-			/* v4 条目只允许用前 4 字节，其余清零：避免同一前缀
-			 * 因为垃圾字节被当成两条。 */
+			/* For a v4 entry only the first 4 bytes are used, the rest is zeroed: avoid the same prefix
+			 * being taken as two entries because of garbage bytes. */
 			RtlZeroMemory(t->addr + 4, 12);
 		} else if (t->family == IWAN_WIN_AF_V6) {
 			if (t->prefix_len > 128) {
@@ -446,13 +491,13 @@ iwan_win_targets_import(_In_reads_bytes_(in_len) const IWAN_WIN_SESSION_OPEN *re
 }
 
 /*
- * ABI 里的端口是"网络序字节"（iwan_win_abi.h 写明 be16；Windows 客户端直接放
- * sockaddr 的 sin_port，本来就是网络序）。会话内部统一成**大端整数**这一种表示，
- * 与 IWAN_WIN_OUTER.sport/dport（iwan_win_rd16 读出来的值）一致：
- *   · 出向用 iwan_win_wr16 写回字节，得到正确的外层端口；
- *   · 入向闸门拿 iwan_win_rd16 读出的端口直接比。
- * 曾经原样当 uint16 用，等于两边差一次字节序：入向闸门永远不相等 -> 整批放行，
- * 外层帧一路交付到用户态套接字；出向封装出去的端口也是反的。
+ * Ports in the ABI are 'network-order bytes' (iwan_win_abi.h states be16; the Windows client stores
+ * sockaddr's sin_port directly, which is already network order). Internally the session unifies on **big-endian integers** as the single representation,
+ * consistent with IWAN_WIN_OUTER.sport/dport (the value read by iwan_win_rd16):
+ *   - TX uses iwan_win_wr16 to write bytes back, yielding the correct outer port;
+ *   - the RX gate compares the port read by iwan_win_rd16 directly.
+ * It used to be used as-is as uint16, which equals one byte-order mismatch between the two sides: the RX gate never matches -> everything passes,
+ * outer frames are delivered all the way to the user-mode socket; the port encapsulated on TX is reversed too.
  */
 static USHORT
 iwan_win_abi_port(_In_ USHORT be)
@@ -460,15 +505,15 @@ iwan_win_abi_port(_In_ USHORT be)
 	return iwan_win_rd16((const UINT8 *)&be);
 }
 
-/* v4 地址同理：ABI 里是网络序字节，内部统一成大端整数（iwan_win_outer_hdr4
- * 的参数、WFP 固定字段 IP_LOCAL/REMOTE_ADDRESS 都是这个表示）。 */
+/* Same for v4 addresses: the ABI holds network-order bytes, internally unified to big-endian integers (the
+ * parameters of iwan_win_outer_hdr4 and the WFP fixed fields IP_LOCAL/REMOTE_ADDRESS use this representation). */
 static UINT32
 iwan_win_abi_addr(_In_ UINT32 be)
 {
 	return iwan_win_rd32((const UINT8 *)&be);
 }
 
-/* 参数是否完全一致（用于 SESSION_OPEN 的幂等语义） */
+/* Whether the parameters are exactly identical (used for SESSION_OPEN idempotent semantics) */
 static BOOLEAN
 iwan_win_session_same(_In_ const IWAN_WIN_SESSION *s,
 		      _In_reads_bytes_(in_len) const IWAN_WIN_SESSION_OPEN *req,
@@ -518,9 +563,9 @@ iwan_win_session_open(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	v6 = !iwan_win_is_zero16(req->outer_dst6);
 	overhead = v6 ? IWAN_WIN_OVERHEAD_V6 : IWAN_WIN_OVERHEAD_V4;
 
-	/* MTU：客户端把承载网卡 MTU 一并报上来（Windows 侧没有 netns，驱动
-	 * 不做 FIB 查询），驱动按"内层 + 开销 <= 承载"校验并定出生效值 ——
-	 * 与 Linux 会话建立时的校验同一口径。外层 v6 不分片，所以更要卡死。 */
+	/* MTU: the client reports the carrier NIC MTU along with the request (Windows has no netns, the driver
+	 * does no FIB lookup); the driver validates 'inner + overhead <= carrier' and derives the effective value --
+	 * same criterion as the Linux session setup. Outer v6 is not fragmented, so this must be enforced even harder. */
 	carrier_mtu = req->carrier_mtu;
 	if (carrier_mtu == 0 || carrier_mtu > 65535)
 		return STATUS_INVALID_PARAMETER;
@@ -537,15 +582,15 @@ iwan_win_session_open(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	KeWaitForSingleObject(&ext->ctrl_mutex, Executive, KernelMode, FALSE, NULL);
 
 	if (s->valid && iwan_win_session_same(s, req, in_len)) {
-		/* 幂等：同一份请求重复下发，返回既有会话 */
+		/* Idempotent: the same request sent again returns the existing session */
 		KeReleaseMutex(&ext->ctrl_mutex, FALSE);
 		if (targets != NULL)
 			ExFreePoolWithTag(targets, IWAN_TAG_TARGET);
 		return STATUS_SUCCESS;
 	}
 
-	/* 从这里开始要改会话状态：先把数据面排空，之后直到
-	 * ExReInitializeRundownProtection 之前，数据面会直接返回"不处理"。 */
+	/* From here the session state will be modified: drain the data plane first; until
+	 * ExReInitializeRundownProtection, the data plane returns 'not handled' immediately. */
 	ExWaitForRundownProtectionRelease(&ext->rundown);
 	iwan_win_session_reset(s);
 
@@ -574,11 +619,11 @@ iwan_win_session_open(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	s->flags = req->flags;
 	s->oif_index = req->oif_index;
 	RtlCopyMemory(s->outer_if_guid, req->outer_if_guid, 16);
-	/* 测试旋钮：Parameters\MpPeerMac（REG_BINARY 6 字节）给死下一跳 MAC。
-	 * 存在理由：某些承载（KM-TEST 回环）根本不回 ARP，而有回包的链路又
-	 * 会把报文送出虚拟网卡，二者都无法在没有邻居的情况下跑通数据面；
-	 * 给死 MAC 才能把"数据面本身能跑多快"与"ARP 能不能解析"解耦。
-	 * 生产路径不设这个键时行为完全不变（照常 ARP）。 */
+	/* Test knob: Parameters\MpPeerMac (REG_BINARY 6 bytes) pins the next-hop MAC.
+	 * Rationale: some carriers (KM-TEST loopback) never answer ARP, and links that do reply
+	 * send packets out the virtual NIC instead; neither can run the data plane without a neighbor;
+	 * pinning the MAC decouples 'how fast the data plane itself can go' from 'whether ARP resolves'.
+	 * When this key is not set, the production path behaves exactly the same (normal ARP). */
 	{
 		UINT8 mac[6];
 
@@ -587,6 +632,17 @@ iwan_win_session_open(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 			RtlCopyMemory(s->peer_mac_fixed, mac, 6);
 			s->peer_mac_fixed_valid = 1;
 		}
+	}
+	/* Diagnostic pass-through: Parameters\PassThrough (REG_DWORD, bits IWAN_WIN_PASS_TX / IWAN_WIN_PASS_RX).
+	 * Read at session setup rather than at load so that switching it needs no driver reload (a reload costs a reboot on this
+	 * platform, see the NdisRegisterDeviceEx note). Absent = 0 = normal forwarding, bit-for-bit the old behavior.
+	 * Whatever the previous session left behind is cleared first: a stale 1 must never survive into a new session. */
+	ext->pass_through = 0;
+	{
+		UINT32 pt = 0;
+
+		if (iwan_win_reg_read_dword(L"PassThrough", &pt))
+			ext->pass_through = pt;
 	}
 	s->bind_ip = req->bind_ip;
 	RtlCopyMemory(s->bind_ip6, req->bind_ip6, 16);
@@ -599,10 +655,10 @@ iwan_win_session_open(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	s->targets = targets;
 	s->target_count = tcount;
 
-	KeMemoryBarrier();		/* 字段全部就绪后再置 valid */
+	KeMemoryBarrier();		/* set valid only after all fields are ready */
 	s->valid = 1;
 
-	ExReInitializeRundownProtection(&ext->rundown);	/* 放行数据面 */
+	ExReInitializeRundownProtection(&ext->rundown);	/* allow the data plane in */
 	KeReleaseMutex(&ext->ctrl_mutex, FALSE);
 	return STATUS_SUCCESS;
 }
@@ -610,9 +666,9 @@ iwan_win_session_open(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 NTSTATUS
 iwan_win_session_close(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext)
 {
-	/* 与控制面串行，排空数据面后再撤销用户态映射、释放页与目标集合。
-	 * 共享内存映射由驱动主动撤销（切到属主进程上下文解映射），所以
-	 * 客户端可以在任意时刻关闭，不需要先"放手"那一页。 */
+	/* Serialize with the control plane, drain the data plane, then revoke the user-mode mapping, free the page and target set.
+	 * The shared memory mapping is revoked by the driver itself (switch to the owner process context to unmap), so
+	 * the client can close at any time without 'letting go' of that page first. */
 	iwan_win_session_teardown(ext);
 	return STATUS_SUCCESS;
 }
@@ -623,11 +679,11 @@ iwan_win_session_info(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 {
 	IWAN_WIN_SESSION *s = &ext->sess;
 
-	/* 调用者可能已经持锁（query_shm 就在锁内调本函数）：KMUTEX 可递归，
-	 * 多取一次多放一次即可。不取锁就会与 CLOSE 的
-	 * iwan_win_session_reset → iwan_win_shm_destroy → ExFreePoolWithTag(s->shm)
-	 * 竞态，读到已释放的共享页（shm 是普通非分页池，普通池页仍映射，所以
-	 * 平时不立刻崩，开 Driver Verifier 或特殊池就直接蓝屏）。 */
+	/* The caller may already hold the lock (query_shm calls this inside the lock): KMUTEX is recursive,
+	 * so taking it once more and releasing once more is fine. Without the lock it would race with CLOSE's
+	 * iwan_win_session_reset -> iwan_win_shm_destroy -> ExFreePoolWithTag(s->shm)
+	 * and read a freed shared page (shm is ordinary non-paged pool, ordinary pool pages stay mapped, so
+	 * it usually does not crash immediately, but Driver Verifier or special pool gives a direct BSOD). */
 	KeWaitForSingleObject(&ext->ctrl_mutex, Executive, KernelMode, FALSE, NULL);
 	RtlZeroMemory(info, sizeof(*info));
 	info->abi_version = IWAN_WIN_ABI_VERSION;
@@ -647,7 +703,7 @@ iwan_win_session_info(_Inout_ IWAN_WIN_DEVICE_EXTENSION *ext,
 	info->last_rx_ms = s->shm != NULL ? s->shm->last_rx_ms : 0;
 	info->shm_section_size = s->shm != NULL ? PAGE_SIZE : 0;
 	info->shm_user_va = (UINT64)(ULONG_PTR)s->shm_user_va;
-	info->stats = s->stats;		/* 快照语义：可能落后一个报文，与 Linux 一致 */
+	info->stats = s->stats;		/* snapshot semantics: may lag by one packet, same as Linux */
 	KeReleaseMutex(&ext->ctrl_mutex, FALSE);
 }
 
