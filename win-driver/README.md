@@ -271,3 +271,28 @@ Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\iwan\Parameters'
 仍然**只有外层 v4**：外层 v6 需要承载网卡上的邻居发现（NS/NA），属于下一阶段，
 现在显式拒绝并计 `tx_bad_state`（`IWAN_WIN_DIAG_TX_V6_NOT_IMPL`），不会退化成
 明文。
+
+### 客体实测（2026-11-04，构建 stamp 0x6AEB26B9）
+
+条件：WFP 面，内层目标 `8.8.8.8/32`（走客体以太网卡的路由），对端 `10.0.2.2:45678` 经 QEMU slirp，
+宿主只计外层帧（`tests/win_blast.py sink`），客体单线程发生器、载荷 1200 字节
+（脚本 `tests/win_vm/vm-pass-ab.ps1`）。
+
+| 一轮 | 发生器 | 驱动 `tx_pkts` 增量 | 宿主收到 | `tx_bad_state` 增量 |
+|---|---|---|---|---|
+| `PassThrough=0` | 693,184 包（86.6k pps） | 252,359 | **252,359**（319 Mbps） | 440,825 |
+| `PassThrough=1` | 102,848 包（12.8k pps） | 102,848 | 0 | 0 |
+
+三点结论：
+
+1. **端到端计数是准的**：`PassThrough=0` 一轮里宿主收到的包数恰好等于驱动报的 `tx_pkts`（252,359），
+   说明从封装、注入到对端没有丢包，`tx_pkts`/`tx_bytes` 可以作为「真的上了线」的口径。
+2. **开关确实生效**：`PassThrough=1` 时每个内层包都被计数、但一个都没被封装（宿主 0），
+   在途压力也随之消失（`tx_bad_state` 不再增长）。
+3. **252,359 / 693,184 的差额是承载网的容量，不是驱动的能力**：被接收的那条流是 1264 字节外层帧、
+   319 Mbps，正是标定过的 slirp 单流上限（约 290 Mbps）；其余包撞在在途窗口上
+   （`IWAN_WIN_MAX_INFLIGHT` 1024），计入 `tx_bad_state`。自本次改动起它们不再被重复计成 `tx_err`。
+   要量「封装税」本身，对端不能再受限在 slirp 上 —— 这正是 `iwancnt.sys` 的用途。
+
+注意：`STATS` 是设备级累计值，不是会话级；读数要两次 `IOCTL_IWAN_SESSION_GET` 相减
+（上面两轮就是同一次驱动加载里跑完的）。

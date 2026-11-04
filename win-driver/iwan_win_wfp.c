@@ -677,10 +677,16 @@ iwan_win_classify_out4(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 			 * than ever pass plaintext through. v4 here used to just goto done, and the action was still PERMIT.
 			 * The in-flight window being full (DEVICE_BUSY) was already recorded as
 			 * INFLIGHT, and must not be overwritten as ENCAP_FAIL here. */
-			if (st != STATUS_DEVICE_BUSY)
+			if (st != STATUS_DEVICE_BUSY) {
 				iwan_win_diag_tx(s, IWAN_WIN_DIAG_TX_ENCAP_FAIL,
 						 nblen, tot, pkt[0], pkt);
-			IWAN_STAT_INC(ext, tx_err);
+				/* The in-flight window being full is backpressure, not an encapsulation
+				 * failure: it was already counted as tx_bad_state (and recorded as
+				 * INFLIGHT) by the encapsulation layer, so it must not also be counted
+				 * as tx_err -- that would report one throttled packet as two failures
+				 * and make tx_err useless as "could not be encapsulated". */
+				IWAN_STAT_INC(ext, tx_err);
+			}
 			classifyOut->actionType = FWP_ACTION_BLOCK;
 			classifyOut->flags |= FWPS_CLASSIFY_OUT_FLAG_ABSORB;
 			goto done;
@@ -1368,11 +1374,14 @@ iwan_win_classify_out6(_In_ const FWPS_INCOMING_VALUES *inFixedValues,
 			if (!NT_SUCCESS(st)) {
 				/* The in-flight window being full was already recorded as INFLIGHT in encap_inject,
 				 * and must not be overwritten as ENCAP_FAIL here. */
-				if (st != STATUS_DEVICE_BUSY)
+				if (st != STATUS_DEVICE_BUSY) {
 					iwan_win_diag_tx(s,
 							 IWAN_WIN_DIAG_TX_ENCAP_FAIL,
 							 nblen, tot, pkt[0], pkt);
-				IWAN_STAT_INC(ext, tx_err);
+					/* Same rule as the v4 path: backpressure is counted once, as
+					 * tx_bad_state in the encapsulation layer. */
+					IWAN_STAT_INC(ext, tx_err);
+				}
 				continue;
 			}
 			IWAN_STAT_INC(ext, tx_pkts);
