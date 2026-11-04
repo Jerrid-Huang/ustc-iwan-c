@@ -6,6 +6,7 @@
 #include <string.h>
 
 #ifndef _WIN32
+#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -23,7 +24,7 @@
 #include "util.h"   /* err_printf: the shared stderr printf (replaces the
                      * per-module eprintf this file used to carry) */
 
-/* R37-F3 (R3-M5): variadic printf wrapper (vsnprintf into errmsg) — the
+/* R37-F3 (R3-M5): variadic printf wrapper (vsnprintf into errmsg) -- the
  * message buffer this file hands back to its callers is now format-
  * checked like the shared loggers (errmsg=1, sz=2, fmt=3). On a function
  * *definition* GCC wants the attribute before the declarator. */
@@ -66,7 +67,13 @@ int build_open(buf_t *out, const char *user, const uint8_t ct[16],
     tlv_put(&pl, T_USERNAME, user, (uint8_t)ulen);
     tlv_put(&pl, T_PASSWORD, ct, 16);
     tlv_put(&pl, T_ENCRYPT, &enc, 1);
-    tlv_put(&pl, T_AUTH_VERIFY, nb, sizeof nb);
+    /* T_AUTH_VERIFY (TLV 0x0F) is optional: the production server (measured 2026-11)
+     * replies to an OPEN carrying 0x0F with only a "minimal ACK" (username + nonce echo,
+     * no 0x03/0x04/0x05/0x06, sid=0), issuing no session at all; the official Panabit
+     * client never sends this item. Off by default; when needed, enable it with
+     * IWAN_OPEN_NONCE=1 (a self-hosted server can still echo and verify). */
+    if (env_bool("IWAN_OPEN_NONCE", false))
+        tlv_put(&pl, T_AUTH_VERIFY, nb, sizeof nb);
 
     ctrl_hdr(out, PT_OPEN, enc, 0, 0);
     buf_put(out, pl.data, pl.len);
@@ -114,6 +121,26 @@ static bool ack_tlv(uint8_t typ, const uint8_t *val, uint8_t vlen, void *ud)
         ip_to_string(val, r->dns);
         c->got |= 4u;
         break;
+    /* IPv6 trio (0x0b/0x0c/0x0d): the official client accepts only length byte == 0x12
+     * (2-byte TLV header + 16-byte address); any other length is ignored entirely, and an all-zero address means
+     * "the server did not issue v6", matching the client's "skip all-zero" behavior. */
+    case T_IPV6:
+    case T_DNS6:
+    case T_GATEWAY6: {
+        char *dst = typ == T_IPV6 ? r->tun6
+                 : typ == T_DNS6 ? r->dns6
+                                 : r->gw6;
+        static const uint8_t zero6[16];
+        if (vlen != 16)
+            break;
+        if (memcmp(val, zero6, 16) == 0) {
+            dst[0] = '\0';
+            break;
+        }
+        if (!inet_ntop(AF_INET6, val, dst, 46))
+            dst[0] = '\0';
+        break;
+    }
     case T_MTU:
         if (vlen < 2) {
             c->err = 3;
@@ -173,7 +200,7 @@ static bool parse_ack(const uint8_t *buf, size_t len, uint32_t expect_nonce,
          * an unsigned or truncated reject must fail with "bad sig"
          * instead of rendering attacker-chosen T_ERR_MSG text. The sig
          * key is public, so this only stops accidental/naive forgeries,
-         * not determined attackers — the real server signs its rejects
+         * not determined attackers -- the real server signs its rejects
          * (server.c builds them with ctrl_hdr). len < IWAN_CTRL_LEN was
          * already rejected above. */
         if (!verify_sig(buf, len)) {
@@ -224,10 +251,13 @@ static bool parse_ack(const uint8_t *buf, size_t len, uint32_t expect_nonce,
         free(hex);
         return false;
     }
-    /* ACK is exactly 49-55 bytes on the wire (PROTOCOL.md): header 8 +
-     * sig 16 + TLVs 25-31. Anything larger is malformed rather than an
-     * extension, so cap it before trusting the TLVs. */
-    if (len > IWAN_CTRL_LEN + 31) {
+    /* The ACK TLV area is extensible: this repository's own ACK has 25-31 bytes of TLVs,
+     * while the official Panabit client requires the DNS TLV to be 8 bytes (TLV area +4) and with IPv6
+     * also sends three more TLVs, 0x0b/0x0c/0x0d. The historical limit of 31 was "this repository's own
+     * ACK shape", which judged both classes of legal ACK oversized (measured: interop with the official client
+     * failed with auth failed directly). Relaxed to 200 bytes -- far larger than any known ACK
+     * and still far below the 1500 path MTU; malformed short frames are rejected by the TLV parsing below. */
+    if (len > IWAN_CTRL_LEN + 200) {
         set_err(errmsg, errmsg_sz, "oversized ACK");
         return false;
     }
@@ -238,7 +268,7 @@ static bool parse_ack(const uint8_t *buf, size_t len, uint32_t expect_nonce,
     r->sid = (uint16_t)((buf[2] << 8) | buf[3]);
     r->tok = ((uint32_t)buf[4] << 24) | ((uint32_t)buf[5] << 16) |
              ((uint32_t)buf[6] << 8) | (uint32_t)buf[7];
-    /* M2 (bughunt): degenerate-credential guard — an ACK with a zero
+    /* M2 (bughunt): degenerate-credential guard -- an ACK with a zero
      * session token would reduce blind 2^32 guessing to a 2^16 sid
      * search (tok is the whole data-plane credential); tok==0 alone is
      * degenerate even when sid!=0. Real servers issue random nonzero
@@ -251,6 +281,10 @@ static bool parse_ack(const uint8_t *buf, size_t len, uint32_t expect_nonce,
     memset(r->tun, 0, sizeof r->tun);
     memset(r->gw, 0, sizeof r->gw);
     memset(r->dns, 0, sizeof r->dns);
+    r->unissued = false;   /* the caller's AuthResult is a stack variable, must be cleared explicitly */
+    memset(r->tun6, 0, sizeof r->tun6);
+    memset(r->gw6, 0, sizeof r->gw6);
+    memset(r->dns6, 0, sizeof r->dns6);
     r->mtu = IWAN_DEFAULT_MTU;
     r->enc = 1;   /* default when the ACK omits T_ENCRYPT (R23-F2) */
 
@@ -262,10 +296,101 @@ static bool parse_ack(const uint8_t *buf, size_t len, uint32_t expect_nonce,
         set_err(errmsg, errmsg_sz, "malformed TLVs");
         return false;
     }
+    /* Debug aid: decode and print each ACK TLV entry (IWAN_DEBUG=1). Release builds
+     * compile log_debug out; to see it, switch the build to Debug. */
+    if (debug_enabled()) {
+        const uint8_t *p = buf + IWAN_CTRL_LEN;
+        size_t remain = len - IWAN_CTRL_LEN;
+
+        while (remain >= 2) {
+            uint8_t lt = p[0], ll = p[1];
+            char hex[3 * 32 + 1];
+            size_t vn;
+
+            if (ll < 2 || (size_t)ll > remain)
+                break;
+            vn = (size_t)ll - 2;
+            if (vn > 32) {
+                hex_encode(p + 2, 32, hex);
+                strcpy(hex + 3 * 32, "...");
+            } else {
+                hex_encode(p + 2, vn, hex);
+            }
+            switch (lt) {
+            case T_MTU:
+                log_debug("  TLV 0x03 mtu=%u", (unsigned)((p[2] << 8) | p[3]));
+                break;
+            case T_IP:
+            case T_GATEWAY:
+            case T_DNS: {
+                char a[64] = "";
+                size_t n = 0;
+                while (n + 4 <= vn && n < 8) {
+                    char one[16];
+                    snprintf(one, sizeof one, "%s%u.%u.%u.%u",
+                             n ? "/" : "", p[2 + n], p[3 + n],
+                             p[4 + n], p[5 + n]);
+                    strncat(a, one, sizeof a - strlen(a) - 1);
+                    n += 4;
+                }
+                log_debug("  TLV 0x%02x %s len=%llu", lt,
+                          lt == T_IP ? "tun" :
+                          lt == T_GATEWAY ? "gw" : "dns",
+                          (unsigned long long)vn, a);
+                break;
+            }
+            case T_ENCRYPT:
+                log_debug("  TLV 0x08 enc=%u", vn ? p[2] : 0);
+                break;
+            case T_IPV6:
+            case T_DNS6:
+            case T_GATEWAY6: {
+                char a6[64] = "";
+
+                if (vn == 16)
+                    (void)inet_ntop(AF_INET6, p + 2, a6, sizeof a6);
+                log_debug("  TLV 0x%02x %s len=%llu %s", lt,
+                          lt == T_IPV6 ? "tun6" :
+                          lt == T_DNS6 ? "dns6" : "gw6",
+                          (unsigned long long)vn, a6);
+                break;
+            }
+            default:
+                log_debug("  TLV 0x%02x len=%llu hex=%s", lt,
+                          (unsigned long long)vn, hex);
+                break;
+            }
+            p += ll;
+            remain -= ll;
+        }
+    }
+
     /* R23-F1: the reference server always sends these four; accepting a
      * bare/partial ACK as success would let a forged (header-sig-only)
      * frame report a bogus "auth OK" with no tun/gw/dns/mtu at all. */
-    if ((ctx.got & 0x0F) != 0x0F) {
+    if ((ctx.got & 0x0F) != 0x0F && env_bool("IWAN_ALLOW_MINIMAL_ACK", false)) {
+        /* Minimal-ACK semantics after a server upgrade: both the signature and the nonce echo hold, proving the peer
+         * really received our OPEN and verified the password (a wrong password replies OPEN_REJECT),
+         * but it no longer issues tun/gw/dns/mtu. By default we still hard-fail per the old semantics -- the ACK signing
+         * key is a public constant, so any man-in-the-middle can forge a "bare ACK"; requiring the four TLVs
+         * is the only remaining barrier against forgery; only explicitly enabling the env var relaxes it. */
+        log_err("WARNING: ACK carried no address (got=0x%02x): continuing as minimal ACK "
+                 "(IWAN_ALLOW_MINIMAL_ACK=1)", ctx.got);
+        r->unissued = true;
+    } else if ((ctx.got & 0x0F) != 0x0F) {
+        if (debug_enabled()) {
+            char hex[3 * 128 + 1];
+            size_t tl = len > IWAN_CTRL_LEN ? (size_t)(len - IWAN_CTRL_LEN) : 0;
+            if (tl > 128)
+                tl = 128;
+            hex_encode(buf + IWAN_CTRL_LEN, tl, hex);
+            log_debug("ACK hdr type=0x%02x enc=%u sid=0x%02x%02x tok=%08x "
+                      "got=0x%02x len=%llu: %s",
+                      buf[0], buf[1], buf[2], buf[3],
+                      ((uint32_t)buf[4] << 24) | ((uint32_t)buf[5] << 16) |
+                          ((uint32_t)buf[6] << 8) | (uint32_t)buf[7],
+                      ctx.got, (unsigned long long)len, hex);
+        }
         set_err(errmsg, errmsg_sz, "ACK missing mandatory TLVs");
         return false;
     }
@@ -299,7 +424,7 @@ int udp_connect(const char *host, uint16_t port, int timeout_ms)
     g = getaddrinfo(host, svc, &hints, &res);
     if (g != 0) {
         /* R37-A2: five distinct EAI_* codes used to collapse into a bare
-         * EINVAL, so the caller could only print "auth failed" — an OOM
+         * EINVAL, so the caller could only print "auth failed" -- an OOM
          * (EAI_MEMORY) or a resolver system failure looked exactly like a
          * bad server address. Report the resolver's own text, the same
          * way https.c:725-730 does for its connect diag, and keep errno
@@ -330,7 +455,7 @@ int udp_connect(const char *host, uint16_t port, int timeout_ms)
 
 #ifdef _WIN32
     /* Connected UDP sockets on Windows surface any ICMP unreachable as
-     * WSAECONNRESET on the NEXT recv (the infamous behavior) — a single
+     * WSAECONNRESET on the NEXT recv (the infamous behavior) -- a single
      * stray ICMP (server restart, middlebox, spoofed probe) would then
      * kill the tunnel. Disable it: the protocol has its own
      * keepalive/session-loss detection. */
@@ -347,7 +472,7 @@ int udp_connect(const char *host, uint16_t port, int timeout_ms)
 
     /* large UDP buffers: burst drops on the tunnel path collapse the inner
      * TCP cwnd; default rcvbuf/sndbuf (~208KB) is too small for a VPN.
-     * The kernel may clamp SO_RCVBUF to rmem_max — nonfatal, but note it
+     * The kernel may clamp SO_RCVBUF to rmem_max -- nonfatal, but note it
      * for diagnostics. (No explicit bind needed: connect() binds the
      * local address implicitly.) */
     int bufsz = 16 * 1024 * 1024;
@@ -396,15 +521,16 @@ int get_ct(const char *user, const char *pass, const char *ct_pass_hex,
     return 0;
 }
 
-/* OPEN retry policy: the reference server answers within ~1s, so the 3s
- * recv timeout covers one round trip plus jitter; up to 4 sends spaced
- * ~4s apart (3s recv timeout + 1s sleep) survive a lost or dropped OPEN
- * without flooding the server. A received-but-invalid reply (reject,
- * bad sig, malformed TLVs) is deterministic: the server is up and has
- * answered, so retrying cannot change the outcome — stop early. */
-#define AUTH_TIMEOUT_MS     3000
-#define AUTH_SEND_MAX       4
-#define AUTH_RETRY_DELAY_US 1000000
+/* OPEN retry policy, aligned with the official client's state machine
+ * (docs/sdwan-protocol.md section 6): it re-sends OPEN every 2 s and declares
+ * "AUTH timeout" when 6 s pass without an OPEN_ACK. Three sends spaced 2 s
+ * therefore reproduce that budget (6 s from the first OPEN), still covering
+ * one round trip plus jitter on a slow mobile link. A received-but-invalid
+ * reply (reject, bad sig, malformed TLVs) is deterministic: the server is up
+ * and has answered, so retrying cannot change the outcome -- stop early. */
+#define AUTH_TIMEOUT_MS     2000
+#define AUTH_SEND_MAX       3
+#define AUTH_RETRY_DELAY_US 0
 
 /* M7/R2-B5-1: port_send() returns a byte count and can perform a short
  * write. The old loop only looked for `< 0` and then went straight to
@@ -437,7 +563,7 @@ static int auth_send_open(int fd, const uint8_t *pkt, size_t len) {
         }
         if (w == 0)
             errno = EPIPE;   /* peer closed without taking the frame */
-        /* R37-A1: %llu, never %zu — msvcrt printf (Windows) lacks %zu and
+        /* R37-A1: %llu, never %zu -- msvcrt printf (Windows) lacks %zu and
          * MinGW-w64 rejects it under -Werror=format= (see json.c:55,
          * relay_proxy.c:1328 for the same rule). The two size_t args need
          * the explicit cast because %llu is not size_t on every ABI. */

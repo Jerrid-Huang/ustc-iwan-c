@@ -31,9 +31,9 @@
  * loop keeps pulling while every batch comes back full, so a sustained
  * flood can monopolize the thread and tid==0 never reaches the
  * housekeeping block below the poll (TUN pool tick, dead-TUN probe,
- * session purge — all ~1s contracts). Returning to poll after at most
+ * session purge - all ~1s contracts). Returning to poll after at most
  * this many full batches (512*64 = 32768 datagrams worst case) makes
- * the outer loop — and thereby every 1s housekeeping check — run at
+ * the outer loop - and thereby every 1s housekeeping check - run at
  * least that often; poll's own 100ms timeout keeps the cadence well
  * under the 1s contract even with zero data. No delivery change: a
  * drained-but-still-hot socket simply re-polls immediately (POLLIN
@@ -46,7 +46,7 @@
 /* The shared stop flag comes from util.c (atomic_bool, see util.h): the
  * SIGINT/SIGTERM/SIGHUP handler stores to it (relaxed, lock-free on every
  * supported target), the main loop reads it, and the TUN reader pool
- * receives &g_stop as its abort flag. No private copy — a second flag
+ * receives &g_stop as its abort flag. No private copy - a second flag
  * would let the readers keep running after the loop stopped. */
 static volatile sig_atomic_t g_child_pid = -1; /* root parent: the forked
                                                 * server process */
@@ -56,7 +56,7 @@ static volatile sig_atomic_t g_child_pid = -1; /* root parent: the forked
  * kill <parent-pid>, SIGHUP from a dropped SSH session and systemd
  * KillMode=process all stop the server instead of being swallowed.
  * g_child_pid is sig_atomic_t: written by the main loop after the fork,
- * read from this async-signal context — a wider type would be a C11
+ * read from this async-signal context - a wider type would be a C11
  * data race. */
 static void parent_fwd_signal(int sig)
 {
@@ -87,12 +87,15 @@ struct opts {
     int mask;
     char dns[16];
     char users[256];
+    /* --sr-password: decryption passphrase for source-routed SEGRT(0x28); empty = no decryption */
+    char sr_password[64];
     char nat_if[64];
     char user[64];   /* drop root privileges to this account (A1) */
     bool no_tun;
-    /* --data-plane: v1 只接受 "tun"（占位选项，见 parse_opts 的 'D' 分支）。
-     * 保留成 opts 字段是为了让"值已校验"这件事有一个落点，并让 --help 与
-     * 客户端的三份 CLI 在选项集合上对齐。 */
+    /* --data-plane: v1 accepts only "tun" (placeholder option, see the 'D'
+     * branch in parse_opts). Kept as an opts field so the "value validated"
+     * fact has a landing point and --help stays aligned with the client's
+     * three CLIs on the option set. */
     const char *data_plane;
 };
 
@@ -103,6 +106,7 @@ static const struct option long_opts[] = {
     { "subnet",    required_argument, NULL, 'S' },
     { "dns",       required_argument, NULL, 'd' },
     { "users",     required_argument, NULL, 'u' },
+    { "sr-password", required_argument, NULL, 'P' },
     { "nat-if",    required_argument, NULL, 'n' },
     { "no-tun",    no_argument,       NULL, 'T' },
     { "user",      required_argument, NULL, 'U' },
@@ -126,6 +130,7 @@ static void usage(const char *prog, FILE *out)
     fprintf(out, "  -S, --subnet <IP/MASK> client subnet, mask 8-30 (default 198.18.0.0/16)\n");
     fprintf(out, "  -d, --dns <IP>         DNS server advertised to clients (default 114.114.114.114)\n");
     fprintf(out, "  -u, --users <FILE>     users file, one user:pass per line (default /etc/iwan/users.txt)\n");
+    fprintf(out, "  -P, --sr-password <PW> password for encrypted SEGRT(0x28) source-route payloads\n");
     fprintf(out, "  -n, --nat-if <IF>      outbound interface for MASQUERADE (default eth0)\n");
     fprintf(out, "  -T, --no-tun           (testing) skip TUN device\n");
     fprintf(out, "      --user <NAME>      drop root privileges to this user after setup (default nobody)\n");
@@ -234,7 +239,7 @@ static void parse_opts(int argc, char **argv, struct opts *o)
             snprintf(o->tun, sizeof o->tun, "%s", optarg);
             break;
         case 's':
-            /* M4: same guard as -t — a legal IPv4 dotted quad is at most
+            /* M4: same guard as -t - a legal IPv4 dotted quad is at most
              * 15 chars (exactly fills the 16-byte buffer incl. NUL), so
              * anything >= sizeof is an invalid address that snprintf would
              * silently truncate and s2ip4 afterwards would happily accept
@@ -248,14 +253,15 @@ static void parse_opts(int argc, char **argv, struct opts *o)
             /* R38-C4-2, same family as the -s/-d/-t/-u guards: the longest
              * legal subnet is "255.255.255.255/30" (18 chars), so anything
              * that does not fit 'o->subnet' is invalid input that snprintf
-             * would silently TRUNCATE — and the truncated form could then be
+             * would silently TRUNCATE - and the truncated form could then be
              * ACCEPTED by parse_subnet() when the cut landed on a valid
              * prefix. The guard turns "silently accepted garbage" into a
              * usage error, matching every sibling option above. */
             if (strlen(optarg) >= sizeof o->subnet)
                 usage_error(argv[0],
-                            "error: subnet too long: '%s' (max %zu)",
-                            optarg, sizeof o->subnet - 1);
+                            "error: subnet too long: '%s' (max %llu)",
+                            optarg,
+                            (unsigned long long)(sizeof o->subnet - 1));
             snprintf(o->subnet, sizeof o->subnet, "%s", optarg);
             break;
         case 'd':
@@ -266,62 +272,75 @@ static void parse_opts(int argc, char **argv, struct opts *o)
             snprintf(o->dns, sizeof o->dns, "%s", optarg);
             break;
         case 'u':
-            /* M5: same over-length guard as -t — a too-long path would be
+            /* M5: same over-length guard as -t - a too-long path would be
              * silently truncated and open the wrong users file */
             if (strlen(optarg) >= sizeof o->users)
                 usage_error(argv[0],
-                            "error: users file path too long (max %zu)",
-                            sizeof o->users - 1);
+                            "error: users file path too long (max %llu)",
+                            (unsigned long long)(sizeof o->users - 1));
             snprintf(o->users, sizeof o->users, "%s", optarg);
             break;
         case 'n':
-            /* M5: same over-length guard as -t — a truncated interface name
+            /* M5: same over-length guard as -t - a truncated interface name
              * would target the wrong NIC in iptables MASQUERADE */
             if (strlen(optarg) >= sizeof o->nat_if)
                 usage_error(argv[0],
-                            "error: NAT interface name too long (max %zu)",
-                            sizeof o->nat_if - 1);
+                            "error: NAT interface name too long (max %llu)",
+                            (unsigned long long)(sizeof o->nat_if - 1));
             snprintf(o->nat_if, sizeof o->nat_if, "%s", optarg);
+            break;
+        case 'P':
+            if (strlen(optarg) >= sizeof o->sr_password)
+                usage_error(argv[0],
+                            "error: --sr-password too long (max %llu)",
+                            (unsigned long long)(sizeof o->sr_password - 1));
+            snprintf(o->sr_password, sizeof o->sr_password, "%s", optarg);
             break;
         case 'T':
             o->no_tun = true;
             break;
         case 'D':
-            /* --data-plane 占位：只接受 tun（当前唯一实现，且是默认）。
+            /* --data-plane placeholder: only "tun" is accepted (currently the
+             * only implementation, and the default).
              *
-             * 为什么服务端不支持 kernel（v1 ABI 的限制，不是没时间做）：
-             *   1. 内核模块的控制面是"每 netns 一份会话"、设备名固定 iwan0
-             *      （CONTROL-PLANE.md §2/§10），而服务端要在同一个 netns 里
-             *      同时服务最多 256 个客户端会话；
-             *   2. 服务端的状态机整个在 handle_udp() 里（OPEN 验签、会话表、
-             *      PT_* 分发、内层包写 TUN），没有"每会话一个内核数据面"这种
-             *      可以下移的切分点；
-             *   3. 真要支持得先有 v2 ABI：一个 netns 多会话 + DEVNAME 入参 +
-             *      按会话分流，属于模块侧的设计变更。
-             * 显式传 kernel 按用法错误处理（exit 2），不静默忽略。 */
+             * Why the server does not support kernel (a v1 ABI limitation,
+             * not a lack of time):
+             *   1. The kernel module's control plane is "one session per
+             *      netns" with a fixed device name iwan0 (CONTROL-PLANE.md
+             *      sections 2/10), while the server must serve up to 256
+             *      client sessions in the same netns;
+             *   2. The server state machine lives entirely in handle_udp()
+             *      (OPEN verification, session table, PT_* dispatch, inner
+             *      packet writes to TUN); there is no "one kernel data plane
+             *      per session" split point to move down;
+             *   3. Real support needs a v2 ABI first: multiple sessions per
+             *      netns + DEVNAME argument + per-session demux, which is a
+             *      module-side design change.
+             * Explicit kernel is treated as a usage error (exit 2), never
+             * silently ignored. */
             if (strcmp(optarg, "tun") == 0) {
                 o->data_plane = "tun";
                 break;
             }
             if (strcmp(optarg, "kernel") == 0)
                 usage_error(argv[0],
-                            "error: --data-plane kernel 不被 v1 ABI 支持："
-                            "内核模块是“每 netns 单会话”（设备固定 iwan0），"
-                            "而服务端要同时服务最多 256 个客户端会话；"
-                            "且服务端状态机全部在 handle_udp() 里，"
-                            "没有可下移的每会话数据面。"
-                            "服务端请用默认的 --data-plane tun");
+                            "error: --data-plane kernel is not supported by the v1 ABI: "
+                            "the kernel module is \"one session per netns\" (device fixed to iwan0), "
+                            "while the server must serve up to 256 client sessions; "
+                            "and the server state machine is all in handle_udp(), "
+                            "so there is no per-session data plane to move down. "
+                            "Use the default --data-plane tun on the server");
             usage_error(argv[0],
                         "error: invalid --data-plane '%s' (expected 'tun'; "
                         "'kernel' is rejected by the v1 ABI)", optarg);
             break;
         case 'U':
-            /* M5: same over-length guard as -t — a truncated account name
+            /* M5: same over-length guard as -t - a truncated account name
              * would fail the getpwnam exact match and open the wrong user */
             if (strlen(optarg) >= sizeof o->user)
                 usage_error(argv[0],
-                            "error: user name too long (max %zu)",
-                            sizeof o->user - 1);
+                            "error: user name too long (max %llu)",
+                            (unsigned long long)(sizeof o->user - 1));
             snprintf(o->user, sizeof o->user, "%s", optarg);
             break;
         case 'h':
@@ -471,7 +490,7 @@ static char fwd_subnet_saved[64]; /* subnet of the FORWARD ACCEPT we added:
                                    * kept separate from nat_subnet_saved so
                                    * cleanup removes exactly this rule even
                                    * when the MASQUERADE rule pre-existed
-                                   * (M2 — see setup_nat) */
+                                   * (M2 - see setup_nat) */
 
 static void enable_ip_forward(void)
 {
@@ -563,9 +582,10 @@ static void setup_nat(const char *subnet, const char *nat_if)
                 "warning: iptables MASQUERADE failed (need root and iptables?)\n");
     }
 
-    /* FORWARD 放行:host 防火墙(Tailscale/UFW 等)可能 DROP 转发流量,
-     * 隧道内 DNS 查询和出网数据都要穿过 FORWARD 链;放行隧道子网的
-     * 转发,退出时删除(与 MASQUERADE 同生命周期)。 */
+    /* FORWARD accept: a host firewall (Tailscale/UFW etc.) may DROP forwarded
+     * traffic, and DNS queries inside the tunnel plus outbound data all cross
+     * the FORWARD chain; accept forwarding for the tunnel subnet and remove it
+     * on exit (same lifetime as MASQUERADE). */
     if (subnet[0] != '\0') {
         char *fchk[] = { "iptables", "-C", "FORWARD", "-s", (char *)subnet,
                          "-j", "ACCEPT", NULL };
@@ -577,7 +597,7 @@ static void setup_nat(const char *subnet, const char *nat_if)
             /* M2: remember THIS FORWARD rule's own subnet.  nat_subnet_saved
              * is only written when we also added the MASQUERADE rule; when
              * that rule pre-existed (nat_subnet_saved == "") we still added
-             * the FORWARD ACCEPT and cleanup must remove exactly it — using
+             * the FORWARD ACCEPT and cleanup must remove exactly it - using
              * nat_subnet_saved there would `iptables -D FORWARD -s ""` (fails)
              * and leak the rule forever. */
             snprintf(fwd_subnet_saved, sizeof fwd_subnet_saved, "%s", subnet);
@@ -622,7 +642,7 @@ static void server_cleanup_nat(void)
 
     if (fwd_rule_added) {
         /* M2: delete with fwd_subnet_saved (the subnet we actually added),
-         * never nat_subnet_saved — see setup_nat. */
+         * never nat_subnet_saved - see setup_nat. */
         char *fdel[] = { "iptables", "-D", "FORWARD", "-s",
                          fwd_subnet_saved, "-j", "ACCEPT", NULL };
         if (run_cmd(fdel) != 0)
@@ -631,7 +651,7 @@ static void server_cleanup_nat(void)
 }
 
 /* shared tun_pool glue: downlink reader callback (one per queue) */
-/* A1: downlink sendmmsg batch — each queue gets its own batch state;
+/* A1: downlink sendmmsg batch - each queue gets its own batch state;
  * packets are staged (hdr + payload COPY, the reader's TLS buffer is
  * reused for the next read) and flushed with ONE sendmmsg on the
  * reader's flush signal or when the batch fills. Sparse traffic adds no
@@ -644,16 +664,17 @@ static void server_cleanup_nat(void)
 struct srv_dl_batch {
     uint8_t hdrs[SRV_DL_BATCH][IWAN_HDR_LEN];
     uint8_t pl[SRV_DL_BATCH][SRV_DL_SLOT];
-    /* 目的地可能是 v4 也可能是 v6：每个槽存 sockaddr_storage（容量取两族
-     * 最大）+ 实际长度，msg_namelen 必须按族给准（v4 16 / v6 28）。 */
+    /* Destinations may be v4 or v6: each slot stores sockaddr_storage (sized for
+     * the larger family) + the actual length; msg_namelen must be exact per
+     * family (v4 16 / v6 28). */
     struct sockaddr_storage peers[SRV_DL_BATCH];
     socklen_t peerlens[SRV_DL_BATCH];
     struct iovec iovs[SRV_DL_BATCH * 2];
     struct mmsghdr msgs[SRV_DL_BATCH];
     int n;
-    int fd;              /* 本批目的族对应的发送 socket（n > 0 时有效） */
-    sa_family_t fam;     /* 本批所有目的地的族；混族先 flush 再装（一个 fd
-                          * 只能发一个族） */
+    int fd;              /* send socket for this batch's family (valid when n > 0) */
+    sa_family_t fam;     /* family of all destinations in this batch; a mixed
+                          * batch flushes first (one fd sends one family only) */
     uint64_t last_hard_err;   /* R56-102: rate-limiter for hard-error logs */
 };
 
@@ -661,14 +682,15 @@ struct srv_pool_ud {
     struct server_ctx *ctx;
     const int *udp_fds;    /* A2: per-reader send socket (qid % nfds) */
     int nfds;
-    const int *udp_fds6;   /* 外层 v6 那套（nfds6 == 0 = 宿主无 IPv6） */
+    const int *udp_fds6;   /* outer v6 counterpart (nfds6 == 0 = host has no IPv6) */
     int nfds6;
     struct srv_dl_batch b[TUN_POOL_MAX];  /* one batch state per queue */
 };
 
-/* 目的 peer 的族选发送 socket：v4 与加 v6 之前逐位一致（同一个
- * udp_fds[qid % nfds]），v6 走第二套。返回 -1 = 该族在宿主上不可用
- * （nfds6 == 0），调用方按发送失败计一次 drop。 */
+/* Pick the send socket by destination peer family: v4 is bit-identical to
+ * before v6 support (same udp_fds[qid % nfds]), v6 uses the second set.
+ * Returns -1 = that family is unavailable on this host (nfds6 == 0); the
+ * caller counts one drop as a send failure. */
 static int srv_dl_fd_for(const struct srv_pool_ud *pu,
                          const struct iwan_peer *p, int qid)
 {
@@ -682,7 +704,7 @@ static int srv_dl_fd_for(const struct srv_pool_ud *pu,
 
 /* flush the batch with one sendmmsg. On EAGAIN the unsent remainder is
  * RETAINED at the front of the batch for the next flush (backpressure,
- * not loss — dropping up to SRV_DL_BATCH packets at once on a single
+ * not loss - dropping up to SRV_DL_BATCH packets at once on a single
  * congestion event amplified every client's RTO simultaneously, R28-C1).
  * The reader retries on its next TUN read; a permanently-full peer
  * simply backpressures (bounded at SRV_DL_BATCH, see the guard in
@@ -719,8 +741,8 @@ static void srv_dl_flush(struct srv_dl_batch *b, int fd)
             continue;   /* interrupted by a signal: retry, nothing consumed */
         if (r == 0 || errno == EAGAIN || errno == EWOULDBLOCK)
             break;   /* r==0 is not a real UDP outcome; EAGAIN is the
-                      * designed backpressure — retain the rest below */
-        /* R56-102: persistent hard error — drop the batch + rate-limited
+                      * designed backpressure - retain the rest below */
+        /* R56-102: persistent hard error - drop the batch + rate-limited
          * log (see the function comment for the errno rationale). The
          * timestamp lives in the batch (per-queue) so the multiple TUN
          * reader threads never share a cache line / race on a static. */
@@ -729,11 +751,11 @@ static void srv_dl_flush(struct srv_dl_batch *b, int fd)
             if (nowm - b->last_hard_err >= 1000) {
                 b->last_hard_err = nowm;
                 log_err("downlink sendmmsg: %s (%d); dropping %d-frame "
-                        "batch (UDP loss — TCP RTO recovers)",
+                        "batch (UDP loss - TCP RTO recovers)",
                         strerror(errno), errno, n - sent);
             }
             /* R57-001: count the actually-dropped remainder in the PROF
-             * send-drop counter — without it, hard-error loss (unlike the
+             * send-drop counter - without it, hard-error loss (unlike the
              * stage-guard drops in srv_tun_pkt) was invisible in the
              * profiler. n-sent frames were never handed to the kernel. */
             server_add_send_drops((unsigned)(n - sent));
@@ -749,7 +771,7 @@ static void srv_dl_flush(struct srv_dl_batch *b, int fd)
      * re-pointed after the sub-array memmoves (hdrs/pl/peers moved too).
      * msg_name/msg_namelen are re-pointed as well: the moved msgs[] array
      * still references the OLD b->peers[] cell addresses, and since the UDP
-     * fds are unconnected, msg_name is authoritative for delivery — keeping
+     * fds are unconnected, msg_name is authoritative for delivery - keeping
      * it stale would send the retained downlink to the WRONG client once the
      * next srv_tun_pkt re-staging overwrites those old cells. */
     {
@@ -774,7 +796,7 @@ static void srv_dl_flush(struct srv_dl_batch *b, int fd)
             b->iovs[i * 2 + 1].iov_len = plen;
             b->msgs[i].msg_hdr.msg_iov = &b->iovs[i * 2];
             b->msgs[i].msg_hdr.msg_name = &b->peers[i];
-            /* 长度必须跟着槽一起搬：v4 16 / v6 28，不能一律用 sizeof */
+            /* the length must move with the slot: v4 16 / v6 28, never a blanket sizeof */
             b->msgs[i].msg_hdr.msg_namelen = b->peerlens[i];
         }
         b->n = kept;
@@ -802,26 +824,30 @@ static void srv_tun_pkt(void *ud, uint8_t *pkt, size_t len, bool last)
          * staged batch is sent before this direct-send (R58-I-02: if the
          * flush retains a remainder on EAGAIN backpressure, this
          * direct-sent datagram may still overtake those retained frames
-         * for the same peer — harmless: each frame is an independent UDP
+         * for the same peer - harmless: each frame is an independent UDP
          * datagram carrying one inner TCP segment, which reassembles
          * out of order and RTO-recovers pure loss) */
         srv_dl_flush(b, b->fd);
-        /* 直发的 socket 仍按 v4 队列号给（与改动前同一个 fd）；目的 peer
-         * 是 v6 时 handle_tun_downlink 内部会换成 ctx->dl_fd6 */
+        /* The direct-send socket is still chosen by v4 queue number (same fd
+         * as before); for a v6 destination, handle_tun_downlink swaps in
+         * ctx->dl_fd6 internally. */
         handle_tun_downlink(pu->ctx, pkt, len, pu->udp_fds[qid % pu->nfds]);
     } else if (tun_prep_downlink(pu->ctx, pkt, len, &snap, hdr)) {
         int sfd = srv_dl_fd_for(pu, &snap.peer, qid);
 
         if (sfd < 0) {
-            /* 宿主没有该族的套接字（无 IPv6）：按发送失败丢弃 */
+            /* No socket for that family on this host (no IPv6): drop as a send failure */
             server_add_send_drops(1);
         } else {
-            /* 一个 sendmmsg 只用一个 fd、只能发一个族：批内出现另一族时先
-             * 把已装的 flush 掉。若这次 flush 因 EAGAIN 仍留有残留
-             * （b->n > 0），就绝不能再把本帧装进去 —— 混族批会让下一次
-             * sendmmsg 对整批（含残留）报 EINVAL/EAFNOSUPPORT，损失远大于
-             * 丢这一帧；按背压丢本帧，内层 TCP 由 RTO 恢复。
-             * 纯 v4 流量下 fam 恒为 AF_INET，这个分支不进入，路径不变。 */
+            /* One sendmmsg uses one fd and can send one family only: when
+             * another family appears in the batch, flush the staged entries
+             * first. If that flush retains a remainder on EAGAIN (b->n > 0),
+             * this frame must never be staged: a mixed-family batch makes the
+             * next sendmmsg fail EINVAL/EAFNOSUPPORT for the whole batch
+             * (remainder included), a far bigger loss than dropping this one
+             * frame; drop it under backpressure, inner TCP recovers via RTO.
+             * With pure v4 traffic fam is always AF_INET, this branch is not
+             * entered and the path is unchanged. */
             bool may_stage = true;
             if (b->n > 0 && b->fam != snap.peer.family) {
                 srv_dl_flush(b, b->fd);
@@ -831,7 +857,7 @@ static void srv_tun_pkt(void *ud, uint8_t *pkt, size_t len, bool last)
                 server_add_send_drops(1);
             } else if (b->n >= SRV_DL_BATCH) {
                 /* R28-C1: the send buffer is full and the retained batch is at
-                 * capacity (the flush could not drain it) — drop just this one
+                 * capacity (the flush could not drain it) - drop just this one
                  * packet rather than overflow the batch arrays. */
                 server_add_send_drops(1);
             } else {
@@ -874,10 +900,10 @@ static void srv_tun_pkt(void *ud, uint8_t *pkt, size_t len, bool last)
  * next queue owner and be sent late/out-of-order to the dead session.
  * Registered through tun_pool_set_exit_cb: tun.c runs it on the exiting
  * reader thread itself, strictly AFTER the final flush signal (tun.c gives
- * the retained frames one last best-effort send — if that still hits
+ * the retained frames one last best-effort send - if that still hits
  * EAGAIN they drop under the documented "unsent data recovers by TCP RTO"
  * contract), and tun_pool_del / tun_pool_destroy pthread_join that thread
- * before the slot is ever handed to a new reader — so this reset races
+ * before the slot is ever handed to a new reader - so this reset races
  * nothing (the batch's only writer is gone, no in-flight flush). Only
  * b->n needs resetting: the next srv_tun_pkt stages from index 0 and
  * re-points iovs/msgs/peers as it goes, so the stale hdrs/pl/peers cells
@@ -898,12 +924,12 @@ static int setup_tun(const char *name, const char *server_ip, int mask)
     char addr[64];
 
     /* No pre-delete: our TUN devices are non-persistent (open_tun never
-     * sets TUNSETPERSIST), so the kernel removes them when we exit —
+     * sets TUNSETPERSIST), so the kernel removes them when we exit -
      * including on a crash. This is the MAIN-device creation, so open_tun
      * sets IFF_TUN_EXCL: if `name` is already in use (any interface type,
      * including a tun owned by another process), TUNSETIFF fails EBUSY
-     * and startup aborts instead of silently attaching to — and then
-     * flushing the addresses of — a device we do not own. (The extra
+     * and startup aborts instead of silently attaching to - and then
+     * flushing the addresses of - a device we do not own. (The extra
      * queue fds opened later via tun_attach_many deliberately skip EXCL;
      * they attach to the device created here.) main() already validated
      * the name shape (tun_name_valid). */
@@ -917,8 +943,9 @@ static int setup_tun(const char *name, const char *server_ip, int mask)
     set_nonblock(fd);
     (void)ip_run((char *[]){"addr", "flush", "dev", (char *)name, NULL});
     (void)ip_run((char *[]){"link", "set", (char *)name, "up", NULL});
-    /* 内层 MTU 必须与协商值一致：默认 1500 时这是 no-op；度量档
-     * （IWAN_JUMBO_MTU）下不设，服务端把内层包写进 TUN 会 EMSGSIZE。 */
+    /* Inner MTU must match the negotiated value: a no-op at the default 1500;
+     * in jumbo mode (IWAN_JUMBO_MTU) not setting it makes the server's writes
+     * to the TUN fail with EMSGSIZE. */
     {
         char mtu_s[16];
         snprintf(mtu_s, sizeof mtu_s, "%d", IWAN_DEFAULT_MTU);
@@ -984,7 +1011,7 @@ static int setup_udp(uint16_t port, int *fds, int n)
          * bypasses the net.core.rmem_max cap: a plain SO_RCVBUF request
          * is clamped to rmem_max (4MB here), and with the TUN write
          * occasionally stalling the recv thread the 4MB queue overflows
-         * — measured 340k packets/s dropped at the kernel (UdpRcvbuf-
+         * - measured 340k packets/s dropped at the kernel (UdpRcvbuf-
          * Errors), ~53% of arrivals, collapsing the inner TCP into an
          * RTO storm. Non-root deployments fall back to SO_RCVBUF. */
         if (setsockopt(fd, SOL_SOCKET, SO_RCVBUFFORCE, &sz, sizeof sz) != 0)
@@ -995,7 +1022,7 @@ static int setup_udp(uint16_t port, int *fds, int n)
              * with the default (212KB) the session buffer is far smaller
              * than the clients' aggregate in-flight window, so a burst
              * overflows it and the kernel drops UDP silently
-             * (UdpRcvbufErrors) — the inner TCP then collapses into an
+             * (UdpRcvbufErrors) - the inner TCP then collapses into an
              * RTO storm. SO_RCVBUFFORCE (root, before the fork drops
              * privileges) bypasses the cap; the getsockopt below always
              * prints what actually took effect so a capped buffer is
@@ -1033,14 +1060,16 @@ static int setup_udp(uint16_t port, int *fds, int n)
     return n;
 }
 
-/* 外层 IPv6：与 setup_udp 完全平行的一套 AF_INET6 套接字（同端口、
- * in6addr_any、同样 n 个 SO_REUSEPORT 扇出）。调用序列与 v4 那套一致，
- * 唯一多出来的是 IPV6_V6ONLY=1 —— 硬要求：否则 v4-mapped 流量会从 v6 套接
- * 字漏进来，同一个客户端在会话绑定与限速键上出现两种外层表示（限速键还会
- * 被 ::ffff:a.b.c.d 与 a.b.c.d 分成两份）。
+/* Outer IPv6: an AF_INET6 socket set fully parallel to setup_udp (same port,
+ * in6addr_any, same n SO_REUSEPORT fan-out). The call sequence matches the v4
+ * one; the only addition is IPV6_V6ONLY=1 - a hard requirement: otherwise
+ * v4-mapped traffic leaks in through the v6 socket and the same client gets
+ * two outer representations for session binding and rate-limit keys (the
+ * rate-limit key would also split into ::ffff:a.b.c.d and a.b.c.d).
  *
- * 宿主没有 IPv6（socket/bind/V6ONLY 任何一个失败）时只打一行说明并返回 0：
- * 服务端照常用 v4 起来，绝不失败退出。返回实际创建数（== n 或 0）。 */
+ * When the host has no IPv6 (socket/bind/V6ONLY fails), print one line and
+ * return 0: the server still comes up on v4 and never exits with failure.
+ * Returns the number actually created (== n or 0). */
 static int setup_udp6(uint16_t port, int *fds, int n)
 {
     int one = 1, sz = 16 * 1024 * 1024;
@@ -1050,15 +1079,16 @@ static int setup_udp6(uint16_t port, int *fds, int n)
         int fd = socket(AF_INET6, SOCK_DGRAM, 0);
 
         if (fd < 0) {
-            fprintf(stderr, "warning: IPv6 不可用（%s）；只用 IPv4 监听\n",
+            fprintf(stderr, "warning: IPv6 unavailable (%s); listening on IPv4 only\n",
                     strerror(errno));
             return 0;
         }
         if (setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof one) != 0) {
-            /* 设不上 V6ONLY 就不能安全地收 v6：v4-mapped 会渗进来，语义
-             * 不明的流量宁可整族不要，也不破坏 v4 的既有口径。 */
-            fprintf(stderr, "warning: 无法设置 IPV6_V6ONLY（%s）；"
-                    "只用 IPv4 监听\n", strerror(errno));
+            /* Without V6ONLY we cannot safely receive v6: v4-mapped traffic
+             * leaks in, so the whole family is dropped rather than change the
+             * existing v4 behavior for ambiguous traffic. */
+            fprintf(stderr, "warning: cannot set IPV6_V6ONLY (%s); "
+                    "listening on IPv4 only\n", strerror(errno));
             close(fd);
             for (int j = 0; j < i; j++)
                 close(fds[j]);
@@ -1066,9 +1096,10 @@ static int setup_udp6(uint16_t port, int *fds, int n)
         }
         setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one);
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-        /* 与 v4 同样的收/发缓冲设置（root 阶段调用，SO_RCVBUFFORCE 能绕过
-         * net.core.rmem_max；非 root 回退 SO_RCVBUF）。这里不重复打印
-         * "udp rcvbuf" 行，v4 的启动日志保持逐字节不变。 */
+        /* Same receive/send buffer setup as v4 (called during the root phase,
+         * where SO_RCVBUFFORCE can bypass net.core.rmem_max; non-root falls
+         * back to SO_RCVBUF). Do not print the "udp rcvbuf" line again: the
+         * v4 startup log must stay byte-for-byte unchanged. */
         if (setsockopt(fd, SOL_SOCKET, SO_RCVBUFFORCE, &sz, sizeof sz) != 0)
             setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof sz);
         setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof sz);
@@ -1079,8 +1110,8 @@ static int setup_udp6(uint16_t port, int *fds, int n)
         addr.sin6_addr = in6addr_any;
         addr.sin6_port = htons(port);
         if (bind(fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
-            fprintf(stderr, "warning: IPv6 UDP 端口 %u 绑定失败（%s）；"
-                    "只用 IPv4 监听\n", (unsigned)port, strerror(errno));
+            fprintf(stderr, "warning: IPv6 UDP port %u bind failed (%s); "
+                    "listening on IPv4 only\n", (unsigned)port, strerror(errno));
             close(fd);
             for (int j = 0; j < i; j++)
                 close(fds[j]);
@@ -1092,10 +1123,11 @@ static int setup_udp6(uint16_t port, int *fds, int n)
 }
 
 /* wire the recvmmsg batch: one 64KiB iovec per slot plus peer storage.
- * cap 是该套接字的地址缓冲容量（v4 16 / v6 28），也是初始 msg_namelen：
- * recvmmsg 每轮把 msg_namelen 改写成实际地址长度，v4/v6 两套套接字共用
- * 同一组 msgs[] 时必须在调用前复位（见 recv_drain_socket），否则 v6 的
- * 28 字节地址会被内核按 16 字节截断。 */
+ * cap is the address buffer capacity of this socket (v4 16 / v6 28), and the
+ * initial msg_namelen: recvmmsg rewrites msg_namelen to the actual address
+ * length each round, so when the v4/v6 socket sets share the same msgs[] it
+ * must be reset before the call (see recv_drain_socket), otherwise the
+ * kernel truncates the 28-byte v6 address to 16 bytes. */
 static void setup_rx_batch(uint8_t *udp_buf, struct iovec *udp_iov,
                            struct mmsghdr *msgs,
                            struct sockaddr_storage *peers, socklen_t cap)
@@ -1122,8 +1154,8 @@ struct recv_thr_arg {
     struct server_ctx *ctx;
     const struct server_user *users;
     int nusers;
-    int fd;                  /* 外层 v4 SO_REUSEPORT socket（thread 私有槽） */
-    int fd6;                 /* 外层 v6 那套的对应 socket；-1 = 宿主无 IPv6 */
+    int fd;                  /* outer v4 SO_REUSEPORT socket (thread-private slot) */
+    int fd6;                 /* matching socket of the outer v6 set; -1 = host has no IPv6 */
     unsigned tid;
     _Atomic int *poll_err;   /* M3-6: shared fatal-poll flag (all
                               * threads OR into it; main aggregates) */
@@ -1133,9 +1165,10 @@ struct recv_thr_arg {
                               * in --no-tun mode (never probed there). */
 };
 
-/* 一套套接字上的收包：POLLERR 的错误队列排空 + recvmmsg(64) 批处理 ->
- * handle_udp。v4 与 v6 两套套接字各调用一次，逻辑与只有 v4 时完全一致
- * （fd 只影响回包 socket、诊断日志与下面的地址容量复位）。 */
+/* Receive on one socket set: drain the POLLERR error queue + recvmmsg(64)
+ * batching -> handle_udp. Called once per v4 and v6 socket set; the logic is
+ * identical to the v4-only case (fd only affects the reply socket, diagnostic
+ * logging and the address-capacity reset below). */
 static void recv_drain_socket(struct recv_thr_arg *a, int fd, short revents,
                               struct mmsghdr *msgs,
                               struct sockaddr_storage *peers, socklen_t cap)
@@ -1146,7 +1179,7 @@ static void recv_drain_socket(struct recv_thr_arg *a, int fd, short revents,
          * asserted on a UDP socket. Plain recv/recvmmsg does NOT
          * consume the error queue, so without this the poll loop
          * busy-spins at 100% CPU and the socket stops delivering
-         * data — measured: one of four REUSEPORT recv threads
+         * data - measured: one of four REUSEPORT recv threads
          * wedged this way and every packet hashed to its socket
          * (including the client's OPEN) was silently lost. Drain
          * sk_error_queue via MSG_ERRQUEUE until empty. */
@@ -1162,15 +1195,17 @@ static void recv_drain_socket(struct recv_thr_arg *a, int fd, short revents,
     if (revents & (POLLIN | POLLERR)) {
         /* recvmmsg batch (64): drains up to 64 datagrams per syscall,
          * amortizing the per-packet recvfrom overhead that used to
-         * be the loop's throughput ceiling — a full poll burst is
+         * be the loop's throughput ceiling - a full poll burst is
          * consumed in one syscall round */
         int last_v = 1;
         int full_iters = 0; /* consecutive FULL batches this drain */
         for (;;) {
-            /* 复位地址容量：recvmmsg 把 msg_namelen 改写成实际地址长度
-             * （v4 16 / v6 28），两套套接字共用同一组 msgs[] 时必须在下一次
-             * 调用前恢复容量，否则 v6 的 28 字节源地址会被内核按 16 字节
-             * 截断（iwan_peer_from_sockaddr 会因长度不符丢掉该报文）。 */
+            /* Reset address capacity: recvmmsg rewrites msg_namelen to the
+             * actual address length (v4 16 / v6 28); when both socket sets
+             * share the same msgs[] the capacity must be restored before the
+             * next call, otherwise the kernel truncates v6's 28-byte source
+             * address to 16 bytes (iwan_peer_from_sockaddr then drops the
+             * packet on the length mismatch). */
             if (msgs[0].msg_hdr.msg_namelen != cap) {
                 for (int i = 0; i < UDP_RXBATCH; i++)
                     msgs[i].msg_hdr.msg_namelen = cap;
@@ -1186,12 +1221,12 @@ static void recv_drain_socket(struct recv_thr_arg *a, int fd, short revents,
                     if (msgs[i].msg_len <= 0)
                         continue;
                     PROF_ADD(g_prof_srv_recv, (size_t)msgs[i].msg_len);
-                    /* 接收侧唯一的规范化点：sockaddr -> iwan_peer
-                     * （v4-mapped 归一为 AF_INET） */
+                    /* The receive side's only normalization point: sockaddr
+                     * -> iwan_peer (v4-mapped normalized to AF_INET) */
                     if (!iwan_peer_from_sockaddr(&peer,
                             (const struct sockaddr *)&peers[i],
                             msgs[i].msg_hdr.msg_namelen))
-                        continue;   /* 未知族/地址被截断：丢弃 */
+                        continue;   /* unknown family / truncated address: drop */
                     handle_udp(a->ctx, a->users, a->nusers,
                                (const uint8_t *)msgs[i].msg_hdr.msg_iov[0]
                                    .iov_base,
@@ -1201,7 +1236,7 @@ static void recv_drain_socket(struct recv_thr_arg *a, int fd, short revents,
                 last_v = nready;
                 if (nready < UDP_RXBATCH)
                     break; /* partial batch: drained */
-                /* full batch: R48-L2 — bound consecutive full
+                /* full batch: R48-L2 - bound consecutive full
                  * batches so this thread always returns to poll (and
                  * tid==0 reaches its 1s housekeeping) even under an
                  * unbounded flood */
@@ -1215,7 +1250,7 @@ static void recv_drain_socket(struct recv_thr_arg *a, int fd, short revents,
             break; /* EAGAIN: drained, or ICMP error */
         }
         /* diagnostic: poll reported readable but nothing was
-         * drained — a transient race between poll and recvmmsg, or
+         * drained - a transient race between poll and recvmmsg, or
          * a wedged receive path (see the MSG_ERRQUEUE drain above) */
         if (last_v <= 0 && (revents & POLLIN)) {
             static _Thread_local uint64_t last_pe2;
@@ -1228,7 +1263,7 @@ static void recv_drain_socket(struct recv_thr_arg *a, int fd, short revents,
         }
     } else if (revents != 0) {
         /* unexpected poll event (POLLNVAL/POLLHUP on the socket):
-         * would busy-spin without receiving anything — log it */
+         * would busy-spin without receiving anything - log it */
         static _Thread_local uint64_t last_pe;
         uint64_t nowp = now_ms();
         if (nowp - last_pe >= 1000) {
@@ -1242,8 +1277,9 @@ static void recv_drain_socket(struct recv_thr_arg *a, int fd, short revents,
 static void *recv_thread_main(void *v)
 {
     struct recv_thr_arg *a = v;
-    /* 两个 fd：0 = v4（原样），1 = v6（无 IPv6 时 fd = -1，npfd = 1 不参与
-     * poll）。每个线程仍然只 poll 自己那对 SO_REUSEPORT socket。 */
+    /* Two fds: 0 = v4 (as-is), 1 = v6 (fd = -1 and npfd = 1 when there is no
+     * IPv6, so it is not polled). Each thread still polls only its own pair of
+     * SO_REUSEPORT sockets. */
     struct pollfd pfd[2] = {
         { .fd = a->fd, .events = POLLIN, .revents = 0 },
         { .fd = a->fd6, .events = POLLIN, .revents = 0 },
@@ -1258,7 +1294,7 @@ static void *recv_thread_main(void *v)
 
     buf = malloc((size_t)UDP_RXBATCH * 65536);
     if (!buf) {
-        /* M3: without the fatal flag this was a silent black hole — a
+        /* M3: without the fatal flag this was a silent black hole - a
          * worker returned with its SO_REUSEPORT socket never consumed
          * (every datagram the kernel hashed to it lost forever), and the
          * primary's OOM (tid==0, runs inline in main) still let main
@@ -1281,12 +1317,12 @@ static void *recv_thread_main(void *v)
             atomic_store_explicit(a->poll_err, 1, memory_order_relaxed);
             /* M8 (SUMMARY-2): a thread exiting without the stop flag
              * would leave main deadlocked in pthread_join (whose comment
-             * promises "exit within one poll timeout") — set it so the
+             * promises "exit within one poll timeout") - set it so the
              * shutdown path completes */
             atomic_store_explicit(&g_stop, true, memory_order_relaxed);
             break;
         }
-        /* pfd[0] 的容量仍是 16（与只有 v4 时逐位相同），pfd[1] 是 v6 的 28 */
+        /* pfd[0]'s capacity is still 16 (bit-identical to v4-only), pfd[1] is v6's 28 */
         for (int k = 0; k < npfd; k++)
             recv_drain_socket(a, pfd[k].fd, pfd[k].revents, msgs, peers,
                               k == 0 ? (socklen_t)sizeof(struct sockaddr_in)
@@ -1302,13 +1338,13 @@ static void *recv_thread_main(void *v)
              * fd and the tunnel goes silently dark while UDP keepalives
              * still look alive. Probe the interface index once per
              * second (mirrors the client sentinel, proxy.c cmd_proxy):
-             * zero means the device is gone — say so out loud and fail
+             * zero means the device is gone - say so out loud and fail
              * fast (exit 1 via poll_err) instead of serving a dead
              * tunnel until a manual restart. This probe must run BEFORE
              * tun_pool_tick below: the old order let the tick grow
              * first, and with every reader dead the tick saw busy=1.0
              * and re-created the same-named device via tun_attach in the
-             * microseconds before the probe ran — if_nametoindex then
+             * microseconds before the probe ran - if_nametoindex then
              * saw a live index and the fail-fast never fired. Two
              * independent death signals cover both sides of that:
              *  - if_nametoindex==0 catches the plain deletion;
@@ -1327,7 +1363,7 @@ static void *recv_thread_main(void *v)
                     /* if_nametoindex returns unsigned (index 0 = none) */
                     unsigned int idx = if_nametoindex(a->tun_name);
                     if (rlost > 0 || idx == 0) {
-                        log_err("tun device %s %s; tunnel dead — restart "
+                        log_err("tun device %s %s; tunnel dead - restart "
                                 "to recover", a->tun_name,
                                 idx == 0
                                     ? "vanished (deleted externally)"
@@ -1380,9 +1416,10 @@ static void *recv_thread_main(void *v)
                             (unsigned long long)drops);
                     last_drops = drops;
                 }
-                /* IWAN_SRV_SINK=1：每 5 秒一行计量统计（函数内部按 5s
-                 * 门控，多余的 1s 调用直接返回）。只在主 recv 线程调用：
-                 * 区间速率 latch 是非原子的。 */
+                /* IWAN_SRV_SINK=1: one metering line every 5 seconds (the
+                 * function gates on 5s internally; extra 1s calls return
+                 * immediately). Only called on the main recv thread: the
+                 * interval-rate latch is non-atomic. */
                 if (a->ctx->sink)
                     server_sink_print(a->ctx, false);
                 last_purge = now;
@@ -1394,7 +1431,7 @@ static void *recv_thread_main(void *v)
 }
 
 /* orderly shutdown: stop the TUN reader pool, close fds (both address
- * families), and — in the original root process — undo the NAT changes;
+ * families), and - in the original root process - undo the NAT changes;
  * returns the process exit status (poll_err surfaces fatal runtime
  * failures) */
 static int server_shutdown(struct server_ctx *ctx, int tun_fd,
@@ -1416,10 +1453,11 @@ static int server_shutdown(struct server_ctx *ctx, int tun_fd,
     return poll_err ? 1 : 0;
 }
 
-/* IWAN_SRV_SINK=1：仅计量接收端点（见 usage 的环境变量表）。读法与其他
- * 开关一致：非空即为开，off 拼写 {0,false,no,off}（大小写不敏感）是关；
- * 既不是 on 也不是 off 的写法按开处理，但打一行 warning —— 与
- * IWAN_SRV_THREADS 非法值告警的风格一致。 */
+/* IWAN_SRV_SINK=1: metering receive endpoint only (see the environment
+ * variable table in usage). Parsed like the other switches: non-empty is on,
+ * the off spellings {0,false,no,off} (case-insensitive) are off; anything that
+ * is neither on nor off counts as on but prints a warning - matching the
+ * style of the invalid IWAN_SRV_THREADS warning. */
 static bool sink_env_enabled(void)
 {
     static const char *const on[] = { "1", "true", "yes", "on" };
@@ -1470,6 +1508,7 @@ int main(int argc, char **argv)
     util_ignore_sigpipe();     /* EPIPE on a dead socket, not a SIGPIPE kill */
     prof_init();               /* IWAN_PROFILE=1: stage throughput prints */
     server_rate_limits_init(); /* IWAN_RATE_OPEN_MAX / IWAN_RATE_ECHO_MAX */
+    server_set_sr_password(o.sr_password);   /* empty string = do not decrypt encrypted SEGRT */
 
     /* uplink recv threads: SO_REUSEPORT fan-out across `recv_threads`
      * sockets (the kernel hashes each session to one socket, so inner
@@ -1490,8 +1529,9 @@ int main(int argc, char **argv)
     }
     server_up_stats_set_threads(recv_threads);
 
-    /* IWAN_SRV_SINK=1：仅计量接收端点 —— 不建 TUN、不解密、不转发，只按
-     * 外层 UDP 净荷计数（见 usage）。读一次，之后只读。 */
+    /* IWAN_SRV_SINK=1: metering receive endpoint only - no TUN, no decryption,
+     * no forwarding; count outer UDP payload only (see usage). Read once, then
+     * read-only. */
     bool sink_mode = sink_env_enabled();
 
     memset(&o, 0, sizeof o);
@@ -1503,7 +1543,7 @@ int main(int argc, char **argv)
     strcpy(o.users, "/etc/iwan/users.txt");
     strcpy(o.nat_if, "eth0");
     strcpy(o.user, "nobody");
-    o.data_plane = "tun";   /* v1 服务端只有 TUN 数据面（见 parse_opts 的 'D'） */
+    o.data_plane = "tun";   /* the v1 server has only the TUN data plane (see 'D' in parse_opts) */
 
     parse_opts(argc, argv, &o);
 
@@ -1514,13 +1554,13 @@ int main(int argc, char **argv)
      * (parent: the forwarding handlers below; server: on_signal after the
      * fork), so a SIGINT/SIGTERM/SIGHUP/SIGQUIT in the ms-wide window took
      * default action, terminated the process, and left MASQUERADE +
-     * FORWARD + ip_forward=1 stranded — the server's half of the client's
+     * FORWARD + ip_forward=1 stranded - the server's half of the client's
      * "install signals before any route setup" contract was asymmetric.
      * Block all four here, before the first such side effect; each role
      * re-opens them only once its own graceful-stop machinery is in place
      * (the parent after parent_fwd_signal + g_child_pid, the server after
-     * on_signal). A signal arriving meanwhile is held pending — not lost,
-     * not default-killed — and delivered at the re-open, where it becomes
+     * on_signal). A signal arriving meanwhile is held pending - not lost,
+     * not default-killed - and delivered at the re-open, where it becomes
      * an orderly stop with the full cleanup. sigprocmask affects no other
      * system call; the exec'd helper processes (iptables/ip) inherit the
      * mask across fork+exec, so they cannot be half-killed either. stop_orig
@@ -1540,7 +1580,7 @@ int main(int argc, char **argv)
     /* The argument checks below are pure string/path validation and must stay
      * libcrypto-free: on e07fe75 an invalid --subnet/--tun/--server-ip/--dns
      * exited rc=1 without touching libcrypto at all. */
-    /* sink 模式不建 TUN，--tun 的值不参与任何事（与 --no-tun 同） */
+    /* sink mode creates no TUN; --tun's value is irrelevant (same as --no-tun) */
     if (!o.no_tun && !sink_mode && !tun_name_valid(o.tun)) {
         fprintf(stderr, "error: invalid tun device name '%s'\n", o.tun);
         return 1;
@@ -1610,7 +1650,7 @@ int main(int argc, char **argv)
     if (stat(o.users, &st) == 0 && (st.st_mode & (S_IRWXG | S_IRWXO))) {
         /* R2: a group/world-readable users file leaks credentials; refuse
          * to run unless the operator explicitly opts out with one of the
-         * positive values (1/true/yes/on, case-insensitive) — anything
+         * positive values (1/true/yes/on, case-insensitive) - anything
          * else, including "no", must NOT enable the override */
         const char *env = getenv("IWAN_ALLOW_INSECURE_USERS");
         bool allow = env && (strcasecmp(env, "1") == 0 ||
@@ -1636,8 +1676,9 @@ int main(int argc, char **argv)
     ctx.ip_end = (subnet_base | ~(0xFFFFFFFFu << (32 - o.mask))) - 1; /* pre-broadcast */
     ctx.next_ip = ctx.ip_base;
     ctx.tun_fd = -1;
-    /* IWAN_SRV_SINK=1：数据帧在 server.c 的 DATA 分支里只计数（不解密、
-     * 不解析内层、不写 TUN、不回发）；其他路径零初始化为 false */
+    /* IWAN_SRV_SINK=1: data frames are only counted in server.c's DATA branch
+     * (no decryption, no inner parsing, no TUN writes, no replies); other
+     * paths are zero-initialized to false */
     ctx.sink = sink_mode;
     /* R12 T1: make the H1 gate subnet-aware (see server.h/server.c).  An
      * uplink inner packet to the gateway (-s) or to any address inside
@@ -1681,12 +1722,12 @@ int main(int argc, char **argv)
      * never fatal. T_DNS/T_IP hand the resolver to the client as a
      * tunnel-reachable address, and a public resolver outside --subnet
      * (exactly the documented default 114.114.114.114) is reached
-     * through the tunnel — making that fatal meant the usage's own
+     * through the tunnel - making that fatal meant the usage's own
      * default combination could never start. An in-pool --dns is a
      * different case and stays fatal (L31): the pool allocator
      * (server.c next_ip) only skips addresses held by a live session and
      * never reserves ctx.dns, so it WILL hand the DNS address out on an
-     * OPEN — measured: the first client got tun == dns == 198.18.0.2 and
+     * OPEN - measured: the first client got tun == dns == 198.18.0.2 and
      * the fourth got .5 with -d 198.18.0.5. A resolver address shared
      * with a client is a guaranteed conflict, not a warning. */
     {
@@ -1707,7 +1748,7 @@ int main(int argc, char **argv)
                     o.dns, subnet_net);
     }
 
-    /* R10 (F1-8): every argument check is behind us now — an invalid
+    /* R10 (F1-8): every argument check is behind us now - an invalid
      * --subnet/--tun/--server-ip/--dns or an unreadable/over-permissive
      * users file returns above without libcrypto, as on e07fe75. The next
      * statement that reaches libcrypto is the session/auth handling inside
@@ -1728,7 +1769,7 @@ int main(int argc, char **argv)
         printf("tun %s fd=%d\n", o.tun, tun_fd);
         /* M1: attach the eBPF flow-hash steering HERE, while still root.
          * It is a root-only BPF_PROG_LOAD syscall + TUNSETSTEERINGEBPF
-         * ioctl — no thread interaction, safe to do before the fork.  After
+         * ioctl - no thread interaction, safe to do before the fork.  After
          * the fork/drop below an unprivileged process would hit EPERM and
          * silently fall back to the kernel's degenerate automq flow hash
          * (the exact problem this feature exists to fix).  Failure is
@@ -1748,7 +1789,7 @@ int main(int argc, char **argv)
          * fds on the device we just created; the fds cross the fork below
          * (inherited by the child) and are handed to tun_pool_create_pre,
          * which takes ownership of them (pool closes them on destroy; the
-         * root parent does NOT close them — it just waits/forwards).  Only
+         * root parent does NOT close them - it just waits/forwards).  Only
          * the extra queues we create ourselves are touched; existing
          * devices are never modified.  On a non-root deployment
          * tun_attach_many returns 0 and the pool falls back to attaching
@@ -1772,9 +1813,10 @@ int main(int argc, char **argv)
     }
 
     nfds = setup_udp(o.port, udp_fds, recv_threads);
-    /* 外层 IPv6：第二套同端口 AF_INET6 套接字（IPV6_V6ONLY=1）。v4 那套的
-     * 调用序列与创建个数完全不变；宿主没有 IPv6 时 setup_udp6 打一行说明
-     * 并返回 0，服务端照常用 v4 起来。 */
+    /* Outer IPv6: a second AF_INET6 socket set on the same port (IPV6_V6ONLY=1).
+     * The v4 set's call sequence and created count are completely unchanged;
+     * when the host has no IPv6, setup_udp6 prints one line and returns 0, and
+     * the server still comes up on v4. */
     nfds6 = setup_udp6(o.port, udp_fds6, recv_threads);
     ctx.dl_fd6 = nfds6 > 0 ? udp_fds6[0] : -1;
 
@@ -1796,7 +1838,7 @@ int main(int argc, char **argv)
              * restore ip_forward and drop the MASQUERADE rule we added
              * (both need root). SIGINT/SIGTERM/SIGHUP/SIGQUIT are
              * forwarded to the child so any stop path reaches the
-             * cleanup — ignoring them (as before) let kill <parent-pid>
+             * cleanup - ignoring them (as before) let kill <parent-pid>
              * or an SSH hangup strand the NAT state forever.
              *
              * R52-D2: those signals have been BLOCKED since before the
@@ -1804,7 +1846,7 @@ int main(int argc, char **argv)
              * blocked here while the forwarding handlers and g_child_pid
              * are installed: a signal arriving in this window must not be
              * lost (handlers not yet up) or swallowed without forwarding
-             * (g_child_pid still -1) — it is held pending and delivered
+             * (g_child_pid still -1) - it is held pending and delivered
              * once stop_orig is restored below, with everything in
              * place. */
             if (install_sig(SIGINT, parent_fwd_signal, 0) != 0 ||
@@ -1818,7 +1860,7 @@ int main(int argc, char **argv)
                  * stripped the NAT rules it depends on. Kill + reap it.
                  * R52-D2: keep the stop signals BLOCKED across this
                  * teardown and restore the original mask only AFTER the
-                 * cleanup — a pending window signal delivered mid-cleanup
+                 * cleanup - a pending window signal delivered mid-cleanup
                  * (some of the four failed to install, so their
                  * disposition may still be default) must not kill the
                  * parent before it has undone the NAT changes. */
@@ -1871,7 +1913,7 @@ int main(int argc, char **argv)
     }
     /* signal handlers: installed after the fork so the root parent (which
      * forwards SIGINT/SIGTERM/SIGHUP/SIGQUIT while waiting) never takes
-     * them; the server process — forked child or non-root deployment —
+     * them; the server process - forked child or non-root deployment -
      * exits gracefully. SIGHUP (terminal hangup) stops the server the
      * same way SIGINT/SIGTERM do, so the parent's cleanup always runs.
      * SA_RESTART keeps poll() resuming instead of failing with EINTR. */
@@ -1886,7 +1928,7 @@ int main(int argc, char **argv)
      * default-disposition window could leave MASQUERADE/FORWARD/ip_forward
      * stranded; both the forked child and every non-root deployment
      * inherit that mask. Re-open here, after on_signal guards this
-     * process's graceful shutdown — a signal that arrived during startup
+     * process's graceful shutdown - a signal that arrived during startup
      * is delivered now and becomes an orderly stop: the server exits
      * through the normal path and the root parent's waitpid reaps it and
      * undoes the NAT changes. */
@@ -1928,7 +1970,7 @@ int main(int argc, char **argv)
          * thread (see srv_dl_reader_exit). */
         tun_pool_set_exit_cb(ctx.qpool, srv_dl_reader_exit);
         /* M1: report the REAL queue count (tun_pool_queues) instead of the
-         * requested initq — eager multi-queue fill (tun_pool_add ->
+         * requested initq - eager multi-queue fill (tun_pool_add ->
          * open /dev/net/tun per queue) still degrades when /dev/net/tun
          * access is limited, and claiming initq queues would then lie
          * about the actual fan-out. */
@@ -1943,7 +1985,7 @@ int main(int argc, char **argv)
     }
     /* L23: report the port the kernel actually bound to udp_fds[0], not
      * the requested one. `-p 0` asks for an ephemeral port, and with
-     * SO_REUSEPORT each socket is bound independently — measured: the
+     * SO_REUSEPORT each socket is bound independently - measured: the
      * kernel picked FOUR different ephemeral ports for the four recv
      * sockets, so the old "listening UDP 0.0.0.0:0" line advertised a
      * port that does not exist and no single port reaches the whole
@@ -1974,8 +2016,9 @@ int main(int argc, char **argv)
                (unsigned)bound_port, recv_threads,
                recv_threads > 1 ? "s" : "");
     }
-    /* 外层 v6 的监听行与 v4 平行（同一条 L23 口径：报内核实际绑定的端口）。
-     * 宿主没有 IPv6 时 setup_udp6 已经打过那一行说明，这里整段跳过。 */
+    /* The outer v6 listen line is parallel to v4 (same L23 rule: report the
+     * port the kernel actually bound). When the host has no IPv6, setup_udp6
+     * already printed that line, so this whole block is skipped. */
     if (nfds6 > 0) {
         struct sockaddr_in6 ba6;
         socklen_t blen6 = sizeof ba6;
@@ -1988,9 +2031,9 @@ int main(int argc, char **argv)
             if (getsockname(udp_fds6[i], (struct sockaddr *)&b62, &l62) == 0 &&
                 ntohs(b62.sin6_port) != bound6) {
                 fprintf(stderr,
-                        "warning: v6 SO_REUSEPORT 套接字绑到了不同端口"
-                        "（fd[0]=%u, fd[%d]=%u）；--port 0 的临时端口下没有"
-                        "客户端能连的单一端口，请传固定 --port\n",
+                        "warning: v6 SO_REUSEPORT sockets bound to different ports "
+                        "(fd[0]=%u, fd[%d]=%u); with a temporary port from --port 0 "
+                        "there is no single port clients can connect to; pass a fixed --port\n",
                         (unsigned)bound6, i,
                         (unsigned)ntohs(b62.sin6_port));
                 break;
@@ -2024,7 +2067,7 @@ int main(int argc, char **argv)
                                              (unsigned)(i + 1),
                                              &poll_err, o.tun };
         /* R37 L3 convention (see relay_proxy.c): pthread_create returns
-         * the error number and does NOT set errno — on musl a failure
+         * the error number and does NOT set errno - on musl a failure
          * left a stale "Success" in the log. Report strerror(rc). */
         int prc = pthread_create(&workers[i], NULL, recv_thread_main,
                                  &args[i + 1]);
@@ -2033,7 +2076,7 @@ int main(int argc, char **argv)
                     strerror(prc));
             atomic_store_explicit(&g_stop, true, memory_order_relaxed);
             /* R25-f2 F2-A: without this the process would exit 0 after
-             * "server ready" with zero (or too few) recv threads — a
+             * "server ready" with zero (or too few) recv threads - a
              * silent startup black hole. Surface it as a fatal poll error
              * so server_shutdown returns non-zero. */
             atomic_store_explicit(&poll_err, 1, memory_order_relaxed);
@@ -2056,8 +2099,9 @@ int main(int argc, char **argv)
      * in its final window is not lost (previously only the primary's
      * flag was surfaced and a secondary fatal still exited 0) */
     int shutdown_poll_err = atomic_load(&poll_err);
-    /* IWAN_SRV_SINK=1：退出前的最终统计（SIGINT/SIGTERM 的优雅退出走这
-     * 条路）。所有 recv 线程已 join，打印函数的非原子 latch 可以安全用。 */
+    /* IWAN_SRV_SINK=1: final statistics before exit (graceful SIGINT/SIGTERM
+     * shutdown takes this path). All recv threads have been joined, so the
+     * print function's non-atomic latch can be used safely. */
     if (sink_mode)
         server_sink_print(&ctx, true);
     return server_shutdown(&ctx, tun_fd, udp_fds, nfds, udp_fds6, nfds6,

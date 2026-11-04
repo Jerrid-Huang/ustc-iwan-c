@@ -1,10 +1,10 @@
 /*
- * 回程路由实现：conntrack（CONNMARK）+ fwmark 策略路由。
- * 设计与取舍见 docs/reply-routing.md；接口语义见 reply_route.h。
+ * Reply route implementation: conntrack (CONNMARK) + fwmark policy routing.
+ * For design and tradeoffs see docs/reply-routing.md; for interface semantics see reply_route.h.
  *
- * 命令一律走 port_run_cmd（不经 shell），参数按 argv 逐个给，所以地址/接口名
- * 里的字符不会被解释。装规则时先把同名残留清掉（幂等），失败按逆序回滚自己
- * 装过的部分。
+ * All commands go through port_run_cmd (without a shell); arguments are passed one by one in argv, so characters in addresses/interface names
+ * are not interpreted. When installing rules, same-named leftovers are removed first (idempotent); on failure, roll back what was
+ * installed in reverse order.
  */
 
 #include <stdio.h>
@@ -17,8 +17,8 @@
 
 #define RR_DEF_MARK  0x1u
 #define RR_DEF_TABLE 100u
-/* fwmark 规则的优先级：比 main(32766)/default(32767) 小，比常见的 ip rule
- * 用户规则（1000 起）同一档；只匹配 fwmark，不影响未标记的包。 */
+/* fwmark rule priority: lower than main(32766)/default(32767), in the same range as common ip rule
+ * user rules (starting at 1000); it matches only fwmark and does not affect unmarked packets. */
 #define RR_RULE_PREF 1000u
 
 static uint32_t rr_mark(const reply_route_opts *o)
@@ -50,17 +50,17 @@ static const char *rr_served_at(const reply_route_opts *o, size_t i)
 	return o->served6->v[i - n4];
 }
 
-/* 跑一条命令；失败只记 debug（调用方决定是否致命）。 */
+/* Run one command; on failure only log debug (the caller decides whether it is fatal). */
 static bool rr_run(char *const argv[], const char *what)
 {
-	(void)what;	/* release 档 log_debug 会被编掉，别让参数变未使用 */
+	(void)what;	/* in release builds log_debug is compiled out; keep the parameter from becoming unused */
 	if (port_run_cmd(argv) == 0)
 		return true;
-	log_debug("回程路由: %s 没成功（可能本来就不存在）", what);
+	log_debug("reply route: %s did not succeed (it may simply not exist)", what);
 	return false;
 }
 
-/* 读 /sys/module/iwan/parameters/<name>；成功返回 true。 */
+/* Read /sys/module/iwan/parameters/<name>; returns true on success. */
 static bool rr_sysfs(const char *name, long *out)
 {
 	char path[128];
@@ -88,27 +88,27 @@ bool reply_route_precheck(const reply_route_opts *o, char *why, size_t whysz)
 	bool ct_ok = false;
 
 	if (o->tun == NULL || o->tun[0] == '\0') {
-		snprintf(why, whysz, "回程路由需要隧道接口名（内核面是 iwan0）");
+		snprintf(why, whysz, "reply route needs a tunnel interface name (iwan0 on the kernel plane)");
 		return false;
 	}
 	if (rr_n_served(o) == 0) {
 		snprintf(why, whysz,
-			 "回程路由需要\"被服务地址集合\"，但这一轮一个都没给："
-			 "至少要有一个 --proxy-cidr/--proxy-ip/--proxy-domain"
-			 "（v6 用 --proxy-cidr6）——\n  只按入接口标记会把承载网卡上"
-			 "所有非隧道流量也塞进隧道，所以必须有 -d 这一半");
+			 "reply route needs the \"served address set\", but none was given this round: "
+			 "at least one --proxy-cidr/--proxy-ip/--proxy-domain is required "
+			 "(use --proxy-cidr6 for v6) --\n  marking by ingress interface alone would push all "
+			 "non-tunnel traffic on the carrier NIC into the tunnel too, so the -d half is required");
 		return false;
 	}
 	if (!o->kernel_plane)
-		return true;	/* TUN 面：内层包由 iwan0 重新入栈，必然过 conntrack */
+		return true;	/* TUN plane: inner packets re-enter via iwan0 and necessarily pass conntrack */
 
-	/* 内核面：模块的钩子必须在 conntrack(-200) 之前解封，或者 reinject=1
-	 * 让包重新入栈。否则内层连接不进 conntrack 表 → 回包 restore 得到 0 →
-	 * 规则静默不生效（不报错、也不通）。 */
+	/* Kernel plane: the module hook must decapsulate before conntrack(-200), or reinject=1
+	 * must make packets re-enter the stack. Otherwise inner connections do not enter the conntrack table -> reply restore gets 0 ->
+	 * rules silently take no effect (no error, no connectivity). */
 	if (!rr_sysfs("hooknum", &hooknum) || !rr_sysfs("reinject", &reinject)) {
 		snprintf(why, whysz,
-			 "读不到 /sys/module/iwan/parameters/{hooknum,reinject}："
-			 "内核模块 iwan 没加载？回程路由在内核面需要它");
+			 "cannot read /sys/module/iwan/parameters/{hooknum,reinject}: "
+			 "is the iwan kernel module not loaded? reply route needs it on the kernel plane");
 		return false;
 	}
 	(void)rr_sysfs("hookprio", &hookprio);
@@ -118,13 +118,13 @@ bool reply_route_precheck(const reply_route_opts *o, char *why, size_t whysz)
 		ct_ok = true;
 	if (!ct_ok) {
 		snprintf(why, whysz,
-			 "内核面的模块钩子不在 conntrack 之前（hooknum=%ld hookprio=%ld "
-			 "reinject=%ld）：解封后的内层包不会再经过 conntrack，"
-			 "内层连接没有表项，\n  回包 --restore-mark 得到 0 —— 回程规则"
-			 "会**静默不生效**（不报错，但回包仍走物理网卡）。修复二选一：\n"
+			 "the kernel plane module hook is not before conntrack (hooknum=%ld hookprio=%ld "
+			 "reinject=%ld): decapsulated inner packets no longer pass through conntrack, "
+			 "inner connections have no entry,\n  reply packets --restore-mark get 0 -- reply route rules "
+			 "will **silently take no effect** (no error, but replies still use the physical NIC). Fix by choosing one:\n"
 			 "    echo 0 > /sys/module/iwan/parameters/hooknum\n"
 			 "    echo -300 > /sys/module/iwan/parameters/hookprio\n"
-			 "  或\n"
+			 "  or\n"
 			 "    echo 1 > /sys/module/iwan/parameters/reinject",
 			 hooknum, hookprio, reinject);
 		return false;
@@ -132,7 +132,7 @@ bool reply_route_precheck(const reply_route_opts *o, char *why, size_t whysz)
 	return true;
 }
 
-/* ---------------------------------------------------------------- nft 路径 */
+/* ---------------------------------------------------------------- nft path */
 
 static bool rr_nft(bool add, const reply_route_opts *o, const char *in_if,
 		   uint32_t mark, char *err, size_t errsz)
@@ -157,24 +157,24 @@ static bool rr_nft(bool add, const reply_route_opts *o, const char *in_if,
 	snprintf(vtun, sizeof(vtun), "%s", in_if);
 	rr_run(tbl, "nft add table inet iwan_reply");
 	if (!rr_run(chk, "nft add chain pre")) {
-		snprintf(err, errsz, "nft 建 prerouting 链失败（nft 可用？）");
+		snprintf(err, errsz, "nft failed to create the prerouting chain (is nft available?)");
 		return false;
 	}
 	if (!rr_run(cho, "nft add chain out")) {
-		snprintf(err, errsz, "nft 建 output 链失败");
+		snprintf(err, errsz, "nft failed to create the output chain");
 		return false;
 	}
 	for (i = 0; i < rr_n_served(o); i++) {
-		/* ip|ip6 daddr <集合元素>：同一张 inet 表里两族都能写 */
+		/* ip|ip6 daddr <set element>: both families can be written in the same inet table */
 		char *r[] = { "nft", "add", "rule", "inet", "iwan_reply", "pre",
 			      "iifname", vtun,
 			      rr_is_v6(rr_served_at(o, i)) ? "ip6" : "ip", "daddr",
 			      (char *)rr_served_at(o, i),
 			      "ct", "mark", "set", marks, NULL };
 
-		if (!rr_run(r, "nft add rule pre（被服务地址）")) {
+		if (!rr_run(r, "nft add rule pre (served address)")) {
 			snprintf(err, errsz,
-				 "nft 装 prerouting 规则失败（地址 %s）",
+				 "nft failed to install the prerouting rule (address %s)",
 				 rr_served_at(o, i));
 			return false;
 		}
@@ -184,15 +184,15 @@ static bool rr_nft(bool add, const reply_route_opts *o, const char *in_if,
 			      "ct", "mark", marks, "meta", "mark", "set", marks,
 			      NULL };
 
-		if (!rr_run(r, "nft add rule out（还原标记）")) {
-			snprintf(err, errsz, "nft 装 output 还原规则失败");
+		if (!rr_run(r, "nft add rule out (restore mark)")) {
+			snprintf(err, errsz, "nft failed to install the output restore rule");
 			return false;
 		}
 	}
 	return true;
 }
 
-/* ----------------------------------------------------------- iptables 路径 */
+/* ----------------------------------------------------------- iptables path */
 
 static bool rr_ipt(bool add, const reply_route_opts *o, const char *in_if,
 		   uint32_t mark, char *err, size_t errsz)
@@ -208,8 +208,8 @@ static bool rr_ipt(bool add, const reply_route_opts *o, const char *in_if,
 	if (!rr_run(restore, "iptables CONNMARK --restore-mark")) {
 		if (add) {
 			snprintf(err, errsz,
-				 "iptables 装 OUTPUT 还原规则失败（iptable_mangle/"
-				 "xt_connmark 加载了吗？）");
+				 "iptables failed to install the OUTPUT restore rule (is iptable_mangle/"
+				 "xt_connmark loaded?)");
 			return false;
 		}
 	}
@@ -221,9 +221,9 @@ static bool rr_ipt(bool add, const reply_route_opts *o, const char *in_if,
 			      "-i", vtun, "-d", (char *)rr_served_at(o, i),
 			      "-j", "CONNMARK", "--set-mark", marks, NULL };
 
-		if (!rr_run(r, "iptables CONNMARK --set-mark（被服务地址）")) {
+		if (!rr_run(r, "iptables CONNMARK --set-mark (served address)")) {
 			snprintf(err, errsz,
-				 "iptables 装 PREROUTING 标记规则失败（地址 %s）",
+				 "iptables failed to install the PREROUTING mark rule (address %s)",
 				 rr_served_at(o, i));
 			return false;
 		}
@@ -233,7 +233,7 @@ static bool rr_ipt(bool add, const reply_route_opts *o, const char *in_if,
 
 /* ------------------------------------------------------- ip rule / ip route */
 
-/* 是否至少有一个 v6 被服务地址（决定要不要装 v6 的 rule/表）。 */
+/* Whether there is at least one v6 served address (decides whether v6 rule/table is installed). */
 static bool rr_any_v6(const reply_route_opts *o)
 {
 	size_t i;
@@ -249,9 +249,9 @@ static bool rr_ip(bool add, const reply_route_opts *o, uint32_t mark,
 {
 	char ms[16], ts[16];
 	const char *fw = add ? "add" : "del";
-	/* 两族各一份 argv：**不能**把可空的 "-6" 放进 argv 里占位 ——
-	 * execvp 在第一个 NULL 处截断，v4 时会变成执行不带参数的 `ip`
-	 * （打出 usage 就算失败），这是"装了半个再回滚"的现场根因。 */
+	/* One argv per family: **never** put an optional "-6" in argv as a placeholder --
+	 * execvp truncates at the first NULL, so for v4 it would run `ip` with no arguments
+	 * (printing usage counts as failure); this is the root cause of the "install half then roll back" scenario. */
 	char *rule4[] = { "ip", "rule", (char *)fw,
 			  "fwmark", ms, "lookup", ts, "pref", "1000", NULL };
 	char *rule6[] = { "ip", "-6", "rule", (char *)fw,
@@ -268,7 +268,7 @@ static bool rr_ip(bool add, const reply_route_opts *o, uint32_t mark,
 	if (!rr_run(rule, add ? "ip rule add fwmark" : "ip rule del fwmark")) {
 		if (add) {
 			snprintf(err, errsz,
-				 "装 ip%s rule（fwmark 0x%x → 表 %u）失败",
+				 "failed to install ip%s rule (fwmark 0x%x -> table %u)",
 				 v6 ? " -6" : "", mark, (unsigned)table);
 			return false;
 		}
@@ -277,7 +277,7 @@ static bool rr_ip(bool add, const reply_route_opts *o, uint32_t mark,
 			      "ip route del default table")) {
 		if (add) {
 			snprintf(err, errsz,
-				 "装 ip%s route（表 %u 的 default dev %s）失败",
+				 "failed to install ip%s route (table %u default dev %s)",
 				 v6 ? " -6" : "", (unsigned)table, o->tun);
 			return false;
 		}
@@ -285,7 +285,7 @@ static bool rr_ip(bool add, const reply_route_opts *o, uint32_t mark,
 	return true;
 }
 
-/* ------------------------------------------------------------------ 对外 */
+/* ------------------------------------------------------------------ public */
 
 bool reply_route_setup(const reply_route_opts *o, reply_route_state *st,
 		       char *err, size_t errsz)
@@ -299,7 +299,7 @@ bool reply_route_setup(const reply_route_opts *o, reply_route_state *st,
 	st->table = rr_table(o);
 	st->v6 = v6;
 
-	/* 幂等：先清掉同名残留（nft 整表 / iptables 按规则描述删 / rule+route） */
+	/* Idempotent: first clear same-named leftovers (whole nft table / iptables deleted by rule description / rule+route) */
 	if (rr_run((char *[]) { "nft", "--version", NULL }, "nft --version")) {
 		st->nft = true;
 		rr_nft(false, o, in_if, st->mark, err, errsz);
@@ -324,14 +324,15 @@ bool reply_route_setup(const reply_route_opts *o, reply_route_state *st,
 		goto fail;
 
 	st->installed = true;
-	log_info("回程路由: 已开（conntrack 标记 -i %s -d <%zu 个被服务地址>"
-		 " → fwmark 0x%x → 表 %u 的 default dev %s，%s）",
-		 in_if, rr_n_served(o), st->mark, (unsigned)st->table, o->tun,
+	log_info("reply route: enabled (conntrack mark -i %s -d <%llu served addresses>"
+		 " -> fwmark 0x%x -> table %u default dev %s, %s)",
+		 in_if, (unsigned long long)rr_n_served(o), st->mark,
+		 (unsigned)st->table, o->tun,
 		 st->nft ? "nft" : "iptables");
 	return true;
 
 fail:
-	log_err("回程路由: %s；回滚已装的部分", err);
+	log_err("reply route: %s; rolling back installed parts", err);
 	reply_route_teardown(st);
 	return false;
 }
@@ -356,9 +357,9 @@ void reply_route_teardown(reply_route_state *st)
 			rr_nft(false, o, in_if, st->mark, err, sizeof(err));
 		else
 			rr_ipt(false, o, in_if, st->mark, err, sizeof(err));
-		log_info("回程路由: 已回滚（rule/表 %u/%s 都按自己装过的删）",
+		log_info("reply route: rolled back (rule/table %u/%s deleted per what we installed)",
 			 (unsigned)st->table,
-			 st->nft ? "nft 表" : "iptables 规则");
+			 st->nft ? "nft table" : "iptables rules");
 	}
 	st->installed = false;
 }

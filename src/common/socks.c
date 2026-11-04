@@ -27,10 +27,11 @@
 
 
 #include "protocol.h"
+#include "echo.h"
 #include "socks.h"
 #include "socks_internal.h"
 #include "util.h"
-#include "proxy_internal.h"   /* R25 (R24-B1-1): g_prof_send_eagain — the
+#include "proxy_internal.h"   /* R25 (R24-B1-1): g_prof_send_eagain -- the
                                * socks drain shares the pump family's
                                * EAGAIN/ENOBUFS/ENOMEM hit counter, so
                                * SOCKS uplink send pressure stays
@@ -44,7 +45,7 @@
 
 Netstack g_ns;
 
-/* FIND-R2-5: ns_flow_unref (bridge extension, declared in lwip_bridge.h —
+/* FIND-R2-5: ns_flow_unref (bridge extension, declared in lwip_bridge.h --
  * R37 R1E-1 removed the local forward declarations from this file and
  * socks_flow.c) releases a flow's reference on a rebuildable conn slot.
  * Bounds-checked, idempotent: safe to call on any f->ns_idx value before
@@ -64,13 +65,18 @@ SocksConfig *g_socks_cfg; /* SOCKS5 config; set by run_socks, read by flow hands
 Flow *g_flows;            /* fixed MAX_FLOWS array, never NULL-terminated */
 
 /* one GSO unit: max UDP payload (65535 - 20B IP - 8B UDP) */
-#define SOCKS_KEEPALIVE_MS 10000u
-/* keepalive send must fail this many times in a row before the session
- * is declared dead (transient blips recover; persistent failure means
- * the socket is gone) */
-#define SOCKS_KA_FAIL_MAX 3
+/* Keepalive probe interval: same as the official client, one ECHOREQ every 2 s
+ * (IWAN_ECHO_INTERVAL_MS). This constant only governs the **send cadence**. */
+#define SOCKS_KEEPALIVE_MS IWAN_ECHO_INTERVAL_MS
+/* Death window: the official client resets after 30 s without any valid frame.
+ * With the send period cut to 2 s, the consecutive-failure budget becomes
+ * 30/2=15, the same 30 s tolerance (previously 10 s x 3, semantics unchanged). */
+#define SOCKS_KA_FAIL_MAX 15
+/* In-place re-auth retry interval: decoupled from keepalive cadence (2 s re-auth
+ * becomes a re-OPEN storm on a silent link; 10 s is the historically validated backoff). */
+#define SOCKS_REAUTH_MS 10000u
 /* Downlink-silence watchdog: after this much silence the tunnel is
- * re-authenticated IN PLACE (see socks_reauth_tunnel) — the SOCKS
+ * re-authenticated IN PLACE (see socks_reauth_tunnel) -- the SOCKS
  * listener, client flows and inner TCP state are kept, so connections
  * survive the switch. 0 disables. The USTC server's relay intermittently
  * goes silent for minutes and then recovers; re-authing (server keeps
@@ -78,28 +84,41 @@ Flow *g_flows;            /* fixed MAX_FLOWS array, never NULL-terminated */
  * anything. */
 #define SOCKS_RX_STALE_MS_DEFAULT 120000u
 
-/* parsed once per process (the event loop would otherwise re-run
- * getenv+strtoul every iteration); 0 disables the watchdog */
-static unsigned socks_rx_stale_ms(void)
+/* Downlink-silence death window.
+ *
+ * The official client's DATA timeout is 15 s (ltime+15), but that is safe only
+ * if the peer answers keepalives: some relays never answer ECHOREQ, and any
+ * fixed window would repeatedly misjudge an idle tunnel. Default has two
+ * cases: ECHORESP received (peer answers) -> 15 s, same as official; never
+ * received -> 120 s (historical: 60 s caused false reconnects on mobile
+ * links). An explicit IWAN_RX_STALE_MS always wins; 0 disables the watchdog.
+ *
+ * parsed once per process (the event loop would otherwise re-run
+ * getenv+strtoul every iteration) */
+static unsigned socks_rx_stale_ms(bool peer_echoes)
 {
     static unsigned cached;
     static int parsed;
+    static bool explicit_env;
 
     if (parsed)
         return cached;
     parsed = 1;
-    /* R37 R1E-1: the lower bound used to be 10000 ms, exactly
-     * SOCKS_KEEPALIVE_MS — a keepalive-only tunnel (no downlink payload for a
-     * whole keepalive period, which is the normal idle case) was then judged
-     * "stale" every 10s and re-authenticated in a loop. Keep the bound at
-     * 3 keepalive periods so at least two keepalives are missed before the
-     * tunnel is declared silent; proxy.c (TUN mode) uses the same floor. */
+    /* R37 R1E-1: the lower bound used to be exactly one keepalive period --
+     * a keepalive-only tunnel (no downlink payload for a whole period, which
+     * is the normal idle case) was then judged "stale" on every cycle and
+     * re-authenticated in a loop. Keep the bound at 3 probe periods so at
+     * least two probes are missed before the tunnel is declared silent;
+     * proxy.c (TUN mode) uses the same floor. */
+    explicit_env = getenv("IWAN_RX_STALE_MS") != NULL;
     cached = (unsigned)env_ms_range("IWAN_RX_STALE_MS",
                                     SOCKS_RX_STALE_MS_DEFAULT,
                                     3 * SOCKS_KEEPALIVE_MS,
                                     86400000, 1, "(0 to disable, "
-                                                 "30s..24h)");
-    return cached;
+                                                 "6s..24h)");
+    if (explicit_env)
+        return cached;
+    return peer_echoes ? (unsigned)IWAN_DATA_TIMEOUT_MS : cached;
 }
 #define LISTEN_BACKLOG   64
 #define SOCK_BUF_BYTES   (16 * 1024 * 1024)
@@ -113,7 +132,7 @@ void wait_events(int listener, int sockfd, int dns_evfd, int timeout_ms)
     Flow *fmap[3 + MAX_FLOWS];  /* poll slot -> owning flow (R54-WG4-1):
                                  * flows are registered with skips (inactive
                                  * / fd<0), so the slot index is NOT the flow
-                                 * index — map each slot back to its Flow */
+                                 * index -- map each slot back to its Flow */
     int n = 0;
     fds[n].fd = PORT_FD_ARG(listener);
     fds[n].events = POLLIN;
@@ -135,14 +154,14 @@ void wait_events(int listener, int sockfd, int dns_evfd, int timeout_ms)
             continue;
         /* L-6 defensive guard: the invariant is flow_alloc assigns fd
          * and flow_free closes it before clearing active, so an active
-         * flow always has fd >= 0 — still, never let a negative fd into
+         * flow always has fd >= 0 -- still, never let a negative fd into
          * the poll set (port_poll would treat it as an error slot);
          * skip it instead of registering it. Placed before the events
          * computation. */
         if (f->fd < 0)
             continue;
         fds[n].fd = PORT_FD_ARG(f->fd);
-        /* rx_paused (netstack ring full): do NOT register POLLIN — the
+        /* rx_paused (netstack ring full): do NOT register POLLIN -- the
          * socket stays readable, so polling it would return instantly
          * and busy-spin the loop; the next netstack tick (<=100ms)
          * retries the reserve and clears the pause when room frees.
@@ -150,7 +169,7 @@ void wait_events(int listener, int sockfd, int dns_evfd, int timeout_ms)
          * socket is ALSO permanently readable while nobody will ever
          * read it again (the client half-closed; upstream data keeps
          * flowing via service_local_outputs, which is unconditional).
-         * Same busy-spin trap — leave events empty; the flow is reaped
+         * Same busy-spin trap -- leave events empty; the flow is reaped
          * by the peer FIN or the NS_FIN_WAIT timeout, whichever first.
          * ST_CLOSING (R06-FIND M-1, coordinated with service_local_inputs
          * in socks_flow.c, which has already stopped feeding input for
@@ -172,13 +191,13 @@ void wait_events(int listener, int sockfd, int dns_evfd, int timeout_ms)
         if (f->output.len > 0 || f->rxq_waiting)
             fds[n].events |= POLLOUT;
 #if defined(__linux__)
-        /* R55-SK-1: "events = 0" stops POLLIN/POLLOUT wakes — but NOT
+        /* R55-SK-1: "events = 0" stops POLLIN/POLLOUT wakes -- but NOT
          * POLLERR/POLLHUP, which Linux poll reports UNCONDITIONALLY on a
          * dead fd (probe: poll(events=0) on an RST'd peer returns
          * revents=0x18 immediately, 1000 rounds in 0.287 ms; after a
          * clean FIN it stays quiet). So an events=0 slot on a dead client
-         * fd makes port_poll return instantly every round — the zero-wait
-         * busy spin — until the flow is reaped. The revents scan below
+         * fd makes port_poll return instantly every round -- the zero-wait
+         * busy spin -- until the flow is reaped. The revents scan below
          * therefore detects (POLLERR|POLLHUP) and converges by closing
          * the dead fd (flow_kill_dead_client), so it leaves the poll set.
          * A clean FIN / half-open socket never gets those bits (control:
@@ -192,7 +211,7 @@ void wait_events(int listener, int sockfd, int dns_evfd, int timeout_ms)
     if (pr < 0 && errno != EINTR)
         log_err("poll: %s", strerror(errno));
 #if defined(__linux__)
-    /* R54-WG4-1 (C3): poll() error bits were ignored here — a slot whose
+    /* R54-WG4-1 (C3): poll() error bits were ignored here -- a slot whose
      * fd is invalid (POLLNVAL) makes poll return INSTANTLY with no
      * readable data, so wait_events would turn the parked event loop
      * into an immediate-return busy spin while the round kept reading/
@@ -203,12 +222,12 @@ void wait_events(int listener, int sockfd, int dns_evfd, int timeout_ms)
      * (readv EOF/RST -> ST_CLOSING)" is TRUE only while the flow is still
      * being read (POLLIN registered). The moment the read-EOF/RST path
      * moves the flow to ST_CLOSING / local_eof, wait_events registers the
-     * slot with events=0 — and Linux poll reports POLLERR/POLLHUP
+     * slot with events=0 -- and Linux poll reports POLLERR/POLLHUP
      * UNCONDITIONALLY, ignoring the events mask (probe-verified: an
      * RST'd fd with events=0 returns revents=0x18 instantly, 1000 rounds
      * in 0.287 ms). So an events=0 slot on a dead client fd keeps
-     * port_poll returning immediately every round — the same zero-wait
-     * busy spin C3 removed for POLLNVAL — held until reap_flows finally
+     * port_poll returning immediately every round -- the same zero-wait
+     * busy spin C3 removed for POLLNVAL -- held until reap_flows finally
      * collects the flow (up to ST_CLOSING_TIMEOUT_MS = 30s, or same-round
      * when removable). A clean-FIN / half-open socket NEVER gets these
      * bits (control: events=0 returns revents=0), so acting on them is
@@ -218,21 +237,21 @@ void wait_events(int listener, int sockfd, int dns_evfd, int timeout_ms)
      * The scan below therefore handles, for FLOW slots:
      *  - POLLNVAL: close/free the flow (invariant violation, C3, kept).
      *  - POLLERR|POLLHUP while this slot's event mask has POLLIN: the flow
-     *    is still in a read-consuming state — LEAVE the wake to
+     *    is still in a read-consuming state -- LEAVE the wake to
      *    service_local_inputs' readv/recv, which harvests any in-flight
      *    data (probe: unread bytes survive an RST until read) and then
      *    converges on the EOF/RST exactly as before. This is the
      *    clean-FIN data path and must stay untouched; POLLERR on the
      *    session socket is likewise left to receive_vpn's recvmmsg.
      *  - POLLERR|POLLHUP and nothing left to deliver (output empty, no
-     *    rxq_waiting): the slot is events=0 and dead — close the local fd
+     *    rxq_waiting): the slot is events=0 and dead -- close the local fd
      *    now (wait_events skips fd<0, so the fd leaves the poll set and
      *    cannot wake us again) and converge the flow via
      *    flow_kill_dead_client (local_eof + ns_close + ST_CLOSING, the
      *    same transition readv-EOF makes); reap_flows then collects it on
      *    its normal rules.
      *  - POLLERR|POLLHUP with output/rxq still queued (POLLOUT armed):
-     *    keep polling so service_local_outputs attempts the final flush —
+     *    keep polling so service_local_outputs attempts the final flush --
      *    a half-open client that can still read must receive its queued
      *    bytes, which is why we must NOT drop f->output here. The write
      *    to a dead socket fails hard (EPIPE/ECONNRESET, probe-verified)
@@ -240,8 +259,8 @@ void wait_events(int listener, int sockfd, int dns_evfd, int timeout_ms)
      *    Bounded convergence: count consecutive ERR|HUP rounds in
      *    f->err_rounds; past FLOW_ERR_ROUNDS_MAX the client is confirmed
      *    gone (the bits never appear on a live socket) and the
-     *    undeliverable queue is dropped — the same force-reap semantic
-     *    reap_flows' 30s timeout applies — then the flow converges as
+     *    undeliverable queue is dropped -- the same force-reap semantic
+     *    reap_flows' 30s timeout applies -- then the flow converges as
      *    above. This caps even the pathological case of a dead socket
      *    whose send keeps returning EAGAIN.
      *
@@ -287,14 +306,14 @@ void wait_events(int listener, int sockfd, int dns_evfd, int timeout_ms)
             /* flow slot reporting POLLERR and/or POLLHUP (no POLLNVAL) */
             if (fds[i].events & POLLIN) {
                 /* flow still being read: readv/recv will harvest any
-                 * in-flight data and converge on the error — the
+                 * in-flight data and converge on the error -- the
                  * clean-FIN POLLIN path, untouched (R55-SK-1) */
                 continue;
             }
             if (f->output.len == 0 && !f->rxq_waiting) {
                 /* dead client + nothing left to deliver: the slot was
                  * events=0, yet poll still woke us every round on ERR/HUP
-                 * — the R55-SK-1 busy spin. Close the dead fd so it
+                 * -- the R55-SK-1 busy spin. Close the dead fd so it
                  * leaves the poll set, then converge like readv-EOF;
                  * reap_flows collects the flow. */
                 log_debug("[flow %lu] poll ERR/HUP on fd %d: closing dead "
@@ -310,19 +329,20 @@ void wait_events(int listener, int sockfd, int dns_evfd, int timeout_ms)
                  * and drains the queue itself; this caps the pathological
                  * EAGAIN-on-dead-socket case. */
                 log_debug("[flow %lu] poll ERR/HUP on fd %d for %u rounds: "
-                          "dropping undeliverable output (%zuB)",
+                          "dropping undeliverable output (%lluB)",
                           (unsigned long)f->id, f->fd,
-                          (unsigned)f->err_rounds, f->output.len);
+                          (unsigned)f->err_rounds,
+                          (unsigned long long)f->output.len);
                 buf_clear(&f->output);
                 f->rxq_waiting = false;
                 flow_kill_dead_client(f);
             }
-            /* else: output/rxq queued and under the cap — keep the POLLOUT
+            /* else: output/rxq queued and under the cap -- keep the POLLOUT
              * registration so service_local_outputs attempts the final
              * flush to the client this round. */
         }
     }
-#else /* !defined(__linux__) — R56-001: R55-SK-1's (POLLERR|POLLHUP) flow
+#else /* !defined(__linux__) -- R56-001: R55-SK-1's (POLLERR|POLLHUP) flow
        * convergence is gated to Linux. Windows WSAPoll reports POLLHUP
        * unconditionally on a half-open socket that has read its peer's FIN
        * but can still send (send() still succeeds), so on Windows/macOS
@@ -331,7 +351,7 @@ void wait_events(int listener, int sockfd, int dns_evfd, int timeout_ms)
        * Non-Linux therefore keeps the R54-WG4-1 behavior verbatim: only
        * POLLNVAL is acted on (flow/listener/session/DNS classification
        * unchanged), POLLERR/POLLHUP are never touched. */
-    /* R54-WG4-1 (C3): poll() error bits were ignored here — a slot whose
+    /* R54-WG4-1 (C3): poll() error bits were ignored here -- a slot whose
      * fd is invalid (POLLNVAL) makes poll return INSTANTLY with no
      * readable data, so wait_events would turn the parked event loop
      * into an immediate-return busy spin while the round kept reading/
@@ -340,14 +360,14 @@ void wait_events(int listener, int sockfd, int dns_evfd, int timeout_ms)
      * states that service_local_inputs/outputs already converge on
      * every round (readv EOF/RST -> ST_CLOSING, buffered output still
      * flushed), and POLLERR on the session socket is consumed by
-     * receive_vpn's recvmmsg — acting on them here would risk dropping
+     * receive_vpn's recvmmsg -- acting on them here would risk dropping
      * f->output. Only POLLNVAL (the fd is NOT open: an invariant
      * violation) is acted on, fail-safe:
      *  - flow fd: close/free the flow (it could never be read again);
      *  - listener / session socket / DNS eventfd: log and stop /
      *    session-lost so the caller reconnects instead of spinning on a
      *    dead core. (The dead LISTENER fd is additionally tolerated by
-     *    accept_connections' own EBADF pacing at ~1 line/s + 50ms —
+     *    accept_connections' own EBADF pacing at ~1 line/s + 50ms --
      *    that keep-alive path is preserved; a listener POLLNVAL here
      *    only fires with a listener-fd bug, which cannot recover.) */
     if (pr > 0) {
@@ -383,7 +403,7 @@ void accept_connections(int listener) {
      * by a successful accept). The kernel dequeues an aborted request, so a
      * real storm is bounded by the backlog; this counter makes the bound
      * EXPLICIT so that no pathological source of the error (one that keeps
-     * failing without ever removing a request — e.g. an injected fault) can
+     * failing without ever removing a request -- e.g. an injected fault) can
      * hold the loop inside accept_connections() and spin. Measured with an
      * injector that fails every accept4() unconditionally: 137.4M accepts
      * and 93% of a core in 5s without this bound; with it the loop returns
@@ -412,15 +432,15 @@ void accept_connections(int listener) {
                 return;
             /* R37 R3-M3: a signal-interrupted accept() is not a failure.
              * R38 P2-7: it retried immediately, with no bound and no
-             * pacing — the same hot-spin shape R5-WG-E fixed for the
+             * pacing -- the same hot-spin shape R5-WG-E fixed for the
              * aborted-request class. A signal does NOT dequeue a pending
              * request, so a pathological source that keeps interrupting
              * accept() would hold this loop inside accept_connections()
              * (the caller cannot pace a loop that never returns) and, with
              * a pending backlog, make every round burn unbounded syscalls.
-             * Bound the CONSECUTIVE retries with its own counter — a burst
+             * Bound the CONSECUTIVE retries with its own counter -- a burst
              * of interruptions must not silence the abort/fatal limiters
-             * and vice versa — and hand control back to wait_events();
+             * and vice versa -- and hand control back to wait_events();
              * EINTR only means "no connection was accepted", never "the
              * listener is broken", so exceeding the bound is a plain
              * return: the listener stays open, no backoff sleep and no
@@ -462,7 +482,7 @@ void accept_connections(int listener) {
              * conditions that can PERSIST and are not proof that a request
              * left the backlog; treating them as "just retry" is exactly
              * the shape that spun at 98-102% CPU before R3-M3, so they
-             * stay in the paced (backoff) class below — 50ms there buys
+             * stay in the paced (backoff) class below -- 50ms there buys
              * "never a hot spin".
              * log_debug only (compiled OUT in Release): an aborted peer
              * is a normal event, not a fault, and must not flood stderr.
@@ -470,15 +490,15 @@ void accept_connections(int listener) {
              * R37 R6-WG2 (R6-5): that last claim was false in Debug.
              * ABORT_DRAIN_MAX bounds only CONSECUTIVE retries inside one
              * call, while a listener with pending requests makes the
-             * caller's poll() return immediately every round — so with
+             * caller's poll() return immediately every round -- so with
              * IWAN_DEBUG=1 and a fault that keeps accept4() failing (e.g.
              * an injector) this logged without bound: measured 539.8k
              * lines/s / 35.6 MiB/s at HEAD. Same 1-line/s idiom as the
              * backoff below (its own counter, so a burst of aborted
              * accepts can never silence a resource-exhaustion warning or
-             * vice versa); log_debug is KEPT — the diagnostic exists only
+             * vice versa); log_debug is KEPT -- the diagnostic exists only
              * in Debug, and Debug is precisely the scenario that needs it
-             * — it is the unbounded RATE, not the line, that was the bug.
+             * -- it is the unbounded RATE, not the line, that was the bug.
              * `_Atomic uint64_t` + relaxed: same rationale as
              * relay_proxy.c:1931 (accept_connections runs on the single
              * socks event-loop thread today; the atomic is race-free by
@@ -511,7 +531,7 @@ void accept_connections(int listener) {
              * EHOSTDOWN is omitted, mingw-w64's errno.h has no such name)
              * are grouped here on purpose: they can persist for as long as
              * the network/firewall condition does, so they get the same
-             * ONE bounded sleep. Back off and then return — the main loop
+             * ONE bounded sleep. Back off and then return -- the main loop
              * must still run (under EMFILE it is the thing that releases
              * fds) but at ~20 cycles/s instead of a hot spin. The log is
              * rate-limited to one line per second so a persistent error
@@ -543,7 +563,7 @@ void accept_connections(int listener) {
              * bounded sleep is kept ONLY because accept_connections runs
              * unconditionally each round while wait_events()'s poll() on
              * a closed fd reports POLLNVAL and returns IMMEDIATELY
-             * (measured) — returning without pacing would turn a dead
+             * (measured) -- returning without pacing would turn a dead
              * listener into a 100% CPU spin, which is strictly worse than
              * one visible line per second. */
             static uint64_t last_acc_fatal_ms;
@@ -602,7 +622,7 @@ void accept_connections(int listener) {
             /* R37 R6-WG2 (K-2 Debug twin): a local client that keeps
              * reconnecting while locked out logs one line per attempt
              * (lockout is per-IP and long-lived), so this needed the same
-             * 1-line/s bound as the non-loopback refusal above — own
+             * 1-line/s bound as the non-loopback refusal above -- own
              * counter, neither signal may swallow the other. */
             static _Atomic uint64_t last_lockout_drop_ms;
             uint64_t ld_now = now_ms();
@@ -646,7 +666,7 @@ void accept_connections(int listener) {
                                 * beyond it, give the event loop its
                                 * receive turn instead of wedging it */
 
-/* Aggregate send-rate pacing (token bucket) is shared with proxy.c —
+/* Aggregate send-rate pacing (token bucket) is shared with proxy.c --
  * see pace_bucket in util.h. Enabled only via the environment variable
  * IWAN_SEND_PACING_PPS (default 0 = disabled). run_socks() initializes
  * the bucket and sock_drain_tx() accounts each batch with pace_take(). */
@@ -658,7 +678,7 @@ void accept_connections(int listener) {
  * EAGAIN/ENOBUFS block on POLLOUT for a bounded budget instead of
  * dropping; only fatal errors stop the proxy. The bound matters: this
  * drain runs at the TOP of the event loop, and an unbounded retry would
- * starve receive_vpn — the ACK rcvbuf would overflow while we spin on a
+ * starve receive_vpn -- the ACK rcvbuf would overflow while we spin on a
  * full send buffer, and the livelock (no ACKs -> RTO -> more retries)
  * stalls the tunnel for seconds. Items left unsent are safe to lose:
  * the tx queue's eviction contract recovers data segments by RTO and
@@ -673,10 +693,10 @@ void accept_connections(int listener) {
  * outstanding. This GSO+sendmmsg shape is the local optimum. */
 
 /* One transient EAGAIN/ENOBUFS/ENOMEM/EPERM drain stall (EINTR is handled by
- * the caller before this runs): emit a throttled diagnostic — one per
+ * the caller before this runs): emit a throttled diagnostic -- one per
  * second per drain path, each call site keeps its own last_diag static,
  * so a GSO stall and a sendmmsg stall within the same second are both
- * reported — then wait up to 1ms for the socket to become writable
+ * reported -- then wait up to 1ms for the socket to become writable
  * (writable means the buffer drained, so resend immediately; the old
  * poll-then-usleep inverted this and slept AFTER a writable poll).
  * Returns 1 to retry, or 0 when the bounded retry budget (shared by the
@@ -684,11 +704,40 @@ void accept_connections(int listener) {
  * then returns whatever it has sent so far, giving the event loop its
  * receive turn (see the function comment). Same retry shape as proxy.c
  * send_gso / send_batch. */
+/* tests/plane_matrix: map the userspace send path onto "kernel-plane semantics"
+ * for the two-link comparison matrix. Both switches affect only send pacing,
+ * never the protocol or checksums:
+ *   IWAN_TX_NO_GSO=1     disable UDP_SEGMENT batching, fall back to per-packet sendmsg
+ *                       (kernel plane does one ip_local_out per frame, no batching)
+ *   IWAN_TX_DROP_EBUSY=1  on EAGAIN/ENOBUFS give up this round at once instead of
+ *                       retrying (kernel ip_local_out cannot see bearer-queue
+ *                       congestion; it becomes loss, left to TCP). Names are literal, cached by pointer, no per-drain getenv. */
+static int socks_env_flag(const char *name)
+{
+    static const char *names[4];
+    static int vals[4];
+    static int n;
+
+    for (int i = 0; i < n; i++)
+        if (names[i] == name)
+            return vals[i];
+    const char *s = getenv(name);
+    int v = (s && *s && !(s[0] == '0' && s[1] == '\0')) ? 1 : 0;
+    if (n < 4) {
+        names[n] = name;
+        vals[n] = v;
+        n++;
+    }
+    return v;
+}
+
 static int socks_send_stall_wait(int sockfd, uint64_t retry_t0,
                                  uint64_t *last_diag, const char *diag_fmt,
                                  int npk, unsigned sent)
 {
     uint64_t nowd = now_ms();
+    if (socks_env_flag("IWAN_TX_DROP_EBUSY"))
+        return 0;                 /* kernel-plane semantics: drop on congestion, no wait */
     if (nowd - *last_diag >= 1000) {
         *last_diag = nowd;
         log_err(diag_fmt, strerror(errno), npk, sent);
@@ -705,7 +754,8 @@ static int socks_send_batch2(int sockfd, SocksConfig *cfg,
                              int npk, size_t total, size_t mss)
 {
     uint64_t retry_t0 = now_ms();
-    if (npk >= 2 && mss >= IWAN_GSO_MSS_MIN &&
+    if (!socks_env_flag("IWAN_TX_NO_GSO") &&
+        npk >= 2 && mss >= IWAN_GSO_MSS_MIN &&
         total <= IWAN_UDP_GSO_UNIT &&
         total <= IWAN_GSO_UNIT_SAFE) {
         if (cfg->gso_ok == 0) {
@@ -732,7 +782,7 @@ static int socks_send_batch2(int sockfd, SocksConfig *cfg,
                 cfg->gso_mss = mss;
         } else if (cfg->gso_ok < 0) {
             /* M11 (SUMMARY-2): a cached failure is re-probed at most
-             * once per second — the cause can be transient (temporary
+             * once per second -- the cause can be transient (temporary
              * resource exhaustion, a restored offload setting), and a
              * permanent disable would silently cap uplink throughput
              * for the process lifetime. Previously the disabled state
@@ -766,14 +816,14 @@ static int socks_send_batch2(int sockfd, SocksConfig *cfg,
                      errno == ENOBUFS || errno == EINTR ||
                      errno == EPERM ||
                      /* R23 (R22-B1-2): ENOMEM (socket-buffer/memory
-                      * pressure) is transient, same class as ENOBUFS —
+                      * pressure) is transient, same class as ENOBUFS --
                       * it must not permanently disable GSO (the old
                       * hard-error branch did) nor kill the session;
                       * unified across the pump family */
                      errno == ENOMEM)) {
                     /* EPERM: netfilter OUTPUT DROP returns EPERM for
                      * the dropped datagram (firewall rule, not a dead
-                     * tunnel) — transient per-packet, retry like
+                     * tunnel) -- transient per-packet, retry like
                      * EAGAIN; TCP retransmission covers the loss */
                     if (errno != EINTR) {
                         /* throttled diagnostic: identify which error
@@ -792,7 +842,7 @@ static int socks_send_batch2(int sockfd, SocksConfig *cfg,
                     continue;
                 }
                 /* hard error (EIO/EINVAL/EMSGSIZE/...): UDP_SEGMENT is
-                 * unusable on this socket — a feature failure, NOT a
+                 * unusable on this socket -- a feature failure, NOT a
                  * dead tunnel. Disable GSO permanently and fall through
                  * to the per-message sendmmsg path for this batch and
                  * all future ones; only that path may declare the
@@ -841,17 +891,17 @@ per_msg:
             if (errno == EAGAIN || errno == EWOULDBLOCK ||
                 errno == ENOBUFS || errno == EPERM ||
                 /* R23 (R22-B1-2): ENOMEM (socket-buffer/memory pressure)
-                 * is transient, same class as ENOBUFS — the old code
+                 * is transient, same class as ENOBUFS -- the old code
                  * marked the session lost on it here while the GSO path
                  * merely disabled GSO; unified across the pump family */
                 errno == ENOMEM) {
                 /* EPERM: netfilter OUTPUT DROP returns EPERM for the
-                 * dropped datagram — transient per-packet, retry like
+                 * dropped datagram -- transient per-packet, retry like
                  * EAGAIN (send buffer full: poll up to 1ms for
                  * writability, then retry immediately (writable -> the
                  * buffer drained -> resend; same shape as the GSO path
                  * above and proxy.c send_batch). Never blocks the
-                 * single event loop — receive_vpn must keep draining
+                 * single event loop -- receive_vpn must keep draining
                  * downlink (ACKs, keepalive replies) or the receive
                  * buffer
                  * overflows and the peer's segments (and our own ACK
@@ -863,7 +913,7 @@ per_msg:
                 /* R25 (R24-B1-1): count on the shared pump-family counter
                  * (EINTR is handled above, so this arm is exactly the
                  * EAGAIN/ENOBUFS/ENOMEM/EPERM transient class proxy.c
-                 * counts — SOCKS uplink pressure is now observable) */
+                 * counts -- SOCKS uplink pressure is now observable) */
                 atomic_fetch_add(&g_prof_send_eagain, 1);
                 if (!socks_send_stall_wait(sockfd, retry_t0, &last_diag,
                                            "SOCKS sendmmsg EAGAIN: %s (npk=%d sent=%u)",
@@ -872,7 +922,7 @@ per_msg:
                 continue;
             }
             if (errno == EMSGSIZE || errno == EINVAL) {
-                /* R37 R3-M4: same classification as the GSO path above —
+                /* R37 R3-M4: same classification as the GSO path above --
                  * a per-datagram reject (too large for the path MTU, or
                  * an option the datagram cannot carry) is a FEATURE
                  * failure of this batch, not a dead tunnel. Marking the
@@ -907,11 +957,11 @@ per_msg:
  * DATA segments are re-enqueued at the tail instead of being dropped
  * into RTO recovery: a dropped segment re-enters the still-full send
  * buffer on retransmit and the RTO doubling escalates into a 30s storm
- * under sustained backpressure. Pure-ACK control items are dropped —
+ * under sustained backpressure. Pure-ACK control items are dropped --
  * the stack regenerates them. A re-enqueued segment whose slot moved in
  * a later compaction still delivers one of the ring's genuine
  * (seq, payload) pairs (payloads are immutable once sealed), so the peer
- * assembles a correct stream — at worst a duplicate it dedups by seq. */
+ * assembles a correct stream -- at worst a duplicate it dedups by seq. */
 static void sock_drain_tx(int sockfd, SocksConfig *cfg)
 {
     struct iovec iovs[SOCKS_MAX_PK];
@@ -954,7 +1004,7 @@ static void sock_drain_tx(int sockfd, SocksConfig *cfg)
         if (sent < j - k + 1) {
             /* blocked: re-enqueue the unsent data segments (see above);
              * the already-sent items of this run were sent in order and
-             * are gone — re-enqueue from the first unsent one on */
+             * are gone -- re-enqueue from the first unsent one on */
             for (int m = k + sent; m < npk; m++)
                 if (items[m]->seg)
                     ns_tx_rearm_seg(&g_ns, items[m]->seg, items[m]->conn);
@@ -970,7 +1020,11 @@ void send_vpn_keepalive(int sockfd, const SocksConfig *cfg,
         return;
     buf_t p;
     buf_init(&p);
-    ctrl_hdr(&p, PT_ECHO_REQ, cfg->encryption, cfg->sid, cfg->token);
+    /* The official client sends a 60-byte ECHOREQ (36-byte payload); the peer
+     * echoes it verbatim and the tick measures one-way latency; old servers ignore the extra tail, so it can always be sent */
+    /* Measured on the official client: the ECHO frame header's encrypt bit is always 0 (only OPEN/DATA carry encryption) */
+    iwan_echo_build(&p, PT_ECHO_REQ, 0, cfg->sid, cfg->token,
+                    (struct iwan_echo_stats *)cfg->echo_stats, now_us());
     if (port_send(sockfd, p.data, p.len, 0) < 0) {
         /* transient failures (roaming, carrier hiccup) recover; the
          * main loop re-auths the tunnel once the counter hits the max */
@@ -1009,7 +1063,7 @@ static int vpn_handle_data(SocksConfig *cfg, uint8_t *b, size_t n,
          *
          * Deliberately still log_err, NOT log_debug: this is a
          * security-relevant downgrade signal and log_debug is compiled
-         * OUT in Release (util.h:46) — demoting it would REMOVE the
+         * OUT in Release (util.h:46) -- demoting it would REMOVE the
          * signal from every shipped build, which is the opposite of the
          * fix. The 1-line/s bound keeps Release visibility AND kills the
          * flood. The two mismatches below get SEPARATE counters on
@@ -1018,7 +1072,7 @@ static int vpn_handle_data(SocksConfig *cfg, uint8_t *b, size_t n,
          * re-authed with different encryption settings) and neither may
          * silence the other; the worst case is still only 2 lines/s.
          * Counter type: `_Atomic uint64_t` + relaxed load/store, the
-         * relay_proxy.c:1931 spelling — receive_vpn (and therefore this
+         * relay_proxy.c:1931 spelling -- receive_vpn (and therefore this
          * function) runs on the single socks event-loop thread today, but
          * the atomic costs nothing measurable, is race-free by
          * construction, and matches the project idiom for log limiters;
@@ -1066,7 +1120,7 @@ static int vpn_handle_data(SocksConfig *cfg, uint8_t *b, size_t n,
     if (plen < 20 || plen > (size_t)cfg->mtu)
         return 0;
     if ((b[8] >> 4) == 6) {
-        /* inner IPv6 (SOCKS targets over IPv6): R23-F1 — mirror the v4
+        /* inner IPv6 (SOCKS targets over IPv6): R23-F1 -- mirror the v4
          * M5 ingress filter: the downlink must be addressed to THIS
          * session's derived ULA and never claim it as source (defense in
          * depth on top of the server's H1 gate). */
@@ -1081,13 +1135,13 @@ static int vpn_handle_data(SocksConfig *cfg, uint8_t *b, size_t n,
     } else {
         /* ingress filter (audit M5): a downlink frame must be
          * addressed to THIS session's IP and must never claim our own
-         * address as source — anything else is an injector's forgery,
+         * address as source -- anything else is an injector's forgery,
          * not traffic the stack solicited */
         if (daddr != cfg->inner_ip || saddr == cfg->inner_ip)
             return 0;
     }
     /* M1: inner UDP packets whose dst port belongs to a pending
-     * tunnel DNS query are responses — consume them here, never
+     * tunnel DNS query are responses -- consume them here, never
      * hand them to the TCP stack */
     if (dns_try_handle_response(b + 8, plen))
         return 0;
@@ -1121,7 +1175,7 @@ static int vpn_handle_datagram(int sockfd, SocksConfig *cfg, uint8_t *b,
     if (psid != cfg->sid || ptok != cfg->token)
         return 0;
     /* A-4: a frame that passes the sid/token gate is a genuine downlink
-     * for THIS session (ECHO_REQ / CLOSE / DATA/DATA_ENC) — the true
+     * for THIS session (ECHO_REQ / CLOSE / DATA/DATA_ENC) -- the true
      * "session is alive" signal. The stale-session clock is reset HERE
      * (moved from receive_vpn's raw "v > 0" refresh, which spoofable
      * old/junk frames could keep asleep). The cfg parameter is available
@@ -1135,12 +1189,29 @@ static int vpn_handle_datagram(int sockfd, SocksConfig *cfg, uint8_t *b,
         log_err("VPN server closed the session (CLOSE)");
         cfg->session_lost = true;   /* re-auth + re-run (caller loop) */
         return -1;
-    }    if (t == PT_ECHO_REQ) {
+    }    if (t == PT_ECHO_RES) {
+        if (!verify_sig(b, n))
+            return 0;
+        /* The peer echoes our 36-byte payload verbatim: update cur/min/max */
+        if (n > IWAN_CTRL_LEN) {
+            struct iwan_echo_stats *es = (struct iwan_echo_stats *)cfg->echo_stats;
+            bool first = !es->have;
+            iwan_echo_observe(es, b + IWAN_CTRL_LEN, n - IWAN_CTRL_LEN, now_us());
+            if (first && es->have)
+                log_debug("ECHO: first keepalive reply %u bytes (stride=%u cur=%u us)",
+                          (unsigned)(n - IWAN_CTRL_LEN), IWAN_ECHO_LEN, es->cur);
+        }
+        return 0;
+    }
+    if (t == PT_ECHO_REQ) {
         if (!verify_sig(b, n))
             return 0;
         buf_t p;
         buf_init(&p);
         ctrl_hdr(&p, PT_ECHO_RES, cfg->encryption, cfg->sid, cfg->token);
+        /* The official client echoes the request payload verbatim; without a payload keep the old 24-byte reply */
+        if (n >= IWAN_CTRL_LEN + IWAN_ECHO_LEN)
+            buf_put(&p, b + IWAN_CTRL_LEN, IWAN_ECHO_LEN);
         /* a failed reply is not worth tearing the session down for: the
          * next ECHO_REQ gets an answer (or the keepalive machinery
          * detects a dead socket) */
@@ -1258,7 +1329,7 @@ int receive_vpn(int sockfd, SocksConfig *cfg) {
         int v = port_recvmmsg(sockfd, rx_msgs, (unsigned)got,
                               MSG_DONTWAIT, NULL);
         /* A-4: last_rx is NOT refreshed here merely because a datagram
-         * was received — the old "v > 0 => refresh" rule let a peer
+         * was received -- the old "v > 0 => refresh" rule let a peer
          * keep the stale-session watchdog asleep by flooding frames
          * whose sid/token gate then rejects them. It is refreshed
          * inside vpn_handle_datagram only AFTER the sid/token gate
@@ -1268,7 +1339,7 @@ int receive_vpn(int sockfd, SocksConfig *cfg) {
         /* EINTR is tolerated (falls into the v <= 0 drained branch
          * below): Linux native recvmmsg returns -1/EINTR when a
          * stopping-class signal interrupts the syscall at entry with 0
-         * received, whereas macOS/Windows normalize that to 0 — treating
+         * received, whereas macOS/Windows normalize that to 0 -- treating
          * it as a drop would reconnect the tunnel on Linux only. */
         if (v < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
             errno != ECONNREFUSED && errno != EINTR) {
@@ -1277,7 +1348,7 @@ int receive_vpn(int sockfd, SocksConfig *cfg) {
             log_err("receive_vpn: recvmmsg: %s", strerror(errno));
             /* ECONNRESET is deliberately NOT tolerated here: socks is a
              * connected-type VPN tunnel, so a reset means real loss and
-             * reconnect is correct — unlike the proxy's UDP->TUN pump,
+             * reconnect is correct -- unlike the proxy's UDP->TUN pump,
              * which normalizes it to 0. */
             cfg->session_lost = true;   /* abnormal: reconnect, not a
                                          * clean user stop (run_socks
@@ -1302,7 +1373,7 @@ int receive_vpn(int sockfd, SocksConfig *cfg) {
             if (r < 0) {
                 /* the handler did not take pool ownership: release the
                  * current slot too, or a PT_CLOSE (and any other fatal
-                 * return) leaks it — 256 slots, init-once, and an
+                 * return) leaks it -- 256 slots, init-once, and an
                  * in-place re-auth per CLOSE would exhaust the pool
                  * (SUMMARY-2 M9) */
                 ns_rx_buf_release(rx_bufs[i]);
@@ -1356,7 +1427,7 @@ static void socks_reauth_flows(void)
         uint16_t port = f->tgt_port;
         uint8_t af = f->tgt_af;
         f->ns_idx = -1;
-        /* R37 R1-A-10: no ns_flow_unref here either — the ref for the new
+        /* R37 R1-A-10: no ns_flow_unref here either -- the ref for the new
          * slot is taken by open_tcp_connection{6} below. */
         f->rx_paused = false;
         if (af == 6)
@@ -1366,7 +1437,7 @@ static void socks_reauth_flows(void)
         else {
             /* A5-4: af must be 4 or 6 here (tgt_af is validated at flow
              * creation); an unexpected af (0) would fall through with
-             * ns_idx == -1 and the flow left in ST_ESTABLISHED — a state
+             * ns_idx == -1 and the flow left in ST_ESTABLISHED -- a state
              * nothing can read, re-establish or reap, so the fd + flow slot
              * are pinned and POLLIN busy-polls poll() forever. Converge to
              * ST_CLOSING like the ST_RESOLVING arm above. */
@@ -1388,9 +1459,9 @@ static int socks_reauth_tunnel(SocksConfig *cfg)
     int old_mtu = cfg->mtu;
     int newfd = -1;
     if (cfg->reauth(cfg->reauth_ud, cfg, &newfd) != 0 || newfd < 0) {
-        cfg->reauth_at = now_ms() + SOCKS_KEEPALIVE_MS;
+        cfg->reauth_at = now_ms() + SOCKS_REAUTH_MS;
         log_err("SOCKS: tunnel re-auth failed; retrying in %us",
-                SOCKS_KEEPALIVE_MS / 1000);
+                SOCKS_REAUTH_MS / 1000);
         return -1;
     }
     cfg->last_rx = now_ms();
@@ -1404,7 +1475,7 @@ static int socks_reauth_tunnel(SocksConfig *cfg)
      * old socket closes and reset the wait table for the new session */
     dns_stop();
     /* R25-f1 F1: publish g_dns_server_ip4 under the same DNS wait mutex the
-     * workers snapshot under (R20 contract) — dns_stop/dns_reset self-lock,
+     * workers snapshot under (R20 contract) -- dns_stop/dns_reset self-lock,
      * but the write to g_dns_server_ip4 between them does not otherwise; an
      * unlocked write vs the worker's unlocked read is a formal data race
      * (the exact class R20 claimed fixed). */
@@ -1425,7 +1496,7 @@ static int socks_reauth_tunnel(SocksConfig *cfg)
          * sid/token gate in receive_vpn. */
         /* R4-09-F3: dns_reset() above retired all in-flight DNS workers and
          * cleared the wait table, so a flow still in ST_RESOLVING can never
-         * get a result — fail it now (matching the IP-change path) rather
+         * get a result -- fail it now (matching the IP-change path) rather
          * than leave it hanging to the 30s handshake timeout with no reply. */
         for (int i = 0; i < MAX_FLOWS; i++) {
             Flow *f = &g_flows[i];
@@ -1444,7 +1515,7 @@ static int socks_reauth_tunnel(SocksConfig *cfg)
     } else {
         /* the server re-assigned our inner IP: rebuild the stack and
          * re-establish every active flow on the new tunnel */
-        /* FIND-R19-F5: netif_add failure must not be swallowed — return -1
+        /* FIND-R19-F5: netif_add failure must not be swallowed -- return -1
          * so the caller re-auth retry schedule (reauth_at backoff) fixes
          * the stack instead of running receive_vpn against a dead netif. */
         dns_session_lock();   /* R20: publish under the DNS wait mutex */
@@ -1460,10 +1531,10 @@ static int socks_reauth_tunnel(SocksConfig *cfg)
              * reauth_at alone: the re-auth callback had already SUCCEEDED
              * and cleared it to 0 (the success arm at :1181), so the stale
              * watchdog / retry / keepalive-fail gates all saw "no backoff
-             * needed" and never re-fired — a failed stack rebuild silently
+             * needed" and never re-fired -- a failed stack rebuild silently
              * left the tunnel dead for up to SOCKS_RX_STALE_MS (120s).
-             * Same schedule as :1174: retry in SOCKS_KEEPALIVE_MS. */
-            cfg->reauth_at = now_ms() + SOCKS_KEEPALIVE_MS;
+             * Same schedule as :1174: retry in SOCKS_REAUTH_MS. */
+            cfg->reauth_at = now_ms() + SOCKS_REAUTH_MS;
             log_err("SOCKS: stack rebuild failed");
             return -1;
         }
@@ -1484,7 +1555,7 @@ static void socks_reauth_swap(int *sockfd, int nfd, SocksConfig *cfg)
     if (nfd < 0)
         return;
     /* FIND-F02-1: the GSO cache lives on the SocksConfig but UDP_SEGMENT is
-     * a per-SOCKET option — after swapping in a fresh session fd the old
+     * a per-SOCKET option -- after swapping in a fresh session fd the old
      * gso_ok/gso_mss describe a socket that no longer exists (the new one
      * was never configured), so reset to untried and let the next send
      * batch re-probe. Otherwise the inline state machine would send long
@@ -1504,8 +1575,8 @@ static void socks_reauth_swap(int *sockfd, int nfd, SocksConfig *cfg)
      * run_pump applies to every session socket.
      *
      * Rollback (same ownership rule as the nfd < 0 early return above): the
-     * new fd is closed HERE, *sockfd/g_sockfd keep the OLD — still
-     * non-blocking — socket, and nothing in cfg points at the closed fd, so
+     * new fd is closed HERE, *sockfd/g_sockfd keep the OLD -- still
+     * non-blocking -- socket, and nothing in cfg points at the closed fd, so
      * run_socks teardown still closes exactly one fd and the callers' `nfd`
      * bookkeeping (which tests socks_reauth_tunnel's return, not this swap)
      * stays valid. cfg->gso_ok/gso_mss above are merely back to "untried"
@@ -1596,7 +1667,7 @@ int run_socks(int sockfd, SocksConfig *cfg) {
         port_close(sockfd);   /* A-1: own + close sockfd on every return */
         return -1;   /* R13-M-1: startup failure, NOT a clean user stop */
     }
-    /* A-6: non-blocking mode is not optional here — a blocking listener
+    /* A-6: non-blocking mode is not optional here -- a blocking listener
      * would freeze the single-threaded event loop on the first accept,
      * and a blocking session socket would stall sends. Refuse to start
      * (same style as the error paths above) rather than half-set-up.
@@ -1655,7 +1726,7 @@ int run_socks(int sockfd, SocksConfig *cfg) {
     g_sockfd = sockfd;
     /* R20 (R06 M-3): dns_set_server/ns_init/ns_set_outer publish the
      * session globals DNS workers build packets from (g_dns_server_ip4,
-     * g_ns.ip/outer_hdr/xor_key) — write them under the DNS wait mutex so
+     * g_ns.ip/outer_hdr/xor_key) -- write them under the DNS wait mutex so
      * the workers' locked snapshot reads are race-free (previously an
      * unlocked write vs unlocked read = formal C11 data race). */
     dns_session_lock();
@@ -1664,7 +1735,7 @@ int run_socks(int sockfd, SocksConfig *cfg) {
     /* Rust prints the configured address (config.listen), not the bound one */
     const char *listen_s = cfg->listen_str ? cfg->listen_str : "?";
 
-    /* FIND-R19-F5: netif_add failure is a real startup failure — close the
+    /* FIND-R19-F5: netif_add failure is a real startup failure -- close the
      * listener + session socket (A-1) and return the R13 three-state -1
      * instead of running receive_vpn against a half-built stack. */
     if (!ns_init(&g_ns, cfg->inner_ip, cfg->gateway, (uint16_t)cfg->mtu)) {
@@ -1730,14 +1801,16 @@ int run_socks(int sockfd, SocksConfig *cfg) {
                   (cfg->gateway >> 8) & 0xff, cfg->gateway & 0xff, cfg->mtu);
 
     uint64_t last_ka = now_ms() - SOCKS_KEEPALIVE_MS;
-    unsigned stale_ms = socks_rx_stale_ms();   /* parsed once, cached */
+    /* Use the official 15 s only if the peer answers keepalives; otherwise fall back to the conservative value (see function comment) */
+    const struct iwan_echo_stats *es = (const struct iwan_echo_stats *)cfg->echo_stats;
+    unsigned stale_ms = socks_rx_stale_ms(es->have);
 
     while (!g_stop && !g_user_stop) {
         /* downlink-silence watchdog: re-auth the tunnel in place (the
-         * listener, flows and inner TCP survive); the old behavior —
-         * declaring the session lost and exiting — only applies when no
+         * listener, flows and inner TCP survive); the old behavior --
+         * declaring the session lost and exiting -- only applies when no
          * re-auth callback was provided. stale_ms == 0 disables it. */
-        /* A-2: fold the watchdog into the reauth_at backoff — a stale
+        /* A-2: fold the watchdog into the reauth_at backoff -- a stale
          * trigger while a previous re-auth is still backing off (a
          * failed auth sets reauth_at = now+10s) must NOT immediately
          * fire a second full re-auth. legacy (!cfg->reauth) keeps
@@ -1782,7 +1855,7 @@ int run_socks(int sockfd, SocksConfig *cfg) {
         /* the queue drained: let lwIP retry output it held on ERR_MEM */
         ns_tx_kick(&g_ns);
         send_vpn_keepalive(sockfd, cfg, &last_ka);
-        /* A-3: same reauth_at backoff as the stale watchdog — a failed
+        /* A-3: same reauth_at backoff as the stale watchdog -- a failed
          * re-auth sets reauth_at (= now+10s) and does NOT reset ka_fail
          * (only success does), so without this gate every loop round
          * would re-auth again and blast the server. legacy keeps
@@ -1805,7 +1878,7 @@ int run_socks(int sockfd, SocksConfig *cfg) {
              * callback exists, else legacy exit for the caller loop.
              * A-6: fold this trigger into the same reauth_at backoff as
              * the A-2 stale watchdog / :1533 retry / A-3 keepalive-fail
-             * gates — a repeated hard recv error while a previous
+             * gates -- a repeated hard recv error while a previous
              * re-auth is still backing off (a failed auth set reauth_at
              * = now+10s) must NOT fire another full re-auth every loop
              * round. Under a sustained hard error the old code re-auth'd
@@ -1835,7 +1908,7 @@ int run_socks(int sockfd, SocksConfig *cfg) {
                  * (mirrors the session_lost branch above, :1062-1063). */
                 cfg->session_lost = false;
             } else {
-                /* A-6: still inside the reauth_at backoff window — do
+                /* A-6: still inside the reauth_at backoff window -- do
                  * NOT re-auth now. Clear session_lost (same A-5 reason:
                  * without it the next round's session_lost branch would
                  * fire a re-auth ahead of the schedule) and fall through
@@ -1893,7 +1966,7 @@ int run_socks(int sockfd, SocksConfig *cfg) {
     dns_stop();
     g_sockfd = -1;
     /* L-4: the global config pointer still refers to the caller's stack
-     * cfg after we return — NULL it so nothing can dereference a dangling
+     * cfg after we return -- NULL it so nothing can dereference a dangling
      * pointer on a later re-entry or from another thread. */
     g_socks_cfg = NULL;
 
@@ -1913,7 +1986,7 @@ int run_socks(int sockfd, SocksConfig *cfg) {
 
     /* A-1 ownership contract: run_socks owns sockfd and MUST close the
      * CURRENT value on exit (the original fd, or the new fd swapped in
-     * by a re-auth — the old one was already closed inside
+     * by a re-auth -- the old one was already closed inside
      * socks_reauth_swap, so this is a single close either way; without
      * reauth it is the original fd). Callers must NOT close it
      * themselves: with a re-auth the caller-held old fd number may have
@@ -1943,7 +2016,7 @@ int run_socks(int sockfd, SocksConfig *cfg) {
 #endif
     /* R25 (R24-B1-1): run_socks replaces run_pump in the same process,
      * so the shared g_prof_send_eagain counter (incremented by
-     * sock_drain_tx above) would never be read — run_pump's [pump-prof]
+     * sock_drain_tx above) would never be read -- run_pump's [pump-prof]
      * tail reader does not run here. Read it ourselves under the same
      * IWAN_PUMP_PROF gate so SOCKS uplink send pressure stays observable
      * at teardown (whole-run counter, printed once like pump_prof_print). */

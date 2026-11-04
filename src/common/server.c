@@ -10,11 +10,13 @@
 
 #include "common.h"
 #include "crypto.h"
+#include "frag.h"
 #include "ipv4.h"
 #include "profile.h"
 #include "protocol.h"
 #include "server.h"
 #include "server_rate.h"
+#include "sr.h"
 #include "tun.h"
 #include "util.h"
 
@@ -30,8 +32,8 @@
  * Every inner TCP packet is swapped (addresses, ports, seq/ack, flags,
  * checksums) and sent back. Two counters per 4-tuple make the mirror
  * correct under both delayed ACKs and retransmits:
- *   client_max — the highest contiguous client seq+len seen (dedup);
- *   emit_seq   — the next seq our mirrored stream will use.
+ *   client_max -- the highest contiguous client seq+len seen (dedup);
+ *   emit_seq   -- the next seq our mirrored stream will use.
  * A new segment is echoed at emit_seq and advances both counters; a
  * retransmit (client seq behind client_max) is re-echoed at the
  * position its content was originally mirrored to (emit_seq minus the
@@ -40,7 +42,7 @@
  * client discards almost all echoes), and a naive advance-on-seen table
  * fails on the first lost echo (the retransmit advances the table a
  * second time and every later mirror is discarded as out-of-order).
- * The first segment of a connection (its SYN — the only packet that
+ * The first segment of a connection (its SYN -- the only packet that
  * creates an entry) must always be treated as NEW data: the retransmit
  * heuristic reads client_max - s_orig, but with a fresh entry
  * client_max stays 0, so an initial ISN in the upper half of the seq
@@ -52,11 +54,11 @@
 #define ECHO_MAX_CONN 64
 struct echo_conn {
     uint8_t  af;                 /* 4 or 6 */
-    uint32_t c_ip;               /* client inner IP (BE) — af == 4 */
-    uint8_t  c6[16];             /* client inner address — af == 6 */
+    uint32_t c_ip;               /* client inner IP (BE) -- af == 4 */
+    uint8_t  c6[16];             /* client inner address -- af == 6 */
     uint16_t c_port;
-    uint32_t t_ip;               /* target IP (BE) — af == 4 */
-    uint8_t  t6[16];             /* target address — af == 6 */
+    uint32_t t_ip;               /* target IP (BE) -- af == 4 */
+    uint8_t  t6[16];             /* target address -- af == 6 */
     uint16_t t_port;
     uint32_t client_max;         /* highest client seq+len seen */
     uint32_t emit_seq;           /* next seq our mirrors will use */
@@ -124,6 +126,7 @@ static int echo_seq_advance(uint8_t af, const uint32_t *c4,
                             const uint32_t *t4, const uint8_t t6[16],
                             uint16_t dport, uint8_t flags,
                             uint32_t s_orig, size_t paylen,
+                            uint32_t cli_ack, uint32_t wnd,
                             uint32_t *seq_out)
 {
     struct echo_conn *ec = echo_lookup(af, c4, c6, sport, t4, t6, dport,
@@ -135,13 +138,13 @@ static int echo_seq_advance(uint8_t af, const uint32_t *c4,
         len++;               /* SYN/FIN each consume one sequence number */
     /* R20 (R09 M-3): echo_lookup released g_echo_mu, but the RMW on
      * client_max/emit_seq/seeded below is shared state (several SO_REUSEPORT
-     * recv threads) — re-lock around the whole read/modify. The entry is
+     * recv threads) -- re-lock around the whole read/modify. The entry is
      * safe against mid-flight reclamation: a hit or just-created entry has
      * last_ms=now, so no other thread can idle-reclaim it for 60s. */
     pthread_mutex_lock(&g_echo_mu);
     if (!ec->seeded) {
         /* First segment for this 4-tuple (in practice its SYN, the only
-         * segment that creates an entry): never a retransmit — always a
+         * segment that creates an entry): never a retransmit -- always a
          * fresh new-data packet. The retransmit test below relies on a
          * valid client_max and would otherwise misfire for an initial
          * ISN in [2^31+1, 2^32-1] (a fresh client_max of 0 wraps
@@ -161,6 +164,13 @@ static int echo_seq_advance(uint8_t af, const uint32_t *c4,
             return 0;
         }
     }
+    /* NOTE: this used to throttle by the client's advertised window (drop the round
+     * when the window is insufficient). Measured worse: the mirror's ACKs ride only
+     * on echo packets, so once echoes stop the client's uplink window stops
+     * advancing and both directions stall (good link: 241 Mbps -> 1.8 Mbps). Doing
+     * it right needs decoupled ACKs (pure ACKs + a real send queue), another order of magnitude; noted here. */
+    (void)cli_ack;
+    (void)wnd;
     *seq_out = ec->emit_seq;
     ec->client_max = s_orig + len;
     ec->emit_seq += len;
@@ -168,7 +178,7 @@ static int echo_seq_advance(uint8_t af, const uint32_t *c4,
     return 0;
 }
 /* shared echo ack/flags rules: the mirrored ack advances past the
- * client's bytes — SYN and FIN each consume one sequence number — and
+ * client's bytes -- SYN and FIN each consume one sequence number -- and
  * SYN/FIN echoes carry the ACK flag. Returns the ack; *flags is
  * updated in place (the caller writes it to the packet). */
 static uint32_t echo_mirror_ack(uint32_t s_orig, size_t paylen, uint8_t *flags)
@@ -226,7 +236,7 @@ static int echo_mirror(struct server_ctx *ctx, uint8_t *p, size_t len,
  * always win, however many forged frames arrive. The cost is that a
  * spoofer who already knows the sid can test guesses at line rate; it
  * must still find the 32-bit token (and, blindly, the 16-bit sid), while
- * the unspoofable non-peer class stays capped at 4 tested guesses/s —
+ * the unspoofable non-peer class stays capped at 4 tested guesses/s --
  * and that is the class every NAT neighbour / stale-token device lands
  * in. RATE_TOKEN_MISMATCH_BOUND_MAX is kept as the saturation point of
  * the observability counter (a bound-address mismatch storm is the
@@ -240,14 +250,14 @@ static int echo_mirror(struct server_ctx *ctx, uint8_t *p, size_t len,
  * frames may take the session table's global write lock, switching
  * over-budget sources to a lock-free drop. Since it fires only after the
  * compare and only on frames that are dropped either way, it changes no
- * delivery — see server_rate_allow_tokbad(). */
+ * delivery -- see server_rate_allow_tokbad(). */
 #define RATE_TOKEN_MISMATCH_MAX 4        /* non-peer sources, per session */
 #define RATE_TOKEN_MISMATCH_BOUND_MAX 64 /* bound-peer address, per session */
 /* Rate-table hashing: Knuth's multiplicative hash. The constant is
  * 2^32 / golden ratio (~2654435761); multiplying by this odd number
  * scrambles the low bits of the key across the full 32-bit range, and
  * keeping the TOP bits afterwards spreads sequential client IPs evenly
- * over the table — a plain "ip % 1024" would keep only the low 10 bits,
+ * over the table -- a plain "ip % 1024" would keep only the low 10 bits,
  * so e.g. 10.0.0.1 and 10.0.4.1 would land in the same bucket. 1024
  * buckets (1<<10, so the index is a cheap shift, 32 KB of state) is the
  * tradeoff: large enough that a few hostile sources rarely collide,
@@ -273,7 +283,7 @@ static atomic_uint_fast64_t g_send_drops;
 atomic_uint_fast64_t g_prof_srv_recv, g_prof_srv_tunw, g_prof_srv_tunr,
     g_prof_srv_dlsend;
 static atomic_ullong g_dl_pkts;   /* UDP datagrams sent (incl. control
-                                   * frames like OPEN_ACK/PING_RSP — the
+                                   * frames like OPEN_ACK/PING_RSP -- the
                                    * counter is not a pure data metric) */
 static atomic_ullong g_dl_drops;  /* downlink inner-IPv4 gate drops (H1) */
 /* L37: unknown-sid DATA/PT_DATA_ENC/CLOSE frames per source per window.
@@ -282,15 +292,15 @@ static atomic_ullong g_dl_drops;  /* downlink inner-IPv4 gate drops (H1) */
 /* R47-H2-M2: per-source pre-budget for BOUND-class wrong-token DATA
  * frames (rate_allow_tokbad, same family as rate_allow_sid_miss: shared
  * per-source shard buckets + a lock-free over-budget gate). Default
- * 4096 per source-IP per RATE_WINDOW_MS (1 s) — roughly three orders of
+ * 4096 per source-IP per RATE_WINDOW_MS (1 s) -- roughly three orders of
  * magnitude above the legitimate boundary: an honest client with a stale
  * token sends a handful of wrong-token frames and re-OPENs, so 4096/s
  * can never misjudge it, while a focused attacker is capped at 4096
- * global-write-lock acquisitions per second (sub-µs each) before its
+ * global-write-lock acquisitions per second (sub-us each) before its
  * frames switch to the lock-free drop fast path. This budget is a COST
  * cap on write-lock acquisitions, never a delivery gate: it fires only
  * AFTER a token compare failed, so a correct-token frame can never touch
- * it, and a wrong-token frame is dropped either way — see
+ * it, and a wrong-token frame is dropped either way -- see
  * server_rate_allow_tokbad() and the RATE_TOKEN_MISMATCH bound-class note.
  * Env IWAN_RATE_TOKBAD_MAX (rate_limit_env: 1..65535). */
 /* R48-F1(2/3): per-source pre-budget for known-sid wrong-token CLOSE
@@ -300,14 +310,14 @@ static atomic_ullong g_dl_drops;  /* downlink inner-IPv4 gate drops (H1) */
  * lock but left one write lock per KNOWN-sid CLOSE frame until the token
  * compare; a spoofer who knows a live sid (held in the plaintext 8-byte
  * header, ~16-33 s blind scan) and forges the victim peer's ip:port
- * byte-for-byte makes every such frame fail only AT the compare — after
- * one global sess_lock WRITE lock — so the bound class still convoyed
+ * byte-for-byte makes every such frame fail only AT the compare -- after
+ * one global sess_lock WRITE lock -- so the bound class still convoyed
  * the rwlock at line rate (R48-CLOSE-1's residual, which the DATA-side
  * R47-H2-M2 budget never covered). Same default 4096 per source-IP per
  * RATE_WINDOW_MS (1 s), same cost-cap-not-delivery-gate argument: it
  * fires only AFTER a CLOSE token compare failed, so the real peer's
  * correct-token CLOSE wipe is never even charged, and it bounds
- * write-lock acquisitions, not delivery — see server_rate_allow_close().
+ * write-lock acquisitions, not delivery -- see server_rate_allow_close().
  * Env IWAN_RATE_CLOSE_MAX (rate_limit_env: 1..65535). */
 /* R47-H2-M1: default per-session uplink fairness throttle window (ms),
  * applied only after THIS session's TUN write hit a full device queue.
@@ -329,7 +339,7 @@ static atomic_ullong g_dl_drops;  /* downlink inner-IPv4 gate drops (H1) */
 static pthread_mutex_t g_log_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static uint64_t server_dl_pkts(void);
-/* R37-F3 (R3-M5): printf-like wrapper (vfprintf(stdout, fmt, ap)) — see
+/* R37-F3 (R3-M5): printf-like wrapper (vfprintf(stdout, fmt, ap)) -- see
  * util.h; without the attribute its call sites were unchecked. On a
  * function definition GCC wants the attribute before the declarator. */
 static void IWAN_PRINTF_LIKE(1, 2)
@@ -360,7 +370,7 @@ void server_ctx_destroy(struct server_ctx *ctx)
 /* ---- uplink per-step timing (IWAN_DEBUG=1, printed once per second) ---- */
 struct up_stats {
     /* R20 (F06-2): each g_up[tid] is RMW'd by recv thread tid while the
-     * primary thread sums AND zeroes it in server_up_stats_print — atomic
+     * primary thread sums AND zeroes it in server_up_stats_print -- atomic
      * fields remove the cross-thread data race on every counter. */
     _Atomic uint64_t n;
     _Atomic uint64_t parse;   /* frame parse + rate_allow + dispatch */
@@ -380,16 +390,16 @@ static struct up_stats g_up[IWAN_SRV_THREADS_MAX];
  * of the multi-queue fan-out (A/B benchmark switch; cached at startup) */
 static bool srv_tun_single(void)
 {
-    /* R20: called from every recv thread's handle_udp — atomic cache.
+    /* R20: called from every recv thread's handle_udp -- atomic cache.
      * R37 R2: a boolean env must treat "0"/"false"/"no"/"off"/"" as OFF;
      * existence-only parsing made IWAN_SRV_TUN_SINGLE=0 mean ON, the
      * opposite of what an operator writing "=0" intends.
-     * R38 P1-3: the sixth spelling that chain implemented now has a name —
+     * R38 P1-3: the sixth spelling that chain implemented now has a name --
      * env_bool_value(ENV_BOOL_CS_NO, ...) (util.h): LOOSE's off tokens,
      * case-SENSITIVE, "no" included, unset/empty -> dflt. Value-for-value
      * equivalence with the removed inline chain was proven over 15 cells
      * (NULL, "", 0/false/no/off, NO/No/OFF/False, 1/yes/0x/00/"0 ") before
-     * the swap — see .cc_tmp/r38/fixes/notes-srv-h1.md; dflt is false to
+     * the swap -- see .cc_tmp/r38/fixes/notes-srv-h1.md; dflt is false to
      * match the old `e && *e` short-circuit. The cached-atomic protocol
      * and relaxed orderings are unchanged. */
     static _Atomic int v = -1;
@@ -420,9 +430,9 @@ static uint64_t now_ns(void)
 
 /* R37 R7 (R3-L37): last g_rate_drops total the operator has already been
  * told about, by either printer (the Debug stats line or the always-on
- * line below). Both run on the primary recv thread — R38 P2-14: that
+ * line below). Both run on the primary recv thread -- R38 P2-14: that
  * invariant is a hard API contract now written into server.h; the caller
- * in src/iwan_server.c gates both on tid==0 — so no atomic is needed;
+ * in src/iwan_server.c gates both on tid==0 -- so no atomic is needed;
  * server_up_stats_print() refreshes it so the always-on line does not
  * repeat a number the stats line just printed. */
 
@@ -460,7 +470,7 @@ void server_up_stats_print(void)
             (unsigned long long)atomic_load(&g_dl_drops),
             (unsigned long long)server_rate_drops_total());
     /* R37 R7 (R3-L37): this line already reported the ratedrop total, so
-     * mark it as reported — server_server_rate_drops_maybe_print() then stays
+     * mark it as reported -- server_server_rate_drops_maybe_print() then stays
      * quiet instead of repeating the same number on its own line. */
     server_rate_drops_mark_reported();
     for (int t = 0; t < g_up_nthreads; t++) {
@@ -479,7 +489,7 @@ void server_up_stats_print(void)
 /* R37 R7 (R3-L37): report per-source rate-limit drops in EVERY build.
  *
  * Why this exists: g_rate_drops is otherwise observable only through the
- * "uplink: ... ratedrop=" stats line, which lives in the debug tier —
+ * "uplink: ... ratedrop=" stats line, which lives in the debug tier --
  * Release builds default to IWAN_DEBUG_STRIP=ON, where debug_enabled() is
  * a compile-time false and server_up_stats_print() is never called at
  * all. Even in Debug that line is suppressed while no DATA was delivered
@@ -492,17 +502,17 @@ void server_up_stats_print(void)
  *    an idle server writes nothing;
  *  - at most one line per second (RATE_DROPS_PRINT_MS), so a flood cannot
  *    turn this into a log amplifier; the printed delta is then the growth
- *    accumulated since the last line that reported the TOTAL — which is
+ *    accumulated since the last line that reported the TOTAL -- which is
  *    either a previous `rate:` line or, in Debug with IWAN_DEBUG=1, the
  *    `uplink: ... ratedrop=` stats line, since server_up_stats_print()
  *    refreshes the same g_rate_drops_reported latch (R38 P2-15: so
  *    `+delta` is always unreported growth and never re-counts a total the
- *    stats line already showed — it is NOT necessarily the delta since the
+ *    stats line already showed -- it is NOT necessarily the delta since the
  *    previous `rate:` line specifically);
  *  - stderr, same stream as the Debug stats line;
  *  - caller: the primary recv thread's 1 Hz housekeeping tick
  *    (src/iwan_server.c), right after the debug-gated stats print.
- *    Primary recv thread ONLY — it shares the plain, non-atomic
+ *    Primary recv thread ONLY -- it shares the plain, non-atomic
  *    g_rate_drops_reported and file-static last_ms latches with
  *    server_up_stats_print(); see the R38 P2-14 contract in server.h. */
 #define RATE_DROPS_PRINT_MS 1000
@@ -514,7 +524,7 @@ void server_up_stats_print(void)
 
 /* printable-only copy of an attacker-controlled string for logging.
  *
- * R3-L20: C0 + DEL alone is not enough — the C1 block (0x80..0x9F) holds
+ * R3-L20: C0 + DEL alone is not enough -- the C1 block (0x80..0x9F) holds
  * the 8-bit CSI (0x9B), OSC (0x9D) and the other escape introducers, so
  * a username like "\x9b31m" (8-bit SGR) or "\x9b2J" (erase display) went
  * to stdout raw and let an unauthenticated OPEN forge terminal output.
@@ -529,7 +539,7 @@ void server_up_stats_print(void)
  * are rejected with the same criteria as https.c's https_utf8_seq.
  * Everything that is not part of a valid sequence becomes '?', so no
  * lead byte can leak.  Input is a NUL-terminated C string (usernames),
- * so — unlike https.c's length-carrying sanitizer — an embedded NUL
+ * so -- unlike https.c's length-carrying sanitizer -- an embedded NUL
  * still ends the visible value. */
 static size_t utf8_seq_len(const char *in, size_t avail)
 {
@@ -576,7 +586,7 @@ static void log_escape(const char *in, char out[], size_t outsz)
             if (i + seq + 1 > outsz)
                 break;              /* no room for the whole char */
             /* C2 80..C2 9F is U+0080..U+009F: a C1 control in its only
-             * legal two-byte form, not text — neutralise the WHOLE group
+             * legal two-byte form, not text -- neutralise the WHOLE group
              * with one '?' instead of leaking the 0xC2 lead byte (R17,
              * R16-4) */
             if (seq == 2 && c == 0xC2 &&
@@ -629,9 +639,9 @@ static bool tok_win_live(const struct server_session *s, uint64_t now)
  * WITHOUT comparing the token, so the budget really caps how many guesses
  * the server ever tests. Only sources that are NOT the session's current
  * peer can charge this counter, so gating on it can never starve the
- * session's legitimate (bound) client — which is exactly why the bound
+ * session's legitimate (bound) client -- which is exactly why the bound
  * class is NOT pre-checked (see the RATE_TOKEN_MISMATCH_* note above).
- * Pure — safe under the read lock. */
+ * Pure -- safe under the read lock. */
 static bool tok_budget_over(const struct server_session *s, uint64_t now)
 {
     return tok_win_live(s, now) && s->tok_mis_cnt >= RATE_TOKEN_MISMATCH_MAX;
@@ -639,7 +649,7 @@ static bool tok_budget_over(const struct server_session *s, uint64_t now)
 
 /* Charge one wrong-token frame to this session's class counter, rolling
  * the window first. Caller holds ctx->sess_lock in WRITE mode. The bound
- * class is charged for observability only — it never gates a frame (see
+ * class is charged for observability only -- it never gates a frame (see
  * the RATE_TOKEN_MISMATCH_* note): a third party can spend it, so using
  * it as a pre-compare budget would blackhole the session's real peer. */
 static void tok_budget_charge(struct server_session *s, bool bound,
@@ -663,9 +673,9 @@ static void tok_budget_charge(struct server_session *s, bool bound,
 /* Rebind gate (the old per-source rate_token_zero, now per session): a
  * new source may take over the session only while no unbound source has
  * charged a mismatch against THIS session in the current window. That
- * keeps both halves of the original test — an over-budget sprayer has
+ * keeps both halves of the original test -- an over-budget sprayer has
  * cnt >= MAX > 0 and fails, and a sub-budget sprayer with 1..MAX-1 also
- * fails — while a guess aimed at a different session (or at a different
+ * fails -- while a guess aimed at a different session (or at a different
  * address behind the same NAT) no longer closes this session's door.
  * Pure. */
 static bool tok_rebind_allowed(const struct server_session *s, uint64_t now)
@@ -673,12 +683,12 @@ static bool tok_rebind_allowed(const struct server_session *s, uint64_t now)
     return !tok_win_live(s, now) || s->tok_mis_cnt == 0;
 }
 
-/* ---- 族无关的外层对端（见 server.h 的 struct iwan_peer） ---- */
+/* ---- family-agnostic outer peer (see struct iwan_peer in server.h) ---- */
 
-/* 接收侧唯一的规范化点：sockaddr -> iwan_peer。v4-mapped 的 AF_INET6 归一
- * 到 AF_INET（IPV6_V6ONLY=1 时不该出现；真出现了也不能让同一个 v4 源在
- * 绑定判定/限速键上有两种表示）。len 是内核写回的实际地址长度，小于该族
- * 结构体长度说明被截断，返回 false 让调用方丢弃。 */
+/* The only normalization point on the receive side: sockaddr -> iwan_peer. v4-mapped
+ * AF_INET6 normalizes to AF_INET (should not occur with IPV6_V6ONLY=1; if it does,
+ * the same v4 source must not get two representations in bind/rate-limit keys).
+ * len is the kernel-written actual length; less than the family struct length means truncation -> return false. */
 bool iwan_peer_from_sockaddr(struct iwan_peer *p, const struct sockaddr *sa,
                              socklen_t len)
 {
@@ -709,7 +719,7 @@ bool iwan_peer_from_sockaddr(struct iwan_peer *p, const struct sockaddr *sa,
         p->scope_id = s6->sin6_scope_id;
         return true;
     }
-    return false;   /* 未知族：调用方丢弃 */
+    return false;   /* unknown family: caller drops it */
 }
 
 socklen_t iwan_peer_to_sockaddr(const struct iwan_peer *p,
@@ -736,16 +746,16 @@ socklen_t iwan_peer_to_sockaddr(const struct iwan_peer *p,
     return 0;
 }
 
-/* 族 + 地址 + scope，忽略端口（旧的顶替判定只比 sin_addr.s_addr 4 字节，
- * 不看端口，这里保持同一口径） */
+/* family + address + scope, ignoring port (the old takeover decision compared
+ * only sin_addr.s_addr, 4 bytes, and ignored the port; same criterion here) */
 bool iwan_peer_eq_addr(const struct iwan_peer *a, const struct iwan_peer *b)
 {
     return a->family == b->family && a->scope_id == b->scope_id &&
            memcmp(a->addr, b->addr, sizeof a->addr) == 0;
 }
 
-/* 族 + 地址 + scope + 端口（旧的 memcmp(&s->peer, peer, sizeof(sockaddr_in))
- * 的显式等价物，不再算进结构体填充字节） */
+/* family + address + scope + port (explicit equivalent of the old
+ * memcmp(&s->peer, peer, sizeof(sockaddr_in)); no longer counts struct padding) */
 bool iwan_peer_eq(const struct iwan_peer *a, const struct iwan_peer *b)
 {
     return a->port == b->port && iwan_peer_eq_addr(a, b);
@@ -761,7 +771,7 @@ void iwan_peer_to_string(const struct iwan_peer *p, char *out, size_t outlen)
         if (inet_ntop(AF_INET6, p->addr, ip, sizeof ip) == NULL) {
             snprintf(out, outlen, "[?]:%u", (unsigned)p->port);
         } else if (p->scope_id != 0) {
-            /* 链路本地：scope 必须一起打印，否则 fe80:: 地址不可区分 */
+            /* Link-local: scope must be printed too, or fe80:: addresses are indistinguishable */
             snprintf(out, outlen, "[%s%%%u]:%u", ip, (unsigned)p->scope_id,
                      (unsigned)p->port);
         } else {
@@ -773,7 +783,7 @@ void iwan_peer_to_string(const struct iwan_peer *p, char *out, size_t outlen)
         snprintf(out, outlen, "?:%u", (unsigned)p->port);
         return;
     }
-    /* v4 文本与加 v6 之前逐字节相同（"%s:%u"） */
+    /* v4 text is byte-identical to before IPv6 support ("%s:%u") */
     snprintf(out, outlen, "%s:%u", ip, (unsigned)p->port);
 }
 
@@ -841,7 +851,7 @@ static struct server_session *find_session_unlocked(struct server_ctx *ctx,
     int slot = ctx->sid_map[sid];
 
     /* L37: sid_map[sid] < 0 means NO live session carries this sid, so the
-     * scan below could not match either — short-circuit it instead of
+     * scan below could not match either -- short-circuit it instead of
      * walking all 256 slots (~80 KB) for every flooded unknown-sid frame.
      * Invariant: every valid session's sid maps to its own slot. sid_map
      * is written ONLY in handle_open and cleared ONLY in sess_wipe, both
@@ -856,7 +866,7 @@ static struct server_session *find_session_unlocked(struct server_ctx *ctx,
         return &ctx->sess[slot];
     /* stale/absent map entry: the linear scan is authoritative. The map
      * is only written under the WRITE lock (handle_open/sess_wipe), so
-     * this read-side fallback deliberately does NOT heal it — a write
+     * this read-side fallback deliberately does NOT heal it -- a write
      * here would race other read-lock holders (C11 data race). */
     for (int i = 0; i < SERVER_MAX_SESSIONS; i++)
         if (ctx->sess[i].valid && ctx->sess[i].sid == sid)
@@ -873,7 +883,7 @@ static struct server_session *find_session_by_ip_unlocked(struct server_ctx *ctx
     uint16_t sid = (uint16_t)(((uint32_t)ip[2] << 8) | ip[3]);
     int slot = ctx->sid_map[sid];
 
-    /* L37: same invariant as find_session_unlocked — sid is the low 16
+    /* L37: same invariant as find_session_unlocked -- sid is the low 16
      * bits of the session's OWN assigned IP (handle_open), so a live
      * session owning `ip` would have to be reachable through this map
      * entry; slot < 0 therefore means no live session owns `ip`. */
@@ -893,11 +903,11 @@ static struct server_session *find_session_by_ip_unlocked(struct server_ctx *ctx
 /* invalidate a session and scrub its secrets; caller must hold
  * ctx->sess_lock (write mode).
  *
- * R37 R6 (R6-I5): idempotent — wiping an already-invalidated slot is a
+ * R37 R6 (R6-I5): idempotent -- wiping an already-invalidated slot is a
  * NO-OP. The body reads s->sid and clears ctx->sid_map[sid], but never
  * clears s->sid itself (callers log it after the wipe, and handle_open's
  * re-OPEN path memsets the whole slot right after). A second wipe of the
- * same slot would therefore clear sid_map[sid] a SECOND time — and by
+ * same slot would therefore clear sid_map[sid] a SECOND time -- and by
  * then that map entry may already have been re-pointed at a DIFFERENT,
  * live session that recycled the same sid (sid is derived from the
  * user's assigned IP, so a re-OPEN of the same user reuses it). With the
@@ -929,7 +939,7 @@ static void sess_wipe(struct server_ctx *ctx, struct server_session *s)
 /* Charge a wrong-token DATA frame to the session's budget. The DATA fast
  * path holds only the READ lock, so it releases it and calls this: take
  * the write lock, re-find the session by sid, and charge the mismatch
- * only if the frame really is still a mismatch for that session — a
+ * only if the frame really is still a mismatch for that session -- a
  * racing re-OPEN (new token, same sid) must not be charged for a guess
  * aimed at the previous token. R1-D-1. */
 static void tok_charge_upgrade(struct server_ctx *ctx, uint16_t sid,
@@ -964,7 +974,7 @@ static void send_reject(int sockfd, const struct iwan_peer *peer, const char *ms
 }
 
 /* shared OPEN-reject exit: peer string + rate-limited reject log +
- * reject frame, in that order — identical at every handle_open
+ * reject frame, in that order -- identical at every handle_open
  * rejection. The two "server full" exits unlock ctx->sess_lock BEFORE
  * calling (the reject must never run under the session-table lock). */
 static void open_reject(int sockfd, const struct iwan_peer *peer,
@@ -1052,12 +1062,12 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
     a.mtu = IWAN_DEFAULT_MTU;
     /* R50-B7: FAIL-CLOSED enc default. memset left a.enc == 0, so an OPEN
      * that omitted T_ENCRYPT created a plaintext (enc=0) session whose
-     * ACK advertised enc=0 — the opposite default of the reference client,
+     * ACK advertised enc=0 -- the opposite default of the reference client,
      * which treats a missing T_ENCRYPT in the ACK as enc=1 (auth.c R23-F2)
      * and always sends T_ENCRYPT on its own OPEN anyway (auth.c:68). The
      * two defaults were asymmetric and server-side fail-open: any future
      * client that omits the TLV would silently get an unencrypted tunnel.
-     * An EXPLICIT T_ENCRYPT — including 0 — is still honoured verbatim by
+     * An EXPLICIT T_ENCRYPT -- including 0 -- is still honoured verbatim by
      * open_tlv's clamp below, so plaintext remains an explicit client
      * choice, exactly as before. Wire and parse semantics for the always-
      * present case are byte-for-byte unchanged. */
@@ -1075,10 +1085,10 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
         return;
     }
 
-    if (!a.have_av) {
-        open_reject(sockfd, peer, a.user, "missing AV");
-        return;
-    }
+    /* T_AUTH_VERIFY is optional: the official Panabit client has no nonce
+     * TLV at all (its OPEN carries only 0x01/0x02/0x03/0x08/0x0a). When a
+     * client does send one, the ACK echoes it verbatim below so this
+     * repo's own client still gets the R23-F1 nonce check. */
 
     for (i = 0; i < nusers; i++) {
         if (strcmp(users[i].name, a.user) == 0) {
@@ -1088,7 +1098,7 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
     }
     if (!pass) {
         /* M-4: burn an equal-cost dummy derivation so an unknown-username
-         * rejection takes the same time as a known user's wrong password —
+         * rejection takes the same time as a known user's wrong password --
          * prevents remote account enumeration by timing (the real compare
          * is already CRYPTO_memcmp constant-time; this closes the
          * path-existence side channel). The dummy never participates in
@@ -1137,7 +1147,7 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
     }
 
     /* R47-H2-L1: a re-OPEN of an account that ALREADY has a live session
-     * instantly rotates the token and rebinds the peer — anyone holding
+     * instantly rotates the token and rebinds the peer -- anyone holding
      * the account password could silently blackhole the active client
      * from any other address. Guard the takeover instead:
      *   - same source IP  -> allowed (legitimate reconnect: a
@@ -1147,7 +1157,7 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
      *     heartbeat < IDLE_TIMEOUT_MS ago) -> reject the new OPEN with
      *     the existing PT_OPEN_REJECT frame; the active client's session
      *     stays untouched. The takeover only completes once the old
-     *     session naturally idles out (purge_expired reaps it) — the
+     *     session naturally idles out (purge_expired reaps it) -- the
      *     sanctioned "require the old session to time out first" path.
      *   - different IP but the old session already idle-expired -> allow
      *     (the old peer is gone; purge_expired would wipe it anyway).
@@ -1156,7 +1166,7 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
      * Accepted residual (L level, R48-L4): an attacker behind the SAME
      * NAT / same public IP as the client still passes the source-IP
      * check and can bump the active client off (token rotation + rebind)
-     * — the guard only closes the cross-address takeover, not the
+     * -- the guard only closes the cross-address takeover, not the
      * same-IP one, which is indistinguishable from a legitimate
      * reconnect without channel-bound auth. */
     if (ctx->sess[slot].valid &&
@@ -1245,8 +1255,9 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
     wipe(sk, sizeof sk);
     wipe(expect, sizeof expect);
 
-    /* echo the client's nonce verbatim; this repo's client rejects ACKs
-     * without a matching T_AUTH_VERIFY */
+    /* Echo the client's nonce verbatim (when it sent one): this repo's
+     * client rejects ACKs without a matching T_AUTH_VERIFY, while the
+     * official client never sends 0x0f and would not understand it. */
     nb[0] = (uint8_t)(a.nonce >> 24);
     nb[1] = (uint8_t)(a.nonce >> 16);
     nb[2] = (uint8_t)(a.nonce >> 8);
@@ -1265,9 +1276,21 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
         tlv_put(&b, T_IP, ipb, 4);
     }
     tlv_put(&b, T_GATEWAY, ctx->server_ip, 4);
-    tlv_put(&b, T_DNS, ctx->dns, 4);
+    {
+        /* T_DNS carries a PAIR of IPv4 servers (8-byte value, length byte
+         * 0x0a): the official client requires that exact length and drops
+         * the whole ACK otherwise (sdwan_onOPENACK accepts 0x05 only when
+         * vlen == 0x0a). This server advertises a single DNS, so the
+         * secondary address mirrors the primary. Old clients read the
+         * first 4 bytes (vlen >= 4), so this stays compatible. */
+        uint8_t dnb[8];
+        memcpy(dnb, ctx->dns, 4);
+        memcpy(dnb + 4, ctx->dns, 4);
+        tlv_put(&b, T_DNS, dnb, sizeof dnb);
+    }
     tlv_put(&b, T_ENCRYPT, &a.enc, 1);
-    tlv_put(&b, T_AUTH_VERIFY, nb, sizeof nb);
+    if (a.have_av)
+        tlv_put(&b, T_AUTH_VERIFY, nb, sizeof nb);
     udp_send(sockfd, peer, b.data, b.len);
     buf_free(&b);
 
@@ -1288,7 +1311,7 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
  * session's assigned address / derived ULA). The downlink gate
  * (tun_prep_downlink) validates the destination, and the two SSRF gates
  * (relay_proxy.c M7 rp_target_blocked, socks_flow.c socks_target_blocked)
- * refuse host-local targets — so the tunnel was asymmetric: an
+ * refuse host-local targets -- so the tunnel was asymmetric: an
  * authenticated client could hand the server an inner packet addressed to
  * the server's own loopback / link-local range and let the kernel stack
  * deliver it locally; the TUN write is the only thing in between. Local
@@ -1306,7 +1329,7 @@ static void handle_open(struct server_ctx *ctx, const struct server_user *users,
  *   fe80::/10       link-local
  *   R12-T3 (R41-2-3): and the IPv4 reject set applied to its IPv4-embedded
  *   spellings (::ffff:a.b.c.d v4-mapped, 64:ff9b::/96 NAT64, ::a.b.c.d
- *   v4-compatible, 2002::/16 6to4) — see up_inner_dst_blocked6. Real-lwIP/
+ *   v4-compatible, 2002::/16 6to4) -- see up_inner_dst_blocked6. Real-lwIP/
  *   kernel-side routability of the embedded spellings still needs root
  *   hardware re-verification (see .cc_tmp/r38/fixes/notes-srv-h1.md).
  *
@@ -1322,15 +1345,15 @@ static bool up_inner_dst_blocked4(uint32_t d)
 }
 
 /* R12 T1: is d (BE u32) an address that belongs to THIS tunnel's own
- * configured address space — the --server-ip gateway or anywhere inside
+ * configured address space -- the --server-ip gateway or anywhere inside
  * --subnet?  Those are addresses the server itself hands out and routes;
  * an uplink packet to them is ordinary tunnel traffic (gateway ping/DNS,
  * client-to-client within the pool), not a springboard into the server
  * host, so the H1 host-local reject set must not fire for them.
  *
  * Without this exemption, an operator whose tunnel legitimately sits in
- * a range of the reject set — e.g. `-s 169.254.0.1 -S 169.254.0.0/16`
- * (link-local /16 as the tunnel subnet) — lost EVERY uplink packet
+ * a range of the reject set -- e.g. `-s 169.254.0.1 -S 169.254.0.0/16`
+ * (link-local /16 as the tunnel subnet) -- lost EVERY uplink packet
  * addressed to the gateway or to another pool address: the frame dies in
  * the gate (only the g_up[tid].h1 counter and, under IWAN_DEBUG, one log
  * line/s), the kernel never sees it.
@@ -1348,15 +1371,15 @@ static bool up_inner_dst_in_tunnel(const struct server_ctx *ctx, uint32_t d)
 
 /* R12 T3 (R41-2-3): the IPv6 branch of the H1 gate must apply the IPv4
  * host-local reject set even when the destination is an IPv4-embedded
- * IPv6 spelling — v4-mapped (::ffff:a.b.c.d), NAT64 well-known prefix
+ * IPv6 spelling -- v4-mapped (::ffff:a.b.c.d), NAT64 well-known prefix
  * (64:ff9b::a.b.c.d), v4-compatible (::a.b.c.d) and 6to4 (2002:a.b.c.d::).
  * R14 (R13-A3-1): the SIIT/IPv4-translated family ::ffff:0:0:0/96
- * (::ffff:0:a.b.c.d, RFC 6052 §3.1 / RFC 2765) gets the same treatment —
+ * (::ffff:0:a.b.c.d, RFC 6052 section 3.1 / RFC 2765) gets the same treatment --
  * its embedded v4 lives in bytes 12-15 under the 96-bit prefix {0*8,
  * ff,ff,0,0}, so it used to sail through every branch above while lwIP's
  * ip6_addr_isipv4mappedipv6 also left it alone (the only v4-embedded
  * spelling both layers pass). Before the fix, the five spellings of
- * 127.0.0.1 from R41-2-3 — four blocked, this one let through — reached
+ * 127.0.0.1 from R41-2-3 -- four blocked, this one let through -- reached
  * the same loopback alias one packet type away.
  *
  * The embedded IPv4 gets the SAME T1 exemption (up_inner_dst_in_tunnel)
@@ -1376,7 +1399,7 @@ static bool up_inner_dst_blocked6(const struct server_ctx *ctx,
     static const uint8_t v4mapped[12] = { 0,0,0,0,0,0,0,0,0,0,0xff,0xff };
     static const uint8_t nat64[12] = { 0x00,0x64,0xff,0x9b, 0,0,0,0,0,0,0,0 };
     static const uint8_t compat[12] = { 0,0,0,0,0,0,0,0,0,0,0,0 };
-    /* ::ffff:0:0:0/96 — SIIT / IPv4-translated (RFC 6052 §3.1 / RFC 2765):
+    /* ::ffff:0:0:0/96 -- SIIT / IPv4-translated (RFC 6052 section 3.1 / RFC 2765):
      * prefix bytes 0..11 = {0*8, ff, ff, 0, 0}, embedded v4 at 12..15. */
     static const uint8_t siit[12] = { 0,0,0,0,0,0,0,0,0xff,0xff,0,0 };
     uint32_t emb = 0;
@@ -1423,7 +1446,7 @@ static bool up_inner_dst_blocked6(const struct server_ctx *ctx,
  * instead of being silently clamped. Counters are _Atomic because
  * handle_udp runs on several SO_REUSEPORT recv threads at once; relaxed
  * load/store/exchange is enough (a lost update costs one extra line at
- * worst). Frames that fail the gate are ALWAYS counted in g_up[tid].h1 —
+ * worst). Frames that fail the gate are ALWAYS counted in g_up[tid].h1 --
  * only the stderr line is decimated. */
 #define H1_DROP_LOG_MS 1000
 static _Atomic uint64_t g_h1_log_last_ms;
@@ -1451,14 +1474,14 @@ static bool h1_drop_log_due(void)
     return true;
 }
 
-/* ---- IWAN_SRV_SINK=1：仅计量模式的计数与打印 ----
- * 口径（与 usage 的说明保持一致）：
- *   - pkts  = 通过会话/令牌校验的数据帧（PT_DATA / PT_DATA_ENC）个数；
- *   - bytes = 这些帧的“外层 UDP 净荷字节数”，即收到的 UDP 载荷 len，
- *             含 8 字节 iwan 封装首部；因为不解密，这不是内层 IP 字节数。
- * 校验失败的数据帧（未知 sid、错令牌、超预算）仍由既有控制面代码丢弃，
- * 不计入这里 —— 计量模式不改变、也不放宽协议状态机。
- * 计数是 relaxed 原子加：多 recv 线程并发，精度只需要在统计周期内收敛。 */
+/* ---- IWAN_SRV_SINK=1: metering-only counters and printing ----
+ * Semantics (consistent with usage):
+ *   - pkts  = data frames that passed session/token validation (PT_DATA / PT_DATA_ENC);
+ *   - bytes = these frames' "outer UDP payload bytes", i.e. the received UDP payload
+ *             len including the 8-byte iwan header; since nothing is decrypted,
+ *             this is not the inner IP byte count.
+ * Data frames that fail validation (unknown sid, bad token, over budget) are still
+ * dropped by the existing control-plane code and not counted here -- metering mode neither changes nor relaxes the protocol state machine. Counters are relaxed atomic adds: multiple recv threads run concurrently, and precision only needs to converge within the stats period. */
 static _Atomic uint64_t g_sink_pkts, g_sink_bytes;
 
 #define SINK_PRINT_MS 5000
@@ -1475,8 +1498,8 @@ static void sink_account(struct server_session *s, size_t len)
 
 void server_sink_print(struct server_ctx *ctx, bool final)
 {
-    /* 区间起点/上次总量：非原子，调用点由头文件约定串行化（主 recv
-     * 线程的 1s 心跳 + main 在 join 之后） */
+    /* interval start / last totals: non-atomic, serialized by the header's
+     * contract at call sites (main recv thread's 1s heartbeat + main after join) */
     static uint64_t last_ms, last_pkts, last_bytes;
     uint64_t now = now_ms();
     uint64_t pkts = atomic_load_explicit(&g_sink_pkts, memory_order_relaxed);
@@ -1485,7 +1508,7 @@ void server_sink_print(struct server_ctx *ctx, bool final)
     double pps, gbps;
 
     if (last_ms == 0) {
-        /* 第一次调用：只立区间起点（final 时仍照常打印，区间取 0） */
+        /* First call: only set the interval start (final still prints normally with interval 0) */
         last_ms = now;
         last_pkts = pkts;
         last_bytes = bytes;
@@ -1500,7 +1523,7 @@ void server_sink_print(struct server_ctx *ctx, bool final)
                : 0.0;
     printf("SINK pkts=%llu bytes=%llu pps=%.1f gbps=%.3f\n",
            (unsigned long long)pkts, (unsigned long long)bytes, pps, gbps);
-    /* 每会话一行（累计值，不是区间值）；只列有计数的活会话 */
+    /* One line per session (cumulative, not interval); only live sessions with counts are listed */
     pthread_rwlock_rdlock(&ctx->sess_lock);
     for (int i = 0; i < SERVER_MAX_SESSIONS; i++) {
         struct server_session *s = &ctx->sess[i];
@@ -1516,10 +1539,136 @@ void server_sink_print(struct server_ctx *ctx, bool final)
                (unsigned long long)sp, (unsigned long long)sb);
     }
     pthread_rwlock_unlock(&ctx->sess_lock);
-    fflush(stdout); /* 管道/文件下 stdout 是块缓冲：逐行落盘才可实时观测 */
+    fflush(stdout); /* stdout is block-buffered when piped/to a file: line-by-line flush enables real-time observation */
     last_ms = now;
     last_pkts = pkts;
     last_bytes = bytes;
+}
+
+/* Panabit frame types that carry a normal 8-byte iwan header plus a session
+ * (sid, token) and therefore may be re-dispatched from a SEGRT inner packet.
+ * SEGRT and the fragment types are excluded on purpose: a nested SEGRT would
+ * recurse, and a SEGRT-wrapped fragment has no inner frame header to take a
+ * session from. */
+static bool frag_type_dispatchable(uint8_t typ)
+{
+    switch (typ) {
+    case PT_DATA:
+    case PT_DATA_ENC:
+    case PT_DATA_IPV6:
+    case PT_CLOSE:
+    case PT_ECHO_REQ:
+    case PT_PING_REQ:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* Fragment reassembly state is per-thread on purpose: handle_udp runs on one
+ * shard thread per socket, groups are matched on (sid, tok, id), and a
+ * cross-thread pool would need a lock on the data path for no benefit. */
+static _Thread_local struct iwan_frag_pool g_frag_pool;
+
+/*
+ * 0x22 / 0x24 arrive with the ordinary 8-byte header (carrying the session's
+ * sid/token) followed by the 16-byte fragment header. Reassembly is bounded by
+ * IWAN_FRAG_SLOTS and IWAN_FRAG_TIMEOUT_MS (the official client's fragTimeOut);
+ * a completed packet is replayed into handle_udp() as a synthetic PT_DATA frame
+ * so every existing check -- session lookup, token compare, source rebinding,
+ * inner-header sanity, TUN write backpressure -- applies unchanged instead of
+ * being duplicated here.
+ */
+static void handle_frag(struct server_ctx *ctx, const struct server_user *users,
+                        int nusers, const uint8_t *raw, size_t len,
+                        const struct iwan_peer *peer, int sockfd, unsigned tid,
+                        uint16_t sid, uint32_t tok)
+{
+    uint8_t frame[IWAN_HDR_LEN + IWAN_FRAG_BUF_MAX];
+    const uint8_t *out = NULL;
+    size_t outlen = 0;
+    int rc;
+
+    if (len <= IWAN_HDR_LEN)
+        return;
+    rc = iwan_frag_in(&g_frag_pool, sid, tok, raw + IWAN_HDR_LEN,
+                      len - IWAN_HDR_LEN, now_ms(), &out, &outlen);
+    if (rc != IWAN_FRAG_DONE) {
+        if (rc == IWAN_FRAG_DROP) {
+            atomic_fetch_add_explicit(&g_up[tid].h1, 1, memory_order_relaxed);
+            log_debug("uplink drop: bad IP fragment (sid 0x%04x len %llu)",
+                      sid, (unsigned long long)len);
+        }
+        return;
+    }
+    pkt_hdr(PT_DATA, 0, sid, tok, frame);
+    memcpy(frame + IWAN_HDR_LEN, out, outlen);
+    handle_udp(ctx, users, nusers, frame, IWAN_HDR_LEN + outlen, peer, sockfd,
+               tid);
+}
+
+/*
+ * 0x28 SEGRT: no 8-byte header and no signature -- the source-routing header
+ * starts at offset 0 and its first byte is the frame type. A plaintext SEGRT
+ * (algo 0) wraps a complete iwan frame; re-dispatch it so the session, token
+ * and source checks still run. Encrypted SEGRT needs the SR password from the
+ * network's iwan.conf, which this server has no option for yet, so it is
+ * dropped rather than mis-parsed (docs/sdwan-protocol.md section 8).
+ */
+/* --sr-password: decryption password for source-routed SEGRT. Empty string = no decryption (encrypted SEGRT is dropped). */
+static char g_sr_password[64];
+
+void server_set_sr_password(const char *pw)
+{
+    if (pw == NULL) {
+        g_sr_password[0] = '\0';
+        return;
+    }
+    snprintf(g_sr_password, sizeof g_sr_password, "%s", pw);
+}
+
+static void handle_segrt(struct server_ctx *ctx, const struct server_user *users,
+                         int nusers, const uint8_t *raw, size_t len,
+                         const struct iwan_peer *peer, int sockfd, unsigned tid)
+{
+    struct iwan_sr_hdr sr;
+    size_t hl = 0;
+
+    if (!iwan_sr_parse(raw, len, &sr, &hl))
+        return;
+    if (sr.algo != 0) {
+        /* Encrypted SEGRT: after the inner frame's 8-byte header comes AES-ECB ciphertext
+         * plus padlen bytes of trailing padding. The key comes from --sr-password +
+         * link-table hash (same construction as the official client's set_sr_encrypt).
+         * Decrypt must be whole-block, in place; any failure may only drop the frame -- never deliver ciphertext as plaintext. */
+        static _Thread_local uint8_t sbuf[IWAN_SR_BUF_MAX];
+        uint8_t key[32];
+        size_t klen, clen;
+
+        if (g_sr_password[0] == '\0') {
+            log_debug("uplink drop: encrypted SEGRT but no --sr-password");
+            atomic_fetch_add_explicit(&g_up[tid].h1, 1, memory_order_relaxed);
+            return;
+        }
+        if (len <= hl + IWAN_HDR_LEN + sr.padlen || len > sizeof sbuf)
+            return;
+        klen = iwan_sr_key(g_sr_password, sr.links, sr.linkcnt, sr.algo, key);
+        clen = len - hl - IWAN_HDR_LEN - sr.padlen;
+        if (clen == 0 || clen % 16 != 0)
+            return;
+        memcpy(sbuf, raw, len);
+        if (!iwan_sr_crypt(sbuf + hl + IWAN_HDR_LEN, clen, key, (unsigned)klen * 8,
+                           false))
+            return;
+        if (!frag_type_dispatchable(sbuf[hl]))
+            return;
+        handle_udp(ctx, users, nusers, sbuf + hl, len - hl - sr.padlen, peer,
+                   sockfd, tid);
+        return;
+    }
+    if (len <= hl + IWAN_HDR_LEN || !frag_type_dispatchable(raw[hl]))
+        return;
+    handle_udp(ctx, users, nusers, raw + hl, len - hl, peer, sockfd, tid);
 }
 
 void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nusers,
@@ -1556,8 +1705,25 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
             handle_open(ctx, users, nusers, raw, len, peer, sockfd);
             break;
 
+        case PT_IPFRAG:
+        case PT_IPFRAG_ALT:
+            handle_frag(ctx, users, nusers, raw, len, peer, sockfd, tid, sid,
+                        tok);
+            break;
+
+        case PT_SEGRT:
+            handle_segrt(ctx, users, nusers, raw, len, peer, sockfd, tid);
+            break;
+
         case PT_DATA:
-        case PT_DATA_ENC: {
+        case PT_DATA_ENC:
+        /* Panabit duplicate frames (docs/sdwan-protocol.md section 2): identical
+         * payload sent twice with a different type id. The protocol carries no
+         * sequence number, so the receiver cannot de-duplicate; deliver both
+         * exactly like the reference implementation and let the inner stack
+         * cope (TCP handles it; UDP sees a duplicate, which is the point). */
+        case PT_DATA_DUP:
+        case PT_DATA_ENC_DUP: {
             uint64_t tb = 0, tx0 = 0, tx1 = 0, tc = 0;
             uint8_t enc, xk[8];
             uint32_t s_ip, saddr, daddr; /* session addr + inner header */
@@ -1579,7 +1745,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                 return;
             }
             /* F4 (per session, R1-D-1; R37 R2 regression fix): the
-             * pre-compare budget is applied ONLY to the non-peer class —
+             * pre-compare budget is applied ONLY to the non-peer class --
              * a source that is not this session's peer. That class cannot
              * be presented by the session's legitimate client, so gating
              * on it caps tested guesses (4/s) without ever letting a
@@ -1596,8 +1762,8 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                 pthread_rwlock_unlock(&ctx->sess_lock);
                 /* R47-H2-M2: bound-class (source == this session's peer
                  * verbatim) wrong-token DATA frames used to reach
-                 * tok_charge_upgrade() — one global sess_lock WRITE lock
-                 * per frame — on EVERY frame: R37-R2's 4/s pre-compare
+                 * tok_charge_upgrade() -- one global sess_lock WRITE lock
+                 * per frame -- on EVERY frame: R37-R2's 4/s pre-compare
                  * budget (tok_budget_over above) gates only the NON-peer
                  * class, and the bound class is deliberately never
                  * pre-compare-gated. An unauthenticated attacker who
@@ -1606,7 +1772,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                  * therefore convoy the whole rwlock: every recv thread
                  * holding the read lock and the downlink stalled behind
                  * his frames. Pre-budget the bound class per SOURCE
-                 * (rate_allow_tokbad — same rate_bucket/rate_gate family
+                 * (rate_allow_tokbad -- same rate_bucket/rate_gate family
                  * as rate_allow_sid_miss), strictly AFTER the token
                  * compare failed: over budget the frame is dropped here
                  * with no write lock and no observability charge
@@ -1625,8 +1791,8 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
             /* R47-H2-M1: congestion-reactive per-session uplink fairness.
              * throttle_until_ms is set only when THIS session's own TUN
              * write just hit a full device queue (the drop path below);
-             * while active, its DATA frames are dropped here — before the
-             * inner-packet checks and the (up-to-1 ms) queue-full poll —
+             * while active, its DATA frames are dropped here -- before the
+             * inner-packet checks and the (up-to-1 ms) queue-full poll --
              * so a flooding client yields the shared TUN queue to other
              * sessions and cannot monopolize its recv thread with poll
              * churn. Drops are covered by the client's retransmits, the
@@ -1675,11 +1841,11 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
             memcpy(xk, s->xor_key, sizeof xk);
             s_ip = ip4_u32(s->ip); /* BE-value order, same as the header */
             atomic_store(&s->last_active_ms, now_ms());
-            /* IWAN_SRV_SINK=1：计量模式的数据帧在这里就结束 —— 会话与令牌
-             * 校验（上面）照旧，控制面行为不变；这里只累加计数，不解密、
-             * 不解析内层 IP、不写 TUN、不回发任何东西。放在 TUN 注入/回发
-             * 分派点（下面的 ctx->tun_fd / echo_mirror 分支）之前，也放在
-             * 内层 H1 门之前，所以数据帧不产生任何下游效果。 */
+            /* IWAN_SRV_SINK=1: a metering-mode data frame ends here -- session and token
+             * validation (above) still runs and control-plane behavior is unchanged; this
+             * only accumulates counters, with no decryption, no inner-IP parsing, no TUN
+             * write and no reply. It sits before the TUN-injection/reply dispatch point
+             * (ctx->tun_fd / echo_mirror branches below) and before the inner H1 gate, so the frame has no downstream effect. */
             if (ctx->sink) {
                 sink_account(s, len);
                 pthread_rwlock_unlock(&ctx->sess_lock);
@@ -1705,7 +1871,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
              * source is the session's derived ULA (fd00::/96 + assigned
              * IPv4, see protocol.h) and whose destination is not
              * host-local (R38 P1-4: see up_inner_dst_blocked4/6). Anything
-             * else is a malformed, spoofed, or springboard frame — drop
+             * else is a malformed, spoofed, or springboard frame -- drop
              * it before it reaches the TUN (always counted in
              * g_up[tid].h1; the diagnosis goes to the IWAN_DEBUG log,
              * capped at 1 line/s by h1_drop_log_due()). The inner header
@@ -1726,7 +1892,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                         atomic_fetch_add_explicit(&g_up[tid].h1, 1, memory_order_relaxed);
                         if (debug_enabled() && h1_drop_log_due()) {
                             /* short frames can fail the sanity check
-                             * before in[4..6] exist — never read past the
+                             * before in[4..6] exist -- never read past the
                              * datagram end (stale slot bytes), just log a
                              * shorter diagnosis */
                             if (inlen >= 8)
@@ -1750,7 +1916,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                         atomic_fetch_add_explicit(&g_up[tid].h1, 1, memory_order_relaxed);
                         if (debug_enabled() && h1_drop_log_due()) {
                             /* short frames can fail the sanity check
-                             * before the inner header bytes exist — never
+                             * before the inner header bytes exist -- never
                              * read past the datagram end (stale slot
                              * bytes); skip the unavailable fields */
                             if (inlen >= 20)
@@ -1795,19 +1961,19 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                      * the pool's read lock, and tun_pool_del /
                      * tun_pool_destroy close removed queue fds under the
                      * write lock, so a del can never close-and-recycle
-                     * this fd number while we are writing into it — the
+                     * this fd number while we are writing into it -- the
                      * old tun_pool_write_fd + tun_write_retry pair left
                      * that microsecond TOCTOU open (a recycled fd would
                      * silently receive a TUN frame).
                      * R55-TUN-1: tun_pool_write can still return -1 for
-                     * a NON-congestion reason (pool momentarily empty —
-                     * nq<=0 mid-shrink — or a stop-marked queue selected
+                     * a NON-congestion reason (pool momentarily empty --
+                     * nq<=0 mid-shrink -- or a stop-marked queue selected
                      * just as the owner swaps it out), a case the
                      * pre-R54 path survived: write_fd selection failure
                      * kept wfd == ctx->tun_fd, so the raw path still
                      * completed the send on the owner fd. Restore that
                      * fallback: on -1 we retry once on ctx->tun_fd. This
-                     * does NOT reopen the R54-WG3-3 fd-reuse window —
+                     * does NOT reopen the R54-WG3-3 fd-reuse window --
                      * tun_pool_write has released the pool read lock on
                      * return, and ctx->tun_fd is the owner fd, which is
                      * never closed; the retry runs entirely outside the
@@ -1833,7 +1999,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
                     tun_pool_note_stall(ctx->qpool);
                     atomic_fetch_add_explicit(&g_up[tid].drop, 1, memory_order_relaxed);
                     /* R47-H2-M1: stamp this session's fairness throttle
-                     * (re-lock — the DATA path released the read lock
+                     * (re-lock -- the DATA path released the read lock
                      * before the TUN write; this path is rare: it runs
                      * only per queue-full drop). Its own next frames are
                      * dropped at the gate above for server_rate_get_throttle_ms(),
@@ -1877,8 +2043,8 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
             return;
         /* R48-F1(1/3, R48-CLOSE-1): probe the sid under the READ lock,
          * exactly like the DATA path. The unknown-sid CLOSE branch is the
-         * cheapest forged attack shape — random 16-bit sids, no live
-         * session needed, sig = MD5(hdr8+"mw") forgeable by anyone — and
+         * cheapest forged attack shape -- random 16-bit sids, no live
+         * session needed, sig = MD5(hdr8+"mw") forgeable by anyone -- and
          * it used to take one global sess_lock WRITE lock per frame with
          * no per-source budget (rate_allow's CLOSE ="default:return true"
          * and R37-R6's sid_miss budget only caps the accounting AFTER the
@@ -1888,7 +2054,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
         pthread_rwlock_rdlock(&ctx->sess_lock);
         s = find_session_unlocked(ctx, sid);
         if (!s) {
-            /* R1-D-1: unknown sid — one table probe, no per-source state */
+            /* R1-D-1: unknown sid -- one table probe, no per-source state */
             pthread_rwlock_unlock(&ctx->sess_lock);
             /* L37: dedicated per-source unknown-sid budget (see the DATA
              * path / rate_allow_sid_miss note); sess_lock already released */
@@ -1897,9 +2063,9 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
             return;
         }
         /* known sid: R48-F1(2/3) runs the token and peer checks under the
-         * READ lock — both are pure (tok_budget_over is documented as
+         * READ lock -- both are pure (tok_budget_over is documented as
          * read-lock safe; token/peer fields are written only under the
-         * WRITE lock, so a read-lock holder sees a consistent snapshot) —
+         * WRITE lock, so a read-lock holder sees a consistent snapshot) --
          * exactly like the DATA path. A wrong-token CLOSE therefore never
          * takes the write lock at all; only the correct-token WIPE
          * upgrades (TOCTOU-safe re-find below). */
@@ -1917,7 +2083,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
             /* R48-F1(2/3): a wrong-token CLOSE against a live sid is a
              * guess, and when its source forges the session's peer
              * verbatim it is the BOUND class, which R37-R2 never
-             * pre-gates — under F1-1 every such frame still took one
+             * pre-gates -- under F1-1 every such frame still took one
              * global sess_lock WRITE lock (plus the tok_mis_bound
              * observability charge) at line rate. Pre-budget it per
              * SOURCE strictly AFTER the failed compare (rate_allow_close,
@@ -1938,7 +2104,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
             }
             /* within budget: re-lock and charge the session's mismatch
              * budget only if the frame is STILL a mismatch for it,
-             * exactly like the DATA path's tok_charge_upgrade — a racing
+             * exactly like the DATA path's tok_charge_upgrade -- a racing
              * re-OPEN (new token, same sid) must not be charged for a
              * guess aimed at the previous token */
             pthread_rwlock_wrlock(&ctx->sess_lock);
@@ -1948,7 +2114,7 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
             pthread_rwlock_unlock(&ctx->sess_lock);
             break;
         }
-        /* correct token: CLOSE is terminal — the wipe needs the write
+        /* correct token: CLOSE is terminal -- the wipe needs the write
          * lock, so upgrade and RE-FIND (TOCTOU-safe: the session may have
          * been wiped or replaced by a re-OPEN between the read-lock probe
          * and the upgrade; the DATA rebind path re-finds under the
@@ -1994,11 +2160,11 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
         /* Common path (same peer, valid token) takes only the read
          * lock: last_active is an atomic store, so keepalives no longer
          * serialize the whole session table against every DATA reader.
-         * A peer change (rebind) upgrades to the write lock — gated on
+         * A peer change (rebind) upgrades to the write lock -- gated on
          * the session's own unbound-source mismatch history (F4/R1-D-1)
          * so a guessed token cannot claim the session from an address
          * that has been spraying at it. R34-1: ECHO_RES is only a per-session keepalive
-         * acknowledgement — it must not be a liveness oracle, so it is
+         * acknowledgement -- it must not be a liveness oracle, so it is
          * sent only when the session was found AND its token matched
          * (the same condition that refreshed last_active above). PING_RSP
          * stays unconditional: `iwan ping` is an unauthenticated server
@@ -2029,13 +2195,20 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
         }
         if (typ == PT_ECHO_REQ && !valid)
             break; /* unknown session / bad token: silent drop, like the
-                    * PT_DATA path — the client's watchdog then concludes
+                    * PT_DATA path -- the client's watchdog then concludes
                     * the tunnel is dead and reconnects */
         buf_init(&b);
         if (typ == PT_PING_REQ)
             ctrl_hdr(&b, PT_PING_RSP, 0, IWAN_PING_SID, IWAN_PING_TOK);
-        else
+        else {
             ctrl_hdr(&b, PT_ECHO_RES, raw[1], sid, tok);
+            /* Panabit ECHOREQ carries a 36-byte payload (docs/sdwan-protocol.md
+             * section 5); echo it verbatim so the official client can compute its
+             * one-way delay from our copy of its tick. Our own clients send an
+             * empty frame, in which case there is nothing to append. */
+            if (len >= IWAN_CTRL_LEN + IWAN_ECHO_LEN)
+                buf_put(&b, raw + IWAN_CTRL_LEN, IWAN_ECHO_LEN);
+        }
         udp_send(sockfd, peer, b.data, b.len);
         buf_free(&b);
         break;
@@ -2047,13 +2220,227 @@ void handle_udp(struct server_ctx *ctx, const struct server_user *users, int nus
     }
 }
 
+/* ---- tests/plane_matrix: simulate the "server -> target" network segment ----
+ *
+ * --no-tun's echo mirror bounces each inner packet straight back, as if the target
+ * lived in the server process at zero latency. A two-segment link matrix also needs
+ * the second segment (server <-> target) to add delay/jitter/loss/rate limitation
+ *
+ * independently, so a delayed-send queue is inserted at the bounce point:
+ *   IWAN_LEGB_RTT_MS     target round-trip delay (ms, 0 = disable this whole simulation)
+ *   IWAN_LEGB_JITTER_MS  extra random delay cap (ms, uniform)
+ *   IWAN_LEGB_LOSS_PCT   loss percent (0..100)
+ *
+ *   IWAN_LEGB_RATE_MBIT  one-way rate cap for the target segment (Mbit/s, 0 = unlimited)
+ * The queue inserts in due-time order: the mirror's seq table advances in arrival
+ * order; reordering would make its ack wrong (real networks absorb reordering in TCP; no reorder buffer here). All four 0 => synchronous send, bit-identical.
+ */
+struct legb_item {
+    struct legb_item *next;
+    struct server_ctx *ctx;
+    uint64_t due_ns;
+    int fd;
+    size_t len;
+    uint8_t pkt[1];
+};
+
+static pthread_mutex_t g_legb_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_legb_cv;
+static struct legb_item *g_legb_head;
+static pthread_t g_legb_tid;
+static int g_legb_state;          /* 0 = undecided, 1 = off, 2 = running */
+static uint64_t g_legb_rtt_ns;
+static uint64_t g_legb_jit_ns;
+static unsigned g_legb_loss;      /* percent */
+static uint64_t g_legb_rate;      /* bytes/s, 0 = unlimited */
+static double g_legb_tokens;
+static uint64_t g_legb_tok_ts;
+static uint32_t g_legb_seed = 0x9e3779b9u;
+
+static uint32_t legb_rand_locked(void)
+{
+    /* xorshift32: called only by enqueue and drain while holding the lock */
+    uint32_t x = g_legb_seed;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    g_legb_seed = x;
+    return x;
+}
+
+static uint64_t legb_env_ns(const char *name)
+{
+    const char *v = getenv(name);
+    char *end = NULL;
+    unsigned long long n;
+
+    if (!v || !*v)
+        return 0;
+    /* Decimals allowed: callers/scripts often write fixed-point values like "8.000";
+     * strtoull used to reject the decimal and silently disable the whole link simulation (all matrix B segments dead). */
+    n = (unsigned long long)(strtod(v, &end) * 1000000.0);
+    if (end == v || (end && *end) || !n)
+        return 0;
+    return n * 1ull;
+}
+
+static void *legb_thread_main(void *arg);
+
+static int legb_init(void)
+{
+    int state;
+    uint64_t rate_mbit;
+
+    pthread_mutex_lock(&g_legb_mu);
+    if (g_legb_state) {
+        state = g_legb_state;
+        pthread_mutex_unlock(&g_legb_mu);
+        return state == 2;
+    }
+    g_legb_rtt_ns = legb_env_ns("IWAN_LEGB_RTT_MS");
+    g_legb_jit_ns = legb_env_ns("IWAN_LEGB_JITTER_MS");
+    g_legb_loss = (unsigned)(legb_env_ns("IWAN_LEGB_LOSS_PCT") / 1000000ull);
+    rate_mbit = legb_env_ns("IWAN_LEGB_RATE_MBIT") / 1000000ull;
+    if (g_legb_loss > 100)
+        g_legb_loss = 100;
+    g_legb_rate = rate_mbit ? rate_mbit * 1000000ull / 8ull : 0;   /* B/s */
+    if (!g_legb_rtt_ns && !g_legb_jit_ns && !g_legb_loss && !g_legb_rate) {
+        g_legb_state = 1;
+        pthread_mutex_unlock(&g_legb_mu);
+        return 0;
+    }
+    pthread_condattr_t ca;
+    pthread_condattr_init(&ca);
+    pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
+    pthread_cond_init(&g_legb_cv, &ca);
+    pthread_condattr_destroy(&ca);
+    g_legb_tok_ts = now_ns();
+    if (pthread_create(&g_legb_tid, NULL, legb_thread_main, NULL) != 0) {
+        g_legb_state = 1;
+        pthread_mutex_unlock(&g_legb_mu);
+        return 0;
+    }
+    pthread_detach(g_legb_tid);
+    g_legb_state = 2;
+    pthread_mutex_unlock(&g_legb_mu);
+    return 1;
+}
+
+static void legb_enqueue(struct server_ctx *ctx, uint8_t *p, size_t len, int fd)
+{
+    struct legb_item *it, **pp;
+    uint64_t now, due;
+    size_t sz;
+
+    pthread_mutex_lock(&g_legb_mu);
+    if (g_legb_loss && (legb_rand_locked() % 100u) < g_legb_loss) {
+        pthread_mutex_unlock(&g_legb_mu);
+        return;                       /* simulate loss on the target segment */
+    }
+    now = now_ns();
+    due = now + g_legb_rtt_ns;
+    if (g_legb_jit_ns)
+        due += (uint64_t)(legb_rand_locked() % (uint32_t)(g_legb_jit_ns + 1));
+    sz = sizeof(*it) + len;           /* pkt[1] already includes 1 byte */
+    it = malloc(sz);
+    if (!it) {
+        pthread_mutex_unlock(&g_legb_mu);
+        handle_tun_downlink(ctx, p, len, fd);   /* out of memory: fall back to synchronous send */
+        return;
+    }
+    it->next = NULL;
+    it->ctx = ctx;
+    it->due_ns = due;
+    it->fd = fd;
+    it->len = len;
+    memcpy(it->pkt, p, len);
+    for (pp = &g_legb_head; *pp && (*pp)->due_ns <= due; pp = &(*pp)->next)
+        ;
+    it->next = *pp;
+    *pp = it;
+    pthread_cond_signal(&g_legb_cv);
+    pthread_mutex_unlock(&g_legb_mu);
+}
+
+static void legb_deliver(struct server_ctx *ctx, uint8_t *p, size_t len, int fd)
+{
+    if (!legb_init()) {
+        handle_tun_downlink(ctx, p, len, fd);
+        return;
+    }
+    legb_enqueue(ctx, p, len, fd);
+}
+
+static void legb_abs_timeout(struct timespec *ts, uint64_t ns_from_now)
+{
+    clock_gettime(CLOCK_MONOTONIC, ts);
+    ts->tv_sec += (time_t)(ns_from_now / 1000000000ull);
+    ts->tv_nsec += (long)(ns_from_now % 1000000000ull);
+    if (ts->tv_nsec >= 1000000000L) {
+        ts->tv_sec++;
+        ts->tv_nsec -= 1000000000L;
+    }
+}
+
+static void *legb_thread_main(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        struct legb_item *it;
+        uint64_t now;
+
+        pthread_mutex_lock(&g_legb_mu);
+        while (!g_legb_head)
+            pthread_cond_wait(&g_legb_cv, &g_legb_mu);
+        now = now_ns();
+        if (g_legb_head->due_ns > now) {
+            struct timespec ts;
+            legb_abs_timeout(&ts, g_legb_head->due_ns - now);
+            pthread_cond_timedwait(&g_legb_cv, &g_legb_mu, &ts);
+            pthread_mutex_unlock(&g_legb_mu);
+            continue;
+        }
+        it = g_legb_head;
+        g_legb_head = it->next;
+        pthread_mutex_unlock(&g_legb_mu);
+
+        if (g_legb_rate) {
+            double deficit;
+            now = now_ns();
+            pthread_mutex_lock(&g_legb_mu);
+            g_legb_tokens += (double)(now - g_legb_tok_ts) *
+                             (double)g_legb_rate / 1e9;
+            g_legb_tok_ts = now;
+            if (g_legb_tokens > (double)g_legb_rate * 0.05)
+                g_legb_tokens = (double)g_legb_rate * 0.05;  /* 50ms burst */
+            deficit = (double)it->len - g_legb_tokens;
+            if (deficit > 0) {
+                g_legb_tokens = 0;
+            } else {
+                g_legb_tokens -= (double)it->len;
+            }
+            pthread_mutex_unlock(&g_legb_mu);
+            if (deficit > 0) {
+                uint64_t ns = (uint64_t)(deficit * 1e9 / (double)g_legb_rate);
+                struct timespec ts;
+                ts.tv_sec = (time_t)(ns / 1000000000ull);
+                ts.tv_nsec = (long)(ns % 1000000000ull);
+                nanosleep(&ts, NULL);
+            }
+        }
+        handle_tun_downlink(it->ctx, it->pkt, it->len, it->fd);
+        free(it);
+    }
+    return NULL;
+}
+
 /* --no-tun echo mode: mirror an inner IPv6/TCP packet back to its
  * sender (v6 sibling of echo_mirror; same stateless-ish swap, checksum
  * via the IPv6 pseudo header). */
 static int echo_mirror6(struct server_ctx *ctx, uint8_t *p, size_t len,
                         int sockfd)
 {
-    uint32_t seq, ack, s_orig;
+    uint32_t seq, ack, s_orig, cli_ack = 0, cli_wnd = 0;
     uint16_t sport, dport, cs;
     uint8_t flags;
     size_t thlen, paylen;
@@ -2061,7 +2448,7 @@ static int echo_mirror6(struct server_ctx *ctx, uint8_t *p, size_t len,
 
     if (len < 60) {              /* 40 IPv6 + 20 TCP */
         if (debug_enabled())
-            log_debug("echo6: short pkt %zu", len);
+            log_debug("echo6: short pkt %llu", (unsigned long long)len);
         return -1;
     }
     if (p[6] != IPPROTO_TCP) {   /* next header must be TCP (no ext hdrs) */
@@ -2072,7 +2459,9 @@ static int echo_mirror6(struct server_ctx *ctx, uint8_t *p, size_t len,
     thlen = (size_t)((p[52] >> 4) & 0x0F) * 4;
     if (len < 40 + thlen) {
         if (debug_enabled())
-            log_debug("echo6: bad thlen %zu len %zu", thlen, len);
+            log_debug("echo6: bad thlen %llu len %llu",
+                      (unsigned long long)thlen,
+                      (unsigned long long)len);
         return -1;
     }
     if (debug_enabled()) {
@@ -2081,12 +2470,12 @@ static int echo_mirror6(struct server_ctx *ctx, uint8_t *p, size_t len,
         for (size_t k = 0; k < hn; k++)
             sprintf(hx + k * 3, "%02x ", p[k]);
         log_debug("echo6: [%02x%02x:..:%02x%02x]:%u -> [%02x%02x:..:%02x%02x]:%u "
-                  "flags=%02x len=%zu [%s]",
+                  "flags=%02x len=%llu [%s]",
                   p[8], p[9], p[22], p[23],
                   (unsigned)((p[40] << 8) | p[41]),
                   p[24], p[25], p[38], p[39],
                   (unsigned)((p[42] << 8) | p[43]),
-                  p[53], len, hx);
+                  p[53], (unsigned long long)len, hx);
     }
     sport = (uint16_t)((p[40] << 8) | p[41]);
     dport = (uint16_t)((p[42] << 8) | p[43]);
@@ -2095,8 +2484,12 @@ static int echo_mirror6(struct server_ctx *ctx, uint8_t *p, size_t len,
     flags = p[53];
     paylen = len - 40 - thlen;
 
+    cli_ack = ((uint32_t)p[40 + 8] << 24) | ((uint32_t)p[40 + 9] << 16) |
+              ((uint32_t)p[40 + 10] << 8) | p[40 + 11];
+    cli_wnd = ((uint32_t)p[40 + 14] << 8) | p[40 + 15];
     if (echo_seq_advance(6, NULL, p + 8, sport, NULL, p + 24, dport,
-                         flags, s_orig, paylen, &seq) != 0)
+                         flags, s_orig, paylen, cli_ack, cli_wnd,
+                         &seq) != 0)
         return -1;           /* table full */
     /* Do not mirror a pure ACK (no payload, no SYN/FIN/RST). Echoing it
      * back puts the client's own ACK in front of it again; Windows
@@ -2138,7 +2531,7 @@ static int echo_mirror6(struct server_ctx *ctx, uint8_t *p, size_t len,
     p[56] = (uint8_t)(cs >> 8);
     p[57] = (uint8_t)cs;
 
-    handle_tun_downlink(ctx, p, len, sockfd);
+    legb_deliver(ctx, p, len, sockfd);
     return 0;
 }
 
@@ -2146,16 +2539,82 @@ static int echo_mirror6(struct server_ctx *ctx, uint8_t *p, size_t len,
  * sender by swapping addresses/ports and seq/ack and turning SYN/FIN
  * into SYN+ACK/FIN+ACK (ISN 0, so no per-connection state). The client
  * netstack sees a lossless zero-RTT peer, which exercises the full
- * client<->server tunnel + netstack data path end to end — a bench
+ * client<->server tunnel + netstack data path end to end -- a bench
  * harness for SOCKS-mode throughput without a TUN device or a real
  * target network. */
+/* --no-tun mode UDP echo: turn an inner UDP packet around verbatim (swap addresses/
+ * ports, recompute IPv4 and UDP checksums). UDP has no congestion window, so this is
+ * the test rig's only "no window limit" throughput entry -- TCP echo is limited by
+ * lwIP's 16 KB receive window; measured throughput equals window/RTT and measures
+ * the peer's stack, not the data plane. Link B's delay/loss still goes through legb_deliver(). */
+static int echo_udp4(struct server_ctx *ctx, uint8_t *p, size_t len,
+                     uint8_t ihl, int sockfd)
+{
+    uint8_t tmp4[4];
+    uint16_t cs;
+    size_t ulen = len - (size_t)ihl;
+
+    if (ulen < 8) {
+        if (debug_enabled())
+            log_debug("echo: short udp %llu", (unsigned long long)ulen);
+        return -1;
+    }
+    if ((size_t)((p[ihl + 6] << 8) | p[ihl + 7]) != ulen) {
+        if (debug_enabled())
+            log_debug("echo: bad udp len %u vs %llu",
+                      (unsigned)((p[ihl + 6] << 8) | p[ihl + 7]),
+                      (unsigned long long)ulen);
+        return -1;
+    }
+    /* Swap IP addresses (byte-by-byte, not via host-order u32, to avoid byte-order reversal) */
+    memcpy(tmp4, p + 12, 4);
+    memcpy(p + 12, p + 16, 4);
+    memcpy(p + 16, tmp4, 4);
+    /* Swap UDP ports */
+    tmp4[0] = p[ihl];
+    tmp4[1] = p[ihl + 1];
+    p[ihl] = p[ihl + 2];
+    p[ihl + 1] = p[ihl + 3];
+    p[ihl + 2] = tmp4[0];
+    p[ihl + 3] = tmp4[1];
+    /* UDP checksum (including pseudo-header, IPPROTO_UDP): addresses are swapped, so
+     * compute in the swapped direction; two passes (pseudo-header + UDP segment) avoid a 64 KB stack buffer. */
+    p[ihl + 6] = (uint8_t)(ulen >> 8);
+    p[ihl + 7] = (uint8_t)ulen;
+    {
+        uint32_t sum = 0;
+        uint8_t pseudo[12];
+        memcpy(pseudo, p + 12, 8);   /* swapped src/dst */
+        pseudo[8] = 0;
+        pseudo[9] = IPPROTO_UDP;
+        pseudo[10] = (uint8_t)(ulen >> 8);
+        pseudo[11] = (uint8_t)ulen;
+        sum = ip_csum_accum(0, pseudo, sizeof pseudo);
+        sum = ip_csum_accum(sum, p + ihl, ulen);
+        cs = ip_csum_fold(sum);
+        if (cs == 0)
+            cs = 0xFFFF;
+    }
+    p[ihl + 6] = (uint8_t)(cs >> 8);
+    p[ihl + 7] = (uint8_t)cs;
+    /* IP header checksum */
+    p[10] = 0;
+    p[11] = 0;
+    cs = ip_csum_fold(ip_csum_accum(0, p, ihl));
+    p[10] = (uint8_t)(cs >> 8);
+    p[11] = (uint8_t)cs;
+
+    legb_deliver(ctx, p, len, sockfd);
+    return 0;
+}
+
 int echo_mirror(struct server_ctx *ctx, uint8_t *p, size_t len,
                 int sockfd)
 {
     if (len >= 1 && (p[0] >> 4) == 6)
         return echo_mirror6(ctx, p, len, sockfd);
 
-    uint32_t seq, ack, s_orig, nsrc, ndst;
+    uint32_t seq, ack, s_orig, nsrc, ndst, cli_ack = 0, cli_wnd = 0;
     uint16_t sport, dport, cs;
     uint8_t ihl, flags;
     size_t thlen, paylen;
@@ -2163,15 +2622,17 @@ int echo_mirror(struct server_ctx *ctx, uint8_t *p, size_t len,
 
     if (len < 40) {              /* 20 IP + 20 TCP */
         if (debug_enabled())
-            log_debug("echo: short pkt %zu", len);
+            log_debug("echo: short pkt %llu", (unsigned long long)len);
         return -1;
     }
     ihl = (uint8_t)((p[0] & 0x0F) * 4);
     if (ihl < 20 || len < (size_t)ihl + 20) {
         if (debug_enabled())
-            log_debug("echo: bad ihl %u len %zu", ihl, len);
+            log_debug("echo: bad ihl %u len %llu", ihl, (unsigned long long)len);
         return -1;
     }
+    if (p[9] == IPPROTO_UDP)
+        return echo_udp4(ctx, p, len, ihl, sockfd);
     if (p[9] != IPPROTO_TCP) {
         if (debug_enabled())
             log_debug("echo: proto %u not TCP", p[9]);
@@ -2180,7 +2641,9 @@ int echo_mirror(struct server_ctx *ctx, uint8_t *p, size_t len,
     thlen = (size_t)((p[ihl + 12] >> 4) & 0x0F) * 4;
     if (len < (size_t)ihl + thlen) {
         if (debug_enabled())
-            log_debug("echo: bad thlen %zu len %zu", thlen, len);
+            log_debug("echo: bad thlen %llu len %llu",
+                      (unsigned long long)thlen,
+                      (unsigned long long)len);
         return -1;
     }
     if (debug_enabled()) {
@@ -2188,12 +2651,12 @@ int echo_mirror(struct server_ctx *ctx, uint8_t *p, size_t len,
         size_t hn = len < 48 ? len : 48;
         for (size_t k = 0; k < hn; k++)
             sprintf(hx + k * 3, "%02x ", p[k]);
-        log_debug("echo: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u flags=%02x len=%zu [%s]",
+        log_debug("echo: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u flags=%02x len=%llu [%s]",
                   p[12], p[13], p[14], p[15],
                   (unsigned)((p[ihl] << 8) | p[ihl + 1]),
                   p[16], p[17], p[18], p[19],
                   (unsigned)((p[ihl + 2] << 8) | p[ihl + 3]),
-                  p[ihl + 13], len, hx);
+                  p[ihl + 13], (unsigned long long)len, hx);
     }
     sport = (uint16_t)((p[ihl] << 8) | p[ihl + 1]);
     dport = (uint16_t)((p[ihl + 2] << 8) | p[ihl + 3]);
@@ -2208,11 +2671,15 @@ int echo_mirror(struct server_ctx *ctx, uint8_t *p, size_t len,
            ((uint32_t)p[18] << 8) | p[19];
     /* mirrored seq from the per-connection state machine (new data
      * advances emit_seq; retransmits re-echo at their original spot) */
+    cli_ack = ((uint32_t)p[ihl + 8] << 24) | ((uint32_t)p[ihl + 9] << 16) |
+              ((uint32_t)p[ihl + 10] << 8) | p[ihl + 11];
+    cli_wnd = ((uint32_t)p[ihl + 14] << 8) | p[ihl + 15];
     if (echo_seq_advance(4, &nsrc, NULL, sport, &ndst, NULL, dport,
-                         flags, s_orig, paylen, &seq) != 0)
-        return -1;           /* table full */
+                         flags, s_orig, paylen, cli_ack, cli_wnd,
+                         &seq) != 0)
+        return -1;           /* table full or client window full */
     /* Do not mirror a pure ACK: echoing the client's ACK back makes
-     * Windows send another ACK, which is echoed again — a self-
+     * Windows send another ACK, which is echoed again -- a self-
      * sustaining ACK storm that stalls data. The table lookup above
      * still refreshes the connection, and data echoes already carry
      * the ACK that advances the client's send window. */
@@ -2258,7 +2725,7 @@ int echo_mirror(struct server_ctx *ctx, uint8_t *p, size_t len,
     p[10] = (uint8_t)(cs >> 8);
     p[11] = (uint8_t)cs;
 
-    handle_tun_downlink(ctx, p, len, sockfd);
+    legb_deliver(ctx, p, len, sockfd);
     return 0;
 }
 
@@ -2287,9 +2754,9 @@ bool tun_prep_downlink(struct server_ctx *ctx, uint8_t *ip_pkt, size_t len,
         if (ip6_pkt_ok(ip_pkt, len, s6, d6) != 0) {   /* guards len < 40 itself */
             atomic_fetch_add(&g_dl_drops, 1);
             if (debug_enabled())
-                log_debug("downlink drop: bad inner IPv6 (%zuB) v=%u "
+                log_debug("downlink drop: bad inner IPv6 (%lluB) v=%u "
                           "plen=%u",
-                          len, ip_pkt[0] >> 4,
+                          (unsigned long long)len, ip_pkt[0] >> 4,
                           ((unsigned)ip_pkt[4] << 8) | ip_pkt[5]);
             return false;
         }
@@ -2303,7 +2770,7 @@ bool tun_prep_downlink(struct server_ctx *ctx, uint8_t *ip_pkt, size_t len,
         /* session lookup: the client's ULA embeds its inner IPv4 in the
          * low 32 bits (protocol.h), so the IPv4 session table applies.
          * R23-F1 (asymmetry with the uplink H1 full-16B ULA check): only a
-         * genuine fd00::/96 client ULA may select a session — an arbitrary
+         * genuine fd00::/96 client ULA may select a session -- an arbitrary
          * v6 dest whose low 32 bits happen to match a client IP must never
          * be routed to that session (gate gap). */
         {
@@ -2338,8 +2805,8 @@ bool tun_prep_downlink(struct server_ctx *ctx, uint8_t *ip_pkt, size_t len,
             atomic_fetch_add(&g_dl_drops, 1);
             if (debug_enabled()) {
                 /* len<20 already filtered above, so src/dst bytes are safe */
-                log_debug("downlink drop: bad inner IPv4 (%zuB) %u.%u.%u.%u->%u.%u.%u.%u v=%u ihl=%u tot=%u",
-                          len, ip_pkt[12], ip_pkt[13], ip_pkt[14], ip_pkt[15],
+                log_debug("downlink drop: bad inner IPv4 (%lluB) %u.%u.%u.%u->%u.%u.%u.%u v=%u ihl=%u tot=%u",
+                          (unsigned long long)len, ip_pkt[12], ip_pkt[13], ip_pkt[14], ip_pkt[15],
                           ip_pkt[16], ip_pkt[17], ip_pkt[18], ip_pkt[19],
                           ip_pkt[0] >> 4, ip_pkt[0] & 0x0F,
                           ((unsigned)ip_pkt[2] << 8) | ip_pkt[3]);
@@ -2348,7 +2815,7 @@ bool tun_prep_downlink(struct server_ctx *ctx, uint8_t *ip_pkt, size_t len,
         }
         if (daddr == ip4_u32(ctx->server_ip)) {
             /* server-bound packet: the gate allows it, but no client owns
-             * this address — the server machine consumes it locally */
+             * this address -- the server machine consumes it locally */
             return false;
         }
         /* snapshot under the read lock; the send happens lock-free */
@@ -2385,8 +2852,8 @@ void handle_tun_downlink(struct server_ctx *ctx, uint8_t *ip_pkt, size_t len,
     if (!tun_prep_downlink(ctx, ip_pkt, len, &snap, hdr))
         return;
     /* Zero-copy send: the payload is XORed IN PLACE (the buffer belongs
-     * to the caller until this returns — the tun reader's scratch or a
-     * mirror stack buffer — and UDP datagrams are never retransmitted,
+     * to the caller until this returns -- the tun reader's scratch or a
+     * mirror stack buffer -- and UDP datagrams are never retransmitted,
      * so in-place crypto is safe) and sent as a 2-iovec message
      * [outer header, payload]. This eliminates the full-packet memcpy
      * the old sendto path did. */
@@ -2397,10 +2864,10 @@ void handle_tun_downlink(struct server_ctx *ctx, uint8_t *ip_pkt, size_t len,
         socklen_t slen;
         int sfd = sockfd;
 
-        /* 目的 peer 的族决定发送 socket：调用方传入的 fd 是本机 v4 侧的
-         * （TUN 队列池的 v4 socket，或 --no-tun echo 模式下报文到达的
-         * socket），拿它发 v6 目的地会 EAFNOSUPPORT/EINVAL。v6 走 ctx 里
-         * 的 v6 兜底 socket；v4 完全保持调用方传入的 fd（逐位不变）。 */
+        /* The destination peer's family picks the send socket: the caller's fd is the
+         * local v4 side (TUN queue pool v4 socket, or the arrival socket in --no-tun
+         * echo mode); sending to a v6 destination with it gives EAFNOSUPPORT/EINVAL.
+         * v6 uses ctx's v6 fallback socket; v4 keeps the caller's fd exactly (bit-identical). */
         if (snap.peer.family == AF_INET6) {
             if (ctx->dl_fd6 < 0) {
                 atomic_fetch_add(&g_send_drops, 1);
@@ -2428,7 +2895,7 @@ void handle_tun_downlink(struct server_ctx *ctx, uint8_t *ip_pkt, size_t len,
             PROF_ADD(g_prof_srv_dlsend, len);
     }
     /* Deliberately NO sendmsg(ECONNREFUSED) teardown here: this socket is
-     * unconnected, so on Linux sendmsg never returns ECONNREFUSED — an
+     * unconnected, so on Linux sendmsg never returns ECONNREFUSED -- an
      * ICMP port-unreachable is queued and surfaces on the NEXT receive
      * (which the main loop treats as EAGAIN/drained). Identifying the
      * dead peer from the error queue would need MSG_ERRQUEUE plumbing;
@@ -2445,7 +2912,7 @@ void purge_expired(struct server_ctx *ctx, uint64_t now)
     /* Re-take the timestamp AFTER acquiring the write lock: waiting for
      * it can span DATA-path last_active updates (readers update it
      * lock-free), so a `now` sampled before the wait may be OLDER than
-     * last_active — the unsigned subtraction then underflows to a huge
+     * last_active -- the unsigned subtraction then underflows to a huge
      * "idle time" and a live session is wiped as expired (measured:
      * last_active = now + 1ms -> diff = 2^64-1). */
     now = now_ms();

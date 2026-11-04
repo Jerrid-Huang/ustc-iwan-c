@@ -1,17 +1,17 @@
 /*
- * iWAN 内核数据面的 genetlink 控制面客户端（Linux only）。
+ * iWAN kernel data plane genetlink control-plane client (Linux only).
  *
- * 手法与 kernel/tests/iwan_ctl.c 完全一致：纯 libc、自己拼 nlmsghdr/nlattr、
- * CTRL_CMD_GETFAMILY 解析家族 id（等价 libnl 的 genl_ctrl_resolve），不引入
- * 新依赖。区别只在错误处理：本文件是库代码，失败返回负 errno + 中文 err 文本，
- * 不 exit()。
+ * Approach is identical to kernel/tests/iwan_ctl.c: plain libc, hand-built nlmsghdr/nlattr,
+ * CTRL_CMD_GETFAMILY to resolve the family id (equivalent to libnl's genl_ctrl_resolve), no new
+ * dependencies. The only difference is error handling: this file is library code, on failure it returns a negative errno + err text,
+ * it does not exit().
  *
- * 线程模型：一个 genl_iwan 对应一个套接字，单线程使用（kdp.c 的监督循环）。
+ * Thread model: one genl_iwan corresponds to one socket, used single-threaded (kdp.c's supervision loop).
  *
- * 注意 libc 的 UAPI 宏：linux/netlink.h 的 NLMSG 与 NLA 宏在
- * -Wsign-conversion 下不可用（展开式里的 "& ~3" 把 int -4 隐式转成 size_t，
- * 而 CI 红线是 -Werror）。下面的 GENL 常量/函数与那些宏语义完全相同，
- * 只是每一步都显式转换。
+ * Beware libc's UAPI macros: linux/netlink.h's NLMSG and NLA macros are unusable under
+ * -Wsign-conversion (the "& ~3" in the expansion implicitly converts int -4 to size_t,
+ * and the CI red line is -Werror). The GENL constants/functions below are semantically identical to those macros,
+ * only every step uses explicit casts.
  */
 
 #if defined(__linux__)
@@ -32,24 +32,24 @@
 
 #define GENL_BUF 8192
 
-/* 对齐/头部长度（等价 NLMSG_ALIGN / NLMSG_HDRLEN / NLA_ALIGN / NLA_HDRLEN） */
+/* Alignment/header lengths (equivalent to NLMSG_ALIGN / NLMSG_HDRLEN / NLA_ALIGN / NLA_HDRLEN) */
 #define GENL_ALIGN4(n)   (((size_t)(n) + 3u) & ~(size_t)3u)
 #define GENL_NLMSG_HDR   ((int)sizeof(struct nlmsghdr))
 #define GENL_GENL_HDR    ((int)sizeof(struct genlmsghdr))
 #define GENL_NLA_HDR     ((size_t)sizeof(struct nlattr))
 
-/* 编译期钉住"头文件用了 8 字节密钥"这一条：IWAN_KEY_LEN 来自冻结 ABI。 */
-_Static_assert(IWAN_KEY_LEN == 8, "IWAN_KEY_LEN 变了，同步 genl_iwan_session");
+/* Pin at compile time that "the header uses an 8-byte key": IWAN_KEY_LEN comes from the frozen ABI. */
+_Static_assert(IWAN_KEY_LEN == 8, "IWAN_KEY_LEN changed; sync genl_iwan_session");
 
 struct genl_iwan {
     int      fd;
     bool     resolved;
     uint16_t fam_id;
-    int      grp_id;    /* -1 = 家族没有 events 组 */
+    int      grp_id;    /* -1 = family has no events group */
     uint32_t seq;
 };
 
-/* ------------------------------------------------------------ 消息构造 */
+/* ------------------------------------------------------------ message construction */
 
 struct genl_req {
     uint8_t          buf[GENL_BUF];
@@ -125,9 +125,9 @@ static bool nla_put_u32(struct genl_req *r, uint16_t t, uint32_t v)
     return nla_put(r, t, &v, sizeof(v));
 }
 
-/* 主机序地址 -> htonl 后再进属性（字节序转换只在这一层做一次） */
-/* 16 字节地址（外层 v6 端点 / 出口 v6 IP）原样进属性：内核侧按
- * NLA_BINARY + 长度恰好 16 校验，字节序就是网络序（in6_addr 本来就是） */
+/* host-order address -> htonl, then into the attribute (byte-order conversion happens only once, at this layer) */
+/* 16-byte address (outer v6 endpoint / egress v6 IP) goes into the attribute as-is: the kernel validates it as
+ * NLA_BINARY + exactly 16 bytes; the byte order is network order (in6_addr already is) */
 static bool nla_put_addr6(struct genl_req *r, uint16_t t,
                           const struct in6_addr *a)
 {
@@ -141,7 +141,7 @@ static bool nla_put_addr(struct genl_req *r, uint16_t t, uint32_t host)
     return nla_put(r, t, &be, sizeof(be));
 }
 
-/* 主机序端口 -> htons 后再进属性 */
+/* host-order port -> htons, then into the attribute */
 static bool nla_put_port(struct genl_req *r, uint16_t t, uint16_t host)
 {
     uint16_t be = htons(host);
@@ -154,10 +154,10 @@ static bool nla_put_str(struct genl_req *r, uint16_t t, const char *s)
     return nla_put(r, t, s, strlen(s) + 1);
 }
 
-/* ------------------------------------------------------------ 属性解析 */
+/* ------------------------------------------------------------ attribute parsing */
 
-/* NLA_OK/NLA_NEXT 是内核内部宏（include/net/netlink.h），UAPI 头里没有；
- * 按同样语义自己写一份（与 iwan_ctl.c 一致）。 */
+/* NLA_OK/NLA_NEXT are kernel-internal macros (include/net/netlink.h), absent from UAPI headers;
+ * we provide our own with the same semantics (consistent with iwan_ctl.c). */
 static bool nla_ok(const struct nlattr *nla, int rem)
 {
     return rem >= (int)sizeof(*nla) && nla->nla_len >= sizeof(*nla) &&
@@ -183,7 +183,7 @@ static void parse_attrs(const void *data, int len, struct nlattr **tb, int max)
         int t = (int)(nla->nla_type & NLA_TYPE_MASK);
 
         if (t > 0 && t < max)
-            tb[t] = (struct nlattr *)(void *)nla;   /* 只读使用 */
+            tb[t] = (struct nlattr *)(void *)nla;   /* read-only use */
     }
 }
 
@@ -221,7 +221,7 @@ static bool attr_u32(struct nlattr *const *tb, int t, uint32_t *out)
     return true;
 }
 
-/* be32 属性 -> 主机序地址（读方向；写方向见 nla_put_addr） */
+/* be32 attribute -> host-order address (read direction; for write see nla_put_addr) */
 static bool attr_addr(struct nlattr *const *tb, int t, uint32_t *out)
 {
     uint32_t be;
@@ -233,8 +233,8 @@ static bool attr_addr(struct nlattr *const *tb, int t, uint32_t *out)
     return true;
 }
 
-/* 16 字节地址属性 -> struct in6_addr（读方向）。长度必须恰好 16：
- * 内核按 NLA_BINARY(.len=16) + 显式长度校验发出来，短了就是 ABI 不对。 */
+/* 16-byte address attribute -> struct in6_addr (read direction). Length must be exactly 16:
+ * the kernel emits it with NLA_BINARY(.len=16) + explicit length check; anything shorter means a broken ABI. */
 static bool attr_addr6(struct nlattr *const *tb, int t, struct in6_addr *out)
 {
     if (tb[t] == NULL || nla_payload_len(tb[t]) != (int)sizeof(*out))
@@ -267,7 +267,7 @@ static bool attr_str(struct nlattr *const *tb, int t, char *out, size_t outsz)
     return true;
 }
 
-/* ------------------------------------------------------------ 套接字 */
+/* ------------------------------------------------------------ socket */
 
 genl_iwan *genl_iwan_open(char *err, size_t errsz)
 {
@@ -277,29 +277,29 @@ genl_iwan *genl_iwan_open(char *err, size_t errsz)
 
     g = calloc(1, sizeof(*g));
     if (g == NULL) {
-        snprintf(err, errsz, "内存不足");
+        snprintf(err, errsz, "out of memory");
         return NULL;
     }
     g->grp_id = -1;
     g->fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_GENERIC);
     if (g->fd < 0) {
-        snprintf(err, errsz, "创建 genetlink 套接字失败: %s", strerror(errno));
+        snprintf(err, errsz, "failed to create genetlink socket: %s", strerror(errno));
         free(g);
         return NULL;
     }
     memset(&sa, 0, sizeof(sa));
     sa.nl_family = AF_NETLINK;
     if (bind(g->fd, (struct sockaddr *)(void *)&sa, sizeof(sa)) < 0) {
-        snprintf(err, errsz, "绑定 genetlink 套接字失败: %s", strerror(errno));
+        snprintf(err, errsz, "failed to bind genetlink socket: %s", strerror(errno));
         close(g->fd);
         free(g);
         return NULL;
     }
-    /* 回执超时：内核没应答时报错而不是挂死 */
+    /* reply timeout: report an error instead of hanging when the kernel does not answer */
     tv.tv_sec = 2;
     tv.tv_usec = 0;
     if (setsockopt(g->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
-        snprintf(err, errsz, "设置 genetlink 超时失败: %s", strerror(errno));
+        snprintf(err, errsz, "failed to set genetlink timeout: %s", strerror(errno));
         close(g->fd);
         free(g);
         return NULL;
@@ -316,9 +316,9 @@ void genl_iwan_close(genl_iwan *g)
     free(g);
 }
 
-/* 发一条请求并等回执。返回 0 或负 errno；reply 带回第一条数据消息
- * （genlmsghdr + 属性）。语义与 iwan_ctl.c 的 nl_talk 一致：带 NLM_F_ACK
- * 时先收数据消息再等 ACK，只收到数据消息时也算成功。 */
+/* Send one request and wait for the reply. Returns 0 or a negative errno; reply carries the first data message
+ * (genlmsghdr + attributes). Semantics match nl_talk in iwan_ctl.c: with NLM_F_ACK
+ * it first receives the data message and then waits for the ACK; receiving only the data message also counts as success. */
 static int nl_talk(struct genl_iwan *g, struct genl_req *r, char *reply,
                    size_t replysz, size_t *replylen)
 {
@@ -350,13 +350,13 @@ static int nl_talk(struct genl_iwan *g, struct genl_req *r, char *reply,
         for (h = (struct nlmsghdr *)(void *)buf; nlmsg_ok(h, rem);
              h = nlmsg_next(h, &rem)) {
             if (h->nlmsg_seq != r->nlh->nlmsg_seq)
-                continue;   /* 不是本请求的回执（事件 seq=0 也走这里） */
+                continue;   /* not a reply to this request (event seq=0 also lands here) */
             if (h->nlmsg_type == NLMSG_ERROR) {
                 const struct nlmsgerr *e =
                     (const struct nlmsgerr *)nlmsg_data(h);
 
                 if (e->error != 0)
-                    return e->error;    /* 负 errno */
+                    return e->error;    /* negative errno */
                 return 0;               /* ACK */
             }
             if (h->nlmsg_type == NLMSG_DONE)
@@ -377,10 +377,10 @@ static int nl_talk(struct genl_iwan *g, struct genl_req *r, char *reply,
     }
 }
 
-/* err 里补一条"模块没加载？"的提示；调用方给操作名。 */
+/* Append a "module not loaded?" hint to err; the caller supplies the operation name. */
 static void err_from_errno(char *err, size_t errsz, const char *what, int e)
 {
-    snprintf(err, errsz, "%s 失败: %s（内核模块 iwan 未加载或版本不匹配？）",
+    snprintf(err, errsz, "%s failed: %s (kernel module iwan not loaded or version mismatch?)",
              what, strerror(e < 0 ? -e : e));
 }
 
@@ -399,32 +399,33 @@ int genl_iwan_resolve(genl_iwan *g, char *err, size_t errsz)
 
     req_init(g, &r, GENL_ID_CTRL, NLM_F_REQUEST, CTRL_CMD_GETFAMILY);
     if (!nla_put_str(&r, CTRL_ATTR_FAMILY_NAME, IWAN_GENL_NAME)) {
-        snprintf(err, errsz, "构造家族查询消息失败");
+        snprintf(err, errsz, "failed to build the family query message");
         return -EMSGSIZE;
     }
     e = nl_talk(g, &r, reply, sizeof(reply), &rl);
     if (e != 0) {
         if (e == -ETIMEDOUT)
             snprintf(err, errsz,
-                     "查询 genetlink 家族 \"%s\" 超时：内核模块 iwan 未加载"
-                     "（insmod iwan.ko），或与客户端不是同批构建",
+                     "querying genetlink family \"%s\" timed out: kernel module iwan not loaded"
+                     " (insmod iwan.ko), or not built from the same batch as the client",
                      IWAN_GENL_NAME);
         else
-            err_from_errno(err, errsz, "查询 genetlink 家族 \"iwan\"", e);
+            err_from_errno(err, errsz, "query genetlink family \"iwan\"", e);
         return e;
     }
     if (rl < (size_t)GENL_GENL_HDR) {
-        snprintf(err, errsz, "家族查询回执过短（%zu 字节）", rl);
+        snprintf(err, errsz, "family query reply too short (%llu bytes)",
+                 (unsigned long long)rl);
         return -EIO;
     }
     parse_attrs(reply + GENL_GENL_HDR, (int)rl - GENL_GENL_HDR, tb,
                 CTRL_ATTR_MAX + 1);
     if (!attr_u16(tb, CTRL_ATTR_FAMILY_ID, &fam_id) || fam_id == 0) {
-        snprintf(err, errsz, "内核回执里没有 CTRL_ATTR_FAMILY_ID");
+        snprintf(err, errsz, "kernel reply has no CTRL_ATTR_FAMILY_ID");
         return -EIO;
     }
 
-    /* events 组是可选的（诊断通道）：解析不到不算错误，只是没有它 */
+    /* the events group is optional (diagnostic channel): failure to resolve it is not an error, it is just absent */
     if (tb[CTRL_ATTR_MCAST_GROUPS] != NULL) {
         int glen = nla_payload_len(tb[CTRL_ATTR_MCAST_GROUPS]);
         const struct nlattr *grp;
@@ -451,7 +452,7 @@ int genl_iwan_resolve(genl_iwan *g, char *err, size_t errsz)
     return 0;
 }
 
-/* ------------------------------------------------------------ 命令 */
+/* ------------------------------------------------------------ commands */
 
 int genl_iwan_session_up(genl_iwan *g, const genl_iwan_session *s,
                          char *dev, size_t devsz, uint32_t *mtu_out,
@@ -476,14 +477,14 @@ int genl_iwan_session_up(genl_iwan *g, const genl_iwan_session *s,
 
     req_init(g, &r, g->fam_id, NLM_F_REQUEST | NLM_F_ACK,
              IWAN_CMD_SESSION_UP);
-    /* SPORT 一律显式给出：模块首次存下的值参与幂等比较，省略会存 0，
-     * 之后显式给值直接 -EINVAL（CONTROL-PLANE.md §10.2） */
+    /* SPORT is always given explicitly: the value stored by the module on the first call participates in idempotent comparison; omitting it stores 0,
+     * and explicitly giving it later returns -EINVAL directly (CONTROL-PLANE.md section 10.2) */
     if (!nla_put_u16(&r, IWAN_A_SID, s->sid) ||
         !nla_put_u32(&r, IWAN_A_TOK, s->tok) ||
         !nla_put_u8(&r, IWAN_A_ENC, s->enc) ||
         !nla_put(&r, IWAN_A_KEY, s->key, IWAN_KEY_LEN) ||
-        /* 外层端点：按族只发一对 —— 内核按"给了哪一对"判族，两对同时给
-         * 是 -EINVAL（族的切换是重建会话，不是改一个地址） */
+        /* Outer endpoint: send only one pair according to the family -- the kernel decides the family by "which pair was given"; giving both pairs
+         * returns -EINVAL (switching family means rebuilding the session, not changing one address) */
         (s->outer_v6 ?
              (!nla_put_addr6(&r, IWAN_A_OUTER_SRC6, &s->outer_src6) ||
               !nla_put_addr6(&r, IWAN_A_OUTER_DST6, &s->outer_dst6)) :
@@ -492,14 +493,14 @@ int genl_iwan_session_up(genl_iwan *g, const genl_iwan_session *s,
         !nla_put_port(&r, IWAN_A_DPORT, s->dport) ||
         !nla_put_port(&r, IWAN_A_SPORT, s->sport) ||
         !nla_put_u32(&r, IWAN_A_FLAGS, flags) ||
-        /* 绑定规格：0 一律不发（= 不绑），保持旧客户端逐位语义不变 */
+        /* Binding spec: never send 0 (= unbound), preserving the old client's per-bit semantics */
         (s->oif != 0 && !nla_put_u32(&r, IWAN_A_OIF, s->oif)) ||
         (s->outer_v6 ?
              (!IN6_IS_ADDR_UNSPECIFIED(&s->bind_ip6) &&
               !nla_put_addr6(&r, IWAN_A_IP6, &s->bind_ip6)) :
              (s->bind_ip != 0 && !nla_put_addr(&r, IWAN_A_IP, s->bind_ip))) ||
         (s->mtu != 0 && !nla_put_u32(&r, IWAN_A_MTU, s->mtu))) {
-        snprintf(err, errsz, "构造 SESSION_UP 消息失败（属性超长）");
+        snprintf(err, errsz, "failed to build the SESSION_UP message (attribute too long)");
         return -EMSGSIZE;
     }
 
@@ -507,21 +508,21 @@ int genl_iwan_session_up(genl_iwan *g, const genl_iwan_session *s,
     if (e != 0) {
         if (e == -EBUSY)
             snprintf(err, errsz,
-                     "SESSION_UP 失败: 设备名被占用（-EBUSY）——"
-                     "iwan0 已存在且不是 iwan 模块创建的设备，"
-                     "请先删除它（ip link del iwan0）或改用 --data-plane tun");
+                     "SESSION_UP failed: device name is taken (-EBUSY) -- "
+                     "iwan0 already exists and is not a device created by the iwan module; "
+                     "delete it first (ip link del iwan0) or use --data-plane tun");
         else if (e == -EINVAL)
             snprintf(err, errsz,
-                     "SESSION_UP 失败: 参数被拒（-EINVAL）——两种可能："
-                     "①本 netns 已有会话且参数漂移（sid/tok/key/enc/外层端点/"
-                     "sport/oif/绑定 IP 任一项与内核里那条不一致，必须先 "
-                     "SESSION_DOWN 再重建）；②参数本身越界（内层 MTU 超过模块 "
-                     "max_mtu，默认 1500；ENC/FLAGS 非法；外层地址或端口为 0）。"
-                     "内核日志里有具体字段与数值：sudo dmesg | grep iwan");
+                     "SESSION_UP failed: parameters rejected (-EINVAL) -- two possibilities: "
+                     "(1) this netns already has a session and parameters drifted (sid/tok/key/enc/outer endpoint/"
+                     "sport/oif/bound IP, any item inconsistent with the entry in the kernel; you must "
+                     "SESSION_DOWN and rebuild first); (2) the parameters themselves are out of range (inner MTU exceeds the module's "
+                     "max_mtu, default 1500; ENC/FLAGS invalid; outer address or port is 0). "
+                     "The kernel log has the specific field and value: sudo dmesg | grep iwan");
         else if (e == -ENODEV || e == -EOPNOTSUPP)
             snprintf(err, errsz,
-                     "SESSION_UP 失败: %s（内核不支持按需建卡？模块需要与本"
-                     "客户端同批构建）", strerror(-e));
+                     "SESSION_UP failed: %s (kernel cannot create the device on demand? the module must be built from the same "
+                     "batch as this client)", strerror(-e));
         else
             err_from_errno(err, errsz, "SESSION_UP", e);
         return e;
@@ -531,11 +532,11 @@ int genl_iwan_session_up(genl_iwan *g, const genl_iwan_session *s,
                 IWAN_A_MAX + 1);
     if (!attr_str(tb, IWAN_A_DEVNAME, dev, devsz) || dev[0] == '\0' ||
         strcmp(dev, "-") == 0) {
-        /* 回执缺 DEVNAME（或内核回了"无会话"占位符 "-"）：按设计默认名继续，
-         * 但要说出来 —— 否则后面拿 "-" 当接口名去配地址/路由，报错看不懂 */
+        /* Reply lacks DEVNAME (or the kernel returned the "no session" placeholder "-"): continue with the designed default name,
+         * but say so -- otherwise later "-" is used as the interface name for address/route setup and the error is incomprehensible */
         if (devsz != 0)
             snprintf(dev, devsz, "iwan0");
-        log_err("SESSION_UP 回执的 IWAN_A_DEVNAME 不可用，按 \"iwan0\" 处理");
+        log_err("IWAN_A_DEVNAME in the SESSION_UP reply is unusable; treating it as \"iwan0\"");
     }
     if (attr_u32(tb, IWAN_A_MTU, &rmtu) && mtu_out != NULL)
         *mtu_out = rmtu;
@@ -586,8 +587,8 @@ int genl_iwan_get_stats(genl_iwan *g, genl_iwan_stats *st, char *err,
     (void)attr_u32(tb, IWAN_A_OIF, &st->oif);
     (void)attr_u32(tb, IWAN_A_CARRIER, &st->carrier);
     (void)attr_addr(tb, IWAN_A_IP, &st->bind_ip);
-    /* 外层 v6 会话：内核回执里只在这时发这三个属性，"在不在"就是族判据
-     * （详见 kernel/iwan_netlink.c 的回执处说明）。 */
+    /* Outer v6 sessions: the kernel emits these three attributes only in that case; "present or not" is the family criterion
+     * (see the explanation at the reply site in kernel/iwan_netlink.c). */
     st->outer_v6 = attr_addr6(tb, IWAN_A_OUTER_SRC6, &st->outer_src6);
     (void)attr_addr6(tb, IWAN_A_OUTER_DST6, &st->outer_dst6);
     (void)attr_addr6(tb, IWAN_A_IP6, &st->bind_ip6);
@@ -614,14 +615,14 @@ int genl_iwan_events_subscribe(genl_iwan *g, char *err, size_t errsz)
     if (e != 0)
         return e;
     if (g->grp_id < 0) {
-        snprintf(err, errsz, "家族 \"%s\" 没有多播组 \"%s\"",
+        snprintf(err, errsz, "family \"%s\" has no multicast group \"%s\"",
                  IWAN_GENL_NAME, IWAN_GENL_MCGRP_EVENTS);
         return -ENOENT;
     }
     one = g->grp_id;
     if (setsockopt(g->fd, SOL_NETLINK, NETLINK_ADD_MEMBERSHIP, &one,
                    sizeof(one)) < 0) {
-        snprintf(err, errsz, "加入多播组 \"%s\"(id=%d) 失败: %s",
+        snprintf(err, errsz, "failed to join multicast group \"%s\"(id=%d): %s",
                  IWAN_GENL_MCGRP_EVENTS, g->grp_id, strerror(errno));
         return -errno;
     }
@@ -655,8 +656,8 @@ int genl_iwan_events_drain(genl_iwan *g, genl_iwan_ev_cb cb, void *ud)
             size_t flen = 0;
             int alen;
 
-            /* 事件：nlmsg_type == fam_id 且 nlmsg_seq == 0 —— 不能按 seq
-             * 过滤（CONTROL-PLANE.md / iwan_ctl.c 的同一口径） */
+            /* event: nlmsg_type == fam_id and nlmsg_seq == 0 -- cannot filter by seq
+             * (same criterion as CONTROL-PLANE.md / iwan_ctl.c) */
             if (h->nlmsg_type != g->fam_id)
                 continue;
             if (h->nlmsg_len <
