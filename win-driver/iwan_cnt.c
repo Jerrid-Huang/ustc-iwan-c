@@ -1195,6 +1195,24 @@ static const IWAN_CNT_CH_CAND iwan_cnt_ch_cands[] = {
 	{ 20,   NDIS_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_1 }
 };
 
+/* First failure seen by any load attempt, and the candidate that produced it. Every PnP instance runs DriverEntry
+ * once, and a later attempt reports STATUS_DRIVER_FAILED_PRIOR_UNLOAD because the earlier failure left the driver
+ * object referenced -- that overwrites Status/T31 and hides the original cause. These two are written once only. */
+static volatile LONG g_cnt_first_st;
+static volatile LONG g_cnt_first_idx;
+static volatile LONG g_cnt_entry_count;
+
+/* MiniportDriverUnload: required for NDIS 6.0 and later drivers, and registration is rejected outright when it is
+ * NULL. Nothing to tear down here -- a PnP miniport is halted through HaltHandlerEx, and this image is never
+ * unloaded while the machine lives. */
+static
+_Function_class_(MINIPORT_DRIVER_UNLOAD)
+VOID
+iwan_cnt_unload(_In_ PDRIVER_OBJECT driver)
+{
+	UNREFERENCED_PARAMETER(driver);
+}
+
 static VOID
 iwan_cnt_fill_ch(_Out_ PNDIS_MINIPORT_DRIVER_CHARACTERISTICS ch,
 		 _In_ UCHAR minor, _In_ UCHAR revision)
@@ -1232,6 +1250,7 @@ iwan_cnt_fill_ch(_Out_ PNDIS_MINIPORT_DRIVER_CHARACTERISTICS ch,
 	ch->DevicePnPEventNotifyHandler = iwan_cnt_pnp_event;
 	ch->ShutdownHandlerEx = iwan_cnt_shutdown;
 	ch->CancelOidRequestHandler = iwan_cnt_cancel_oid;
+	ch->UnloadHandler = iwan_cnt_unload;
 }
 
 NDIS_STATUS
@@ -1268,6 +1287,9 @@ DriverEntry(_In_ PDRIVER_OBJECT DriverObject,
 	KeInitializeSpinLock(&g_cnt_lock);
 	g_cnt_list_ready = TRUE;
 	iwan_cnt_trace(30, (LONG)NdisGetVersion());
+	/* T47: how many times DriverEntry has run on this boot. Two PnP instances means twice; a number larger than the
+	 * instance count means the loader retried after a failure. */
+	iwan_cnt_trace(47, InterlockedIncrement(&g_cnt_entry_count));
 
 	/* Miniport registration: try the highest characteristics revision first, then fall back.
 	 * A hard-wired REVISION_1 at the runtime minor version is rejected on a current NDIS (the
@@ -1289,6 +1311,13 @@ DriverEntry(_In_ PDRIVER_OBJECT DriverObject,
 		if (st == NDIS_STATUS_SUCCESS) {
 			iwan_cnt_trace(32, (LONG)(((ULONG)minor << 8) | rev));
 			break;
+		}
+		/* T40..T45: the status of each candidate, in order. T46/T48: the first failure ever seen and its candidate
+		 * index, written once so that a later STATUS_DRIVER_FAILED_PRIOR_UNLOAD cannot bury the real reason. */
+		iwan_cnt_trace(40 + i, (LONG)st);
+		if (InterlockedCompareExchange(&g_cnt_first_st, (LONG)st, 0) == 0) {
+			iwan_cnt_trace(46, (LONG)st);
+			iwan_cnt_trace(48, (LONG)i);
 		}
 	}
 	if (st != NDIS_STATUS_SUCCESS) {
