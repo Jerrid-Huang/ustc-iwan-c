@@ -1206,7 +1206,7 @@ static volatile LONG g_cnt_entry_count;
  * NULL. Nothing to tear down here -- a PnP miniport is halted through HaltHandlerEx, and this image is never
  * unloaded while the machine lives. */
 static
-_Function_class_(MINIPORT_DRIVER_UNLOAD)
+_Function_class_(MINIPORT_UNLOAD)
 VOID
 iwan_cnt_unload(_In_ PDRIVER_OBJECT driver)
 {
