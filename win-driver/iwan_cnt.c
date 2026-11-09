@@ -50,6 +50,7 @@ typedef struct _IWAN_CNT_NBL_CTX {
 typedef struct _IWAN_CNT_ADAPTER {
 	NDIS_HANDLE                     adapter_handle;
 	NDIS_HANDLE                     nbl_pool;
+	EX_RUNDOWN_REF                  rundown;
 	volatile LONG                   running;
 	volatile LONG                   inflight;
 	UCHAR                           mac[6];
@@ -468,10 +469,25 @@ iwan_cnt_indicate(_Inout_ PIWAN_CNT_ADAPTER a, _In_ UCHAR *buf, _In_ ULONG len,
 	PNET_BUFFER_LIST nbl;
 	PIWAN_CNT_NBL_CTX ctx;
 
+	/* Retain the adapter until NDIS returns this indication. A bridge caller
+	 * also holds a reference while looking up and invoking the peer. */
+	if (!ExAcquireRundownProtection(&a->rundown)) {
+		ExFreePoolWithTag(buf, IWAN_CNT_TAG);
+		return;
+	}
+	if (InterlockedIncrement(&a->inflight) > 4096) {
+		InterlockedDecrement(&a->inflight);
+		InterlockedIncrement64(&a->drops);
+		ExReleaseRundownProtection(&a->rundown);
+		ExFreePoolWithTag(buf, IWAN_CNT_TAG);
+		return;
+	}
 	mdl = IoAllocateMdl(buf, len, FALSE, FALSE, NULL);
 	if (mdl == NULL) {
 		ExFreePoolWithTag(buf, IWAN_CNT_TAG);
 		InterlockedIncrement64(&a->drops);
+		InterlockedDecrement(&a->inflight);
+		ExReleaseRundownProtection(&a->rundown);
 		return;
 	}
 	MmBuildMdlForNonPagedPool(mdl);
@@ -483,6 +499,8 @@ iwan_cnt_indicate(_Inout_ PIWAN_CNT_ADAPTER a, _In_ UCHAR *buf, _In_ ULONG len,
 		IoFreeMdl(mdl);
 		ExFreePoolWithTag(buf, IWAN_CNT_TAG);
 		InterlockedIncrement64(&a->drops);
+		InterlockedDecrement(&a->inflight);
+		ExReleaseRundownProtection(&a->rundown);
 		return;
 	}
 	ctx = (PIWAN_CNT_NBL_CTX)NET_BUFFER_LIST_CONTEXT_DATA_START(nbl);
@@ -490,9 +508,8 @@ iwan_cnt_indicate(_Inout_ PIWAN_CNT_ADAPTER a, _In_ UCHAR *buf, _In_ ULONG len,
 	ctx->mdl = mdl;
 	nbl->SourceHandle = a->adapter_handle;
 	NET_BUFFER_LIST_INFO(nbl, NetBufferListFrameType) =
-		(PVOID)(ULONG_PTR)ethertype;
+		(PVOID)(ULONG_PTR)RtlUshortByteSwap(ethertype);
 
-	InterlockedIncrement(&a->inflight);
 	InterlockedIncrement64(&a->rx_frames);
 	InterlockedAdd64(&a->rx_bytes, (LONG64)len);
 	/* Ownership transfers here: the later return is handled by ReturnNetBufferLists. */
@@ -581,6 +598,8 @@ iwan_cnt_bridge(_Inout_ PIWAN_CNT_ADAPTER a,
 			continue;
 		if (InterlockedCompareExchange(&peer->running, 1, 1) == 0)
 			continue;
+		if (!ExAcquireRundownProtection(&peer->rundown))
+			continue;
 		peers[npeers++] = peer;
 	}
 	KeReleaseSpinLock(&g_cnt_lock, old);
@@ -592,12 +611,14 @@ iwan_cnt_bridge(_Inout_ PIWAN_CNT_ADAPTER a,
 
 		if (buf == NULL) {
 			InterlockedIncrement64(&a->drops);
+			ExReleaseRundownProtection(&peer->rundown);
 			continue;
 		}
 		RtlCopyMemory(buf, p, len);
 		RtlCopyMemory(buf, peer->mac, 6);	/* destination = peer NIC */
 		RtlCopyMemory(buf + 6, a->mac, 6);	/* source = this NIC */
 		iwan_cnt_indicate(peer, buf, len, ethertype, dispatch);
+		ExReleaseRundownProtection(&peer->rundown);
 	}
 }
 #pragma warning(pop)
@@ -656,48 +677,52 @@ iwan_cnt_send_nbls(_In_ NDIS_HANDLE MiniportAdapterContext,
 			}
 			hp = (const UCHAR *)q;
 			et = iwan_cnt_rd16(hp + 12);
-			if (et == IWAN_CNT_ETH_ARP) {
-				PVOID full = NdisGetDataBuffer(nb, len,
-							       NULL, 1, 0);
+			/* A socket send commonly splits headers and payload across MDLs.
+			 * NULL storage only accepts contiguous data; it cannot be used as
+			 * a test for whether an otherwise valid frame is bridgeable. */
+			if (et == IWAN_CNT_ETH_ARP ||
+			    (et == IWAN_CNT_ETH_IPV4 &&
+			     want >= IWAN_CNT_ETH_HDR + 20 &&
+			     iwan_cnt_rd32(hp + 30) == a->peer_ip)) {
+				UCHAR *storage = NULL;
+				PVOID full;
 
-				if (full != NULL)
-					iwan_cnt_arp_reply(a,
-							   (const UCHAR *)full,
-							   len, dispatch);
-				continue;
-			}
-			if (et != IWAN_CNT_ETH_IPV4) {
-				InterlockedIncrement64(&a->other_frames);
-				continue;
-			}
-			if (want < IWAN_CNT_ETH_HDR + 20) {
-				InterlockedIncrement64(&a->other_frames);
-				continue;
-			}
-			{
-				ULONG saddr = iwan_cnt_rd32(hp + 26);
-				ULONG daddr = iwan_cnt_rd32(hp + 30);
-
-				if (daddr == a->peer_ip) {
-					PVOID full;
-
-					InterlockedIncrement64(
-						&a->peer_in_frames);
-					full = NdisGetDataBuffer(nb, len,
-								 NULL, 1, 0);
-					if (full != NULL)
-						iwan_cnt_bridge(
-							a,
-							(const UCHAR *)full,
-							len, et, dispatch);
-				} else if (saddr == a->peer_ip) {
-					InterlockedIncrement64(
-						&a->peer_out_frames);
-				} else {
-					InterlockedIncrement64(
-						&a->other_frames);
+				if (len > IWAN_CNT_ETH_HDR + IWAN_CNT_MTU) {
+					InterlockedIncrement64(&a->drops);
+					continue;
 				}
+				full = NdisGetDataBuffer(nb, len, NULL, 1, 0);
+				if (full == NULL) {
+					storage = (UCHAR *)ExAllocatePool2(
+						POOL_FLAG_NON_PAGED, len, IWAN_CNT_TAG);
+					if (storage != NULL)
+						full = NdisGetDataBuffer(nb, len,
+								 storage, 1, 0);
+				}
+				if (full == NULL) {
+					if (storage != NULL)
+						ExFreePoolWithTag(storage, IWAN_CNT_TAG);
+					InterlockedIncrement64(&a->drops);
+					continue;
+				}
+				if (et == IWAN_CNT_ETH_ARP) {
+					iwan_cnt_arp_reply(a, (const UCHAR *)full,
+							   len, dispatch);
+				} else {
+					InterlockedIncrement64(&a->peer_in_frames);
+					iwan_cnt_bridge(a, (const UCHAR *)full,
+							len, et, dispatch);
+				}
+				if (storage != NULL)
+					ExFreePoolWithTag(storage, IWAN_CNT_TAG);
+				continue;
 			}
+			if (et == IWAN_CNT_ETH_IPV4 &&
+			    want >= IWAN_CNT_ETH_HDR + 20 &&
+			    iwan_cnt_rd32(hp + 26) == a->peer_ip)
+				InterlockedIncrement64(&a->peer_out_frames);
+			else
+				InterlockedIncrement64(&a->other_frames);
 		}
 	}
 
@@ -733,9 +758,11 @@ iwan_cnt_return_nbls(_In_ NDIS_HANDLE MiniportAdapterContext,
 				ctx->buf = NULL;
 			}
 		}
-		if (a != NULL)
-			InterlockedDecrement(&a->inflight);
 		NdisFreeNetBufferList(nbl);
+		if (a != NULL) {
+			InterlockedDecrement(&a->inflight);
+			ExReleaseRundownProtection(&a->rundown);
+		}
 	}
 }
 
@@ -999,6 +1026,7 @@ iwan_cnt_initialize(_In_ NDIS_HANDLE MiniportAdapterHandle,
 		return NDIS_STATUS_RESOURCES;
 	}
 	RtlZeroMemory(a, sizeof(*a));
+	ExInitializeRundownProtection(&a->rundown);
 	InitializeListHead(&a->link);
 	a->adapter_handle = MiniportAdapterHandle;
 
@@ -1149,7 +1177,6 @@ iwan_cnt_halt(_In_ NDIS_HANDLE MiniportAdapterContext,
 	      _In_ NDIS_HALT_ACTION HaltAction)
 {
 	PIWAN_CNT_ADAPTER a = (PIWAN_CNT_ADAPTER)MiniportAdapterContext;
-	ULONG i;
 
 	UNREFERENCED_PARAMETER(HaltAction);
 	if (a == NULL)
@@ -1162,19 +1189,12 @@ iwan_cnt_halt(_In_ NDIS_HANDLE MiniportAdapterContext,
 		RemoveEntryList(&a->link);
 		KeReleaseSpinLock(&g_cnt_lock, old);
 	}
-	/* Wait for in-flight bridged frames to be returned; if they do not come back, leak the pool rather than free a pool that may still be referenced. */
-	for (i = 0; i < 1000; i++) {
-		if (InterlockedCompareExchange(&a->inflight, 0, 0) == 0)
-			break;
-		KeStallExecutionProcessor(1000);
-	}
-	if (a->nbl_pool != NULL &&
-	    InterlockedCompareExchange(&a->inflight, 0, 0) == 0) {
+	/* Halt runs at PASSIVE_LEVEL. The list reference and every outstanding
+	 * receive own rundown references; wait without spinning, then free. */
+	ExWaitForRundownProtectionRelease(&a->rundown);
+	if (a->nbl_pool != NULL) {
 		NdisFreeNetBufferListPool(a->nbl_pool);
 		a->nbl_pool = NULL;
-	} else if (a->nbl_pool != NULL) {
-		DbgPrint("iwancnt: %ld frames still outstanding at halt, pool not freed\n",
-			 (long)InterlockedCompareExchange(&a->inflight, 0, 0));
 	}
 	ExFreePoolWithTag(a, IWAN_CNT_TAG);
 }
