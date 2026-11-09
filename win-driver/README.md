@@ -255,9 +255,10 @@ Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\iwan\Parameters'
 # iwanmp 平面把 Services\iwan 换成 Services\iwanmp 即可
 ```
 
-用它测"封装税"：同一负载先把 `PassThrough=1` 跑一遍，再把值删掉跑一遍，两个
-`tx_pkts` 速率之差就是封装 + 注入的每包成本；入向同理用 `PassThrough=2` 与 0
-的 `rx_outer` 速率之差。
+用它比较整条封装、注入路径的成本：先标定发生器和接收端容量，再以相同载荷、线程数
+测 `PassThrough=1` 与 0 的最大稳态速率。固定限速下两者都足量送达只能证明该负载下
+没有丢包；速率相同不代表没有处理成本。`PassThrough=1` 不生成外层帧，因此还省掉了承载
+网络和对端接收的工作，差值不能直接解释为纯封装函数的 CPU 成本。
 
 ## iwanmp 平面的内层 IPv6
 
@@ -289,10 +290,79 @@ Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\iwan\Parameters'
    说明从封装、注入到对端没有丢包，`tx_pkts`/`tx_bytes` 可以作为「真的上了线」的口径。
 2. **开关确实生效**：`PassThrough=1` 时每个内层包都被计数、但一个都没被封装（宿主 0），
    在途压力也随之消失（`tx_bad_state` 不再增长）。
-3. **252,359 / 693,184 的差额是承载网的容量，不是驱动的能力**：被接收的那条流是 1264 字节外层帧、
-   319 Mbps，正是标定过的 slirp 单流上限（约 290 Mbps）；其余包撞在在途窗口上
-   （`IWAN_WIN_MAX_INFLIGHT` 1024），计入 `tx_bad_state`。自本次改动起它们不再被重复计成 `tx_err`。
-   要量「封装税」本身，对端不能再受限在 slirp 上 —— 这正是 `iwancnt.sys` 的用途。
+3. **该轮撞到在途窗口**：440,825 包在 `IWAN_WIN_MAX_INFLIGHT`（1024）满时被拒，
+   计入 `tx_bad_state`；自本次改动起不再重复计为 `tx_err`。slirp 是该轮的承载条件，
+   在途时间还包含驱动和协议栈的工作，不能仅凭这一轮把差额全部归因于 slirp，
+   也不能据此确定驱动容量。后续改用 `iwancnt.sys` 网卡对作独立对照。
 
-注意：`STATS` 是设备级累计值，不是会话级；读数要两次 `IOCTL_IWAN_SESSION_GET` 相减
-（上面两轮就是同一次驱动加载里跑完的）。
+注意：`STATS` 在会话重置时清零（`iwan_win_session_reset()`）。同一会话内可取两次
+`IOCTL_IWAN_SESSION_GET` 的差；关闭后重新 OPEN 的两轮应分别从各自的零点计数，
+不能跨会话相减。上表保留历史采样值，后续 A/B 以每轮独立 OPEN/CLOSE 和最终接收计数为准。
+
+## 计数网卡首包修复及 A/B（2026-11-09）
+
+首包超时由三个问题叠加：
+
+- `NdisGetDataBuffer(nb, len, NULL, ...)` 只能取连续数据。旧实现对跨 MDL 报文静默跳过；
+  修复后使用有上限的非分页临时缓冲合并，失败计入丢弃。
+- 接收指示的 `NetBufferListFrameType` 要求网络字节序，IPv4 对应数值 `0x0008`；
+  旧实现写成 `0x0800`。修复后抓到 A 的 Tx 和 B 的 Rx。
+- 新测试网卡的入站 UDP 被 Windows 防火墙拦截。测具仅临时放行指定测试 IP 和接口，
+  并在结束时删除规则。没有关闭全机防火墙。
+
+同时用 rundown 保护跨网卡查找与在途接收的适配器寿命；Halt 摘链后睡眠等待引用归还，
+避免旧实现限时自旋后释放仍被引用的适配器。这个修复消除了一个可证明的释放后使用路径；
+此前无转储硬挂的归属仍未确定。
+
+本轮使用隔离网卡 A（10.201.0.2，ifIndex 38）和 B（10.201.0.1，ifIndex 46）。
+`vm-cnt-first.ps1` 每次新建 socket，显式绑定两端，20 条新流的正反向首包均通过，
+1200 字节逐字节一致。未绑定源地址会走本机环回，不能代替跨网卡验证。
+
+`vm-cnt-ab.ps1` 分别运行 native、encap、pass。通过 IOCTL 建立数据面会话，
+没有认证客户端、HELLO 或保活流量。内层发生器显式绑定 10.0.2.15；如果绑定到
+KM-TEST 的内层地址，会绕过 OUTBOUND_IPPACKET，驱动计数为零，测具拒绝这种空跑。
+外层发送走 A，经桥接到 B 的纯计数 UDP 接收端，不经过 QEMU slirp。
+
+四线程、不限速、每档发送 5 秒；内层 UDP 有效载荷 1200 字节。native 用 1236 字节
+UDP 载荷，匹配封装后的外层 UDP 长度。统计等待接收端排空并输出最终计数后再读驱动，
+每个会话独立 CLOSE。以下 pps 使用发生器的有效发送时间；接收端运行时间还包含就绪和
+排空窗口，其自行打印的平均 pps 不作为发送期吞吐。
+
+| 路径 | 发生器包数 | 驱动 tx_pkts | 对端最终包数 | 发送期 pps |
+| --- | ---: | ---: | ---: | ---: |
+| native | 1,112,232 | — | 1,112,232 | 222,372 |
+| encap（PassThrough=0） | 481,285 | 481,285 | 481,285 | 96,231 |
+| pass（PassThrough=1） | 2,424,841 | 2,424,841 | 0 | 484,804 |
+
+encap 的 UDP 有效载荷吞吐为 **923.8 Mbps**，内层 IP 长度 1228 字节，对应约
+945.4 Mbps。`tx_bad_state`、`tx_bad_inner`、`tx_err` 均为 0，最终逐包投递率 100%。
+PassThrough 是计数后吸收，零外层接收符合设计；其 pps 是该入口路径的容量，不能称为网络吞吐。
+三档同时包含不同的协议栈、承载及接收工作，差值不等于纯封装函数的 CPU 服务时间。
+
+原 `iwan.sys` 开着 Verifier `0x29`（Special Pool、Pool tracking、Deadlock detection）：
+四线程 encap 只有 27,102 pps，但同样逐包无丢失。Windows 拒绝从启动时启用的校验器
+热移除驱动，因此性能档以 `iwanperf.sys` 的独立服务临时加载相同字节的签名映像；
+两份 SHA-256 均为 `455a4ef6259cf381fdd85abdc9392600a0256caf7e463b548168632fd45412a1`。
+测完停止并删除临时服务，保留原校验器配置。客体启动时间始终为 2026-11-08 16:54:06。
+
+Windows 客户端的服务器路由也已修正：先清理隧道自身的陈旧策略，再在改地址和安装新策略前
+通过 `GetBestRoute` 取得实际接口及下一跳。已有本地或用户 `/32` 原样保留；只删除本进程
+成功创建的精确路由。`win_route_pin_test.c` 在客体上验证了本地路由保留、非默认接口的
+on-link 路径连续建立/释放 5 次，以及已有 host route 不被删除。
+
+复现示例（提升权限的 Windows PowerShell；先准备网卡、源地址和已签名驱动）：
+
+```powershell
+# 先使用临时受限入站规则运行首包探针。
+.\vm-cnt-first.ps1 -Src 10.201.0.2 -Dst 10.201.0.1 -Count 20
+# 默认使用当前 iwan 服务；保留校验器时要把性能数字标为诊断档。
+.\vm-cnt-ab.ps1 -CarrierIp 10.201.0.2 -PeerIp 10.201.0.1 `
+    -GenIp 10.0.2.15 -Seconds 5 -Bytes 1200 -Threads 4 -Pps 0
+```
+
+发生器源码为 `tests/win_gen.c`，计数端为 `tests/win_sink.c`；两者只需 MinGW 与
+`-lws2_32`。路由回归程序直接调用生产实现，编译时还需 `-liphlpapi`、
+`-ffunction-sections -fdata-sections -fno-asynchronous-unwind-tables -fno-unwind-tables`
+及链接参数 `-Wl,--gc-sections`。执行示例：
+`win_route_pin_test.exe 10.201.0.1 10.201.0.250 10.201.0.251`；后两地址须为测试子网中
+未占用的目的地址。程序只清理由它创建的临时测试路由。

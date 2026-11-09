@@ -11,7 +11,7 @@
 #ifdef _WIN32
 /* Windows backend: winsock2 (via port.h, included above) must precede
  * iphlpapi.h. Route/address changes go through netsh (port_run_cmd);
- * default-route and adapter discovery use the IP Helper API. */
+ * discovery and owned server pins use the IP Helper API. */
 #  include <iphlpapi.h>
 #  include <windows.h>
 #elif defined(__APPLE__)
@@ -922,19 +922,74 @@ static void sweep_stale_routes(const char *tun, const char *tun_ip,
                  removed, tun);
 }
 
+/* Preserve the actual pre-tunnel path and own only the /32 we create.
+ * Existing host/local routes already outrank policy prefixes. */
+static bool win_srv_pin_installed;
+static MIB_IPFORWARDROW win_srv_pin_row;
+
+static bool win_pin_server(const char *srv)
+{
+    struct in_addr addr;
+    MIB_IPFORWARDROW best;
+    DWORD status;
+
+    if (win_srv_pin_installed) {
+        log_err("route_setup: a server pin is already owned by this process");
+        return false;
+    }
+    if (inet_pton(AF_INET, srv, &addr) != 1 ||
+        (ntohl(addr.s_addr) >> 24) == 127)
+        return true;
+    status = GetBestRoute(addr.s_addr, 0, &best);
+    if (status != NO_ERROR) {
+        log_err("route_setup: server route lookup failed (%lu)", status);
+        return false;
+    }
+    if (best.dwForwardMask == (DWORD)0xffffffffu)
+        return true;
+
+    win_srv_pin_row = best;
+    win_srv_pin_row.dwForwardDest = addr.s_addr;
+    win_srv_pin_row.dwForwardMask = (DWORD)0xffffffffu;
+    win_srv_pin_row.dwForwardPolicy = 0;
+    win_srv_pin_row.dwForwardProto = MIB_IPPROTO_NETMGMT;
+    win_srv_pin_row.dwForwardAge = 0;
+    status = CreateIpForwardEntry(&win_srv_pin_row);
+    if (status == ERROR_OBJECT_ALREADY_EXISTS || status == ERROR_ALREADY_EXISTS)
+        return true; /* A concurrent owner installed it after our lookup. */
+    if (status != NO_ERROR) {
+        log_err("route_setup: pin server route failed (%lu)", status);
+        return false;
+    }
+    win_srv_pin_installed = true;
+    return true;
+}
+
+static void win_unpin_server(void)
+{
+    if (win_srv_pin_installed) {
+        DWORD status = DeleteIpForwardEntry(&win_srv_pin_row);
+        if (status != NO_ERROR && status != ERROR_NOT_FOUND)
+            log_err("route_teardown: remove owned server pin failed (%lu)", status);
+        win_srv_pin_installed = false;
+    }
+}
+
 bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
                  const char *srv, const char *ogw, const char *odev,
                  const char *metric, const slist_t *routes_with_default,
                  const slist_t *routes6)
 {
     char tun_if[32], nh[40];
-    struct in_addr s4;
 
     /* audit M2: crash leftover cleanup. R49-L5: the sweep is fed the
      * current config so the v6 keep-set includes the configured prefixes
      * and the current derived ULA/96 -- the ONLY things it must preserve;
      * removed/crashed >= /64 v6 proxy prefixes are swept here. */
     sweep_stale_routes(tun, tun_ip, routes6);
+    /* Resolve before changing addresses or installing tunnel policy routes. */
+    if (!win_pin_server(srv))
+        return false;
 
     (void)metric;   /* Windows keeps the physical default in the table;
                      * teardown deletes only our own route, so there is
@@ -954,47 +1009,8 @@ bool route_setup(const char *tun, const char *tun_ip, uint16_t mtu,
          * together and the next run re-adds both cleanly. */
         route_rollback_v6(tun, tun_ip, routes6);
         route_iface_down(tun);   /* undo any partial bring-up */
+        win_unpin_server();
         return false;            /* nothing applied yet */
-    }
-
-    /* the server-pinned /32 only exists in the IPv4 table; an IPv6
-     * server address cannot be pinned via the (IPv4) default gateway */
-    if (inet_pton(AF_INET, srv, &s4) == 1 &&
-        (ntohl(s4.s_addr) >> 24) != 127) {
-        char srv32[40], odev_if[32], pin_nh[40];
-        snprintf(srv32, sizeof srv32, "%s/32", srv);
-        snprintf(odev_if, sizeof odev_if, "interface=%s", odev);
-        char *del[] = { "netsh", "interface", "ipv4", "delete", "route",
-                        srv32, odev_if, NULL };
-        port_run_cmd(del);   /* idempotent setup: drop any stale pin */
-        char *pin[10];
-        int pi = 0;
-        pin[pi++] = "netsh";
-        pin[pi++] = "interface";
-        pin[pi++] = "ipv4";
-        pin[pi++] = "add";
-        pin[pi++] = "route";
-        pin[pi++] = srv32;
-        pin[pi++] = odev_if;
-        if (strcmp(ogw, "0.0.0.0") != 0) {
-            snprintf(pin_nh, sizeof pin_nh, "nexthop=%s", ogw);
-            pin[pi++] = pin_nh;
-        }
-        pin[pi] = NULL;
-        if (!netsh_run(pin, "route_setup: pin server route")) {
-            /* R50-D1: route_iface_up already added the derived ULA +
-             * its on-link /96; the R49-L5 sweep inside route_iface_down
-             * (tun_ip/routes6 NULL) would delete the /96 but leave the
-             * ULA ADDRESS on the persistent wintun adapter, and the next
-             * same-inner-IPv4 run's `netsh add address <ula>/96` would
-             * then fail (address already present) -- the /96 is never
-             * rebuilt and the v6 client pool's on-link route is lost
-             * across runs. Delete the current v6 side first so address
-             * and route vanish together. */
-            route_rollback_v6(tun, tun_ip, routes6);
-            route_iface_down(tun);
-            return false;
-        }
     }
 
     for (size_t i = 0; i < routes_with_default->n; i++) {
@@ -1428,17 +1444,10 @@ void route_teardown(const char *tun, const char *srv, const char *ogw,
             port_run_cmd(d2);   /* best-effort */
         }
     }
-    /* drop the server pin installed on the physical NIC by route_setup */
-    struct in_addr s4;
-    if (inet_pton(AF_INET, srv, &s4) == 1 &&
-        (ntohl(s4.s_addr) >> 24) != 127) {
-        char srv32[40], odev_if[32];
-        snprintf(srv32, sizeof srv32, "%s/32", srv);
-        snprintf(odev_if, sizeof odev_if, "interface=%s", odev);
-        char *d3[] = { "netsh", "interface", "ipv4", "delete", "route",
-                       srv32, odev_if, NULL };
-        port_run_cmd(d3);
-    }
+    /* Only remove the exact row this process installed. */
+    (void)srv;
+    (void)odev;
+    win_unpin_server();
     route_iface_down(tun);
 }
 #elif defined(__APPLE__)
