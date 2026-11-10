@@ -35,7 +35,6 @@
     <ProjectGuid>{8D1E2E6E-7A49-4FA6-9C94-3E3ACF9A3D71}</ProjectGuid>
     <RootNamespace>iwannt</RootNamespace>
     <ProjectName>iwannt</ProjectName>
-    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
@@ -108,7 +107,9 @@
     <ClCompile Include="iwan_nt_demux.c" />
     <ClCompile Include="iwan_nt_frame.c" />
     <ClCompile Include="iwan_nt_ingress.c" />
-    <ClCompile Include="iwan_nt_miniport.c" />
+    <ClCompile Include="iwan_nt_miniport.c">
+      <PreprocessorDefinitions>NDIS_MINIPORT_DRIVER;NDIS630_MINIPORT;NDIS_WDM;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
     <ClCompile Include="iwan_nt_ring.c" />
     <ClCompile Include="iwan_nt_transport.c" />
     <ClCompile Include="iwan_nt_tx.c" />

@@ -6,6 +6,8 @@
 #define NDIS630_MINIPORT 1
 #endif
 #include <ndis.h>
+#include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {

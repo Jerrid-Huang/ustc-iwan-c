@@ -61,26 +61,6 @@ jobs:
           )
           foreach ($p in $probe) { "$($p.n) = $($p.v)" }
 
-      # Parse-only pass: /Zs produces no object, does not link and does not need the
-      # driver toolset, so it reports every compile error before msbuild is tried.
-      - name: cl syntax check (non-blocking)
-        continue-on-error: true
-        shell: pwsh
-        run: |
-          $msvc = Get-ChildItem "$env:VSDIR\VC\Tools\MSVC" -Directory |
-                  Sort-Object Name | Select-Object -Last 1
-          $cl = Get-ChildItem $msvc.FullName -Recurse -Filter cl.exe |
-                Where-Object { $_.FullName -match 'Hostx64\\x64' } | Select-Object -First 1
-          "CL=$($cl.FullName)"
-          $incs = @("$env:WDKINC\km", "$env:WDKINC\km\crt", "$env:WDKINC\shared",
-                    "$env:WDKINC\ucrt", "$($msvc.FullName)\include") |
-                  Where-Object { Test-Path $_ } | ForEach-Object { "/I$_" }
-          $common = @('/nologo', '/kernel', '/c', '/Zs', '/std:c11', '/W4', '/WX',
-                      '/Iiwan-nt\driver') + $incs + @('/D_AMD64_', '/DAMD64')
-          $srcs = Get-ChildItem 'iwan-nt\driver' -Filter '*.c' | ForEach-Object { $_.FullName }
-          & $cl.FullName @common @srcs 2>&1 | Tee-Object -FilePath cl-syntax.log
-          "cl exit code=$LASTEXITCODE"
-
       # Compile without linking first: link errors then cannot hide compile errors.
       - name: msbuild compile only (no link)
         continue-on-error: true
@@ -106,22 +86,18 @@ jobs:
 
       # PREfast over the same translation units. Non-blocking for now: the point of this
       # round is to learn what the real analyzer says, not to claim a clean report.
-      - name: PREfast /analyze (non-blocking)
+      # Static analysis through the driver toolset, so the flags and include paths are the
+      # ones the compiler itself uses. Non-blocking: this round is about learning what the
+      # analyzer says, not about claiming a clean report.
+      - name: PREfast (non-blocking)
         continue-on-error: true
         shell: pwsh
         run: |
-          $msvc = Get-ChildItem "$env:VSDIR\VC\Tools\MSVC" -Directory |
-                  Sort-Object Name | Select-Object -Last 1
-          $cl = Get-ChildItem $msvc.FullName -Recurse -Filter cl.exe |
-                Where-Object { $_.FullName -match 'Hostx64\\x64' } | Select-Object -First 1
-          $incs = @("$env:WDKINC\km", "$env:WDKINC\km\crt", "$env:WDKINC\shared",
-                    "$env:WDKINC\ucrt", "$($msvc.FullName)\include") |
-                  Where-Object { Test-Path $_ } | ForEach-Object { "/I$_" }
-          $common = @('/nologo', '/kernel', '/c', '/std:c11', '/W4', '/WX-', '/analyze',
-                      '/analyze:Warnings', '/analyze:log', "$env:GITHUB_WORKSPACE\prefast.sarif",
-                      '/Iiwan-nt\driver') + $incs + @('/D_AMD64_', '/DAMD64')
-          $srcs = Get-ChildItem 'iwan-nt\driver' -Filter '*.c' | ForEach-Object { $_.FullName }
-          & $cl.FullName @common @srcs 2>&1 | Tee-Object -FilePath prefast.log
+          & $env:MSBUILD 'iwan-nt\driver\iwan_nt.vcxproj' /nologo /v:normal /t:ClCompile `
+              /p:Configuration=Release /p:Platform=x64 /p:RunCodeAnalysis=true `
+              "/p:SolutionDir=$env:GITHUB_WORKSPACE\" `
+              "/p:OutDir=$env:GITHUB_WORKSPACE\build\x64\Release\" 2>&1 |
+              Tee-Object -FilePath prefast.log
           "prefast exit code=$LASTEXITCODE"
 
       # The steps above are continue-on-error, so workflow success never means build
@@ -142,8 +118,6 @@ jobs:
           path: |
             build/x64/Release/iwannt.sys
             build/x64/Release/iwannt.pdb
-            cl-syntax.log
             cl-build.log
             msbuild.log
             prefast.log
-            prefast.sarif

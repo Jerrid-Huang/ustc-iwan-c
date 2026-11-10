@@ -2,6 +2,8 @@
 #define IWAN_NT_TX_H
 
 #include <ntddk.h>
+#include <stddef.h>
+#include <stdint.h>
 
 #include "iwan_nt_frame.h"
 
