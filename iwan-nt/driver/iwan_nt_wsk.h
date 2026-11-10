@@ -1,9 +1,10 @@
 #ifndef IWAN_NT_WSK_H
 #define IWAN_NT_WSK_H
 
-#include <ntddk.h>
 #include "iwan_nt_types.h"
+#if defined(IWAN_NT_KERNEL)
 #include <wsk.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {

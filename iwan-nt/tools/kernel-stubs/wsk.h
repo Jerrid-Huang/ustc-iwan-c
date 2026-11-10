@@ -9,6 +9,17 @@
 #define WSK_EVENT_RECEIVE_FROM 0x00000002
 #define WSK_EVENT_DISABLE 0x00000080
 
+/* The real SOCKADDR/SOCKADDR_IN definitions arrive through <wsk.h>, not through
+ * <ntddk.h>; the stub keeps that split so a header that forgets <wsk.h> fails
+ * here the same way it fails on the WDK. */
+typedef struct _SOCKADDR { USHORT sa_family; } SOCKADDR, *PSOCKADDR;
+typedef struct _SOCKADDR_IN {
+    USHORT sin_family;
+    USHORT sin_port;
+    ULONG sin_addr;
+    UCHAR sin_zero[8];
+} SOCKADDR_IN, *PSOCKADDR_IN;
+
 typedef enum _WSK_CONTROL_SOCKET_TYPE {
     WskSetOption = 0,
     WskGetOption,

@@ -208,10 +208,10 @@ IwanNtRingInitialize(
     if (Capacity < IWAN_NT_RING_MIN_CAPACITY) {
         return IwanNtRingBadArgument;
     }
-    if (Capacity > SIZE_MAX / 2u) {
+    if (Capacity > ((size_t)-1) / 2u) {
         return IwanNtRingBadArgument;
     }
-    if (Capacity - IWAN_NT_RING_RECORD_HEADER_LEN > (size_t)UINT32_MAX) {
+    if (Capacity - IWAN_NT_RING_RECORD_HEADER_LEN > (size_t)0xFFFFFFFFu) {
         return IwanNtRingBadArgument;
     }
 

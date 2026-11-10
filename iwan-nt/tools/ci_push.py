@@ -11,35 +11,33 @@ Usage: ci_push.py <mirror-root> [<path-prefix-in-repo>]
 
 Only files under the mirror root are touched; nothing else in the branch moves.
 """
-import base64
 import json
 import os
 import subprocess
 import sys
-import urllib.request
 
 REPO = "Jerrid-Huang/ustc-iwan-c"
 BRANCH = "ci/win-driver-build"
-API = "https://api.github.com"
-
-
-def token():
-    out = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True, check=True)
-    return out.stdout.strip()
-
-
-TOKEN = token()
 
 
 def call(method, path, payload=None):
-    data = None if payload is None else json.dumps(payload).encode()
-    req = urllib.request.Request(API + path, data=data, method=method)
-    req.add_header("Authorization", "Bearer " + TOKEN)
-    req.add_header("Accept", "application/vnd.github+json")
-    if data is not None:
-        req.add_header("Content-Type", "application/json")
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        body = resp.read()
+    """One API call through gh.
+
+    gh is used instead of urllib on purpose: Python's TLS stack dies with
+    "UNEXPECTED_EOF_WHILE_READING" against api.github.com from this host, while
+    gh (Go TLS) works on the same connection.
+    """
+    cmd = ["gh", "api", "-X", method, path]
+    if payload is None:
+        cmd.append("--jq")
+        cmd.append(".")
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    else:
+        cmd += ["--input", "-"]
+        proc = subprocess.run(cmd, input=json.dumps(payload), capture_output=True, text=True)
+    if proc.returncode != 0:
+        sys.exit(f"gh api {method} {path} failed: {proc.stderr.strip()}")
+    body = proc.stdout.strip()
     return json.loads(body) if body else {}
 
 

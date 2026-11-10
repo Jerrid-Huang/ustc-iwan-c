@@ -158,13 +158,8 @@ typedef struct _DRIVER_OBJECT {
 #define DRIVER_INITIALIZE DriverEntry
 #define DRIVER_UNLOAD(Prefix) VOID Prefix(PDRIVER_OBJECT DriverObject)
 
-typedef struct _SOCKADDR { USHORT sa_family; } SOCKADDR, *PSOCKADDR;
-typedef struct _SOCKADDR_IN {
-    USHORT sin_family;
-    USHORT sin_port;
-    ULONG sin_addr;
-    CHAR sin_zero[8];
-} SOCKADDR_IN, *PSOCKADDR_IN;
+/* SOCKADDR/SOCKADDR_IN come from <wsk.h> in the real WDK, so the stub keeps
+ * them there too: a header that forgets <wsk.h> must fail here as well. */
 
 #define AF_INET 2
 #define SOCK_DGRAM 2

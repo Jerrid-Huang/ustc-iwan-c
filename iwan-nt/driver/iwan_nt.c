@@ -1,4 +1,3 @@
-#include <ntddk.h>
 #include "iwan_nt_miniport.h"
 
 static NDIS_HANDLE IwanNtMiniportDriverHandle;

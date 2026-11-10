@@ -14,7 +14,7 @@ for src in driver/*.c; do
         iwan_nt_miniport.c) continue ;;
     esac
     printf '%-28s ' "$(basename "$src")"
-    if out=$(gcc -fsyntax-only -std=c11 -I"$stub" \
+    if out=$(gcc -fsyntax-only -std=c11 -DIWAN_NT_KERNEL -I"$stub" \
                 -Wall -Wextra -Wshadow -Wdeclaration-after-statement \
                 -Wno-unused-parameter "$src" 2>&1); then
         echo OK

@@ -1,7 +1,6 @@
 #ifndef IWAN_NT_TRANSPORT_H
 #define IWAN_NT_TRANSPORT_H
 
-#include <ntddk.h>
 #include "iwan_nt_types.h"
 #include "iwan_nt_wsk.h"
 #include "iwan_nt_wsk_socket.h"

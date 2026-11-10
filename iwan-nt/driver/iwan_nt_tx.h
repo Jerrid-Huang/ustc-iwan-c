@@ -1,8 +1,11 @@
 #ifndef IWAN_NT_TX_H
 #define IWAN_NT_TX_H
 
-#include <ntddk.h>
 #include "iwan_nt_types.h"
+/* SOCKADDR_IN lives in the WSK header, not in <ntddk.h>. */
+#if defined(IWAN_NT_KERNEL)
+#include <wsk.h>
+#endif
 
 #include "iwan_nt_frame.h"
 
