@@ -405,6 +405,7 @@ IwanNtWskDatagramSetReceiveEnabled(
             &control,
             0,
             NULL,
+            NULL,
             NULL);
         IwanNtWskDatagramReleaseOperation(Datagram);
         if (NT_SUCCESS(status)) {
@@ -426,6 +427,7 @@ IwanNtWskDatagramSetReceiveEnabled(
         sizeof(control),
         &control,
         0,
+        NULL,
         NULL,
         Datagram->LifecycleIrp);
     status = IwanNtWskDatagramFinishIrp(Datagram, status, &information);

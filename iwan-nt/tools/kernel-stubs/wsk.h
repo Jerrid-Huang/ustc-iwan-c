@@ -66,7 +66,7 @@ typedef struct _WSK_CLIENT_DATAGRAM_DISPATCH {
 
 typedef struct _WSK_PROVIDER_BASIC_DISPATCH {
     NTSTATUS (*WskControlSocket)(PVOID, WSK_CONTROL_SOCKET_TYPE, ULONG, ULONG,
-                                 SIZE_T, PVOID, SIZE_T, PVOID, PIRP);
+                                 SIZE_T, PVOID, SIZE_T, PVOID, SIZE_T *, PIRP);
     NTSTATUS (*WskCloseSocket)(PVOID, PIRP);
 } WSK_PROVIDER_BASIC_DISPATCH;
 
