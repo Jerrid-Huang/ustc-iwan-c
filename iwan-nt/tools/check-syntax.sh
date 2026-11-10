@@ -15,7 +15,7 @@ for src in driver/*.c; do
     esac
     printf '%-28s ' "$(basename "$src")"
     if out=$(gcc -fsyntax-only -std=c11 -DIWAN_NT_KERNEL -I"$stub" \
-                -Wall -Wextra -Wshadow -Wdeclaration-after-statement \
+                -Wall -Wextra -Wshadow -Wconversion -Wdeclaration-after-statement \
                 -Wno-unused-parameter "$src" 2>&1); then
         echo OK
     else

@@ -587,8 +587,8 @@ IwanNtWskDatagramCopyBuffer(
     )
 {
     PMDL mdl;
-    ULONG skip;
-    ULONG remaining;
+    SIZE_T skip;
+    SIZE_T remaining;
     size_t written = 0;
 
     *Copied = 0;
@@ -614,9 +614,9 @@ IwanNtWskDatagramCopyBuffer(
             continue;
         }
 
-        chunk = mdlBytes - skip;
-        if (chunk > remaining) {
-            chunk = remaining;
+        chunk = (ULONG)((SIZE_T)mdlBytes - skip);
+        if ((SIZE_T)chunk > remaining) {
+            chunk = (ULONG)remaining;
         }
 
         base = MmGetSystemAddressForMdlSafe(

@@ -39,8 +39,8 @@ typedef struct _WSK_CLIENT_NPI {
 
 typedef struct _WSK_BUF {
     PVOID Mdl;
-    ULONG Offset;
-    ULONG Length;
+    SIZE_T Offset;
+    SIZE_T Length;
 } WSK_BUF, *PWSK_BUF;
 
 typedef struct _WSK_DATAGRAM_INDICATION {
