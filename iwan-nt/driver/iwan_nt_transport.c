@@ -555,7 +555,7 @@ IwanNtTransportSendInner(
      * one definition of "ours"; reading it here needs no extra copy.
      */
     KeAcquireSpinLock(&Transport->SessionLock, &oldIrql);
-    sessionValid = Transport->Ingress.SessionValid;
+    sessionValid = (BOOLEAN)(Transport->Ingress.SessionValid != 0);
     encrypted = (BOOLEAN)(Transport->Ingress.Session.Encrypted != 0);
     header.Sid = Transport->Ingress.Session.Sid;
     header.Token = Transport->Ingress.Session.Token;

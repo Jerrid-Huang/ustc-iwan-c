@@ -27,8 +27,7 @@
  * pointer.
  */
 
-#include <stddef.h>
-#include <stdint.h>
+#include "iwan_nt_types.h"
 
 #include "iwan_nt_demux.h"
 #include "iwan_nt_frame.h"

@@ -46,8 +46,7 @@
  * when an exact, coherent snapshot is required.
  */
 
-#include <stddef.h>
-#include <stdint.h>
+#include "iwan_nt_types.h"
 
 #ifdef __cplusplus
 extern "C" {

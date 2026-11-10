@@ -2,8 +2,7 @@
 #define IWAN_NT_WSK_H
 
 #include <ntddk.h>
-#include <stddef.h>
-#include <stdint.h>
+#include "iwan_nt_types.h"
 #include <wsk.h>
 
 #ifdef __cplusplus

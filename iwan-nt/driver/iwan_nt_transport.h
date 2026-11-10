@@ -2,8 +2,7 @@
 #define IWAN_NT_TRANSPORT_H
 
 #include <ntddk.h>
-#include <stddef.h>
-#include <stdint.h>
+#include "iwan_nt_types.h"
 #include "iwan_nt_wsk.h"
 #include "iwan_nt_wsk_socket.h"
 #include "iwan_nt_ingress.h"

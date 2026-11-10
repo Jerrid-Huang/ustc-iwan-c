@@ -3,8 +3,7 @@
 
 #include <ntddk.h>
 #include <wsk.h>
-#include <stddef.h>
-#include <stdint.h>
+#include "iwan_nt_types.h"
 
 #ifdef __cplusplus
 extern "C" {

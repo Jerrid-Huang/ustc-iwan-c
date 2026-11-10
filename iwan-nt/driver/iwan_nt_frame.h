@@ -18,8 +18,7 @@
  *   +8  body      (inner IP packet, XOR-transformed when encrypt != 0)
  */
 
-#include <stddef.h>
-#include <stdint.h>
+#include "iwan_nt_types.h"
 
 #ifdef __cplusplus
 extern "C" {
