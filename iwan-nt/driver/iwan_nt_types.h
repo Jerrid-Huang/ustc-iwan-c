@@ -20,8 +20,12 @@
  * The project defines IWAN_NT_KERNEL for every driver translation unit, so this
  * header can carry <ntddk.h> itself: a kernel-free header such as the frame
  * codec may then be included first without dragging in the user-mode CRT.
+ *
+ * The guard must not test _KERNEL_MODE: the driver toolset already defines that
+ * on the command line, so testing it would skip <ntddk.h> entirely and leave
+ * NULL, KIRQL, PMDL and the real SAL macros undefined.
  */
-#if defined(IWAN_NT_KERNEL) && !defined(_KERNEL_MODE)
+#if defined(IWAN_NT_KERNEL)
 #include <ntddk.h>
 #endif
 
