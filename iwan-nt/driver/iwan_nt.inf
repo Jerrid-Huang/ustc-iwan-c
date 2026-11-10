@@ -1,0 +1,56 @@
+[Version]
+Signature="$WINDOWS NT$"
+Class=Net
+ClassGuid={4D36E972-E325-11CE-BFC1-08002BE10318}
+Provider=%ManufacturerName%
+CatalogFile=iwannt.cat
+PnpLockdown=1
+DriverVer=11/09/2026,1.0.0.0
+
+[Manufacturer]
+%ManufacturerName%=Standard,NTamd64
+
+[Standard.NTamd64]
+%iwannt.DeviceDesc%=iwannt_Device,Root\iwannt
+
+[iwannt_Device.NT]
+Characteristics=0x1
+*IfType=53
+*MediaType=19
+*PhysicalMediaType=0
+CopyFiles=iwannt.CopyFiles
+AddReg=iwannt_NdiReg
+
+[iwannt_Device.NT.Services]
+AddService=iwannt,0x00000002,iwannt_Service
+
+[iwannt_Service]
+DisplayName=%ServiceDisplayName%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%12%\iwannt.sys
+LoadOrderGroup=NDIS
+
+[iwannt.CopyFiles]
+iwannt.sys
+
+[DestinationDirs]
+iwannt.CopyFiles=12
+
+[SourceDisksNames]
+1=%DiskName%,,,
+
+[SourceDisksFiles.amd64]
+iwannt.sys=1
+
+[iwannt_NdiReg]
+HKR,Ndi,Service,0,"iwannt"
+HKR,Ndi\Interfaces,UpperRange,0,"ndis5"
+HKR,Ndi\Interfaces,LowerRange,0,"nolower"
+
+[Strings]
+ManufacturerName="iWAN Project"
+iwannt.DeviceDesc="iWAN NT Transport Adapter"
+ServiceDisplayName="iWAN NT Transport Adapter"
+DiskName="iWAN NT Driver Disk"

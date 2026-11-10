@@ -1,0 +1,17 @@
+# Build output
+build/
+*.obj
+*.sys
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.cat
+*.cer
+*.etl
+
+# Editor and OS noise
+.vs/
+*.user
+*.suo
+.DS_Store

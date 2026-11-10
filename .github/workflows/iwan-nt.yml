@@ -1,0 +1,149 @@
+# Build pipeline for iWAN NT (the WSK-based transport driver).
+#
+# Why this exists: the development host is Linux with no WDK, so the only real
+# compiler is a Windows runner. Locally there is a stub-header syntax pass
+# (tools/check-syntax.sh) plus host unit tests for the kernel-free modules; those
+# prove structure, not API contracts, IRQL rules or PREfast findings.
+#
+# The source of truth is the iwan-nt repository; this workflow builds a mirror
+# under iwan-nt/ that is refreshed before every push, so a failure here is about
+# the same files that live there.
+#
+# Trigger: manual, or a push that touches the mirror.
+name: iwan-nt
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'iwan-nt/**'
+      - '.github/workflows/iwan-nt.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  wdk:
+    runs-on: windows-2022
+    concurrency:
+      group: iwan-nt-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+
+      - name: Probe toolchain (VS / WDK / WSK headers / libs)
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -property installationPath
+          $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild `
+                     -find 'MSBuild\**\Bin\amd64\MSBuild.exe' | Select-Object -First 1
+          if (-not $msbuild) {
+            $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild `
+                       -find 'MSBuild\**\Bin\MSBuild.exe' | Select-Object -First 1
+          }
+          "VSDIR=$vs" >> $env:GITHUB_ENV
+          "MSBUILD=$msbuild" >> $env:GITHUB_ENV
+
+          $sdk = "${env:ProgramFiles(x86)}\Windows Kits\10"
+          $inc = Get-ChildItem "$sdk\Include" -Directory -ErrorAction SilentlyContinue |
+                 Where-Object { $_.Name -match '^10\.' } |
+                 Sort-Object { [version]$_.Name } | Select-Object -Last 1
+          "WDKINC=$($inc.FullName)" >> $env:GITHUB_ENV
+
+          $probe = @(
+            @{ n = 'sdk include versions'; v = (Get-ChildItem "$sdk\Include" -Directory -ErrorAction SilentlyContinue | Select-Object -Expand Name) -join ',' },
+            @{ n = 'km\wsk.h';        v = (Test-Path "$($inc.FullName)\km\wsk.h") },
+            @{ n = 'km\ndis.h';       v = (Test-Path "$($inc.FullName)\km\ndis.h") },
+            @{ n = 'netio.lib';       v = (Get-ChildItem "$sdk\Lib" -Recurse -Filter netio.lib -ErrorAction SilentlyContinue | Select-Object -First 2 -Expand FullName) -join ';' },
+            @{ n = 'ndis.lib';        v = (Get-ChildItem "$sdk\Lib" -Recurse -Filter ndis.lib -ErrorAction SilentlyContinue | Select-Object -First 2 -Expand FullName) -join ';' },
+            @{ n = 'driver toolset props'; v = (Get-ChildItem "$vs\MSBuild" -Recurse -Filter 'WindowsKernelModeDriver*.props' -ErrorAction SilentlyContinue | Select-Object -First 2 -Expand FullName) -join ';' }
+          )
+          foreach ($p in $probe) { "$($p.n) = $($p.v)" }
+
+      # Parse-only pass: /Zs produces no object, does not link and does not need the
+      # driver toolset, so it reports every compile error before msbuild is tried.
+      - name: cl syntax check (non-blocking)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $msvc = Get-ChildItem "$env:VSDIR\VC\Tools\MSVC" -Directory |
+                  Sort-Object Name | Select-Object -Last 1
+          $cl = Get-ChildItem $msvc.FullName -Recurse -Filter cl.exe |
+                Where-Object { $_.FullName -match 'Hostx64\\x64' } | Select-Object -First 1
+          "CL=$($cl.FullName)"
+          $incs = @("$env:WDKINC\km", "$env:WDKINC\km\crt", "$env:WDKINC\shared",
+                    "$env:WDKINC\ucrt", "$($msvc.FullName)\include") |
+                  Where-Object { Test-Path $_ } | ForEach-Object { "/I$_" }
+          $common = @('/nologo', '/kernel', '/c', '/Zs', '/std:c11', '/W4', '/WX',
+                      '/Iiwan-nt\driver') + $incs + @('/D_AMD64_', '/DAMD64')
+          $srcs = Get-ChildItem 'iwan-nt\driver' -Filter '*.c' | ForEach-Object { $_.FullName }
+          & $cl.FullName @common @srcs 2>&1 | Tee-Object -FilePath cl-syntax.log
+          "cl exit code=$LASTEXITCODE"
+
+      # Compile without linking first: link errors then cannot hide compile errors.
+      - name: msbuild compile only (no link)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & $env:MSBUILD 'iwan-nt\driver\iwan_nt.vcxproj' /nologo /v:normal /t:ClCompile `
+              /p:Configuration=Release /p:Platform=x64 `
+              "/p:SolutionDir=$env:GITHUB_WORKSPACE\" `
+              "/p:OutDir=$env:GITHUB_WORKSPACE\build\x64\Release\" 2>&1 |
+              Tee-Object -FilePath cl-build.log
+          "ClCompile exit code=$LASTEXITCODE"
+
+      - name: msbuild driver (link)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & $env:MSBUILD 'iwan-nt\driver\iwan_nt.vcxproj' /nologo /v:normal `
+              /p:Configuration=Release /p:Platform=x64 `
+              "/p:SolutionDir=$env:GITHUB_WORKSPACE\" `
+              "/p:OutDir=$env:GITHUB_WORKSPACE\build\x64\Release\" 2>&1 |
+              Tee-Object -FilePath msbuild.log
+          "msbuild exit code=$LASTEXITCODE"
+
+      # PREfast over the same translation units. Non-blocking for now: the point of this
+      # round is to learn what the real analyzer says, not to claim a clean report.
+      - name: PREfast /analyze (non-blocking)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $msvc = Get-ChildItem "$env:VSDIR\VC\Tools\MSVC" -Directory |
+                  Sort-Object Name | Select-Object -Last 1
+          $cl = Get-ChildItem $msvc.FullName -Recurse -Filter cl.exe |
+                Where-Object { $_.FullName -match 'Hostx64\\x64' } | Select-Object -First 1
+          $incs = @("$env:WDKINC\km", "$env:WDKINC\km\crt", "$env:WDKINC\shared",
+                    "$env:WDKINC\ucrt", "$($msvc.FullName)\include") |
+                  Where-Object { Test-Path $_ } | ForEach-Object { "/I$_" }
+          $common = @('/nologo', '/kernel', '/c', '/std:c11', '/W4', '/WX-', '/analyze',
+                      '/analyze:Warnings', '/analyze:log', "$env:GITHUB_WORKSPACE\prefast.sarif",
+                      '/Iiwan-nt\driver') + $incs + @('/D_AMD64_', '/DAMD64')
+          $srcs = Get-ChildItem 'iwan-nt\driver' -Filter '*.c' | ForEach-Object { $_.FullName }
+          & $cl.FullName @common @srcs 2>&1 | Tee-Object -FilePath prefast.log
+          "prefast exit code=$LASTEXITCODE"
+
+      # The steps above are continue-on-error, so workflow success never means build
+      # success. The criterion is the product: a .sys on disk.
+      - name: Assert iwannt.sys was produced
+        shell: pwsh
+        run: |
+          $sys = Get-ChildItem "$env:GITHUB_WORKSPACE\build" -Recurse -Filter 'iwannt.sys' -ErrorAction SilentlyContinue
+          if (-not $sys) { throw 'iwannt.sys was not produced' }
+          $sys | ForEach-Object { "$($_.FullName) $($_.Length) bytes" }
+
+      - name: Upload logs and driver
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: iwan-nt-x64
+          if-no-files-found: warn
+          path: |
+            build/x64/Release/iwannt.sys
+            build/x64/Release/iwannt.pdb
+            cl-syntax.log
+            cl-build.log
+            msbuild.log
+            prefast.log
+            prefast.sarif

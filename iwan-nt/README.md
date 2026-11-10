@@ -1,0 +1,87 @@
+# iWAN NT
+
+This repository defines the Windows kernel transport boundary for iWAN NT. It is a design and implementation workspace for an NDIS miniport path that transforms frames synchronously on one kernel thread, sends and receives packets through WSK UDP, and indicates received frames back through NDIS.
+
+The existing user-mode client remains responsible for the protocol session around that transport. The kernel component does not become a second handshake or control-plane implementation.
+
+## Boundary
+
+The intended data path is:
+
+    NDIS miniport -> single-thread synchronous frame transform -> WSK UDP -> NDIS receive indication
+
+Control messages and DATA messages use one UDP port. The kernel path therefore owns the UDP demultiplexing decision and a shared bounded queue between packet ingress, control handling, and DATA handling.
+
+The design excludes multi-core crypto worker pools. Resource ownership, cancellation, shutdown, and queue limits must have bounded and reviewable lifetimes.
+
+## Documentation
+
+- [Architecture](docs/architecture.md) - scope, ownership, staged plan, and non-goals.
+
+## Project status
+
+Stage 2 lifecycle skeleton is present: NDIS miniport registration, per-adapter
+transport state, WSK client registration, one IPv4 UDP datagram socket with a
+bounded open/close sequence, and a kernel-free data-frame codec.
+
+A received datagram now has a path: the WSK callback copies it into one
+non-paged scratch buffer, the receive pipeline demultiplexes it, DATA frames are
+transformed in place and handed to a sink, and control frames are queued as whole
+frames on a bounded ring for a PASSIVE consumer. The session (sid, token,
+encryption flag, key) is installed through the transport by a future control
+interface.
+
+The send direction exists as a pool, not yet connected to the miniport: each
+outbound datagram takes one preallocated slot (non-paged buffer, MDL, IRP), the
+frame is transformed into it, and the IRP completion recycles the slot at
+DISPATCH_LEVEL. A full pool fails the send instead of queueing, so backpressure
+reaches the caller; Stop drains the pool before closing the socket.
+
+There are still no worker threads, no NBL/MDL pools, and no receive indication:
+the DATA sink is not yet wired to the miniport, and the miniport send handler
+still completes every packet without sending. The socket binds the wildcard
+address with port zero, because the session endpoint and port still have to come
+from the user-mode control plane through an interface that does not exist yet.
+
+- [NDIS miniport lifecycle](driver/iwan_nt_miniport.h) and [implementation](driver/iwan_nt_miniport.c)
+- [WDM driver entry and unload](driver/iwan_nt.c)
+- [WSK client lifecycle](driver/iwan_nt_wsk.h) and [implementation](driver/iwan_nt_wsk.c)
+- [WSK datagram socket lifecycle](driver/iwan_nt_wsk_socket.h) and [implementation](driver/iwan_nt_wsk_socket.c)
+- [Transport lifecycle interface](driver/iwan_nt_transport.h) and [implementation](driver/iwan_nt_transport.c)
+- [Data-frame codec](driver/iwan_nt_frame.h) and [implementation](driver/iwan_nt_frame.c)
+- [Receive demultiplexer](driver/iwan_nt_demux.h) and [implementation](driver/iwan_nt_demux.c)
+- [Bounded control ring](driver/iwan_nt_ring.h) and [implementation](driver/iwan_nt_ring.c)
+- [Receive pipeline](driver/iwan_nt_ingress.h) and [implementation](driver/iwan_nt_ingress.c)
+- [Send slot pool](driver/iwan_nt_tx.h) and [implementation](driver/iwan_nt_tx.c)
+- [Codec unit test](tests/frame_test.c)
+- [Demultiplexer unit test](tests/demux_test.c)
+- [Ring unit test](tests/ring_test.c)
+- [Receive pipeline unit test](tests/ingress_test.c)
+- [WDK project](driver/iwan_nt.vcxproj)
+- [Root-enumerated adapter INF](driver/iwan_nt.inf)
+
+## Local checks
+
+`tools/check-syntax.sh` runs a fast pre-filter on a Linux host: a parser pass
+over the kernel-independent sources against stub headers, the frame codec unit
+test, and an ASCII check. It is not a WDK build and says nothing about API
+semantics; see [tools/kernel-stubs/README.md](tools/kernel-stubs/README.md).
+
+    bash tools/check-syntax.sh
+
+The host tests cover the four kernel-free modules: frame codec (93 checks),
+demultiplexer (334), bounded ring (840), receive pipeline (82).
+
+## Socket close ordering
+
+The close sequence is fixed and must not be rearranged:
+
+1. close the operation gate (`ExWaitForRundownProtectionRelease` then
+   `ExRundownCompleted`) and wait for calls already inside provider code;
+2. disable the receive event callback, whose IRP completion proves that no
+   callback is still running;
+3. run the callback gate down and wait for a callback that raced the disable;
+4. `WskCloseSocket`, which also cancels the provider's pending IRPs.
+
+Disabling the callback must bypass the operation gate: by that point the gate is
+already closed on purpose, so acquiring it again would deadlock shutdown.
