@@ -7,7 +7,7 @@ reachable. So the branch is updated with the Git Data API instead: build a tree
 with inline file contents on top of the current branch head, commit, move the
 ref.
 
-Usage: ci_push.py <mirror-root> [<path-prefix-in-repo>]
+Usage: ci_push.py <mirror-root> [<path-prefix-in-repo>] [<message>] [<file>=<repo-path> ...]
 
 Only files under the mirror root are touched; nothing else in the branch moves.
 """
@@ -72,6 +72,22 @@ def main():
                 "type": "blob",
                 "content": raw.decode("ascii"),
             })
+
+    for extra in sys.argv[4:]:
+        local_file, repo_path = extra.split("=", 1)
+        with open(local_file, "rb") as handle:
+            raw = handle.read()
+        try:
+            raw.decode("ascii")
+        except UnicodeDecodeError:
+            sys.exit(f"refusing to upload a non-ASCII file: {local_file}")
+        local_paths.add(repo_path)
+        entries.append({
+            "path": repo_path,
+            "mode": "100644",
+            "type": "blob",
+            "content": raw.decode("ascii"),
+        })
 
     for stale in sorted(remote_paths):
         if stale.startswith(prefix + "/") and stale not in local_paths:
