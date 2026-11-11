@@ -139,10 +139,14 @@ semantics; see [tools/kernel-stubs/README.md](tools/kernel-stubs/README.md).
 
     bash tools/check-syntax.sh
 
-The host tests cover the kernel-free modules and the crypto primitives: frame
-codec (93 checks), demultiplexer (334), bounded ring (840), receive pipeline
-(90), the receive pipeline end to end (22), MD5 and AES-128 (7 known-answer
-checks), control framing (42).
+The host tests cover the kernel-free modules and the user-mode half: frame codec
+(93 checks), demultiplexer (334), bounded ring (840), receive pipeline (90), the
+receive pipeline end to end (22), MD5 and AES-128 (7 known-answer checks), control
+framing (47, including one whole OPEN frame against a vector built outside this
+code), the handshake state machine (50), and a stress pass (19898) that feeds
+random bytes through the demultiplexer and the receive pipeline and asserts that
+every rejected input is counted, plus a ring loaded near capacity so its indices
+wrap while occupied.
 
 `tools/build-user.sh` builds the user-mode half with MinGW-w64, which is enough
 to catch ABI-header mistakes before a CI round:
