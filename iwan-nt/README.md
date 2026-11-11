@@ -27,11 +27,17 @@ The design excludes multi-core crypto worker pools. Resource ownership, cancella
 - PREfast (`/p:RunCodeAnalysis=true`): 0 warnings, 0 errors
 - output: `iwannt.sys` 30208 bytes
 
-The user-mode half builds in the same job with cl (`/W4 /WX /std:c11`):
-`iwannt-ctl.exe` 172032 bytes, 0 warnings.
+The user-mode half builds in the same job with cl (`/W4 /WX /std:c11`) as
+`iwannt-ctl.exe`, 0 warnings. It is built with no include path beyond the tree,
+which is deliberate: a header that only compiles when the driver directory
+happens to be on `-I` is a header that will break the next consumer.
 
 That is a build result, not a runtime result: nothing in this repository has
 been loaded on a machine yet.
+
+CI writes the compiler log to the `ci-logs` branch when a job fails. The
+annotation only carries an exit status, and downloading an artifact needs
+credentials, so the raw log is parked where a plain read can reach it.
 
 ## Control interface
 
