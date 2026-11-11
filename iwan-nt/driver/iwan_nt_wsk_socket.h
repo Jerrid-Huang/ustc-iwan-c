@@ -78,6 +78,12 @@ typedef struct _IWAN_NT_WSK_DATAGRAM {
     KEVENT LifecycleEvent;
     KEVENT FaultEvent;
     SOCKADDR_IN LocalAddress;
+    /*
+     * What the bind actually produced. LocalAddress is the request (wildcard,
+     * port zero); this is the address the provider returned, and it is the only
+     * way to learn the port that frames come back to.
+     */
+    SOCKADDR_IN BoundAddress;
     /* Kept from Start so that the send path can reach the dispatch table. */
     WSK_PROVIDER_NPI Provider;
     PWSK_SOCKET Socket;
@@ -114,6 +120,16 @@ NTSTATUS
 IwanNtWskDatagramStart(
     _Inout_ PIWAN_NT_WSK_DATAGRAM Datagram,
     _In_ const WSK_PROVIDER_NPI *Provider
+    );
+
+/*
+ * Copy out the address the socket is bound to. Valid once Start has succeeded;
+ * returns FALSE while the socket is not bound.
+ */
+BOOLEAN
+IwanNtWskDatagramGetLocal(
+    _In_ const IWAN_NT_WSK_DATAGRAM *Datagram,
+    _Out_ SOCKADDR_IN *Local
     );
 
 _IRQL_requires_(PASSIVE_LEVEL)

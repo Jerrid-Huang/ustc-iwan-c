@@ -671,6 +671,21 @@ IwanNtTransportGetIngressCounters(
 }
 
 _IRQL_requires_(PASSIVE_LEVEL)
+BOOLEAN
+IwanNtTransportGetLocal(
+    _In_ const IWAN_NT_TRANSPORT *Transport,
+    _Out_ SOCKADDR_IN *Local
+    )
+{
+    PAGED_CODE();
+
+    if (Transport == NULL || Local == NULL) {
+        return FALSE;
+    }
+    return IwanNtWskDatagramGetLocal(&Transport->Datagram, Local);
+}
+
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID
 IwanNtTransportSetPeer(
     _Inout_ PIWAN_NT_TRANSPORT Transport,

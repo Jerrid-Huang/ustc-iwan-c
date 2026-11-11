@@ -157,6 +157,25 @@ CommandCheck(
 }
 
 static int
+CommandLocal(
+    _In_ PIWAN_NT_DEVICE Device
+    )
+{
+    UINT32 address = 0;
+    UINT16 port = 0;
+    const unsigned char *bytes = (const unsigned char *)&address;
+
+    if (IwanNtGetLocal(Device, &address, &port) == FALSE) {
+        fprintf(stderr, "local failed: %lu\n", GetLastError());
+        return 1;
+    }
+    /* The address is network order, so its bytes print in the right order. */
+    printf("local: %u.%u.%u.%u:%u\n", bytes[0], bytes[1], bytes[2], bytes[3],
+           (unsigned)_byteswap_ushort(port));
+    return 0;
+}
+
+static int
 CommandStats(
     _In_ PIWAN_NT_DEVICE Device
     )
@@ -493,6 +512,8 @@ main(
         result = CommandCheck(&device);
     } else if (strcmp(argv[1], "stats") == 0) {
         result = CommandStats(&device);
+    } else if (strcmp(argv[1], "local") == 0) {
+        result = CommandLocal(&device);
     } else if (strcmp(argv[1], "peer") == 0) {
         result = CommandPeer(&device, argc, argv);
     } else if (strcmp(argv[1], "session") == 0) {

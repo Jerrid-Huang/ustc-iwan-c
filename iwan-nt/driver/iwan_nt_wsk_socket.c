@@ -348,6 +348,23 @@ IwanNtWskDatagramBind(
     }
     IwanNtWskDatagramReleaseOperation(Datagram);
 
+    /*
+     * The bind asked for port zero, so the real port is only known now. Without
+     * reading it back nothing could ever address this socket deliberately, and
+     * the operator could not tell a NAT problem from a protocol one.
+     */
+    if (NT_SUCCESS(status)) {
+        const WSK_PROVIDER_BASIC_DISPATCH *basic =
+            IwanNtWskDatagramGetBasicDispatch(Datagram->Socket);
+
+        if (basic->WskGetLocalAddress != NULL) {
+            ULONG length = (ULONG)sizeof(Datagram->LocalAddress);
+
+            (void)basic->WskGetLocalAddress(
+                Datagram->Socket, (PSOCKADDR)&Datagram->BoundAddress, &length);
+        }
+    }
+
     if (NT_SUCCESS(status)) {
         Datagram->SocketBound = TRUE;
     }
@@ -1019,4 +1036,29 @@ IwanNtWskDatagramCloseRequired(
     closeRequired = Datagram->CloseRequired;
     KeReleaseSpinLock(&Datagram->StateLock, oldIrql);
     return closeRequired;
+}
+
+BOOLEAN
+IwanNtWskDatagramGetLocal(
+    _In_ const IWAN_NT_WSK_DATAGRAM *Datagram,
+    _Out_ SOCKADDR_IN *Local
+    )
+{
+    PIWAN_NT_WSK_DATAGRAM datagram = (PIWAN_NT_WSK_DATAGRAM)Datagram;
+    KIRQL oldIrql;
+    BOOLEAN bound;
+
+    if (Datagram == NULL || Local == NULL) {
+        return FALSE;
+    }
+
+    /* The lock is mutable state; the getter still takes a const view. */
+    KeAcquireSpinLock(&datagram->StateLock, &oldIrql);
+    bound = (datagram->State == IwanNtWskDatagramRunning &&
+             datagram->BoundAddress.sin_family != 0) ? TRUE : FALSE;
+    if (bound != FALSE) {
+        *Local = datagram->BoundAddress;
+    }
+    KeReleaseSpinLock(&datagram->StateLock, oldIrql);
+    return bound;
 }

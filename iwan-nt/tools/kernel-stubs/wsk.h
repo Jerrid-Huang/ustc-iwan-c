@@ -87,6 +87,10 @@ typedef struct _WSK_PROVIDER_BASIC_DISPATCH {
     NTSTATUS (*WskControlSocket)(PVOID, WSK_CONTROL_SOCKET_TYPE, ULONG, ULONG,
                                  SIZE_T, PVOID, SIZE_T, PVOID, SIZE_T *, PIRP);
     NTSTATUS (*WskCloseSocket)(PVOID, PIRP);
+    /*
+     * Synchronous: the address is copied out and the length is in/out.
+     */
+    NTSTATUS (*WskGetLocalAddress)(PVOID, PSOCKADDR, PULONG);
 } WSK_PROVIDER_BASIC_DISPATCH;
 
 typedef struct _WSK_SOCKET { const void *Dispatch; } WSK_SOCKET, *PWSK_SOCKET;

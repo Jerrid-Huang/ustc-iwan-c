@@ -280,6 +280,55 @@ IwanNtControlReadControlFrame(
 }
 
 static NTSTATUS
+IwanNtControlGetLocal(
+    _In_ PIRP Irp,
+    _In_ PIO_STACK_LOCATION Stack
+    )
+{
+    IWAN_NT_PEER_ABI *reply;
+    PIWAN_NT_TRANSPORT transport;
+    SOCKADDR_IN local;
+    NTSTATUS status;
+    uint32_t address;
+    uint16_t port;
+
+    if (Stack->Parameters.DeviceIoControl.OutputBufferLength <
+        IWAN_NT_PEER_STRUCT_SIZE) {
+        Irp->IoStatus.Information = (ULONG_PTR)IWAN_NT_PEER_STRUCT_SIZE;
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    reply = (IWAN_NT_PEER_ABI *)Irp->AssociatedIrp.SystemBuffer;
+    if (reply == NULL || Irp->AssociatedIrp.SystemBuffer == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    status = IwanNtControlBegin(&transport);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+    if (IwanNtTransportGetLocal(transport, &local) == FALSE) {
+        IwanNtControlEnd();
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    /*
+     * The ABI carries the address in network order, the same way SET_PEER takes
+     * it, so both ends of the exchange read the same bytes.
+     */
+    RtlCopyMemory(&address, &local.sin_addr, sizeof(address));
+    RtlCopyMemory(&port, &local.sin_port, sizeof(port));
+
+    RtlZeroMemory(reply, sizeof(*reply));
+    reply->Address = address;
+    reply->Port = port;
+
+    IwanNtControlEnd();
+
+    Irp->IoStatus.Information = (ULONG_PTR)sizeof(*reply);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS
 IwanNtControlGetStats(
     _In_ PIRP Irp,
     _In_ PIO_STACK_LOCATION Stack
@@ -352,6 +401,8 @@ IwanNtControlDispatchDeviceControl(
         return IwanNtControlSendControlFrame(Irp, Stack);
     case IWAN_NT_IOCTL_READ_CONTROL:
         return IwanNtControlReadControlFrame(Irp, Stack);
+    case IWAN_NT_IOCTL_GET_LOCAL:
+        return IwanNtControlGetLocal(Irp, Stack);
     case IWAN_NT_IOCTL_GET_STATS:
         return IwanNtControlGetStats(Irp, Stack);
     default:

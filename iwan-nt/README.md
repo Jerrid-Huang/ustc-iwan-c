@@ -40,6 +40,13 @@ CI writes the compiler log to the `ci-logs` branch when a job fails. The
 annotation only carries an exit status, and downloading an artifact needs
 credentials, so the raw log is parked where a plain read can reach it.
 
+## Which port the peer answers to
+
+The transport binds its datagram socket to the wildcard address and port zero, so
+the provider picks the port. `iwannt-ctl local` reads it back
+(`IWAN_NT_IOCTL_GET_LOCAL`), which separates "the peer never answered" from "the
+answer went somewhere else" — the second one is invisible from the counters.
+
 ## Session keepalive and timeout
 
 `iwannt-ctl connect` keeps the session alive with an ECHO request every two

@@ -75,6 +75,17 @@ IwanNtSendControl(
  * GetLastError() == ERROR_INSUFFICIENT_BUFFER and RequiredLength set, so the
  * caller can retry with a bigger buffer.
  */
+/*
+ * Read the address the driver's socket is bound to, in network order. Useful for
+ * telling "the peer never answered" from "the answer went to another port".
+ */
+BOOL
+IwanNtGetLocal(
+    _In_ PIWAN_NT_DEVICE Device,
+    _Out_ UINT32 *Address,
+    _Out_ UINT16 *Port
+    );
+
 int
 IwanNtReadControl(
     _In_ PIWAN_NT_DEVICE Device,

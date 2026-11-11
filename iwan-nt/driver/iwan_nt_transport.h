@@ -148,6 +148,18 @@ IwanNtTransportSetPeer(
  * STATUS_INSUFFICIENT_RESOURCES when every slot is busy (backpressure, not an
  * error), and the provider status otherwise.
  */
+/*
+ * The address the transport's socket is bound to. Available while the transport
+ * is running; used by the control device so the operator can see the port the
+ * peer will answer to.
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+BOOLEAN
+IwanNtTransportGetLocal(
+    _In_ const IWAN_NT_TRANSPORT *Transport,
+    _Out_ SOCKADDR_IN *Local
+    );
+
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 IwanNtTransportSendInner(

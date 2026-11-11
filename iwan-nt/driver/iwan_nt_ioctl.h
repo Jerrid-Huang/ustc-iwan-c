@@ -65,6 +65,8 @@
 /* Dequeue one complete control datagram payload (read). */
 #define IWAN_NT_IOCTL_READ_CONTROL IWAN_NT_CTL_CODE(0x804u)
 /* Snapshot of every counter the transport keeps (read). */
+#define IWAN_NT_IOCTL_GET_LOCAL \
+    IWAN_NT_CTL_CODE(0x806)
 #define IWAN_NT_IOCTL_GET_STATS IWAN_NT_CTL_CODE(0x805u)
 
 #define IWAN_NT_SESSION_STRUCT_SIZE 24u
@@ -143,6 +145,11 @@ typedef struct _IWAN_NT_STATS_ABI {
  */
 _Static_assert(sizeof(IWAN_NT_SESSION_ABI) == IWAN_NT_SESSION_STRUCT_SIZE,
                "SESSION ABI size changed");
+/*
+ * GET_LOCAL returns the address the transport is bound to, in the same shape as
+ * the peer request: the port is the part that matters, because it is chosen by
+ * the provider and cannot be predicted from user mode.
+ */
 _Static_assert(sizeof(IWAN_NT_PEER_ABI) == IWAN_NT_PEER_STRUCT_SIZE,
                "PEER ABI size changed");
 _Static_assert(sizeof(IWAN_NT_STATS_ABI) == IWAN_NT_STATS_STRUCT_SIZE,

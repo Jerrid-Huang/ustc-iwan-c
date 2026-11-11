@@ -136,6 +136,31 @@ IwanNtSendControl(
         Device, IWAN_NT_IOCTL_SEND_CONTROL, Frame, Length, NULL, 0, NULL);
 }
 
+BOOL
+IwanNtGetLocal(
+    _In_ PIWAN_NT_DEVICE Device,
+    _Out_ UINT32 *Address,
+    _Out_ UINT16 *Port
+    )
+{
+    IWAN_NT_PEER_ABI reply;
+    DWORD returned = 0;
+
+    if (Device == NULL || Address == NULL || Port == NULL) {
+        return FALSE;
+    }
+    if (DeviceIoControl(Device->Handle, IWAN_NT_IOCTL_GET_LOCAL, NULL, 0,
+                        &reply, (DWORD)sizeof(reply), &returned, NULL) == FALSE) {
+        return FALSE;
+    }
+    if (returned < IWAN_NT_PEER_STRUCT_SIZE) {
+        return FALSE;
+    }
+    *Address = reply.Address;
+    *Port = reply.Port;
+    return TRUE;
+}
+
 int
 IwanNtReadControl(
     _In_ PIWAN_NT_DEVICE Device,
