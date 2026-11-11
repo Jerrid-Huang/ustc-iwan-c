@@ -67,8 +67,11 @@ Check: `ipconfig` shows the address on the adapter, and the counters in
 | `tx rejected` grows | the stack handed down more than the adapter's MTU, or the send pool is empty under load |
 | `inflight` pinned at the pool size | the peer or the carrier is not draining: the send path is backpressured |
 
-Counters are cumulative per session: `iwan_nt_session` resets them when a session
-is installed, so two readings from different sessions must not be subtracted.
+Counters are cumulative since the driver loaded and are not reset when a session
+is installed, so two readings from different sessions can be subtracted to get the
+work of one session only if you also account for what the previous one left. When
+a number has to be attributed to one session, take a reading right after the
+session comes up and subtract that.
 
 ## When it does not come up
 
