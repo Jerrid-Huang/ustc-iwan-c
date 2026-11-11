@@ -79,8 +79,9 @@
       <PreprocessorDefinitions>_AMD64_;AMD64;IWAN_NT_KERNEL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
-      <!-- netio.lib provides Wsk*, ndis.lib the miniport entry points. -->
-      <AdditionalDependencies>ndis.lib;netio.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <!-- netio.lib provides Wsk*, ndis.lib the miniport entry points, and
+           NPI_WSK_INTERFACE_ID comes from uuid.lib (netio.lib does not carry it). -->
+      <AdditionalDependencies>ndis.lib;netio.lib;uuid.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <SubSystem>Native</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
     </Link>
