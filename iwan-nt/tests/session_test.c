@@ -13,6 +13,7 @@
 #include "iwan_nt_session.h"
 
 static int Failures = 0;
+static int Checks = 0;
 
 static void
 Check(
@@ -20,6 +21,7 @@ Check(
     int Condition
     )
 {
+    Checks++;
     if (!Condition) {
         printf("FAIL %s\n", Name);
         Failures++;
@@ -34,6 +36,7 @@ CheckBytes(
     size_t Length
     )
 {
+    Checks++;
     if (memcmp(Actual, Expected, Length) != 0) {
         size_t index;
 
@@ -96,6 +99,7 @@ TestOpen(void)
     result = IwanNtSessionBuildOpen(&open, frame, sizeof(frame), &length);
     Check("open-ok", result == IwanNtSessionOk);
     /* The reference client produces 59 bytes for an 8-character user. */
+    /* 24 prefix + 4 mtu + 10 user + 18 password + 3 encrypt = 59. */
     Check("open-length", length == 59u);
     CheckBytes("open-header", frame, header, sizeof(header));
     CheckBytes("open-mtu-tlv", frame + 24u, (const uint8_t *)"\x03\x04\x05\x78", 4u);
@@ -110,6 +114,34 @@ TestOpen(void)
     /* NULL inputs are a caller bug, not a crash. */
     result = IwanNtSessionBuildOpen(NULL, frame, sizeof(frame), &length);
     Check("open-null", result == IwanNtSessionBadArgument);
+
+    /*
+     * The whole frame, byte for byte, against a vector built outside this code:
+     * python hashlib for the signature (md5 of the header followed by "mw") and
+     * the password key (md5 of "mw" + user), then openssl enc -aes-128-ecb for the
+     * password block. A builder and its test that both come from the same
+     * assumption agree even when both are wrong; this one cannot.
+     */
+    {
+        static const uint8_t expected[] = {
+            0x13, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x36, 0x01, 0x68, 0x0d,
+            0xe3, 0xa6, 0xb3, 0xdd, 0x33, 0x6a, 0xc5, 0x57, 0xc8, 0x7b, 0x50, 0x1b,
+            0x03, 0x04, 0x05, 0x78, 0x01, 0x0a, 0x5f, 0x72, 0x65, 0x76, 0x5f, 0x6d,
+            0x5f, 0x32, 0x02, 0x12, 0x29, 0xc3, 0x36, 0x81, 0xe8, 0xc0, 0xd8, 0xa1,
+            0xd9, 0xca, 0x02, 0x74, 0x62, 0x78, 0x22, 0xa0, 0x08, 0x03, 0x01,
+        };
+        IWAN_NT_SESSION_OPEN wire;
+        uint8_t built[128];
+        size_t builtLength = 0u;
+
+        wire.User = "_rev_m_2";
+        wire.Password = "testpass123";
+        wire.Mtu = 1400u;
+        result = IwanNtSessionBuildOpen(&wire, built, sizeof(built), &builtLength);
+        Check("wire-ok", result == IwanNtSessionOk);
+        Check("wire-length", builtLength == sizeof(expected));
+        CheckBytes("wire-bytes", built, expected, sizeof(expected));
+    }
 }
 
 static void
@@ -227,6 +259,6 @@ main(void)
         printf("session: %d failures\n", Failures);
         return 1;
     }
-    printf("session: 42 checks, 0 failures\n");
+    printf("session: %d checks, 0 failures\n", Checks);
     return 0;
 }

@@ -137,7 +137,7 @@ IwanNtSessionBuildOpen(
     if (userLength == 0 || userLength > 64u) {
         return IwanNtSessionBadArgument;
     }
-    if (Capacity < IWAN_NT_SESSION_PREFIX + 6u + (2u + userLength) + 18u + 3u) {
+    if (Capacity < IWAN_NT_SESSION_PREFIX + 4u + (2u + userLength) + 18u + 3u) {
         return IwanNtSessionTooLarge;
     }
 
@@ -156,7 +156,16 @@ IwanNtSessionBuildOpen(
     IwanNtSessionPutBe16(Buffer + offset + 2u, Open->Mtu);
     offset += 4u;
 
-    /* TLV 1: user name, not NUL terminated on the wire. */
+    /*
+     * TLV 1: user name, not NUL terminated.
+     *
+     * The length byte is the whole TLV size, header included, so it is the value
+     * length plus two. This is the protocol's convention (both the vendor client
+     * and src/common/protocol.c's tlv_put write vlen + 2), but it reads like an
+     * off-by-two to anyone expecting a payload count: adding two bytes of padding
+     * to "make the declaration true" shifts every later TLV and the server answers
+     * "invalid packet format" without naming the field. Keep vlen + 2, write vlen.
+     */
     Buffer[offset + 0u] = IWAN_NT_SESSION_TLV_USER;
     Buffer[offset + 1u] = (uint8_t)(2u + userLength);
     memcpy(Buffer + offset + 2u, Open->User, userLength);
