@@ -153,6 +153,15 @@ through `SET_PEER` and the session through `SET_SESSION`.
 - [WDK project](driver/iwan_nt.vcxproj)
 - [Root-enumerated adapter INF](driver/iwan_nt.inf)
 
+## About `tools/kernel-stubs`
+
+The stubs exist so the frame, demux, ring, ingress and socket sources can be
+parsed and unit tested without a WDK. They are a guess at the real headers, and
+they have been wrong more than once: `WSK_BUF` sizes are `SIZE_T`, `WskControlSocket`
+takes ten arguments, `NPI_WSK_INTERFACE_ID` lives in `uuid.lib`, `WskGetLocalAddress`
+is a datagram-dispatch entry taking an IRP, and `SOCKADDR_IN` comes from `wsk.h`.
+Whenever a stub and the WDK disagree, the WDK is right and the stub is a bug.
+
 ## Local checks
 
 `tools/check-syntax.sh` runs a fast pre-filter on a Linux host: a parser pass

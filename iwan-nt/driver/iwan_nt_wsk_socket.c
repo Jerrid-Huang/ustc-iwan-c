@@ -357,10 +357,8 @@ IwanNtWskDatagramBind(
         NTSTATUS localStatus = IwanNtWskDatagramPrepareIrp(Datagram);
 
         if (NT_SUCCESS(localStatus)) {
-            ULONG length = (ULONG)sizeof(Datagram->BoundAddress);
-
             localStatus = dispatch->WskGetLocalAddress(
-                Datagram->Socket, (PSOCKADDR)&Datagram->BoundAddress, &length,
+                Datagram->Socket, (PSOCKADDR)&Datagram->BoundAddress,
                 Datagram->LifecycleIrp);
             (void)IwanNtWskDatagramFinishIrp(Datagram, localStatus, &information);
         }
