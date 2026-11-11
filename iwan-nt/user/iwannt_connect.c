@@ -214,6 +214,20 @@ IwanNtRunConnect(
                     PrintAddress(handshake.Gateway);
                 }
                 printf("\n");
+                if (handshake.MtuFromPeer != 0u &&
+                    handshake.MtuFromPeer < handshake.Mtu) {
+                    /*
+                     * NDIS does not let a miniport change its MTU at runtime, and
+                     * the deployed client uses min(configured, peer) on its tun
+                     * device, so the remaining step belongs to the host.
+                     */
+                    printf("CONNECT the peer accepts %u-byte packets; "
+                           "lower the adapter to match:\n"
+                           "  netsh interface ipv4 set subinterface "
+                           "\"iWAN NT Transport Adapter\" mtu=%u store=persistent\n",
+                           (unsigned)handshake.MtuFromPeer,
+                           (unsigned)handshake.MtuFromPeer);
+                }
                 if (handshake.HasAddress) {
                     /*
                      * Print the command rather than running it: the tool talks to

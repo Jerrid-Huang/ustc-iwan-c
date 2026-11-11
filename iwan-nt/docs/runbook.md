@@ -82,3 +82,13 @@ session comes up and subtract that.
    not reaching this host: check the port and the route before suspecting the
    protocol. A stale host route pinning the server address to another interface is
    the most common cause and looks exactly like silence.
+
+## When the peer accepts less than 1400 bytes
+
+The answer carries the peer's MTU. `connect` prints the command that lowers the
+adapter when the peer's value is smaller than the configured one; NDIS does not
+allow a running miniport to change its own MTU, so this is a host step:
+
+```
+netsh interface ipv4 set subinterface "iWAN NT Transport Adapter" mtu=1380 store=persistent
+```
