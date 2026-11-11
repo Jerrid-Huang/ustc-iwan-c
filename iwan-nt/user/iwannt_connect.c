@@ -109,6 +109,12 @@ HandleFrame(
     }
 
     if (Frame[0] == IWAN_NT_SESSION_TYPE_CLOSE) {
+        /*
+         * Forget the session here too: the driver must stop transforming DATA
+         * with a key the peer has already torn down.
+         */
+        (void)IwanNtClearSession(Device);
+        State->Established = FALSE;
         printf("CONNECT closed by peer\n");
         return 2;
     }
@@ -143,7 +149,19 @@ SendOpen(
         return 1;
     }
     if (IwanNtSendControl(Device, frame, (UINT32)length) == FALSE) {
-        fprintf(stderr, "SEND_CONTROL failed: %lu\n", GetLastError());
+        DWORD error = GetLastError();
+
+        fprintf(stderr, "SEND_CONTROL failed: %lu\n", error);
+        if (error == ERROR_NOT_READY || error == ERROR_DEVICE_NOT_CONNECTED) {
+            /*
+             * The transport only runs while the adapter does, and a freshly
+             * installed root adapter starts disabled. Say so instead of leaving
+             * the operator to guess why a send fails on a "ready" device.
+             */
+            fprintf(stderr,
+                    "the adapter is not up: enable it, for example\n"
+                    "  netsh interface set interface \"iWAN NT Transport Adapter\" admin=enable\n");
+        }
         return 1;
     }
 
