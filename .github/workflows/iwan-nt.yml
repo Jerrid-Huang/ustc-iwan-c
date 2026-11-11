@@ -20,7 +20,7 @@ on:
       - '.github/workflows/iwan-nt.yml'
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   wdk:
@@ -136,6 +136,24 @@ jobs:
           $sys = Get-ChildItem "$env:GITHUB_WORKSPACE\build" -Recurse -Filter 'iwannt.sys' -ErrorAction SilentlyContinue
           if (-not $sys) { throw 'iwannt.sys was not produced' }
           $sys | ForEach-Object { "$($_.FullName) $($_.Length) bytes" }
+
+      # Annotations only carry the exit status, and an artifact needs credentials to
+      # fetch. A failed build therefore parks its log on a side branch, where a plain
+      # read is enough to see the compiler's own words.
+      - name: Publish build logs on failure
+        if: failure()
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $repo = '${{ github.repository }}'
+          $files = @('user-build.log', 'cl-build.log')
+          foreach ($name in $files) {
+            if (-not (Test-Path $name)) { continue }
+            $text = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((Get-Content $name -Raw)))
+            gh api -X PUT "/repos/$repo/contents/logs/$name" --method PUT `
+              -f message='ci: publish build log' -f content=$text -f branch='ci-logs'
+          }
 
       - name: Upload logs and driver
         if: always()
