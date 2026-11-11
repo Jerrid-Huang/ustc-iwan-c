@@ -18,6 +18,18 @@ The design excludes multi-core crypto worker pools. Resource ownership, cancella
 
 - [Architecture](docs/architecture.md) - scope, ownership, staged plan, and non-goals.
 
+## Build status
+
+`driver/iwan_nt.vcxproj` compiles and links on the Windows WDK toolset
+(MSVC 14.44, WDK 10.0.26100, x64 Release) with `/W4 /WX /sdl /kernel`:
+
+- every translation unit: 0 warnings, 0 errors
+- PREfast (`/p:RunCodeAnalysis=true`): 0 warnings, 0 errors
+- output: `iwannt.sys` 20480 bytes
+
+That is a build result, not a runtime result: nothing in this repository has
+been loaded on a machine yet.
+
 ## Project status
 
 Stage 2 lifecycle skeleton is present: NDIS miniport registration, per-adapter

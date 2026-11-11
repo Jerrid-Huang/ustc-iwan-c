@@ -1,5 +1,6 @@
 #include "iwan_nt_miniport.h"
 #include "iwan_nt_transport.h"
+#include "iwan_nt_tx.h"
 
 #define IWAN_NT_MINIPORT_POOL_TAG 'mNwI'
 #define IWAN_NT_MINIPORT_LINK_SPEED 1000000000ULL
@@ -31,6 +32,19 @@ typedef struct _IWAN_NT_MINIPORT_ADAPTER {
     NDIS_DEVICE_POWER_STATE PowerState;
     IWAN_NT_TRANSPORT Transport;
     BOOLEAN TransportReady;
+    /*
+     * One contiguous staging buffer per adapter: NdisGetDataBuffer can be asked
+     * to flatten a scattered NET_BUFFER into it, and the frame transform then
+     * runs on contiguous bytes. The lock keeps that shared buffer, and the
+     * transform itself, single threaded as the design requires.
+     */
+    KSPIN_LOCK SendLock;
+    PUCHAR SendScratch;
+    NDIS_HANDLE RxPool;
+    volatile LONG TxAccepted;
+    volatile LONG TxRejected;
+    volatile LONG RxIndicated;
+    volatile LONG RxDropped;
 } IWAN_NT_MINIPORT_ADAPTER, *PIWAN_NT_MINIPORT_ADAPTER;
 
 /* NDIS role types supply the callback IRQL and parameter annotations. */
@@ -45,6 +59,14 @@ static MINIPORT_CANCEL_SEND IwanNtMiniportCancelSend;
 static MINIPORT_CANCEL_OID_REQUEST IwanNtMiniportCancelOidRequest;
 static MINIPORT_DEVICE_PNP_EVENT_NOTIFY IwanNtMiniportDevicePnPEventNotify;
 static MINIPORT_SHUTDOWN IwanNtMiniportShutdownEx;
+
+static VOID
+IwanNtMiniportIndicateInner(
+    void *Context,
+    const uint8_t *Inner,
+    size_t Length,
+    unsigned Family
+    );
 
 /* NDIS caches the general-attribute OIDs on our behalf. */
 static NDIS_OID IwanNtMiniportSupportedOids[] = {
@@ -173,7 +195,35 @@ IwanNtMiniportInitializeEx(
         goto Failure;
     }
     adapter->TransportReady = TRUE;
+    NdisAllocateSpinLock(&adapter->SendLock);
+    adapter->SendScratch = NdisAllocateMemoryWithTagPriority(
+        MiniportAdapterHandle, IWAN_NT_TX_BUFFER_BYTES, IWAN_NT_MINIPORT_POOL_TAG,
+        NormalPoolPriority);
+    if (adapter->SendScratch == NULL) {
+        status = NDIS_STATUS_RESOURCES;
+        goto Failure;
+    }
+    {
+        NET_BUFFER_LIST_POOL_PARAMETERS params;
+
+        NdisZeroMemory(&params, sizeof(params));
+        params.Header.Type = NDIS_OBJECT_TYPE_DEFAULT;
+        params.Header.Revision = NET_BUFFER_LIST_POOL_PARAMETERS_REVISION_1;
+        params.Header.Size = NDIS_SIZEOF_NET_BUFFER_LIST_POOL_PARAMETERS_REVISION_1;
+        params.ProtocolId = NDIS_PROTOCOL_ID_DEFAULT;
+        params.fAllocateNetBuffer = FALSE;
+        params.PoolTag = IWAN_NT_MINIPORT_POOL_TAG;
+        adapter->RxPool = NdisAllocateNetBufferListPool(MiniportAdapterHandle,
+                                                        &params);
+        if (adapter->RxPool == NULL) {
+            status = NDIS_STATUS_RESOURCES;
+            goto Failure;
+        }
+    }
+    IwanNtTransportSetDataSink(&adapter->Transport, IwanNtMiniportIndicateInner,
+                               adapter);
     NdisZeroMemory(&registration, sizeof(registration));
+    registration.Header.Type =
         NDIS_OBJECT_TYPE_MINIPORT_ADAPTER_REGISTRATION_ATTRIBUTES;
     registration.Header.Revision =
         NDIS_MINIPORT_ADAPTER_REGISTRATION_ATTRIBUTES_REVISION_2;
@@ -244,6 +294,14 @@ Failure:
         IwanNtTransportFinalize(&adapter->Transport);
         adapter->TransportReady = FALSE;
     }
+    if (adapter->RxPool != NULL) {
+        NdisFreeNetBufferListPool(adapter->RxPool);
+        adapter->RxPool = NULL;
+    }
+    if (adapter->SendScratch != NULL) {
+        NdisFreeMemory(adapter->SendScratch, 0, 0);
+        adapter->SendScratch = NULL;
+    }
     NdisFreeMemory(adapter, 0, 0);
     return status;
 }
@@ -259,9 +317,18 @@ IwanNtMiniportHaltEx(
 
     UNREFERENCED_PARAMETER(HaltAction);
     InterlockedExchange(&adapter->State, IwanNtMiniportStopped);
+    /* The transport drain waits out the receive callback before this returns. */
     if (adapter->TransportReady) {
         IwanNtTransportFinalize(&adapter->Transport);
         adapter->TransportReady = FALSE;
+    }
+    if (adapter->RxPool != NULL) {
+        NdisFreeNetBufferListPool(adapter->RxPool);
+        adapter->RxPool = NULL;
+    }
+    if (adapter->SendScratch != NULL) {
+        NdisFreeMemory(adapter->SendScratch, 0, 0);
+        adapter->SendScratch = NULL;
     }
     NdisFreeMemory(adapter, 0, 0);
 }
@@ -311,6 +378,74 @@ IwanNtMiniportRestart(
     return NDIS_STATUS_SUCCESS;
 }
 
+/*
+ * Runs at DISPATCH_LEVEL inside the WSK receive callback, so it copies the inner
+ * packet into a fresh NBL and hands ownership to NDIS immediately. Nothing here
+ * blocks, and nothing keeps the WSK buffer alive past this call.
+ */
+static VOID
+IwanNtMiniportIndicateInner(
+    void *Context,
+    const uint8_t *Inner,
+    size_t Length,
+    unsigned Family
+    )
+{
+    PIWAN_NT_MINIPORT_ADAPTER adapter = Context;
+    PNET_BUFFER_LIST nbl;
+    PVOID buffer;
+    PMDL mdl;
+    LONG state;
+
+    if (Inner == NULL || Length == 0 || Length > IWAN_NT_MINIPORT_MTU) {
+        InterlockedIncrement(&adapter->RxDropped);
+        return;
+    }
+    state = InterlockedCompareExchange(
+        &adapter->State, IwanNtMiniportPaused, IwanNtMiniportPaused);
+    if (state != IwanNtMiniportRunning) {
+        InterlockedIncrement(&adapter->RxDropped);
+        return;
+    }
+
+    buffer = NdisAllocateMemoryWithTagPriority(adapter->AdapterHandle,
+                                               (ULONG)Length,
+                                               IWAN_NT_MINIPORT_POOL_TAG,
+                                               NormalPoolPriority);
+    if (buffer == NULL) {
+        InterlockedIncrement(&adapter->RxDropped);
+        return;
+    }
+    NdisMoveMemory(buffer, Inner, Length);
+
+    mdl = NdisAllocateMdl(adapter->AdapterHandle, buffer, (ULONG)Length);
+    if (mdl == NULL) {
+        NdisFreeMemory(buffer, 0, 0);
+        InterlockedIncrement(&adapter->RxDropped);
+        return;
+    }
+
+    nbl = NdisAllocateNetBufferAndNetBufferList(adapter->RxPool, 0, 0, mdl, 0,
+                                                (ULONG)Length);
+    if (nbl == NULL) {
+        NdisFreeMdl(mdl);
+        NdisFreeMemory(buffer, 0, 0);
+        InterlockedIncrement(&adapter->RxDropped);
+        return;
+    }
+
+    /*
+     * The miniport is raw IP, so NDIS needs the EtherType it should report and
+     * must be told to trust that single value instead of parsing the frame.
+     */
+    NET_BUFFER_LIST_INFO(nbl, NetBufferListFrameType) =
+        (Family == 6) ? (PVOID)(ULONG_PTR)0xDD86 : (PVOID)(ULONG_PTR)0x0008;
+    InterlockedIncrement(&adapter->RxIndicated);
+    NdisMIndicateReceiveNetBufferLists(adapter->AdapterHandle, nbl,
+                                       NDIS_DEFAULT_PORT_NUMBER, 1,
+                                       NDIS_RECEIVE_FLAGS_SINGLE_ETHER_TYPE);
+}
+
 _Use_decl_annotations_
 static VOID
 IwanNtMiniportSendNetBufferLists(
@@ -324,20 +459,64 @@ IwanNtMiniportSendNetBufferLists(
     NDIS_HANDLE handle = adapter->AdapterHandle;
     PNET_BUFFER_LIST current;
     ULONG completeFlags = 0;
+    LONG state;
 
     UNREFERENCED_PARAMETER(PortNumber);
-    for (current = NetBufferLists; current != NULL;
-         current = NET_BUFFER_LIST_NEXT_NBL(current)) {
-        LONG state = InterlockedCompareExchange(
-            &adapter->State, IwanNtMiniportPaused, IwanNtMiniportPaused);
 
-        NET_BUFFER_LIST_STATUS(current) =
-            (state == IwanNtMiniportRunning) ?
-            NDIS_STATUS_NOT_SUPPORTED : NDIS_STATUS_PAUSED;
-    }
     if ((SendFlags & NDIS_SEND_FLAGS_DISPATCH_LEVEL) != 0) {
         completeFlags = NDIS_SEND_COMPLETE_FLAGS_DISPATCH_LEVEL;
     }
+
+    state = InterlockedCompareExchange(
+        &adapter->State, IwanNtMiniportPaused, IwanNtMiniportPaused);
+    if (state != IwanNtMiniportRunning) {
+        for (current = NetBufferLists; current != NULL;
+             current = NET_BUFFER_LIST_NEXT_NBL(current)) {
+            NET_BUFFER_LIST_STATUS(current) = NDIS_STATUS_PAUSED;
+        }
+        NdisMSendNetBufferListsComplete(handle, NetBufferLists, completeFlags);
+        return;
+    }
+
+    /*
+     * One lock covers the shared staging buffer and the transform, so the
+     * synchronous path stays single threaded even when several CPUs send.
+     */
+    NdisAcquireSpinLock(&adapter->SendLock);
+    for (current = NetBufferLists; current != NULL;
+         current = NET_BUFFER_LIST_NEXT_NBL(current)) {
+        PNET_BUFFER nb;
+        NDIS_STATUS packetStatus = NDIS_STATUS_SUCCESS;
+
+        for (nb = NET_BUFFER_LIST_FIRST_NB(current);
+             nb != NULL; nb = NET_BUFFER_NEXT_NB(nb)) {
+            ULONG length = NET_BUFFER_DATA_LENGTH(nb);
+            PUCHAR bytes;
+            NTSTATUS status;
+
+            if (length == 0) {
+                continue;
+            }
+            if (length > IWAN_NT_TX_BUFFER_BYTES) {
+                packetStatus = NDIS_STATUS_INVALID_PACKET;
+                continue;
+            }
+            bytes = NdisGetDataBuffer(nb, length, adapter->SendScratch, 1, 0);
+            if (bytes == NULL) {
+                packetStatus = NDIS_STATUS_RESOURCES;
+                continue;
+            }
+            status = IwanNtTransportSendInner(&adapter->Transport, bytes, length);
+            if (NT_SUCCESS(status)) {
+                InterlockedIncrement(&adapter->TxAccepted);
+            } else {
+                InterlockedIncrement(&adapter->TxRejected);
+                packetStatus = NDIS_STATUS_RESOURCES;
+            }
+        }
+        NET_BUFFER_LIST_STATUS(current) = packetStatus;
+    }
+    NdisReleaseSpinLock(&adapter->SendLock);
     /* No access to an NBL or adapter is made after returning its ownership. */
     NdisMSendNetBufferListsComplete(handle, NetBufferLists, completeFlags);
 }
@@ -350,14 +529,26 @@ IwanNtMiniportReturnNetBufferLists(
     ULONG ReturnFlags
     )
 {
+    PNET_BUFFER_LIST current;
+
     UNREFERENCED_PARAMETER(MiniportAdapterContext);
-    UNREFERENCED_PARAMETER(NetBufferLists);
     UNREFERENCED_PARAMETER(ReturnFlags);
+
     /*
-     * Unreachable while no receives are indicated. Before adding WSK RX,
-     * implement explicit NBL ownership, return reclamation and pause rundown.
+     * Every indicated NBL owns exactly one MDL over one pooled buffer, and the
+     * MDL keeps the buffer address, so the pair can be freed without extra
+     * bookkeeping.
      */
-    NT_ASSERT(NetBufferLists == NULL);
+    for (current = NetBufferLists; current != NULL;
+         current = NET_BUFFER_LIST_NEXT_NBL(current)) {
+        PNET_BUFFER nb = NET_BUFFER_LIST_FIRST_NB(current);
+        PMDL mdl = NET_BUFFER_CURRENT_MDL(nb);
+        PVOID buffer = MmGetMdlVirtualAddress(mdl);
+
+        NdisFreeMdl(mdl);
+        NdisFreeMemory(buffer, 0, 0);
+        NdisFreeNetBufferList(current);
+    }
 }
 
 static NDIS_STATUS
