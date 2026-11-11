@@ -34,6 +34,7 @@ Usage(VOID)
 {
     fprintf(stderr,
             "usage:\n"
+            "  iwannt-ctl check\n"
             "  iwannt-ctl stats\n"
             "  iwannt-ctl peer <a.b.c.d> <port>\n"
             "  iwannt-ctl session <sid-hex> <token-hex> <0|1> <key-hex>\n"
@@ -96,6 +97,63 @@ PrintHex(
             printf(" ");
         }
     }
+}
+
+/*
+ * Say whether the driver is usable and what is missing, in the order the pieces
+ * have to work: device, transport, session. Every step names the command that
+ * fixes it, because "open \\.\IwanNt failed: 2" on its own is not actionable.
+ */
+static int
+CommandCheck(
+    _In_ PIWAN_NT_DEVICE Device
+    )
+{
+    IWAN_NT_STATS_ABI stats;
+    int problems = 0;
+
+    memset(&stats, 0, sizeof(stats));
+    if (IwanNtGetStats(Device, &stats) == FALSE) {
+        fprintf(stderr, "device is open but GET_STATS failed: %lu\n", GetLastError());
+        return 1;
+    }
+
+    printf("device      ok (%s)\n", IWAN_NT_WIN32_NAME);
+
+    if (stats.Running != 0) {
+        printf("transport   running\n");
+    } else {
+        printf("transport   NOT running: the adapter is disabled or its session is down\n");
+        printf("            netsh interface set interface \"iWAN NT Transport Adapter\" admin=enable\n");
+        problems++;
+    }
+
+    if (stats.SessionValid != 0) {
+        printf("session     installed\n");
+    } else {
+        printf("session     none: run \"iwannt-ctl connect <ip> <port> <user> <password>\"\n");
+        problems++;
+    }
+
+    if (stats.RxOversize != 0 || stats.RxSinkErrors != 0) {
+        printf("receive     %llu oversize and %llu refused datagrams: check the MTU\n",
+               (unsigned long long)stats.RxOversize,
+               (unsigned long long)stats.RxSinkErrors);
+        problems++;
+    }
+
+    printf("counters    rx=%llu delivered=%llu tx=%llu inflight=%lu\n",
+           (unsigned long long)stats.Receives,
+           (unsigned long long)stats.Delivered,
+           (unsigned long long)stats.TxAccepted,
+           (unsigned long)stats.TxInFlight);
+
+    if (problems != 0) {
+        printf("check: %d problem(s)\n", problems);
+        return 1;
+    }
+    printf("check: ready\n");
+    return 0;
 }
 
 static int
@@ -415,12 +473,25 @@ main(
 
     device.Handle = INVALID_HANDLE_VALUE;
     if (IwanNtOpen(&device) == FALSE) {
-        fprintf(stderr, "open %s failed: %lu\n", IWAN_NT_WIN32_NAME,
-                GetLastError());
+        DWORD error = GetLastError();
+
+        fprintf(stderr, "open %s failed: %lu\n", IWAN_NT_WIN32_NAME, error);
+        if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) {
+            /*
+             * The first thing that goes wrong on a fresh machine: the control
+             * device only exists while the driver is loaded, and a root-enumerated
+             * service does not start itself.
+             */
+            fprintf(stderr,
+                    "the driver is not loaded, so the control device does not exist\n"
+                    "  sc start iwannt\n");
+        }
         return 1;
     }
 
-    if (strcmp(argv[1], "stats") == 0) {
+    if (strcmp(argv[1], "check") == 0) {
+        result = CommandCheck(&device);
+    } else if (strcmp(argv[1], "stats") == 0) {
         result = CommandStats(&device);
     } else if (strcmp(argv[1], "peer") == 0) {
         result = CommandPeer(&device, argc, argv);

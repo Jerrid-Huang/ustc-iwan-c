@@ -17,6 +17,7 @@ The design excludes multi-core crypto worker pools. Resource ownership, cancella
 ## Documentation
 
 - [Architecture](docs/architecture.md) - scope, ownership, staged plan, and non-goals.
+- [Runbook](docs/runbook.md) - from an installed driver to a session, and how to read the counters.
 
 ## Build status
 
@@ -25,7 +26,7 @@ The design excludes multi-core crypto worker pools. Resource ownership, cancella
 
 - every translation unit: 0 warnings, 0 errors
 - PREfast (`/p:RunCodeAnalysis=true`): 0 warnings, 0 errors
-- output: `iwannt.sys` 30208 bytes
+- output: `iwannt.sys` (size in the build log; it changes with every edit)
 
 The user-mode half builds in the same job with cl (`/W4 /WX /std:c11`) as
 `iwannt-ctl.exe`, 0 warnings. It is built with no include path beyond the tree,
