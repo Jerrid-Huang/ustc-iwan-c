@@ -1,0 +1,8 @@
+iwannt-ctl.c
+D:\a\ustc-iwan-c\ustc-iwan-c\iwan-nt\user\iwan_nt_session.h(21): fatal error C1083: Cannot open include file: 'iwan_nt_types.h': No such file or directory
+iwan_nt_control.c
+iwan_nt_crypto.c
+D:\a\ustc-iwan-c\ustc-iwan-c\iwan-nt\user\iwan_nt_crypto.h(18): fatal error C1083: Cannot open include file: 'iwan_nt_types.h': No such file or directory
+iwan_nt_session.c
+D:\a\ustc-iwan-c\ustc-iwan-c\iwan-nt\user\iwan_nt_session.h(21): fatal error C1083: Cannot open include file: 'iwan_nt_types.h': No such file or directory
+Generating Code...
