@@ -38,7 +38,8 @@ typedef struct _IWAN_NT_MINIPORT_ADAPTER {
      * runs on contiguous bytes. The lock keeps that shared buffer, and the
      * transform itself, single threaded as the design requires.
      */
-    KSPIN_LOCK SendLock;
+    NDIS_SPIN_LOCK SendLock;
+    BOOLEAN SendLockReady;
     PUCHAR SendScratch;
     NDIS_HANDLE RxPool;
     volatile LONG TxAccepted;
@@ -196,6 +197,7 @@ IwanNtMiniportInitializeEx(
     }
     adapter->TransportReady = TRUE;
     NdisAllocateSpinLock(&adapter->SendLock);
+    adapter->SendLockReady = TRUE;
     adapter->SendScratch = NdisAllocateMemoryWithTagPriority(
         MiniportAdapterHandle, IWAN_NT_TX_BUFFER_BYTES, IWAN_NT_MINIPORT_POOL_TAG,
         NormalPoolPriority);
@@ -294,6 +296,10 @@ Failure:
         IwanNtTransportFinalize(&adapter->Transport);
         adapter->TransportReady = FALSE;
     }
+    if (adapter->SendLockReady) {
+        NdisFreeSpinLock(&adapter->SendLock);
+        adapter->SendLockReady = FALSE;
+    }
     if (adapter->RxPool != NULL) {
         NdisFreeNetBufferListPool(adapter->RxPool);
         adapter->RxPool = NULL;
@@ -321,6 +327,10 @@ IwanNtMiniportHaltEx(
     if (adapter->TransportReady) {
         IwanNtTransportFinalize(&adapter->Transport);
         adapter->TransportReady = FALSE;
+    }
+    if (adapter->SendLockReady) {
+        NdisFreeSpinLock(&adapter->SendLock);
+        adapter->SendLockReady = FALSE;
     }
     if (adapter->RxPool != NULL) {
         NdisFreeNetBufferListPool(adapter->RxPool);
