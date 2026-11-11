@@ -114,7 +114,7 @@ typedef struct _WSK_PROVIDER_DATAGRAM_DISPATCH {
     /*
      * Synchronous: the address is copied out and the length is in and out.
      */
-    NTSTATUS (*WskGetLocalAddress)(PVOID, PSOCKADDR, PULONG);
+    NTSTATUS (*WskGetLocalAddress)(PVOID, PSOCKADDR, PULONG, PIRP);
 } WSK_PROVIDER_DATAGRAM_DISPATCH;
 
 

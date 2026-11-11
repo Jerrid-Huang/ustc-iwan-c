@@ -346,24 +346,27 @@ IwanNtWskDatagramBind(
             Datagram->LifecycleIrp);
         status = IwanNtWskDatagramFinishIrp(Datagram, status, &information);
     }
-    IwanNtWskDatagramReleaseOperation(Datagram);
-
     /*
      * The bind asked for port zero, so the real port is only known now. Without
      * reading it back nothing could ever address this socket deliberately, and
-     * the operator could not tell a NAT problem from a protocol one.
+     * the operator could not tell a NAT problem from a protocol one. The query
+     * takes an IRP like every other provider call, so it runs inside the same
+     * operation gate, and failing it is not fatal: the tunnel works either way.
      */
-    if (NT_SUCCESS(status)) {
-        const WSK_PROVIDER_DATAGRAM_DISPATCH *datagram =
-            IwanNtWskDatagramGetDatagramDispatch(Datagram->Socket);
+    if (NT_SUCCESS(status) && dispatch->WskGetLocalAddress != NULL) {
+        NTSTATUS localStatus = IwanNtWskDatagramPrepareIrp(Datagram);
 
-        if (datagram->WskGetLocalAddress != NULL) {
+        if (NT_SUCCESS(localStatus)) {
             ULONG length = (ULONG)sizeof(Datagram->BoundAddress);
 
-            (void)datagram->WskGetLocalAddress(
-                Datagram->Socket, (PSOCKADDR)&Datagram->BoundAddress, &length);
+            localStatus = dispatch->WskGetLocalAddress(
+                Datagram->Socket, (PSOCKADDR)&Datagram->BoundAddress, &length,
+                Datagram->LifecycleIrp);
+            (void)IwanNtWskDatagramFinishIrp(Datagram, localStatus, &information);
         }
     }
+
+    IwanNtWskDatagramReleaseOperation(Datagram);
 
     if (NT_SUCCESS(status)) {
         Datagram->SocketBound = TRUE;
