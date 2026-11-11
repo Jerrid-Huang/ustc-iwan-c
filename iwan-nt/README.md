@@ -25,10 +25,31 @@ The design excludes multi-core crypto worker pools. Resource ownership, cancella
 
 - every translation unit: 0 warnings, 0 errors
 - PREfast (`/p:RunCodeAnalysis=true`): 0 warnings, 0 errors
-- output: `iwannt.sys` 20480 bytes
+- output: `iwannt.sys` 29696 bytes
 
 That is a build result, not a runtime result: nothing in this repository has
 been loaded on a machine yet.
+
+## Control interface
+
+The transport owns the outer UDP socket inside the kernel, so both directions
+of the control plane cross the control device (`\\.\IwanNt`, admin and SYSTEM
+only) instead of a user-mode socket:
+
+| IOCTL | Direction | Purpose |
+| --- | --- | --- |
+| `SET_SESSION` | write | sid, token, encryption flag and XOR key from OPEN_ACK |
+| `CLEAR_SESSION` | - | drop the session; later DATA frames are counted drops |
+| `SET_PEER` | write | outer IPv4 endpoint for every send |
+| `SEND_CONTROL` | write | one complete control frame, sent verbatim |
+| `READ_CONTROL` | read | dequeue one control frame from the bounded ring |
+| `GET_STATS` | read | one snapshot of every transport and adapter counter |
+
+`driver/iwan_nt_ioctl.h` is the whole ABI and is shared verbatim with user
+mode: fixed-width fields, no padding, no kernel headers. `READ_CONTROL` never
+loses a frame to a short buffer: it reports the required length and leaves the
+record queued. A full ring drops the newest control frame and counts it, so a
+flooding peer cannot make the driver allocate.
 
 ## Project status
 
