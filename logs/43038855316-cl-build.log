@@ -1,0 +1,62 @@
+Build started 11/11/2026 2:29:11 PM.
+
+Project "D:\a\ustc-iwan-c\ustc-iwan-c\iwan-nt\driver\iwan_nt.vcxproj" on node 1 (ClCompile target(s)).
+DriverBuildNotifications:
+  Building 'iwannt' with toolset 'WindowsKernelModeDriver10.0' and the 'Desktop' target platform.
+  Using KMDF 1.15.
+PrepareForBuild:
+  Creating directory "D:\a\ustc-iwan-c\ustc-iwan-c\build\obj\x64\Release\".
+  Structured output is enabled. The formatting of compiler diagnostics will reflect the error hierarchy. See https://aka.ms/cpp/structured-output for more details.
+  Creating directory "D:\a\ustc-iwan-c\ustc-iwan-c\build\x64\Release\".
+  Creating directory "D:\a\ustc-iwan-c\ustc-iwan-c\build\obj\x64\Release\iwannt.tlog\".
+InitializeBuildStatus:
+  Creating "D:\a\ustc-iwan-c\ustc-iwan-c\build\obj\x64\Release\iwannt.tlog\unsuccessfulbuild" because "AlwaysCreate" was specified.
+  Touching "D:\a\ustc-iwan-c\ustc-iwan-c\build\obj\x64\Release\iwannt.tlog\unsuccessfulbuild".
+ClCompile:
+  C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207\bin\HostX64\x64\CL.exe /c /I"D:\a\ustc-iwan-c\ustc-iwan-c\iwan-nt\driver\\" /I"D:\a\ustc-iwan-c\ustc-iwan-c\build\obj\x64\Release\\" /Zi /nologo /W4 /WX /diagnostics:column /sdl /O2 /Oi /Os /Oy- /D NDEBUG /D _AMD64_ /D AMD64 /D IWAN_NT_KERNEL /D _WIN64 /D _AMD64_ /D AMD64 /D _WIN32_WINNT=0x0A00 /D WINVER=0x0A00 /D WINNT=1 /D NTDDI_VERSION=0xA000010 /GF /Gm- /Zp8 /GS /guard:cf /Gy /fp:precise /Qspectre /Zc:wchar_t- /Zc:forScope /Zc:inline /GR- /std:c11 /Fo"D:\a\ustc-iwan-c\ustc-iwan-c\build\obj\x64\Release\\" /Fd"D:\a\ustc-iwan-c\ustc-iwan-c\build\obj\x64\Release\vc143.pdb" /external:W4 /Gz /TC /wd4603 /wd4627 /wd4986 /wd4987 /FI"C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\warning.h" /FC /errorReport:queue /source-charset:utf-8 /execution-charset:utf-8 /kernel -cbstring -d2epilogunwind  /d1nodatetime /d1import_no_registry /d2AllowCompatibleILVersions /d2Zi+ iwan_nt.c iwan_nt_demux.c iwan_nt_addr.c iwan_nt_frame.c iwan_nt_control.c iwan_nt_ingress.c iwan_nt_ring.c iwan_nt_transport.c iwan_nt_tx.c iwan_nt_wsk.c iwan_nt_wsk_socket.c
+  iwan_nt.c
+  iwan_nt_demux.c
+  iwan_nt_addr.c
+  iwan_nt_frame.c
+  iwan_nt_control.c
+  iwan_nt_ingress.c
+  iwan_nt_ring.c
+  iwan_nt_transport.c
+  iwan_nt_tx.c
+  iwan_nt_wsk.c
+  iwan_nt_wsk_socket.c
+  Generating Code...
+  C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207\bin\HostX64\x64\CL.exe /c /I"D:\a\ustc-iwan-c\ustc-iwan-c\iwan-nt\driver\\" /I"D:\a\ustc-iwan-c\ustc-iwan-c\build\obj\x64\Release\\" /Zi /nologo /W4 /WX /diagnostics:column /sdl /O2 /Oi /Os /Oy- /D NDIS_MINIPORT_DRIVER /D NDIS630_MINIPORT /D NDIS_WDM /D NDEBUG /D _AMD64_ /D AMD64 /D IWAN_NT_KERNEL /D _WIN64 /D _AMD64_ /D AMD64 /D _WIN32_WINNT=0x0A00 /D WINVER=0x0A00 /D WINNT=1 /D NTDDI_VERSION=0xA000010 /GF /Gm- /Zp8 /GS /guard:cf /Gy /fp:precise /Qspectre /Zc:wchar_t- /Zc:forScope /Zc:inline /GR- /std:c11 /Fo"D:\a\ustc-iwan-c\ustc-iwan-c\build\obj\x64\Release\\" /Fd"D:\a\ustc-iwan-c\ustc-iwan-c\build\obj\x64\Release\vc143.pdb" /external:W4 /Gz /TC /wd4603 /wd4627 /wd4986 /wd4987 /FI"C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\warning.h" /FC /errorReport:queue /source-charset:utf-8 /execution-charset:utf-8 /kernel -cbstring -d2epilogunwind  /d1nodatetime /d1import_no_registry /d2AllowCompatibleILVersions /d2Zi+ iwan_nt_miniport.c
+  iwan_nt_miniport.c
+D:\a\ustc-iwan-c\ustc-iwan-c\iwan-nt\driver\iwan_nt_miniport.c(746,1): error C2159: more than one storage class specified [D:\a\ustc-iwan-c\ustc-iwan-c\iwan-nt\driver\iwan_nt.vcxproj]
+D:\a\ustc-iwan-c\ustc-iwan-c\iwan-nt\driver\iwan_nt_miniport.c(747,1): error C2061: syntax error: identifier 'IwanNtMiniportStagePacket' [D:\a\ustc-iwan-c\ustc-iwan-c\iwan-nt\driver\iwan_nt.vcxproj]
+D:\a\ustc-iwan-c\ustc-iwan-c\iwan-nt\driver\iwan_nt_miniport.c(747,1): error C2059: syntax error: ';' [D:\a\ustc-iwan-c\ustc-iwan-c\iwan-nt\driver\iwan_nt.vcxproj]
+D:\a\ustc-iwan-c\ustc-iwan-c\iwan-nt\driver\iwan_nt_miniport.c(748,13): error C2059: syntax error: '<parameter-list>' [D:\a\ustc-iwan-c\ustc-iwan-c\iwan-nt\driver\iwan_nt.vcxproj]
+D:\a\ustc-iwan-c\ustc-iwan-c\iwan-nt\driver\iwan_nt_miniport.c(803,1): error C2371: 'IwanNtMiniportSendNetBufferLists': redefinition; different basic types [D:\a\ustc-iwan-c\ustc-iwan-c\iwan-nt\driver\iwan_nt.vcxproj]
+      D:\a\ustc-iwan-c\ustc-iwan-c\iwan-nt\driver\iwan_nt_miniport.c(100,39):
+      see declaration of 'IwanNtMiniportSendNetBufferLists'
+  
+D:\a\ustc-iwan-c\ustc-iwan-c\iwan-nt\driver\iwan_nt_miniport.c(830,9): warning C4033: 'IwanNtMiniportSendNetBufferLists' must return a value [D:\a\ustc-iwan-c\ustc-iwan-c\iwan-nt\driver\iwan_nt.vcxproj]
+D:\a\ustc-iwan-c\ustc-iwan-c\iwan-nt\driver\iwan_nt_miniport.c(877,22): error C4013: 'IwanNtMiniportStagePacket' undefined; assuming extern returning int [D:\a\ustc-iwan-c\ustc-iwan-c\iwan-nt\driver\iwan_nt.vcxproj]
+Done Building Project "D:\a\ustc-iwan-c\ustc-iwan-c\iwan-nt\driver\iwan_nt.vcxproj" (ClCompile target(s)) -- FAILED.
+
+Build FAILED.
+
+"D:\a\ustc-iwan-c\ustc-iwan-c\iwan-nt\driver\iwan_nt.vcxproj" (ClCompile target) (1) ->
+(ClCompile target) -> 
+  D:\a\ustc-iwan-c\ustc-iwan-c\iwan-nt\driver\iwan_nt_miniport.c(830,9): warning C4033: 'IwanNtMiniportSendNetBufferLists' must return a value [D:\a\ustc-iwan-c\ustc-iwan-c\iwan-nt\driver\iwan_nt.vcxproj]
+
+
+"D:\a\ustc-iwan-c\ustc-iwan-c\iwan-nt\driver\iwan_nt.vcxproj" (ClCompile target) (1) ->
+(ClCompile target) -> 
+  D:\a\ustc-iwan-c\ustc-iwan-c\iwan-nt\driver\iwan_nt_miniport.c(746,1): error C2159: more than one storage class specified [D:\a\ustc-iwan-c\ustc-iwan-c\iwan-nt\driver\iwan_nt.vcxproj]
+  D:\a\ustc-iwan-c\ustc-iwan-c\iwan-nt\driver\iwan_nt_miniport.c(747,1): error C2061: syntax error: identifier 'IwanNtMiniportStagePacket' [D:\a\ustc-iwan-c\ustc-iwan-c\iwan-nt\driver\iwan_nt.vcxproj]
+  D:\a\ustc-iwan-c\ustc-iwan-c\iwan-nt\driver\iwan_nt_miniport.c(747,1): error C2059: syntax error: ';' [D:\a\ustc-iwan-c\ustc-iwan-c\iwan-nt\driver\iwan_nt.vcxproj]
+  D:\a\ustc-iwan-c\ustc-iwan-c\iwan-nt\driver\iwan_nt_miniport.c(748,13): error C2059: syntax error: '<parameter-list>' [D:\a\ustc-iwan-c\ustc-iwan-c\iwan-nt\driver\iwan_nt.vcxproj]
+  D:\a\ustc-iwan-c\ustc-iwan-c\iwan-nt\driver\iwan_nt_miniport.c(803,1): error C2371: 'IwanNtMiniportSendNetBufferLists': redefinition; different basic types [D:\a\ustc-iwan-c\ustc-iwan-c\iwan-nt\driver\iwan_nt.vcxproj]
+  D:\a\ustc-iwan-c\ustc-iwan-c\iwan-nt\driver\iwan_nt_miniport.c(877,22): error C4013: 'IwanNtMiniportStagePacket' undefined; assuming extern returning int [D:\a\ustc-iwan-c\ustc-iwan-c\iwan-nt\driver\iwan_nt.vcxproj]
+
+    1 Warning(s)
+    6 Error(s)
+
+Time Elapsed 00:00:07.80
