@@ -27,6 +27,9 @@ The design excludes multi-core crypto worker pools. Resource ownership, cancella
 - PREfast (`/p:RunCodeAnalysis=true`): 0 warnings, 0 errors
 - output: `iwannt.sys` 29696 bytes
 
+The user-mode half builds in the same job with cl (`/W4 /WX /std:c11`):
+`iwannt-ctl.exe` 172032 bytes, 0 warnings.
+
 That is a build result, not a runtime result: nothing in this repository has
 been loaded on a machine yet.
 
