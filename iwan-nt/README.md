@@ -25,7 +25,7 @@ The design excludes multi-core crypto worker pools. Resource ownership, cancella
 
 - every translation unit: 0 warnings, 0 errors
 - PREfast (`/p:RunCodeAnalysis=true`): 0 warnings, 0 errors
-- output: `iwannt.sys` 29696 bytes
+- output: `iwannt.sys` 30208 bytes
 
 The user-mode half builds in the same job with cl (`/W4 /WX /std:c11`):
 `iwannt-ctl.exe` 172032 bytes, 0 warnings.
@@ -85,11 +85,15 @@ instead of queueing, so backpressure reaches the caller; Stop drains the pool
 before closing the socket. The miniport send handler flattens each NBL into a
 per-adapter scratch buffer and hands it to that pool.
 
-There are still no worker threads and no NBL/MDL pools on the receive side: a
-single non-paged scratch buffer is copied per datagram, and the indication path
-allocates a buffer, an MDL and an NBL per inner packet. The socket binds the
-wildcard address with port zero; the peer endpoint arrives through `SET_PEER`
-and the session through `SET_SESSION`.
+The receive path has no per-packet allocation either: the indication side owns
+64 prebuilt slots (buffer, MDL and NBL each), a datagram claims one slot or is
+dropped and counted, and `ReturnNetBufferLists` clears it. Halt waits for the
+last frame to come back before freeing the pool. The WSK side still copies each
+datagram into one non-paged scratch buffer, because in-place transformation
+needs contiguous bytes; that copy is the next thing to remove.
+
+The socket binds the wildcard address with port zero; the peer endpoint arrives
+through `SET_PEER` and the session through `SET_SESSION`.
 
 - [NDIS miniport lifecycle](driver/iwan_nt_miniport.h) and [implementation](driver/iwan_nt_miniport.c)
 - [WDM driver entry and unload](driver/iwan_nt.c)
