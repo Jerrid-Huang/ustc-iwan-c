@@ -121,7 +121,27 @@ CommandCheck(
     printf("device      ok (%s)\n", IWAN_NT_WIN32_NAME);
 
     if (stats.Running != 0) {
+        UINT32 boundAddress = 0;
+        UINT16 boundPort = 0;
+
         printf("transport   running\n");
+        /*
+         * The port is assigned by the provider, so a zero here means the socket
+         * is not the one carrying traffic: every reply the peer sends would be
+         * blamed on the network instead of on the bind step.
+         */
+        if (IwanNtGetLocal(Device, &boundAddress, &boundPort) == FALSE ||
+            boundPort == 0) {
+            printf("socket      no bound port: the datagram socket is not running\n");
+            problems++;
+        } else {
+            printf("socket      %u.%u.%u.%u:%u\n",
+                   (unsigned)(boundAddress & 0xFFu),
+                   (unsigned)((boundAddress >> 8) & 0xFFu),
+                   (unsigned)((boundAddress >> 16) & 0xFFu),
+                   (unsigned)((boundAddress >> 24) & 0xFFu),
+                   (unsigned)boundPort);
+        }
     } else {
         printf("transport   NOT running: the adapter is disabled or its session is down\n");
         printf("            netsh interface set interface \"iWAN NT Transport Adapter\" admin=enable\n");

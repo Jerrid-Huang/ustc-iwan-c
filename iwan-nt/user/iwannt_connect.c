@@ -91,6 +91,7 @@ IwanNtRunConnect(
     )
 {
     IWAN_NT_HANDSHAKE handshake;
+    IWAN_NT_STATS_ABI stats;
     uint8_t frame[IWAN_NT_CONTROL_MAX];
     ULONG address;
     USHORT port;
@@ -137,7 +138,6 @@ IwanNtRunConnect(
      */
     {
         ULONGLONG waitUntil = GetTickCount64() + 5000ull;
-        IWAN_NT_STATS_ABI stats;
 
         for (;;) {
             memset(&stats, 0, sizeof(stats));
@@ -156,6 +156,18 @@ IwanNtRunConnect(
             }
             Sleep(100);
         }
+    }
+
+    /*
+     * One device carries one session. A second connect would overwrite the first
+     * one's identifiers while it is still running and then clear them on its own
+     * exit, so refuse instead of letting two processes fight over the device.
+     */
+    if (stats.SessionValid != 0) {
+        fprintf(stderr,
+                "the device already carries a session, so another connect owns it\n"
+                "  iwannt-ctl clear   (only when that process is gone)\n");
+        return 1;
     }
 
     /*

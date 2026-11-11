@@ -86,6 +86,14 @@ session comes up and subtract that.
    protocol. A stale host route pinning the server address to another interface is
    the most common cause and looks exactly like silence.
 
+## One tunnel per adapter
+
+One device carries one session, and `connect` clears the session when it exits.
+That makes a second `connect` on the same device a hazard: it would overwrite the
+first one's identifiers while it is still running, and its exit would tear the
+first one down. `connect` therefore refuses to start when the device already
+reports a session; use `iwannt-ctl clear` only after the owning process is gone.
+
 ## When the peer accepts less than 1400 bytes
 
 The answer carries the peer's MTU. `connect` prints the command that lowers the
