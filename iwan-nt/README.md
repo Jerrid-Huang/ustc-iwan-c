@@ -138,6 +138,11 @@ test, and an ASCII check. It is not a WDK build and says nothing about API
 semantics; see [tools/kernel-stubs/README.md](tools/kernel-stubs/README.md).
 
     bash tools/check-syntax.sh
+    bash tools/check-syntax.sh --sanitize   # the same tests under ASan and UBSan
+
+The sanitizer pass is slower and needs the runtime, so it is opt-in; run it before
+trusting a change to the ring or pipeline index arithmetic, where an out-of-bounds
+read can otherwise pass every assertion.
 
 The host tests cover the kernel-free modules and the user-mode half: frame codec
 (93 checks), demultiplexer (334), bounded ring (840), receive pipeline (90), the

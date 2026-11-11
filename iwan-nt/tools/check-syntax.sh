@@ -4,6 +4,14 @@
 set -u
 cd "$(dirname "$0")/.." || exit 1
 
+# --sanitize rebuilds every host test with the address and undefined-behaviour
+# checkers. It is slower and it needs the sanitizer runtime, so it is not the
+# default; run it before trusting a change to the index arithmetic.
+sanitize=0
+if [ "${1:-}" = "--sanitize" ]; then
+    sanitize=1
+fi
+
 stub=tools/kernel-stubs
 status=0
 
@@ -33,8 +41,12 @@ run_host_test() {
     local main=$2
     shift 2
     [ -f "$main" ] || return 0
+    local flags="-Wall -Wextra -Werror"
+    if [ "$sanitize" = 1 ]; then
+        flags="$flags -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all"
+    fi
     printf '%-28s ' "$main"
-    if out=$(gcc -std=c11 -Wall -Wextra -Werror -I driver -I user \
+    if out=$(gcc -std=c11 $flags -I driver -I user \
                 "$main" "$@" -o "/tmp/iwan_nt_${name}_test" 2>&1) && \
        out=$("/tmp/iwan_nt_${name}_test" 2>&1); then
         echo "OK ($out)"
