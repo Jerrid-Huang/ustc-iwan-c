@@ -125,8 +125,9 @@ semantics; see [tools/kernel-stubs/README.md](tools/kernel-stubs/README.md).
 
     bash tools/check-syntax.sh
 
-The host tests cover the four kernel-free modules: frame codec (93 checks),
-demultiplexer (334), bounded ring (840), receive pipeline (82).
+The host tests cover the kernel-free modules and the crypto primitives: frame
+codec (93 checks), demultiplexer (334), bounded ring (840), receive pipeline
+(82), MD5 and AES-128 (7 known-answer checks).
 
 `tools/build-user.sh` builds the user-mode half with MinGW-w64, which is enough
 to catch ABI-header mistakes before a CI round:

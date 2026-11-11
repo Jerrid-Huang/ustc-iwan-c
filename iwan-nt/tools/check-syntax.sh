@@ -34,7 +34,7 @@ run_host_test() {
     shift 2
     [ -f "$main" ] || return 0
     printf '%-28s ' "$main"
-    if out=$(gcc -std=c11 -Wall -Wextra -Werror -I driver \
+    if out=$(gcc -std=c11 -Wall -Wextra -Werror -I driver -I user \
                 "$main" "$@" -o "/tmp/iwan_nt_${name}_test" 2>&1) && \
        out=$("/tmp/iwan_nt_${name}_test" 2>&1); then
         echo "OK ($out)"
@@ -49,6 +49,7 @@ run_host_test frame tests/frame_test.c driver/iwan_nt_frame.c
 run_host_test demux tests/demux_test.c driver/iwan_nt_demux.c driver/iwan_nt_frame.c
 run_host_test ring tests/ring_test.c driver/iwan_nt_ring.c
 run_host_test ingress tests/ingress_test.c driver/iwan_nt_ingress.c driver/iwan_nt_demux.c driver/iwan_nt_frame.c driver/iwan_nt_ring.c
+run_host_test crypto tests/crypto_test.c user/iwan_nt_crypto.c
 
 if grep -rlP '[^\x00-\x7F]' driver tools 2>/dev/null | grep -v '\.vcxproj$' | grep -q .; then
     echo "non-ASCII source found:"
