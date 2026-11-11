@@ -48,6 +48,11 @@ typedef struct _IWAN_NT_TRANSPORT {
     BOOLEAN RundownCompleted;
     IWAN_NT_WSK_CLIENT Wsk;
     IWAN_NT_WSK_DATAGRAM Datagram;
+    /*
+     * Family the socket is (re)started with. The peer decides it, but the
+     * adapter can start before any peer is known, so it defaults to IPv4.
+     */
+    uint16_t SocketFamily;
     IWAN_NT_INGRESS Ingress;
     IWAN_NT_RING ControlRing;
     BOOLEAN ControlRingInitialized;
@@ -131,12 +136,21 @@ IwanNtTransportGetIngressCounters(
     _Out_ IWAN_NT_INGRESS_COUNTERS *Counters
     );
 
-/* Peer endpoint for the send path. IRQL: PASSIVE_LEVEL. */
+/*
+ * Peer endpoint for the send path, in either family. IRQL: PASSIVE_LEVEL.
+ *
+ * The socket family is fixed when the socket is created, so a peer in the other
+ * family forces the transport to recycle the socket: it drains the send pool,
+ * stops the datagram socket, and starts a new one with that family. The session
+ * and the receive path are untouched. Returns the provider status when the new
+ * socket cannot be created; the transport is Stopped in that case, because a
+ * Running transport with no socket would report success and carry nothing.
+ */
 _IRQL_requires_(PASSIVE_LEVEL)
-VOID
+NTSTATUS
 IwanNtTransportSetPeer(
     _Inout_ PIWAN_NT_TRANSPORT Transport,
-    _In_ const SOCKADDR_IN *Remote
+    _In_ const IWAN_NT_SOCKADDR *Remote
     );
 
 /*
@@ -157,7 +171,7 @@ _IRQL_requires_(PASSIVE_LEVEL)
 BOOLEAN
 IwanNtTransportGetLocal(
     _In_ const IWAN_NT_TRANSPORT *Transport,
-    _Out_ SOCKADDR_IN *Local
+    _Out_ PIWAN_NT_SOCKADDR Local
     );
 
 _IRQL_requires_max_(DISPATCH_LEVEL)

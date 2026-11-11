@@ -168,7 +168,7 @@ _IRQL_requires_(PASSIVE_LEVEL)
 VOID
 IwanNtTxSetRemote(
     _Inout_ PIWAN_NT_TX Tx,
-    _In_ const SOCKADDR_IN *Remote
+    _In_ const IWAN_NT_SOCKADDR *Remote
     )
 {
     PAGED_CODE();
@@ -258,7 +258,7 @@ IwanNtTxSubmitSlot(
     _In_ size_t Length
     )
 {
-    SOCKADDR_IN remote;
+    IWAN_NT_SOCKADDR remote;
     NTSTATUS status;
     KIRQL oldIrql;
     BOOLEAN remoteValid;

@@ -104,8 +104,8 @@ allow a running miniport to change its own MTU, so this is a host step:
 netsh interface ipv4 set subinterface "iWAN NT Transport Adapter" mtu=1380 store=persistent
 ```
 
-## Outer IPv6 is not implemented
+## Outer IPv6
 
-The reference client can carry the outer packet over IPv6 (`ipv6_addr` and the
-`0x0b`-`0x0d` TLVs); this build cannot. It speaks IPv4 only, and `connect` says so
-when handed an IPv6 literal instead of reporting a bad address.
+`connect` takes either literal form. The socket family follows the peer: asking
+for an IPv6 peer on a running transport recycles the datagram socket and keeps
+the session, so a wrong family is a hiccup rather than a restart.

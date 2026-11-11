@@ -2,6 +2,7 @@
 #define IWAN_NT_WSK_SOCKET_H
 
 #include "iwan_nt_types.h"
+#include "iwan_nt_addr.h"
 #if defined(IWAN_NT_KERNEL)
 #include <wsk.h>
 #endif
@@ -11,10 +12,10 @@ extern "C" {
 #endif
 
 /*
- * This module owns one IPv4 UDP socket. The local port is zero so the
- * transport does not invent a user-mode or control-plane configuration.
- * A later stage can replace the address before Start when that interface is
- * defined.
+ * This module owns one UDP socket, in whichever family Start is given. The
+ * local port is zero so the transport does not invent a user-mode or
+ * control-plane configuration; the provider assigns one and GetLocal reports
+ * it.
  */
 #define IWAN_NT_WSK_DATAGRAM_PORT 0U
 
@@ -77,13 +78,15 @@ typedef struct _IWAN_NT_WSK_DATAGRAM {
     EX_RUNDOWN_REF CallbackRundown;
     KEVENT LifecycleEvent;
     KEVENT FaultEvent;
-    SOCKADDR_IN LocalAddress;
+    IWAN_NT_SOCKADDR LocalAddress;
+    /* The family this socket was created with; it cannot change while running. */
+    uint16_t Family;
     /*
      * What the bind actually produced. LocalAddress is the request (wildcard,
      * port zero); this is the address the provider returned, and it is the only
      * way to learn the port that frames come back to.
      */
-    SOCKADDR_IN BoundAddress;
+    IWAN_NT_SOCKADDR BoundAddress;
     /* Kept from Start so that the send path can reach the dispatch table. */
     WSK_PROVIDER_NPI Provider;
     PWSK_SOCKET Socket;
@@ -119,7 +122,8 @@ _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 IwanNtWskDatagramStart(
     _Inout_ PIWAN_NT_WSK_DATAGRAM Datagram,
-    _In_ const WSK_PROVIDER_NPI *Provider
+    _In_ const WSK_PROVIDER_NPI *Provider,
+    _In_ uint16_t Family
     );
 
 /*
@@ -129,7 +133,13 @@ IwanNtWskDatagramStart(
 BOOLEAN
 IwanNtWskDatagramGetLocal(
     _In_ const IWAN_NT_WSK_DATAGRAM *Datagram,
-    _Out_ SOCKADDR_IN *Local
+    _Out_ PIWAN_NT_SOCKADDR Local
+    );
+
+/* Family the running socket speaks, or 0 when it is not running. */
+uint16_t
+IwanNtWskDatagramFamily(
+    _In_ const IWAN_NT_WSK_DATAGRAM *Datagram
     );
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -181,7 +191,7 @@ IwanNtWskDatagramSubmitSend(
     _In_ PIWAN_NT_WSK_DATAGRAM Datagram,
     _In_ PMDL Mdl,
     _In_ ULONG Length,
-    _In_ const SOCKADDR_IN *Remote,
+    _In_ const IWAN_NT_SOCKADDR *Remote,
     _In_ PIRP Irp
     );
 

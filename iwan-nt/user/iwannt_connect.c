@@ -6,6 +6,7 @@
 #include <windows.h>
 
 #include "iwan_nt_handshake.h"
+#include "iwan_nt_inet.h"
 #include "iwan_nt_session.h"
 
 static void
@@ -93,7 +94,8 @@ IwanNtRunConnect(
     IWAN_NT_HANDSHAKE handshake;
     IWAN_NT_STATS_ABI stats;
     uint8_t frame[IWAN_NT_CONTROL_MAX];
-    ULONG address;
+    UINT8 address[16];
+    UINT16 family = 0;
     USHORT port;
     USHORT mtu = 1400;
     unsigned long seconds = 15;
@@ -107,20 +109,8 @@ IwanNtRunConnect(
         return 1;
     }
 
-    address = inet_addr(Argv[2]);
-    if (address == INADDR_NONE) {
-        /*
-         * An IPv6 literal is the mistake worth naming: the reference client can
-         * carry the outer packet over IPv6, this build cannot, and "bad address"
-         * would send the operator looking for a typo that is not there.
-         */
-        if (strchr(Argv[2], ':') != NULL) {
-            fprintf(stderr,
-                    "outer IPv6 transport is not implemented; this build carries "
-                    "the outer packet over IPv4 only\n");
-        } else {
-            fprintf(stderr, "bad address %s\n", Argv[2]);
-        }
+    if (!IwanNtParseEndpoint(Argv[2], address, &family)) {
+        fprintf(stderr, "bad address %s\n", Argv[2]);
         return 1;
     }
     port = _byteswap_ushort((USHORT)strtoul(Argv[3], NULL, 10));
@@ -131,7 +121,8 @@ IwanNtRunConnect(
         seconds = strtoul(Argv[7], NULL, 10);
     }
 
-    if (IwanNtSetPeer(Device, address, port) == FALSE) {
+    if (IwanNtSetPeer(Device, address, (family == 6) ? AF_INET6 : AF_INET,
+                      port) == FALSE) {
         fprintf(stderr, "SET_PEER failed: %lu\n", GetLastError());
         return 1;
     }

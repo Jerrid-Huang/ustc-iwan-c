@@ -105,15 +105,24 @@ IwanNtClearSession(
 BOOL
 IwanNtSetPeer(
     _In_ PIWAN_NT_DEVICE Device,
-    _In_ UINT32 Address,
+    _In_reads_bytes_(16) const UINT8 *Address,
+    _In_ UINT16 Family,
     _In_ UINT16 Port
     )
 {
-    IWAN_NT_PEER_ABI request;
+    IWAN_NT_ADDR_ABI request;
+
+    if (Address == NULL || Port == 0 ||
+        (Family != (UINT16)AF_INET && Family != (UINT16)AF_INET6)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
 
     ZeroMemory(&request, sizeof(request));
-    request.Address = Address;
+    CopyMemory(request.Address, Address, 16);
     request.Port = Port;
+    request.Family = Family;
+    request.ScopeId = 0;
 
     return IwanNtIoctl(
         Device, IWAN_NT_IOCTL_SET_PEER, &request, sizeof(request), NULL, 0,
@@ -139,24 +148,26 @@ IwanNtSendControl(
 BOOL
 IwanNtGetLocal(
     _In_ PIWAN_NT_DEVICE Device,
-    _Out_ UINT32 *Address,
+    _Out_writes_bytes_(16) UINT8 *Address,
+    _Out_ UINT16 *Family,
     _Out_ UINT16 *Port
     )
 {
-    IWAN_NT_PEER_ABI reply;
+    IWAN_NT_ADDR_ABI reply;
     DWORD returned = 0;
 
-    if (Device == NULL || Address == NULL || Port == NULL) {
+    if (Device == NULL || Address == NULL || Family == NULL || Port == NULL) {
         return FALSE;
     }
     if (DeviceIoControl(Device->Handle, IWAN_NT_IOCTL_GET_LOCAL, NULL, 0,
                         &reply, (DWORD)sizeof(reply), &returned, NULL) == FALSE) {
         return FALSE;
     }
-    if (returned < IWAN_NT_PEER_STRUCT_SIZE) {
+    if (returned < IWAN_NT_ADDR_STRUCT_SIZE) {
         return FALSE;
     }
-    *Address = reply.Address;
+    CopyMemory(Address, reply.Address, 16);
+    *Family = reply.Family;
     *Port = reply.Port;
     return TRUE;
 }

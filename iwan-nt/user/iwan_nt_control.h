@@ -15,6 +15,15 @@
 
 #include <windows.h>
 
+/*
+ * The two families this ABI accepts. <windows.h> pulls in winsock v1, which
+ * spells AF_INET but does not always carry AF_INET6, and the library does not
+ * otherwise need the winsock headers.
+ */
+#ifndef AF_INET6
+#define AF_INET6 23
+#endif
+
 #include "../driver/iwan_nt_ioctl.h"
 
 #ifdef __cplusplus
@@ -51,11 +60,17 @@ IwanNtClearSession(
     _In_ PIWAN_NT_DEVICE Device
     );
 
-/* Outer endpoint, in network byte order as it appears on the wire. */
+/*
+ * Peer endpoint, in either family. Address is the network-order address for
+ * Family (the first four bytes for AF_INET, all sixteen for AF_INET6) and Port
+ * is in network order. A family change on a running transport makes the driver
+ * build a new socket, which keeps the session.
+ */
 BOOL
 IwanNtSetPeer(
     _In_ PIWAN_NT_DEVICE Device,
-    _In_ UINT32 Address,
+    _In_reads_bytes_(16) const UINT8 *Address,
+    _In_ UINT16 Family,
     _In_ UINT16 Port
     );
 
@@ -82,7 +97,8 @@ IwanNtSendControl(
 BOOL
 IwanNtGetLocal(
     _In_ PIWAN_NT_DEVICE Device,
-    _Out_ UINT32 *Address,
+    _Out_writes_bytes_(16) UINT8 *Address,
+    _Out_ UINT16 *Family,
     _Out_ UINT16 *Port
     );
 

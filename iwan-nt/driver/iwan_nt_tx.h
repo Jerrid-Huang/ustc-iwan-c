@@ -2,10 +2,7 @@
 #define IWAN_NT_TX_H
 
 #include "iwan_nt_types.h"
-/* SOCKADDR_IN lives in the WSK header, not in <ntddk.h>. */
-#if defined(IWAN_NT_KERNEL)
-#include <wsk.h>
-#endif
+#include "iwan_nt_addr.h"
 
 #include "iwan_nt_frame.h"
 
@@ -48,7 +45,7 @@ typedef NTSTATUS (*IWAN_NT_TX_SUBMIT)(
     _In_opt_ void *Context,
     _In_ PMDL Mdl,
     _In_ ULONG Length,
-    _In_ const SOCKADDR_IN *Remote,
+    _In_ const IWAN_NT_SOCKADDR *Remote,
     _In_ PIRP Irp
     );
 
@@ -57,7 +54,7 @@ struct _IWAN_NT_TX {
     KEVENT IdleEvent;
     IWAN_NT_TX_SUBMIT Submit;
     void *SubmitContext;
-    SOCKADDR_IN Remote;
+    IWAN_NT_SOCKADDR Remote;
     BOOLEAN RemoteValid;
     ULONG SlotCount;
     ULONG FreeCount;
@@ -103,7 +100,7 @@ _IRQL_requires_(PASSIVE_LEVEL)
 VOID
 IwanNtTxSetRemote(
     _Inout_ PIWAN_NT_TX Tx,
-    _In_ const SOCKADDR_IN *Remote
+    _In_ const IWAN_NT_SOCKADDR *Remote
     );
 
 /*

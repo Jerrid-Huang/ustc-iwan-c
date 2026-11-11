@@ -26,6 +26,7 @@
 #include <windows.h>
 
 #include "iwan_nt_control.h"
+#include "iwan_nt_inet.h"
 #include "iwan_nt_session.h"
 #include "iwannt_connect.h"
 
@@ -110,6 +111,7 @@ CommandCheck(
     )
 {
     IWAN_NT_STATS_ABI stats;
+    char buffer[64];
     int problems = 0;
 
     memset(&stats, 0, sizeof(stats));
@@ -121,7 +123,8 @@ CommandCheck(
     printf("device      ok (%s)\n", IWAN_NT_WIN32_NAME);
 
     if (stats.Running != 0) {
-        UINT32 boundAddress = 0;
+        UINT8 boundAddress[16];
+        UINT16 boundFamily = 0;
         UINT16 boundPort = 0;
 
         printf("transport   running\n");
@@ -130,17 +133,16 @@ CommandCheck(
          * is not the one carrying traffic: every reply the peer sends would be
          * blamed on the network instead of on the bind step.
          */
-        if (IwanNtGetLocal(Device, &boundAddress, &boundPort) == FALSE ||
+        if (IwanNtGetLocal(Device, boundAddress, &boundFamily, &boundPort) ==
+                FALSE ||
             boundPort == 0) {
             printf("socket      no bound port: the datagram socket is not running\n");
             problems++;
         } else {
-            printf("socket      %u.%u.%u.%u:%u\n",
-                   (unsigned)(boundAddress & 0xFFu),
-                   (unsigned)((boundAddress >> 8) & 0xFFu),
-                   (unsigned)((boundAddress >> 16) & 0xFFu),
-                   (unsigned)((boundAddress >> 24) & 0xFFu),
-                   (unsigned)boundPort);
+            printf("socket      %s:%u\n",
+                   IwanNtFormatAddress(boundAddress, boundFamily,
+                                       buffer, sizeof(buffer)),
+                   (unsigned)_byteswap_ushort(boundPort));
         }
     } else {
         printf("transport   NOT running: the adapter is disabled or its session is down\n");
@@ -181,16 +183,18 @@ CommandLocal(
     _In_ PIWAN_NT_DEVICE Device
     )
 {
-    UINT32 address = 0;
+    UINT8 address[16];
+    UINT16 family = 0;
     UINT16 port = 0;
-    const unsigned char *bytes = (const unsigned char *)&address;
+    char text[64];
 
-    if (IwanNtGetLocal(Device, &address, &port) == FALSE) {
+    if (IwanNtGetLocal(Device, address, &family, &port) == FALSE) {
         fprintf(stderr, "local failed: %lu\n", GetLastError());
         return 1;
     }
-    /* The address is network order, so its bytes print in the right order. */
-    printf("local: %u.%u.%u.%u:%u\n", bytes[0], bytes[1], bytes[2], bytes[3],
+    /* The port is network order on the wire, so it swaps for display. */
+    printf("local: %s:%u\n", IwanNtFormatAddress(address, (family == 6) ? 6 : 4,
+                                                text, sizeof(text)),
            (unsigned)_byteswap_ushort(port));
     return 0;
 }
@@ -251,7 +255,8 @@ CommandPeer(
     _In_ char **Argv
     )
 {
-    UINT32 address;
+    UINT8 address[16];
+    UINT16 family = 0;
     UINT16 port;
 
     if (Argc < 4) {
@@ -259,8 +264,7 @@ CommandPeer(
         return 2;
     }
 
-    address = inet_addr(Argv[2]);
-    if (address == INADDR_NONE) {
+    if (!IwanNtParseEndpoint(Argv[2], address, &family)) {
         fprintf(stderr, "bad address: %s\n", Argv[2]);
         return 2;
     }
@@ -271,7 +275,8 @@ CommandPeer(
     }
 
     /* The ABI takes the wire form, so the port is stored big endian. */
-    if (IwanNtSetPeer(Device, address, _byteswap_ushort(port)) == FALSE) {
+    if (IwanNtSetPeer(Device, address, (family == 6) ? AF_INET6 : AF_INET,
+                      _byteswap_ushort(port)) == FALSE) {
         fprintf(stderr, "peer failed: %lu\n", GetLastError());
         return 1;
     }

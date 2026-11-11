@@ -23,6 +23,7 @@ mkdir -p "$(dirname "$out")"
     -o "$out" \
     "$root/user/iwan_nt_control.c" \
     "$root/user/iwan_nt_crypto.c" \
+    "$root/user/iwan_nt_inet.c" \
     "$root/user/iwan_nt_session.c" \
     "$root/user/iwan_nt_handshake.c" \
     "$root/user/iwannt_connect.c" \

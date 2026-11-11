@@ -42,7 +42,7 @@ IwanNtTransportSubmitSend(
     _In_opt_ void *Context,
     _In_ PMDL Mdl,
     _In_ ULONG Length,
-    _In_ const SOCKADDR_IN *Remote,
+    _In_ const IWAN_NT_SOCKADDR *Remote,
     _In_ PIRP Irp
     )
 {
@@ -89,6 +89,7 @@ IwanNtTransportInitialize(
         return status;
     }
 
+    Transport->SocketFamily = (uint16_t)AF_INET;
     status = IwanNtWskDatagramInitialize(&Transport->Datagram);
     if (!NT_SUCCESS(status)) {
         IwanNtWskUninitialize(&Transport->Wsk);
@@ -198,7 +199,8 @@ IwanNtTransportStart(
     Transport->IngressAttached = TRUE;
 
     status = IwanNtWskDatagramStart(
-        &Transport->Datagram, &Transport->Wsk.ProviderNpi);
+        &Transport->Datagram, &Transport->Wsk.ProviderNpi,
+        Transport->SocketFamily);
     if (!NT_SUCCESS(status)) {
         IwanNtWskDatagramAttachReceive(
             &Transport->Datagram, NULL, 0, NULL, NULL);
@@ -674,7 +676,7 @@ _IRQL_requires_(PASSIVE_LEVEL)
 BOOLEAN
 IwanNtTransportGetLocal(
     _In_ const IWAN_NT_TRANSPORT *Transport,
-    _Out_ SOCKADDR_IN *Local
+    _Out_ PIWAN_NT_SOCKADDR Local
     )
 {
     PAGED_CODE();
@@ -686,19 +688,56 @@ IwanNtTransportGetLocal(
 }
 
 _IRQL_requires_(PASSIVE_LEVEL)
-VOID
+NTSTATUS
 IwanNtTransportSetPeer(
     _Inout_ PIWAN_NT_TRANSPORT Transport,
-    _In_ const SOCKADDR_IN *Remote
+    _In_ const IWAN_NT_SOCKADDR *Remote
     )
 {
+    KIRQL oldIrql;
+    uint16_t family;
+    BOOLEAN running;
+    NTSTATUS status;
+
     PAGED_CODE();
 
     if (Transport == NULL || Remote == NULL) {
-        return;
+        return STATUS_INVALID_PARAMETER;
+    }
+    family = IwanNtAddrFamily(Remote);
+    if (family == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    KeAcquireSpinLock(&Transport->StateLock, &oldIrql);
+    running = (Transport->State == IwanNtTransportRunning) ? TRUE : FALSE;
+    KeReleaseSpinLock(&Transport->StateLock, oldIrql);
+
+    /*
+     * A socket cannot change family, so a peer in the other family needs a new
+     * one. Only the socket is recycled: the session, the receive sink and the
+     * scratch buffer belong to the transport and survive.
+     */
+    Transport->SocketFamily = family;
+
+    if (running != FALSE &&
+        IwanNtWskDatagramFamily(&Transport->Datagram) != family) {
+
+        (VOID)IwanNtTxWaitIdle(&Transport->Tx, IWAN_NT_TX_DRAIN_MS);
+        (VOID)IwanNtWskDatagramStop(&Transport->Datagram);
+
+        status = IwanNtWskDatagramStart(
+            &Transport->Datagram, &Transport->Wsk.ProviderNpi, family);
+        if (!NT_SUCCESS(status)) {
+            KeAcquireSpinLock(&Transport->StateLock, &oldIrql);
+            Transport->State = IwanNtTransportStopped;
+            KeReleaseSpinLock(&Transport->StateLock, oldIrql);
+            return status;
+        }
     }
 
     IwanNtTxSetRemote(&Transport->Tx, Remote);
+    return STATUS_SUCCESS;
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)

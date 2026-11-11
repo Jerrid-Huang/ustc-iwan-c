@@ -61,6 +61,7 @@ run_host_test frame tests/frame_test.c driver/iwan_nt_frame.c
 run_host_test demux tests/demux_test.c driver/iwan_nt_demux.c driver/iwan_nt_frame.c
 run_host_test ring tests/ring_test.c driver/iwan_nt_ring.c
 run_host_test ingress tests/ingress_test.c driver/iwan_nt_ingress.c driver/iwan_nt_demux.c driver/iwan_nt_frame.c driver/iwan_nt_ring.c
+run_host_test inet tests/inet_test.c user/iwan_nt_inet.c
 run_host_test crypto tests/crypto_test.c user/iwan_nt_crypto.c
 run_host_test session tests/session_test.c user/iwan_nt_session.c user/iwan_nt_crypto.c
 run_host_test handshake tests/handshake_test.c user/iwan_nt_handshake.c user/iwan_nt_session.c user/iwan_nt_crypto.c

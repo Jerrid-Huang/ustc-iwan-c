@@ -168,17 +168,35 @@ IwanNtControlSetPeer(
     _In_ PIO_STACK_LOCATION Stack
     )
 {
-    const IWAN_NT_PEER_ABI *request;
-    SOCKADDR_IN remote;
+    const IWAN_NT_ADDR_ABI *request;
+    IWAN_NT_SOCKADDR remote;
     PIWAN_NT_TRANSPORT transport;
     NTSTATUS status;
 
     if (Stack->Parameters.DeviceIoControl.InputBufferLength <
-        IWAN_NT_PEER_STRUCT_SIZE) {
+        IWAN_NT_ADDR_STRUCT_SIZE) {
         return STATUS_INVALID_PARAMETER;
     }
-    request = (const IWAN_NT_PEER_ABI *)Irp->AssociatedIrp.SystemBuffer;
-    if (request == NULL || request->Port == 0) {
+    request = (const IWAN_NT_ADDR_ABI *)Irp->AssociatedIrp.SystemBuffer;
+    if (request == NULL || request->Port == 0 || request->ScopeId != 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    RtlZeroMemory(&remote, sizeof(remote));
+    if (request->Family == (uint16_t)AF_INET) {
+        remote.V4.sin_family = (ADDRESS_FAMILY)AF_INET;
+        remote.V4.sin_port = request->Port;
+        /*
+         * Copy the address as bytes instead of naming a union member: the WDK
+         * spells the kernel-side field differently from winsock2.h, and the
+         * wire value is opaque here anyway.
+         */
+        RtlCopyMemory(&remote.V4.sin_addr, request->Address, 4);
+    } else if (request->Family == (uint16_t)AF_INET6) {
+        remote.V6.sin6_family = (ADDRESS_FAMILY)AF_INET6;
+        remote.V6.sin6_port = request->Port;
+        RtlCopyMemory(&remote.V6.sin6_addr, request->Address, 16);
+    } else {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -187,20 +205,9 @@ IwanNtControlSetPeer(
         return status;
     }
 
-    RtlZeroMemory(&remote, sizeof(remote));
-    remote.sin_family = AF_INET;
-    remote.sin_port = request->Port;
-    /*
-     * Copy the address as four bytes instead of naming a union member: the
-     * WDK spells the kernel-side field differently from winsock2.h, and the
-     * wire value is opaque here anyway.
-     */
-    RtlCopyMemory(&remote.sin_addr, &request->Address, sizeof(request->Address));
-
-    IwanNtTransportSetPeer(transport, &remote);
-
+    status = IwanNtTransportSetPeer(transport, &remote);
     IwanNtControlEnd();
-    return STATUS_SUCCESS;
+    return status;
 }
 
 static NTSTATUS
@@ -285,19 +292,19 @@ IwanNtControlGetLocal(
     _In_ PIO_STACK_LOCATION Stack
     )
 {
-    IWAN_NT_PEER_ABI *reply;
+    IWAN_NT_ADDR_ABI *reply;
     PIWAN_NT_TRANSPORT transport;
-    SOCKADDR_IN local;
+    IWAN_NT_SOCKADDR local;
     NTSTATUS status;
-    uint32_t address;
     uint16_t port;
+    uint16_t family;
 
     if (Stack->Parameters.DeviceIoControl.OutputBufferLength <
-        IWAN_NT_PEER_STRUCT_SIZE) {
-        Irp->IoStatus.Information = (ULONG_PTR)IWAN_NT_PEER_STRUCT_SIZE;
+        IWAN_NT_ADDR_STRUCT_SIZE) {
+        Irp->IoStatus.Information = (ULONG_PTR)IWAN_NT_ADDR_STRUCT_SIZE;
         return STATUS_BUFFER_TOO_SMALL;
     }
-    reply = (IWAN_NT_PEER_ABI *)Irp->AssociatedIrp.SystemBuffer;
+    reply = (IWAN_NT_ADDR_ABI *)Irp->AssociatedIrp.SystemBuffer;
     if (reply == NULL || Irp->AssociatedIrp.SystemBuffer == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -315,12 +322,18 @@ IwanNtControlGetLocal(
      * The ABI carries the address in network order, the same way SET_PEER takes
      * it, so both ends of the exchange read the same bytes.
      */
-    RtlCopyMemory(&address, &local.sin_addr, sizeof(address));
-    RtlCopyMemory(&port, &local.sin_port, sizeof(port));
-
     RtlZeroMemory(reply, sizeof(*reply));
-    reply->Address = address;
+    family = IwanNtAddrFamily(&local);
+    if (family == (uint16_t)AF_INET6) {
+        RtlCopyMemory(reply->Address, &local.V6.sin6_addr, 16);
+        RtlCopyMemory(&port, &local.V6.sin6_port, sizeof(port));
+    } else {
+        RtlCopyMemory(reply->Address, &local.V4.sin_addr, 4);
+        RtlCopyMemory(&port, &local.V4.sin_port, sizeof(port));
+    }
     reply->Port = port;
+    reply->Family = family;
+    reply->ScopeId = 0;
 
     IwanNtControlEnd();
 

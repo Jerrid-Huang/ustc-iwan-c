@@ -284,7 +284,7 @@ IwanNtWskDatagramCreateSocket(
     if (NT_SUCCESS(status)) {
         status = Provider->Dispatch->WskSocket(
             Provider->Client,
-            AF_INET,
+            Datagram->Family,
             SOCK_DGRAM,
             IPPROTO_UDP,
             WSK_FLAG_DATAGRAM_SOCKET,
@@ -812,10 +812,12 @@ IwanNtWskDatagramInitialize(
     ExInitializeRundownProtection(&Datagram->CallbackRundown);
     KeInitializeEvent(&Datagram->LifecycleEvent, NotificationEvent, FALSE);
     KeInitializeEvent(&Datagram->FaultEvent, NotificationEvent, FALSE);
-    RtlZeroMemory(&Datagram->LocalAddress, sizeof(Datagram->LocalAddress));
-    Datagram->LocalAddress.sin_family = AF_INET;
-    Datagram->LocalAddress.sin_port = RtlUshortByteSwap(
-        (USHORT)IWAN_NT_WSK_DATAGRAM_PORT);
+    /*
+     * A socket needs a family before it exists, so the transport starts one for
+     * IPv4 and asks for a restart when a peer turns out to be IPv6.
+     */
+    Datagram->Family = (uint16_t)AF_INET;
+    IwanNtAddrSetWildcard(&Datagram->LocalAddress, Datagram->Family);
     Datagram->LifecycleIrp = IoAllocateIrp(1, FALSE);
     if (Datagram->LifecycleIrp == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
@@ -829,7 +831,8 @@ _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 IwanNtWskDatagramStart(
     _Inout_ PIWAN_NT_WSK_DATAGRAM Datagram,
-    _In_ const WSK_PROVIDER_NPI *Provider
+    _In_ const WSK_PROVIDER_NPI *Provider,
+    _In_ uint16_t Family
     )
 {
     KIRQL oldIrql;
@@ -838,7 +841,8 @@ IwanNtWskDatagramStart(
     PAGED_CODE();
 
     if (Datagram == NULL || Provider == NULL || Provider->Client == NULL ||
-        Provider->Dispatch == NULL) {
+        Provider->Dispatch == NULL ||
+        (Family != (uint16_t)AF_INET && Family != (uint16_t)AF_INET6)) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -857,6 +861,12 @@ IwanNtWskDatagramStart(
     Datagram->CloseRequired = FALSE;
     Datagram->CloseCompleted = FALSE;
     Datagram->IndicationCount = 0;
+    /*
+     * The family is fixed for the life of the socket, so it is set here rather
+     * than passed down every call.
+     */
+    Datagram->Family = Family;
+    IwanNtAddrSetWildcard(&Datagram->LocalAddress, Family);
     KeReleaseSpinLock(&Datagram->StateLock, oldIrql);
     KeClearEvent(&Datagram->FaultEvent);
 
@@ -972,7 +982,7 @@ IwanNtWskDatagramSubmitSend(
     _In_ PIWAN_NT_WSK_DATAGRAM Datagram,
     _In_ PMDL Mdl,
     _In_ ULONG Length,
-    _In_ const SOCKADDR_IN *Remote,
+    _In_ const IWAN_NT_SOCKADDR *Remote,
     _In_ PIRP Irp
     )
 {
@@ -1042,7 +1052,7 @@ IwanNtWskDatagramCloseRequired(
 BOOLEAN
 IwanNtWskDatagramGetLocal(
     _In_ const IWAN_NT_WSK_DATAGRAM *Datagram,
-    _Out_ SOCKADDR_IN *Local
+    _Out_ PIWAN_NT_SOCKADDR Local
     )
 {
     PIWAN_NT_WSK_DATAGRAM datagram = (PIWAN_NT_WSK_DATAGRAM)Datagram;
@@ -1056,10 +1066,21 @@ IwanNtWskDatagramGetLocal(
     /* The lock is mutable state; the getter still takes a const view. */
     KeAcquireSpinLock(&datagram->StateLock, &oldIrql);
     bound = (datagram->State == IwanNtWskDatagramRunning &&
-             datagram->BoundAddress.sin_family != 0) ? TRUE : FALSE;
+             IwanNtAddrFamily(&datagram->BoundAddress) != 0) ? TRUE : FALSE;
     if (bound != FALSE) {
         *Local = datagram->BoundAddress;
     }
     KeReleaseSpinLock(&datagram->StateLock, oldIrql);
     return bound;
+}
+
+uint16_t
+IwanNtWskDatagramFamily(
+    _In_ const IWAN_NT_WSK_DATAGRAM *Datagram
+    )
+{
+    if (Datagram == NULL) {
+        return 0;
+    }
+    return Datagram->Family;
 }

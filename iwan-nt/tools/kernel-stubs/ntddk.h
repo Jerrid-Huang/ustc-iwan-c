@@ -226,6 +226,8 @@ typedef struct _DRIVER_OBJECT {
  * them there too: a header that forgets <wsk.h> must fail here as well. */
 
 #define AF_INET 2
+#define AF_INET6 23
+typedef USHORT ADDRESS_FAMILY;
 #define SOCK_DGRAM 2
 #define IPPROTO_UDP 17
 #define SOL_SOCKET 0xffff

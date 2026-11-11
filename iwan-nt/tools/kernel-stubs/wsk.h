@@ -39,6 +39,18 @@ typedef struct _SOCKADDR_IN {
     UCHAR sin_zero[8];
 } SOCKADDR_IN, *PSOCKADDR_IN;
 
+typedef struct _IN6_ADDR {
+    UCHAR Byte[16];
+} IN6_ADDR, *PIN6_ADDR;
+
+typedef struct _SOCKADDR_IN6 {
+    USHORT sin6_family;
+    USHORT sin6_port;
+    ULONG sin6_flowinfo;
+    IN6_ADDR sin6_addr;
+    ULONG sin6_scope_id;
+} SOCKADDR_IN6, *PSOCKADDR_IN6;
+
 typedef enum _WSK_CONTROL_SOCKET_TYPE {
     WskSetOption = 0,
     WskGetOption,

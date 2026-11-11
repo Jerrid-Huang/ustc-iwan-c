@@ -153,6 +153,14 @@ through `SET_PEER` and the session through `SET_SESSION`.
 - [WDK project](driver/iwan_nt.vcxproj)
 - [Root-enumerated adapter INF](driver/iwan_nt.inf)
 
+## Which address families the outer packet uses
+
+The datagram socket is created for the family of the peer: `SET_PEER` carries a
+family tag, and when it differs from the running socket the transport drains the
+send pool, recycles the socket, and keeps the session. IPv4 and IPv6 are equally
+supported; the parser in `user/iwan_nt_inet.c` accepts both literal forms and has
+host tests.
+
 ## About `tools/kernel-stubs`
 
 The stubs exist so the frame, demux, ring, ingress and socket sources can be

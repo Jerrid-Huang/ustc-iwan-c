@@ -70,7 +70,7 @@
 #define IWAN_NT_IOCTL_GET_STATS IWAN_NT_CTL_CODE(0x805u)
 
 #define IWAN_NT_SESSION_STRUCT_SIZE 24u
-#define IWAN_NT_PEER_STRUCT_SIZE 8u
+#define IWAN_NT_ADDR_STRUCT_SIZE 24u
 #define IWAN_NT_STATS_STRUCT_SIZE 192u
 
 /* Largest control frame accepted in either direction. */
@@ -85,11 +85,21 @@ typedef struct _IWAN_NT_SESSION_ABI {
     uint8_t Key[8];      /* XOR key; only read when Encrypted != 0 */
 } IWAN_NT_SESSION_ABI;
 
-typedef struct _IWAN_NT_PEER_ABI {
-    uint32_t Address;    /* IPv4, network byte order */
-    uint16_t Port;       /* UDP port, network byte order */
-    uint16_t Reserved;   /* must be zero */
-} IWAN_NT_PEER_ABI;
+/*
+ * One endpoint, either family. The outer packet is carried by a kernel datagram
+ * socket, and which family that socket speaks decides the address width, so the
+ * request names the family explicitly instead of guessing from the bytes.
+ *
+ * Address is in network order for the family named by Family (the first four
+ * bytes for IPv4, all sixteen for IPv6); Port is in network order too. ScopeId
+ * matters only for IPv6 link-local peers and must be zero otherwise.
+ */
+typedef struct _IWAN_NT_ADDR_ABI {
+    uint8_t Address[16];
+    uint16_t Port;
+    uint16_t Family;     /* AF_INET or AF_INET6 */
+    uint32_t ScopeId;
+} IWAN_NT_ADDR_ABI;
 
 /*
  * One coherent-enough snapshot. The transport writes this from PASSIVE_LEVEL
@@ -150,8 +160,8 @@ _Static_assert(sizeof(IWAN_NT_SESSION_ABI) == IWAN_NT_SESSION_STRUCT_SIZE,
  * the peer request: the port is the part that matters, because it is chosen by
  * the provider and cannot be predicted from user mode.
  */
-_Static_assert(sizeof(IWAN_NT_PEER_ABI) == IWAN_NT_PEER_STRUCT_SIZE,
-               "PEER ABI size changed");
+_Static_assert(sizeof(IWAN_NT_ADDR_ABI) == IWAN_NT_ADDR_STRUCT_SIZE,
+               "address ABI size changed");
 _Static_assert(sizeof(IWAN_NT_STATS_ABI) == IWAN_NT_STATS_STRUCT_SIZE,
                "STATS ABI size changed");
 
