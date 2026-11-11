@@ -155,7 +155,16 @@ TestParseAck(void)
     IWAN_NT_SESSION_RESULT result;
     uint8_t frame[sizeof(RealAck)];
 
+    /*
+     * The recorded bytes carry a placeholder signature, so sign the copy the
+     * way the peer would. What this block tests is the payload parse; the
+     * signature itself is covered right below.
+     */
+    result = IwanNtSessionParseAck(RealAck, sizeof(RealAck), &ack);
+    Check("ack-unsigned-rejected", result == IwanNtSessionBadSignature);
+
     memcpy(frame, RealAck, sizeof(frame));
+    IwanNtSessionSignFrame(frame);
     result = IwanNtSessionParseAck(frame, sizeof(frame), &ack);
     Check("ack-ok", result == IwanNtSessionOk);
     Check("ack-sid", ack.Sid == 0x0900u);
@@ -167,18 +176,36 @@ TestParseAck(void)
     Check("ack-has-gateway", ack.HasGateway == 1);
     CheckBytes("ack-gateway", ack.Gateway, (const uint8_t *)"\x64\x64\x01\x01", 4u);
 
+    /*
+     * Sign, then change one header byte: the signature covers the eight header
+     * bytes plus the constant, so this must fail. Note what it does not cover:
+     * the TLVs. The deployed protocol authenticates the header only, so a
+     * tampered TLV is accepted here exactly as it is there.
+     */
+    {
+        uint8_t tampered[sizeof(RealAck)];
+
+        memcpy(tampered, RealAck, sizeof(tampered));
+        IwanNtSessionSignFrame(tampered);
+        tampered[3] = (uint8_t)(tampered[3] ^ 0xFFu);
+        result = IwanNtSessionParseAck(tampered, sizeof(tampered), &ack);
+        Check("ack-tampered-rejected", result == IwanNtSessionBadSignature);
+    }
+
     /* A truncated frame must be rejected before any TLV is read. */
     result = IwanNtSessionParseAck(frame, 12u, &ack);
     Check("ack-short", result == IwanNtSessionShortFrame);
 
     /* Wrong frame type: an ECHO response is not an ACK. */
     frame[0] = 0x16;
+    IwanNtSessionSignFrame(frame);
     result = IwanNtSessionParseAck(frame, sizeof(frame), &ack);
     Check("ack-wrong-type", result == IwanNtSessionWrongType);
 
     /* A TLV whose length runs past the buffer must not be trusted. */
     memcpy(frame, RealAck, sizeof(frame));
     frame[24u + 1u] = 0x40;
+    IwanNtSessionSignFrame(frame);
     result = IwanNtSessionParseAck(frame, sizeof(frame), &ack);
     Check("ack-bad-tlv", result == IwanNtSessionBadTlv);
 }

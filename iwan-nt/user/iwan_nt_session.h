@@ -87,7 +87,8 @@ typedef enum _IWAN_NT_SESSION_RESULT {
     IwanNtSessionTooLarge,
     IwanNtSessionWrongType,
     IwanNtSessionShortFrame,
-    IwanNtSessionBadTlv
+    IwanNtSessionBadTlv,
+    IwanNtSessionBadSignature
 } IWAN_NT_SESSION_RESULT;
 
 /*
@@ -143,6 +144,27 @@ IwanNtSessionParseEchoResponse(
     );
 
 /* The frame type, for callers that only need to route a received frame. */
+/*
+ * Non-zero when the 16-byte signature after the header matches
+ * md5(header || "mw"). Every control frame carries one, including the answer
+ * that installs a session, so nothing is parsed before this passes.
+ */
+/*
+ * Write the signature for Frame into its own bytes 8..23. Exposed so callers
+ * that build control frames (and the tests that fabricate peer frames) sign
+ * exactly the way this implementation checks.
+ */
+void
+IwanNtSessionSignFrame(
+    uint8_t *Frame
+    );
+
+int
+IwanNtSessionVerify(
+    const uint8_t *Frame,
+    size_t Length
+    );
+
 uint8_t
 IwanNtSessionType(
     const uint8_t *Frame,

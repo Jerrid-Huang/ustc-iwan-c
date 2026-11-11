@@ -106,6 +106,48 @@ IwanNtSessionSign(
 }
 
 void
+IwanNtSessionSignFrame(
+    uint8_t *Frame
+    )
+{
+    IwanNtSessionSign(Frame);
+}
+
+int
+IwanNtSessionVerify(
+    const uint8_t *Frame,
+    size_t Length
+    )
+{
+    IWAN_NT_MD5_CTX context;
+    uint8_t digest[16];
+    uint8_t difference;
+    size_t index;
+
+    if (Frame == NULL || Length < IWAN_NT_SESSION_PREFIX) {
+        return 0;
+    }
+
+    /*
+     * The deployed client verifies every control frame this way before it
+     * touches the payload: md5(header || "mw") into the 16 bytes after the
+     * header. Comparing without an early exit keeps the rejection branch from
+     * depending on where the first differing byte sits.
+     */
+    IwanNtMd5Initialize(&context);
+    IwanNtMd5Update(&context, Frame, IWAN_NT_SESSION_HEADER);
+    IwanNtMd5Update(&context, IwanNtSessionMagic, sizeof(IwanNtSessionMagic));
+    IwanNtMd5Finalize(&context, digest);
+
+    difference = 0;
+    for (index = 0; index < sizeof(digest); index++) {
+        difference |= (uint8_t)(digest[index] ^
+            Frame[IWAN_NT_SESSION_HEADER + index]);
+    }
+    return (difference == 0) ? 1 : 0;
+}
+
+void
 IwanNtSessionKey(
     const char *User,
     const char *Password,
@@ -245,6 +287,9 @@ IwanNtSessionParseAck(
     }
     if (Length < IWAN_NT_SESSION_PREFIX) {
         return IwanNtSessionShortFrame;
+    }
+    if (IwanNtSessionVerify(Frame, Length) == 0) {
+        return IwanNtSessionBadSignature;
     }
     if (Frame[0] != IWAN_NT_SESSION_TYPE_OPEN_ACK &&
         Frame[0] != IWAN_NT_SESSION_TYPE_OPEN_REJECT) {

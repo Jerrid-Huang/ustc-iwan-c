@@ -44,6 +44,7 @@ BuildAck(
     Buffer[6] = (uint8_t)((Token >> 16) & 0xFFu);
     Buffer[7] = (uint8_t)((Token >> 24) & 0xFFu);
     memcpy(Buffer + 24u, body, sizeof(body));
+    IwanNtSessionSignFrame(Buffer);
     return 24u + sizeof(body);
 }
 
@@ -59,30 +60,32 @@ BuildEchoAnswer(
     uint32_t Maximum
     )
 {
-    size_t length = 0;
+    size_t length = 60u;
     size_t index;
 
-    if (IwanNtSessionBuildEchoRequest(Sid, Token, Tick, Buffer, Capacity,
-                                      &length) != IwanNtSessionOk) {
+    if (Capacity < length) {
         return 0;
     }
+    memset(Buffer, 0, length);
     Buffer[0] = IWAN_NT_SESSION_TYPE_ECHO_RESPONSE;
-    /* The delays are machine order, like the tick. */
-    Buffer[32] = (uint8_t)(Current & 0xFFu);
-    Buffer[33] = (uint8_t)((Current >> 8) & 0xFFu);
-    Buffer[34] = (uint8_t)((Current >> 16) & 0xFFu);
-    Buffer[35] = (uint8_t)((Current >> 24) & 0xFFu);
-    Buffer[36] = (uint8_t)(Minimum & 0xFFu);
-    Buffer[37] = (uint8_t)((Minimum >> 8) & 0xFFu);
-    Buffer[38] = (uint8_t)((Minimum >> 16) & 0xFFu);
-    Buffer[39] = (uint8_t)((Minimum >> 24) & 0xFFu);
-    Buffer[40] = (uint8_t)(Maximum & 0xFFu);
-    Buffer[41] = (uint8_t)((Maximum >> 8) & 0xFFu);
-    Buffer[42] = (uint8_t)((Maximum >> 16) & 0xFFu);
-    Buffer[43] = (uint8_t)((Maximum >> 24) & 0xFFu);
-    for (index = 44u; index < length; index++) {
-        Buffer[index] = 0;
+    Buffer[1] = 0;
+    /* Machine-order words, as the peer writes them. */
+    Buffer[2] = (uint8_t)(Sid & 0xFFu);
+    Buffer[3] = (uint8_t)((Sid >> 8) & 0xFFu);
+    Buffer[4] = (uint8_t)(Token & 0xFFu);
+    Buffer[5] = (uint8_t)((Token >> 8) & 0xFFu);
+    Buffer[6] = (uint8_t)((Token >> 16) & 0xFFu);
+    Buffer[7] = (uint8_t)((Token >> 24) & 0xFFu);
+    /* The tick and the three delays sit at 24, 32, 36 and 40. */
+    for (index = 0u; index < 8u; index++) {
+        Buffer[24u + index] = (uint8_t)((Tick >> (8u * index)) & 0xFFu);
     }
+    for (index = 0u; index < 4u; index++) {
+        Buffer[32u + index] = (uint8_t)((Current >> (8u * index)) & 0xFFu);
+        Buffer[36u + index] = (uint8_t)((Minimum >> (8u * index)) & 0xFFu);
+        Buffer[40u + index] = (uint8_t)((Maximum >> (8u * index)) & 0xFFu);
+    }
+    IwanNtSessionSignFrame(Buffer);
     return length;
 }
 
@@ -197,6 +200,14 @@ TestRejected(void)
     memset(reject, 0, sizeof(reject));
     reject[0] = IWAN_NT_SESSION_TYPE_OPEN_REJECT;
 
+    /* An unsigned rejection is not the peer speaking: ignore, do not reset. */
+    CHECK(IwanNtHandshakeOnFrame(&handshake, reject, sizeof(reject), 1000u) ==
+          IwanNtHandshakeEventNone);
+    CHECK(handshake.Rejects == 0u);
+    CHECK(handshake.ForeignFrames == 1u);
+
+    IwanNtSessionSignFrame(reject);
+
     CHECK(IwanNtHandshakeOnFrame(&handshake, reject, sizeof(reject), 1000u) ==
           IwanNtHandshakeEventRejected);
     CHECK(handshake.State == IwanNtHandshakeDown);
@@ -224,6 +235,7 @@ TestClosed(void)
 
     memset(closeFrame, 0, sizeof(closeFrame));
     closeFrame[0] = IWAN_NT_SESSION_TYPE_CLOSE;
+    IwanNtSessionSignFrame(closeFrame);
     CHECK(IwanNtHandshakeOnFrame(&handshake, closeFrame, sizeof(closeFrame), 500u) ==
           IwanNtHandshakeEventClosed);
     CHECK(handshake.Closes == 1u);

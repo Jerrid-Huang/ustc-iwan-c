@@ -137,6 +137,16 @@ IwanNtHandshakeOnFrame(
         return IwanNtHandshakeEventNone;
     }
 
+    /*
+     * Every control frame the peer sends carries the header signature. Drop
+     * anything else as foreign: an unsigned CLOSE would otherwise tear the
+     * session down, and an unsigned answer would fault a healthy one.
+     */
+    if (IwanNtSessionVerify(Frame, Length) == 0) {
+        Handshake->ForeignFrames++;
+        return IwanNtHandshakeEventNone;
+    }
+
     switch (Frame[0]) {
     case IWAN_NT_SESSION_TYPE_OPEN_ACK:
     {

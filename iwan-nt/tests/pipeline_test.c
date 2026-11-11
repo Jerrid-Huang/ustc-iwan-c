@@ -117,7 +117,12 @@ main(void)
           IwanNtRingOk);
     IwanNtIngressAttach(&gIngress, &gRing, Sink, NULL);
 
+    /*
+     * The recorded answer has a placeholder signature, so sign the copy the way
+     * the peer would before it goes in at the wire.
+     */
     memcpy(payload, kAck, sizeof(kAck));
+    IwanNtSessionSignFrame(payload);
     CHECK(IwanNtIngressReceive(&gIngress, payload, sizeof(kAck)) ==
           IwanNtIngressQueuedControl);
     CHECK(gIngress.Counters.QueuedControl == 1);
@@ -127,7 +132,7 @@ main(void)
     CHECK(IwanNtRingPop(&gRing, popped, sizeof(popped), &poppedLength) ==
           IwanNtRingOk);
     CHECK(poppedLength == sizeof(kAck));
-    CHECK(memcmp(popped, kAck, sizeof(kAck)) == 0);
+    CHECK(memcmp(popped, payload, sizeof(kAck)) == 0);
     CHECK(IwanNtSessionParseAck(popped, poppedLength, &ack) == IwanNtSessionOk);
     /* Machine-order words: 00 09 reads as 0x0900, e4 97 77 30 as 0x307797e4. */
     CHECK(ack.Sid == 0x0900u);
