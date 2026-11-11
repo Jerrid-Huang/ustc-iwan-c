@@ -175,6 +175,22 @@ IwanNtTransportGetLocal(
     );
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
+/*
+ * Encapsulate and submit up to Count inner packets under one provider call.
+ *
+ * IRQL: <= DISPATCH_LEVEL.
+ * The items are wrapped in a single frame header, so they all have to belong to
+ * the same inner family; a mixed batch is rejected rather than half sent.
+ */
+NTSTATUS
+IwanNtTransportSendInnerBatch(
+    _Inout_ PIWAN_NT_TRANSPORT Transport,
+    _In_reads_(Count) const IWAN_NT_TX_ITEM *Items,
+    _In_ ULONG Count,
+    _Out_ PULONG Accepted
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 IwanNtTransportSendInner(
     _Inout_ PIWAN_NT_TRANSPORT Transport,

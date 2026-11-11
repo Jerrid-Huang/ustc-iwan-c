@@ -1,4 +1,5 @@
 #include "iwan_nt_miniport.h"
+#include "iwan_nt_frame.h"
 #include "iwan_nt_transport.h"
 #include "iwan_nt_tx.h"
 #include "iwan_nt_control.h"
@@ -35,6 +36,13 @@ typedef enum _IWAN_NT_MINIPORT_STATE {
  * bounded because the receive callback is its only producer and NDIS is the only
  * consumer that returns slots.
  */
+/*
+ * Packets per provider call. The pool has 32 slots, so a batch never asks for
+ * more than it could hold; 8 keeps the staging memory small while still
+ * collapsing the common case of one busy queue into one WskSendMessages.
+ */
+#define IWAN_NT_MINIPORT_SEND_BATCH 8u
+
 #define IWAN_NT_MINIPORT_RX_SLOTS 64u
 
 typedef struct _IWAN_NT_MINIPORT_RX_SLOT {
@@ -361,7 +369,9 @@ IwanNtMiniportInitializeEx(
     NdisAllocateSpinLock(&adapter->SendLock);
     adapter->SendLockReady = TRUE;
     adapter->SendScratch = NdisAllocateMemoryWithTagPriority(
-        MiniportAdapterHandle, IWAN_NT_TX_BUFFER_BYTES, IWAN_NT_MINIPORT_POOL_TAG,
+        MiniportAdapterHandle,
+        IWAN_NT_TX_BUFFER_BYTES * IWAN_NT_MINIPORT_SEND_BATCH,
+        IWAN_NT_MINIPORT_POOL_TAG,
         NormalPoolPriority);
     if (adapter->SendScratch == NULL) {
         status = NDIS_STATUS_RESOURCES;
@@ -727,6 +737,69 @@ IwanNtMiniportIndicateInner(
 
 _Use_decl_annotations_
 static VOID
+/*
+ * Flatten one net buffer into its own staging area.
+ *
+ * The staging area has to be distinct per packet in a batch, because the pool
+ * copies from these pointers only after the whole batch is assembled.
+ */
+static BOOLEAN
+IwanNtMiniportStagePacket(
+    _Inout_ PIWAN_NT_MINIPORT_ADAPTER Adapter,
+    _In_ PNET_BUFFER Nb,
+    _In_ ULONG Slot,
+    _Out_ IWAN_NT_TX_ITEM *Item
+    )
+{
+    ULONG length = NET_BUFFER_DATA_LENGTH(Nb);
+    PUCHAR bytes;
+
+    if (length == 0 || length > IWAN_NT_TX_BUFFER_BYTES) {
+        return FALSE;
+    }
+
+    bytes = NdisGetDataBuffer(
+        Nb, length, Adapter->SendScratch + (SIZE_T)Slot * IWAN_NT_TX_BUFFER_BYTES,
+        1, 0);
+    if (bytes == NULL) {
+        return FALSE;
+    }
+
+    Item->Inner = bytes;
+    Item->InnerLength = length;
+    return TRUE;
+}
+
+/*
+ * Hand one assembled batch to the transport and account for what it took.
+ *
+ * A short batch is backpressure, not an error: the packets the pool could not
+ * hold are reported as resources so the stack retries them.
+ */
+static VOID
+IwanNtMiniportFlushBatch(
+    _Inout_ PIWAN_NT_MINIPORT_ADAPTER Adapter,
+    _In_reads_(Count) const IWAN_NT_TX_ITEM *Items,
+    _In_ ULONG Count,
+    _Inout_ PNDIS_STATUS PacketStatus
+    )
+{
+    ULONG accepted = 0;
+
+    if (Count == 0) {
+        return;
+    }
+
+    (VOID)IwanNtTransportSendInnerBatch(
+        &Adapter->Transport, Items, Count, &accepted);
+
+    InterlockedExchangeAdd(&Adapter->TxAccepted, (LONG)accepted);
+    if (accepted < Count) {
+        InterlockedExchangeAdd(&Adapter->TxRejected, (LONG)(Count - accepted));
+        *PacketStatus = NDIS_STATUS_RESOURCES;
+    }
+}
+
 IwanNtMiniportSendNetBufferLists(
     NDIS_HANDLE MiniportAdapterContext,
     PNET_BUFFER_LIST NetBufferLists,
@@ -767,31 +840,65 @@ IwanNtMiniportSendNetBufferLists(
         PNET_BUFFER nb;
         NDIS_STATUS packetStatus = NDIS_STATUS_SUCCESS;
 
-        for (nb = NET_BUFFER_LIST_FIRST_NB(current);
-             nb != NULL; nb = NET_BUFFER_NEXT_NB(nb)) {
-            ULONG length = NET_BUFFER_DATA_LENGTH(nb);
-            PUCHAR bytes;
-            NTSTATUS status;
+        /*
+         * Accumulate up to SEND_BATCH packets of one inner family and hand
+         * them over together. A family change flushes first: one frame header
+         * serves the batch, so the packets must agree.
+         */
+        {
+            IWAN_NT_TX_ITEM items[IWAN_NT_MINIPORT_SEND_BATCH];
+            ULONG count = 0;
+            unsigned family = 0;
 
-            if (length == 0) {
-                continue;
+            for (nb = NET_BUFFER_LIST_FIRST_NB(current);
+                 nb != NULL; nb = NET_BUFFER_NEXT_NB(nb)) {
+                IWAN_NT_TX_ITEM item;
+                unsigned nbFamily;
+                ULONG length = NET_BUFFER_DATA_LENGTH(nb);
+
+                if (length == 0) {
+                    continue;
+                }
+                if (length > IWAN_NT_TX_BUFFER_BYTES) {
+                    packetStatus = NDIS_STATUS_INVALID_PACKET;
+                    continue;
+                }
+
+                /*
+                 * Flush before staging, so the slot index used here is always
+                 * inside the staging array.
+                 */
+                if (count == IWAN_NT_MINIPORT_SEND_BATCH) {
+                    IwanNtMiniportFlushBatch(adapter, items, count,
+                                             &packetStatus);
+                    count = 0;
+                }
+
+                if (!IwanNtMiniportStagePacket(adapter, nb, count, &item)) {
+                    packetStatus = NDIS_STATUS_RESOURCES;
+                    continue;
+                }
+                nbFamily = IwanNtFrameInnerFamily(item.Inner, length);
+
+                /*
+                 * A frame header serves the whole batch, so a family change
+                 * has to break it. The pending packets go out now; this one
+                 * moves to the front of the next batch.
+                 */
+                if (count != 0 && nbFamily != family) {
+                    IwanNtMiniportFlushBatch(adapter, items, count,
+                                             &packetStatus);
+                    RtlCopyMemory(adapter->SendScratch, item.Inner, length);
+                    item.Inner = adapter->SendScratch;
+                    count = 0;
+                }
+
+                family = nbFamily;
+                items[count] = item;
+                count++;
             }
-            if (length > IWAN_NT_TX_BUFFER_BYTES) {
-                packetStatus = NDIS_STATUS_INVALID_PACKET;
-                continue;
-            }
-            bytes = NdisGetDataBuffer(nb, length, adapter->SendScratch, 1, 0);
-            if (bytes == NULL) {
-                packetStatus = NDIS_STATUS_RESOURCES;
-                continue;
-            }
-            status = IwanNtTransportSendInner(&adapter->Transport, bytes, length);
-            if (NT_SUCCESS(status)) {
-                InterlockedIncrement(&adapter->TxAccepted);
-            } else {
-                InterlockedIncrement(&adapter->TxRejected);
-                packetStatus = NDIS_STATUS_RESOURCES;
-            }
+
+            IwanNtMiniportFlushBatch(adapter, items, count, &packetStatus);
         }
         NET_BUFFER_LIST_STATUS(current) = packetStatus;
     }

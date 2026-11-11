@@ -978,6 +978,68 @@ IwanNtWskDatagramFinalize(
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
+IwanNtWskDatagramSubmitSendList(
+    _In_ PIWAN_NT_WSK_DATAGRAM Datagram,
+    _In_ PWSK_BUF_LIST List,
+    _In_ ULONG Messages,
+    _In_ const IWAN_NT_SOCKADDR *Remote,
+    _In_ PIRP Irp
+    )
+{
+    const WSK_PROVIDER_DATAGRAM_DISPATCH *dispatch;
+    KIRQL oldIrql;
+    BOOLEAN running;
+
+    if (Datagram == NULL || List == NULL || Messages == 0 || Remote == NULL ||
+        Irp == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (Datagram->Socket == NULL) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
+    KeAcquireSpinLock(&Datagram->StateLock, &oldIrql);
+    running = (BOOLEAN)(Datagram->State == IwanNtWskDatagramRunning);
+    KeReleaseSpinLock(&Datagram->StateLock, oldIrql);
+    if (!running) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
+    dispatch = IwanNtWskDatagramGetDatagramDispatch(Datagram->Socket);
+    if (dispatch == NULL) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
+    /*
+     * Fall back to the single-datagram call when the provider has no batched
+     * entry point: a batch of one is exactly the same thing.
+     */
+    if (dispatch->WskSendMessages == NULL) {
+        if (Messages != 1 || dispatch->WskSendTo == NULL) {
+            return STATUS_NOT_SUPPORTED;
+        }
+        return dispatch->WskSendTo(
+            Datagram->Socket,
+            &List->Buffer,
+            0,
+            (PSOCKADDR)Remote,
+            0,
+            NULL,
+            Irp);
+    }
+
+    return dispatch->WskSendMessages(
+        Datagram->Socket,
+        List,
+        0,
+        (PSOCKADDR)Remote,
+        0,
+        NULL,
+        Irp);
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+NTSTATUS
 IwanNtWskDatagramSubmitSend(
     _In_ PIWAN_NT_WSK_DATAGRAM Datagram,
     _In_ PMDL Mdl,

@@ -186,6 +186,20 @@ IwanNtWskDatagramAttachReceive(
  * the IRP is not in use.
  */
 _IRQL_requires_max_(DISPATCH_LEVEL)
+/*
+ * Hand a chain of datagrams to the provider under one IRP. The buffers stay
+ * owned by the caller until the IRP completes.
+ */
+NTSTATUS
+IwanNtWskDatagramSubmitSendList(
+    _Inout_ PIWAN_NT_WSK_DATAGRAM Datagram,
+    _In_ PWSK_BUF_LIST List,
+    _In_ ULONG Messages,
+    _In_ const IWAN_NT_SOCKADDR *Remote,
+    _In_ PIRP Irp
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 IwanNtWskDatagramSubmitSend(
     _In_ PIWAN_NT_WSK_DATAGRAM Datagram,

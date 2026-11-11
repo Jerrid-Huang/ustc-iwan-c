@@ -33,22 +33,23 @@ IwanNtTransportReceiveChunk(
 }
 
 /*
- * Pool callback: hand one prepared datagram to the socket.
+ * Pool callback: hand one prepared batch to the socket.
  *
  * IRQL: <= DISPATCH_LEVEL, called from the send path.
  */
 static NTSTATUS
 IwanNtTransportSubmitSend(
     _In_opt_ void *Context,
-    _In_ PMDL Mdl,
-    _In_ ULONG Length,
+    _In_ PWSK_BUF_LIST List,
+    _In_ ULONG Messages,
     _In_ const IWAN_NT_SOCKADDR *Remote,
     _In_ PIRP Irp
     )
 {
     PIWAN_NT_WSK_DATAGRAM datagram = (PIWAN_NT_WSK_DATAGRAM)Context;
 
-    return IwanNtWskDatagramSubmitSend(datagram, Mdl, Length, Remote, Irp);
+    return IwanNtWskDatagramSubmitSendList(
+        datagram, List, Messages, Remote, Irp);
 }
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -738,6 +739,83 @@ IwanNtTransportSetPeer(
 
     IwanNtTxSetRemote(&Transport->Tx, Remote);
     return STATUS_SUCCESS;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+NTSTATUS
+IwanNtTransportSendInnerBatch(
+    _Inout_ PIWAN_NT_TRANSPORT Transport,
+    _In_reads_(Count) const IWAN_NT_TX_ITEM *Items,
+    _In_ ULONG Count,
+    _Out_ PULONG Accepted
+    )
+{
+    IWAN_NT_FRAME_HEADER header;
+    uint8_t key[IWAN_NT_FRAME_KEY_LEN];
+    unsigned family = 0;
+    unsigned itemFamily;
+    ULONG index;
+    KIRQL oldIrql;
+    BOOLEAN running;
+    BOOLEAN sessionValid;
+    BOOLEAN encrypted;
+
+    if (Accepted != NULL) {
+        *Accepted = 0;
+    }
+    if (Transport == NULL || Items == NULL || Count == 0 || Accepted == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    KeAcquireSpinLock(&Transport->StateLock, &oldIrql);
+    running = (BOOLEAN)(Transport->State == IwanNtTransportRunning);
+    KeReleaseSpinLock(&Transport->StateLock, oldIrql);
+    if (!running) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
+    /*
+     * One header serves the whole batch, so every packet has to agree on the
+     * inner family. Checking up front keeps a mixed chain from being sent with
+     * the wrong frame type.
+     */
+    for (index = 0; index < Count; index++) {
+        if (Items[index].Inner == NULL || Items[index].InnerLength == 0) {
+            return STATUS_INVALID_PARAMETER;
+        }
+        itemFamily = IwanNtFrameInnerFamily(Items[index].Inner,
+                                            Items[index].InnerLength);
+        if (itemFamily != 4 && itemFamily != 6) {
+            return STATUS_INVALID_PARAMETER;
+        }
+        if (index == 0) {
+            family = itemFamily;
+        } else if (family != itemFamily) {
+            return STATUS_INVALID_PARAMETER;
+        }
+    }
+
+    KeAcquireSpinLock(&Transport->SessionLock, &oldIrql);
+    sessionValid = (BOOLEAN)(Transport->Ingress.SessionValid != 0);
+    encrypted = (BOOLEAN)(Transport->Ingress.Session.Encrypted != 0);
+    header.Sid = Transport->Ingress.Session.Sid;
+    header.Token = Transport->Ingress.Session.Token;
+    header.Encrypt = (uint8_t)(encrypted ? 1u : 0u);
+    RtlCopyMemory(key, Transport->Ingress.Session.Key, sizeof(key));
+    KeReleaseSpinLock(&Transport->SessionLock, oldIrql);
+
+    if (!sessionValid) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
+    if (family == 4) {
+        header.Type = encrypted ? IWAN_NT_TYPE_DATA_ENC : IWAN_NT_TYPE_DATA;
+    } else {
+        header.Type = encrypted ? IWAN_NT_TYPE_DATA6_ENC : IWAN_NT_TYPE_DATA6;
+    }
+
+    return IwanNtTxSendBatch(
+        &Transport->Tx, &header, encrypted ? key : NULL, Items, Count, Accepted);
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)

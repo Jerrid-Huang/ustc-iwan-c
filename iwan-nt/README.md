@@ -161,6 +161,15 @@ send pool, recycles the socket, and keeps the session. IPv4 and IPv6 are equally
 supported; the parser in `user/iwan_nt_inet.c` accepts both literal forms and has
 host tests.
 
+## Batched sends
+
+The send pool hands several datagrams to the provider under one IRP
+(`WskSendMessages`) instead of one call per packet. The miniport assembles a
+batch per net buffer list, up to `IWAN_NT_MINIPORT_SEND_BATCH` packets, and
+flushes early when the inner family changes because one frame header serves the
+whole batch. A short batch is backpressure: the unsent packets are completed with
+`NDIS_STATUS_RESOURCES` so the stack retries them, and nothing is queued.
+
 ## About `tools/kernel-stubs`
 
 The stubs exist so the frame, demux, ring, ingress and socket sources can be

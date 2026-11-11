@@ -94,6 +94,7 @@ typedef ULONG_PTR KSPIN_LOCK;
 #define STATUS_SUCCESS ((NTSTATUS)0x00000000L)
 #define STATUS_PENDING ((NTSTATUS)0x00000103L)
 #define STATUS_UNSUCCESSFUL ((NTSTATUS)0xC0000001L)
+#define STATUS_NOT_SUPPORTED ((NTSTATUS)0xC00000BBL)
 #define STATUS_INVALID_PARAMETER ((NTSTATUS)0xC000000DL)
 #define STATUS_INVALID_DEVICE_STATE ((NTSTATUS)0xC0000184L)
 #define STATUS_DEVICE_BUSY ((NTSTATUS)0x80000011L)
@@ -202,6 +203,43 @@ IoCompleteRequest(
     PIRP Irp,
     CCHAR PriorityBoost
     );
+
+typedef struct _LIST_ENTRY {
+    struct _LIST_ENTRY *Flink;
+    struct _LIST_ENTRY *Blink;
+} LIST_ENTRY, *PLIST_ENTRY;
+
+#define CONTAINING_RECORD(address, type, field) \
+    ((type *)((char *)(address) - (size_t)(&((type *)0)->field)))
+
+static __inline void
+InitializeListHead(LIST_ENTRY *Head)
+{
+    Head->Flink = Head;
+    Head->Blink = Head;
+}
+
+static __inline int
+IsListEmpty(const LIST_ENTRY *Head)
+{
+    return Head->Flink == Head;
+}
+
+static __inline void
+InsertTailList(LIST_ENTRY *Head, LIST_ENTRY *Entry)
+{
+    Entry->Blink = Head->Blink;
+    Entry->Flink = Head;
+    Head->Blink->Flink = Entry;
+    Head->Blink = Entry;
+}
+
+static __inline void
+RemoveEntryList(LIST_ENTRY *Entry)
+{
+    Entry->Blink->Flink = Entry->Flink;
+    Entry->Flink->Blink = Entry->Blink;
+}
 
 typedef struct _UNICODE_STRING {
     USHORT Length;

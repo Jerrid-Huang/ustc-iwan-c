@@ -33,21 +33,32 @@ typedef struct _IWAN_NT_TX_SLOT {
     PVOID Buffer;
     PMDL Mdl;
     PIRP Irp;
+    WSK_BUF_LIST List;
     ULONG Index;
     BOOLEAN InUse;
 } IWAN_NT_TX_SLOT, *PIWAN_NT_TX_SLOT;
 
 /*
- * Submit one datagram. Implemented by the socket layer; the pool only decides
- * when to call it.
+ * Submit one or more datagrams. Implemented by the socket layer; the pool only
+ * decides when to call it. A single IRP covers the whole chain, so the slot
+ * that owns the IRP releases every slot in the batch when it completes.
  */
 typedef NTSTATUS (*IWAN_NT_TX_SUBMIT)(
     _In_opt_ void *Context,
-    _In_ PMDL Mdl,
-    _In_ ULONG Length,
+    _In_ PWSK_BUF_LIST List,
+    _In_ ULONG Messages,
     _In_ const IWAN_NT_SOCKADDR *Remote,
     _In_ PIRP Irp
     );
+
+/*
+ * One inner packet of a batch. The header and key are shared by the batch,
+ * because a batch belongs to a single session and a single frame type.
+ */
+typedef struct _IWAN_NT_TX_ITEM {
+    const uint8_t *Inner;
+    size_t InnerLength;
+} IWAN_NT_TX_ITEM, *PIWAN_NT_TX_ITEM;
 
 struct _IWAN_NT_TX {
     KSPIN_LOCK Lock;
@@ -57,6 +68,7 @@ struct _IWAN_NT_TX {
     IWAN_NT_SOCKADDR Remote;
     BOOLEAN RemoteValid;
     ULONG SlotCount;
+    ULONG Batches;
     ULONG FreeCount;
     ULONG InFlight;
     /* Counters are updated under Lock, so they stay exact. */
@@ -133,6 +145,25 @@ IwanNtTxSend(
  * in user mode (header, signature and TLVs included), so this path performs
  * no transform at all.
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+/*
+ * Send up to Count inner packets with one provider call.
+ *
+ * IRQL: <= DISPATCH_LEVEL.
+ * Returns the number of packets accepted (0..Count) through Accepted, and a
+ * status that is an error only when nothing was submitted. A short batch is
+ * backpressure: the caller keeps the remainder and reports it as resources.
+ */
+NTSTATUS
+IwanNtTxSendBatch(
+    _Inout_ PIWAN_NT_TX Tx,
+    _In_ const IWAN_NT_FRAME_HEADER *Header,
+    _In_reads_bytes_opt_(IWAN_NT_FRAME_KEY_LEN) const uint8_t *Key,
+    _In_reads_(Count) const IWAN_NT_TX_ITEM *Items,
+    _In_ ULONG Count,
+    _Out_ PULONG Accepted
+    );
+
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 IwanNtTxSendRaw(

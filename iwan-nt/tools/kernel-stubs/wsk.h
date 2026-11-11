@@ -103,6 +103,15 @@ typedef struct _WSK_PROVIDER_BASIC_DISPATCH {
 
 typedef struct _WSK_SOCKET { const void *Dispatch; } WSK_SOCKET, *PWSK_SOCKET;
 
+/*
+ * A chained datagram: the provider walks List to send several datagrams with
+ * one IRP. WSK_BUF_LIST is what WskSendMessages consumes.
+ */
+typedef struct _WSK_BUF_LIST {
+    WSK_BUF Buffer;
+    LIST_ENTRY List;
+} WSK_BUF_LIST, *PWSK_BUF_LIST;
+
 typedef struct _CMSGHDR { SIZE_T DataOffset; SIZE_T DataLength; } CMSGHDR, *PCMSGHDR;
 
 typedef NTSTATUS(WSKAPI *PFN_WSK_SEND_TO)(
@@ -127,6 +136,11 @@ typedef struct _WSK_PROVIDER_DATAGRAM_DISPATCH {
      * Synchronous: the address is copied out and the length is in and out.
      */
     NTSTATUS (*WskGetLocalAddress)(PVOID, PSOCKADDR, PIRP);
+    /*
+     * The batched form of WskSendTo: one IRP, several datagrams.
+     */
+    NTSTATUS (*WskSendMessages)(PVOID, PWSK_BUF_LIST, ULONG, PSOCKADDR, ULONG,
+                                PCMSGHDR, PIRP);
 } WSK_PROVIDER_DATAGRAM_DISPATCH;
 
 

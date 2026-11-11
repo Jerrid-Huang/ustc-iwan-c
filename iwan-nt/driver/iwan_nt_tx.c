@@ -38,8 +38,27 @@ IwanNtTxComplete(
      * A completion runs at IRQL <= DISPATCH_LEVEL, possibly synchronously
      * inside the submit call at PASSIVE, so the lock must be taken with the
      * IRQL-raising form rather than the at-DPC form.
+     *
+     * One IRP covers the whole batch, so walk the chain this slot heads and
+     * release every slot on it. The list is circular: stop when we come back.
      */
     KeAcquireSpinLock(&tx->Lock, &oldIrql);
+    {
+        PLIST_ENTRY entry = slot->List.List.Flink;
+
+        while (entry != &slot->List.List) {
+            PIWAN_NT_TX_SLOT member =
+                CONTAINING_RECORD(entry, IWAN_NT_TX_SLOT, List.List);
+
+            entry = entry->Flink;
+            RemoveEntryList(&member->List.List);
+            member->InUse = FALSE;
+            tx->FreeCount++;
+            tx->InFlight--;
+            tx->Completed++;
+        }
+    }
+    RemoveEntryList(&slot->List.List);
     slot->InUse = FALSE;
     tx->FreeCount++;
     tx->InFlight--;
@@ -275,12 +294,21 @@ IwanNtTxSubmitSlot(
         return STATUS_INVALID_DEVICE_STATE;
     }
 
+    /*
+     * Single-datagram submit: the slot stands alone as a one-entry chain, so
+     * the same provider call and the same completion path serve both shapes.
+     */
+    Slot->List.Buffer.Mdl = Slot->Mdl;
+    Slot->List.Buffer.Offset = 0;
+    Slot->List.Buffer.Length = Length;
+    InitializeListHead(&Slot->List.List);
+
     IoReuseIrp(Slot->Irp, STATUS_SUCCESS);
     IoSetCompletionRoutine(
         Slot->Irp, IwanNtTxComplete, Slot, TRUE, TRUE, TRUE);
 
     status = Tx->Submit(
-        Tx->SubmitContext, Slot->Mdl, (ULONG)Length, &remote, Slot->Irp);
+        Tx->SubmitContext, &Slot->List, 1, &remote, Slot->Irp);
 
     if (!NT_SUCCESS(status) && status != STATUS_PENDING) {
         IwanNtTxAbandonSlot(Tx, Slot, TRUE);
@@ -289,8 +317,170 @@ IwanNtTxSubmitSlot(
 
     KeAcquireSpinLock(&Tx->Lock, &oldIrql);
     Tx->Submitted++;
+    Tx->Batches++;
     KeReleaseSpinLock(&Tx->Lock, oldIrql);
 
+    return STATUS_SUCCESS;
+}
+
+/*
+ * Submit a chain of already-filled slots under one IRP.
+ *
+ * IRQL: <= DISPATCH_LEVEL.
+ * The chain hangs off Head->List.List; the completion routine walks it and
+ * releases every slot, so a failure here has to unwind them itself.
+ */
+static NTSTATUS
+IwanNtTxSubmitChain(
+    _Inout_ PIWAN_NT_TX Tx,
+    _Inout_ PIWAN_NT_TX_SLOT Head,
+    _In_ ULONG Count
+    )
+{
+    IWAN_NT_SOCKADDR remote;
+    NTSTATUS status;
+    KIRQL oldIrql;
+    BOOLEAN remoteValid;
+
+    if (Count == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    KeAcquireSpinLock(&Tx->Lock, &oldIrql);
+    remoteValid = Tx->RemoteValid;
+    remote = Tx->Remote;
+    KeReleaseSpinLock(&Tx->Lock, oldIrql);
+    if (remoteValid == FALSE) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
+    IoReuseIrp(Head->Irp, STATUS_SUCCESS);
+    IoSetCompletionRoutine(
+        Head->Irp, IwanNtTxComplete, Head, TRUE, TRUE, TRUE);
+
+    status = Tx->Submit(
+        Tx->SubmitContext, &Head->List, Count, &remote, Head->Irp);
+
+    if (!NT_SUCCESS(status) && status != STATUS_PENDING) {
+        PLIST_ENTRY entry;
+
+        /*
+         * The completion routine never ran, so nothing has been released: walk
+         * the chain here. AbandonSlot touches the counters, so it happens once
+         * per slot inside the loop.
+         */
+        for (;;) {
+            PIWAN_NT_TX_SLOT slot =
+                CONTAINING_RECORD(&Head->List.List, IWAN_NT_TX_SLOT, List.List);
+
+            entry = Head->List.List.Flink;
+            IwanNtTxAbandonSlot(Tx, slot, TRUE);
+            if (entry == &Head->List.List || entry == NULL) {
+                break;
+            }
+            Head = CONTAINING_RECORD(entry, IWAN_NT_TX_SLOT, List.List);
+        }
+        return status;
+    }
+
+    KeAcquireSpinLock(&Tx->Lock, &oldIrql);
+    Tx->Submitted += Count;
+    Tx->Batches++;
+    KeReleaseSpinLock(&Tx->Lock, oldIrql);
+
+    return STATUS_SUCCESS;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+NTSTATUS
+IwanNtTxSendBatch(
+    _Inout_ PIWAN_NT_TX Tx,
+    _In_ const IWAN_NT_FRAME_HEADER *Header,
+    _In_reads_bytes_opt_(IWAN_NT_FRAME_KEY_LEN) const uint8_t *Key,
+    _In_reads_(Count) const IWAN_NT_TX_ITEM *Items,
+    _In_ ULONG Count,
+    _Out_ PULONG Accepted
+    )
+{
+    PIWAN_NT_TX_SLOT head = NULL;
+    PIWAN_NT_TX_SLOT tail = NULL;
+    PLIST_ENTRY queue = NULL;
+    ULONG taken = 0;
+    ULONG index;
+
+    if (Accepted != NULL) {
+        *Accepted = 0;
+    }
+    if (Tx == NULL || Header == NULL || Items == NULL || Count == 0 ||
+        Accepted == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    for (index = 0; index < Count; index++) {
+        PIWAN_NT_TX_SLOT slot;
+        IWAN_NT_FRAME_RESULT seal;
+        size_t frameLength;
+        size_t innerLength = Items[index].InnerLength;
+
+        if (Items[index].Inner == NULL || innerLength == 0) {
+            break;
+        }
+        frameLength = innerLength + IWAN_NT_FRAME_HDR_LEN;
+        if (frameLength > IWAN_NT_TX_BUFFER_BYTES) {
+            KIRQL oldIrql;
+
+            KeAcquireSpinLock(&Tx->Lock, &oldIrql);
+            Tx->TooLarge++;
+            KeReleaseSpinLock(&Tx->Lock, oldIrql);
+            break;
+        }
+
+        slot = IwanNtTxClaimSlot(Tx);
+        if (slot == NULL) {
+            break;
+        }
+
+        seal = IwanNtFrameSeal(
+            (uint8_t *)slot->Buffer, IWAN_NT_TX_BUFFER_BYTES, Items[index].Inner,
+            innerLength, Header, Key, &frameLength);
+        if (seal != IwanNtFrameOk) {
+            IwanNtTxAbandonSlot(Tx, slot, TRUE);
+            break;
+        }
+
+        slot->List.Buffer.Mdl = slot->Mdl;
+        slot->List.Buffer.Offset = 0;
+        slot->List.Buffer.Length = frameLength;
+        InitializeListHead(&slot->List.List);
+
+        if (head == NULL) {
+            head = slot;
+            if (queue == NULL) {
+                queue = &slot->List.List;
+            }
+        } else {
+            InsertTailList(queue, &slot->List.List);
+        }
+        tail = slot;
+        taken++;
+    }
+
+    if (taken == 0) {
+        return (Count == 0) ? STATUS_INVALID_PARAMETER
+                            : STATUS_INSUFFICIENT_RESOURCES;
+    }
+    UNREFERENCED_PARAMETER(tail);
+
+    {
+        NTSTATUS status = IwanNtTxSubmitChain(Tx, head, taken);
+
+        if (!NT_SUCCESS(status)) {
+            /* SubmitChain unwound every slot on the failing path. */
+            return status;
+        }
+    }
+
+    *Accepted = taken;
     return STATUS_SUCCESS;
 }
 
