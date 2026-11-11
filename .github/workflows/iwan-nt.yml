@@ -56,7 +56,7 @@ jobs:
             @{ n = 'km\wsk.h';        v = (Test-Path "$($inc.FullName)\km\wsk.h") },
             @{ n = 'km\ndis.h';       v = (Test-Path "$($inc.FullName)\km\ndis.h") },
             @{ n = 'netio.lib';       v = (Get-ChildItem "$sdk\Lib" -Recurse -Filter netio.lib -ErrorAction SilentlyContinue | Select-Object -First 6 -Expand FullName) -join ';' },
-            @{ n = 'wsk npi symbol';  v = ((Get-ChildItem "$sdk\Lib" -Recurse -Filter netio.lib -ErrorAction SilentlyContinue | ForEach-Object { if (Select-String -Path $_.FullName -Pattern 'NPI_WSK_INTERFACE_ID' -Quiet) { $_.FullName } }) -join ';') },
+            @{ n = 'wsk npi decl';    v = ((Get-ChildItem "$($inc.FullName)\km","$($inc.FullName)\shared" -Filter *.h -ErrorAction SilentlyContinue | Select-String -Pattern 'NPI_WSK_INTERFACE_ID' | ForEach-Object { "$($_.Filename):$($_.LineNumber):$($_.Line.Trim())" }) -join ' | ') },
             @{ n = 'ndis.lib';        v = (Get-ChildItem "$sdk\Lib" -Recurse -Filter ndis.lib -ErrorAction SilentlyContinue | Select-Object -First 2 -Expand FullName) -join ';' },
             @{ n = 'driver toolset props'; v = (Get-ChildItem "$vs\MSBuild" -Recurse -Filter 'WindowsKernelModeDriver*.props' -ErrorAction SilentlyContinue | Select-Object -First 2 -Expand FullName) -join ';' }
           )
