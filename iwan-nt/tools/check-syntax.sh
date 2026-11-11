@@ -51,6 +51,7 @@ run_host_test ring tests/ring_test.c driver/iwan_nt_ring.c
 run_host_test ingress tests/ingress_test.c driver/iwan_nt_ingress.c driver/iwan_nt_demux.c driver/iwan_nt_frame.c driver/iwan_nt_ring.c
 run_host_test crypto tests/crypto_test.c user/iwan_nt_crypto.c
 run_host_test session tests/session_test.c user/iwan_nt_session.c user/iwan_nt_crypto.c
+run_host_test handshake tests/handshake_test.c user/iwan_nt_handshake.c user/iwan_nt_session.c user/iwan_nt_crypto.c
 run_host_test pipeline tests/pipeline_test.c driver/iwan_nt_ingress.c driver/iwan_nt_demux.c driver/iwan_nt_frame.c driver/iwan_nt_ring.c user/iwan_nt_session.c user/iwan_nt_crypto.c
 
 if grep -rlP '[^\x00-\x7F]' driver tools 2>/dev/null | grep -v '\.vcxproj$' | grep -q .; then

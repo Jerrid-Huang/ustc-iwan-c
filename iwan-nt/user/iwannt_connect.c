@@ -5,28 +5,8 @@
 #include <string.h>
 #include <windows.h>
 
+#include "iwan_nt_handshake.h"
 #include "iwan_nt_session.h"
-
-/* The deployed protocol resends OPEN every two seconds until the answer lands. */
-#define IWANNT_OPEN_INTERVAL_MS 2000u
-#define IWANNT_ECHO_INTERVAL_MS 2000u
-
-typedef struct _IWANNT_CONNECT_STATE {
-    USHORT Sid;
-    ULONG Token;
-    ULONG Encrypted;
-    BOOLEAN Established;
-    ULONG OpensSent;
-    ULONG EchoesSent;
-    ULONG EchoesAnswered;
-    ULONG FramesRead;
-    ULONG ForeignFrames;
-    ULONG Rejected;
-    ULONG Closed;
-    BOOLEAN EverEstablished;
-    ULONGLONG NextOpen;
-    ULONGLONG NextEcho;
-} IWANNT_CONNECT_STATE;
 
 static void
 PrintAddress(
@@ -37,181 +17,58 @@ PrintAddress(
 }
 
 /*
- * Report one received control frame. The caller has already routed it by type, so
- * anything unexpected here is worth naming: a silent skip would hide a protocol
- * change behind an idle loop.
+ * Apply a state change to the driver. The state machine decides what the session
+ * is; this only mirrors that decision into the device, so the two cannot disagree
+ * about whether a key is installed.
  */
 static int
-HandleFrame(
-    _Inout_ PIWAN_NT_DEVICE Device,
-    _Inout_ IWANNT_CONNECT_STATE *State,
-    _In_ const UCHAR *Frame,
-    _In_ size_t Length,
-    _In_ const char *User,
-    _In_ const char *Password
+ApplyState(
+    _In_ PIWAN_NT_DEVICE Device,
+    _In_ const IWAN_NT_HANDSHAKE *Handshake
     )
 {
-    IWAN_NT_SESSION_RESULT result;
-
-    if (Frame[0] == IWAN_NT_SESSION_TYPE_OPEN_ACK) {
-        IWAN_NT_SESSION_ACK ack;
-        UCHAR key[8];
-
-        result = IwanNtSessionParseAck(Frame, Length, &ack);
-        if (result != IwanNtSessionOk) {
-            fprintf(stderr, "ACK parse failed: %d (%lu bytes)\n", (int)result,
-                    (unsigned long)Length);
-            return 1;
-        }
-
-        IwanNtSessionKey(User, Password, key);
-        if (IwanNtSetSession(Device, ack.Sid, ack.Token, ack.Encrypted ? TRUE : FALSE,
-                             key) == FALSE) {
+    if (Handshake->State == IwanNtHandshakeUp) {
+        if (IwanNtSetSession(Device, Handshake->Sid, Handshake->Token,
+                             Handshake->Encrypted ? TRUE : FALSE,
+                             Handshake->Key) == FALSE) {
             fprintf(stderr, "SET_SESSION failed: %lu\n", GetLastError());
             return 1;
         }
-
-        State->Sid = ack.Sid;
-        State->Token = ack.Token;
-        State->Encrypted = ack.Encrypted;
-        State->Established = TRUE;
-        State->EverEstablished = TRUE;
-
-        printf("CONNECT ack sid=%u token=%08lx mtu=%u encrypted=%lu",
-               (unsigned)ack.Sid, (unsigned long)ack.Token, (unsigned)ack.Mtu,
-               (unsigned long)ack.Encrypted);
-        if (ack.HasAddress) {
-            printf(" tun=");
-            PrintAddress(ack.Address);
-        }
-        if (ack.HasGateway) {
-            printf(" gw=");
-            PrintAddress(ack.Gateway);
-        }
-        printf("\n");
-        return 0;
-    }
-
-    if (Frame[0] == IWAN_NT_SESSION_TYPE_OPEN_REJECT) {
-        /*
-         * A rejection is not fatal: the server may be restarting, or the session
-         * may have been replaced. Forget the session, announce it, and let the
-         * retry timer send OPEN again.
-         */
-        (void)IwanNtClearSession(Device);
-        State->Established = FALSE;
-        State->Rejected++;
-        printf("CONNECT rejected by peer (#%lu)\n", (unsigned long)State->Rejected);
-        return 0;
-    }
-
-    if (Frame[0] == IWAN_NT_SESSION_TYPE_ECHO_RESPONSE) {
-        IWAN_NT_SESSION_ECHO echo;
-
-        result = IwanNtSessionParseEchoResponse(Frame, Length, &echo);
-        if (result != IwanNtSessionOk) {
-            fprintf(stderr, "ECHO parse failed: %d\n", (int)result);
+    } else {
+        if (IwanNtClearSession(Device) == FALSE) {
+            fprintf(stderr, "CLEAR_SESSION failed: %lu\n", GetLastError());
             return 1;
         }
-        State->EchoesAnswered++;
-        printf("CONNECT echo current=%luus min=%luus max=%luus\n",
-               (unsigned long)echo.Current, (unsigned long)echo.Minimum,
-               (unsigned long)echo.Maximum);
+    }
+    return 0;
+}
+
+static int
+Send(
+    _In_ PIWAN_NT_DEVICE Device,
+    _In_ const uint8_t *Frame,
+    _In_ size_t Length
+    )
+{
+    DWORD error;
+
+    if (IwanNtSendControl(Device, Frame, (UINT32)Length) != FALSE) {
         return 0;
     }
 
-    if (Frame[0] == IWAN_NT_SESSION_TYPE_CLOSE) {
+    error = GetLastError();
+    fprintf(stderr, "SEND_CONTROL failed: %lu\n", error);
+    if (error == ERROR_NOT_READY || error == ERROR_DEVICE_NOT_CONNECTED) {
         /*
-         * Forget the session here too: the driver must stop transforming DATA
-         * with a key the peer has already torn down.
+         * The transport only runs while the adapter does, and a freshly installed
+         * root adapter starts disabled. Name the fix instead of leaving the
+         * operator to guess why a send fails on a "ready" device.
          */
-        (void)IwanNtClearSession(Device);
-        State->Established = FALSE;
-        State->Closed++;
-        printf("CONNECT closed by peer (#%lu)\n", (unsigned long)State->Closed);
-        return 0;
+        fprintf(stderr,
+                "the adapter is not up: enable it, for example\n"
+                "  netsh interface set interface \"iWAN NT Transport Adapter\" admin=enable\n");
     }
-
-    State->ForeignFrames++;
-    printf("CONNECT frame type=0x%02x len=%lu\n", (unsigned)Frame[0],
-           (unsigned long)Length);
-    return 0;
-}
-
-static int
-SendOpen(
-    _In_ PIWAN_NT_DEVICE Device,
-    _Inout_ IWANNT_CONNECT_STATE *State,
-    _In_ const char *User,
-    _In_ const char *Password,
-    _In_ USHORT Mtu
-    )
-{
-    IWAN_NT_SESSION_OPEN open;
-    IWAN_NT_SESSION_RESULT result;
-    UCHAR frame[IWAN_NT_SESSION_CONTROL_MAX];
-    size_t length = 0;
-
-    open.User = User;
-    open.Password = Password;
-    open.Mtu = Mtu;
-
-    result = IwanNtSessionBuildOpen(&open, frame, sizeof(frame), &length);
-    if (result != IwanNtSessionOk) {
-        fprintf(stderr, "OPEN build failed: %d\n", (int)result);
-        return 1;
-    }
-    if (IwanNtSendControl(Device, frame, (UINT32)length) == FALSE) {
-        DWORD error = GetLastError();
-
-        fprintf(stderr, "SEND_CONTROL failed: %lu\n", error);
-        if (error == ERROR_NOT_READY || error == ERROR_DEVICE_NOT_CONNECTED) {
-            /*
-             * The transport only runs while the adapter does, and a freshly
-             * installed root adapter starts disabled. Say so instead of leaving
-             * the operator to guess why a send fails on a "ready" device.
-             */
-            fprintf(stderr,
-                    "the adapter is not up: enable it, for example\n"
-                    "  netsh interface set interface \"iWAN NT Transport Adapter\" admin=enable\n");
-        }
-        return 1;
-    }
-
-    State->OpensSent++;
-    printf("CONNECT open sent #%lu (%lu bytes)\n", (unsigned long)State->OpensSent,
-           (unsigned long)length);
-    return 0;
-}
-
-static int
-SendEcho(
-    _In_ PIWAN_NT_DEVICE Device,
-    _Inout_ IWANNT_CONNECT_STATE *State
-    )
-{
-    IWAN_NT_SESSION_RESULT result;
-    UCHAR frame[IWAN_NT_SESSION_ECHO_LEN];
-    size_t length = 0;
-    LARGE_INTEGER counter;
-    ULONGLONG microseconds = 0;
-
-    QueryPerformanceCounter(&counter);
-    microseconds = (ULONGLONG)counter.QuadPart;
-
-    result = IwanNtSessionBuildEchoRequest(State->Sid, State->Token, microseconds,
-                                           frame, sizeof(frame), &length);
-    if (result != IwanNtSessionOk) {
-        fprintf(stderr, "ECHO build failed: %d\n", (int)result);
-        return 1;
-    }
-    if (IwanNtSendControl(Device, frame, (UINT32)length) == FALSE) {
-        fprintf(stderr, "SEND_CONTROL failed: %lu\n", GetLastError());
-        return 1;
-    }
-
-    State->EchoesSent++;
-    return 0;
+    return 1;
 }
 
 int
@@ -221,14 +78,12 @@ IwanNtRunConnect(
     _In_ char **Argv
     )
 {
-    IWANNT_CONNECT_STATE state;
-    UCHAR frame[IWAN_NT_CONTROL_MAX];
-    ULONG address = 0;
-    USHORT port = 0;
+    IWAN_NT_HANDSHAKE handshake;
+    uint8_t frame[IWAN_NT_CONTROL_MAX];
+    ULONG address;
+    USHORT port;
     USHORT mtu = 1400;
     unsigned long seconds = 15;
-    const char *user;
-    const char *password;
     ULONGLONG deadline;
     int status = 0;
 
@@ -238,8 +93,6 @@ IwanNtRunConnect(
         return 1;
     }
 
-    user = Argv[4];
-    password = Argv[5];
     address = inet_addr(Argv[2]);
     if (address == INADDR_NONE) {
         fprintf(stderr, "bad address %s\n", Argv[2]);
@@ -257,81 +110,112 @@ IwanNtRunConnect(
         fprintf(stderr, "SET_PEER failed: %lu\n", GetLastError());
         return 1;
     }
+    if (IwanNtHandshakeInitialize(&handshake, Argv[4], Argv[5], mtu,
+                                  GetTickCount64()) == 0) {
+        fprintf(stderr, "user or password too long\n");
+        return 1;
+    }
 
-    memset(&state, 0, sizeof(state));
     deadline = GetTickCount64() + (ULONGLONG)seconds * 1000ull;
-    state.NextOpen = GetTickCount64();
 
     for (;;) {
         ULONGLONG now = GetTickCount64();
         UINT32 required = 0;
-        int length;
+        size_t length = 0;
+        int pending;
+        int read;
 
         if (now >= deadline) {
             break;
         }
 
-        if (!state.Established && now >= state.NextOpen) {
-            if (SendOpen(Device, &state, user, password, mtu) != 0) {
+        pending = IwanNtHandshakeTick(&handshake, now, frame, sizeof(frame),
+                                      &length);
+        if (handshake.Fault != IwanNtSessionOk) {
+            fprintf(stderr, "frame build failed: %d\n", (int)handshake.Fault);
+            status = 1;
+            break;
+        }
+        if (pending) {
+            if (Send(Device, frame, length) != 0) {
                 status = 1;
                 break;
             }
-            state.NextOpen = now + IWANNT_OPEN_INTERVAL_MS;
-        } else if (!state.Established) {
-            /* Waiting for the retry timer; nothing to send this pass. */
-        } else if (now >= state.NextEcho) {
-            if (SendEcho(Device, &state) != 0) {
-                status = 1;
-                break;
-            }
-            state.NextEcho = now + IWANNT_ECHO_INTERVAL_MS;
         }
 
         /*
-         * One frame per pass: the ring is bounded and the driver reports an empty
-         * queue as zero bytes, so this drains without ever blocking the keepalive.
+         * One frame per pass. The ring is bounded and an empty queue is reported
+         * as zero bytes, so this drains without ever blocking the timer.
          */
-        length = IwanNtReadControl(Device, frame, sizeof(frame), &required);
-        if (length < 0) {
+        read = IwanNtReadControl(Device, frame, sizeof(frame), &required);
+        if (read < 0) {
             if (GetLastError() != ERROR_NO_MORE_ITEMS) {
                 fprintf(stderr, "READ_CONTROL failed: %lu\n", GetLastError());
                 status = 1;
                 break;
             }
-        } else if (length > 0) {
-            state.FramesRead++;
-            status = HandleFrame(Device, &state, frame, (size_t)length, user, password);
-            if (status != 0) {
+        } else if (read > 0) {
+            IWAN_NT_HANDSHAKE_EVENT event = IwanNtHandshakeOnFrame(
+                &handshake, frame, (size_t)read, GetTickCount64());
+
+            if (event == IwanNtHandshakeEventEstablished) {
+                printf("CONNECT ack sid=%u token=%08lx mtu=%u encrypted=%lu",
+                       (unsigned)handshake.Sid, (unsigned long)handshake.Token,
+                       (unsigned)handshake.MtuFromPeer,
+                       (unsigned long)handshake.Encrypted);
+                if (handshake.HasAddress) {
+                    printf(" tun=");
+                    PrintAddress(handshake.Address);
+                }
+                if (handshake.HasGateway) {
+                    printf(" gw=");
+                    PrintAddress(handshake.Gateway);
+                }
+                printf("\n");
+            } else if (event == IwanNtHandshakeEventRejected) {
+                printf("CONNECT rejected (#%lu)\n",
+                       (unsigned long)handshake.Rejects);
+            } else if (event == IwanNtHandshakeEventClosed) {
+                printf("CONNECT closed by peer (#%lu)\n",
+                       (unsigned long)handshake.Closes);
+            } else if (event == IwanNtHandshakeEventEchoAnswer) {
+                printf("CONNECT echo current=%luus min=%luus max=%luus\n",
+                       (unsigned long)handshake.DelayCurrent,
+                       (unsigned long)handshake.DelayMinimum,
+                       (unsigned long)handshake.DelayMaximum);
+            } else if (event == IwanNtHandshakeEventFault) {
+                fprintf(stderr, "frame rejected: %d\n", (int)handshake.Fault);
+                status = 1;
                 break;
             }
-            if (!state.Established) {
-                /* The next OPEN must not wait for a stale deadline. */
-                state.NextOpen = GetTickCount64() + IWANNT_OPEN_INTERVAL_MS;
+
+            if (ApplyState(Device, &handshake) != 0) {
+                status = 1;
+                break;
             }
         }
 
         Sleep(10);
     }
 
-    printf("CONNECT done opens=%lu echoes=%lu answered=%lu frames=%lu foreign=%lu "
-           "rejected=%lu closed=%lu\n",
-           (unsigned long)state.OpensSent, (unsigned long)state.EchoesSent,
-           (unsigned long)state.EchoesAnswered, (unsigned long)state.FramesRead,
-           (unsigned long)state.ForeignFrames, (unsigned long)state.Rejected,
-           (unsigned long)state.Closed);
-    if (!state.EverEstablished) {
+    printf("CONNECT done opens=%lu echoes=%lu answered=%lu rejected=%lu closed=%lu "
+           "foreign=%lu state=%s\n",
+           (unsigned long)handshake.Opens, (unsigned long)handshake.Echoes,
+           (unsigned long)handshake.EchoAnswers, (unsigned long)handshake.Rejects,
+           (unsigned long)handshake.Closes, (unsigned long)handshake.ForeignFrames,
+           (handshake.State == IwanNtHandshakeUp) ? "up" : "down");
+
+    if (handshake.EverEstablished == 0) {
         status = 3;
-    }
-    if (state.Established) {
+    } else if (handshake.State == IwanNtHandshakeUp) {
         IWAN_NT_STATS_ABI stats;
 
         memset(&stats, 0, sizeof(stats));
         if (IwanNtGetStats(Device, &stats) != FALSE) {
-            printf("CONNECT stats tx=%llu rx=%llu delivered=%llu dropped=%llu inflight=%lu\n",
+            printf("CONNECT stats tx=%llu rx=%llu delivered=%llu inflight=%lu\n",
                    (unsigned long long)stats.TxAccepted,
                    (unsigned long long)stats.RxIndicated,
                    (unsigned long long)stats.Delivered,
-                   (unsigned long long)stats.DroppedBadInner,
                    (unsigned long)stats.TxInFlight);
         }
     }
