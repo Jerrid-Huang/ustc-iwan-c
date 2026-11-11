@@ -171,6 +171,49 @@ TestEcho(void)
     Check("echo-too-large", result == IwanNtSessionTooLarge);
 }
 
+static void
+TestEchoResponse(void)
+{
+    uint8_t frame[IWAN_NT_SESSION_ECHO_LEN];
+    IWAN_NT_SESSION_ECHO echo;
+    IWAN_NT_SESSION_RESULT result;
+    size_t length = 0;
+
+    /* A response is the request echoed back with the type and delays filled in. */
+    result = IwanNtSessionBuildEchoRequest(9u, 0xe4977730u, 0x1122334455667788ull,
+                                          frame, sizeof(frame), &length);
+    Check("echo-resp-build", result == IwanNtSessionOk);
+    frame[0] = 0x16;
+    frame[32] = 0x00;
+    frame[33] = 0x00;
+    frame[34] = 0x1f;
+    frame[35] = 0x40;   /* 8000 us */
+    frame[36] = 0x00;
+    frame[37] = 0x00;
+    frame[38] = 0x0d;
+    frame[39] = 0xac;   /* 3500 us */
+    frame[40] = 0x00;
+    frame[41] = 0x00;
+    frame[42] = 0x27;
+    frame[43] = 0x10;   /* 10000 us */
+
+    result = IwanNtSessionParseEchoResponse(frame, length, &echo);
+    Check("echo-resp-ok", result == IwanNtSessionOk);
+    Check("echo-resp-sid", echo.Sid == 9u);
+    Check("echo-resp-token", echo.Token == 0xe4977730u);
+    Check("echo-resp-tick", echo.Tick == 0x1122334455667788ull);
+    Check("echo-resp-current", echo.Current == 8000u);
+    Check("echo-resp-minimum", echo.Minimum == 3500u);
+    Check("echo-resp-maximum", echo.Maximum == 10000u);
+
+    Check("echo-resp-short", IwanNtSessionParseEchoResponse(frame, 40u, &echo) ==
+                                 IwanNtSessionShortFrame);
+
+    /* Routing helper: an unknown type must not be mistaken for a known one. */
+    Check("type-open", IwanNtSessionType(frame, length) == 0x16u);
+    Check("type-null", IwanNtSessionType(NULL, 0u) == 0u);
+}
+
 int
 main(void)
 {
@@ -178,11 +221,12 @@ main(void)
     TestOpen();
     TestParseAck();
     TestEcho();
+    TestEchoResponse();
 
     if (Failures != 0) {
         printf("session: %d failures\n", Failures);
         return 1;
     }
-    printf("session: 32 checks, 0 failures\n");
+    printf("session: 42 checks, 0 failures\n");
     return 0;
 }

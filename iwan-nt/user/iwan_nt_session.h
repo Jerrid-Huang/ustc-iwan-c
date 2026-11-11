@@ -68,6 +68,19 @@ typedef struct _IWAN_NT_SESSION_ACK {
     uint8_t Gateway[4];
 } IWAN_NT_SESSION_ACK;
 
+/*
+ * A keepalive answer carries the delay the peer measured, which is the only
+ * reachability signal that is stronger than "the socket accepted the send".
+ */
+typedef struct _IWAN_NT_SESSION_ECHO {
+    uint16_t Sid;
+    uint32_t Token;
+    uint64_t Tick;      /* echoed from the request, in microseconds */
+    uint32_t Current;   /* microseconds */
+    uint32_t Minimum;
+    uint32_t Maximum;
+} IWAN_NT_SESSION_ECHO;
+
 typedef enum _IWAN_NT_SESSION_RESULT {
     IwanNtSessionOk = 0,
     IwanNtSessionBadArgument,
@@ -119,6 +132,21 @@ IwanNtSessionBuildEchoRequest(
     uint8_t *Buffer,
     size_t Capacity,
     size_t *Length
+    );
+
+/* Parse an ECHO response; the delay fields are big endian, the tick is not. */
+IWAN_NT_SESSION_RESULT
+IwanNtSessionParseEchoResponse(
+    const uint8_t *Frame,
+    size_t Length,
+    IWAN_NT_SESSION_ECHO *Echo
+    );
+
+/* The frame type, for callers that only need to route a received frame. */
+uint8_t
+IwanNtSessionType(
+    const uint8_t *Frame,
+    size_t Length
     );
 
 #ifdef __cplusplus

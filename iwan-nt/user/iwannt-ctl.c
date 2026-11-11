@@ -14,6 +14,7 @@
  *   iwannt-ctl read [count]
  *   iwannt-ctl watch <seconds>
  *   iwannt-ctl open <user> <password> <mtu> [send]
+ *   iwannt-ctl connect <ip> <port> <user> <password> [mtu] [seconds]
  *
  * The open subcommand works without the driver loaded: it only builds the frame,
  * which is the fastest way to compare our framing against a captured one.
@@ -26,6 +27,7 @@
 
 #include "iwan_nt_control.h"
 #include "iwan_nt_session.h"
+#include "iwannt_connect.h"
 
 static VOID
 Usage(VOID)
@@ -39,7 +41,8 @@ Usage(VOID)
             "  iwannt-ctl send <hex>\n"
             "  iwannt-ctl read [count]\n"
             "  iwannt-ctl watch <seconds>\n"
-            "  iwannt-ctl open <user> <password> <mtu> [send]\n");
+            "  iwannt-ctl open <user> <password> <mtu> [send]\n"
+            "  iwannt-ctl connect <ip> <port> <user> <password> [mtu] [seconds]\n");
 }
 
 static BOOL
@@ -434,6 +437,8 @@ main(
         result = CommandRead(&device, argc, argv);
     } else if (strcmp(argv[1], "watch") == 0) {
         result = CommandWatch(&device, argc, argv);
+    } else if (strcmp(argv[1], "connect") == 0) {
+        result = IwanNtRunConnect(&device, argc, argv);
     } else {
         Usage();
         result = 2;

@@ -307,3 +307,42 @@ IwanNtSessionBuildEchoRequest(
     *Length = offset;
     return IwanNtSessionOk;
 }
+
+uint8_t
+IwanNtSessionType(
+    const uint8_t *Frame,
+    size_t Length
+    )
+{
+    if (Frame == NULL || Length < 1u) {
+        return 0;
+    }
+    return Frame[0];
+}
+
+IWAN_NT_SESSION_RESULT
+IwanNtSessionParseEchoResponse(
+    const uint8_t *Frame,
+    size_t Length,
+    IWAN_NT_SESSION_ECHO *Echo
+    )
+{
+    if (Frame == NULL || Echo == NULL) {
+        return IwanNtSessionBadArgument;
+    }
+    if (Length < IWAN_NT_SESSION_ECHO_LEN) {
+        return IwanNtSessionShortFrame;
+    }
+    if (Frame[0] != IWAN_NT_SESSION_TYPE_ECHO_RESPONSE) {
+        return IwanNtSessionWrongType;
+    }
+
+    memset(Echo, 0, sizeof(*Echo));
+    Echo->Sid = IwanNtSessionGetBe16(Frame + 2u);
+    Echo->Token = IwanNtSessionGetBe32(Frame + 4u);
+    memcpy(&Echo->Tick, Frame + IWAN_NT_SESSION_PREFIX, sizeof(Echo->Tick));
+    Echo->Current = IwanNtSessionGetBe32(Frame + IWAN_NT_SESSION_PREFIX + 8u);
+    Echo->Minimum = IwanNtSessionGetBe32(Frame + IWAN_NT_SESSION_PREFIX + 12u);
+    Echo->Maximum = IwanNtSessionGetBe32(Frame + IWAN_NT_SESSION_PREFIX + 16u);
+    return IwanNtSessionOk;
+}
