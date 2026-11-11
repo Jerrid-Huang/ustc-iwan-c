@@ -107,6 +107,9 @@
     <ClCompile Include="iwan_nt.c" />
     <ClCompile Include="iwan_nt_demux.c" />
     <ClCompile Include="iwan_nt_addr.c" />
+    <ClCompile Include="iwan_nt_peer.c" />
+    <ClCompile Include="iwan_nt_session.c" />
+    <ClCompile Include="iwan_nt_crypto.c" />
     <ClCompile Include="iwan_nt_frame.c" />
     <ClCompile Include="iwan_nt_control.c" />
     <ClCompile Include="iwan_nt_ingress.c" />
@@ -122,6 +125,10 @@
   <ItemGroup>
     <ClInclude Include="iwan_nt_demux.h" />
     <ClInclude Include="iwan_nt_addr.h" />
+    <ClInclude Include="iwan_nt_string.h" />
+    <ClInclude Include="iwan_nt_peer.h" />
+    <ClInclude Include="iwan_nt_session.h" />
+    <ClInclude Include="iwan_nt_crypto.h" />
     <ClInclude Include="iwan_nt_frame.h" />
     <ClInclude Include="iwan_nt_control.h" />
     <ClInclude Include="iwan_nt_ioctl.h" />

@@ -1,6 +1,6 @@
-#include "iwan_nt_handshake.h"
+#include "iwan_nt_peer.h"
 
-#include <string.h>
+#include "iwan_nt_string.h"
 
 static int
 CopyName(
@@ -19,17 +19,17 @@ CopyName(
         return 1;
     }
 
-    length = strlen(Source);
+    length = IwanNtStringLength(Source);
     if (length >= Capacity) {
         return 0;
     }
-    memcpy(Destination, Source, length + 1u);
+    IwanNtMemCopy(Destination, Source, length + 1u);
     return 1;
 }
 
 int
-IwanNtHandshakeInitialize(
-    IWAN_NT_HANDSHAKE *Handshake,
+IwanNtPeerInitialize(
+    IWAN_NT_PEER *Handshake,
     const char *User,
     const char *Password,
     uint16_t Mtu,
@@ -40,7 +40,7 @@ IwanNtHandshakeInitialize(
         return 0;
     }
 
-    memset(Handshake, 0, sizeof(*Handshake));
+    IwanNtMemZero(Handshake, sizeof(*Handshake));
     if (!CopyName(Handshake->User, sizeof(Handshake->User), User)) {
         return 0;
     }
@@ -49,15 +49,15 @@ IwanNtHandshakeInitialize(
     }
 
     Handshake->Mtu = Mtu;
-    Handshake->State = IwanNtHandshakeDown;
+    Handshake->State = IwanNtPeerDown;
     /* Send the first OPEN on the first tick rather than a full interval later. */
     Handshake->NextActionMs = NowMs;
     return 1;
 }
 
 void
-IwanNtHandshakeReset(
-    IWAN_NT_HANDSHAKE *Handshake,
+IwanNtPeerReset(
+    IWAN_NT_PEER *Handshake,
     uint64_t NowMs
     )
 {
@@ -65,21 +65,21 @@ IwanNtHandshakeReset(
         return;
     }
 
-    Handshake->State = IwanNtHandshakeDown;
+    Handshake->State = IwanNtPeerDown;
     Handshake->Sid = 0;
     Handshake->Token = 0;
     Handshake->Encrypted = 0;
-    memset(Handshake->Key, 0, sizeof(Handshake->Key));
+    IwanNtMemZero(Handshake->Key, sizeof(Handshake->Key));
     /*
      * Wait one interval before the next OPEN: an immediate retry would spin
      * against a peer that is already refusing us.
      */
-    Handshake->NextActionMs = NowMs + IWAN_NT_HANDSHAKE_OPEN_MS;
+    Handshake->NextActionMs = NowMs + IWAN_NT_PEER_OPEN_MS;
 }
 
 int
-IwanNtHandshakeTick(
-    IWAN_NT_HANDSHAKE *Handshake,
+IwanNtPeerTick(
+    IWAN_NT_PEER *Handshake,
     uint64_t NowMs,
     uint8_t *Buffer,
     size_t Capacity,
@@ -95,12 +95,12 @@ IwanNtHandshakeTick(
      * the machine back in Down and schedules the next OPEN one interval out, so
      * the caller does not have to drive reconnection itself.
      */
-    if (Handshake->State == IwanNtHandshakeUp &&
+    if (Handshake->State == IwanNtPeerUp &&
         NowMs > Handshake->LastAcceptedMs &&
         (NowMs - Handshake->LastAcceptedMs) >
-            (uint64_t)IWAN_NT_HANDSHAKE_DATA_TIMEOUT_MS) {
+            (uint64_t)IWAN_NT_PEER_DATA_TIMEOUT_MS) {
         Handshake->Timeouts++;
-        IwanNtHandshakeReset(Handshake, NowMs);
+        IwanNtPeerReset(Handshake, NowMs);
         return 0;
     }
 
@@ -108,7 +108,7 @@ IwanNtHandshakeTick(
         return 0;
     }
 
-    if (Handshake->State == IwanNtHandshakeUp) {
+    if (Handshake->State == IwanNtPeerUp) {
         IWAN_NT_SESSION_RESULT result = IwanNtSessionBuildEchoRequest(
             Handshake->Sid, Handshake->Token, NowMs, Buffer, Capacity, Length);
 
@@ -117,7 +117,7 @@ IwanNtHandshakeTick(
             return 0;
         }
         Handshake->Echoes++;
-        Handshake->NextActionMs = NowMs + IWAN_NT_HANDSHAKE_ECHO_MS;
+        Handshake->NextActionMs = NowMs + IWAN_NT_PEER_ECHO_MS;
         return 1;
     }
 
@@ -135,21 +135,21 @@ IwanNtHandshakeTick(
             return 0;
         }
         Handshake->Opens++;
-        Handshake->NextActionMs = NowMs + IWAN_NT_HANDSHAKE_OPEN_MS;
+        Handshake->NextActionMs = NowMs + IWAN_NT_PEER_OPEN_MS;
         return 1;
     }
 }
 
-IWAN_NT_HANDSHAKE_EVENT
-IwanNtHandshakeOnFrame(
-    IWAN_NT_HANDSHAKE *Handshake,
+IWAN_NT_PEER_EVENT
+IwanNtPeerOnFrame(
+    IWAN_NT_PEER *Handshake,
     const uint8_t *Frame,
     size_t Length,
     uint64_t NowMs
     )
 {
     if (Handshake == NULL || Frame == NULL || Length < 1u) {
-        return IwanNtHandshakeEventNone;
+        return IwanNtPeerEventNone;
     }
 
     /*
@@ -159,7 +159,7 @@ IwanNtHandshakeOnFrame(
      */
     if (IwanNtSessionVerify(Frame, Length) == 0) {
         Handshake->ForeignFrames++;
-        return IwanNtHandshakeEventNone;
+        return IwanNtPeerEventNone;
     }
 
     /* Any authenticated frame proves the peer is alive and the key still fits. */
@@ -173,12 +173,12 @@ IwanNtHandshakeOnFrame(
 
         if (result != IwanNtSessionOk) {
             Handshake->Fault = result;
-            return IwanNtHandshakeEventFault;
+            return IwanNtPeerEventFault;
         }
-        if (Handshake->State == IwanNtHandshakeUp &&
+        if (Handshake->State == IwanNtPeerUp &&
             ack.Sid == Handshake->Sid && ack.Token == Handshake->Token) {
             /* A duplicate answer to a retransmitted OPEN: nothing changed. */
-            return IwanNtHandshakeEventNone;
+            return IwanNtPeerEventNone;
         }
 
         IwanNtSessionKey(Handshake->User, Handshake->Password, Handshake->Key);
@@ -189,26 +189,26 @@ IwanNtHandshakeOnFrame(
         Handshake->HasAddress = ack.HasAddress ? 1 : 0;
         Handshake->HasGateway = ack.HasGateway ? 1 : 0;
         if (Handshake->HasAddress) {
-            memcpy(Handshake->Address, ack.Address, sizeof(Handshake->Address));
+            IwanNtMemCopy(Handshake->Address, ack.Address, sizeof(Handshake->Address));
         }
         if (Handshake->HasGateway) {
-            memcpy(Handshake->Gateway, ack.Gateway, sizeof(Handshake->Gateway));
+            IwanNtMemCopy(Handshake->Gateway, ack.Gateway, sizeof(Handshake->Gateway));
         }
-        Handshake->State = IwanNtHandshakeUp;
+        Handshake->State = IwanNtPeerUp;
         Handshake->EverEstablished = 1;
-        Handshake->NextActionMs = NowMs + IWAN_NT_HANDSHAKE_ECHO_MS;
-        return IwanNtHandshakeEventEstablished;
+        Handshake->NextActionMs = NowMs + IWAN_NT_PEER_ECHO_MS;
+        return IwanNtPeerEventEstablished;
     }
 
     case IWAN_NT_SESSION_TYPE_OPEN_REJECT:
         Handshake->Rejects++;
-        IwanNtHandshakeReset(Handshake, NowMs);
-        return IwanNtHandshakeEventRejected;
+        IwanNtPeerReset(Handshake, NowMs);
+        return IwanNtPeerEventRejected;
 
     case IWAN_NT_SESSION_TYPE_CLOSE:
         Handshake->Closes++;
-        IwanNtHandshakeReset(Handshake, NowMs);
-        return IwanNtHandshakeEventClosed;
+        IwanNtPeerReset(Handshake, NowMs);
+        return IwanNtPeerEventClosed;
 
     case IWAN_NT_SESSION_TYPE_ECHO_RESPONSE:
     {
@@ -218,22 +218,22 @@ IwanNtHandshakeOnFrame(
 
         if (result != IwanNtSessionOk) {
             Handshake->Fault = result;
-            return IwanNtHandshakeEventFault;
+            return IwanNtPeerEventFault;
         }
-        if (Handshake->State != IwanNtHandshakeUp) {
+        if (Handshake->State != IwanNtPeerUp) {
             /* An answer without a session is a stray from an older exchange. */
-            return IwanNtHandshakeEventNone;
+            return IwanNtPeerEventNone;
         }
 
         Handshake->DelayCurrent = echo.Current;
         Handshake->DelayMinimum = echo.Minimum;
         Handshake->DelayMaximum = echo.Maximum;
         Handshake->EchoAnswers++;
-        return IwanNtHandshakeEventEchoAnswer;
+        return IwanNtPeerEventEchoAnswer;
     }
 
     default:
         Handshake->ForeignFrames++;
-        return IwanNtHandshakeEventNone;
+        return IwanNtPeerEventNone;
     }
 }

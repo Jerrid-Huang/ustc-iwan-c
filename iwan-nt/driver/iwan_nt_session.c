@@ -1,6 +1,6 @@
 #include "iwan_nt_session.h"
 
-#include <string.h>
+#include "iwan_nt_string.h"
 
 #include "iwan_nt_crypto.h"
 
@@ -102,7 +102,7 @@ IwanNtSessionSign(
     IwanNtMd5Update(&context, Frame, IWAN_NT_SESSION_HEADER);
     IwanNtMd5Update(&context, IwanNtSessionMagic, sizeof(IwanNtSessionMagic));
     IwanNtMd5Finalize(&context, digest);
-    memcpy(Frame + IWAN_NT_SESSION_HEADER, digest, sizeof(digest));
+    IwanNtMemCopy(Frame + IWAN_NT_SESSION_HEADER, digest, sizeof(digest));
 }
 
 void
@@ -158,11 +158,11 @@ IwanNtSessionKey(
     uint8_t digest[16];
 
     IwanNtMd5Initialize(&context);
-    IwanNtMd5Update(&context, User, strlen(User));
-    IwanNtMd5Update(&context, Password, strlen(Password));
+    IwanNtMd5Update(&context, User, IwanNtStringLength(User));
+    IwanNtMd5Update(&context, Password, IwanNtStringLength(Password));
     IwanNtMd5Finalize(&context, digest);
-    memcpy(Key, digest, 8);
-    memset(digest, 0, sizeof(digest));
+    IwanNtMemCopy(Key, digest, 8);
+    IwanNtMemZero(digest, sizeof(digest));
 }
 
 static size_t
@@ -179,23 +179,23 @@ IwanNtSessionPasswordBlock(
 
     IwanNtMd5Initialize(&context);
     IwanNtMd5Update(&context, IwanNtSessionMagic, sizeof(IwanNtSessionMagic));
-    IwanNtMd5Update(&context, User, strlen(User));
+    IwanNtMd5Update(&context, User, IwanNtStringLength(User));
     IwanNtMd5Finalize(&context, key);
 
     /*
      * Long passwords are truncated, not rejected: the reference implementation
      * does the same, and the server compares against that same truncation.
      */
-    memset(plain, 0, sizeof(plain));
-    length = strlen(Password);
+    IwanNtMemZero(plain, sizeof(plain));
+    length = IwanNtStringLength(Password);
     if (length > sizeof(plain)) {
         length = sizeof(plain);
     }
-    memcpy(plain, Password, length);
+    IwanNtMemCopy(plain, Password, length);
 
     IwanNtAes128EncryptBlock(key, plain, Out);
-    memset(key, 0, sizeof(key));
-    memset(plain, 0, sizeof(plain));
+    IwanNtMemZero(key, sizeof(key));
+    IwanNtMemZero(plain, sizeof(plain));
     return length;
 }
 
@@ -216,7 +216,7 @@ IwanNtSessionBuildOpen(
         return IwanNtSessionBadArgument;
     }
 
-    userLength = strlen(Open->User);
+    userLength = IwanNtStringLength(Open->User);
     if (userLength == 0 || userLength > 64u) {
         return IwanNtSessionBadArgument;
     }
@@ -224,7 +224,7 @@ IwanNtSessionBuildOpen(
         return IwanNtSessionTooLarge;
     }
 
-    memset(Buffer, 0, IWAN_NT_SESSION_PREFIX);
+    IwanNtMemZero(Buffer, IWAN_NT_SESSION_PREFIX);
     Buffer[0] = IWAN_NT_SESSION_TYPE_OPEN;
     /*
      * Header byte 1 carries the encryption request in OPEN and the session's
@@ -251,16 +251,16 @@ IwanNtSessionBuildOpen(
      */
     Buffer[offset + 0u] = IWAN_NT_SESSION_TLV_USER;
     Buffer[offset + 1u] = (uint8_t)(2u + userLength);
-    memcpy(Buffer + offset + 2u, Open->User, userLength);
+    IwanNtMemCopy(Buffer + offset + 2u, Open->User, userLength);
     offset += 2u + userLength;
 
     /* TLV 2: AES-128-ECB of the zero-padded password. */
     (void)IwanNtSessionPasswordBlock(Open->User, Open->Password, password);
     Buffer[offset + 0u] = IWAN_NT_SESSION_TLV_PASSWORD;
     Buffer[offset + 1u] = 18;
-    memcpy(Buffer + offset + 2u, password, sizeof(password));
+    IwanNtMemCopy(Buffer + offset + 2u, password, sizeof(password));
     offset += 18u;
-    memset(password, 0, sizeof(password));
+    IwanNtMemZero(password, sizeof(password));
 
     /* TLV 8: request the encrypted DATA form. */
     Buffer[offset + 0u] = IWAN_NT_SESSION_TLV_ENCRYPT;
@@ -296,7 +296,7 @@ IwanNtSessionParseAck(
         return IwanNtSessionWrongType;
     }
 
-    memset(Ack, 0, sizeof(*Ack));
+    IwanNtMemZero(Ack, sizeof(*Ack));
     Ack->Sid = IwanNtSessionGetLe16(Frame + 2u);
     Ack->Token = IwanNtSessionGetLe32(Frame + 4u);
 
@@ -323,14 +323,14 @@ IwanNtSessionParseAck(
             if (valueLength != 4u) {
                 return IwanNtSessionBadTlv;
             }
-            memcpy(Ack->Address, value, 4);
+            IwanNtMemCopy(Ack->Address, value, 4);
             Ack->HasAddress = 1;
             break;
         case IWAN_NT_SESSION_TLV_GATEWAY:
             if (valueLength != 4u) {
                 return IwanNtSessionBadTlv;
             }
-            memcpy(Ack->Gateway, value, 4);
+            IwanNtMemCopy(Ack->Gateway, value, 4);
             Ack->HasGateway = 1;
             break;
         case IWAN_NT_SESSION_TLV_ENCRYPT:
@@ -369,7 +369,7 @@ IwanNtSessionBuildEchoRequest(
         return IwanNtSessionTooLarge;
     }
 
-    memset(Buffer, 0, IWAN_NT_SESSION_ECHO_LEN);
+    IwanNtMemZero(Buffer, IWAN_NT_SESSION_ECHO_LEN);
     Buffer[0] = IWAN_NT_SESSION_TYPE_ECHO_REQUEST;
     Buffer[1] = 0;
     IwanNtSessionPutLe16(Buffer + 2u, Sid);
@@ -378,7 +378,7 @@ IwanNtSessionBuildEchoRequest(
 
     offset = IWAN_NT_SESSION_PREFIX;
     /* The tick is little endian: the peer reads it as a host-order integer. */
-    memcpy(Buffer + offset, &TickMicros, sizeof(TickMicros));
+    IwanNtMemCopy(Buffer + offset, &TickMicros, sizeof(TickMicros));
     offset += 8u;
     /*
      * The delays are machine order as well: the reference client stores them from
@@ -395,7 +395,7 @@ IwanNtSessionBuildEchoRequest(
     offset += 4u;
     /* four bytes the reference client never writes */
     offset += 4u;
-    memcpy(Buffer + offset, "SDRT", 4u);
+    IwanNtMemCopy(Buffer + offset, "SDRT", 4u);
     offset += 4u;
     /* route magic and entry count: this build never fills the table */
     IwanNtSessionPutBe32(Buffer + offset, 0);
@@ -436,10 +436,10 @@ IwanNtSessionParseEchoResponse(
         return IwanNtSessionWrongType;
     }
 
-    memset(Echo, 0, sizeof(*Echo));
+    IwanNtMemZero(Echo, sizeof(*Echo));
     Echo->Sid = IwanNtSessionGetLe16(Frame + 2u);
     Echo->Token = IwanNtSessionGetLe32(Frame + 4u);
-    memcpy(&Echo->Tick, Frame + IWAN_NT_SESSION_PREFIX, sizeof(Echo->Tick));
+    IwanNtMemCopy(&Echo->Tick, Frame + IWAN_NT_SESSION_PREFIX, sizeof(Echo->Tick));
     Echo->Current = IwanNtSessionGetLe32(Frame + IWAN_NT_SESSION_PREFIX + 8u);
     Echo->Minimum = IwanNtSessionGetLe32(Frame + IWAN_NT_SESSION_PREFIX + 12u);
     Echo->Maximum = IwanNtSessionGetLe32(Frame + IWAN_NT_SESSION_PREFIX + 16u);

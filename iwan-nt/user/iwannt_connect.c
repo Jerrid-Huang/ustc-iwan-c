@@ -5,7 +5,7 @@
 #include <string.h>
 #include <windows.h>
 
-#include "iwan_nt_handshake.h"
+#include "iwan_nt_peer.h"
 #include "iwan_nt_inet.h"
 #include "iwan_nt_session.h"
 
@@ -25,10 +25,10 @@ PrintAddress(
 static int
 ApplyState(
     _In_ PIWAN_NT_DEVICE Device,
-    _In_ const IWAN_NT_HANDSHAKE *Handshake
+    _In_ const IWAN_NT_PEER *Handshake
     )
 {
-    if (Handshake->State == IwanNtHandshakeUp) {
+    if (Handshake->State == IwanNtPeerUp) {
         IWAN_NT_STATS_ABI stats;
 
         if (IwanNtSetSession(Device, Handshake->Sid, Handshake->Token,
@@ -91,7 +91,7 @@ IwanNtRunConnect(
     _In_ char **Argv
     )
 {
-    IWAN_NT_HANDSHAKE handshake;
+    IWAN_NT_PEER handshake;
     IWAN_NT_STATS_ABI stats;
     uint8_t frame[IWAN_NT_CONTROL_MAX];
     UINT8 address[16];
@@ -126,7 +126,7 @@ IwanNtRunConnect(
         fprintf(stderr, "SET_PEER failed: %lu\n", GetLastError());
         return 1;
     }
-    if (IwanNtHandshakeInitialize(&handshake, Argv[4], Argv[5], mtu,
+    if (IwanNtPeerInitialize(&handshake, Argv[4], Argv[5], mtu,
                                   GetTickCount64()) == 0) {
         fprintf(stderr, "user or password too long\n");
         return 1;
@@ -192,11 +192,11 @@ IwanNtRunConnect(
         }
 
         timeoutsBefore = handshake.Timeouts;
-        pending = IwanNtHandshakeTick(&handshake, now, frame, sizeof(frame),
+        pending = IwanNtPeerTick(&handshake, now, frame, sizeof(frame),
                                       &length);
         if (handshake.Timeouts != timeoutsBefore) {
             printf("CONNECT timeout after %us of silence (#%lu), reconnecting\n",
-                   (unsigned)(IWAN_NT_HANDSHAKE_DATA_TIMEOUT_MS / 1000u),
+                   (unsigned)(IWAN_NT_PEER_DATA_TIMEOUT_MS / 1000u),
                    (unsigned long)handshake.Timeouts);
         }
         if (handshake.Fault != IwanNtSessionOk) {
@@ -223,10 +223,10 @@ IwanNtRunConnect(
                 break;
             }
         } else if (read > 0) {
-            IWAN_NT_HANDSHAKE_EVENT event = IwanNtHandshakeOnFrame(
+            IWAN_NT_PEER_EVENT event = IwanNtPeerOnFrame(
                 &handshake, frame, (size_t)read, GetTickCount64());
 
-            if (event == IwanNtHandshakeEventEstablished) {
+            if (event == IwanNtPeerEventEstablished) {
                 printf("CONNECT ack sid=%u token=%08lx mtu=%u encrypted=%lu",
                        (unsigned)handshake.Sid, (unsigned long)handshake.Token,
                        (unsigned)handshake.MtuFromPeer,
@@ -265,18 +265,18 @@ IwanNtRunConnect(
                            handshake.Address[0], handshake.Address[1],
                            handshake.Address[2], handshake.Address[3]);
                 }
-            } else if (event == IwanNtHandshakeEventRejected) {
+            } else if (event == IwanNtPeerEventRejected) {
                 printf("CONNECT rejected (#%lu)\n",
                        (unsigned long)handshake.Rejects);
-            } else if (event == IwanNtHandshakeEventClosed) {
+            } else if (event == IwanNtPeerEventClosed) {
                 printf("CONNECT closed by peer (#%lu)\n",
                        (unsigned long)handshake.Closes);
-            } else if (event == IwanNtHandshakeEventEchoAnswer) {
+            } else if (event == IwanNtPeerEventEchoAnswer) {
                 printf("CONNECT echo current=%luus min=%luus max=%luus\n",
                        (unsigned long)handshake.DelayCurrent,
                        (unsigned long)handshake.DelayMinimum,
                        (unsigned long)handshake.DelayMaximum);
-            } else if (event == IwanNtHandshakeEventFault) {
+            } else if (event == IwanNtPeerEventFault) {
                 fprintf(stderr, "frame rejected: %d\n", (int)handshake.Fault);
                 status = 1;
                 break;
@@ -301,20 +301,20 @@ IwanNtRunConnect(
            (unsigned long)handshake.Opens, (unsigned long)handshake.Echoes,
            (unsigned long)handshake.EchoAnswers, (unsigned long)handshake.Rejects,
            (unsigned long)handshake.Closes, (unsigned long)handshake.ForeignFrames,
-           (handshake.State == IwanNtHandshakeUp) ? "up" : "down");
+           (handshake.State == IwanNtPeerUp) ? "up" : "down");
 
     /*
      * Leave the driver in the state this process ended in. A session nobody is
      * keeping alive would otherwise make the adapter look connected while every
      * packet it carries goes nowhere.
      */
-    if (handshake.State == IwanNtHandshakeUp) {
+    if (handshake.State == IwanNtPeerUp) {
         (void)IwanNtClearSession(Device);
     }
 
     if (handshake.EverEstablished == 0) {
         status = 3;
-    } else if (handshake.State == IwanNtHandshakeUp) {
+    } else if (handshake.State == IwanNtPeerUp) {
         memset(&stats, 0, sizeof(stats));
         if (IwanNtGetStats(Device, &stats) != FALSE) {
             printf("CONNECT stats tx=%llu rx=%llu delivered=%llu inflight=%lu\n",

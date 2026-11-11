@@ -1,7 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "iwan_nt_handshake.h"
+#include "iwan_nt_peer.h"
 
 static int Failures = 0;
 static int Checks = 0;
@@ -95,15 +95,15 @@ BuildEchoAnswer(
 static void
 TestOpenRetry(void)
 {
-    IWAN_NT_HANDSHAKE handshake;
+    IWAN_NT_PEER handshake;
     uint8_t frame[IWAN_NT_SESSION_CONTROL_MAX];
     size_t length = 0;
     unsigned sent = 0;
     uint64_t now;
 
-    CHECK(IwanNtHandshakeInitialize(&handshake, "_rev_m_2", "secret", 1400, 0u));
+    CHECK(IwanNtPeerInitialize(&handshake, "_rev_m_2", "secret", 1400, 0u));
     for (now = 0; now <= 7000u; now += 100u) {
-        if (IwanNtHandshakeTick(&handshake, now, frame, sizeof(frame), &length)) {
+        if (IwanNtPeerTick(&handshake, now, frame, sizeof(frame), &length)) {
             CHECK(length == 59u);
             CHECK(frame[0] == IWAN_NT_SESSION_TYPE_OPEN);
             sent++;
@@ -112,14 +112,14 @@ TestOpenRetry(void)
     /* t = 0, 2000, 4000, 6000 */
     CHECK(sent == 4u);
     CHECK(handshake.Opens == 4u);
-    CHECK(handshake.State == IwanNtHandshakeDown);
+    CHECK(handshake.State == IwanNtPeerDown);
 }
 
 /* The answer installs the session and switches the timer to keepalives. */
 static void
 TestEstablished(void)
 {
-    IWAN_NT_HANDSHAKE handshake;
+    IWAN_NT_PEER handshake;
     uint8_t frame[IWAN_NT_SESSION_CONTROL_MAX];
     uint8_t ack[128];
     size_t length = 0;
@@ -127,15 +127,15 @@ TestEstablished(void)
     uint64_t now;
     unsigned echoes = 0;
 
-    CHECK(IwanNtHandshakeInitialize(&handshake, "_rev_m_2", "secret", 1400, 0u));
-    CHECK(IwanNtHandshakeTick(&handshake, 0u, frame, sizeof(frame), &length) == 1);
+    CHECK(IwanNtPeerInitialize(&handshake, "_rev_m_2", "secret", 1400, 0u));
+    CHECK(IwanNtPeerTick(&handshake, 0u, frame, sizeof(frame), &length) == 1);
     CHECK(handshake.Opens == 1u);
 
     ackLength = BuildAck(ack, sizeof(ack), 9u, 0xe4977730u);
     CHECK(ackLength > 0);
-    CHECK(IwanNtHandshakeOnFrame(&handshake, ack, ackLength, 500u) ==
-          IwanNtHandshakeEventEstablished);
-    CHECK(handshake.State == IwanNtHandshakeUp);
+    CHECK(IwanNtPeerOnFrame(&handshake, ack, ackLength, 500u) ==
+          IwanNtPeerEventEstablished);
+    CHECK(handshake.State == IwanNtPeerUp);
     CHECK(handshake.Sid == 9u);
     CHECK(handshake.Token == 0xe4977730u);
     CHECK(handshake.Encrypted == 1u);
@@ -158,9 +158,9 @@ TestEstablished(void)
     }
 
     /* No keepalive before the interval, then one, then another. */
-    CHECK(IwanNtHandshakeTick(&handshake, 1000u, frame, sizeof(frame), &length) == 0);
+    CHECK(IwanNtPeerTick(&handshake, 1000u, frame, sizeof(frame), &length) == 0);
     for (now = 500u; now <= 7000u; now += 100u) {
-        if (IwanNtHandshakeTick(&handshake, now, frame, sizeof(frame), &length)) {
+        if (IwanNtPeerTick(&handshake, now, frame, sizeof(frame), &length)) {
             CHECK(frame[0] == IWAN_NT_SESSION_TYPE_ECHO_REQUEST);
             CHECK(length == IWAN_NT_SESSION_ECHO_LEN);
             echoes++;
@@ -175,48 +175,48 @@ TestEstablished(void)
 static void
 TestDuplicateAck(void)
 {
-    IWAN_NT_HANDSHAKE handshake;
+    IWAN_NT_PEER handshake;
     uint8_t ack[128];
     size_t ackLength;
 
-    CHECK(IwanNtHandshakeInitialize(&handshake, "u", "p", 1400, 0u));
+    CHECK(IwanNtPeerInitialize(&handshake, "u", "p", 1400, 0u));
     ackLength = BuildAck(ack, sizeof(ack), 9u, 0xe4977730u);
-    CHECK(IwanNtHandshakeOnFrame(&handshake, ack, ackLength, 0u) ==
-          IwanNtHandshakeEventEstablished);
-    CHECK(handshake.NextActionMs == IWAN_NT_HANDSHAKE_ECHO_MS);
-    CHECK(IwanNtHandshakeOnFrame(&handshake, ack, ackLength, 100u) ==
-          IwanNtHandshakeEventNone);
-    CHECK(handshake.NextActionMs == IWAN_NT_HANDSHAKE_ECHO_MS);
+    CHECK(IwanNtPeerOnFrame(&handshake, ack, ackLength, 0u) ==
+          IwanNtPeerEventEstablished);
+    CHECK(handshake.NextActionMs == IWAN_NT_PEER_ECHO_MS);
+    CHECK(IwanNtPeerOnFrame(&handshake, ack, ackLength, 100u) ==
+          IwanNtPeerEventNone);
+    CHECK(handshake.NextActionMs == IWAN_NT_PEER_ECHO_MS);
 }
 
 /* A rejection returns to OPEN after one interval rather than immediately. */
 static void
 TestRejected(void)
 {
-    IWAN_NT_HANDSHAKE handshake;
+    IWAN_NT_PEER handshake;
     uint8_t reject[24];
     uint8_t frame[IWAN_NT_SESSION_CONTROL_MAX];
     size_t length = 0;
 
-    CHECK(IwanNtHandshakeInitialize(&handshake, "u", "p", 1400, 0u));
+    CHECK(IwanNtPeerInitialize(&handshake, "u", "p", 1400, 0u));
     memset(reject, 0, sizeof(reject));
     reject[0] = IWAN_NT_SESSION_TYPE_OPEN_REJECT;
 
     /* An unsigned rejection is not the peer speaking: ignore, do not reset. */
-    CHECK(IwanNtHandshakeOnFrame(&handshake, reject, sizeof(reject), 1000u) ==
-          IwanNtHandshakeEventNone);
+    CHECK(IwanNtPeerOnFrame(&handshake, reject, sizeof(reject), 1000u) ==
+          IwanNtPeerEventNone);
     CHECK(handshake.Rejects == 0u);
     CHECK(handshake.ForeignFrames == 1u);
 
     IwanNtSessionSignFrame(reject);
 
-    CHECK(IwanNtHandshakeOnFrame(&handshake, reject, sizeof(reject), 1000u) ==
-          IwanNtHandshakeEventRejected);
-    CHECK(handshake.State == IwanNtHandshakeDown);
+    CHECK(IwanNtPeerOnFrame(&handshake, reject, sizeof(reject), 1000u) ==
+          IwanNtPeerEventRejected);
+    CHECK(handshake.State == IwanNtPeerDown);
     CHECK(handshake.Rejects == 1u);
     /* Not before the interval, even though the timer had already expired. */
-    CHECK(IwanNtHandshakeTick(&handshake, 1500u, frame, sizeof(frame), &length) == 0);
-    CHECK(IwanNtHandshakeTick(&handshake, 3000u, frame, sizeof(frame), &length) == 1);
+    CHECK(IwanNtPeerTick(&handshake, 1500u, frame, sizeof(frame), &length) == 0);
+    CHECK(IwanNtPeerTick(&handshake, 3000u, frame, sizeof(frame), &length) == 1);
     CHECK(frame[0] == IWAN_NT_SESSION_TYPE_OPEN);
 }
 
@@ -224,24 +224,24 @@ TestRejected(void)
 static void
 TestClosed(void)
 {
-    IWAN_NT_HANDSHAKE handshake;
+    IWAN_NT_PEER handshake;
     uint8_t ack[128];
     uint8_t closeFrame[24];
     size_t ackLength;
     size_t index;
 
-    CHECK(IwanNtHandshakeInitialize(&handshake, "u", "p", 1400, 0u));
+    CHECK(IwanNtPeerInitialize(&handshake, "u", "p", 1400, 0u));
     ackLength = BuildAck(ack, sizeof(ack), 9u, 0xe4977730u);
-    CHECK(IwanNtHandshakeOnFrame(&handshake, ack, ackLength, 0u) ==
-          IwanNtHandshakeEventEstablished);
+    CHECK(IwanNtPeerOnFrame(&handshake, ack, ackLength, 0u) ==
+          IwanNtPeerEventEstablished);
 
     memset(closeFrame, 0, sizeof(closeFrame));
     closeFrame[0] = IWAN_NT_SESSION_TYPE_CLOSE;
     IwanNtSessionSignFrame(closeFrame);
-    CHECK(IwanNtHandshakeOnFrame(&handshake, closeFrame, sizeof(closeFrame), 500u) ==
-          IwanNtHandshakeEventClosed);
+    CHECK(IwanNtPeerOnFrame(&handshake, closeFrame, sizeof(closeFrame), 500u) ==
+          IwanNtPeerEventClosed);
     CHECK(handshake.Closes == 1u);
-    CHECK(handshake.State == IwanNtHandshakeDown);
+    CHECK(handshake.State == IwanNtPeerDown);
     CHECK(handshake.Sid == 0u);
     CHECK(handshake.Token == 0u);
     for (index = 0; index < sizeof(handshake.Key); index++) {
@@ -255,31 +255,31 @@ TestClosed(void)
 static void
 TestEchoAnswer(void)
 {
-    IWAN_NT_HANDSHAKE handshake;
+    IWAN_NT_PEER handshake;
     uint8_t ack[128];
     uint8_t echo[128];
     size_t ackLength;
     size_t echoLength;
 
-    CHECK(IwanNtHandshakeInitialize(&handshake, "u", "p", 1400, 0u));
+    CHECK(IwanNtPeerInitialize(&handshake, "u", "p", 1400, 0u));
     ackLength = BuildAck(ack, sizeof(ack), 9u, 0xe4977730u);
-    CHECK(IwanNtHandshakeOnFrame(&handshake, ack, ackLength, 0u) ==
-          IwanNtHandshakeEventEstablished);
+    CHECK(IwanNtPeerOnFrame(&handshake, ack, ackLength, 0u) ==
+          IwanNtPeerEventEstablished);
 
     echoLength = BuildEchoAnswer(echo, sizeof(echo), 9u, 0xe4977730u,
                                  123456u, 8000u, 3500u, 12000u);
     CHECK(echoLength == IWAN_NT_SESSION_ECHO_LEN);
-    CHECK(IwanNtHandshakeOnFrame(&handshake, echo, echoLength, 100u) ==
-          IwanNtHandshakeEventEchoAnswer);
+    CHECK(IwanNtPeerOnFrame(&handshake, echo, echoLength, 100u) ==
+          IwanNtPeerEventEchoAnswer);
     CHECK(handshake.DelayCurrent == 8000u);
     CHECK(handshake.DelayMinimum == 3500u);
     CHECK(handshake.DelayMaximum == 12000u);
     CHECK(handshake.EchoAnswers == 1u);
 
     /* While down, a stray answer is ignored rather than adopted. */
-    IwanNtHandshakeReset(&handshake, 200u);
-    CHECK(IwanNtHandshakeOnFrame(&handshake, echo, echoLength, 300u) ==
-          IwanNtHandshakeEventNone);
+    IwanNtPeerReset(&handshake, 200u);
+    CHECK(IwanNtPeerOnFrame(&handshake, echo, echoLength, 300u) ==
+          IwanNtPeerEventNone);
     CHECK(handshake.EchoAnswers == 1u);
 }
 
@@ -287,54 +287,54 @@ TestEchoAnswer(void)
 static void
 TestFault(void)
 {
-    IWAN_NT_HANDSHAKE handshake;
+    IWAN_NT_PEER handshake;
     uint8_t ack[128];
     size_t ackLength;
 
-    CHECK(IwanNtHandshakeInitialize(&handshake, "u", "p", 1400, 0u));
+    CHECK(IwanNtPeerInitialize(&handshake, "u", "p", 1400, 0u));
     ackLength = BuildAck(ack, sizeof(ack), 9u, 0xe4977730u);
     /* A TLV whose length runs past the frame. */
     ack[25] = 0x7f;
-    CHECK(IwanNtHandshakeOnFrame(&handshake, ack, ackLength, 0u) ==
-          IwanNtHandshakeEventFault);
+    CHECK(IwanNtPeerOnFrame(&handshake, ack, ackLength, 0u) ==
+          IwanNtPeerEventFault);
     CHECK(handshake.Fault != IwanNtSessionOk);
-    CHECK(handshake.State == IwanNtHandshakeDown);
+    CHECK(handshake.State == IwanNtPeerDown);
 }
 
 static void
 TestDataTimeout(void)
 {
-    IWAN_NT_HANDSHAKE handshake;
+    IWAN_NT_PEER handshake;
     uint8_t ack[IWAN_NT_SESSION_CONTROL_MAX];
     uint8_t frame[IWAN_NT_SESSION_CONTROL_MAX];
     size_t ackLength;
     size_t length = 0;
 
-    CHECK(IwanNtHandshakeInitialize(&handshake, "u", "p", 1400, 0u));
+    CHECK(IwanNtPeerInitialize(&handshake, "u", "p", 1400, 0u));
     ackLength = BuildAck(ack, sizeof(ack), 9u, 0xe4977730u);
     CHECK(ackLength > 0);
-    CHECK(IwanNtHandshakeOnFrame(&handshake, ack, ackLength, 1000u) ==
-          IwanNtHandshakeEventEstablished);
+    CHECK(IwanNtPeerOnFrame(&handshake, ack, ackLength, 1000u) ==
+          IwanNtPeerEventEstablished);
 
     /* Silence up to the timeout is normal: the peer only answers every 2 s. */
-    CHECK(IwanNtHandshakeTick(&handshake, 1000u + 14000u, frame, sizeof(frame),
+    CHECK(IwanNtPeerTick(&handshake, 1000u + 14000u, frame, sizeof(frame),
                               &length) == 1);
-    CHECK(handshake.State == IwanNtHandshakeUp);
+    CHECK(handshake.State == IwanNtPeerUp);
     CHECK(handshake.Timeouts == 0u);
 
     /*
      * One millisecond past it the session is gone: the socket still accepts our
      * writes, so only the peer going quiet can explain no frame for this long.
      */
-    (void)IwanNtHandshakeTick(&handshake, 1000u + 15001u, frame, sizeof(frame),
+    (void)IwanNtPeerTick(&handshake, 1000u + 15001u, frame, sizeof(frame),
                               &length);
-    CHECK(handshake.State == IwanNtHandshakeDown);
+    CHECK(handshake.State == IwanNtPeerDown);
     CHECK(handshake.Timeouts == 1u);
     CHECK(handshake.Sid == 0u);
     CHECK(handshake.Token == 0u);
 
     /* And it starts over rather than staying down forever. */
-    CHECK(IwanNtHandshakeTick(&handshake, 1000u + 15001u + 2000u, frame,
+    CHECK(IwanNtPeerTick(&handshake, 1000u + 15001u + 2000u, frame,
                               sizeof(frame), &length) == 1);
     CHECK(frame[0] == IWAN_NT_SESSION_TYPE_OPEN);
 }

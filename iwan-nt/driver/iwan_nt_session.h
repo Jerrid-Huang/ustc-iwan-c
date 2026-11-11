@@ -17,8 +17,7 @@
  *   TLV           = type, length (both bytes, length includes itself), value
  */
 
-#include <stddef.h>
-#include <stdint.h>
+#include "iwan_nt_types.h"
 
 /*
  * These headers are user-mode only, so they take the C runtime integer types

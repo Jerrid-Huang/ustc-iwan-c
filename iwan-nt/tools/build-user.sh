@@ -19,13 +19,13 @@ if ! command -v "$cc" >/dev/null 2>&1; then
 fi
 
 mkdir -p "$(dirname "$out")"
-"$cc" -std=c11 -Wall -Wextra -Werror -Wshadow -O2 \
+"$cc" -std=c11 -Wall -Wextra -Werror -Wshadow -O2 -I "$root/driver" \
     -o "$out" \
     "$root/user/iwan_nt_control.c" \
-    "$root/user/iwan_nt_crypto.c" \
+    "$root/driver/iwan_nt_crypto.c" \
     "$root/user/iwan_nt_inet.c" \
-    "$root/user/iwan_nt_session.c" \
-    "$root/user/iwan_nt_handshake.c" \
+    "$root/driver/iwan_nt_session.c" \
+    "$root/driver/iwan_nt_peer.c" \
     "$root/user/iwannt_connect.c" \
     "$root/user/iwannt-ctl.c" \
     -lws2_32

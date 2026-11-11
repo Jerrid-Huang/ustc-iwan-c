@@ -1,6 +1,6 @@
 #include "iwan_nt_crypto.h"
 
-#include <string.h>
+#include "iwan_nt_string.h"
 
 /*
  * MD5, following RFC 1321. The constants are the sine-derived table from the
@@ -145,7 +145,7 @@ IwanNtMd5Initialize(
     Context->State[2] = 0x98badcfeu;
     Context->State[3] = 0x10325476u;
     Context->Bytes = 0;
-    memset(Context->Buffer, 0, sizeof(Context->Buffer));
+    IwanNtMemZero(Context->Buffer, sizeof(Context->Buffer));
 }
 
 void
@@ -164,10 +164,10 @@ IwanNtMd5Update(
         size_t space = 64u - used;
 
         if (Length < space) {
-            memcpy(Context->Buffer + used, bytes, Length);
+            IwanNtMemCopy(Context->Buffer + used, bytes, Length);
             return;
         }
-        memcpy(Context->Buffer + used, bytes, space);
+        IwanNtMemCopy(Context->Buffer + used, bytes, space);
         IwanNtMd5Transform(Context->State, Context->Buffer);
         bytes += space;
         Length -= space;
@@ -180,7 +180,7 @@ IwanNtMd5Update(
     }
 
     if (Length > 0) {
-        memcpy(Context->Buffer, bytes, Length);
+        IwanNtMemCopy(Context->Buffer, bytes, Length);
     }
 }
 
@@ -196,7 +196,7 @@ IwanNtMd5Finalize(
     uint64_t bits = Context->Bytes * 8u;
     unsigned int index;
 
-    memset(padding, 0, sizeof(padding));
+    IwanNtMemZero(padding, sizeof(padding));
     padding[0] = 0x80u;
     for (index = 0; index < 8; index++) {
         padding[padLength + index] = (uint8_t)((bits >> (8u * index)) & 0xFFu);
@@ -206,7 +206,7 @@ IwanNtMd5Finalize(
     for (index = 0; index < 4; index++) {
         IwanNtMd5Store(Digest + (size_t)index * 4u, Context->State[index]);
     }
-    memset(Context, 0, sizeof(*Context));
+    IwanNtMemZero(Context, sizeof(*Context));
 }
 
 void
@@ -288,11 +288,11 @@ IwanNtAes128EncryptBlock(
     unsigned int round;
     unsigned int index;
 
-    memcpy(roundKeys, Key, 16);
+    IwanNtMemCopy(roundKeys, Key, 16);
     for (index = 16; index < 176; index += 4) {
         uint8_t temp[4];
 
-        memcpy(temp, roundKeys + index - 4, 4);
+        IwanNtMemCopy(temp, roundKeys + index - 4, 4);
         if ((index % 16u) == 0u) {
             uint8_t first = temp[0];
 
@@ -331,7 +331,7 @@ IwanNtAes128EncryptBlock(
 
             mixed[index] = IwanNtAesSbox[state[row + 4u * sourceColumn]];
         }
-        memcpy(state, mixed, sizeof(state));
+        IwanNtMemCopy(state, mixed, sizeof(state));
 
         if (round != 10u) {
             for (index = 0; index < 4u; index++) {
@@ -358,6 +358,6 @@ IwanNtAes128EncryptBlock(
         }
     }
 
-    memcpy(Output, state, 16);
-    memset(roundKeys, 0, sizeof(roundKeys));
+    IwanNtMemCopy(Output, state, 16);
+    IwanNtMemZero(roundKeys, sizeof(roundKeys));
 }

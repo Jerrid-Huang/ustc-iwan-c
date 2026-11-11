@@ -14,8 +14,7 @@
  * implemented for interoperability, not for new designs.
  */
 
-#include <stddef.h>
-#include <stdint.h>
+#include "iwan_nt_types.h"
 
 /*
  * These headers are user-mode only, so they take the C runtime integer types

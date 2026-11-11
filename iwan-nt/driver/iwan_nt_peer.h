@@ -1,5 +1,5 @@
-#ifndef IWAN_NT_HANDSHAKE_H
-#define IWAN_NT_HANDSHAKE_H
+#ifndef IWAN_NT_PEER_H
+#define IWAN_NT_PEER_H
 
 /*
  * The handshake as a state machine, with no Windows dependency.
@@ -16,8 +16,7 @@
  *   (back Down) -- on rejection, close, or the caller clearing it
  */
 
-#include <stddef.h>
-#include <stdint.h>
+#include "iwan_nt_types.h"
 
 #include "iwan_nt_session.h"
 
@@ -25,8 +24,8 @@
 extern "C" {
 #endif
 
-#define IWAN_NT_HANDSHAKE_OPEN_MS 2000u
-#define IWAN_NT_HANDSHAKE_ECHO_MS 2000u
+#define IWAN_NT_PEER_OPEN_MS 2000u
+#define IWAN_NT_PEER_ECHO_MS 2000u
 
 /*
  * The deployed client gives up on a session that has been silent this long,
@@ -34,24 +33,24 @@ extern "C" {
  * sent: a peer that stopped answering is gone even if the socket still accepts
  * our writes.
  */
-#define IWAN_NT_HANDSHAKE_DATA_TIMEOUT_MS 15000u
+#define IWAN_NT_PEER_DATA_TIMEOUT_MS 15000u
 
-typedef enum _IWAN_NT_HANDSHAKE_STATE {
-    IwanNtHandshakeDown = 0,
-    IwanNtHandshakeUp
-} IWAN_NT_HANDSHAKE_STATE;
+typedef enum _IWAN_NT_PEER_STATE {
+    IwanNtPeerDown = 0,
+    IwanNtPeerUp
+} IWAN_NT_PEER_STATE;
 
-typedef enum _IWAN_NT_HANDSHAKE_EVENT {
-    IwanNtHandshakeEventNone = 0,
-    IwanNtHandshakeEventEstablished,
-    IwanNtHandshakeEventRejected,
-    IwanNtHandshakeEventClosed,
-    IwanNtHandshakeEventEchoAnswer,
-    IwanNtHandshakeEventTimeout,
-    IwanNtHandshakeEventFault
-} IWAN_NT_HANDSHAKE_EVENT;
+typedef enum _IWAN_NT_PEER_EVENT {
+    IwanNtPeerEventNone = 0,
+    IwanNtPeerEventEstablished,
+    IwanNtPeerEventRejected,
+    IwanNtPeerEventClosed,
+    IwanNtPeerEventEchoAnswer,
+    IwanNtPeerEventTimeout,
+    IwanNtPeerEventFault
+} IWAN_NT_PEER_EVENT;
 
-typedef struct _IWAN_NT_HANDSHAKE {
+typedef struct _IWAN_NT_PEER {
     /* Configuration, copied in at initialize so the caller owns no pointers. */
     char User[64];
     char Password[64];
@@ -73,7 +72,7 @@ typedef struct _IWAN_NT_HANDSHAKE {
     int HasGateway;
     uint8_t Gateway[4];
 
-    IWAN_NT_HANDSHAKE_STATE State;
+    IWAN_NT_PEER_STATE State;
     int EverEstablished;
 
     /*
@@ -95,12 +94,12 @@ typedef struct _IWAN_NT_HANDSHAKE {
     uint32_t ForeignFrames;
     uint32_t Timeouts;
     IWAN_NT_SESSION_RESULT Fault;
-} IWAN_NT_HANDSHAKE;
+} IWAN_NT_PEER;
 
 /* Returns nonzero on success; a name or password that does not fit is a bug. */
 int
-IwanNtHandshakeInitialize(
-IWAN_NT_HANDSHAKE *Handshake,
+IwanNtPeerInitialize(
+IWAN_NT_PEER *Handshake,
     const char *User,
     const char *Password,
     uint16_t Mtu,
@@ -113,8 +112,8 @@ IWAN_NT_HANDSHAKE *Handshake,
  * timer inside the state machine is the only retry clock.
  */
 int
-IwanNtHandshakeTick(
-IWAN_NT_HANDSHAKE *Handshake,
+IwanNtPeerTick(
+IWAN_NT_PEER *Handshake,
     uint64_t NowMs,
     uint8_t *Buffer,
     size_t Capacity,
@@ -122,9 +121,9 @@ IWAN_NT_HANDSHAKE *Handshake,
     );
 
 /* Feed one received control frame; returns what changed, if anything. */
-IWAN_NT_HANDSHAKE_EVENT
-IwanNtHandshakeOnFrame(
-IWAN_NT_HANDSHAKE *Handshake,
+IWAN_NT_PEER_EVENT
+IwanNtPeerOnFrame(
+IWAN_NT_PEER *Handshake,
     const uint8_t *Frame,
     size_t Length,
     uint64_t NowMs
@@ -132,8 +131,8 @@ IWAN_NT_HANDSHAKE *Handshake,
 
 /* Drop the session at the caller's request, keeping the retry clock. */
 void
-IwanNtHandshakeReset(
-IWAN_NT_HANDSHAKE *Handshake,
+IwanNtPeerReset(
+IWAN_NT_PEER *Handshake,
     uint64_t NowMs
     );
 
