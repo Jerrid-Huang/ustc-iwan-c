@@ -13,10 +13,22 @@
  * <ntddk.h>; the stub keeps that split so a header that forgets <wsk.h> fails
  * here the same way it fails on the WDK. */
 typedef struct _SOCKADDR { USHORT sa_family; } SOCKADDR, *PSOCKADDR;
+typedef struct _IN_ADDR {
+    union {
+        struct {
+            UCHAR s_b1;
+            UCHAR s_b2;
+            UCHAR s_b3;
+            UCHAR s_b4;
+        } S_un_b;
+        ULONG s_addr;
+    } S_un;
+} IN_ADDR, *PIN_ADDR;
+
 typedef struct _SOCKADDR_IN {
     USHORT sin_family;
     USHORT sin_port;
-    ULONG sin_addr;
+    IN_ADDR sin_addr;
     UCHAR sin_zero[8];
 } SOCKADDR_IN, *PSOCKADDR_IN;
 

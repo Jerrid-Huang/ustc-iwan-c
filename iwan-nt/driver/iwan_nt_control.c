@@ -168,7 +168,7 @@ IwanNtControlSetPeer(
     RtlZeroMemory(&remote, sizeof(remote));
     remote.sin_family = AF_INET;
     remote.sin_port = request->Port;
-    remote.sin_addr = request->Address;
+    remote.sin_addr.S_un.s_addr = request->Address;
 
     IwanNtTransportSetPeer(transport, &remote);
 
