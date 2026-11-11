@@ -116,6 +116,35 @@ IwanNtRunConnect(
         return 1;
     }
 
+    /*
+     * The transport only runs while the adapter does, and a freshly installed
+     * root adapter starts disabled. Finding that out from the first send wastes a
+     * retry interval on an error the operator can fix in one command, so check
+     * the state first and say what is wrong.
+     */
+    {
+        ULONGLONG waitUntil = GetTickCount64() + 5000ull;
+        IWAN_NT_STATS_ABI stats;
+
+        for (;;) {
+            memset(&stats, 0, sizeof(stats));
+            if (IwanNtGetStats(Device, &stats) == FALSE) {
+                fprintf(stderr, "GET_STATS failed: %lu\n", GetLastError());
+                return 1;
+            }
+            if (stats.Running != 0) {
+                break;
+            }
+            if (GetTickCount64() >= waitUntil) {
+                fprintf(stderr,
+                        "the adapter is not up, so the transport is not running\n"
+                        "  netsh interface set interface \"iWAN NT Transport Adapter\" admin=enable\n");
+                return 1;
+            }
+            Sleep(100);
+        }
+    }
+
     deadline = GetTickCount64() + (ULONGLONG)seconds * 1000ull;
 
     for (;;) {
@@ -172,6 +201,17 @@ IwanNtRunConnect(
                     PrintAddress(handshake.Gateway);
                 }
                 printf("\n");
+                if (handshake.HasAddress) {
+                    /*
+                     * Print the command rather than running it: the tool talks to
+                     * the device, it does not own the host's routing table.
+                     */
+                    printf("CONNECT to carry traffic, give the adapter that address:\n"
+                           "  netsh interface ipv4 set address name=\"iWAN NT Transport Adapter\" "
+                           "static %u.%u.%u.%u 255.255.255.0\n",
+                           handshake.Address[0], handshake.Address[1],
+                           handshake.Address[2], handshake.Address[3]);
+                }
             } else if (event == IwanNtHandshakeEventRejected) {
                 printf("CONNECT rejected (#%lu)\n",
                        (unsigned long)handshake.Rejects);
