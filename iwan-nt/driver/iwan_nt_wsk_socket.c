@@ -354,13 +354,13 @@ IwanNtWskDatagramBind(
      * the operator could not tell a NAT problem from a protocol one.
      */
     if (NT_SUCCESS(status)) {
-        const WSK_PROVIDER_BASIC_DISPATCH *basic =
-            IwanNtWskDatagramGetBasicDispatch(Datagram->Socket);
+        const WSK_PROVIDER_DATAGRAM_DISPATCH *datagram =
+            IwanNtWskDatagramGetDatagramDispatch(Datagram->Socket);
 
-        if (basic->WskGetLocalAddress != NULL) {
-            ULONG length = (ULONG)sizeof(Datagram->LocalAddress);
+        if (datagram->WskGetLocalAddress != NULL) {
+            ULONG length = (ULONG)sizeof(Datagram->BoundAddress);
 
-            (void)basic->WskGetLocalAddress(
+            (void)datagram->WskGetLocalAddress(
                 Datagram->Socket, (PSOCKADDR)&Datagram->BoundAddress, &length);
         }
     }
