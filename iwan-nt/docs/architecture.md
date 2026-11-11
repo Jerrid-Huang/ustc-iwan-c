@@ -1,5 +1,7 @@
 # iWAN NT Architecture
 
+The adapter advertises a 1400-byte MTU, not 1500. The outer datagram is the inner packet plus an 8-byte frame header and the outer IP/UDP headers, so an inner 1500 would leave as 1536 bytes and be fragmented on the way out; the deployed client negotiates 1400 for the same reason.
+
 ## Purpose and boundary
 
 The iWAN NT project will provide a Windows kernel transport boundary for the existing iWAN client. The boundary is deliberately narrow:

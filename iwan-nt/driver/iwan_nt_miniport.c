@@ -608,6 +608,11 @@ IwanNtMiniportIndicateInner(
     ULONG index;
     LONG state;
 
+    /*
+     * The adapter advertises IWAN_NT_MINIPORT_MTU, so the stack should never hand
+     * us more. If it does, drop rather than build a datagram that would fragment
+     * on the way out.
+     */
     if (Inner == NULL || Length == 0 || Length > IWAN_NT_MINIPORT_MTU) {
         InterlockedIncrement(&adapter->RxDropped);
         return;
