@@ -109,7 +109,18 @@ IwanNtRunConnect(
 
     address = inet_addr(Argv[2]);
     if (address == INADDR_NONE) {
-        fprintf(stderr, "bad address %s\n", Argv[2]);
+        /*
+         * An IPv6 literal is the mistake worth naming: the reference client can
+         * carry the outer packet over IPv6, this build cannot, and "bad address"
+         * would send the operator looking for a typo that is not there.
+         */
+        if (strchr(Argv[2], ':') != NULL) {
+            fprintf(stderr,
+                    "outer IPv6 transport is not implemented; this build carries "
+                    "the outer packet over IPv4 only\n");
+        } else {
+            fprintf(stderr, "bad address %s\n", Argv[2]);
+        }
         return 1;
     }
     port = _byteswap_ushort((USHORT)strtoul(Argv[3], NULL, 10));

@@ -103,3 +103,9 @@ allow a running miniport to change its own MTU, so this is a host step:
 ```
 netsh interface ipv4 set subinterface "iWAN NT Transport Adapter" mtu=1380 store=persistent
 ```
+
+## Outer IPv6 is not implemented
+
+The reference client can carry the outer packet over IPv6 (`ipv6_addr` and the
+`0x0b`-`0x0d` TLVs); this build cannot. It speaks IPv4 only, and `connect` says so
+when handed an IPv6 literal instead of reporting a bad address.
