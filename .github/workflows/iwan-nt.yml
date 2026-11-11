@@ -149,9 +149,10 @@ jobs:
           $repo = '${{ github.repository }}'
           $sha = '${{ github.sha }}'
           $run = '${{ github.run_id }}'
-          try {
-            gh api "/repos/$repo/git/ref/heads/ci-logs" | Out-Null
-          } catch {
+          # gh is a native command, so a failure sets $LASTEXITCODE instead of
+          # throwing: probing with try/catch would never create the branch.
+          gh api "/repos/$repo/git/ref/heads/ci-logs" 2>$null | Out-Null
+          if ($LASTEXITCODE -ne 0) {
             gh api -X POST "/repos/$repo/git/refs" -f ref='refs/heads/ci-logs' -f sha=$sha | Out-Null
           }
           foreach ($name in @('user-build.log', 'cl-build.log')) {
