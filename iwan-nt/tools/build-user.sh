@@ -19,7 +19,7 @@ if ! command -v "$cc" >/dev/null 2>&1; then
 fi
 
 mkdir -p "$(dirname "$out")"
-"$cc" -std=c11 -Wall -Wextra -Werror -O2 \
+"$cc" -std=c11 -Wall -Wextra -Werror -Wshadow -O2 \
     -o "$out" \
     "$root/user/iwan_nt_control.c" \
     "$root/user/iwan_nt_crypto.c" \

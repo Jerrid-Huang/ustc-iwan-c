@@ -313,8 +313,6 @@ IwanNtRunConnect(
     if (handshake.EverEstablished == 0) {
         status = 3;
     } else if (handshake.State == IwanNtHandshakeUp) {
-        IWAN_NT_STATS_ABI stats;
-
         memset(&stats, 0, sizeof(stats));
         if (IwanNtGetStats(Device, &stats) != FALSE) {
             printf("CONNECT stats tx=%llu rx=%llu delivered=%llu inflight=%lu\n",
