@@ -157,6 +157,7 @@ IwanNtRunConnect(
         ULONGLONG now = GetTickCount64();
         UINT32 required = 0;
         size_t length = 0;
+        ULONG timeoutsBefore;
         int pending;
         int read;
 
@@ -164,8 +165,14 @@ IwanNtRunConnect(
             break;
         }
 
+        timeoutsBefore = handshake.Timeouts;
         pending = IwanNtHandshakeTick(&handshake, now, frame, sizeof(frame),
                                       &length);
+        if (handshake.Timeouts != timeoutsBefore) {
+            printf("CONNECT timeout after %us of silence (#%lu), reconnecting\n",
+                   (unsigned)(IWAN_NT_HANDSHAKE_DATA_TIMEOUT_MS / 1000u),
+                   (unsigned long)handshake.Timeouts);
+        }
         if (handshake.Fault != IwanNtSessionOk) {
             fprintf(stderr, "frame build failed: %d\n", (int)handshake.Fault);
             status = 1;
@@ -235,10 +242,15 @@ IwanNtRunConnect(
                 break;
             }
 
-            if (ApplyState(Device, &handshake) != 0) {
-                status = 1;
-                break;
-            }
+        }
+
+        /*
+         * Mirror the state machine every pass: a data timeout resets it without
+         * any frame arriving, and the driver must hear about that too.
+         */
+        if (ApplyState(Device, &handshake) != 0) {
+            status = 1;
+            break;
         }
 
         Sleep(10);

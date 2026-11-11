@@ -4,9 +4,11 @@
 #include "iwan_nt_handshake.h"
 
 static int Failures = 0;
+static int Checks = 0;
 
 #define CHECK(Condition)                                                       \
     do {                                                                       \
+        Checks++;                                                              \
         if (!(Condition)) {                                                    \
             printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #Condition);         \
             Failures++;                                                        \
@@ -299,6 +301,44 @@ TestFault(void)
     CHECK(handshake.State == IwanNtHandshakeDown);
 }
 
+static void
+TestDataTimeout(void)
+{
+    IWAN_NT_HANDSHAKE handshake;
+    uint8_t ack[IWAN_NT_SESSION_CONTROL_MAX];
+    uint8_t frame[IWAN_NT_SESSION_CONTROL_MAX];
+    size_t ackLength;
+    size_t length = 0;
+
+    CHECK(IwanNtHandshakeInitialize(&handshake, "u", "p", 1400, 0u));
+    ackLength = BuildAck(ack, sizeof(ack), 9u, 0xe4977730u);
+    CHECK(ackLength > 0);
+    CHECK(IwanNtHandshakeOnFrame(&handshake, ack, ackLength, 1000u) ==
+          IwanNtHandshakeEventEstablished);
+
+    /* Silence up to the timeout is normal: the peer only answers every 2 s. */
+    CHECK(IwanNtHandshakeTick(&handshake, 1000u + 14000u, frame, sizeof(frame),
+                              &length) == 1);
+    CHECK(handshake.State == IwanNtHandshakeUp);
+    CHECK(handshake.Timeouts == 0u);
+
+    /*
+     * One millisecond past it the session is gone: the socket still accepts our
+     * writes, so only the peer going quiet can explain no frame for this long.
+     */
+    (void)IwanNtHandshakeTick(&handshake, 1000u + 15001u, frame, sizeof(frame),
+                              &length);
+    CHECK(handshake.State == IwanNtHandshakeDown);
+    CHECK(handshake.Timeouts == 1u);
+    CHECK(handshake.Sid == 0u);
+    CHECK(handshake.Token == 0u);
+
+    /* And it starts over rather than staying down forever. */
+    CHECK(IwanNtHandshakeTick(&handshake, 1000u + 15001u + 2000u, frame,
+                              sizeof(frame), &length) == 1);
+    CHECK(frame[0] == IWAN_NT_SESSION_TYPE_OPEN);
+}
+
 int
 main(void)
 {
@@ -306,6 +346,7 @@ main(void)
     TestEstablished();
     TestDuplicateAck();
     TestRejected();
+    TestDataTimeout();
     TestClosed();
     TestEchoAnswer();
     TestFault();
@@ -314,6 +355,6 @@ main(void)
         printf("handshake: %d failures\n", Failures);
         return 1;
     }
-    printf("handshake: 50 checks, 0 failures\n");
+    printf("handshake: %d checks, 0 failures\n", Checks);
     return 0;
 }

@@ -13,6 +13,7 @@
 #include "iwan_nt_crypto.h"
 
 static int Failures = 0;
+static int Checks = 0;
 
 static void
 Expect(
@@ -22,6 +23,7 @@ Expect(
     size_t Length
     )
 {
+    Checks++;
     if (memcmp(Actual, Expected, Length) != 0) {
         size_t index;
 
@@ -119,6 +121,6 @@ main(void)
         printf("crypto: %d failures\n", Failures);
         return 1;
     }
-    printf("crypto: 7 checks, 0 failures\n");
+    printf("crypto: %d checks, 0 failures\n", Checks);
     return 0;
 }

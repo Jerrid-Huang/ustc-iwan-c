@@ -28,6 +28,14 @@ extern "C" {
 #define IWAN_NT_HANDSHAKE_OPEN_MS 2000u
 #define IWAN_NT_HANDSHAKE_ECHO_MS 2000u
 
+/*
+ * The deployed client gives up on a session that has been silent this long,
+ * counting from the last frame it accepted rather than from the last frame it
+ * sent: a peer that stopped answering is gone even if the socket still accepts
+ * our writes.
+ */
+#define IWAN_NT_HANDSHAKE_DATA_TIMEOUT_MS 15000u
+
 typedef enum _IWAN_NT_HANDSHAKE_STATE {
     IwanNtHandshakeDown = 0,
     IwanNtHandshakeUp
@@ -39,6 +47,7 @@ typedef enum _IWAN_NT_HANDSHAKE_EVENT {
     IwanNtHandshakeEventRejected,
     IwanNtHandshakeEventClosed,
     IwanNtHandshakeEventEchoAnswer,
+    IwanNtHandshakeEventTimeout,
     IwanNtHandshakeEventFault
 } IWAN_NT_HANDSHAKE_EVENT;
 
@@ -75,6 +84,8 @@ typedef struct _IWAN_NT_HANDSHAKE {
     uint32_t DelayMinimum;
     uint32_t DelayMaximum;
 
+    /* Last accepted frame, for the data timeout above. */
+    uint64_t LastAcceptedMs;
     uint64_t NextActionMs;
     uint32_t Opens;
     uint32_t Echoes;
@@ -82,6 +93,7 @@ typedef struct _IWAN_NT_HANDSHAKE {
     uint32_t Rejects;
     uint32_t Closes;
     uint32_t ForeignFrames;
+    uint32_t Timeouts;
     IWAN_NT_SESSION_RESULT Fault;
 } IWAN_NT_HANDSHAKE;
 

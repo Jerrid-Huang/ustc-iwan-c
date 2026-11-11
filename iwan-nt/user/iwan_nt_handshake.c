@@ -89,6 +89,21 @@ IwanNtHandshakeTick(
     if (Handshake == NULL || Buffer == NULL || Length == NULL) {
         return 0;
     }
+
+    /*
+     * A session that has been silent for the whole timeout is gone. Reset puts
+     * the machine back in Down and schedules the next OPEN one interval out, so
+     * the caller does not have to drive reconnection itself.
+     */
+    if (Handshake->State == IwanNtHandshakeUp &&
+        NowMs > Handshake->LastAcceptedMs &&
+        (NowMs - Handshake->LastAcceptedMs) >
+            (uint64_t)IWAN_NT_HANDSHAKE_DATA_TIMEOUT_MS) {
+        Handshake->Timeouts++;
+        IwanNtHandshakeReset(Handshake, NowMs);
+        return 0;
+    }
+
     if (NowMs < Handshake->NextActionMs) {
         return 0;
     }
@@ -146,6 +161,9 @@ IwanNtHandshakeOnFrame(
         Handshake->ForeignFrames++;
         return IwanNtHandshakeEventNone;
     }
+
+    /* Any authenticated frame proves the peer is alive and the key still fits. */
+    Handshake->LastAcceptedMs = NowMs;
 
     switch (Frame[0]) {
     case IWAN_NT_SESSION_TYPE_OPEN_ACK:

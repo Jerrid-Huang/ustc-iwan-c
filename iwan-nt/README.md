@@ -40,6 +40,14 @@ CI writes the compiler log to the `ci-logs` branch when a job fails. The
 annotation only carries an exit status, and downloading an artifact needs
 credentials, so the raw log is parked where a plain read can reach it.
 
+## Session keepalive and timeout
+
+`iwannt-ctl connect` keeps the session alive with an ECHO request every two
+seconds and gives up after fifteen seconds of silence, counted from the last
+frame it accepted. The state machine does that, not the shell loop, so the same
+timeout applies to a service. On expiry the session is dropped, the adapter's
+link goes down, and OPEN retries resume.
+
 ## Link state
 
 The adapter reports `MediaConnectStateDisconnected` until a session is
