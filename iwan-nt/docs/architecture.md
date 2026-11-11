@@ -51,13 +51,13 @@ Queue depth, packet size, outstanding operations, and shutdown wait conditions m
 
 ## Staged plan
 
-1. **Boundary specification** (drafted): define the user-mode control interface, packet framing contract, message classification rules, queue limits, ownership table, and state transitions. The user-mode control interface is still the largest open item.
+1. **Boundary specification** (done): the user-mode control interface is six IOCTLs on one device, with a fixed-size ABI header shared verbatim with user mode (`driver/iwan_nt_ioctl.h`); packet framing, classification, queue limits and state transitions are documented in the driver headers.
 2. **Lifecycle skeleton** (done): NDIS miniport lifecycle, per-adapter transport state, and WSK client registration, with no socket operations or frame transform.
 3. **WSK socket path** (done, unbuilt): one datagram socket created at PASSIVE_LEVEL, bound, and closed only after the operation gate, the callback gate, and the close IRP have drained. The bind address is still the wildcard with port zero.
 4. **Data-frame codec** (done, host-tested): header encode/decode, XOR body transform, inner IPv4/IPv6 sanity, and seal/open. It has no kernel dependencies and is covered by `tests/frame_test.c`.
 5. **Shared ingress path** (done, host-tested): the UDP receive callback copies a datagram into one non-paged scratch buffer, the demultiplexer classifies it, DATA is transformed in place and handed to a sink, and control frames are queued whole on a bounded ring for a PASSIVE consumer. Buffer ownership is stated in `driver/iwan_nt_ingress.h`; `tests/ingress_test.c` asserts that every outcome is counted.
-6. **Synchronous frame path** (in progress): the send slot pool exists (preallocated buffer/MDL/IRP per slot, completion recycles at DISPATCH, a full pool fails the send, Stop drains before close). Next: connect miniport sends and the DATA sink to NDIS indication, both from pools rather than per-packet allocation.
-7. **Client integration**: connect the existing client's handshake, keepalive, and control operations to the kernel interface while retaining those responsibilities in user mode.
+6. **Synchronous frame path** (in progress): the send slot pool exists (preallocated buffer/MDL/IRP per slot, completion recycles at DISPATCH, a full pool fails the send, Stop drains before close) and the miniport send handler feeds it through one per-adapter scratch buffer. Next: replace the receive-side per-packet buffer/MDL/NBL allocation with pools and confirm the indication path under load.
+7. **Client integration** (in progress): the user-mode half exists (`user/iwan_nt_control.c` plus the `iwannt-ctl` diagnostic tool), so the IOCTLs can be exercised by hand. Still open: driving the real client's OPEN/OPEN_ACK/ECHO exchange through `SEND_CONTROL`/`READ_CONTROL` while its handshake, keepalive and control logic stay in user mode.
 8. **Fault and stress validation**: exercise malformed packets, queue limits, allocation failure, cancellation, device removal, socket errors, concurrent shutdown requests, and repeated start/stop cycles.
 
 ## Explicit non-goals

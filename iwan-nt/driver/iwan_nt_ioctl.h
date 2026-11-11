@@ -4,10 +4,12 @@
 /*
  * iWAN NT control-plane ABI.
  *
- * This header is shared verbatim with user mode, so it depends on nothing:
- * no kernel headers, no CRT headers, no SAL. Every structure is a fixed-size
- * POD with explicit-width fields and no padding surprises; every multi-byte
- * integer is host order unless a field name says otherwise.
+ * This header is shared verbatim with user mode. Its only dependency is
+ * iwan_nt_types.h, which supplies the fixed-width integers in both
+ * environments (ntddk.h in the kernel, stdint.h everywhere else). Every
+ * structure is a fixed-size POD with explicit-width fields and no packing
+ * surprises; every multi-byte integer is host order unless a field name says
+ * otherwise.
  *
  * Why a control device exists at all: the transport owns the outer UDP socket
  * inside the kernel (WSK), so the user-mode client can no longer bind that
@@ -27,6 +29,8 @@
  * transport send lock, READ_CONTROL is a single-consumer dequeue. A ring
  * overflow drops the newest control frame and is counted, never blocks.
  */
+
+#include "iwan_nt_types.h"
 
 #ifdef _MSC_VER
 #pragma warning(push)
@@ -63,7 +67,7 @@
 /* Snapshot of every counter the transport keeps (read). */
 #define IWAN_NT_IOCTL_GET_STATS IWAN_NT_CTL_CODE(0x805u)
 
-#define IWAN_NT_SESSION_STRUCT_SIZE 16u
+#define IWAN_NT_SESSION_STRUCT_SIZE 24u
 #define IWAN_NT_PEER_STRUCT_SIZE 8u
 #define IWAN_NT_STATS_STRUCT_SIZE 176u
 
@@ -123,6 +127,18 @@ typedef struct _IWAN_NT_STATS_ABI {
      * queued.
      */
 } IWAN_NT_STATS_ABI;
+
+/*
+ * The sizes are part of the contract: if a field is ever added or a compiler
+ * pads a structure differently, both sides must fail loudly rather than write
+ * past a buffer one of them sized from the other's belief.
+ */
+_Static_assert(sizeof(IWAN_NT_SESSION_ABI) == IWAN_NT_SESSION_STRUCT_SIZE,
+               "SESSION ABI size changed");
+_Static_assert(sizeof(IWAN_NT_PEER_ABI) == IWAN_NT_PEER_STRUCT_SIZE,
+               "PEER ABI size changed");
+_Static_assert(sizeof(IWAN_NT_STATS_ABI) == IWAN_NT_STATS_STRUCT_SIZE,
+               "STATS ABI size changed");
 
 #ifdef _MSC_VER
 #pragma warning(pop)

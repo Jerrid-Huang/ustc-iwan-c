@@ -51,6 +51,17 @@ loses a frame to a short buffer: it reports the required length and leaves the
 record queued. A full ring drops the newest control frame and counts it, so a
 flooding peer cannot make the driver allocate.
 
+`user/` is the other side of that ABI: `iwan_nt_control.c` is a small Win32
+wrapper around the six IOCTLs, and `iwannt-ctl.c` is a diagnostic tool that
+installs a peer and a session, prints counters, sends one handcrafted control
+frame and watches frames arrive:
+
+    iwannt-ctl stats
+    iwannt-ctl peer 10.0.2.2 6001
+    iwannt-ctl session 1234 12345678 1 0102030405060708
+    iwannt-ctl send 1301000000000000...
+    iwannt-ctl watch 5
+
 ## Project status
 
 Stage 2 lifecycle skeleton is present: NDIS miniport registration, per-adapter
@@ -64,17 +75,18 @@ frames on a bounded ring for a PASSIVE consumer. The session (sid, token,
 encryption flag, key) is installed through the transport by a future control
 interface.
 
-The send direction exists as a pool, not yet connected to the miniport: each
-outbound datagram takes one preallocated slot (non-paged buffer, MDL, IRP), the
-frame is transformed into it, and the IRP completion recycles the slot at
-DISPATCH_LEVEL. A full pool fails the send instead of queueing, so backpressure
-reaches the caller; Stop drains the pool before closing the socket.
+The send direction is a pool: each outbound datagram takes one preallocated
+slot (non-paged buffer, MDL, IRP), the frame is transformed into it, and the IRP
+completion recycles the slot at DISPATCH_LEVEL. A full pool fails the send
+instead of queueing, so backpressure reaches the caller; Stop drains the pool
+before closing the socket. The miniport send handler flattens each NBL into a
+per-adapter scratch buffer and hands it to that pool.
 
-There are still no worker threads, no NBL/MDL pools, and no receive indication:
-the DATA sink is not yet wired to the miniport, and the miniport send handler
-still completes every packet without sending. The socket binds the wildcard
-address with port zero, because the session endpoint and port still have to come
-from the user-mode control plane through an interface that does not exist yet.
+There are still no worker threads and no NBL/MDL pools on the receive side: a
+single non-paged scratch buffer is copied per datagram, and the indication path
+allocates a buffer, an MDL and an NBL per inner packet. The socket binds the
+wildcard address with port zero; the peer endpoint arrives through `SET_PEER`
+and the session through `SET_SESSION`.
 
 - [NDIS miniport lifecycle](driver/iwan_nt_miniport.h) and [implementation](driver/iwan_nt_miniport.c)
 - [WDM driver entry and unload](driver/iwan_nt.c)
@@ -86,6 +98,10 @@ from the user-mode control plane through an interface that does not exist yet.
 - [Bounded control ring](driver/iwan_nt_ring.h) and [implementation](driver/iwan_nt_ring.c)
 - [Receive pipeline](driver/iwan_nt_ingress.h) and [implementation](driver/iwan_nt_ingress.c)
 - [Send slot pool](driver/iwan_nt_tx.h) and [implementation](driver/iwan_nt_tx.c)
+- [Control device](driver/iwan_nt_control.h) and [implementation](driver/iwan_nt_control.c)
+- [Shared IOCTL ABI](driver/iwan_nt_ioctl.h)
+- [User-mode control library](user/iwan_nt_control.h) and [implementation](user/iwan_nt_control.c)
+- [Diagnostic tool](user/iwannt-ctl.c)
 - [Codec unit test](tests/frame_test.c)
 - [Demultiplexer unit test](tests/demux_test.c)
 - [Ring unit test](tests/ring_test.c)
@@ -104,6 +120,12 @@ semantics; see [tools/kernel-stubs/README.md](tools/kernel-stubs/README.md).
 
 The host tests cover the four kernel-free modules: frame codec (93 checks),
 demultiplexer (334), bounded ring (840), receive pipeline (82).
+
+`tools/build-user.sh` builds the user-mode half with MinGW-w64, which is enough
+to catch ABI-header mistakes before a CI round:
+
+    bash tools/build-user.sh
+    build/user/iwannt-ctl.exe stats
 
 ## Socket close ordering
 

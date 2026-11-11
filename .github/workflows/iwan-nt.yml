@@ -102,6 +102,26 @@ jobs:
               Tee-Object -FilePath prefast.log
           "prefast exit code=$LASTEXITCODE"
 
+      # The user-mode half (control library plus diagnostic tool) is plain Win32 and
+      # shares the ABI header with the driver, so it is built here too: a header that
+      # only compiles on one side of the fence is a bug in the ABI.
+      - name: Build user-mode control tool
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $vcvars = Join-Path $env:VSDIR 'VC\Auxiliary\Build\vcvars64.bat'
+          New-Item -ItemType Directory -Force -Path 'build\x64\Release' | Out-Null
+          cmd /c "`"$vcvars`" >nul && cl /nologo /W4 /WX /std:c11 /utf-8 /Fe:build\x64\Release\iwannt-ctl.exe /Fo:build\x64\Release\ user\iwannt-ctl.c user\iwan_nt_control.c ws2_32.lib" 2>&1 |
+              Tee-Object -FilePath user-build.log
+          "user build exit code=$LASTEXITCODE"
+
+      - name: Assert iwannt-ctl.exe was produced
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'build\x64\Release\iwannt-ctl.exe'
+          if (-not (Test-Path $exe)) { throw 'iwannt-ctl.exe was not produced' }
+          "$exe $((Get-Item $exe).Length) bytes"
+
       # The steps above are continue-on-error, so workflow success never means build
       # success. The criterion is the product: a .sys on disk.
       - name: Assert iwannt.sys was produced
@@ -120,6 +140,8 @@ jobs:
           path: |
             build/x64/Release/iwannt.sys
             build/x64/Release/iwannt.pdb
+            build/x64/Release/iwannt-ctl.exe
+            user-build.log
             cl-build.log
             msbuild.log
             prefast.log
