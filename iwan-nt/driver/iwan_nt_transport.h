@@ -6,6 +6,7 @@
 #include "iwan_nt_wsk_socket.h"
 #include "iwan_nt_ingress.h"
 #include "iwan_nt_tx.h"
+#include "iwan_nt_ioctl.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -55,6 +56,10 @@ typedef struct _IWAN_NT_TRANSPORT {
     size_t ScratchCapacity;
     BOOLEAN IngressAttached;
     IWAN_NT_TX Tx;
+    /* Control-plane counters; one writer each, see the getter below. */
+    ULONG64 ControlSent;
+    ULONG64 ControlSendFailed;
+    ULONG64 ControlRead;
 } IWAN_NT_TRANSPORT, *PIWAN_NT_TRANSPORT;
 
 /* Lifecycle calls are serialized by the owning device and run at PASSIVE_LEVEL. */
@@ -149,6 +154,57 @@ IwanNtTransportSendInner(
     _Inout_ PIWAN_NT_TRANSPORT Transport,
     _In_reads_bytes_(InnerLength) const uint8_t *Inner,
     _In_ size_t InnerLength
+    );
+
+/*
+ * Send one complete control datagram payload verbatim.
+ *
+ * IRQL: PASSIVE_LEVEL.
+ * The caller builds the frame header, the 16-byte signature and every TLV;
+ * this path copies the bytes into a send slot and submits them unchanged.
+ * Returns STATUS_INVALID_DEVICE_STATE when the transport is not Running or no
+ * peer is installed, STATUS_INSUFFICIENT_RESOURCES when the pool is full.
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS
+IwanNtTransportSendControl(
+    _Inout_ PIWAN_NT_TRANSPORT Transport,
+    _In_reads_bytes_(Length) const uint8_t *Payload,
+    _In_ size_t Length
+    );
+
+/*
+ * Dequeue one complete control datagram payload.
+ *
+ * IRQL: PASSIVE_LEVEL.
+ * Single consumer: the control device serializes callers. On
+ * STATUS_BUFFER_TOO_SMALL the frame stays queued and Required receives its
+ * length, so a caller can retry with a larger buffer without losing it.
+ * Returns STATUS_NO_MORE_ENTRIES when the ring is empty.
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS
+IwanNtTransportReadControl(
+    _Inout_ PIWAN_NT_TRANSPORT Transport,
+    _Out_writes_bytes_opt_(Capacity) uint8_t *Out,
+    _In_ size_t Capacity,
+    _Out_ size_t *OutLength,
+    _Out_opt_ size_t *Required
+    );
+
+/*
+ * Snapshot every counter the transport owns.
+ *
+ * IRQL: PASSIVE_LEVEL.
+ * TxAccepted, TxRejected, RxIndicated and RxDropped belong to the adapter, so
+ * they are left zero here; the control device overlays them from its counter
+ * source and this module never has to know about the miniport.
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID
+IwanNtTransportGetStats(
+    _In_ PIWAN_NT_TRANSPORT Transport,
+    _Out_ IWAN_NT_STATS_ABI *Stats
     );
 
 /* These two routines reserve bounded send slots for future transport I/O. */

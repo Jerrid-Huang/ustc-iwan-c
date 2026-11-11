@@ -107,6 +107,7 @@
     <ClCompile Include="iwan_nt.c" />
     <ClCompile Include="iwan_nt_demux.c" />
     <ClCompile Include="iwan_nt_frame.c" />
+    <ClCompile Include="iwan_nt_control.c" />
     <ClCompile Include="iwan_nt_ingress.c" />
     <ClCompile Include="iwan_nt_miniport.c">
       <PreprocessorDefinitions>NDIS_MINIPORT_DRIVER;NDIS630_MINIPORT;NDIS_WDM;%(PreprocessorDefinitions)</PreprocessorDefinitions>
@@ -120,6 +121,8 @@
   <ItemGroup>
     <ClInclude Include="iwan_nt_demux.h" />
     <ClInclude Include="iwan_nt_frame.h" />
+    <ClInclude Include="iwan_nt_control.h" />
+    <ClInclude Include="iwan_nt_ioctl.h" />
     <ClInclude Include="iwan_nt_ingress.h" />
     <ClInclude Include="iwan_nt_miniport.h" />
     <ClInclude Include="iwan_nt_ring.h" />

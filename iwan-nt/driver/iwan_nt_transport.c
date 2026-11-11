@@ -344,6 +344,167 @@ IwanNtTransportFinalize(
     KeReleaseSpinLock(&Transport->StateLock, oldIrql);
 }
 
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS
+IwanNtTransportSendControl(
+    _Inout_ PIWAN_NT_TRANSPORT Transport,
+    _In_reads_bytes_(Length) const uint8_t *Payload,
+    _In_ size_t Length
+    )
+{
+    KIRQL oldIrql;
+    BOOLEAN running;
+    NTSTATUS status;
+
+    PAGED_CODE();
+
+    if (Transport == NULL || Payload == NULL || Length == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (Length > IWAN_NT_CONTROL_MAX) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    KeAcquireSpinLock(&Transport->StateLock, &oldIrql);
+    running = (BOOLEAN)(Transport->State == IwanNtTransportRunning);
+    KeReleaseSpinLock(&Transport->StateLock, oldIrql);
+    if (!running) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
+    status = IwanNtTxSendRaw(&Transport->Tx, Payload, Length);
+
+    KeAcquireSpinLock(&Transport->StateLock, &oldIrql);
+    if (NT_SUCCESS(status)) {
+        Transport->ControlSent++;
+    } else {
+        Transport->ControlSendFailed++;
+    }
+    KeReleaseSpinLock(&Transport->StateLock, oldIrql);
+
+    return status;
+}
+
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS
+IwanNtTransportReadControl(
+    _Inout_ PIWAN_NT_TRANSPORT Transport,
+    _Out_writes_bytes_opt_(Capacity) uint8_t *Out,
+    _In_ size_t Capacity,
+    _Out_ size_t *OutLength,
+    _Out_opt_ size_t *Required
+    )
+{
+    IWAN_NT_RING_RESULT result;
+    size_t length = 0;
+    KIRQL oldIrql;
+
+    PAGED_CODE();
+
+    if (Transport == NULL || OutLength == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    *OutLength = 0;
+
+    if (Transport->ControlRingInitialized == FALSE) {
+        return STATUS_NO_MORE_ENTRIES;
+    }
+
+    result = IwanNtRingPeekLength(&Transport->ControlRing, &length);
+    if (result == IwanNtRingEmpty) {
+        return STATUS_NO_MORE_ENTRIES;
+    }
+    if (result != IwanNtRingOk) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
+    if (length > Capacity || Out == NULL) {
+        /*
+         * Leave the record in the ring: a caller that guessed the size wrong
+         * retries instead of losing a control frame.
+         */
+        if (Required != NULL) {
+            *Required = length;
+        }
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+
+    result = IwanNtRingPop(&Transport->ControlRing, Out, Capacity, &length);
+    if (result != IwanNtRingOk) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
+    *OutLength = length;
+    if (Required != NULL) {
+        *Required = length;
+    }
+
+    KeAcquireSpinLock(&Transport->StateLock, &oldIrql);
+    Transport->ControlRead++;
+    KeReleaseSpinLock(&Transport->StateLock, oldIrql);
+
+    return STATUS_SUCCESS;
+}
+
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID
+IwanNtTransportGetStats(
+    _In_ PIWAN_NT_TRANSPORT Transport,
+    _Out_ IWAN_NT_STATS_ABI *Stats
+    )
+{
+    IWAN_NT_INGRESS_COUNTERS ingress;
+    KIRQL oldIrql;
+
+    PAGED_CODE();
+
+    if (Transport == NULL || Stats == NULL) {
+        return;
+    }
+
+    IwanNtIngressGetCounters(&Transport->Ingress, &ingress);
+
+    Stats->Receives = ingress.Receives;
+    Stats->Delivered = ingress.Delivered;
+    Stats->BytesDelivered = ingress.BytesDelivered;
+    Stats->QueuedControl = ingress.QueuedControl;
+    Stats->DroppedNoSession = ingress.DroppedNoSession;
+    Stats->DroppedMalformed = ingress.DroppedMalformed;
+    Stats->DroppedBadInner = ingress.DroppedBadInner;
+    Stats->DroppedControlFull = ingress.DroppedControlFull;
+    Stats->DroppedControlTooLarge = ingress.DroppedControlTooLarge;
+    Stats->DroppedControlNoRing = ingress.DroppedControlNoRing;
+    Stats->DroppedNoSink = ingress.DroppedNoSink;
+    Stats->DroppedSegrt = ingress.DroppedSegrt;
+    Stats->DroppedUnknown = ingress.DroppedUnknown;
+
+    Stats->TxAccepted = 0;
+    Stats->TxRejected = 0;
+    Stats->RxIndicated = 0;
+    Stats->RxDropped = 0;
+
+    KeAcquireSpinLock(&Transport->StateLock, &oldIrql);
+    Stats->ControlRead = Transport->ControlRead;
+    Stats->ControlSent = Transport->ControlSent;
+    Stats->ControlSendFailed = Transport->ControlSendFailed;
+    Stats->Running =
+        (uint32_t)(Transport->State == IwanNtTransportRunning ? 1u : 0u);
+    KeReleaseSpinLock(&Transport->StateLock, oldIrql);
+
+    /*
+     * SessionValid has its own lock: the receive path updates it from the
+     * WSK callback, so it must not be read under StateLock.
+     */
+    KeAcquireSpinLock(&Transport->SessionLock, &oldIrql);
+    Stats->SessionValid =
+        (uint32_t)(Transport->Ingress.SessionValid != 0 ? 1u : 0u);
+    KeReleaseSpinLock(&Transport->SessionLock, oldIrql);
+
+    Stats->TxInFlight = (uint32_t)IwanNtTxInFlight(&Transport->Tx);
+    Stats->Reserved0 = 0;
+}
+
 _IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN
 IwanNtTransportTryAcquireSend(

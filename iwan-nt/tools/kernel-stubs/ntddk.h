@@ -99,7 +99,12 @@ typedef ULONG_PTR KSPIN_LOCK;
 #define STATUS_DEVICE_BUSY ((NTSTATUS)0x80000011L)
 #define STATUS_INSUFFICIENT_RESOURCES ((NTSTATUS)0xC000009AL)
 #define STATUS_DEVICE_PROTOCOL_ERROR ((NTSTATUS)0xC0000189L)
+/* Same value in ntstatus.h; both spellings exist because callers use both. */
+#define STATUS_BUFFER_TOO_SMALL ((NTSTATUS)0xC0000023L)
 #define STATUS_BUFFER_TOO_SHORT ((NTSTATUS)0xC0000023L)
+#define STATUS_NO_MORE_ENTRIES ((NTSTATUS)0x8000001AL)
+#define STATUS_DEVICE_NOT_READY ((NTSTATUS)0xC00000A3L)
+#define STATUS_INVALID_DEVICE_REQUEST ((NTSTATUS)0xC0000010L)
 #define STATUS_MORE_PROCESSING_REQUIRED ((NTSTATUS)0xC0000016L)
 
 #define PASSIVE_LEVEL 0
@@ -137,15 +142,74 @@ typedef struct _DEVICE_OBJECT DEVICE_OBJECT, *PDEVICE_OBJECT;
 typedef struct _IRP IRP, *PIRP;
 typedef struct _MDL MDL, *PMDL;
 
+typedef struct _GUID {
+    uint32_t Data1;
+    uint16_t Data2;
+    uint16_t Data3;
+    uint8_t Data4[8];
+} GUID, *PGUID;
+typedef const GUID *LPCGUID;
+
+/*
+ * Enough of the I/O-manager surface for a control device: a buffered
+ * device-control request reaches the driver with the parameters in the stack
+ * location and one system buffer in the IRP.
+ */
+#define IRP_MJ_CREATE 0x00
+#define IRP_MJ_CLOSE 0x02
+#define IRP_MJ_CLEANUP 0x12
+#define IRP_MJ_DEVICE_CONTROL 0x0e
+#define IRP_MJ_MAXIMUM_FUNCTION 0x1b
+
+#define FILE_ANY_ACCESS 0
+
+typedef enum _IRP_REQUESTOR_MODE { IrpRequestorKernelMode, IrpRequestorUserMode } IRP_REQUESTOR_MODE;
+
+typedef struct _IO_STACK_LOCATION {
+    UCHAR MajorFunction;
+    union {
+        struct {
+            ULONG OutputBufferLength;
+            ULONG InputBufferLength;
+            ULONG IoControlCode;
+            PVOID Type3InputBuffer;
+        } DeviceIoControl;
+    } Parameters;
+} IO_STACK_LOCATION, *PIO_STACK_LOCATION;
+
 struct _IRP {
     IO_STATUS_BLOCK IoStatus;
+    struct {
+        union {
+            PIO_STACK_LOCATION CurrentStackLocation;
+        } Overlay;
+    } Tail;
+    union {
+        PVOID SystemBuffer;
+        PVOID UserBuffer;
+    } AssociatedIrp;
+    MODE RequestorMode;
+    ULONG Flags;
 };
+
+PIO_STACK_LOCATION
+IoGetCurrentIrpStackLocation(
+    PIRP Irp
+    );
+
+VOID
+IoCompleteRequest(
+    PIRP Irp,
+    CCHAR PriorityBoost
+    );
 
 typedef struct _UNICODE_STRING {
     USHORT Length;
     USHORT MaximumLength;
     PWSTR Buffer;
 } UNICODE_STRING, *PUNICODE_STRING;
+typedef const UNICODE_STRING *PCUNICODE_STRING;
+typedef const wchar_t *PCWSTR;
 
 typedef NTSTATUS (*PDRIVER_DISPATCH)(PDEVICE_OBJECT, PIRP);
 

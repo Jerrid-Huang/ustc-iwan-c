@@ -129,6 +129,22 @@ IwanNtTxSend(
     );
 
 /*
+ * Submit one already-assembled datagram payload verbatim.
+ *
+ * IRQL: <= DISPATCH_LEVEL.
+ * Used by the control plane: OPEN, OPEN_ACK, ECHO and CLOSE frames are built
+ * in user mode (header, signature and TLVs included), so this path performs
+ * no transform at all.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+NTSTATUS
+IwanNtTxSendRaw(
+    _Inout_ PIWAN_NT_TX Tx,
+    _In_reads_bytes_(Length) const uint8_t *Payload,
+    _In_ size_t Length
+    );
+
+/*
  * Wait until no datagram is in flight.
  *
  * IRQL: PASSIVE_LEVEL.

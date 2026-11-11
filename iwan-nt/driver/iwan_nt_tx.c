@@ -182,39 +182,23 @@ IwanNtTxSetRemote(
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
-NTSTATUS
-IwanNtTxSend(
-    _Inout_ PIWAN_NT_TX Tx,
-    _In_ const IWAN_NT_FRAME_HEADER *Header,
-    _In_reads_bytes_opt_(IWAN_NT_FRAME_KEY_LEN) const uint8_t *Key,
-    _In_reads_bytes_(InnerLength) const uint8_t *Inner,
-    _In_ size_t InnerLength
+/*
+ * Claim a free slot, or fail without touching the pool.
+ *
+ * IRQL: <= DISPATCH_LEVEL.
+ * Returns NULL when every slot is in flight; that is backpressure, counted as
+ * NoSlot, not an error worth waiting for.
+ */
+static PIWAN_NT_TX_SLOT
+IwanNtTxClaimSlot(
+    _Inout_ PIWAN_NT_TX Tx
     )
 {
-    PIWAN_NT_TX_SLOT slot;
-    IWAN_NT_FRAME_RESULT seal;
+    PIWAN_NT_TX_SLOT slot = NULL;
     KIRQL oldIrql;
-    SOCKADDR_IN remote;
-    NTSTATUS status;
-    size_t frameLength;
     ULONG index;
-    BOOLEAN signalIdle;
 
-    if (Tx == NULL || Header == NULL || Inner == NULL || InnerLength == 0) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    /*
-     * Claim a slot. Scanning a fixed array costs at most 32 iterations and
-     * keeps the allocation order deterministic, which makes leaks obvious.
-     */
-    slot = NULL;
     KeAcquireSpinLock(&Tx->Lock, &oldIrql);
-    if (Tx->RemoteValid == FALSE) {
-        KeReleaseSpinLock(&Tx->Lock, oldIrql);
-        return STATUS_INVALID_DEVICE_STATE;
-    }
-    remote = Tx->Remote;
     for (index = 0; index < Tx->SlotCount; index++) {
         if (!Tx->Slots[index].InUse) {
             slot = &Tx->Slots[index];
@@ -227,57 +211,79 @@ IwanNtTxSend(
     }
     if (slot == NULL) {
         Tx->NoSlot++;
-        KeReleaseSpinLock(&Tx->Lock, oldIrql);
-        return STATUS_INSUFFICIENT_RESOURCES;
     }
     KeReleaseSpinLock(&Tx->Lock, oldIrql);
 
-    frameLength = InnerLength + IWAN_NT_FRAME_HDR_LEN;
-    if (frameLength > IWAN_NT_TX_BUFFER_BYTES) {
-        KeAcquireSpinLock(&Tx->Lock, &oldIrql);
-        Tx->TooLarge++;
-        signalIdle = IwanNtTxReleaseSlotLocked(Tx, slot);
-        KeReleaseSpinLock(&Tx->Lock, oldIrql);
-        if (signalIdle) {
-            KeSetEvent(&Tx->IdleEvent, IO_NO_INCREMENT, FALSE);
-        }
-        return STATUS_INVALID_PARAMETER;
-    }
+    return slot;
+}
 
-    seal = IwanNtFrameSeal(
-        (uint8_t *)slot->Buffer, IWAN_NT_TX_BUFFER_BYTES, Inner, InnerLength,
-        Header, Key, &frameLength);
-    if (seal != IwanNtFrameOk) {
-        KeAcquireSpinLock(&Tx->Lock, &oldIrql);
+/*
+ * Return a slot that was claimed but never submitted, and bump the counter
+ * that explains why. The idle event is signalled outside the lock.
+ */
+static VOID
+IwanNtTxAbandonSlot(
+    _Inout_ PIWAN_NT_TX Tx,
+    _Inout_ PIWAN_NT_TX_SLOT Slot,
+    _In_ BOOLEAN CountAsSubmitError
+    )
+{
+    KIRQL oldIrql;
+    BOOLEAN signalIdle;
+
+    KeAcquireSpinLock(&Tx->Lock, &oldIrql);
+    if (CountAsSubmitError) {
         Tx->SubmitErrors++;
-        signalIdle = IwanNtTxReleaseSlotLocked(Tx, slot);
-        KeReleaseSpinLock(&Tx->Lock, oldIrql);
-        if (signalIdle) {
-            KeSetEvent(&Tx->IdleEvent, IO_NO_INCREMENT, FALSE);
-        }
+    }
+    signalIdle = IwanNtTxReleaseSlotLocked(Tx, Slot);
+    KeReleaseSpinLock(&Tx->Lock, oldIrql);
+
+    if (signalIdle) {
+        KeSetEvent(&Tx->IdleEvent, IO_NO_INCREMENT, FALSE);
+    }
+}
+
+/*
+ * Submit an already-filled slot holding Length bytes.
+ *
+ * IRQL: <= DISPATCH_LEVEL.
+ * The IRP stays associated with the slot for its whole life. IoReuseIrp gives
+ * it a clean status and no cancellation routine, and the completion routine
+ * claims ownership by returning MORE_PROCESSING_REQUIRED.
+ */
+static NTSTATUS
+IwanNtTxSubmitSlot(
+    _Inout_ PIWAN_NT_TX Tx,
+    _Inout_ PIWAN_NT_TX_SLOT Slot,
+    _In_ size_t Length
+    )
+{
+    SOCKADDR_IN remote;
+    NTSTATUS status;
+    KIRQL oldIrql;
+    BOOLEAN remoteValid;
+
+    if (Length == 0 || Length > IWAN_NT_TX_BUFFER_BYTES) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    /*
-     * The IRP stays associated with the slot for its whole life. IoReuseIrp
-     * gives it a clean status and no cancellation routine, and the completion
-     * routine claims ownership by returning MORE_PROCESSING_REQUIRED.
-     */
-    IoReuseIrp(slot->Irp, STATUS_SUCCESS);
+    KeAcquireSpinLock(&Tx->Lock, &oldIrql);
+    remoteValid = Tx->RemoteValid;
+    remote = Tx->Remote;
+    KeReleaseSpinLock(&Tx->Lock, oldIrql);
+    if (remoteValid == FALSE) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
+    IoReuseIrp(Slot->Irp, STATUS_SUCCESS);
     IoSetCompletionRoutine(
-        slot->Irp, IwanNtTxComplete, slot, TRUE, TRUE, TRUE);
+        Slot->Irp, IwanNtTxComplete, Slot, TRUE, TRUE, TRUE);
 
     status = Tx->Submit(
-        Tx->SubmitContext, slot->Mdl, (ULONG)frameLength, &remote, slot->Irp);
+        Tx->SubmitContext, Slot->Mdl, (ULONG)Length, &remote, Slot->Irp);
 
     if (!NT_SUCCESS(status) && status != STATUS_PENDING) {
-        KeAcquireSpinLock(&Tx->Lock, &oldIrql);
-        Tx->SubmitErrors++;
-        signalIdle = IwanNtTxReleaseSlotLocked(Tx, slot);
-        KeReleaseSpinLock(&Tx->Lock, oldIrql);
-        if (signalIdle) {
-            KeSetEvent(&Tx->IdleEvent, IO_NO_INCREMENT, FALSE);
-        }
+        IwanNtTxAbandonSlot(Tx, Slot, TRUE);
         return status;
     }
 
@@ -286,6 +292,88 @@ IwanNtTxSend(
     KeReleaseSpinLock(&Tx->Lock, oldIrql);
 
     return STATUS_SUCCESS;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+NTSTATUS
+IwanNtTxSend(
+    _Inout_ PIWAN_NT_TX Tx,
+    _In_ const IWAN_NT_FRAME_HEADER *Header,
+    _In_reads_bytes_opt_(IWAN_NT_FRAME_KEY_LEN) const uint8_t *Key,
+    _In_reads_bytes_(InnerLength) const uint8_t *Inner,
+    _In_ size_t InnerLength
+    )
+{
+    PIWAN_NT_TX_SLOT slot;
+    IWAN_NT_FRAME_RESULT seal;
+    size_t frameLength;
+    NTSTATUS status;
+
+    if (Tx == NULL || Header == NULL || Inner == NULL || InnerLength == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    frameLength = InnerLength + IWAN_NT_FRAME_HDR_LEN;
+    if (frameLength > IWAN_NT_TX_BUFFER_BYTES) {
+        KIRQL oldIrql;
+
+        KeAcquireSpinLock(&Tx->Lock, &oldIrql);
+        Tx->TooLarge++;
+        KeReleaseSpinLock(&Tx->Lock, oldIrql);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    slot = IwanNtTxClaimSlot(Tx);
+    if (slot == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    seal = IwanNtFrameSeal(
+        (uint8_t *)slot->Buffer, IWAN_NT_TX_BUFFER_BYTES, Inner, InnerLength,
+        Header, Key, &frameLength);
+    if (seal != IwanNtFrameOk) {
+        IwanNtTxAbandonSlot(Tx, slot, TRUE);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    status = IwanNtTxSubmitSlot(Tx, slot, frameLength);
+    if (!NT_SUCCESS(status)) {
+        /* SubmitSlot already returned the slot on every failing path. */
+        return status;
+    }
+
+    return STATUS_SUCCESS;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+NTSTATUS
+IwanNtTxSendRaw(
+    _Inout_ PIWAN_NT_TX Tx,
+    _In_reads_bytes_(Length) const uint8_t *Payload,
+    _In_ size_t Length
+    )
+{
+    PIWAN_NT_TX_SLOT slot;
+
+    if (Tx == NULL || Payload == NULL || Length == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (Length > IWAN_NT_TX_BUFFER_BYTES) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    slot = IwanNtTxClaimSlot(Tx);
+    if (slot == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    /*
+     * Verbatim: the control plane assembles its own frame header, signature
+     * and TLVs, so nothing is transformed here.
+     */
+    RtlCopyMemory(slot->Buffer, Payload, Length);
+
+    return IwanNtTxSubmitSlot(Tx, slot, Length);
 }
 
 _IRQL_requires_(PASSIVE_LEVEL)

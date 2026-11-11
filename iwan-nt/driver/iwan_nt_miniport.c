@@ -1,8 +1,12 @@
 #include "iwan_nt_miniport.h"
 #include "iwan_nt_transport.h"
 #include "iwan_nt_tx.h"
+#include "iwan_nt_control.h"
 
 #define IWAN_NT_MINIPORT_POOL_TAG 'mNwI'
+
+/* Two hundred 60-byte control frames fit; the ring drops and counts instead. */
+#define IWAN_NT_CONTROL_RING_BYTES 16384u
 #define IWAN_NT_MINIPORT_LINK_SPEED 1000000000ULL
 #define IWAN_NT_MINIPORT_PACKET_FILTERS \
     (NDIS_PACKET_TYPE_DIRECTED | NDIS_PACKET_TYPE_MULTICAST | \
@@ -46,6 +50,12 @@ typedef struct _IWAN_NT_MINIPORT_ADAPTER {
     volatile LONG TxRejected;
     volatile LONG RxIndicated;
     volatile LONG RxDropped;
+    /*
+     * Bounded storage for the control ring that carries inbound OPEN_ACK,
+     * ECHO and CLOSE frames to the user-mode control plane. Fixed size, so a
+     * noisy or hostile peer can only fill the ring, never grow the pool.
+     */
+    PUCHAR ControlStorage;
 } IWAN_NT_MINIPORT_ADAPTER, *PIWAN_NT_MINIPORT_ADAPTER;
 
 /* NDIS role types supply the callback IRQL and parameter annotations. */
@@ -160,6 +170,40 @@ IwanNtMiniportUnregisterDriver(
     }
 }
 
+/*
+ * Adapter counters for IWAN_NT_IOCTL_GET_STATS. Called at PASSIVE_LEVEL while
+ * the adapter is halted only after the control device drained its callers, so
+ * reading the volatile counters here needs no lock.
+ */
+static VOID
+IwanNtMiniportQueryCounters(
+    _In_opt_ void *Context,
+    _Out_ uint64_t *TxAccepted,
+    _Out_ uint64_t *TxRejected,
+    _Out_ uint64_t *RxIndicated,
+    _Out_ uint64_t *RxDropped
+    )
+{
+    PIWAN_NT_MINIPORT_ADAPTER adapter = (PIWAN_NT_MINIPORT_ADAPTER)Context;
+
+    if (adapter == NULL) {
+        *TxAccepted = 0;
+        *TxRejected = 0;
+        *RxIndicated = 0;
+        *RxDropped = 0;
+        return;
+    }
+
+    *TxAccepted = (uint64_t)InterlockedCompareExchange(
+        &adapter->TxAccepted, 0, 0);
+    *TxRejected = (uint64_t)InterlockedCompareExchange(
+        &adapter->TxRejected, 0, 0);
+    *RxIndicated = (uint64_t)InterlockedCompareExchange(
+        &adapter->RxIndicated, 0, 0);
+    *RxDropped = (uint64_t)InterlockedCompareExchange(
+        &adapter->RxDropped, 0, 0);
+}
+
 _Use_decl_annotations_
 static NDIS_STATUS
 IwanNtMiniportInitializeEx(
@@ -224,6 +268,20 @@ IwanNtMiniportInitializeEx(
     }
     IwanNtTransportSetDataSink(&adapter->Transport, IwanNtMiniportIndicateInner,
                                adapter);
+
+    /*
+     * Control frames need somewhere to wait for the user-mode control plane,
+     * so the ring storage is allocated once here rather than per datagram.
+     */
+    adapter->ControlStorage = NdisAllocateMemoryWithTagPriority(
+        MiniportAdapterHandle, IWAN_NT_CONTROL_RING_BYTES,
+        IWAN_NT_MINIPORT_POOL_TAG, NormalPoolPriority);
+    if (adapter->ControlStorage == NULL) {
+        status = NDIS_STATUS_RESOURCES;
+        goto Failure;
+    }
+    IwanNtTransportSetControlRing(&adapter->Transport, adapter->ControlStorage,
+                                  IWAN_NT_CONTROL_RING_BYTES);
     NdisZeroMemory(&registration, sizeof(registration));
     registration.Header.Type =
         NDIS_OBJECT_TYPE_MINIPORT_ADAPTER_REGISTRATION_ATTRIBUTES;
@@ -287,11 +345,30 @@ IwanNtMiniportInitializeEx(
         goto Failure;
     }
 
+    /*
+     * Publish the transport to the control device last: from here on an IOCTL
+     * can reach this adapter, so everything it touches must already be live.
+     */
+    {
+        IWAN_NT_CONTROL_COUNTER_SOURCE source;
+
+        source.Context = adapter;
+        source.Query = IwanNtMiniportQueryCounters;
+        IwanNtControlAttachAdapter(&adapter->Transport, &source);
+    }
+
     /* NDIS initializes an adapter in Paused; Restart enables its data path. */
     return NDIS_STATUS_SUCCESS;
 
 Failure:
     /* NDIS does not call HaltEx when InitializeEx fails. */
+    if (adapter->TransportReady) {
+        IwanNtControlDetachAdapter(&adapter->Transport);
+    }
+    if (adapter->ControlStorage != NULL) {
+        NdisFreeMemory(adapter->ControlStorage, 0, 0);
+        adapter->ControlStorage = NULL;
+    }
     if (adapter->TransportReady) {
         IwanNtTransportFinalize(&adapter->Transport);
         adapter->TransportReady = FALSE;
@@ -323,6 +400,18 @@ IwanNtMiniportHaltEx(
 
     UNREFERENCED_PARAMETER(HaltAction);
     InterlockedExchange(&adapter->State, IwanNtMiniportStopped);
+    /*
+     * Withdraw the control device first: it drains every IOCTL that already
+     * holds a reference, so no request can touch the transport while it is
+     * being finalized below.
+     */
+    if (adapter->TransportReady) {
+        IwanNtControlDetachAdapter(&adapter->Transport);
+    }
+    if (adapter->ControlStorage != NULL) {
+        NdisFreeMemory(adapter->ControlStorage, 0, 0);
+        adapter->ControlStorage = NULL;
+    }
     /* The transport drain waits out the receive callback before this returns. */
     if (adapter->TransportReady) {
         IwanNtTransportFinalize(&adapter->Transport);
