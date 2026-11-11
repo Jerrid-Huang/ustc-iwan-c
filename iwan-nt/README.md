@@ -73,6 +73,9 @@ frame and watches frames arrive:
   iwannt-ctl open _rev_m_2 secret 1400        # build an OPEN frame, no driver needed
   iwannt-ctl open _rev_m_2 secret 1400 send   # build it and hand it to the driver
   iwannt-ctl connect 10.0.2.2 6001 _rev_m_2 secret 1400 20
+                                               # retries OPEN every 2s while the
+                                               # session is down, and again after
+                                               # a rejection or a CLOSE
 
 ## Project status
 

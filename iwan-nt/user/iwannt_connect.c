@@ -21,6 +21,9 @@ typedef struct _IWANNT_CONNECT_STATE {
     ULONG EchoesAnswered;
     ULONG FramesRead;
     ULONG ForeignFrames;
+    ULONG Rejected;
+    ULONG Closed;
+    BOOLEAN EverEstablished;
     ULONGLONG NextOpen;
     ULONGLONG NextEcho;
 } IWANNT_CONNECT_STATE;
@@ -72,6 +75,7 @@ HandleFrame(
         State->Token = ack.Token;
         State->Encrypted = ack.Encrypted;
         State->Established = TRUE;
+        State->EverEstablished = TRUE;
 
         printf("CONNECT ack sid=%u token=%08lx mtu=%u encrypted=%lu",
                (unsigned)ack.Sid, (unsigned long)ack.Token, (unsigned)ack.Mtu,
@@ -89,8 +93,16 @@ HandleFrame(
     }
 
     if (Frame[0] == IWAN_NT_SESSION_TYPE_OPEN_REJECT) {
-        printf("CONNECT rejected by peer\n");
-        return 2;
+        /*
+         * A rejection is not fatal: the server may be restarting, or the session
+         * may have been replaced. Forget the session, announce it, and let the
+         * retry timer send OPEN again.
+         */
+        (void)IwanNtClearSession(Device);
+        State->Established = FALSE;
+        State->Rejected++;
+        printf("CONNECT rejected by peer (#%lu)\n", (unsigned long)State->Rejected);
+        return 0;
     }
 
     if (Frame[0] == IWAN_NT_SESSION_TYPE_ECHO_RESPONSE) {
@@ -115,8 +127,9 @@ HandleFrame(
          */
         (void)IwanNtClearSession(Device);
         State->Established = FALSE;
-        printf("CONNECT closed by peer\n");
-        return 2;
+        State->Closed++;
+        printf("CONNECT closed by peer (#%lu)\n", (unsigned long)State->Closed);
+        return 0;
     }
 
     State->ForeignFrames++;
@@ -255,9 +268,6 @@ IwanNtRunConnect(
         int length;
 
         if (now >= deadline) {
-            if (!state.Established) {
-                status = 3;
-            }
             break;
         }
 
@@ -267,7 +277,9 @@ IwanNtRunConnect(
                 break;
             }
             state.NextOpen = now + IWANNT_OPEN_INTERVAL_MS;
-        } else if (state.Established && now >= state.NextEcho) {
+        } else if (!state.Established) {
+            /* Waiting for the retry timer; nothing to send this pass. */
+        } else if (now >= state.NextEcho) {
             if (SendEcho(Device, &state) != 0) {
                 status = 1;
                 break;
@@ -292,15 +304,24 @@ IwanNtRunConnect(
             if (status != 0) {
                 break;
             }
+            if (!state.Established) {
+                /* The next OPEN must not wait for a stale deadline. */
+                state.NextOpen = GetTickCount64() + IWANNT_OPEN_INTERVAL_MS;
+            }
         }
 
         Sleep(10);
     }
 
-    printf("CONNECT done opens=%lu echoes=%lu answered=%lu frames=%lu foreign=%lu\n",
+    printf("CONNECT done opens=%lu echoes=%lu answered=%lu frames=%lu foreign=%lu "
+           "rejected=%lu closed=%lu\n",
            (unsigned long)state.OpensSent, (unsigned long)state.EchoesSent,
            (unsigned long)state.EchoesAnswered, (unsigned long)state.FramesRead,
-           (unsigned long)state.ForeignFrames);
+           (unsigned long)state.ForeignFrames, (unsigned long)state.Rejected,
+           (unsigned long)state.Closed);
+    if (!state.EverEstablished) {
+        status = 3;
+    }
     if (state.Established) {
         IWAN_NT_STATS_ABI stats;
 
