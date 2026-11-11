@@ -112,7 +112,7 @@ jobs:
           $vcvars = Join-Path $env:VSDIR 'VC\Auxiliary\Build\vcvars64.bat'
           New-Item -ItemType Directory -Force -Path 'build\x64\Release' | Out-Null
           New-Item -ItemType Directory -Force -Path 'build\obj\um' | Out-Null
-          cmd /c "`"$vcvars`" >nul && cl /nologo /W4 /WX /std:c11 /utf-8 /Fe:build\x64\Release\iwannt-ctl.exe /Fo:build\obj\um\ iwan-nt\user\iwannt-ctl.c iwan-nt\user\iwan_nt_control.c ws2_32.lib" 2>&1 |
+          cmd /c "`"$vcvars`" >nul && cl /nologo /W4 /WX /std:c11 /utf-8 /Fe:build\x64\Release\iwannt-ctl.exe /Fo:build\obj\um\ iwan-nt\user\iwannt-ctl.c iwan-nt\user\iwan_nt_control.c iwan-nt\user\iwan_nt_crypto.c iwan-nt\user\iwan_nt_session.c ws2_32.lib" 2>&1 |
               Tee-Object -FilePath user-build.log
           if ($LASTEXITCODE -ne 0) { throw "user-mode build failed: $LASTEXITCODE" }
 

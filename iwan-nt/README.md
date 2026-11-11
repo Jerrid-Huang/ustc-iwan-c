@@ -64,6 +64,8 @@ frame and watches frames arrive:
     iwannt-ctl session 1234 12345678 1 0102030405060708
     iwannt-ctl send 1301000000000000...
     iwannt-ctl watch 5
+  iwannt-ctl open _rev_m_2 secret 1400        # build an OPEN frame, no driver needed
+  iwannt-ctl open _rev_m_2 secret 1400 send   # build it and hand it to the driver
 
 ## Project status
 
@@ -127,7 +129,7 @@ semantics; see [tools/kernel-stubs/README.md](tools/kernel-stubs/README.md).
 
 The host tests cover the kernel-free modules and the crypto primitives: frame
 codec (93 checks), demultiplexer (334), bounded ring (840), receive pipeline
-(82), MD5 and AES-128 (7 known-answer checks).
+(82), MD5 and AES-128 (7 known-answer checks), control framing (32).
 
 `tools/build-user.sh` builds the user-mode half with MinGW-w64, which is enough
 to catch ABI-header mistakes before a CI round:

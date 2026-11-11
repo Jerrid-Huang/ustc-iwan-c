@@ -13,6 +13,10 @@
  *   iwannt-ctl send <hex>
  *   iwannt-ctl read [count]
  *   iwannt-ctl watch <seconds>
+ *   iwannt-ctl open <user> <password> <mtu> [send]
+ *
+ * The open subcommand works without the driver loaded: it only builds the frame,
+ * which is the fastest way to compare our framing against a captured one.
  */
 
 #include <stdio.h>
@@ -21,6 +25,7 @@
 #include <windows.h>
 
 #include "iwan_nt_control.h"
+#include "iwan_nt_session.h"
 
 static VOID
 Usage(VOID)
@@ -33,7 +38,8 @@ Usage(VOID)
             "  iwannt-ctl clear\n"
             "  iwannt-ctl send <hex>\n"
             "  iwannt-ctl read [count]\n"
-            "  iwannt-ctl watch <seconds>\n");
+            "  iwannt-ctl watch <seconds>\n"
+            "  iwannt-ctl open <user> <password> <mtu> [send]\n");
 }
 
 static BOOL
@@ -319,6 +325,66 @@ CommandWatch(
     return 0;
 }
 
+static int
+CommandOpen(
+    _In_ int Argc,
+    _In_ char **Argv
+    )
+{
+    IWAN_NT_SESSION_OPEN open;
+    IWAN_NT_SESSION_RESULT status;
+    UCHAR frame[IWAN_NT_SESSION_CONTROL_MAX];
+    size_t length = 0;
+    size_t index;
+    BOOL send = FALSE;
+
+    if (Argc < 5) {
+        fprintf(stderr, "usage: iwannt-ctl open <user> <password> <mtu> [send]\n");
+        return 2;
+    }
+    if (Argc >= 6) {
+        if (strcmp(Argv[5], "send") != 0) {
+            fprintf(stderr, "unknown flag %s\n", Argv[5]);
+            return 2;
+        }
+        send = TRUE;
+    }
+
+    open.User = Argv[2];
+    open.Password = Argv[3];
+    open.Mtu = (uint16_t)strtoul(Argv[4], NULL, 10);
+
+    status = IwanNtSessionBuildOpen(&open, frame, sizeof(frame), &length);
+    if (status != IwanNtSessionOk) {
+        fprintf(stderr, "build OPEN failed: %d\n", (int)status);
+        return 1;
+    }
+
+    for (index = 0; index < length; index++) {
+        printf("%02x", frame[index]);
+    }
+    printf("\n");
+
+    if (send) {
+        IWAN_NT_DEVICE device;
+
+        device.Handle = INVALID_HANDLE_VALUE;
+        if (IwanNtOpen(&device) == FALSE) {
+            fprintf(stderr, "open %s failed: %lu\n", IWAN_NT_WIN32_NAME,
+                    GetLastError());
+            return 1;
+        }
+        if (IwanNtSendControl(&device, frame, (UINT32)length) == 0) {
+            fprintf(stderr, "SEND_CONTROL failed: %lu\n", GetLastError());
+            IwanNtClose(&device);
+            return 1;
+        }
+        IwanNtClose(&device);
+    }
+
+    return 0;
+}
+
 int
 main(
     _In_ int argc,
@@ -331,6 +397,14 @@ main(
     if (argc < 2) {
         Usage();
         return 2;
+    }
+
+    /*
+     * open only builds a frame, so it must work with the driver absent: that is
+     * the case when comparing our layout against a capture.
+     */
+    if (strcmp(argv[1], "open") == 0) {
+        return CommandOpen(argc, argv);
     }
 
     device.Handle = INVALID_HANDLE_VALUE;
