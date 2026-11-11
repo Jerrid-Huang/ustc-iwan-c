@@ -18,7 +18,13 @@
  */
 
 #include <stddef.h>
-#include "iwan_nt_types.h"
+#include <stdint.h>
+
+/*
+ * These headers are user-mode only, so they take the C runtime integer types
+ * directly instead of the driver's kernel-aware wrapper. Including that wrapper
+ * here would make the user build depend on the driver include path for no gain.
+ */
 
 #ifdef __cplusplus
 extern "C" {
