@@ -53,7 +53,11 @@ CheckBytes(
     }
 }
 
-/* OPEN_ACK captured from the deployment: sid 9, token 0xe4977730, 1400 MTU. */
+/*
+ * OPEN_ACK captured from the deployment. The identifiers are machine-order words,
+ * so 00 09 is sid 0x0900 and e4 97 77 30 is token 0x307797e4, not the network-order
+ * readings 9 and 0xe4977730. The reference client loads both without a byte swap.
+ */
 static const uint8_t RealAck[] = {
     0x12, 0x01, 0x00, 0x09, 0xe4, 0x97, 0x77, 0x30,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -154,8 +158,8 @@ TestParseAck(void)
     memcpy(frame, RealAck, sizeof(frame));
     result = IwanNtSessionParseAck(frame, sizeof(frame), &ack);
     Check("ack-ok", result == IwanNtSessionOk);
-    Check("ack-sid", ack.Sid == 9u);
-    Check("ack-token", ack.Token == 0xe4977730u);
+    Check("ack-sid", ack.Sid == 0x0900u);
+    Check("ack-token", ack.Token == 0x307797e4u);
     Check("ack-mtu", ack.Mtu == 1400u);
     Check("ack-encrypted", ack.Encrypted == 1u);
     Check("ack-has-address", ack.HasAddress == 1);
@@ -190,11 +194,11 @@ TestEcho(void)
                                           frame, sizeof(frame), &length);
     Check("echo-ok", result == IwanNtSessionOk);
     Check("echo-length", length == IWAN_NT_SESSION_ECHO_LEN);
-    CheckBytes("echo-header", frame, (const uint8_t *)"\x15\x00\x00\x09\xe4\x97\x77\x30", 8u);
+    CheckBytes("echo-header", frame, (const uint8_t *)"\x15\x00\x09\x00\x30\x77\x97\xe4", 8u);
     /* The tick is host order, i.e. little endian on every platform this runs on. */
     CheckBytes("echo-tick", frame + 24u, (const uint8_t *)"\x88\x77\x66\x55\x44\x33\x22\x11", 8u);
     CheckBytes("echo-cur", frame + 32u, (const uint8_t *)"\x00\x00\x00\x00", 4u);
-    CheckBytes("echo-min", frame + 36u, (const uint8_t *)"\x00\x4c\x4b\x40", 4u);
+    CheckBytes("echo-min", frame + 36u, (const uint8_t *)"\x40\x4b\x4c\x00", 4u);
     CheckBytes("echo-max", frame + 40u, (const uint8_t *)"\x00\x00\x00\x00", 4u);
     CheckBytes("echo-sdrt", frame + 48u, (const uint8_t *)"SDRT", 4u);
     CheckBytes("echo-tail", frame + 52u, (const uint8_t *)"\x00\x00\x00\x00\x00\x00\x00\x00", 8u);
@@ -216,18 +220,19 @@ TestEchoResponse(void)
                                           frame, sizeof(frame), &length);
     Check("echo-resp-build", result == IwanNtSessionOk);
     frame[0] = 0x16;
-    frame[32] = 0x00;
-    frame[33] = 0x00;
-    frame[34] = 0x1f;
-    frame[35] = 0x40;   /* 8000 us */
-    frame[36] = 0x00;
-    frame[37] = 0x00;
-    frame[38] = 0x0d;
-    frame[39] = 0xac;   /* 3500 us */
-    frame[40] = 0x00;
-    frame[41] = 0x00;
-    frame[42] = 0x27;
-    frame[43] = 0x10;   /* 10000 us */
+    /* The delays are machine-order words, same as everything else in the payload. */
+    frame[32] = 0x40;
+    frame[33] = 0x1f;
+    frame[34] = 0x00;
+    frame[35] = 0x00;   /* 8000 us */
+    frame[36] = 0xac;
+    frame[37] = 0x0d;
+    frame[38] = 0x00;
+    frame[39] = 0x00;   /* 3500 us */
+    frame[40] = 0x10;
+    frame[41] = 0x27;
+    frame[42] = 0x00;
+    frame[43] = 0x00;   /* 10000 us */
 
     result = IwanNtSessionParseEchoResponse(frame, length, &echo);
     Check("echo-resp-ok", result == IwanNtSessionOk);

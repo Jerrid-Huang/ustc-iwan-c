@@ -22,9 +22,11 @@
 #include "iwan_nt_session.h"
 
 static int Failures = 0;
+static int Checks = 0;
 
 #define CHECK(Condition)                                                       \
     do {                                                                       \
+        Checks++;                                                              \
         if (!(Condition)) {                                                    \
             printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #Condition);         \
             Failures++;                                                        \
@@ -127,8 +129,9 @@ main(void)
     CHECK(poppedLength == sizeof(kAck));
     CHECK(memcmp(popped, kAck, sizeof(kAck)) == 0);
     CHECK(IwanNtSessionParseAck(popped, poppedLength, &ack) == IwanNtSessionOk);
-    CHECK(ack.Sid == 9u);
-    CHECK(ack.Token == 0xe4977730u);
+    /* Machine-order words: 00 09 reads as 0x0900, e4 97 77 30 as 0x307797e4. */
+    CHECK(ack.Sid == 0x0900u);
+    CHECK(ack.Token == 0x307797e4u);
     CHECK(ack.Mtu == 1400u);
     CHECK(ack.Encrypted == 1u);
 
@@ -190,7 +193,78 @@ main(void)
         CHECK(gDeliveredCalls == 0);
     }
 
-    /* Step 7: clearing the session must also wipe the stored key. */
+    /*
+     * Step 7: a CLOSE from the peer is a control frame, so it has to reach the
+     * consumer even though it is not DATA: that is the only way the consumer can
+     * learn the session is gone before the next frame arrives.
+     */
+    {
+        uint8_t closed[64];
+
+        memset(closed, 0, sizeof(closed));
+        closed[0] = IWAN_NT_TYPE_CLOSE;
+        closed[1] = 0;
+        /*
+         * The peer identifies the session in every control frame, and it writes the
+         * identifiers as machine-order words, so they go back out little endian.
+         */
+        closed[2] = (uint8_t)(ack.Sid & 0xFFu);
+        closed[3] = (uint8_t)((ack.Sid >> 8) & 0xFFu);
+        closed[4] = (uint8_t)(ack.Token & 0xFFu);
+        closed[5] = (uint8_t)((ack.Token >> 8) & 0xFFu);
+        closed[6] = (uint8_t)((ack.Token >> 16) & 0xFFu);
+        closed[7] = (uint8_t)((ack.Token >> 24) & 0xFFu);
+        closed[23] = 0x11;   /* a signature byte: the ingress does not judge them */
+        gDeliveredCalls = 0;
+        CHECK(IwanNtIngressReceive(&gIngress, closed, 24u) ==
+              IwanNtIngressQueuedControl);
+        CHECK(gDeliveredCalls == 0);
+        CHECK(IwanNtRingPop(&gRing, popped, sizeof(popped), &poppedLength) ==
+              IwanNtRingOk);
+        CHECK(poppedLength == 24u);
+        CHECK(IwanNtSessionType(popped, poppedLength) == IWAN_NT_TYPE_CLOSE);
+    }
+
+    /*
+     * Step 8: after a restart the peer comes back with new identifiers and a new
+     * key. The stale session must not keep accepting frames sealed with the old
+     * one, or a restarted tunnel would decrypt garbage into the stack.
+     */
+    {
+        uint8_t newKey[8];
+        IWAN_NT_INGRESS_SESSION next;
+        IWAN_NT_FRAME_HEADER fresh = header;
+
+        fresh.Sid = 0x0010u;
+        fresh.Token = 0x11223344u;
+
+        IwanNtIngressClearSession(&gIngress);
+        IwanNtSessionKey("_rev_m_2", "secret2", newKey);
+        memset(&next, 0, sizeof(next));
+        next.Sid = fresh.Sid;
+        next.Token = fresh.Token;
+        next.Encrypted = 1;
+        memcpy(next.Key, newKey, sizeof(newKey));
+        IwanNtIngressSetSession(&gIngress, &next);
+
+        CHECK(IwanNtFrameSeal(payload, sizeof(payload), inner, innerLength, &fresh,
+                              newKey, &payloadLength) == IwanNtFrameOk);
+        gDeliveredCalls = 0;
+        CHECK(IwanNtIngressReceive(&gIngress, payload, payloadLength) ==
+              IwanNtIngressDelivered);
+        CHECK(gDeliveredCalls == 1);
+        CHECK(memcmp(gDelivered, inner, innerLength) == 0);
+
+        /* The same frame shape sealed with the retired key must not get through. */
+        CHECK(IwanNtFrameSeal(payload, sizeof(payload), inner, innerLength, &fresh,
+                              key, &payloadLength) == IwanNtFrameOk);
+        gDeliveredCalls = 0;
+        CHECK(IwanNtIngressReceive(&gIngress, payload, payloadLength) ==
+              IwanNtIngressDroppedBadInner);
+        CHECK(gDeliveredCalls == 0);
+    }
+
+    /* Step 9: clearing the session must also wipe the stored key. */
     IwanNtIngressClearSession(&gIngress);
     for (index = 0; index < IWAN_NT_FRAME_KEY_LEN; index++) {
         CHECK(gIngress.Session.Key[index] == 0);
@@ -200,6 +274,6 @@ main(void)
         printf("pipeline: %d failures\n", Failures);
         return 1;
     }
-    printf("pipeline: 22 checks, 0 failures\n");
+    printf("pipeline: %d checks, 0 failures\n", Checks);
     return 0;
 }

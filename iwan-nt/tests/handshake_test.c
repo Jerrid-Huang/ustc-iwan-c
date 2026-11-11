@@ -36,12 +36,13 @@ BuildAck(
     memset(Buffer, 0, 24u);
     Buffer[0] = IWAN_NT_SESSION_TYPE_OPEN_ACK;
     Buffer[1] = 1;
-    Buffer[2] = (uint8_t)(Sid >> 8);
-    Buffer[3] = (uint8_t)(Sid & 0xFFu);
-    Buffer[4] = (uint8_t)(Token >> 24);
-    Buffer[5] = (uint8_t)(Token >> 16);
-    Buffer[6] = (uint8_t)(Token >> 8);
-    Buffer[7] = (uint8_t)(Token & 0xFFu);
+    /* Machine-order words, as the peer writes them. */
+    Buffer[2] = (uint8_t)(Sid & 0xFFu);
+    Buffer[3] = (uint8_t)((Sid >> 8) & 0xFFu);
+    Buffer[4] = (uint8_t)(Token & 0xFFu);
+    Buffer[5] = (uint8_t)((Token >> 8) & 0xFFu);
+    Buffer[6] = (uint8_t)((Token >> 16) & 0xFFu);
+    Buffer[7] = (uint8_t)((Token >> 24) & 0xFFu);
     memcpy(Buffer + 24u, body, sizeof(body));
     return 24u + sizeof(body);
 }
@@ -66,19 +67,19 @@ BuildEchoAnswer(
         return 0;
     }
     Buffer[0] = IWAN_NT_SESSION_TYPE_ECHO_RESPONSE;
-    /* The delays are big endian, unlike the tick. */
-    Buffer[32] = (uint8_t)(Current >> 24);
-    Buffer[33] = (uint8_t)(Current >> 16);
-    Buffer[34] = (uint8_t)(Current >> 8);
-    Buffer[35] = (uint8_t)(Current & 0xFFu);
-    Buffer[36] = (uint8_t)(Minimum >> 24);
-    Buffer[37] = (uint8_t)(Minimum >> 16);
-    Buffer[38] = (uint8_t)(Minimum >> 8);
-    Buffer[39] = (uint8_t)(Minimum & 0xFFu);
-    Buffer[40] = (uint8_t)(Maximum >> 24);
-    Buffer[41] = (uint8_t)(Maximum >> 16);
-    Buffer[42] = (uint8_t)(Maximum >> 8);
-    Buffer[43] = (uint8_t)(Maximum & 0xFFu);
+    /* The delays are machine order, like the tick. */
+    Buffer[32] = (uint8_t)(Current & 0xFFu);
+    Buffer[33] = (uint8_t)((Current >> 8) & 0xFFu);
+    Buffer[34] = (uint8_t)((Current >> 16) & 0xFFu);
+    Buffer[35] = (uint8_t)((Current >> 24) & 0xFFu);
+    Buffer[36] = (uint8_t)(Minimum & 0xFFu);
+    Buffer[37] = (uint8_t)((Minimum >> 8) & 0xFFu);
+    Buffer[38] = (uint8_t)((Minimum >> 16) & 0xFFu);
+    Buffer[39] = (uint8_t)((Minimum >> 24) & 0xFFu);
+    Buffer[40] = (uint8_t)(Maximum & 0xFFu);
+    Buffer[41] = (uint8_t)((Maximum >> 8) & 0xFFu);
+    Buffer[42] = (uint8_t)((Maximum >> 16) & 0xFFu);
+    Buffer[43] = (uint8_t)((Maximum >> 24) & 0xFFu);
     for (index = 44u; index < length; index++) {
         Buffer[index] = 0;
     }

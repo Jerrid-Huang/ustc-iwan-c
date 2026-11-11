@@ -36,14 +36,55 @@ IwanNtSessionGetBe16(
     return (uint16_t)(((uint16_t)Buffer[0] << 8) | (uint16_t)Buffer[1]);
 }
 
-static uint32_t
-IwanNtSessionGetBe32(
+
+/*
+ * The session identifiers are not network order. The reference client loads them
+ * with a plain 16/32-bit read and stores them with a plain write (no ntohs/ntohl
+ * anywhere in its answer handler), so both ends must agree on the machine order of
+ * the word -- little endian for the x86 builds this protocol ships for. Treating
+ * them as network order parses an answer into a session whose identifiers never
+ * match the ones on incoming frames, and every frame is then rejected as foreign.
+ */
+static void
+IwanNtSessionPutLe16(
+    uint8_t *Buffer,
+    uint16_t Value
+    )
+{
+    Buffer[0] = (uint8_t)(Value & 0xFFu);
+    Buffer[1] = (uint8_t)((Value >> 8) & 0xFFu);
+}
+
+static void
+IwanNtSessionPutLe32(
+    uint8_t *Buffer,
+    uint32_t Value
+    )
+{
+    Buffer[0] = (uint8_t)(Value & 0xFFu);
+    Buffer[1] = (uint8_t)((Value >> 8) & 0xFFu);
+    Buffer[2] = (uint8_t)((Value >> 16) & 0xFFu);
+    Buffer[3] = (uint8_t)((Value >> 24) & 0xFFu);
+}
+
+static uint16_t
+IwanNtSessionGetLe16(
     const uint8_t *Buffer
     )
 {
-    return ((uint32_t)Buffer[0] << 24) | ((uint32_t)Buffer[1] << 16) |
-           ((uint32_t)Buffer[2] << 8) | (uint32_t)Buffer[3];
+    return (uint16_t)((uint16_t)Buffer[0] | ((uint16_t)Buffer[1] << 8));
 }
+
+static uint32_t
+IwanNtSessionGetLe32(
+    const uint8_t *Buffer
+    )
+{
+    return (uint32_t)Buffer[0] | ((uint32_t)Buffer[1] << 8) |
+           ((uint32_t)Buffer[2] << 16) | ((uint32_t)Buffer[3] << 24);
+}
+
+
 
 /*
  * The signature covers the frame header and the literal suffix "mw"; the TLVs are
@@ -211,8 +252,8 @@ IwanNtSessionParseAck(
     }
 
     memset(Ack, 0, sizeof(*Ack));
-    Ack->Sid = IwanNtSessionGetBe16(Frame + 2u);
-    Ack->Token = IwanNtSessionGetBe32(Frame + 4u);
+    Ack->Sid = IwanNtSessionGetLe16(Frame + 2u);
+    Ack->Token = IwanNtSessionGetLe32(Frame + 4u);
 
     offset = IWAN_NT_SESSION_PREFIX;
     while (offset + 2u <= Length) {
@@ -286,22 +327,26 @@ IwanNtSessionBuildEchoRequest(
     memset(Buffer, 0, IWAN_NT_SESSION_ECHO_LEN);
     Buffer[0] = IWAN_NT_SESSION_TYPE_ECHO_REQUEST;
     Buffer[1] = 0;
-    IwanNtSessionPutBe16(Buffer + 2u, Sid);
-    IwanNtSessionPutBe32(Buffer + 4u, Token);
+    IwanNtSessionPutLe16(Buffer + 2u, Sid);
+    IwanNtSessionPutLe32(Buffer + 4u, Token);
     IwanNtSessionSign(Buffer);
 
     offset = IWAN_NT_SESSION_PREFIX;
     /* The tick is little endian: the peer reads it as a host-order integer. */
     memcpy(Buffer + offset, &TickMicros, sizeof(TickMicros));
     offset += 8u;
+    /*
+     * The delays are machine order as well: the reference client stores them from
+     * its own fields with plain moves, in the same buffer as the tick.
+     */
     /* current delay: unknown before the first response */
-    IwanNtSessionPutBe32(Buffer + offset, 0);
+    IwanNtSessionPutLe32(Buffer + offset, 0);
     offset += 4u;
     /* minimum delay seed, matching the reference client */
-    IwanNtSessionPutBe32(Buffer + offset, 5000000u);
+    IwanNtSessionPutLe32(Buffer + offset, 5000000u);
     offset += 4u;
     /* maximum delay */
-    IwanNtSessionPutBe32(Buffer + offset, 0);
+    IwanNtSessionPutLe32(Buffer + offset, 0);
     offset += 4u;
     /* four bytes the reference client never writes */
     offset += 4u;
@@ -347,11 +392,11 @@ IwanNtSessionParseEchoResponse(
     }
 
     memset(Echo, 0, sizeof(*Echo));
-    Echo->Sid = IwanNtSessionGetBe16(Frame + 2u);
-    Echo->Token = IwanNtSessionGetBe32(Frame + 4u);
+    Echo->Sid = IwanNtSessionGetLe16(Frame + 2u);
+    Echo->Token = IwanNtSessionGetLe32(Frame + 4u);
     memcpy(&Echo->Tick, Frame + IWAN_NT_SESSION_PREFIX, sizeof(Echo->Tick));
-    Echo->Current = IwanNtSessionGetBe32(Frame + IWAN_NT_SESSION_PREFIX + 8u);
-    Echo->Minimum = IwanNtSessionGetBe32(Frame + IWAN_NT_SESSION_PREFIX + 12u);
-    Echo->Maximum = IwanNtSessionGetBe32(Frame + IWAN_NT_SESSION_PREFIX + 16u);
+    Echo->Current = IwanNtSessionGetLe32(Frame + IWAN_NT_SESSION_PREFIX + 8u);
+    Echo->Minimum = IwanNtSessionGetLe32(Frame + IWAN_NT_SESSION_PREFIX + 12u);
+    Echo->Maximum = IwanNtSessionGetLe32(Frame + IWAN_NT_SESSION_PREFIX + 16u);
     return IwanNtSessionOk;
 }
