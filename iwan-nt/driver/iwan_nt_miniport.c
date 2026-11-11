@@ -28,6 +28,22 @@ typedef enum _IWAN_NT_MINIPORT_STATE {
     IwanNtMiniportStopped
 } IWAN_NT_MINIPORT_STATE;
 
+/*
+ * One receive slot owns one non-paged buffer, one MDL and one NBL, all built
+ * once at InitializeEx. A datagram either claims a free slot or is dropped and
+ * counted, so the indication path never allocates at DISPATCH_LEVEL. The pool is
+ * bounded because the receive callback is its only producer and NDIS is the only
+ * consumer that returns slots.
+ */
+#define IWAN_NT_MINIPORT_RX_SLOTS 64u
+
+typedef struct _IWAN_NT_MINIPORT_RX_SLOT {
+    PUCHAR Buffer;
+    PMDL Mdl;
+    PNET_BUFFER_LIST Nbl;
+    volatile LONG InUse;
+} IWAN_NT_MINIPORT_RX_SLOT;
+
 typedef struct _IWAN_NT_MINIPORT_ADAPTER {
     NDIS_HANDLE AdapterHandle;
     volatile LONG State;
@@ -46,6 +62,11 @@ typedef struct _IWAN_NT_MINIPORT_ADAPTER {
     BOOLEAN SendLockReady;
     PUCHAR SendScratch;
     NDIS_HANDLE RxPool;
+    IWAN_NT_MINIPORT_RX_SLOT RxSlots[IWAN_NT_MINIPORT_RX_SLOTS];
+    ULONG RxSlotCount;
+    volatile LONG RxInFlight;
+    KEVENT RxIdle;
+    BOOLEAN RxIdleReady;
     volatile LONG TxAccepted;
     volatile LONG TxRejected;
     volatile LONG RxIndicated;
@@ -105,6 +126,36 @@ static NDIS_OID IwanNtMiniportSupportedOids[] = {
     OID_PNP_QUERY_POWER,
     OID_PNP_SET_POWER
 };
+
+/*
+ * Frees every slot that was built, in reverse order of construction. Called from
+ * the InitializeEx failure path and from HaltEx, and in both cases nothing can be
+ * indicating any more: the transport is already finalized.
+ */
+static VOID
+IwanNtMiniportFreeRxSlots(
+    _Inout_ PIWAN_NT_MINIPORT_ADAPTER Adapter
+    )
+{
+    while (Adapter->RxSlotCount > 0) {
+        IWAN_NT_MINIPORT_RX_SLOT *slot;
+
+        Adapter->RxSlotCount--;
+        slot = &Adapter->RxSlots[Adapter->RxSlotCount];
+        if (slot->Nbl != NULL) {
+            NdisFreeNetBufferList(slot->Nbl);
+            slot->Nbl = NULL;
+        }
+        if (slot->Mdl != NULL) {
+            NdisFreeMdl(slot->Mdl);
+            slot->Mdl = NULL;
+        }
+        if (slot->Buffer != NULL) {
+            NdisFreeMemory(slot->Buffer, 0, 0);
+            slot->Buffer = NULL;
+        }
+    }
+}
 
 _Use_decl_annotations_
 NDIS_STATUS
@@ -266,6 +317,50 @@ IwanNtMiniportInitializeEx(
             goto Failure;
         }
     }
+
+    /*
+     * RxIdle starts signalled: nothing is in flight until the first indication.
+     * Halt waits on it, so the pool is never freed under the stack.
+     */
+    KeInitializeEvent(&adapter->RxIdle, NotificationEvent, TRUE);
+    adapter->RxIdleReady = TRUE;
+    {
+        ULONG index;
+
+        for (index = 0; index < IWAN_NT_MINIPORT_RX_SLOTS; index++) {
+            IWAN_NT_MINIPORT_RX_SLOT *slot = &adapter->RxSlots[index];
+            PVOID *context;
+
+            slot->Buffer = NdisAllocateMemoryWithTagPriority(
+                MiniportAdapterHandle, IWAN_NT_MINIPORT_MTU,
+                IWAN_NT_MINIPORT_POOL_TAG, NormalPoolPriority);
+            if (slot->Buffer == NULL) {
+                status = NDIS_STATUS_RESOURCES;
+                goto Failure;
+            }
+            slot->Mdl = NdisAllocateMdl(MiniportAdapterHandle, slot->Buffer,
+                                        IWAN_NT_MINIPORT_MTU);
+            if (slot->Mdl == NULL) {
+                status = NDIS_STATUS_RESOURCES;
+                goto Failure;
+            }
+            slot->Nbl = NdisAllocateNetBufferAndNetBufferList(
+                adapter->RxPool, sizeof(PVOID), 0, slot->Mdl, 0,
+                IWAN_NT_MINIPORT_MTU);
+            if (slot->Nbl == NULL) {
+                status = NDIS_STATUS_RESOURCES;
+                goto Failure;
+            }
+            /*
+             * ReturnNetBufferLists only gets the NBL, so the slot pointer
+             * travels in the NBL context sized by the call above.
+             */
+            context = (PVOID *)NET_BUFFER_LIST_CONTEXT_DATA_START(slot->Nbl);
+            *context = slot;
+            slot->InUse = 0;
+            adapter->RxSlotCount = index + 1;
+        }
+    }
     IwanNtTransportSetDataSink(&adapter->Transport, IwanNtMiniportIndicateInner,
                                adapter);
 
@@ -377,6 +472,7 @@ Failure:
         NdisFreeSpinLock(&adapter->SendLock);
         adapter->SendLockReady = FALSE;
     }
+    IwanNtMiniportFreeRxSlots(adapter);
     if (adapter->RxPool != NULL) {
         NdisFreeNetBufferListPool(adapter->RxPool);
         adapter->RxPool = NULL;
@@ -420,6 +516,22 @@ IwanNtMiniportHaltEx(
     if (adapter->SendLockReady) {
         NdisFreeSpinLock(&adapter->SendLock);
         adapter->SendLockReady = FALSE;
+    }
+    if (adapter->RxIdleReady) {
+        LARGE_INTEGER timeout;
+
+        /*
+         * Halt runs at PASSIVE_LEVEL, so it can wait. If the stack still holds a
+         * frame after two seconds something is very wrong, and leaking the pool
+         * beats freeing it under a live indication.
+         */
+        timeout.QuadPart = -20000000;
+        (VOID)KeWaitForSingleObject(&adapter->RxIdle, Executive, KernelMode,
+                                    FALSE, &timeout);
+        adapter->RxIdleReady = FALSE;
+    }
+    if (InterlockedCompareExchange(&adapter->RxInFlight, 0, 0) == 0) {
+        IwanNtMiniportFreeRxSlots(adapter);
     }
     if (adapter->RxPool != NULL) {
         NdisFreeNetBufferListPool(adapter->RxPool);
@@ -478,9 +590,9 @@ IwanNtMiniportRestart(
 }
 
 /*
- * Runs at DISPATCH_LEVEL inside the WSK receive callback, so it copies the inner
- * packet into a fresh NBL and hands ownership to NDIS immediately. Nothing here
- * blocks, and nothing keeps the WSK buffer alive past this call.
+ * Runs at DISPATCH_LEVEL inside the WSK receive callback. It claims one slot of
+ * the receive pool, copies the inner packet into it and hands ownership to NDIS;
+ * nothing here allocates, blocks or keeps the WSK buffer alive past the call.
  */
 static VOID
 IwanNtMiniportIndicateInner(
@@ -491,9 +603,9 @@ IwanNtMiniportIndicateInner(
     )
 {
     PIWAN_NT_MINIPORT_ADAPTER adapter = Context;
-    PNET_BUFFER_LIST nbl;
-    PVOID buffer;
-    PMDL mdl;
+    IWAN_NT_MINIPORT_RX_SLOT *slot = NULL;
+    PNET_BUFFER nb;
+    ULONG index;
     LONG state;
 
     if (Inner == NULL || Length == 0 || Length > IWAN_NT_MINIPORT_MTU) {
@@ -507,40 +619,35 @@ IwanNtMiniportIndicateInner(
         return;
     }
 
-    buffer = NdisAllocateMemoryWithTagPriority(adapter->AdapterHandle,
-                                               (ULONG)Length,
-                                               IWAN_NT_MINIPORT_POOL_TAG,
-                                               NormalPoolPriority);
-    if (buffer == NULL) {
-        InterlockedIncrement(&adapter->RxDropped);
-        return;
+    for (index = 0; index < adapter->RxSlotCount; index++) {
+        if (InterlockedCompareExchange(&adapter->RxSlots[index].InUse, 1, 0) ==
+            0) {
+            slot = &adapter->RxSlots[index];
+            break;
+        }
     }
-    NdisMoveMemory(buffer, Inner, Length);
-
-    mdl = NdisAllocateMdl(adapter->AdapterHandle, buffer, (ULONG)Length);
-    if (mdl == NULL) {
-        NdisFreeMemory(buffer, 0, 0);
+    if (slot == NULL) {
+        /* Backpressure, not a fault: the stack is not returning frames. */
         InterlockedIncrement(&adapter->RxDropped);
         return;
     }
 
-    nbl = NdisAllocateNetBufferAndNetBufferList(adapter->RxPool, 0, 0, mdl, 0,
-                                                (ULONG)Length);
-    if (nbl == NULL) {
-        NdisFreeMdl(mdl);
-        NdisFreeMemory(buffer, 0, 0);
-        InterlockedIncrement(&adapter->RxDropped);
-        return;
-    }
+    KeClearEvent(&adapter->RxIdle);
+    NdisMoveMemory(slot->Buffer, Inner, Length);
+    nb = NET_BUFFER_LIST_FIRST_NB(slot->Nbl);
+    NET_BUFFER_DATA_OFFSET(nb) = 0;
+    NET_BUFFER_DATA_LENGTH(nb) = (ULONG)Length;
 
     /*
      * The miniport is raw IP, so NDIS needs the EtherType it should report and
      * must be told to trust that single value instead of parsing the frame.
      */
-    NET_BUFFER_LIST_INFO(nbl, NetBufferListFrameType) =
+    NET_BUFFER_LIST_INFO(slot->Nbl, NetBufferListFrameType) =
         (Family == 6) ? (PVOID)(ULONG_PTR)0xDD86 : (PVOID)(ULONG_PTR)0x0008;
+    NET_BUFFER_LIST_STATUS(slot->Nbl) = NDIS_STATUS_SUCCESS;
+    InterlockedIncrement(&adapter->RxInFlight);
     InterlockedIncrement(&adapter->RxIndicated);
-    NdisMIndicateReceiveNetBufferLists(adapter->AdapterHandle, nbl,
+    NdisMIndicateReceiveNetBufferLists(adapter->AdapterHandle, slot->Nbl,
                                        NDIS_DEFAULT_PORT_NUMBER, 1,
                                        NDIS_RECEIVE_FLAGS_SINGLE_ETHER_TYPE);
 }
@@ -628,25 +735,28 @@ IwanNtMiniportReturnNetBufferLists(
     ULONG ReturnFlags
     )
 {
+    PIWAN_NT_MINIPORT_ADAPTER adapter = MiniportAdapterContext;
     PNET_BUFFER_LIST current;
 
-    UNREFERENCED_PARAMETER(MiniportAdapterContext);
     UNREFERENCED_PARAMETER(ReturnFlags);
 
     /*
-     * Every indicated NBL owns exactly one MDL over one pooled buffer, and the
-     * MDL keeps the buffer address, so the pair can be freed without extra
-     * bookkeeping.
+     * Every indicated NBL carries its slot pointer in the NBL context, so this
+     * path never searches the pool: it clears the slot and, when the last frame
+     * comes back, wakes Halt.
      */
     for (current = NetBufferLists; current != NULL;
          current = NET_BUFFER_LIST_NEXT_NBL(current)) {
-        PNET_BUFFER nb = NET_BUFFER_LIST_FIRST_NB(current);
-        PMDL mdl = NET_BUFFER_CURRENT_MDL(nb);
-        PVOID buffer = MmGetMdlVirtualAddress(mdl);
+        PVOID *context = (PVOID *)NET_BUFFER_LIST_CONTEXT_DATA_START(current);
+        IWAN_NT_MINIPORT_RX_SLOT *slot = (context != NULL) ? *context : NULL;
 
-        NdisFreeMdl(mdl);
-        NdisFreeMemory(buffer, 0, 0);
-        NdisFreeNetBufferList(current);
+        if (slot == NULL) {
+            continue;
+        }
+        InterlockedExchange(&slot->InUse, 0);
+        if (InterlockedDecrement(&adapter->RxInFlight) == 0) {
+            KeSetEvent(&adapter->RxIdle, IO_NO_INCREMENT, FALSE);
+        }
     }
 }
 
