@@ -28,10 +28,22 @@ ApplyState(
     )
 {
     if (Handshake->State == IwanNtHandshakeUp) {
+        IWAN_NT_STATS_ABI stats;
+
         if (IwanNtSetSession(Device, Handshake->Sid, Handshake->Token,
                              Handshake->Encrypted ? TRUE : FALSE,
                              Handshake->Key) == FALSE) {
             fprintf(stderr, "SET_SESSION failed: %lu\n", GetLastError());
+            return 1;
+        }
+        /*
+         * Read it back. A session the driver did not actually install looks
+         * exactly like a working one from here: sends succeed, and nothing ever
+         * arrives.
+         */
+        if (IwanNtGetStats(Device, &stats) != FALSE && stats.SessionValid == 0u) {
+            fprintf(stderr, "SET_SESSION was accepted but the driver is not "
+                            "using it\n");
             return 1;
         }
     } else {
@@ -276,6 +288,15 @@ IwanNtRunConnect(
            (unsigned long)handshake.EchoAnswers, (unsigned long)handshake.Rejects,
            (unsigned long)handshake.Closes, (unsigned long)handshake.ForeignFrames,
            (handshake.State == IwanNtHandshakeUp) ? "up" : "down");
+
+    /*
+     * Leave the driver in the state this process ended in. A session nobody is
+     * keeping alive would otherwise make the adapter look connected while every
+     * packet it carries goes nowhere.
+     */
+    if (handshake.State == IwanNtHandshakeUp) {
+        (void)IwanNtClearSession(Device);
+    }
 
     if (handshake.EverEstablished == 0) {
         status = 3;

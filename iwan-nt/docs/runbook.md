@@ -40,8 +40,9 @@ like.
 Check: `iwannt-ctl check` prints `session installed`.
 
 The keepalive lives in this process on purpose: the kernel path only transports,
-and the session's timeout is the peer's clock. When the tool exits, the peer stops
-hearing from us and drops the session. Pass `0` for the seconds to keep it up until
+and the session's timeout is the peer's clock. When the tool exits it clears the
+session first, so the adapter stops reporting a link it can no longer feed; the
+peer drops its side within fifteen seconds of silence. Pass `0` for the seconds to keep it up until
 interrupted, and run it as a service for a tunnel that should outlive a shell.
 
 ## 4. Give the adapter the address the server assigned
