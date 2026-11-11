@@ -741,6 +741,7 @@ IwanNtMiniportIndicateInner(
  * The staging area has to be distinct per packet in a batch, because the pool
  * copies from these pointers only after the whole batch is assembled.
  */
+_Use_decl_annotations_
 static BOOLEAN
 IwanNtMiniportStagePacket(
     _Inout_ PIWAN_NT_MINIPORT_ADAPTER Adapter,
@@ -774,6 +775,7 @@ IwanNtMiniportStagePacket(
  * A short batch is backpressure, not an error: the packets the pool could not
  * hold are reported as resources so the stack retries them.
  */
+_Use_decl_annotations_
 static VOID
 IwanNtMiniportFlushBatch(
     _Inout_ PIWAN_NT_MINIPORT_ADAPTER Adapter,
@@ -798,7 +800,8 @@ IwanNtMiniportFlushBatch(
     }
 }
 
-static MINIPORT_SEND_NET_BUFFER_LISTS
+_Use_decl_annotations_
+static VOID
 IwanNtMiniportSendNetBufferLists(
     NDIS_HANDLE MiniportAdapterContext,
     PNET_BUFFER_LIST NetBufferLists,
