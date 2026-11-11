@@ -735,8 +735,6 @@ IwanNtMiniportIndicateInner(
                                        NDIS_RECEIVE_FLAGS_SINGLE_ETHER_TYPE);
 }
 
-_Use_decl_annotations_
-static VOID
 /*
  * Flatten one net buffer into its own staging area.
  *
@@ -800,6 +798,7 @@ IwanNtMiniportFlushBatch(
     }
 }
 
+static MINIPORT_SEND_NET_BUFFER_LISTS
 IwanNtMiniportSendNetBufferLists(
     NDIS_HANDLE MiniportAdapterContext,
     PNET_BUFFER_LIST NetBufferLists,
