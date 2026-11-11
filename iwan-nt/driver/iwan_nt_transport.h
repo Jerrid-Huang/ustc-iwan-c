@@ -5,6 +5,7 @@
 #include "iwan_nt_wsk.h"
 #include "iwan_nt_wsk_socket.h"
 #include "iwan_nt_ingress.h"
+#include "iwan_nt_peer.h"
 #include "iwan_nt_tx.h"
 #include "iwan_nt_ioctl.h"
 
@@ -61,6 +62,13 @@ typedef struct _IWAN_NT_TRANSPORT {
     size_t ScratchCapacity;
     BOOLEAN IngressAttached;
     IWAN_NT_TX Tx;
+    /*
+     * The peer owns the handshake. It lives in the driver for the same reason
+     * WireGuard's does: the socket belongs to the kernel, so the frames that
+     * keep the session alive have to be produced and consumed here.
+     */
+    IWAN_NT_PEER Peer;
+    BOOLEAN PeerReady;
     /* Control-plane counters; one writer each, see the getter below. */
     ULONG64 ControlSent;
     ULONG64 ControlSendFailed;
@@ -172,6 +180,28 @@ BOOLEAN
 IwanNtTransportGetLocal(
     _In_ const IWAN_NT_TRANSPORT *Transport,
     _Out_ PIWAN_NT_SOCKADDR Local
+    );
+
+_IRQL_requires_(PASSIVE_LEVEL)
+/*
+ * Install the credentials and start the handshake.
+ *
+ * IRQL: PASSIVE_LEVEL.
+ * Called once the peer address is known; from then on the driver keeps the
+ * session up by itself and reports state changes through the control device.
+ */
+NTSTATUS
+IwanNtTransportStartPeer(
+    _Inout_ PIWAN_NT_TRANSPORT Transport,
+    _In_reads_z_(64) const char *User,
+    _In_reads_z_(64) const char *Password,
+    _In_ uint16_t Mtu
+    );
+
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID
+IwanNtTransportStopPeer(
+    _Inout_ PIWAN_NT_TRANSPORT Transport
     );
 
 _IRQL_requires_max_(DISPATCH_LEVEL)

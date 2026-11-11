@@ -352,9 +352,9 @@ main(void)
     TestFault();
 
     if (Failures != 0) {
-        printf("handshake: %d failures\n", Failures);
+        printf("peer: %d failures\n", Failures);
         return 1;
     }
-    printf("handshake: %d checks, 0 failures\n", Checks);
+    printf("peer: %d checks, 0 failures\n", Checks);
     return 0;
 }

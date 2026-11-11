@@ -140,6 +140,37 @@ IwanNtPeerTick(
     }
 }
 
+int
+IwanNtPeerWantsFrame(
+    const IWAN_NT_PEER *Peer,
+    const uint8_t *Frame,
+    size_t Length
+    )
+{
+    uint8_t type;
+
+    (void)Peer;
+
+    if (Frame == NULL || Length < IWAN_NT_SESSION_HEADER) {
+        return 0;
+    }
+    type = IwanNtSessionType(Frame, Length);
+
+    /*
+     * The peer only claims frames it has an answer for. A frame that fails its
+     * signature later is counted as foreign rather than dropped silently.
+     */
+    switch (type) {
+    case IWAN_NT_SESSION_TYPE_OPEN_ACK:
+    case IWAN_NT_SESSION_TYPE_OPEN_REJECT:
+    case IWAN_NT_SESSION_TYPE_ECHO_RESPONSE:
+    case IWAN_NT_SESSION_TYPE_CLOSE:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 IWAN_NT_PEER_EVENT
 IwanNtPeerOnFrame(
     IWAN_NT_PEER *Handshake,

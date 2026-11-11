@@ -1,6 +1,18 @@
 #include "iwan_nt_transport.h"
 
+#include "iwan_nt_string.h"
+
 #define IWAN_NT_TAG_SCRATCH 'tcSI'
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static uint64_t
+IwanNtTransportNowMs(VOID);
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static VOID
+IwanNtTransportApplyPeerStateLocked(
+    _Inout_ PIWAN_NT_TRANSPORT Transport
+    );
 
 /*
  * Adapter from the WSK datagram callback to the receive pipeline.
@@ -28,7 +40,20 @@ IwanNtTransportReceiveChunk(
      * keep arriving, so the pipeline read needs the same lock the writers take.
      */
     KeAcquireSpinLock(&transport->SessionLock, &oldIrql);
-    (VOID)IwanNtIngressReceive(&transport->Ingress, Payload, Length);
+
+    /*
+     * Control frames feed the peer and stop there: they are the handshake, not
+     * payload. Everything else goes down the data pipeline.
+     */
+    if (transport->PeerReady &&
+        IwanNtPeerWantsFrame(&transport->Peer, Payload, Length)) {
+        (VOID)IwanNtPeerOnFrame(
+            &transport->Peer, Payload, Length, IwanNtTransportNowMs());
+        IwanNtTransportApplyPeerStateLocked(transport);
+    } else {
+        (VOID)IwanNtIngressReceive(&transport->Ingress, Payload, Length);
+    }
+
     KeReleaseSpinLock(&transport->SessionLock, oldIrql);
 }
 
@@ -50,6 +75,49 @@ IwanNtTransportSubmitSend(
 
     return IwanNtWskDatagramSubmitSendList(
         datagram, List, Messages, Remote, Irp);
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static uint64_t
+IwanNtTransportNowMs(VOID)
+{
+    /*
+     * Interrupt time is the monotonic clock every IRQL may read; 10,000 ticks
+     * make a millisecond.
+     */
+    return (uint64_t)(KeQueryInterruptTime() / 10000u);
+}
+
+/*
+ * Mirror the peer state into the data path.
+ *
+ * IRQL: <= DISPATCH_LEVEL, session lock held.
+ * The peer is the only writer of the session while it runs: when it comes up the
+ * sid/token/key are installed, and when it drops they are cleared, so a stale
+ * session can never encrypt with a key the server has forgotten.
+ */
+static VOID
+IwanNtTransportApplyPeerStateLocked(
+    _Inout_ PIWAN_NT_TRANSPORT Transport
+    )
+{
+    IWAN_NT_INGRESS_SESSION session;
+
+    if (Transport->Peer.State == IwanNtPeerUp) {
+        IwanNtMemZero(&session, sizeof(session));
+        session.Sid = Transport->Peer.Sid;
+        session.Token = Transport->Peer.Token;
+        session.Encrypted = (int)Transport->Peer.Encrypted;
+        IwanNtMemCopy(session.Key, Transport->Peer.Key, sizeof(session.Key));
+
+        if (Transport->Ingress.SessionValid == 0 ||
+            Transport->Ingress.Session.Sid != session.Sid ||
+            Transport->Ingress.Session.Token != session.Token) {
+            (VOID)IwanNtIngressSetSession(&Transport->Ingress, &session);
+        }
+    } else if (Transport->Ingress.SessionValid != 0) {
+        IwanNtIngressClearSession(&Transport->Ingress);
+    }
 }
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -739,6 +807,74 @@ IwanNtTransportSetPeer(
 
     IwanNtTxSetRemote(&Transport->Tx, Remote);
     return STATUS_SUCCESS;
+}
+
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS
+IwanNtTransportStartPeer(
+    _Inout_ PIWAN_NT_TRANSPORT Transport,
+    _In_reads_z_(64) const char *User,
+    _In_reads_z_(64) const char *Password,
+    _In_ uint16_t Mtu
+    )
+{
+    size_t length;
+    KIRQL oldIrql;
+    BOOLEAN running;
+
+    PAGED_CODE();
+
+    if (Transport == NULL || User == NULL || Password == NULL || Mtu == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    KeAcquireSpinLock(&Transport->StateLock, &oldIrql);
+    running = (BOOLEAN)(Transport->State == IwanNtTransportRunning);
+    KeReleaseSpinLock(&Transport->StateLock, oldIrql);
+    if (!running) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
+    length = IwanNtStringLength(User);
+    if (length >= sizeof(Transport->Peer.User)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    length = IwanNtStringLength(Password);
+    if (length >= sizeof(Transport->Peer.Password)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!IwanNtPeerInitialize(&Transport->Peer, User, Password, Mtu,
+                              IwanNtTransportNowMs())) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    KeAcquireSpinLock(&Transport->SessionLock, &oldIrql);
+    Transport->PeerReady = TRUE;
+    KeReleaseSpinLock(&Transport->SessionLock, oldIrql);
+
+    return STATUS_SUCCESS;
+}
+
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID
+IwanNtTransportStopPeer(
+    _Inout_ PIWAN_NT_TRANSPORT Transport
+    )
+{
+    KIRQL oldIrql;
+
+    PAGED_CODE();
+
+    if (Transport == NULL) {
+        return;
+    }
+
+    KeAcquireSpinLock(&Transport->SessionLock, &oldIrql);
+    Transport->PeerReady = FALSE;
+    IwanNtPeerReset(&Transport->Peer, IwanNtTransportNowMs());
+    IwanNtTransportApplyPeerStateLocked(Transport);
+    KeReleaseSpinLock(&Transport->SessionLock, oldIrql);
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)

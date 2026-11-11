@@ -36,6 +36,7 @@
 #define _Out_writes_bytes_(n)
 #define _Out_writes_bytes_opt_(n)
 #define _Out_writes_bytes_to_(c, l)
+#define _In_reads_z_(n)
 #define _In_reads_(n)
 #define _In_reads_opt_(n)
 #define _In_reads_bytes_(n)
@@ -211,6 +212,12 @@ typedef struct _LIST_ENTRY {
 
 #define CONTAINING_RECORD(address, type, field) \
     ((type *)((char *)(address) - (size_t)(&((type *)0)->field)))
+
+static __inline unsigned long long
+KeQueryInterruptTime(void)
+{
+    return 0ull;
+}
 
 static __inline void
 InitializeListHead(LIST_ENTRY *Head)

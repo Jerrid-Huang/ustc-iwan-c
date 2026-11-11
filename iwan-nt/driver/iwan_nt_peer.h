@@ -121,6 +121,20 @@ IWAN_NT_PEER *Handshake,
     );
 
 /* Feed one received control frame; returns what changed, if anything. */
+/*
+ * Does this datagram belong to the peer rather than to the data path?
+ *
+ * Only the control types the peer knows are claimed; everything else is payload
+ * and goes to the ingress pipeline. Kept separate from OnFrame so the transport
+ * can decide without parsing twice.
+ */
+int
+IwanNtPeerWantsFrame(
+    const IWAN_NT_PEER *Peer,
+    const uint8_t *Frame,
+    size_t Length
+    );
+
 IWAN_NT_PEER_EVENT
 IwanNtPeerOnFrame(
 IWAN_NT_PEER *Handshake,
