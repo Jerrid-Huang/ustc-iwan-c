@@ -147,12 +147,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $repo = '${{ github.repository }}'
-          $files = @('user-build.log', 'cl-build.log')
-          foreach ($name in $files) {
+          $sha = '${{ github.sha }}'
+          $run = '${{ github.run_id }}'
+          try {
+            gh api "/repos/$repo/git/ref/heads/ci-logs" | Out-Null
+          } catch {
+            gh api -X POST "/repos/$repo/git/refs" -f ref='refs/heads/ci-logs' -f sha=$sha | Out-Null
+          }
+          foreach ($name in @('user-build.log', 'cl-build.log')) {
             if (-not (Test-Path $name)) { continue }
             $text = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((Get-Content $name -Raw)))
-            gh api -X PUT "/repos/$repo/contents/logs/$name" --method PUT `
-              -f message='ci: publish build log' -f content=$text -f branch='ci-logs'
+            gh api -X PUT "/repos/$repo/contents/logs/$run-$name" -f message='ci: publish build log' -f content=$text -f branch='ci-logs'
           }
 
       - name: Upload logs and driver
