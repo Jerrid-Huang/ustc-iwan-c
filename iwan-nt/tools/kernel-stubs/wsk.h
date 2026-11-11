@@ -13,6 +13,9 @@
  * <ntddk.h>; the stub keeps that split so a header that forgets <wsk.h> fails
  * here the same way it fails on the WDK. */
 typedef struct _SOCKADDR { USHORT sa_family; } SOCKADDR, *PSOCKADDR;
+/* The kernel header exposes an anonymous union, so S_addr is a direct member
+ * and S_un is not. Mirroring that here keeps a wrong member name from passing
+ * the host check and failing only on the WDK. */
 typedef struct _IN_ADDR {
     union {
         struct {
@@ -21,8 +24,12 @@ typedef struct _IN_ADDR {
             UCHAR s_b3;
             UCHAR s_b4;
         } S_un_b;
-        ULONG s_addr;
-    } S_un;
+        struct {
+            USHORT s_w1;
+            USHORT s_w2;
+        } S_un_w;
+        ULONG S_addr;
+    };
 } IN_ADDR, *PIN_ADDR;
 
 typedef struct _SOCKADDR_IN {

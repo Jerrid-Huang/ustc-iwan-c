@@ -168,7 +168,12 @@ IwanNtControlSetPeer(
     RtlZeroMemory(&remote, sizeof(remote));
     remote.sin_family = AF_INET;
     remote.sin_port = request->Port;
-    remote.sin_addr.S_un.s_addr = request->Address;
+    /*
+     * Copy the address as four bytes instead of naming a union member: the
+     * WDK spells the kernel-side field differently from winsock2.h, and the
+     * wire value is opaque here anyway.
+     */
+    RtlCopyMemory(&remote.sin_addr, &request->Address, sizeof(request->Address));
 
     IwanNtTransportSetPeer(transport, &remote);
 
