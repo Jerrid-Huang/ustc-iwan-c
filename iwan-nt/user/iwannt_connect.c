@@ -89,7 +89,8 @@ IwanNtRunConnect(
 
     if (Argc < 6) {
         fprintf(stderr,
-                "usage: iwannt-ctl connect <ip> <port> <user> <password> [mtu] [seconds]\n");
+                "usage: iwannt-ctl connect <ip> <port> <user> <password> [mtu] [seconds]\n"
+                "  seconds 0 (the default is 15) keeps the session alive until interrupted\n");
         return 1;
     }
 
@@ -145,7 +146,12 @@ IwanNtRunConnect(
         }
     }
 
-    deadline = GetTickCount64() + (ULONGLONG)seconds * 1000ull;
+    /*
+     * Zero means "until interrupted". Keepalives live in this process by design:
+     * when it exits, the peer stops hearing from us and times the session out, so
+     * a tunnel that should outlive a shell needs this to run as a service.
+     */
+    deadline = (seconds == 0) ? 0 : GetTickCount64() + (ULONGLONG)seconds * 1000ull;
 
     for (;;) {
         ULONGLONG now = GetTickCount64();
@@ -154,7 +160,7 @@ IwanNtRunConnect(
         int pending;
         int read;
 
-        if (now >= deadline) {
+        if (deadline != 0 && now >= deadline) {
             break;
         }
 
