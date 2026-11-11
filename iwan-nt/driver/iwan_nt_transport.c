@@ -485,6 +485,13 @@ IwanNtTransportGetStats(
     Stats->RxDropped = 0;
 
     KeAcquireSpinLock(&Transport->StateLock, &oldIrql);
+    /*
+     * These two are written by the socket callback without a lock; a snapshot may
+     * catch them mid-update, which is acceptable for advisory counters and is
+     * why they are documented as such rather than presented as exact.
+     */
+    Stats->RxOversize = (uint64_t)Transport->Datagram.OversizeDrops;
+    Stats->RxSinkErrors = (uint64_t)Transport->Datagram.SinkErrors;
     Stats->ControlRead = Transport->ControlRead;
     Stats->ControlSent = Transport->ControlSent;
     Stats->ControlSendFailed = Transport->ControlSendFailed;

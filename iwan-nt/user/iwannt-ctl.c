@@ -138,6 +138,9 @@ CommandStats(
            (unsigned long long)stats.DroppedNoSink,
            (unsigned long long)stats.DroppedSegrt,
            (unsigned long long)stats.DroppedUnknown);
+    printf("drops: oversize=%llu sinkerrors=%llu\n",
+           (unsigned long long)stats.RxOversize,
+           (unsigned long long)stats.RxSinkErrors);
     printf("state: running=%lu session=%lu\n",
            (unsigned long)stats.Running, (unsigned long)stats.SessionValid);
 

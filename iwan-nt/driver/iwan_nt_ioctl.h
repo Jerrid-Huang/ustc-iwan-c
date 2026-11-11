@@ -69,7 +69,7 @@
 
 #define IWAN_NT_SESSION_STRUCT_SIZE 24u
 #define IWAN_NT_PEER_STRUCT_SIZE 8u
-#define IWAN_NT_STATS_STRUCT_SIZE 176u
+#define IWAN_NT_STATS_STRUCT_SIZE 192u
 
 /* Largest control frame accepted in either direction. */
 #define IWAN_NT_CONTROL_MAX 512u
@@ -126,6 +126,14 @@ typedef struct _IWAN_NT_STATS_ABI {
      * every successful dequeue, and a frame is never dropped after it was
      * queued.
      */
+
+    /*
+     * Dropped below the ingress path, in the socket callback itself: a datagram
+     * longer than the receive scratch, and one the sink refused. Both are counted
+     * here because a drop with no counter is indistinguishable from an idle link.
+     */
+    uint64_t RxOversize;
+    uint64_t RxSinkErrors;
 } IWAN_NT_STATS_ABI;
 
 /*
