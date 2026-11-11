@@ -357,8 +357,6 @@ IwanNtTxSubmitChain(
         Tx->SubmitContext, &Head->List, Count, &remote, Head->Irp);
 
     if (!NT_SUCCESS(status) && status != STATUS_PENDING) {
-        PLIST_ENTRY entry;
-
         /*
          * The completion routine never ran, so nothing has been released: walk
          * the chain here. AbandonSlot touches the counters, so it happens once
