@@ -43,6 +43,24 @@ IwanNtControlTransportLocked(
 }
 
 /*
+ * Tell the adapter whether a session exists. Called with the rundown
+ * reference held, so the source may not disappear underneath us.
+ */
+static VOID
+IwanNtControlNotifySession(
+    _In_ int Valid
+    )
+{
+    IWAN_NT_CONTROL_COUNTER_SOURCE source;
+
+    RtlZeroMemory(&source, sizeof(source));
+    (void)IwanNtControlTransportLocked(&source);
+    if (source.SessionChanged != NULL) {
+        source.SessionChanged(source.Context, Valid);
+    }
+}
+
+/*
  * Every request runs the same preamble: one rundown reference, one transport
  * pointer, and one guaranteed release on the way out.
  */
@@ -117,6 +135,8 @@ IwanNtControlSetSession(
     IwanNtTransportSetSession(transport, &session);
     RtlZeroMemory(&session, sizeof(session));
 
+    IwanNtControlNotifySession(1);
+
     IwanNtControlEnd();
     return STATUS_SUCCESS;
 }
@@ -135,6 +155,8 @@ IwanNtControlClearSession(
     }
 
     IwanNtTransportClearSession(transport);
+
+    IwanNtControlNotifySession(0);
 
     IwanNtControlEnd();
     return STATUS_SUCCESS;

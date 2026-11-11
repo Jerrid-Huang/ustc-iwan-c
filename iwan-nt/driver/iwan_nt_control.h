@@ -28,6 +28,16 @@ typedef struct _IWAN_NT_CONTROL_COUNTER_SOURCE {
         _Out_ uint64_t *RxIndicated,
         _Out_ uint64_t *RxDropped
         );
+    /*
+     * Optional. Called after a session is installed (Valid != 0) or dropped
+     * (Valid == 0), so the adapter can report its link state. The transport is
+     * up long before a session exists; telling the stack that the link is up
+     * too early turns every packet into a silent drop.
+     */
+    _In_opt_ VOID (*SessionChanged)(
+        _In_opt_ void *Context,
+        _In_ int Valid
+        );
 } IWAN_NT_CONTROL_COUNTER_SOURCE;
 
 /*

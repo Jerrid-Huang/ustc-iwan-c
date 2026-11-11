@@ -40,6 +40,14 @@ CI writes the compiler log to the `ci-logs` branch when a job fails. The
 annotation only carries an exit status, and downloading an artifact needs
 credentials, so the raw log is parked where a plain read can reach it.
 
+## Link state
+
+The adapter reports `MediaConnectStateDisconnected` until a session is
+installed, and the control device flips it whenever a session appears or
+disappears (`NDIS_STATUS_LINK_STATE`). Reporting the link up earlier would let
+the stack route traffic into an adapter that can only drop it, and every
+counter would still look healthy.
+
 ## Control interface
 
 The transport owns the outer UDP socket inside the kernel, so both directions

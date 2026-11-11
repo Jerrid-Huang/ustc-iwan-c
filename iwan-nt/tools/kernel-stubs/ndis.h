@@ -65,4 +65,68 @@ NdisInitUnicodeString(
     PCWSTR SourceString
     );
 
+/*
+ * Link state indications. The stub only needs the shapes the driver touches.
+ */
+typedef ULONG NDIS_PORT_NUMBER;
+typedef enum _NDIS_MEDIA_CONNECT_STATE {
+    MediaConnectStateUnknown = 0,
+    MediaConnectStateConnected,
+    MediaConnectStateDisconnected
+} NDIS_MEDIA_CONNECT_STATE;
+
+typedef enum _NDIS_MEDIA_DUPLEX_STATE {
+    MediaDuplexStateUnknown = 0,
+    MediaDuplexStateHalf,
+    MediaDuplexStateFull
+} NDIS_MEDIA_DUPLEX_STATE;
+
+typedef enum _NDIS_SUPPORTED_PAUSE_FUNCTIONS {
+    NdisPauseFunctionsUnsupported = 0,
+    NdisPauseFunctionsSendOnly,
+    NdisPauseFunctionsReceiveOnly,
+    NdisPauseFunctionsSendAndReceive,
+    NdisPauseFunctionsUnknown = 3
+} NDIS_SUPPORTED_PAUSE_FUNCTIONS;
+
+#define NDIS_OBJECT_TYPE_STATUS_INDICATION 0x83
+#define NDIS_OBJECT_TYPE_DEFAULT 0x80
+#define NDIS_STATUS_LINK_STATE 0x40010020L
+
+typedef struct _NDIS_LINK_STATE {
+    NDIS_OBJECT_HEADER Header;
+    NDIS_MEDIA_CONNECT_STATE MediaConnectState;
+    NDIS_MEDIA_DUPLEX_STATE MediaDuplexState;
+    ULONG64 XmitLinkSpeed;
+    ULONG64 RcvLinkSpeed;
+    NDIS_SUPPORTED_PAUSE_FUNCTIONS PauseFunctions;
+    ULONG AutoNegotiationFlags;
+} NDIS_LINK_STATE, *PNDIS_LINK_STATE;
+
+#define NDIS_LINK_STATE_REVISION_1 1
+#define NDIS_SIZEOF_LINK_STATE_REVISION_1 ((USHORT)sizeof(NDIS_LINK_STATE))
+
+typedef struct _NDIS_STATUS_INDICATION {
+    NDIS_OBJECT_HEADER Header;
+    NDIS_HANDLE SourceHandle;
+    NDIS_PORT_NUMBER PortNumber;
+    NDIS_STATUS StatusCode;
+    ULONG Flags;
+    PVOID DestinationHandle;
+    PVOID RequestId;
+    PVOID StatusBuffer;
+    ULONG StatusBufferSize;
+} NDIS_STATUS_INDICATION, *PNDIS_STATUS_INDICATION;
+
+#define NDIS_STATUS_INDICATION_REVISION_1 1
+#define NDIS_SIZEOF_STATUS_INDICATION_REVISION_1 \
+    ((USHORT)sizeof(NDIS_STATUS_INDICATION))
+
+NDIS_STATUS
+NdisMIndicateStatusEx(
+    NDIS_HANDLE MiniportAdapterHandle,
+    PNDIS_STATUS_INDICATION StatusIndication
+    );
+
+
 #endif

@@ -53,6 +53,11 @@ typedef struct _IWAN_NT_MINIPORT_ADAPTER {
     IWAN_NT_TRANSPORT Transport;
     BOOLEAN TransportReady;
     /*
+     * The link is up only while a session exists. Reporting it earlier would let
+     * the stack route traffic into an adapter that can only drop it.
+     */
+    volatile LONG LinkUp;
+    /*
      * One contiguous staging buffer per adapter: NdisGetDataBuffer can be asked
      * to flatten a scattered NET_BUFFER into it, and the frame transform then
      * runs on contiguous bytes. The lock keeps that shared buffer, and the
@@ -219,6 +224,68 @@ IwanNtMiniportUnregisterDriver(
     if (handle != NULL) {
         NdisMDeregisterMiniportDriver(handle);
     }
+}
+
+/*
+ * Publish the media connect state. NDIS_LINK_STATE is the only supported way to
+ * move a running adapter between connected and disconnected.
+ */
+static VOID
+IwanNtMiniportIndicateLink(
+    _Inout_ PIWAN_NT_MINIPORT_ADAPTER Adapter,
+    _In_ int Up
+    )
+{
+    NDIS_STATUS_INDICATION indication;
+    NDIS_LINK_STATE state;
+
+    if (Adapter->AdapterHandle == NULL) {
+        return;
+    }
+
+    NdisZeroMemory(&state, sizeof(state));
+    state.Header.Type = NDIS_OBJECT_TYPE_DEFAULT;
+    state.Header.Revision = NDIS_LINK_STATE_REVISION_1;
+    state.Header.Size = NDIS_SIZEOF_LINK_STATE_REVISION_1;
+    state.MediaConnectState = (Up != 0) ? MediaConnectStateConnected :
+        MediaConnectStateDisconnected;
+    state.MediaDuplexState = MediaDuplexStateFull;
+    state.XmitLinkSpeed = (Up != 0) ? IWAN_NT_MINIPORT_LINK_SPEED :
+        NDIS_LINK_SPEED_UNKNOWN;
+    state.RcvLinkSpeed = state.XmitLinkSpeed;
+
+    NdisZeroMemory(&indication, sizeof(indication));
+    indication.Header.Type = NDIS_OBJECT_TYPE_STATUS_INDICATION;
+    indication.Header.Revision = NDIS_STATUS_INDICATION_REVISION_1;
+    indication.Header.Size = NDIS_SIZEOF_STATUS_INDICATION_REVISION_1;
+    indication.SourceHandle = Adapter->AdapterHandle;
+    indication.StatusCode = NDIS_STATUS_LINK_STATE;
+    indication.StatusBuffer = &state;
+    indication.StatusBufferSize = sizeof(state);
+
+    (void)NdisMIndicateStatusEx(Adapter->AdapterHandle, &indication);
+}
+
+/*
+ * Called by the control device when a session appears or disappears, from
+ * PASSIVE_LEVEL with the control rundown reference held.
+ */
+static VOID
+IwanNtMiniportSessionChanged(
+    _In_opt_ void *Context,
+    _In_ int Valid
+    )
+{
+    PIWAN_NT_MINIPORT_ADAPTER adapter = (PIWAN_NT_MINIPORT_ADAPTER)Context;
+
+    if (adapter == NULL) {
+        return;
+    }
+    if (InterlockedExchange(&adapter->LinkUp, (Valid != 0) ? 1 : 0) ==
+        ((Valid != 0) ? 1 : 0)) {
+        return;
+    }
+    IwanNtMiniportIndicateLink(adapter, Valid);
 }
 
 /*
@@ -449,6 +516,7 @@ IwanNtMiniportInitializeEx(
 
         source.Context = adapter;
         source.Query = IwanNtMiniportQueryCounters;
+        source.SessionChanged = IwanNtMiniportSessionChanged;
         IwanNtControlAttachAdapter(&adapter->Transport, &source);
     }
 
@@ -977,7 +1045,8 @@ IwanNtMiniportOidRequest(
             NDIS_MAC_OPTION_TRANSFERS_NOT_PEND | NDIS_MAC_OPTION_NO_LOOPBACK;
         break;
     case OID_GEN_MEDIA_CONNECT_STATUS:
-        value = NdisMediaStateDisconnected;
+        value = (InterlockedCompareExchange(&adapter->LinkUp, 0, 0) != 0) ?
+            NdisMediaStateConnected : NdisMediaStateDisconnected;
         break;
     case OID_GEN_PHYSICAL_MEDIUM:
         value = NdisPhysicalMediumUnspecified;
