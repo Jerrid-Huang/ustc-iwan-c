@@ -44,25 +44,20 @@ IwanNtTxComplete(
      */
     KeAcquireSpinLock(&tx->Lock, &oldIrql);
     {
-        PLIST_ENTRY entry = slot->List.List.Flink;
+        PWSK_BUF_LIST entry = &slot->List;
 
-        while (entry != &slot->List.List) {
+        while (entry != NULL) {
             PIWAN_NT_TX_SLOT member =
-                CONTAINING_RECORD(entry, IWAN_NT_TX_SLOT, List.List);
+                CONTAINING_RECORD(entry, IWAN_NT_TX_SLOT, List);
 
-            entry = entry->Flink;
-            RemoveEntryList(&member->List.List);
+            entry = entry->Next;
+            member->List.Next = NULL;
             member->InUse = FALSE;
             tx->FreeCount++;
             tx->InFlight--;
             tx->Completed++;
         }
     }
-    RemoveEntryList(&slot->List.List);
-    slot->InUse = FALSE;
-    tx->FreeCount++;
-    tx->InFlight--;
-    tx->Completed++;
     signalIdle = (BOOLEAN)(tx->InFlight == 0);
     KeReleaseSpinLock(&tx->Lock, oldIrql);
 
@@ -298,10 +293,10 @@ IwanNtTxSubmitSlot(
      * Single-datagram submit: the slot stands alone as a one-entry chain, so
      * the same provider call and the same completion path serve both shapes.
      */
+    Slot->List.Next = NULL;
     Slot->List.Buffer.Mdl = Slot->Mdl;
     Slot->List.Buffer.Offset = 0;
     Slot->List.Buffer.Length = Length;
-    InitializeListHead(&Slot->List.List);
 
     IoReuseIrp(Slot->Irp, STATUS_SUCCESS);
     IoSetCompletionRoutine(
@@ -370,15 +365,13 @@ IwanNtTxSubmitChain(
          * per slot inside the loop.
          */
         for (;;) {
-            PIWAN_NT_TX_SLOT slot =
-                CONTAINING_RECORD(&Head->List.List, IWAN_NT_TX_SLOT, List.List);
+            PWSK_BUF_LIST next = Head->List.Next;
 
-            entry = Head->List.List.Flink;
-            IwanNtTxAbandonSlot(Tx, slot, TRUE);
-            if (entry == &Head->List.List || entry == NULL) {
+            IwanNtTxAbandonSlot(Tx, Head, TRUE);
+            if (next == NULL) {
                 break;
             }
-            Head = CONTAINING_RECORD(entry, IWAN_NT_TX_SLOT, List.List);
+            Head = CONTAINING_RECORD(next, IWAN_NT_TX_SLOT, List);
         }
         return status;
     }
@@ -404,7 +397,6 @@ IwanNtTxSendBatch(
 {
     PIWAN_NT_TX_SLOT head = NULL;
     PIWAN_NT_TX_SLOT tail = NULL;
-    PLIST_ENTRY queue = NULL;
     ULONG taken = 0;
     ULONG index;
 
@@ -448,18 +440,15 @@ IwanNtTxSendBatch(
             break;
         }
 
+        slot->List.Next = NULL;
         slot->List.Buffer.Mdl = slot->Mdl;
         slot->List.Buffer.Offset = 0;
         slot->List.Buffer.Length = frameLength;
-        InitializeListHead(&slot->List.List);
 
         if (head == NULL) {
             head = slot;
-            if (queue == NULL) {
-                queue = &slot->List.List;
-            }
         } else {
-            InsertTailList(queue, &slot->List.List);
+            tail->List.Next = &slot->List;
         }
         tail = slot;
         taken++;

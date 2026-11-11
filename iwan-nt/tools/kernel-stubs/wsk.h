@@ -104,12 +104,12 @@ typedef struct _WSK_PROVIDER_BASIC_DISPATCH {
 typedef struct _WSK_SOCKET { const void *Dispatch; } WSK_SOCKET, *PWSK_SOCKET;
 
 /*
- * A chained datagram: the provider walks List to send several datagrams with
- * one IRP. WSK_BUF_LIST is what WskSendMessages consumes.
+ * A chained datagram: the provider walks Next to send several datagrams with
+ * one IRP. Field order is Next then Buffer, which is what the header documents.
  */
 typedef struct _WSK_BUF_LIST {
+    struct _WSK_BUF_LIST *Next;
     WSK_BUF Buffer;
-    LIST_ENTRY List;
 } WSK_BUF_LIST, *PWSK_BUF_LIST;
 
 typedef struct _CMSGHDR { SIZE_T DataOffset; SIZE_T DataLength; } CMSGHDR, *PCMSGHDR;
