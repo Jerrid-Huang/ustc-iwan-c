@@ -242,6 +242,53 @@ TestNoSession(void)
     CHECK_EQ(gSink.Calls, 0);
 }
 
+/*
+ * The handshake answer arrives while there is still no session. Without a
+ * special case it is counted as DroppedNoSession and the tunnel can never come
+ * up, which is exactly the kind of deadlock that only shows on a live peer.
+ */
+static void
+TestHandshakeBeforeSession(void)
+{
+    uint8_t ack[53];
+    uint8_t out[512];
+    size_t outLength = 0;
+
+    IwanNtIngressInitialize(&gIngress);
+    CHECK_EQ(IwanNtRingInitialize(&gRing, gRingBuffer, sizeof(gRingBuffer)),
+             IwanNtRingOk);
+    IwanNtIngressAttach(&gIngress, &gRing, FakeSink, NULL);
+
+    memset(ack, 0, sizeof(ack));
+    ack[0] = IWAN_NT_TYPE_OPEN_ACK;
+    ack[1] = 1;
+    ack[2] = 0x00;
+    ack[3] = 0x09;
+    ack[4] = 0xe4;
+    ack[5] = 0x97;
+    ack[6] = 0x77;
+    ack[7] = 0x30;
+
+    CHECK_EQ(IwanNtIngressReceive(&gIngress, ack, sizeof(ack)),
+             IwanNtIngressQueuedControl);
+    CHECK_EQ(gIngress.Counters.QueuedControl, 1);
+    CHECK_EQ(gIngress.Counters.DroppedNoSession, 0);
+    CHECK_EQ(IwanNtRingPop(&gRing, out, sizeof(out), &outLength),
+             IwanNtRingOk);
+    CHECK_EQ(outLength, sizeof(ack));
+    CHECK_EQ(out[0], IWAN_NT_TYPE_OPEN_ACK);
+
+    /* DATA still has nothing to validate against, so it stays dropped. */
+    {
+        uint8_t data[64];
+
+        memset(data, 0, sizeof(data));
+        data[0] = IWAN_NT_TYPE_DATA;
+        CHECK_EQ(IwanNtIngressReceive(&gIngress, data, sizeof(data)),
+                 IwanNtIngressDroppedNoSession);
+    }
+}
+
 static void
 TestDataIpv4(void)
 {
@@ -669,6 +716,7 @@ main(void)
     TestNoSink();
     TestShortPayload();
     TestCountersReconcile();
+    TestHandshakeBeforeSession();
     TestCounterSnapshot();
 
     printf("ingress: %u checks, %u failures\n", gChecks, gFailures);

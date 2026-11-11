@@ -76,6 +76,22 @@ IwanNtIngressAttach(
 /*
  * Route one payload the demux already accepted.
  */
+/*
+ * Types that can legitimately arrive before a session exists: the peer's answer
+ * to OPEN, its rejection, a keepalive response, and a close. OPEN itself is
+ * client-to-server, so it is not here.
+ */
+static int
+IwanNtIngressIsHandshakeType(
+    uint8_t Type
+    )
+{
+    return Type == IWAN_NT_TYPE_OPEN_ACK ||
+           Type == IWAN_NT_TYPE_OPEN_REJECT ||
+           Type == IWAN_NT_TYPE_ECHO_RESPONSE ||
+           Type == IWAN_NT_TYPE_CLOSE;
+}
+
 static IWAN_NT_INGRESS_RESULT
 IwanNtIngressRouteData(
     PIWAN_NT_INGRESS Ingress,
@@ -181,6 +197,15 @@ IwanNtIngressReceive(
     Ingress->Counters.Receives++;
 
     if (!Ingress->SessionValid) {
+        /*
+         * The answer that creates the session arrives before there is a session
+         * to check it against, so a control frame from the handshake must reach
+         * the ring on the strength of its type alone. Everything else is dropped:
+         * DATA with no sid or key has nothing to be validated with.
+         */
+        if (IwanNtIngressIsHandshakeType(Payload[0])) {
+            return IwanNtIngressRouteControl(Ingress, Payload, Length);
+        }
         Ingress->Counters.DroppedNoSession++;
         return IwanNtIngressDroppedNoSession;
     }
