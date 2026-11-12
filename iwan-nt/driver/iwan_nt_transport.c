@@ -923,12 +923,21 @@ IwanNtTransportStartPeer(
         return STATUS_INVALID_PARAMETER;
     }
 
+    /*
+     * Install the credentials under the lock the receive path takes: a second
+     * START_PEER while the first is live would otherwise reinitialise the peer
+     * under a datagram that is feeding it.
+     */
+    KeAcquireSpinLock(&Transport->SessionLock, &oldIrql);
+    if (Transport->PeerReady) {
+        KeReleaseSpinLock(&Transport->SessionLock, oldIrql);
+        return STATUS_DEVICE_BUSY;
+    }
     if (!IwanNtPeerInitialize(&Transport->Peer, User, Password, Mtu,
                               IwanNtTransportNowMs())) {
+        KeReleaseSpinLock(&Transport->SessionLock, oldIrql);
         return STATUS_INVALID_PARAMETER;
     }
-
-    KeAcquireSpinLock(&Transport->SessionLock, &oldIrql);
     Transport->PeerReady = TRUE;
     KeReleaseSpinLock(&Transport->SessionLock, oldIrql);
 
