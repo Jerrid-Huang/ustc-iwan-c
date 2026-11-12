@@ -70,7 +70,7 @@ typedef struct _WSK_CLIENT_NPI {
 
 typedef struct _WSK_BUF {
     PVOID Mdl;
-    SIZE_T Offset;
+    ULONG Offset;
     SIZE_T Length;
 } WSK_BUF, *PWSK_BUF;
 

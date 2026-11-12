@@ -56,6 +56,7 @@ IwanNtTransportReceiveChunk(
 {
     PIWAN_NT_TRANSPORT transport = (PIWAN_NT_TRANSPORT)Context;
     IWAN_NT_RECEIVE_VIEW view;
+    WSK_BUF buffer;
     PUCHAR contiguous = NULL;
     uint8_t *payload = NULL;
     KIRQL oldIrql;
@@ -76,18 +77,23 @@ IwanNtTransportReceiveChunk(
      * is and point NDIS at it; otherwise we copy into the scratch buffer and
      * tell the sink to copy into its own slot.
      */
-    direct = IwanNtWskDatagramContiguous(
-        &(WSK_BUF){ .Mdl = Mdl, .Offset = Offset, .Length = Length },
-        &contiguous);
+    /*
+     * WSK_BUF.Offset is a ULONG while the callback hands out SIZE_T, so the
+     * narrowing is explicit here rather than hidden in an initializer.
+     */
+    buffer.Mdl = Mdl;
+    buffer.Offset = (ULONG)Offset;
+    buffer.Length = Length;
+
+    direct = IwanNtWskDatagramContiguous(&buffer, &contiguous);
     if (direct) {
         payload = contiguous;
     } else {
         size_t copied = 0;
 
         if (transport->Scratch == NULL ||
-            !IwanNtWskDatagramCopyBuffer(
-                &(WSK_BUF){ .Mdl = Mdl, .Offset = Offset, .Length = Length },
-                transport->Scratch, transport->ScratchCapacity, &copied)) {
+            !IwanNtWskDatagramCopyBuffer(&buffer, transport->Scratch,
+                                         transport->ScratchCapacity, &copied)) {
             return FALSE;
         }
         payload = transport->Scratch;
