@@ -192,6 +192,23 @@ IPv6.
 counts the indications that carried more than one NBL, which is the only way to
 tell from user mode whether batching is actually happening.
 
+## Receiving without a copy
+
+The receive callback does not copy the datagram: the provider keeps the buffer
+valid until `WskRelease`, so the miniport points the net buffer at that MDL and
+gives the indication back only when NDIS returns the NBL. When the MDL chain is
+not one contiguous run the frame transform cannot work in place, and that
+datagram takes the copy path instead (into the pool slot).
+
+That changes the callback contract. It detaches each indication, keeps the ones
+the sink accepted, and returns `STATUS_PENDING`, so WSK no longer reclaims the
+chain and every kept indication must be released exactly once. Teardown
+therefore waits for the last release before it closes the socket: the stack may
+still be reading those pages, and closing early would free memory underneath
+it. If a halt wins the race with a staged chain, the flush recycles the slots
+and releases their indications rather than indicating a frame on an adapter
+that is going away.
+
 ## About `tools/kernel-stubs`
 
 The stubs exist so the frame, demux, ring, ingress and socket sources can be
