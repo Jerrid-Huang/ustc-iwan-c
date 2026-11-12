@@ -93,7 +93,6 @@ typedef struct _IWAN_NT_MINIPORT_ADAPTER {
     PNET_BUFFER_LIST RxChainHead;
     PNET_BUFFER_LIST RxChainTail;
     ULONG RxChainCount;
-    unsigned RxChainFamily;
     /*
      * Bounded storage for the control ring that carries inbound OPEN_ACK,
      * ECHO and CLOSE frames to the user-mode control plane. Fixed size, so a
@@ -748,14 +747,12 @@ IwanNtMiniportFlushInner(
     }
 
     /*
-     * Every NBL in a batch carries the same family, because a family change
-     * flushes first: NDIS_RECEIVE_FLAGS_SINGLE_ETHER_TYPE applies to the whole
-     * chain, and a chain that mixed 0x0800 with 0xDD86 would be described
-     * wrongly.
+     * Flags are zero on purpose. A chain may mix IPv4 and IPv6 frames, and on a
+     * raw IP miniport each frame states its own version; SINGLE_ETHER_TYPE would
+     * assert one value for the whole chain.
      */
     NdisMIndicateReceiveNetBufferLists(adapter->AdapterHandle, chain,
-                                       NDIS_DEFAULT_PORT_NUMBER, count,
-                                       NDIS_RECEIVE_FLAGS_SINGLE_ETHER_TYPE);
+                                       NDIS_DEFAULT_PORT_NUMBER, count, 0);
 }
 
 /*
@@ -777,6 +774,8 @@ IwanNtMiniportIndicateInner(
     PNET_BUFFER nb;
     ULONG index;
     LONG state;
+
+    UNREFERENCED_PARAMETER(Family);
 
     /*
      * The adapter advertises IWAN_NT_MINIPORT_MTU, so the stack should never hand
@@ -814,27 +813,18 @@ IwanNtMiniportIndicateInner(
     NET_BUFFER_DATA_LENGTH(nb) = (ULONG)Length;
 
     /*
-     * The miniport is raw IP, so NDIS needs the EtherType it should report and
-     * must be told to trust that single value instead of parsing the frame.
+     * No EtherType metadata and no NDIS_RECEIVE_FLAGS_SINGLE_ETHER_TYPE: this is
+     * a raw IP miniport, so NDIS reads the version nibble from the packet itself.
+     * Both the frame-type info and that flag describe Ethernet framing, which
+     * does not exist here.
      */
-    NET_BUFFER_LIST_INFO(slot->Nbl, NetBufferListFrameType) =
-        (Family == 6) ? (PVOID)(ULONG_PTR)0xDD86 : (PVOID)(ULONG_PTR)0x0008;
     NET_BUFFER_LIST_STATUS(slot->Nbl) = NDIS_STATUS_SUCCESS;
     NET_BUFFER_LIST_NEXT_NBL(slot->Nbl) = NULL;
-
-    /*
-     * A family change ends the batch: the SINGLE_ETHER_TYPE flag describes one
-     * value for the whole chain.
-     */
-    if (adapter->RxChainHead != NULL && adapter->RxChainFamily != Family) {
-        IwanNtMiniportFlushInner(adapter);
-    }
 
     InterlockedIncrement(&adapter->RxInFlight);
     InterlockedIncrement(&adapter->RxIndicated);
     if (adapter->RxChainHead == NULL) {
         adapter->RxChainHead = slot->Nbl;
-        adapter->RxChainFamily = Family;
     } else {
         NET_BUFFER_LIST_NEXT_NBL(adapter->RxChainTail) = slot->Nbl;
     }

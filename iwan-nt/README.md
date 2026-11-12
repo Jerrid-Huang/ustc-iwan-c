@@ -45,7 +45,7 @@ credentials, so the raw log is parked where a plain read can reach it.
 The transport binds its datagram socket to the wildcard address and port zero, so
 the provider picks the port. `iwannt-ctl local` reads it back
 (`IWAN_NT_IOCTL_GET_LOCAL`), which separates "the peer never answered" from "the
-answer went somewhere else" — the second one is invisible from the counters.
+answer went somewhere else" -- the second one is invisible from the counters.
 
 ## Session keepalive and timeout
 

@@ -81,10 +81,10 @@ session comes up and subtract that.
 
 ## When it does not come up
 
-1. `iwannt-ctl check` — the three lines name the step that is missing.
-2. `iwannt-ctl local` — the port the peer has to answer to. If it is zero, the
+1. `iwannt-ctl check` -- the three lines name the step that is missing.
+2. `iwannt-ctl local` -- the port the peer has to answer to. If it is zero, the
    socket is not bound, which means the adapter is not enabled yet.
-3. `iwannt-ctl stats` — `Running` and `SessionValid` are the same two facts, and
+3. `iwannt-ctl stats` -- `Running` and `SessionValid` are the same two facts, and
    the drop counters say whether frames are arriving at all.
 4. If `receives` stays at zero while the server claims to answer, the frames are
    not reaching this host: check the port and the route before suspecting the
