@@ -65,6 +65,7 @@
 #endif
 
 typedef unsigned char UCHAR;
+typedef UCHAR *PUCHAR;
 typedef unsigned short USHORT;
 typedef unsigned long ULONG;
 typedef unsigned long long ULONG64;
@@ -391,7 +392,18 @@ KeFlushQueuedDpcs(void)
 
 #define InterlockedAdd(p, v) (*(volatile long *)(p) += (long)(v))
 #define InterlockedExchange(p, v) (*(volatile long *)(p) = (long)(v))
+static __inline LONG IwanNtStubInterlockedCompareExchange(volatile LONG *Target, LONG Exchange, LONG Comparand)
+{
+    LONG original = *Target;
+    if (original == Comparand) {
+        *Target = Exchange;
+    }
+    return original;
+}
+#define InterlockedCompareExchange(p, e, c) \
+    IwanNtStubInterlockedCompareExchange((volatile LONG *)(p), (LONG)(e), (LONG)(c))
 #define InterlockedIncrement64(p) (++(*(volatile long long *)(p)))
 #define InterlockedIncrement(p) (++(*(volatile long *)(p)))
+#define InterlockedDecrement(p) (--(*(volatile long *)(p)))
 
 #endif /* IWAN_NT_NTDDK_STUB_H */

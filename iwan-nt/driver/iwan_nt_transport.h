@@ -36,6 +36,23 @@ typedef enum _IWAN_NT_TRANSPORT_STATE {
     IwanNtTransportFinalized
 } IWAN_NT_TRANSPORT_STATE;
 
+/*
+ * What the receive path hands to the data sink besides the bytes.
+ *
+ * The sink is the miniport, and it needs the provider's MDL to point NDIS at the
+ * received buffer instead of a copy. Taken is the answer back: a sink that bound
+ * the frame to Mdl sets it, and the reference then belongs to the sink and must
+ * be released with IwanNtWskDatagramReleaseReceive. A sink that copied instead
+ * leaves it clear, and the transport releases the reference itself.
+ */
+typedef struct _IWAN_NT_RECEIVE_VIEW {
+    PMDL Mdl;
+    SIZE_T Offset;      /* byte offset inside the MDL chain where the frame starts */
+    SIZE_T Length;      /* datagram length in bytes, header included */
+    void *Reference;    /* exactly what IwanNtWskDatagramReleaseReceive expects */
+    BOOLEAN Taken;      /* set by the sink when it kept the buffer */
+} IWAN_NT_RECEIVE_VIEW, *PIWAN_NT_RECEIVE_VIEW;
+
 typedef struct _IWAN_NT_TRANSPORT {
     EX_RUNDOWN_REF Rundown;
     KSPIN_LOCK StateLock;

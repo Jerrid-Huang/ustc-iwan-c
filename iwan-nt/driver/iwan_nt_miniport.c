@@ -41,7 +41,12 @@ typedef enum _IWAN_NT_MINIPORT_STATE {
  * more than it could hold; 8 keeps the staging memory small while still
  * collapsing the common case of one busy queue into one WskSendMessages.
  */
-#define IWAN_NT_MINIPORT_SEND_BATCH 8u
+/*
+ * Packets per WskSendMessages call. WireGuardNT hands over whatever its staging
+ * queue holds (MAX_STAGED_PACKETS 128); the ceiling here is the send pool, so
+ * one batch can claim every slot at most.
+ */
+#define IWAN_NT_MINIPORT_SEND_BATCH IWAN_NT_TX_SLOTS
 
 #define IWAN_NT_MINIPORT_RX_SLOTS 64u
 
@@ -49,6 +54,12 @@ typedef struct _IWAN_NT_MINIPORT_RX_SLOT {
     PUCHAR Buffer;
     PMDL Mdl;
     PNET_BUFFER_LIST Nbl;
+    /*
+     * Set only when this frame points straight at the provider's buffer: the
+     * indication must then be released when NDIS gives the frame back, not when
+     * the receive callback ends.
+     */
+    void *Reference;
     volatile LONG InUse;
 } IWAN_NT_MINIPORT_RX_SLOT;
 
@@ -119,7 +130,8 @@ IwanNtMiniportIndicateInner(
     void *Context,
     const uint8_t *Inner,
     size_t Length,
-    unsigned Family
+    unsigned Family,
+    void *View
     );
 
 /* NDIS caches the general-attribute OIDs on our behalf. */
@@ -733,6 +745,16 @@ IwanNtMiniportFlushInner(
             if (slot == NULL) {
                 continue;
             }
+            /*
+             * The frame was built on the provider's buffer, so give that back
+             * before the slot: teardown waits for this count to reach zero and
+             * would otherwise wait forever.
+             */
+            if (slot->Reference != NULL) {
+                IwanNtWskDatagramReleaseReceive(&adapter->Transport.Datagram,
+                                                slot->Reference);
+                slot->Reference = NULL;
+            }
             InterlockedExchange(&slot->InUse, 0);
             if (InterlockedDecrement(&adapter->RxInFlight) == 0) {
                 KeSetEvent(&adapter->RxIdle, IO_NO_INCREMENT, FALSE);
@@ -766,10 +788,12 @@ IwanNtMiniportIndicateInner(
     void *Context,
     const uint8_t *Inner,
     size_t Length,
-    unsigned Family
+    unsigned Family,
+    void *View
     )
 {
     PIWAN_NT_MINIPORT_ADAPTER adapter = Context;
+    PIWAN_NT_RECEIVE_VIEW view = (PIWAN_NT_RECEIVE_VIEW)View;
     IWAN_NT_MINIPORT_RX_SLOT *slot = NULL;
     PNET_BUFFER nb;
     ULONG index;
@@ -807,10 +831,31 @@ IwanNtMiniportIndicateInner(
     }
 
     KeClearEvent(&adapter->RxIdle);
-    NdisMoveMemory(slot->Buffer, Inner, Length);
     nb = NET_BUFFER_LIST_FIRST_NB(slot->Nbl);
-    NET_BUFFER_DATA_OFFSET(nb) = 0;
-    NET_BUFFER_DATA_LENGTH(nb) = (ULONG)Length;
+    if (view != NULL) {
+        /*
+         * Zero copy: the frame sits inside the provider's buffer, behind the
+         * eight byte header the transform just rewrote in place. Point the net
+         * buffer at that MDL instead of copying, and keep the indication until
+         * NDIS returns the frame.
+         */
+        NET_BUFFER_FIRST_MDL(nb) = view->Mdl;
+        NET_BUFFER_CURRENT_MDL(nb) = view->Mdl;
+        NET_BUFFER_CURRENT_MDL_OFFSET(nb) =
+            view->Offset + IWAN_NT_FRAME_HDR_LEN;
+        NET_BUFFER_DATA_OFFSET(nb) = view->Offset + IWAN_NT_FRAME_HDR_LEN;
+        NET_BUFFER_DATA_LENGTH(nb) = (ULONG)Length;
+        slot->Reference = view->Reference;
+        view->Taken = TRUE;
+    } else {
+        NdisMoveMemory(slot->Buffer, Inner, Length);
+        NET_BUFFER_FIRST_MDL(nb) = slot->Mdl;
+        NET_BUFFER_CURRENT_MDL(nb) = slot->Mdl;
+        NET_BUFFER_CURRENT_MDL_OFFSET(nb) = 0;
+        NET_BUFFER_DATA_OFFSET(nb) = 0;
+        NET_BUFFER_DATA_LENGTH(nb) = (ULONG)Length;
+        slot->Reference = NULL;
+    }
 
     /*
      * No EtherType metadata and no NDIS_RECEIVE_FLAGS_SINGLE_ETHER_TYPE: this is
@@ -1031,6 +1076,16 @@ IwanNtMiniportReturnNetBufferLists(
 
         if (slot == NULL) {
             continue;
+        }
+        if (slot->Reference != NULL) {
+            /*
+             * The frame lived in the provider's buffer, so the indication is only
+             * safe to release now that the stack is done reading it. This runs at
+             * DISPATCH_LEVEL, which WskRelease allows.
+             */
+            IwanNtWskDatagramReleaseReceive(&adapter->Transport.Datagram,
+                                            slot->Reference);
+            slot->Reference = NULL;
         }
         InterlockedExchange(&slot->InUse, 0);
         if (InterlockedDecrement(&adapter->RxInFlight) == 0) {

@@ -55,6 +55,7 @@ typedef struct _SINK_RECORD {
     unsigned LastFamily;
     uint8_t Last[2048];
     void *ContextSeen;
+    void *LastView;
 } SINK_RECORD;
 
 static SINK_RECORD gSink;
@@ -64,10 +65,12 @@ FakeSink(
     void *Context,
     const uint8_t *Inner,
     size_t Length,
-    unsigned Family
+    unsigned Family,
+    void *View
     )
 {
     gSink.Calls++;
+    gSink.LastView = View;
     gSink.LastLength = Length;
     gSink.LastFamily = Family;
     gSink.ContextSeen = Context;

@@ -45,19 +45,60 @@ IwanNtTransportReceiveFlush(
  * transforms the payload in place and never blocks, so this stays a straight
  * call; the counters it updates are read-only to everyone else here.
  */
-static VOID
+static BOOLEAN
 IwanNtTransportReceiveChunk(
     _In_opt_ void *Context,
-    _Inout_updates_bytes_(Length) uint8_t *Payload,
-    _In_ size_t Length
+    _In_ PMDL Mdl,
+    _In_ SIZE_T Offset,
+    _In_ SIZE_T Length,
+    _In_opt_ void *Reference
     )
 {
     PIWAN_NT_TRANSPORT transport = (PIWAN_NT_TRANSPORT)Context;
+    IWAN_NT_RECEIVE_VIEW view;
+    PUCHAR contiguous = NULL;
+    uint8_t *payload = NULL;
     KIRQL oldIrql;
+    BOOLEAN direct;
 
-    if (transport == NULL || Payload == NULL) {
-        return;
+    if (transport == NULL || Mdl == NULL) {
+        return FALSE;
     }
+    if (Length == 0 || Length > IWAN_NT_SCRATCH_BYTES) {
+        /* Beyond the transform's working size: counted as an oversize drop by
+         * the socket layer, so the reference stays with the caller. */
+        return FALSE;
+    }
+
+    /*
+     * The frame transform works in place, so it needs the whole datagram under
+     * one pointer. When the provider handed us one contiguous run we use it as
+     * is and point NDIS at it; otherwise we copy into the scratch buffer and
+     * tell the sink to copy into its own slot.
+     */
+    direct = IwanNtWskDatagramContiguous(
+        &(WSK_BUF){ .Mdl = Mdl, .Offset = Offset, .Length = Length },
+        &contiguous);
+    if (direct) {
+        payload = contiguous;
+    } else {
+        size_t copied = 0;
+
+        if (transport->Scratch == NULL ||
+            !IwanNtWskDatagramCopyBuffer(
+                &(WSK_BUF){ .Mdl = Mdl, .Offset = Offset, .Length = Length },
+                transport->Scratch, transport->ScratchCapacity, &copied)) {
+            return FALSE;
+        }
+        payload = transport->Scratch;
+        Length = copied;
+    }
+
+    view.Mdl = Mdl;
+    view.Offset = Offset;
+    view.Length = Length;
+    view.Reference = Reference;
+    view.Taken = FALSE;
 
     /*
      * The control plane replaces the session at PASSIVE_LEVEL while datagrams
@@ -70,15 +111,25 @@ IwanNtTransportReceiveChunk(
      * payload. Everything else goes down the data pipeline.
      */
     if (transport->PeerReady &&
-        IwanNtPeerWantsFrame(&transport->Peer, Payload, Length)) {
+        IwanNtPeerWantsFrame(&transport->Peer, payload, Length)) {
         (VOID)IwanNtPeerOnFrame(
-            &transport->Peer, Payload, Length, IwanNtTransportNowMs());
+            &transport->Peer, payload, Length, IwanNtTransportNowMs());
         IwanNtTransportApplyPeerStateLocked(transport);
     } else {
-        (VOID)IwanNtIngressReceive(&transport->Ingress, Payload, Length);
+        (VOID)IwanNtIngressReceiveWithView(
+            &transport->Ingress, payload, Length, direct ? &view : NULL);
     }
 
     KeReleaseSpinLock(&transport->SessionLock, oldIrql);
+
+    if (!view.Taken) {
+        /* Nothing downstream bound this datagram, so the reference is ours to
+         * give back. Doing it after the lock keeps the provider call out of the
+         * session critical section. */
+        IwanNtWskDatagramReleaseReceive(&transport->Datagram, Reference);
+        return TRUE;
+    }
+    return TRUE;
 }
 
 /*
@@ -347,8 +398,6 @@ IwanNtTransportStart(
      */
     IwanNtWskDatagramAttachReceive(
         &Transport->Datagram,
-        Transport->Scratch,
-        Transport->ScratchCapacity,
         IwanNtTransportReceiveChunk,
         IwanNtTransportReceiveFlush,
         Transport);
@@ -359,7 +408,7 @@ IwanNtTransportStart(
         Transport->SocketFamily);
     if (!NT_SUCCESS(status)) {
         IwanNtWskDatagramAttachReceive(
-            &Transport->Datagram, NULL, 0, NULL, NULL, NULL);
+            &Transport->Datagram, NULL, NULL, NULL);
         Transport->IngressAttached = FALSE;
         IwanNtWskReleaseProvider(&Transport->Wsk);
         KeAcquireSpinLock(&Transport->StateLock, &oldIrql);
@@ -422,7 +471,7 @@ IwanNtTransportStop(
     /* Stop has drained the callbacks, so the sink can be detached safely. */
     if (Transport->IngressAttached) {
         IwanNtWskDatagramAttachReceive(
-            &Transport->Datagram, NULL, 0, NULL, NULL, NULL);
+            &Transport->Datagram, NULL, NULL, NULL);
         Transport->IngressAttached = FALSE;
     }
 
@@ -493,7 +542,7 @@ IwanNtTransportFinalize(
 
     if (Transport->IngressAttached) {
         IwanNtWskDatagramAttachReceive(
-            &Transport->Datagram, NULL, 0, NULL, NULL, NULL);
+            &Transport->Datagram, NULL, NULL, NULL);
         Transport->IngressAttached = FALSE;
     }
 

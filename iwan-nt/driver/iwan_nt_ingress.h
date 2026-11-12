@@ -90,7 +90,8 @@ typedef void (*IWAN_NT_INGRESS_DATA_SINK)(
     _In_opt_ void *Context,
     _In_reads_bytes_(Length) const uint8_t *Inner,
     _In_ size_t Length,
-    _In_ unsigned Family
+    _In_ unsigned Family,
+    _In_opt_ void *View
     );
 
 typedef struct _IWAN_NT_INGRESS_COUNTERS {
@@ -116,6 +117,13 @@ typedef struct _IWAN_NT_INGRESS {
     int SessionValid;
     IWAN_NT_INGRESS_DATA_SINK DataSink;
     void *DataSinkContext;
+    /*
+     * Opaque caller token handed back to the sink unchanged. The kernel receive
+     * path uses it to tell the sink where the frame came from, so the sink can
+     * point NDIS at the provider's buffer instead of a copy; nothing in this
+     * module looks at it. Only IwanNtIngressReceiveWithView sets it.
+     */
+    void *View;
     IWAN_NT_INGRESS_COUNTERS Counters;
 } IWAN_NT_INGRESS, *PIWAN_NT_INGRESS;
 
@@ -181,6 +189,23 @@ IwanNtIngressReceive(
     _Inout_ PIWAN_NT_INGRESS Ingress,
     _Inout_updates_bytes_(Length) uint8_t *Payload,
     _In_ size_t Length
+    );
+
+/*
+ * Same as IwanNtIngressReceive, but hands View to the data sink.
+ *
+ * View is opaque here and is not interpreted; it only has to stay valid for the
+ * duration of the call, exactly like Payload. Passing NULL is the same as
+ * calling IwanNtIngressReceive.
+ *
+ * IRQL: <= DISPATCH_LEVEL. Calls must be serialized.
+ */
+IWAN_NT_INGRESS_RESULT
+IwanNtIngressReceiveWithView(
+    _Inout_ PIWAN_NT_INGRESS Ingress,
+    _Inout_updates_bytes_(Length) uint8_t *Payload,
+    _In_ size_t Length,
+    _In_opt_ void *View
     );
 
 /*

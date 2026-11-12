@@ -173,29 +173,24 @@ host tests.
 Both directions batch, for the same reason: a WSK callback and an NDIS call each
 have a fixed cost that does not grow with the number of packets carried.
 
-Sends stage up to eight inner packets that arrived in one `SendNetBufferLists`
-call and submit them with one `WskSendMessages`; a family change flushes first,
-and a short batch is backpressure, not a queue.
+Sends stage as many inner packets as arrived in one `SendNetBufferLists` call and
+submit them with one `WskSendMessages`, up to
+`IWAN_NT_MINIPORT_SEND_BATCH` (the size of the send pool, so one batch can claim
+every slot). A family change flushes first, because one frame header serves the
+whole batch. A short batch is backpressure, not a queue: the packets the pool
+could not take are completed with `NDIS_STATUS_RESOURCES` so the stack retries
+them.
 
-Receives work the other way around: one WSK receive callback can carry a whole
-chain of datagrams, and the miniport assembles the NBLs it builds into one chain
-that it indicates with a single `NdisMIndicateReceiveNetBufferLists`. Every NBL
-still owns its pool slot, so `ReturnNetBufferLists` frees a chain exactly the way
-it frees a single frame. A family change ends a batch, because
-`NDIS_RECEIVE_FLAGS_SINGLE_ETHER_TYPE` describes one value for the whole chain.
+Receives work the other way around: one WSK receive callback can carry a chain of
+datagrams, and the miniport assembles the NBLs it builds into one chain indicated
+with a single `NdisMIndicateReceiveNetBufferLists`. No EtherType metadata and no
+`NDIS_RECEIVE_FLAGS_SINGLE_ETHER_TYPE` go with it: this is a raw IP miniport, so
+NDIS reads the version nibble from each packet, and a chain may mix IPv4 with
+IPv6.
 
 `iwannt-ctl stats` reports `rx indicated`, `dropped` and `batches`; `batches`
 counts the indications that carried more than one NBL, which is the only way to
 tell from user mode whether batching is actually happening.
-
-## Batched sends
-
-The send pool hands several datagrams to the provider under one IRP
-(`WskSendMessages`) instead of one call per packet. The miniport assembles a
-batch per net buffer list, up to `IWAN_NT_MINIPORT_SEND_BATCH` packets, and
-flushes early when the inner family changes because one frame header serves the
-whole batch. A short batch is backpressure: the unsent packets are completed with
-`NDIS_STATUS_RESOURCES` so the stack retries them, and nothing is queued.
 
 ## About `tools/kernel-stubs`
 

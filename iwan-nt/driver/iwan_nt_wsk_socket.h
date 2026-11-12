@@ -58,16 +58,23 @@ typedef enum _IWAN_NT_WSK_DATAGRAM_STATE {
  * out. The sink must not block, must not allocate, and must not call back into
  * this datagram.
  *
- * The scratch buffer exists because the frame transform is in-place and needs
- * contiguous bytes, while a WSK datagram arrives as an MDL chain. One buffer
- * is enough because the receive lock serializes callbacks; it costs one copy
- * per datagram, which is the deliberate first-stage trade against the pool and
- * direct-MDL transform that a later stage adds.
+  * Ownership passes with the indication. The sink gets the provider's own MDL
+ * and offset, so a consumer that can work in place points NDIS straight at the
+ * received buffer and copies nothing. A consumer that cannot (for example the
+ * datagram is split across pages) returns FALSE: the caller releases that
+ * indication and the datagram is gone, so the sink owns the drop.
+ *
+ * A TRUE return means the sink kept the indication, and it must call
+ * IwanNtWskDatagramReleaseReceive with the same Reference once it is done with
+ * the bytes. Until then the socket stays open: Stop waits out every callback,
+ * and Close would invalidate the buffer under the sink.
  */
-typedef void (*IWAN_NT_WSK_DATAGRAM_RECEIVE_SINK)(
+typedef BOOLEAN (*IWAN_NT_WSK_DATAGRAM_RECEIVE_SINK)(
     _In_opt_ void *Context,
-    _Inout_updates_bytes_(Length) uint8_t *Payload,
-    _In_ size_t Length
+    _In_ PMDL Mdl,
+    _In_ SIZE_T Offset,
+    _In_ SIZE_T Length,
+    _In_opt_ void *Reference
     );
 
 /*
@@ -114,13 +121,18 @@ typedef struct _IWAN_NT_WSK_DATAGRAM {
     BOOLEAN CloseCompleted;
     BOOLEAN CloseRequired;
     /* Receive plumbing; NULL until AttachReceive runs and after Detach. */
-    uint8_t *Scratch;
-    size_t ScratchCapacity;
     IWAN_NT_WSK_DATAGRAM_RECEIVE_SINK ReceiveSink;
     IWAN_NT_WSK_DATAGRAM_RECEIVE_FLUSH ReceiveFlush;
     void *ReceiveSinkContext;
     ULONG OversizeDrops;
     ULONG SinkErrors;
+    /*
+     * Indications the sink kept and has not released. Teardown waits for this to
+     * reach zero before closing the socket: the provider's buffers are still
+     * being read by the stack, and closing would invalidate them.
+     */
+    volatile LONG OutstandingReceives;
+    KEVENT ReceiveIdle;
 } IWAN_NT_WSK_DATAGRAM, *PIWAN_NT_WSK_DATAGRAM;
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -169,20 +181,60 @@ IwanNtWskDatagramFinalize(
  * Install the receive path.
  *
  * IRQL: PASSIVE_LEVEL, before Start and after Stop; no callback may be running.
- * Ownership: Scratch stays owned by the caller and must be non-paged, because
- * the callback runs at IRQL <= DISPATCH_LEVEL. Neither pointer is retained
- * beyond Detach. A NULL sink detaches the path, which makes the callback drop
- * datagrams instead of processing them.
+ * Ownership: no pointer is retained beyond Detach. A NULL sink detaches the
+ * path, which makes the callback release datagrams instead of processing
+ * them.
  */
 _IRQL_requires_(PASSIVE_LEVEL)
 VOID
 IwanNtWskDatagramAttachReceive(
     _Inout_ PIWAN_NT_WSK_DATAGRAM Datagram,
-    _In_reads_bytes_opt_(ScratchCapacity) uint8_t *Scratch,
-    _In_ size_t ScratchCapacity,
     _In_opt_ IWAN_NT_WSK_DATAGRAM_RECEIVE_SINK Sink,
     _In_opt_ IWAN_NT_WSK_DATAGRAM_RECEIVE_FLUSH Flush,
     _In_opt_ void *Context
+    );
+
+/*
+ * Copy one datagram out of the provider's MDL chain.
+ *
+ * IRQL: <= DISPATCH_LEVEL. Returns FALSE when the chain is shorter than it
+ * claims or an MDL cannot be mapped; the caller counts that as a sink error
+ * rather than processing a partially filled buffer.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN
+IwanNtWskDatagramCopyBuffer(
+    _In_ const WSK_BUF *Buffer,
+    _Out_writes_bytes_(Capacity) uint8_t *Destination,
+    _In_ size_t Capacity,
+    _Out_ size_t *Copied
+    );
+
+/*
+ * Release one indication the sink kept.
+ *
+ * IRQL: <= DISPATCH_LEVEL. Reference is exactly the one the sink received;
+ * calling it twice is a bug that corrupts the provider's lists.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+IwanNtWskDatagramReleaseReceive(
+    _Inout_ PIWAN_NT_WSK_DATAGRAM Datagram,
+    _In_opt_ void *Reference
+    );
+
+/*
+ * Tell whether one datagram is a single contiguous run, and where it starts.
+ *
+ * IRQL: <= DISPATCH_LEVEL. On success *VirtualAddress points at the first byte
+ * and the whole Length can be read or written through it; on failure the
+ * datagram straddles a page boundary and the caller must copy it instead.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN
+IwanNtWskDatagramContiguous(
+    _In_ const WSK_BUF *Buffer,
+    _Out_ PUCHAR *VirtualAddress
     );
 
 /*

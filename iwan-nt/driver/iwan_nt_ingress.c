@@ -128,7 +128,8 @@ IwanNtIngressRouteData(
         return IwanNtIngressDroppedNoSink;
     }
 
-    Ingress->DataSink(Ingress->DataSinkContext, inner, innerLength, family);
+    Ingress->DataSink(Ingress->DataSinkContext, inner, innerLength, family,
+                      Ingress->View);
     Ingress->Counters.Delivered++;
     Ingress->Counters.BytesDelivered += (uint64_t)innerLength;
     return IwanNtIngressDelivered;
@@ -176,6 +177,18 @@ IwanNtIngressReceive(
     size_t Length
     )
 {
+    return IwanNtIngressReceiveWithView(Ingress, Payload, Length, NULL);
+}
+
+IWAN_NT_INGRESS_RESULT
+IwanNtIngressReceiveWithView(
+    PIWAN_NT_INGRESS Ingress,
+    uint8_t *Payload,
+    size_t Length,
+    void *View
+    )
+{
+    Ingress->View = View;
     IWAN_NT_DEMUX_SESSION demuxSession;
     IWAN_NT_DEMUX_DECISION decision;
     IWAN_NT_DEMUX_RESULT demuxResult;

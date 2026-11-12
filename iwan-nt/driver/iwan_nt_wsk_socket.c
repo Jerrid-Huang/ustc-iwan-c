@@ -15,6 +15,11 @@ static const WSK_CLIENT_DATAGRAM_DISPATCH IwanNtWskDatagramClientDispatch = {
     IwanNtWskDatagramReceiveFromEvent
 };
 
+static VOID
+IwanNtWskDatagramWaitForReceives(
+    _Inout_ PIWAN_NT_WSK_DATAGRAM Datagram
+    );
+
 static NTSTATUS
 IwanNtWskDatagramIrpComplete(
     _In_ PDEVICE_OBJECT DeviceObject,
@@ -524,6 +529,12 @@ IwanNtWskDatagramTearDownInternal(
 
     IwanNtWskDatagramRunDown(Datagram, FALSE);
 
+    /*
+     * Callbacks are fenced now, so no new indication can be kept; wait out the
+     * ones already in the stack's hands before the socket goes away.
+     */
+    IwanNtWskDatagramWaitForReceives(Datagram);
+
     if (socket != NULL) {
         closeStatus = IwanNtWskDatagramCloseSocket(Datagram);
         if (!NT_SUCCESS(closeStatus)) {
@@ -596,7 +607,7 @@ IwanNtWskDatagramTearDown(
  * mapped; the caller counts that as a sink error rather than processing a
  * partially filled buffer.
  */
-static BOOLEAN
+BOOLEAN
 IwanNtWskDatagramCopyBuffer(
     _In_ const WSK_BUF *Buffer,
     _Out_writes_bytes_(Capacity) uint8_t *Destination,
@@ -661,12 +672,144 @@ IwanNtWskDatagramCopyBuffer(
     return TRUE;
 }
 
+/*
+ * Is this datagram one contiguous run?
+ *
+ * A pool allocation that fits in a page is; a larger one may not be, and then the
+ * frame transform cannot work in place. Walking the chain is cheaper than
+ * copying first and finding out.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN
+IwanNtWskDatagramContiguous(
+    _In_ const WSK_BUF *Buffer,
+    _Out_ PUCHAR *VirtualAddress
+    )
+{
+    PMDL mdl;
+    SIZE_T skip;
+    SIZE_T remaining;
+    PUCHAR first = NULL;
+    PUCHAR expected = NULL;
+
+    *VirtualAddress = NULL;
+    if (Buffer == NULL || Buffer->Mdl == NULL) {
+        return FALSE;
+    }
+
+    mdl = Buffer->Mdl;
+    skip = Buffer->Offset;
+    remaining = Buffer->Length;
+
+    while (mdl != NULL && remaining > 0) {
+        ULONG mdlBytes = MmGetMdlByteCount(mdl);
+        ULONG chunk;
+        PVOID base;
+
+        if (skip >= mdlBytes) {
+            skip -= mdlBytes;
+            mdl = mdl->Next;
+            continue;
+        }
+
+        chunk = (ULONG)((SIZE_T)mdlBytes - skip);
+        if ((SIZE_T)chunk > remaining) {
+            chunk = (ULONG)remaining;
+        }
+
+        base = MmGetSystemAddressForMdlSafe(
+            mdl,
+            NormalPagePriority | MdlMappingNoExecute);
+        if (base == NULL) {
+            return FALSE;
+        }
+
+        if (first == NULL) {
+            first = (PUCHAR)base + skip;
+        } else if ((PUCHAR)base + skip != expected) {
+            return FALSE;
+        }
+
+        expected = (PUCHAR)base + skip + chunk;
+        remaining -= chunk;
+        skip = 0;
+        mdl = mdl->Next;
+    }
+
+    if (remaining != 0 || first == NULL) {
+        return FALSE;
+    }
+
+    *VirtualAddress = first;
+    return TRUE;
+}
+
+/*
+ * Release one indication the sink kept.
+ *
+ * The socket and its dispatch are read under the state lock, because teardown
+ * clears them; the release itself runs outside it, since the provider may
+ * complete work inline. Teardown cannot close the socket while a release is
+ * outstanding: it waits for OutstandingReceives to reach zero first.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+IwanNtWskDatagramReleaseReceive(
+    _Inout_ PIWAN_NT_WSK_DATAGRAM Datagram,
+    _In_opt_ void *Reference
+    )
+{
+    PWSK_DATAGRAM_INDICATION indication;
+    const WSK_PROVIDER_DATAGRAM_DISPATCH *dispatch;
+    PWSK_SOCKET socket;
+    KIRQL oldIrql;
+
+    if (Datagram == NULL || Reference == NULL) {
+        return;
+    }
+
+    indication = (PWSK_DATAGRAM_INDICATION)Reference;
+
+    KeAcquireSpinLock(&Datagram->StateLock, &oldIrql);
+    socket = Datagram->Socket;
+    dispatch = (socket != NULL) ? IwanNtWskDatagramGetDatagramDispatch(socket)
+                                : NULL;
+    KeReleaseSpinLock(&Datagram->StateLock, oldIrql);
+
+    if (dispatch != NULL && dispatch->WskRelease != NULL) {
+        dispatch->WskRelease(socket, indication);
+    }
+
+    if (InterlockedDecrement(&Datagram->OutstandingReceives) == 0) {
+        KeSetEvent(&Datagram->ReceiveIdle, IO_NO_INCREMENT, FALSE);
+    }
+}
+
+/*
+ * Wait until every indication the sink kept has been given back.
+ *
+ * IRQL: PASSIVE_LEVEL. Unbounded on purpose: the frames are still being read by
+ * NDIS, so closing the socket early would free memory underneath it. Wait in
+ * slices and re-read the counter, so a stale event cannot let this through.
+ */
+static VOID
+IwanNtWskDatagramWaitForReceives(
+    _Inout_ PIWAN_NT_WSK_DATAGRAM Datagram
+    )
+{
+    while (InterlockedCompareExchange(&Datagram->OutstandingReceives, 0, 0) != 0) {
+        LARGE_INTEGER timeout;
+
+        timeout.QuadPart = -1000000; /* 100 ms */
+        (VOID)KeWaitForSingleObject(&Datagram->ReceiveIdle, Executive,
+                                    KernelMode, FALSE, &timeout);
+    }
+}
+
 _IRQL_requires_(PASSIVE_LEVEL)
 VOID
 IwanNtWskDatagramAttachReceive(
     _Inout_ PIWAN_NT_WSK_DATAGRAM Datagram,
-    _In_reads_bytes_opt_(ScratchCapacity) uint8_t *Scratch,
-    _In_ size_t ScratchCapacity,
     _In_opt_ IWAN_NT_WSK_DATAGRAM_RECEIVE_SINK Sink,
     _In_opt_ IWAN_NT_WSK_DATAGRAM_RECEIVE_FLUSH Flush,
     _In_opt_ void *Context
@@ -681,19 +824,14 @@ IwanNtWskDatagramAttachReceive(
 
     PAGED_CODE();
 
-    detach = (Sink == NULL || Scratch == NULL || ScratchCapacity == 0) ?
-             TRUE : FALSE;
+    detach = (Sink == NULL) ? TRUE : FALSE;
 
     KeAcquireSpinLock(&Datagram->ReceiveLock, &oldIrql);
     if (detach) {
-        Datagram->Scratch = NULL;
-        Datagram->ScratchCapacity = 0;
         Datagram->ReceiveSink = NULL;
         Datagram->ReceiveFlush = NULL;
         Datagram->ReceiveSinkContext = NULL;
     } else {
-        Datagram->Scratch = Scratch;
-        Datagram->ScratchCapacity = ScratchCapacity;
         Datagram->ReceiveSink = Sink;
         Datagram->ReceiveFlush = Flush;
         Datagram->ReceiveSinkContext = Context;
@@ -710,6 +848,7 @@ IwanNtWskDatagramReceiveFromEvent(
 {
     PIWAN_NT_WSK_DATAGRAM datagram;
     PWSK_DATAGRAM_INDICATION indication;
+    PWSK_DATAGRAM_INDICATION next;
     KIRQL oldIrql;
 
     UNREFERENCED_PARAMETER(Flags);
@@ -731,12 +870,10 @@ IwanNtWskDatagramReceiveFromEvent(
     }
 
     /*
-     * Returning STATUS_SUCCESS consumes the complete linked indication list,
-     * which is then reclaimed by WSK; calling WskRelease here would release it
-     * twice. Nothing is retained across the callback, so no WskRelease is ever
-     * owed by this module.
-     */
-    /*
+     * One indication at a time, each detached before it is handed out: a sink
+     * that keeps one must not keep the rest of the chain alive, and one that
+     * refuses is released on its own instead of being swept up by the provider.
+     *
      * The receive lock makes the whole batch single-threaded: the frame
      * transform is in-place, the ingress counters have one writer, and the
      * control ring is single-producer. It is held across the sink call, which
@@ -745,8 +882,12 @@ IwanNtWskDatagramReceiveFromEvent(
     KeAcquireSpinLock(&datagram->ReceiveLock, &oldIrql);
     for (indication = DataIndication;
          indication != NULL;
-         indication = indication->Next) {
-        size_t copied = 0;
+         indication = next) {
+        BOOLEAN kept = FALSE;
+        void *reference = indication;
+
+        next = indication->Next;
+        indication->Next = NULL;
 
         KeAcquireSpinLockAtDpcLevel(&datagram->StateLock);
         if (datagram->IndicationCount != MAXULONG) {
@@ -754,41 +895,26 @@ IwanNtWskDatagramReceiveFromEvent(
         }
         KeReleaseSpinLockFromDpcLevel(&datagram->StateLock);
 
-        if (datagram->ReceiveSink == NULL || datagram->Scratch == NULL) {
-            /* No consumer attached: counted, not silently absorbed. */
+        if (datagram->ReceiveSink != NULL) {
+            kept = datagram->ReceiveSink(datagram->ReceiveSinkContext,
+                                         indication->Buffer.Mdl,
+                                         indication->Buffer.Offset,
+                                         indication->Buffer.Length,
+                                         reference);
+        }
+
+        if (kept) {
+            InterlockedIncrement(&datagram->OutstandingReceives);
+        } else {
+            /* No consumer, or it could not use this buffer: the datagram is
+             * counted and released here, because nothing else owns it now. */
             KeAcquireSpinLockAtDpcLevel(&datagram->StateLock);
             if (datagram->SinkErrors != MAXULONG) {
                 datagram->SinkErrors++;
             }
             KeReleaseSpinLockFromDpcLevel(&datagram->StateLock);
-            continue;
+            IwanNtWskDatagramReleaseReceive(datagram, reference);
         }
-
-        if ((size_t)indication->Buffer.Length >
-            datagram->ScratchCapacity) {
-            KeAcquireSpinLockAtDpcLevel(&datagram->StateLock);
-            if (datagram->OversizeDrops != MAXULONG) {
-                datagram->OversizeDrops++;
-            }
-            KeReleaseSpinLockFromDpcLevel(&datagram->StateLock);
-            continue;
-        }
-
-        if (!IwanNtWskDatagramCopyBuffer(&indication->Buffer,
-                                         datagram->Scratch,
-                                         datagram->ScratchCapacity,
-                                         &copied)) {
-            KeAcquireSpinLockAtDpcLevel(&datagram->StateLock);
-            if (datagram->SinkErrors != MAXULONG) {
-                datagram->SinkErrors++;
-            }
-            KeReleaseSpinLockFromDpcLevel(&datagram->StateLock);
-            continue;
-        }
-
-        datagram->ReceiveSink(datagram->ReceiveSinkContext,
-                              datagram->Scratch,
-                              copied);
     }
 
     /*
@@ -801,7 +927,15 @@ IwanNtWskDatagramReceiveFromEvent(
     KeReleaseSpinLock(&datagram->ReceiveLock, oldIrql);
 
     ExReleaseRundownProtection(&datagram->CallbackRundown);
-    return STATUS_SUCCESS;
+
+    /*
+     * STATUS_PENDING is the honest answer, not just for the retained ones: every
+     * indication was taken off the list above, either kept by the sink or
+     * released explicitly, so the provider must not walk the chain again. From
+     * here the list that arrived is gone and nothing is owed to WSK unless the
+     * sink kept a reference, which it releases itself.
+     */
+    return STATUS_PENDING;
 }
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -819,6 +953,7 @@ IwanNtWskDatagramInitialize(
     RtlZeroMemory(Datagram, sizeof(*Datagram));
     KeInitializeSpinLock(&Datagram->StateLock);
     KeInitializeSpinLock(&Datagram->ReceiveLock);
+    KeInitializeEvent(&Datagram->ReceiveIdle, NotificationEvent, TRUE);
     ExInitializeRundownProtection(&Datagram->OperationRundown);
     ExInitializeRundownProtection(&Datagram->CallbackRundown);
     KeInitializeEvent(&Datagram->LifecycleEvent, NotificationEvent, FALSE);

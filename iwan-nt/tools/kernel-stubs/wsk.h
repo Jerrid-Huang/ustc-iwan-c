@@ -132,6 +132,14 @@ typedef struct _WSK_PROVIDER_DATAGRAM_DISPATCH {
     WSK_PROVIDER_BASIC_DISPATCH Basic;
     NTSTATUS (*WskBind)(PVOID, PSOCKADDR, ULONG, PIRP);
     PFN_WSK_SEND_TO WskSendTo;
+    /* Named only for its position: this driver never posts a receive IRP. */
+    NTSTATUS (*WskReceiveFrom)(PVOID, PWSK_BUF, ULONG, PSOCKADDR, PIRP);
+    /*
+     * Hands a datagram indication list back to the provider. Required whenever
+     * the receive callback returns STATUS_PENDING, which is what a consumer that
+     * keeps the buffer does.
+     */
+    NTSTATUS (*WskRelease)(PVOID, PWSK_DATAGRAM_INDICATION);
     /*
      * Synchronous: the address is copied out and the length is in and out.
      */

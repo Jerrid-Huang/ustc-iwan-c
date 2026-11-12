@@ -59,10 +59,12 @@ Sink(
     void *Context,
     const uint8_t *Inner,
     size_t Length,
-    unsigned Family
+    unsigned Family,
+    void *View
     )
 {
     (void)Context;
+    (void)View;
     gDeliveredCalls++;
     gDeliveredFamily = Family;
     gDeliveredLength = Length;
