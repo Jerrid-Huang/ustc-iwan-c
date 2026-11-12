@@ -1,5 +1,7 @@
 #include "iwan_nt_transport.h"
 
+#include <stddef.h>
+
 #include "iwan_nt_string.h"
 
 #define IWAN_NT_TAG_SCRATCH 'tcSI'
@@ -12,6 +14,12 @@ _IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
 IwanNtTransportApplyPeerStateLocked(
     _Inout_ PIWAN_NT_TRANSPORT Transport
+    );
+
+_IRQL_requires_(DISPATCH_LEVEL)
+static VOID
+IwanNtTransportPeerTimerCallback(
+    _In_ PIWAN_NT_TIMER Timer
     );
 
 /*
@@ -120,6 +128,67 @@ IwanNtTransportApplyPeerStateLocked(
     }
 }
 
+/*
+ * Peer clock.
+ *
+ * IRQL: DISPATCH_LEVEL.
+ * The timer callback runs here, so it needs one place to read the monotonic
+ * millisecond clock that is legal above PASSIVE.
+ */
+_IRQL_requires_(DISPATCH_LEVEL)
+static VOID
+IwanNtTransportPeerTimerCallback(
+    _In_ PIWAN_NT_TIMER Timer
+    )
+{
+    PIWAN_NT_TRANSPORT transport = (PIWAN_NT_TRANSPORT)
+        ((uint8_t *)Timer - offsetof(IWAN_NT_TRANSPORT, PeerTimer));
+    KIRQL oldIrql;
+    size_t length;
+    NTSTATUS status;
+    BOOLEAN again;
+    BOOLEAN running;
+
+    length = 0;
+    again = FALSE;
+
+    KeAcquireSpinLock(&transport->SessionLock, &oldIrql);
+    if (transport->PeerReady &&
+        IwanNtPeerTick(
+            &transport->Peer,
+            IwanNtTransportNowMs(),
+            transport->PeerScratch,
+            sizeof(transport->PeerScratch),
+            &length)) {
+        /*
+         * Hand the frame straight to the send pool. It carries its own header,
+         * so it goes out raw: the peer already sealed it.
+         */
+        status = IwanNtTxSendRaw(&transport->Tx, transport->PeerScratch, length);
+        if (NT_SUCCESS(status)) {
+            InterlockedIncrement64((volatile LONG64 *)&transport->ControlSent);
+        } else {
+            /*
+             * The pool is full or the socket is gone. Count it and let the next
+             * tick try again: a dropped keepalive is recoverable, a stuck timer
+             * is not.
+             */
+            InterlockedIncrement64((volatile LONG64 *)&transport->ControlSendFailed);
+        }
+    }
+    IwanNtTransportApplyPeerStateLocked(transport);
+    again = transport->PeerReady;
+    KeReleaseSpinLock(&transport->SessionLock, oldIrql);
+
+    KeAcquireSpinLock(&transport->StateLock, &oldIrql);
+    running = (BOOLEAN)(transport->State == IwanNtTransportRunning);
+    KeReleaseSpinLock(&transport->StateLock, oldIrql);
+
+    if (again && running) {
+        IwanNtTimerArm(Timer, IWAN_NT_PEER_TICK_MS);
+    }
+}
+
 _IRQL_requires_(PASSIVE_LEVEL)
 static VOID
 IwanNtTransportWaitForSends(
@@ -150,6 +219,7 @@ IwanNtTransportInitialize(
     ExInitializeRundownProtection(&Transport->Rundown);
     KeInitializeSpinLock(&Transport->StateLock);
     KeInitializeSpinLock(&Transport->SessionLock);
+    IwanNtTimerInitialize(&Transport->PeerTimer, IwanNtTransportPeerTimerCallback);
     Transport->State = IwanNtTransportUninitialized;
     Transport->SendLimit = SendLimit;
 
@@ -300,6 +370,9 @@ IwanNtTransportStop(
     }
 
     waitForSends = FALSE;
+    /* No tick may start after the socket closes underneath it. */
+    (VOID)IwanNtTimerCancel(&Transport->PeerTimer);
+
     KeAcquireSpinLock(&Transport->StateLock, &oldIrql);
     if (Transport->State == IwanNtTransportRunning ||
         Transport->State == IwanNtTransportStopping) {
@@ -366,6 +439,12 @@ IwanNtTransportFinalize(
         KeReleaseSpinLock(&Transport->StateLock, oldIrql);
         return;
     }
+
+    /*
+     * Stop the peer clock first: a tick that fires while the socket is being
+     * finalized would submit into a pool whose transport is going away.
+     */
+    (VOID)IwanNtTimerCancel(&Transport->PeerTimer);
 
     /* Finalizing rejects new sends; the rundown wait closes all prior refs. */
     Transport->State = IwanNtTransportFinalizing;
@@ -853,6 +932,9 @@ IwanNtTransportStartPeer(
     Transport->PeerReady = TRUE;
     KeReleaseSpinLock(&Transport->SessionLock, oldIrql);
 
+    /* From here the handshake runs on its own clock, not on arrivals. */
+    IwanNtTimerArm(&Transport->PeerTimer, IWAN_NT_PEER_TICK_MS);
+
     return STATUS_SUCCESS;
 }
 
@@ -869,6 +951,13 @@ IwanNtTransportStopPeer(
     if (Transport == NULL) {
         return;
     }
+
+    /*
+     * Stop the clock before the state: a tick that runs after PeerReady is
+     * cleared would be harmless, but waiting for it here keeps the shutdown
+     * sequence single-threaded.
+     */
+    (VOID)IwanNtTimerCancel(&Transport->PeerTimer);
 
     KeAcquireSpinLock(&Transport->SessionLock, &oldIrql);
     Transport->PeerReady = FALSE;

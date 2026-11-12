@@ -398,6 +398,70 @@ IwanNtControlGetStats(
 }
 
 static NTSTATUS
+IwanNtControlStartPeer(
+    _In_ PIRP Irp,
+    _In_ PIO_STACK_LOCATION Stack
+    )
+{
+    const IWAN_NT_CREDENTIALS_ABI *request;
+    PIWAN_NT_TRANSPORT transport;
+    NTSTATUS status;
+    char user[IWAN_NT_CREDENTIALS_USER_MAX];
+    char password[IWAN_NT_CREDENTIALS_USER_MAX];
+
+    if (Stack->Parameters.DeviceIoControl.InputBufferLength <
+        IWAN_NT_CREDENTIALS_STRUCT_SIZE) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    request = (const IWAN_NT_CREDENTIALS_ABI *)Irp->AssociatedIrp.SystemBuffer;
+    if (request == NULL || request->Mtu == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    /*
+     * The ABI carries fixed-width, not necessarily terminated fields, so copy
+     * with an explicit terminator instead of trusting the caller.
+     */
+    RtlZeroMemory(user, sizeof(user));
+    RtlZeroMemory(password, sizeof(password));
+    RtlCopyMemory(user, request->User, sizeof(request->User) - 1);
+    RtlCopyMemory(password, request->Password, sizeof(request->Password) - 1);
+
+    status = IwanNtControlBegin(&transport);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    status = IwanNtTransportStartPeer(transport, user, password, request->Mtu);
+    if (NT_SUCCESS(status)) {
+        /* The peer drives the session now, so the manual one must not linger. */
+        IwanNtControlNotifySession(0);
+    }
+    IwanNtControlEnd();
+
+    RtlZeroMemory(password, sizeof(password));
+    return status;
+}
+
+static NTSTATUS
+IwanNtControlStopPeer(
+    VOID
+    )
+{
+    PIWAN_NT_TRANSPORT transport;
+    NTSTATUS status;
+
+    status = IwanNtControlBegin(&transport);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    IwanNtTransportStopPeer(transport);
+    IwanNtControlEnd();
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS
 IwanNtControlDispatchDeviceControl(
     _In_ PIRP Irp,
     _In_ PIO_STACK_LOCATION Stack
@@ -418,6 +482,12 @@ IwanNtControlDispatchDeviceControl(
         return IwanNtControlGetLocal(Irp, Stack);
     case IWAN_NT_IOCTL_GET_STATS:
         return IwanNtControlGetStats(Irp, Stack);
+    case IWAN_NT_IOCTL_START_PEER:
+        return IwanNtControlStartPeer(Irp, Stack);
+    case IWAN_NT_IOCTL_STOP_PEER:
+        (VOID)Irp;
+        (VOID)Stack;
+        return IwanNtControlStopPeer();
     default:
         return STATUS_INVALID_DEVICE_REQUEST;
     }

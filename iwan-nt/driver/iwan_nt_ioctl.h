@@ -68,13 +68,38 @@
 #define IWAN_NT_IOCTL_GET_LOCAL \
     IWAN_NT_CTL_CODE(0x806)
 #define IWAN_NT_IOCTL_GET_STATS IWAN_NT_CTL_CODE(0x805u)
+/*
+ * Start or stop the in-kernel handshake. Write returns no payload; stop needs
+ * no input either.
+ */
+#define IWAN_NT_IOCTL_START_PEER IWAN_NT_CTL_CODE(0x807u)
+#define IWAN_NT_IOCTL_STOP_PEER IWAN_NT_CTL_CODE(0x808u)
 
 #define IWAN_NT_SESSION_STRUCT_SIZE 24u
 #define IWAN_NT_ADDR_STRUCT_SIZE 24u
 #define IWAN_NT_STATS_STRUCT_SIZE 192u
+#define IWAN_NT_CREDENTIALS_STRUCT_SIZE 136u
+
+/* Field widths inside IWAN_NT_CREDENTIALS_ABI. */
+#define IWAN_NT_CREDENTIALS_USER_MAX 64u
+#define IWAN_NT_CREDENTIALS_PASSWORD_MAX 64u
 
 /* Largest control frame accepted in either direction. */
 #define IWAN_NT_CONTROL_MAX 512u
+
+/*
+ * Credentials for the in-kernel peer.
+ *
+ * The driver copies them and never hands the pointers back, so the caller may
+ * reuse the buffer as soon as the call returns.
+ */
+typedef struct _IWAN_NT_CREDENTIALS_ABI {
+    uint8_t User[64];
+    uint8_t Password[64];
+    uint16_t Mtu;
+    uint16_t Reserved0;
+    uint32_t Reserved1;
+} IWAN_NT_CREDENTIALS_ABI;
 
 typedef struct _IWAN_NT_SESSION_ABI {
     uint16_t Sid;        /* session id from OPEN_ACK */
@@ -164,6 +189,9 @@ _Static_assert(sizeof(IWAN_NT_ADDR_ABI) == IWAN_NT_ADDR_STRUCT_SIZE,
                "address ABI size changed");
 _Static_assert(sizeof(IWAN_NT_STATS_ABI) == IWAN_NT_STATS_STRUCT_SIZE,
                "STATS ABI size changed");
+
+_Static_assert(sizeof(IWAN_NT_CREDENTIALS_ABI) == IWAN_NT_CREDENTIALS_STRUCT_SIZE,
+               "credentials ABI size changed");
 
 #ifdef _MSC_VER
 #pragma warning(pop)

@@ -119,6 +119,7 @@
     <ClCompile Include="iwan_nt_ring.c" />
     <ClCompile Include="iwan_nt_transport.c" />
     <ClCompile Include="iwan_nt_tx.c" />
+    <ClCompile Include="iwan_nt_timer.c" />
     <ClCompile Include="iwan_nt_wsk.c" />
     <ClCompile Include="iwan_nt_wsk_socket.c" />
   </ItemGroup>
@@ -137,6 +138,7 @@
     <ClInclude Include="iwan_nt_ring.h" />
     <ClInclude Include="iwan_nt_transport.h" />
     <ClInclude Include="iwan_nt_tx.h" />
+    <ClInclude Include="iwan_nt_timer.h" />
     <ClInclude Include="iwan_nt_types.h" />
     <ClInclude Include="iwan_nt_wsk.h" />
     <ClInclude Include="iwan_nt_wsk_socket.h" />

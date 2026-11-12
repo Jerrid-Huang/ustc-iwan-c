@@ -1,3 +1,7 @@
+/* The real <ntddk.h> has its own include guard, so the stub needs one too:
+ * several headers include it directly. */
+#ifndef IWAN_NT_NTDDK_STUB_H
+#define IWAN_NT_NTDDK_STUB_H
 /*
  * Local syntax-check stub for the Windows kernel surface used by iWAN NT.
  *
@@ -340,3 +344,53 @@ VOID IoFreeMdl(PMDL);
 USHORT RtlUshortByteSwap(USHORT);
 
 #endif
+
+typedef struct _KTIMER { unsigned char Reserved[64]; } KTIMER, *PKTIMER;
+typedef struct _KDPC { unsigned char Reserved[64]; } KDPC, *PKDPC;
+#define KDEFERRED_ROUTINE
+#define CONTAINING_RECORD(address, type, field) \
+    ((type *)((char *)(address) - (size_t)(&((type *)0)->field)))
+
+static __inline void
+KeInitializeTimer(KTIMER *Timer)
+{
+    (void)Timer;
+}
+
+static __inline void
+KeInitializeDpc(KDPC *Dpc, void *DeferredRoutine, void *DeferredContext)
+{
+    (void)Dpc;
+    (void)DeferredRoutine;
+    (void)DeferredContext;
+}
+
+static __inline unsigned char
+KeSetCoalescableTimer(KTIMER *Timer, LARGE_INTEGER DueTime, unsigned long Period,
+                      unsigned long TolerableDelay, KDPC *Dpc)
+{
+    (void)Timer;
+    (void)DueTime;
+    (void)Period;
+    (void)TolerableDelay;
+    (void)Dpc;
+    return 1;
+}
+
+static __inline unsigned char
+KeCancelTimer(KTIMER *Timer)
+{
+    (void)Timer;
+    return 0;
+}
+
+static __inline void
+KeFlushQueuedDpcs(void)
+{
+}
+
+#define InterlockedExchange(p, v) (*(volatile long *)(p) = (long)(v))
+#define InterlockedIncrement64(p) (++(*(volatile long long *)(p)))
+#define InterlockedIncrement(p) (++(*(volatile long *)(p)))
+
+#endif /* IWAN_NT_NTDDK_STUB_H */

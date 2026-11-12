@@ -26,6 +26,12 @@ extern "C" {
 
 #define IWAN_NT_PEER_OPEN_MS 2000u
 #define IWAN_NT_PEER_ECHO_MS 2000u
+/*
+ * How often the driver looks at the peer state. The protocol works in seconds,
+ * so a 100 ms tick is only about promptness: it decides how late a keepalive can
+ * be, not whether the peer stays up.
+ */
+#define IWAN_NT_PEER_TICK_MS 100u
 
 /*
  * The deployed client gives up on a session that has been silent this long,

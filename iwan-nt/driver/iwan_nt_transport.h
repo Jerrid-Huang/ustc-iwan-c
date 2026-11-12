@@ -6,6 +6,7 @@
 #include "iwan_nt_wsk_socket.h"
 #include "iwan_nt_ingress.h"
 #include "iwan_nt_peer.h"
+#include "iwan_nt_timer.h"
 #include "iwan_nt_tx.h"
 #include "iwan_nt_ioctl.h"
 
@@ -69,6 +70,13 @@ typedef struct _IWAN_NT_TRANSPORT {
      */
     IWAN_NT_PEER Peer;
     BOOLEAN PeerReady;
+    IWAN_NT_TIMER PeerTimer;
+    /*
+     * Control frames the peer generates are built here. The buffer lives in the
+     * transport because the timer callback runs at DISPATCH_LEVEL and may not
+     * allocate.
+     */
+    uint8_t PeerScratch[IWAN_NT_SESSION_CONTROL_MAX];
     /* Control-plane counters; one writer each, see the getter below. */
     ULONG64 ControlSent;
     ULONG64 ControlSendFailed;
