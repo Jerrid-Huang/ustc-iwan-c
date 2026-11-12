@@ -344,6 +344,11 @@ IwanNtMiniportQueryCounters(
         &adapter->RxBatched, 0, 0);
 }
 
+static VOID
+IwanNtMiniportFlushInner(
+    _In_opt_ void *Context
+    );
+
 _Use_decl_annotations_
 static NDIS_STATUS
 IwanNtMiniportInitializeEx(
@@ -452,8 +457,9 @@ IwanNtMiniportInitializeEx(
             adapter->RxSlotCount = index + 1;
         }
     }
-    IwanNtTransportSetDataSink(&adapter->Transport, IwanNtMiniportIndicateInner, IwanNtMiniportFlushInner,
-                               adapter);
+    IwanNtTransportSetDataSink(
+        &adapter->Transport, IwanNtMiniportIndicateInner,
+        IwanNtMiniportFlushInner, adapter);
 
     /*
      * Control frames need somewhere to wait for the user-mode control plane,
