@@ -233,9 +233,10 @@ CommandStats(
            (unsigned long long)stats.TxAccepted,
            (unsigned long long)stats.TxRejected,
            (unsigned long)stats.TxInFlight);
-    printf("rx indicated=%llu dropped=%llu\n",
+    printf("rx indicated=%llu dropped=%llu batches=%llu\n",
            (unsigned long long)stats.RxIndicated,
-           (unsigned long long)stats.RxDropped);
+           (unsigned long long)stats.RxDropped,
+           (unsigned long long)stats.RxBatches);
     printf("drops: nosession=%llu malformed=%llu badinner=%llu "
            "ctlfull=%llu ctllarge=%llu ctlring=%llu nosink=%llu "
            "segrt=%llu unknown=%llu\n",

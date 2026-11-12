@@ -26,7 +26,8 @@ typedef struct _IWAN_NT_CONTROL_COUNTER_SOURCE {
         _Out_ uint64_t *TxAccepted,
         _Out_ uint64_t *TxRejected,
         _Out_ uint64_t *RxIndicated,
-        _Out_ uint64_t *RxDropped
+        _Out_ uint64_t *RxDropped,
+        _Out_ uint64_t *RxBatches
         );
     /*
      * Optional. Called after a session is installed (Valid != 0) or dropped

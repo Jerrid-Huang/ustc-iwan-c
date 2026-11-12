@@ -70,6 +70,16 @@ typedef void (*IWAN_NT_WSK_DATAGRAM_RECEIVE_SINK)(
     _In_ size_t Length
     );
 
+/*
+ * Called once after the last indication of one receive callback, still under the
+ * socket's receive lock. A consumer that accumulates chunks (the miniport does,
+ * so it can indicate a chain instead of one NBL at a time) uses this as the batch
+ * boundary; a consumer that handles each chunk immediately passes NULL.
+ */
+typedef void (*IWAN_NT_WSK_DATAGRAM_RECEIVE_FLUSH)(
+    _In_opt_ void *Context
+    );
+
 typedef struct _IWAN_NT_WSK_DATAGRAM {
     KSPIN_LOCK StateLock;
     /* Serializes datagrams so the in-place transform stays single-threaded. */
@@ -107,6 +117,7 @@ typedef struct _IWAN_NT_WSK_DATAGRAM {
     uint8_t *Scratch;
     size_t ScratchCapacity;
     IWAN_NT_WSK_DATAGRAM_RECEIVE_SINK ReceiveSink;
+    IWAN_NT_WSK_DATAGRAM_RECEIVE_FLUSH ReceiveFlush;
     void *ReceiveSinkContext;
     ULONG OversizeDrops;
     ULONG SinkErrors;
@@ -170,6 +181,7 @@ IwanNtWskDatagramAttachReceive(
     _In_reads_bytes_opt_(ScratchCapacity) uint8_t *Scratch,
     _In_ size_t ScratchCapacity,
     _In_opt_ IWAN_NT_WSK_DATAGRAM_RECEIVE_SINK Sink,
+    _In_opt_ IWAN_NT_WSK_DATAGRAM_RECEIVE_FLUSH Flush,
     _In_opt_ void *Context
     );
 

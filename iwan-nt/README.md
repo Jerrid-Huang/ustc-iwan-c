@@ -168,6 +168,26 @@ send pool, recycles the socket, and keeps the session. IPv4 and IPv6 are equally
 supported; the parser in `user/iwan_nt_inet.c` accepts both literal forms and has
 host tests.
 
+## Batched sends and batched indications
+
+Both directions batch, for the same reason: a WSK callback and an NDIS call each
+have a fixed cost that does not grow with the number of packets carried.
+
+Sends stage up to eight inner packets that arrived in one `SendNetBufferLists`
+call and submit them with one `WskSendMessages`; a family change flushes first,
+and a short batch is backpressure, not a queue.
+
+Receives work the other way around: one WSK receive callback can carry a whole
+chain of datagrams, and the miniport assembles the NBLs it builds into one chain
+that it indicates with a single `NdisMIndicateReceiveNetBufferLists`. Every NBL
+still owns its pool slot, so `ReturnNetBufferLists` frees a chain exactly the way
+it frees a single frame. A family change ends a batch, because
+`NDIS_RECEIVE_FLAGS_SINGLE_ETHER_TYPE` describes one value for the whole chain.
+
+`iwannt-ctl stats` reports `rx indicated`, `dropped` and `batches`; `batches`
+counts the indications that carried more than one NBL, which is the only way to
+tell from user mode whether batching is actually happening.
+
 ## Batched sends
 
 The send pool hands several datagrams to the provider under one IRP

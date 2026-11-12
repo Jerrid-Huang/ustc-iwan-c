@@ -62,6 +62,12 @@ typedef struct _IWAN_NT_TRANSPORT {
     uint8_t *Scratch;
     size_t ScratchCapacity;
     BOOLEAN IngressAttached;
+    /*
+     * The consumer's batch boundary. The socket calls it once per receive
+     * callback; the transport forwards it to whoever installed the data sink.
+     */
+    IWAN_NT_WSK_DATAGRAM_RECEIVE_FLUSH DataFlush;
+    void *DataFlushContext;
     IWAN_NT_TX Tx;
     /*
      * The peer owns the handshake. It lives in the driver for the same reason
@@ -134,6 +140,7 @@ VOID
 IwanNtTransportSetDataSink(
     _Inout_ PIWAN_NT_TRANSPORT Transport,
     _In_opt_ IWAN_NT_INGRESS_DATA_SINK Sink,
+    _In_opt_ IWAN_NT_WSK_DATAGRAM_RECEIVE_FLUSH Flush,
     _In_opt_ void *Context
     );
 

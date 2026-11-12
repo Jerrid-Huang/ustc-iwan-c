@@ -84,6 +84,16 @@ typedef struct _IWAN_NT_MINIPORT_ADAPTER {
     volatile LONG TxRejected;
     volatile LONG RxIndicated;
     volatile LONG RxDropped;
+    volatile LONG RxBatched;
+    /*
+     * Chain assembled during one WSK receive callback. The callback holds the
+     * socket's receive lock for the whole batch, so a single set of head/tail
+     * pointers is enough.
+     */
+    PNET_BUFFER_LIST RxChainHead;
+    PNET_BUFFER_LIST RxChainTail;
+    ULONG RxChainCount;
+    unsigned RxChainFamily;
     /*
      * Bounded storage for the control ring that carries inbound OPEN_ACK,
      * ECHO and CLOSE frames to the user-mode control plane. Fixed size, so a
@@ -307,7 +317,8 @@ IwanNtMiniportQueryCounters(
     _Out_ uint64_t *TxAccepted,
     _Out_ uint64_t *TxRejected,
     _Out_ uint64_t *RxIndicated,
-    _Out_ uint64_t *RxDropped
+    _Out_ uint64_t *RxDropped,
+    _Out_ uint64_t *RxBatches
     )
 {
     PIWAN_NT_MINIPORT_ADAPTER adapter = (PIWAN_NT_MINIPORT_ADAPTER)Context;
@@ -317,6 +328,7 @@ IwanNtMiniportQueryCounters(
         *TxRejected = 0;
         *RxIndicated = 0;
         *RxDropped = 0;
+        *RxBatches = 0;
         return;
     }
 
@@ -328,6 +340,8 @@ IwanNtMiniportQueryCounters(
         &adapter->RxIndicated, 0, 0);
     *RxDropped = (uint64_t)InterlockedCompareExchange(
         &adapter->RxDropped, 0, 0);
+    *RxBatches = (uint64_t)InterlockedCompareExchange(
+        &adapter->RxBatched, 0, 0);
 }
 
 _Use_decl_annotations_
@@ -438,7 +452,7 @@ IwanNtMiniportInitializeEx(
             adapter->RxSlotCount = index + 1;
         }
     }
-    IwanNtTransportSetDataSink(&adapter->Transport, IwanNtMiniportIndicateInner,
+    IwanNtTransportSetDataSink(&adapter->Transport, IwanNtMiniportIndicateInner, IwanNtMiniportFlushInner,
                                adapter);
 
     /*
@@ -668,9 +682,52 @@ IwanNtMiniportRestart(
 }
 
 /*
+ * Hand everything staged during this callback to NDIS in one call.
+ *
+ * IRQL: DISPATCH_LEVEL. The chain is built by IwanNtMiniportIndicateInner and
+ * lives until NDIS returns the NBLs through IwanNtMiniportReturnNetBufferLists;
+ * each NBL carries its own pool slot in its context, so the return path does not
+ * need to know about batching at all.
+ */
+static VOID
+IwanNtMiniportFlushInner(
+    _In_opt_ void *Context
+    )
+{
+    PIWAN_NT_MINIPORT_ADAPTER adapter = Context;
+    PNET_BUFFER_LIST chain;
+    ULONG count;
+
+    if (adapter == NULL || adapter->RxChainHead == NULL) {
+        return;
+    }
+
+    chain = adapter->RxChainHead;
+    count = adapter->RxChainCount;
+    adapter->RxChainHead = NULL;
+    adapter->RxChainTail = NULL;
+    adapter->RxChainCount = 0;
+
+    if (count > 1) {
+        InterlockedIncrement(&adapter->RxBatched);
+    }
+
+    /*
+     * Every NBL in a batch carries the same family, because a family change
+     * flushes first: NDIS_RECEIVE_FLAGS_SINGLE_ETHER_TYPE applies to the whole
+     * chain, and a chain that mixed 0x0800 with 0xDD86 would be described
+     * wrongly.
+     */
+    NdisMIndicateReceiveNetBufferLists(adapter->AdapterHandle, chain,
+                                       NDIS_DEFAULT_PORT_NUMBER, count,
+                                       NDIS_RECEIVE_FLAGS_SINGLE_ETHER_TYPE);
+}
+
+/*
  * Runs at DISPATCH_LEVEL inside the WSK receive callback. It claims one slot of
- * the receive pool, copies the inner packet into it and hands ownership to NDIS;
- * nothing here allocates, blocks or keeps the WSK buffer alive past the call.
+ * the receive pool, copies the inner packet into it and appends the NBL to the
+ * chain that the flush call will hand to NDIS in one go; nothing here allocates,
+ * blocks or keeps the WSK buffer alive past the call.
  */
 static VOID
 IwanNtMiniportIndicateInner(
@@ -728,11 +785,26 @@ IwanNtMiniportIndicateInner(
     NET_BUFFER_LIST_INFO(slot->Nbl, NetBufferListFrameType) =
         (Family == 6) ? (PVOID)(ULONG_PTR)0xDD86 : (PVOID)(ULONG_PTR)0x0008;
     NET_BUFFER_LIST_STATUS(slot->Nbl) = NDIS_STATUS_SUCCESS;
+    NET_BUFFER_LIST_NEXT_NBL(slot->Nbl) = NULL;
+
+    /*
+     * A family change ends the batch: the SINGLE_ETHER_TYPE flag describes one
+     * value for the whole chain.
+     */
+    if (adapter->RxChainHead != NULL && adapter->RxChainFamily != Family) {
+        IwanNtMiniportFlushInner(adapter);
+    }
+
     InterlockedIncrement(&adapter->RxInFlight);
     InterlockedIncrement(&adapter->RxIndicated);
-    NdisMIndicateReceiveNetBufferLists(adapter->AdapterHandle, slot->Nbl,
-                                       NDIS_DEFAULT_PORT_NUMBER, 1,
-                                       NDIS_RECEIVE_FLAGS_SINGLE_ETHER_TYPE);
+    if (adapter->RxChainHead == NULL) {
+        adapter->RxChainHead = slot->Nbl;
+        adapter->RxChainFamily = Family;
+    } else {
+        NET_BUFFER_LIST_NEXT_NBL(adapter->RxChainTail) = slot->Nbl;
+    }
+    adapter->RxChainTail = slot->Nbl;
+    adapter->RxChainCount++;
 }
 
 /*

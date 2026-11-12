@@ -77,7 +77,7 @@
 
 #define IWAN_NT_SESSION_STRUCT_SIZE 24u
 #define IWAN_NT_ADDR_STRUCT_SIZE 24u
-#define IWAN_NT_STATS_STRUCT_SIZE 272u
+#define IWAN_NT_STATS_STRUCT_SIZE 280u
 #define IWAN_NT_CREDENTIALS_STRUCT_SIZE 136u
 
 /* Field widths inside IWAN_NT_CREDENTIALS_ABI. */
@@ -153,6 +153,7 @@ typedef struct _IWAN_NT_STATS_ABI {
     uint64_t TxRejected;           /* inner packets the miniport refused */
     uint64_t RxIndicated;          /* NBLs indicated up */
     uint64_t RxDropped;            /* indications that could not be built */
+    uint64_t RxBatches;            /* indications that carried more than one NBL */
     uint32_t TxInFlight;           /* send slots currently owned by WSK */
     uint32_t Reserved0;            /* must be zero */
     uint32_t SessionValid;         /* nonzero: a session is installed */

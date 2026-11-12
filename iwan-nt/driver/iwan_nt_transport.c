@@ -23,6 +23,22 @@ IwanNtTransportPeerTimerCallback(
     );
 
 /*
+ * IRQL: DISPATCH_LEVEL, at the end of one receive callback. Whatever the data
+ * sink staged is now one batch.
+ */
+static VOID
+IwanNtTransportReceiveFlush(
+    _In_opt_ void *Context
+    )
+{
+    PIWAN_NT_TRANSPORT transport = (PIWAN_NT_TRANSPORT)Context;
+
+    if (transport != NULL && transport->DataFlush != NULL) {
+        transport->DataFlush(transport->DataFlushContext);
+    }
+}
+
+/*
  * Adapter from the WSK datagram callback to the receive pipeline.
  *
  * IRQL: <= DISPATCH_LEVEL, inside the datagram receive lock. The pipeline
@@ -334,6 +350,7 @@ IwanNtTransportStart(
         Transport->Scratch,
         Transport->ScratchCapacity,
         IwanNtTransportReceiveChunk,
+        IwanNtTransportReceiveFlush,
         Transport);
     Transport->IngressAttached = TRUE;
 
@@ -342,7 +359,7 @@ IwanNtTransportStart(
         Transport->SocketFamily);
     if (!NT_SUCCESS(status)) {
         IwanNtWskDatagramAttachReceive(
-            &Transport->Datagram, NULL, 0, NULL, NULL);
+            &Transport->Datagram, NULL, 0, NULL, NULL, NULL);
         Transport->IngressAttached = FALSE;
         IwanNtWskReleaseProvider(&Transport->Wsk);
         KeAcquireSpinLock(&Transport->StateLock, &oldIrql);
@@ -405,7 +422,7 @@ IwanNtTransportStop(
     /* Stop has drained the callbacks, so the sink can be detached safely. */
     if (Transport->IngressAttached) {
         IwanNtWskDatagramAttachReceive(
-            &Transport->Datagram, NULL, 0, NULL, NULL);
+            &Transport->Datagram, NULL, 0, NULL, NULL, NULL);
         Transport->IngressAttached = FALSE;
     }
 
@@ -476,7 +493,7 @@ IwanNtTransportFinalize(
 
     if (Transport->IngressAttached) {
         IwanNtWskDatagramAttachReceive(
-            &Transport->Datagram, NULL, 0, NULL, NULL);
+            &Transport->Datagram, NULL, 0, NULL, NULL, NULL);
         Transport->IngressAttached = FALSE;
     }
 
@@ -773,6 +790,7 @@ VOID
 IwanNtTransportSetDataSink(
     _Inout_ PIWAN_NT_TRANSPORT Transport,
     _In_opt_ IWAN_NT_INGRESS_DATA_SINK Sink,
+    _In_opt_ IWAN_NT_WSK_DATAGRAM_RECEIVE_FLUSH Flush,
     _In_opt_ void *Context
     )
 {
@@ -782,6 +800,8 @@ IwanNtTransportSetDataSink(
         return;
     }
 
+    Transport->DataFlush = Flush;
+    Transport->DataFlushContext = Context;
     IwanNtIngressAttach(
         &Transport->Ingress, Transport->Ingress.ControlRing, Sink, Context);
 }

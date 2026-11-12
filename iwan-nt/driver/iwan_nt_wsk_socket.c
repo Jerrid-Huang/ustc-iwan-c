@@ -668,6 +668,7 @@ IwanNtWskDatagramAttachReceive(
     _In_reads_bytes_opt_(ScratchCapacity) uint8_t *Scratch,
     _In_ size_t ScratchCapacity,
     _In_opt_ IWAN_NT_WSK_DATAGRAM_RECEIVE_SINK Sink,
+    _In_opt_ IWAN_NT_WSK_DATAGRAM_RECEIVE_FLUSH Flush,
     _In_opt_ void *Context
     )
 {
@@ -688,11 +689,13 @@ IwanNtWskDatagramAttachReceive(
         Datagram->Scratch = NULL;
         Datagram->ScratchCapacity = 0;
         Datagram->ReceiveSink = NULL;
+        Datagram->ReceiveFlush = NULL;
         Datagram->ReceiveSinkContext = NULL;
     } else {
         Datagram->Scratch = Scratch;
         Datagram->ScratchCapacity = ScratchCapacity;
         Datagram->ReceiveSink = Sink;
+        Datagram->ReceiveFlush = Flush;
         Datagram->ReceiveSinkContext = Context;
     }
     KeReleaseSpinLock(&Datagram->ReceiveLock, oldIrql);
@@ -786,6 +789,14 @@ IwanNtWskDatagramReceiveFromEvent(
         datagram->ReceiveSink(datagram->ReceiveSinkContext,
                               datagram->Scratch,
                               copied);
+    }
+
+    /*
+     * One flush per callback, still inside the lock: whatever the sink staged is
+     * now one batch, and no other callback can interleave with it.
+     */
+    if (datagram->ReceiveFlush != NULL) {
+        datagram->ReceiveFlush(datagram->ReceiveSinkContext);
     }
     KeReleaseSpinLock(&datagram->ReceiveLock, oldIrql);
 

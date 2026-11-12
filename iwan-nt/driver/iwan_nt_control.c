@@ -354,6 +354,7 @@ IwanNtControlGetStats(
     uint64_t txRejected = 0;
     uint64_t rxIndicated = 0;
     uint64_t rxDropped = 0;
+    uint64_t rxBatches = 0;
     NTSTATUS status;
 
     if (Stack->Parameters.DeviceIoControl.OutputBufferLength <
@@ -384,11 +385,12 @@ IwanNtControlGetStats(
     if (source.Query != NULL) {
         source.Query(
             source.Context, &txAccepted, &txRejected, &rxIndicated,
-            &rxDropped);
+            &rxDropped, &rxBatches);
         stats->TxAccepted = txAccepted;
         stats->TxRejected = txRejected;
         stats->RxIndicated = rxIndicated;
         stats->RxDropped = rxDropped;
+        stats->RxBatches = rxBatches;
     }
 
     IwanNtControlEnd();
