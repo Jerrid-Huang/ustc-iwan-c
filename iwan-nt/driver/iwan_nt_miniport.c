@@ -841,9 +841,11 @@ IwanNtMiniportIndicateInner(
          */
         NET_BUFFER_FIRST_MDL(nb) = view->Mdl;
         NET_BUFFER_CURRENT_MDL(nb) = view->Mdl;
+        /* Both offsets are ULONG in the net buffer, so narrow once, on purpose. */
         NET_BUFFER_CURRENT_MDL_OFFSET(nb) =
-            view->Offset + IWAN_NT_FRAME_HDR_LEN;
-        NET_BUFFER_DATA_OFFSET(nb) = view->Offset + IWAN_NT_FRAME_HDR_LEN;
+            (ULONG)(view->Offset + IWAN_NT_FRAME_HDR_LEN);
+        NET_BUFFER_DATA_OFFSET(nb) =
+            (ULONG)(view->Offset + IWAN_NT_FRAME_HDR_LEN);
         NET_BUFFER_DATA_LENGTH(nb) = (ULONG)Length;
         slot->Reference = view->Reference;
         view->Taken = TRUE;
