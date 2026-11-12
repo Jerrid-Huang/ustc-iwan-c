@@ -714,6 +714,35 @@ IwanNtMiniportFlushInner(
     adapter->RxChainTail = NULL;
     adapter->RxChainCount = 0;
 
+    if (InterlockedCompareExchange(&adapter->State, IwanNtMiniportPaused,
+                                   IwanNtMiniportPaused) !=
+        IwanNtMiniportRunning) {
+        /*
+         * Halt or Pause won the race: handing an NBL up now would give the stack
+         * a frame whose adapter context is being torn down. Recycle the slots
+         * ourselves instead, exactly as the return path would.
+         */
+        PNET_BUFFER_LIST current;
+
+        for (current = chain; current != NULL;
+             current = NET_BUFFER_LIST_NEXT_NBL(current)) {
+            PVOID *context = (PVOID *)NET_BUFFER_LIST_CONTEXT_DATA_START(current);
+            IWAN_NT_MINIPORT_RX_SLOT *slot =
+                (context != NULL) ? *context : NULL;
+
+            NET_BUFFER_LIST_NEXT_NBL(current) = NULL;
+            if (slot == NULL) {
+                continue;
+            }
+            InterlockedExchange(&slot->InUse, 0);
+            if (InterlockedDecrement(&adapter->RxInFlight) == 0) {
+                KeSetEvent(&adapter->RxIdle, IO_NO_INCREMENT, FALSE);
+            }
+        }
+        InterlockedAdd(&adapter->RxDropped, (LONG)count);
+        return;
+    }
+
     if (count > 1) {
         InterlockedIncrement(&adapter->RxBatched);
     }

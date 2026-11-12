@@ -389,6 +389,7 @@ KeFlushQueuedDpcs(void)
 {
 }
 
+#define InterlockedAdd(p, v) (*(volatile long *)(p) += (long)(v))
 #define InterlockedExchange(p, v) (*(volatile long *)(p) = (long)(v))
 #define InterlockedIncrement64(p) (++(*(volatile long long *)(p)))
 #define InterlockedIncrement(p) (++(*(volatile long *)(p)))
