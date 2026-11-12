@@ -49,11 +49,18 @@ answer went somewhere else" — the second one is invisible from the counters.
 
 ## Session keepalive and timeout
 
-`iwannt-ctl connect` keeps the session alive with an ECHO request every two
-seconds and gives up after fifteen seconds of silence, counted from the last
-frame it accepted. The state machine does that, not the shell loop, so the same
-timeout applies to a service. On expiry the session is dropped, the adapter's
-link goes down, and OPEN retries resume.
+The handshake runs in the driver, not in the tool. `iwannt-ctl connect` hands over
+the credentials over `START_PEER` and then only reads counters; a timer in the
+kernel retransmits OPEN every two seconds until the server answers, sends an ECHO
+every two seconds afterwards, and gives up after fifteen seconds of silence. On
+expiry it drops the session, the adapter's link goes down, and OPEN retries
+resume.
+
+That split is deliberate: a keepalive whose lifetime depends on a console window
+is not a keepalive. `iwannt-ctl connect` still stops the handshake when it exits,
+because leaving one running would keep a tunnel alive behind a command that has
+already returned, and the next `connect` would be refused. Use `connect ... 0` to
+keep it up until interrupted, or `disconnect` to stop it from another shell.
 
 ## Link state
 

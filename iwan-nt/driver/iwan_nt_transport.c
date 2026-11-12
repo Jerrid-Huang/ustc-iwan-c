@@ -656,6 +656,23 @@ IwanNtTransportGetStats(
     KeAcquireSpinLock(&Transport->SessionLock, &oldIrql);
     Stats->SessionValid =
         (uint32_t)(Transport->Ingress.SessionValid != 0 ? 1u : 0u);
+    /*
+     * The peer counters move on the same lock: the timer callback and the
+     * receive path both update them.
+     */
+    Stats->PeerOpens = Transport->Peer.Opens;
+    Stats->PeerEchoes = Transport->Peer.Echoes;
+    Stats->PeerEchoAnswers = Transport->Peer.EchoAnswers;
+    Stats->PeerRejects = Transport->Peer.Rejects;
+    Stats->PeerCloses = Transport->Peer.Closes;
+    Stats->PeerForeign = Transport->Peer.ForeignFrames;
+    Stats->PeerTimeouts = Transport->Peer.Timeouts;
+    Stats->PeerState = (uint32_t)(Transport->Peer.State == IwanNtPeerUp ? 1u : 0u);
+    Stats->PeerReady = (uint32_t)(Transport->PeerReady != 0 ? 1u : 0u);
+    Stats->PeerDelayCurrent = Transport->Peer.DelayCurrent;
+    Stats->PeerDelayMinimum = Transport->Peer.DelayMinimum;
+    Stats->PeerDelayMaximum = Transport->Peer.DelayMaximum;
+    Stats->Reserved1 = 0;
     KeReleaseSpinLock(&Transport->SessionLock, oldIrql);
 
     Stats->TxInFlight = (uint32_t)IwanNtTxInFlight(&Transport->Tx);

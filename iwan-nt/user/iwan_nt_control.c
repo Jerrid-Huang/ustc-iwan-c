@@ -103,6 +103,52 @@ IwanNtClearSession(
 }
 
 BOOL
+IwanNtStartPeer(
+    _In_ PIWAN_NT_DEVICE Device,
+    _In_z_ const char *User,
+    _In_z_ const char *Password,
+    _In_ UINT16 Mtu
+    )
+{
+    IWAN_NT_CREDENTIALS_ABI request;
+    size_t userLength;
+    size_t passwordLength;
+
+    if (User == NULL || Password == NULL || Mtu == 0) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    userLength = strlen(User);
+    passwordLength = strlen(Password);
+    if (userLength >= IWAN_NT_CREDENTIALS_USER_MAX ||
+        passwordLength >= IWAN_NT_CREDENTIALS_PASSWORD_MAX) {
+        /* The ABI carries fixed-width fields, so an oversized name would be
+         * silently truncated into a different account. */
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    ZeroMemory(&request, sizeof(request));
+    CopyMemory(request.User, User, userLength);
+    CopyMemory(request.Password, Password, passwordLength);
+    request.Mtu = Mtu;
+
+    return IwanNtIoctl(
+        Device, IWAN_NT_IOCTL_START_PEER, &request, (DWORD)sizeof(request),
+        NULL, 0, NULL);
+}
+
+BOOL
+IwanNtStopPeer(
+    _In_ PIWAN_NT_DEVICE Device
+    )
+{
+    return IwanNtIoctl(
+        Device, IWAN_NT_IOCTL_STOP_PEER, NULL, 0, NULL, 0, NULL);
+}
+
+BOOL
 IwanNtSetPeer(
     _In_ PIWAN_NT_DEVICE Device,
     _In_reads_bytes_(16) const UINT8 *Address,

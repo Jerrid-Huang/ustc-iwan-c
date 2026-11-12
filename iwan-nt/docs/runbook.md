@@ -27,23 +27,28 @@ Check: `iwannt-ctl check` now prints `transport running`.
 
     iwannt-ctl connect <server-ip> <server-port> <user> <password> [mtu] [seconds]
 
-This sends OPEN every two seconds until the server answers, installs the sid,
-token and key the driver needs, then keeps ECHO alive and prints the delay the
-server measured. The line
+The tool sets the peer endpoint and hands the credentials to the driver, then
+watches the counters. The driver does the work: OPEN every two seconds until the
+server answers, then an ECHO every two seconds, and a fifteen-second silence
+timeout that drops the session and starts over.
 
-    CONNECT ack sid=... token=... mtu=1400 encrypted=1 tun=... gw=...
+    CONNECT handshake handed to the driver (mtu=1400, peer=...)
+    CONNECT open #1 sent
+    CONNECT up (the driver holds the session; the adapter needs an address)
+    CONNECT keepalive #1  rtt=12.480 ms (min 12.480, max 12.480)
 
-is the point where the tunnel exists. A `rejected` or `closed` line is not fatal:
-the tool drops the session and retries, which is what a restarting server looks
-like.
+`CONNECT up` is the point where the tunnel exists. A `rejected` or `closed` line
+is not fatal: the driver drops the session and retries, which is what a
+restarting server looks like.
 
-Check: `iwannt-ctl check` prints `session installed`.
+Check: `iwannt-ctl check` prints `session installed`, and `iwannt-ctl stats` has a
+`peer:` line with the counters that explain a session that will not come up --
+`opens` climbing with nothing else means the server is not answering; `foreign`
+climbing means frames are arriving that do not pass the signature check.
 
-The keepalive lives in this process on purpose: the kernel path only transports,
-and the session's timeout is the peer's clock. When the tool exits it clears the
-session first, so the adapter stops reporting a link it can no longer feed; the
-peer drops its side within fifteen seconds of silence. Pass `0` for the seconds to keep it up until
-interrupted, and run it as a service for a tunnel that should outlive a shell.
+The command stops the handshake when it exits, so the tunnel does not outlive it
+silently. Pass `0` for the seconds to follow it until interrupted, and use
+`iwannt-ctl disconnect` from another shell to stop one you started that way.
 
 ## 4. Give the adapter the address the server assigned
 

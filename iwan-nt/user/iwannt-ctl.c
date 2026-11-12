@@ -15,6 +15,7 @@
  *   iwannt-ctl watch <seconds>
  *   iwannt-ctl open <user> <password> <mtu> [send]
  *   iwannt-ctl connect <ip> <port> <user> <password> [mtu] [seconds]
+ *   iwannt-ctl disconnect
  *
  * The open subcommand works without the driver loaded: it only builds the frame,
  * which is the fastest way to compare our framing against a captured one.
@@ -44,7 +45,8 @@ Usage(VOID)
             "  iwannt-ctl read [count]\n"
             "  iwannt-ctl watch <seconds>\n"
             "  iwannt-ctl open <user> <password> <mtu> [send]\n"
-            "  iwannt-ctl connect <ip> <port> <user> <password> [mtu] [seconds]\n");
+            "  iwannt-ctl connect <ip> <port> <user> <password> [mtu] [seconds]\n"
+            "  iwannt-ctl disconnect\n");
 }
 
 static BOOL
@@ -153,7 +155,14 @@ CommandCheck(
     if (stats.SessionValid != 0) {
         printf("session     installed\n");
     } else {
-        printf("session     none: run \"iwannt-ctl connect <ip> <port> <user> <password>\"\n");
+        if (stats.PeerReady != 0u) {
+            printf("session     none: the driver is still handshaking "
+                   "(opens=%llu)\n",
+                   (unsigned long long)stats.PeerOpens);
+        } else {
+            printf("session     none: run \"iwannt-ctl connect <ip> <port> "
+                   "<user> <password>\"\n");
+        }
         problems++;
     }
 
@@ -244,6 +253,21 @@ CommandStats(
            (unsigned long long)stats.RxSinkErrors);
     printf("state: running=%lu session=%lu\n",
            (unsigned long)stats.Running, (unsigned long)stats.SessionValid);
+    printf("peer: ready=%lu state=%s opens=%llu echoes=%llu answered=%llu "
+           "rejected=%llu closed=%llu foreign=%llu timeouts=%llu\n",
+           (unsigned long)stats.PeerReady,
+           stats.PeerState != 0u ? "up" : "down",
+           (unsigned long long)stats.PeerOpens,
+           (unsigned long long)stats.PeerEchoes,
+           (unsigned long long)stats.PeerEchoAnswers,
+           (unsigned long long)stats.PeerRejects,
+           (unsigned long long)stats.PeerCloses,
+           (unsigned long long)stats.PeerForeign,
+           (unsigned long long)stats.PeerTimeouts);
+    printf("peer: rtt cur=%u.%03u min=%u.%03u max=%u.%03u ms\n",
+           stats.PeerDelayCurrent / 1000u, stats.PeerDelayCurrent % 1000u,
+           stats.PeerDelayMinimum / 1000u, stats.PeerDelayMinimum % 1000u,
+           stats.PeerDelayMaximum / 1000u, stats.PeerDelayMaximum % 1000u);
 
     return 0;
 }
@@ -559,6 +583,14 @@ main(
         result = CommandWatch(&device, argc, argv);
     } else if (strcmp(argv[1], "connect") == 0) {
         result = IwanNtRunConnect(&device, argc, argv);
+    } else if (strcmp(argv[1], "disconnect") == 0) {
+        if (IwanNtStopPeer(&device) == FALSE) {
+            fprintf(stderr, "disconnect failed: %lu\n", GetLastError());
+            result = 1;
+        } else {
+            printf("handshake stopped\n");
+            result = 0;
+        }
     } else {
         Usage();
         result = 2;

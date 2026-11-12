@@ -61,6 +61,24 @@ IwanNtClearSession(
     );
 
 /*
+ * Hand the handshake to the driver. From here the tunnel stays up as long as the
+ * driver runs, whatever this process does; stop it with IwanNtStopPeer.
+ */
+BOOL
+IwanNtStartPeer(
+    _In_ PIWAN_NT_DEVICE Device,
+    _In_z_ const char *User,
+    _In_z_ const char *Password,
+    _In_ UINT16 Mtu
+    );
+
+/* Stop the in-kernel handshake and drop the session it installed. */
+BOOL
+IwanNtStopPeer(
+    _In_ PIWAN_NT_DEVICE Device
+    );
+
+/*
  * Peer endpoint, in either family. Address is the network-order address for
  * Family (the first four bytes for AF_INET, all sixteen for AF_INET6) and Port
  * is in network order. A family change on a running transport makes the driver

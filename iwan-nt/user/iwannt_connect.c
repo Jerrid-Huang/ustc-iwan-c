@@ -1,3 +1,16 @@
+/* SPDX-License-Identifier: MIT
+ *
+ * connect: ask the driver to run the handshake, then follow it.
+ *
+ * The handshake used to live here, in user mode: this process built OPEN frames,
+ * read ACKs from the control ring and installed the session. It works, but it
+ * ties the tunnel's liveness to a console window, and a keepalive is exactly the
+ * thing that must keep running when no one is looking.
+ *
+ * The driver owns it now. This command hands over the credentials and watches the
+ * counters; it never builds a frame.
+ */
+
 #include "iwannt_connect.h"
 
 #include <stdio.h>
@@ -5,83 +18,113 @@
 #include <string.h>
 #include <windows.h>
 
-#include "iwan_nt_peer.h"
 #include "iwan_nt_inet.h"
-#include "iwan_nt_session.h"
+
+/*
+ * How often the counters are sampled. The handshake retransmits every two
+ * seconds, so a faster poll only makes the console noisier.
+ */
+#define IWAN_NT_CONNECT_POLL_MS 200u
 
 static void
 PrintAddress(
-    _In_ const UCHAR Address[4]
+    _In_ const uint8_t *Address,
+    _In_ uint16_t Family
     )
 {
-    printf("%u.%u.%u.%u", Address[0], Address[1], Address[2], Address[3]);
+    char text[48];
+
+    if (IwanNtFormatAddress(Address, Family, text, sizeof(text)) == NULL) {
+        printf("?");
+        return;
+    }
+    printf("%s", text);
+}
+
+static int
+WaitForTransport(
+    _In_ PIWAN_NT_DEVICE Device
+    )
+{
+    IWAN_NT_STATS_ABI stats;
+    DWORD started;
+
+    started = GetTickCount();
+    for (;;) {
+        if (IwanNtGetStats(Device, &stats) == FALSE) {
+            fprintf(stderr, "GET_STATS failed: %lu\n", GetLastError());
+            return 1;
+        }
+        if (stats.Running != 0u) {
+            return 0;
+        }
+        if (GetTickCount() - started > 5000u) {
+            fprintf(stderr,
+                    "the adapter is not up, so the transport is not running\n"
+                    "  netsh interface set interface \"iWAN NT Transport "
+                    "Adapter\" admin=enable\n");
+            return 1;
+        }
+        Sleep(50);
+    }
 }
 
 /*
- * Apply a state change to the driver. The state machine decides what the session
- * is; this only mirrors that decision into the device, so the two cannot disagree
- * about whether a key is installed.
+ * Report a transition once, then stay quiet. The counters are cumulative from
+ * driver load, so the interesting event is a change, not a value.
  */
-static int
-ApplyState(
-    _In_ PIWAN_NT_DEVICE Device,
-    _In_ const IWAN_NT_PEER *Handshake
+typedef struct _IWAN_NT_CONNECT_SEEN {
+    uint32_t Up;
+    uint64_t Opens;
+    uint64_t Echoes;
+    uint64_t Rejects;
+    uint64_t Closes;
+    uint64_t Timeouts;
+} IWAN_NT_CONNECT_SEEN;
+
+static void
+Report(
+    _In_ const IWAN_NT_STATS_ABI *Stats,
+    _Inout_ IWAN_NT_CONNECT_SEEN *Seen
     )
 {
-    if (Handshake->State == IwanNtPeerUp) {
-        IWAN_NT_STATS_ABI stats;
-
-        if (IwanNtSetSession(Device, Handshake->Sid, Handshake->Token,
-                             Handshake->Encrypted ? TRUE : FALSE,
-                             Handshake->Key) == FALSE) {
-            fprintf(stderr, "SET_SESSION failed: %lu\n", GetLastError());
-            return 1;
-        }
-        /*
-         * Read it back. A session the driver did not actually install looks
-         * exactly like a working one from here: sends succeed, and nothing ever
-         * arrives.
-         */
-        if (IwanNtGetStats(Device, &stats) != FALSE && stats.SessionValid == 0u) {
-            fprintf(stderr, "SET_SESSION was accepted but the driver is not "
-                            "using it\n");
-            return 1;
-        }
-    } else {
-        if (IwanNtClearSession(Device) == FALSE) {
-            fprintf(stderr, "CLEAR_SESSION failed: %lu\n", GetLastError());
-            return 1;
-        }
+    if (Stats->PeerOpens != Seen->Opens) {
+        printf("CONNECT open #%llu sent\n",
+               (unsigned long long)Stats->PeerOpens);
+        Seen->Opens = Stats->PeerOpens;
     }
-    return 0;
-}
-
-static int
-Send(
-    _In_ PIWAN_NT_DEVICE Device,
-    _In_ const uint8_t *Frame,
-    _In_ size_t Length
-    )
-{
-    DWORD error;
-
-    if (IwanNtSendControl(Device, Frame, (UINT32)Length) != FALSE) {
-        return 0;
+    if (Stats->PeerRejects != Seen->Rejects) {
+        fprintf(stderr, "CONNECT rejected by the server (#%llu)\n",
+                (unsigned long long)Stats->PeerRejects);
+        Seen->Rejects = Stats->PeerRejects;
     }
-
-    error = GetLastError();
-    fprintf(stderr, "SEND_CONTROL failed: %lu\n", error);
-    if (error == ERROR_NOT_READY || error == ERROR_DEVICE_NOT_CONNECTED) {
-        /*
-         * The transport only runs while the adapter does, and a freshly installed
-         * root adapter starts disabled. Name the fix instead of leaving the
-         * operator to guess why a send fails on a "ready" device.
-         */
-        fprintf(stderr,
-                "the adapter is not up: enable it, for example\n"
-                "  netsh interface set interface \"iWAN NT Transport Adapter\" admin=enable\n");
+    if (Stats->PeerCloses != Seen->Closes) {
+        printf("CONNECT closed by the server (#%llu)\n",
+               (unsigned long long)Stats->PeerCloses);
+        Seen->Closes = Stats->PeerCloses;
     }
-    return 1;
+    if (Stats->PeerTimeouts != Seen->Timeouts) {
+        printf("CONNECT timeout after 15s of silence (#%llu), reconnecting\n",
+               (unsigned long long)Stats->PeerTimeouts);
+        Seen->Timeouts = Stats->PeerTimeouts;
+    }
+    if (Stats->PeerEchoes != Seen->Echoes && Stats->PeerState != 0u) {
+        printf("CONNECT keepalive #%llu  rtt=%u.%03u ms (min %u.%03u, max "
+               "%u.%03u)\n",
+               (unsigned long long)Stats->PeerEchoes,
+               Stats->PeerDelayCurrent / 1000u, Stats->PeerDelayCurrent % 1000u,
+               Stats->PeerDelayMinimum / 1000u, Stats->PeerDelayMinimum % 1000u,
+               Stats->PeerDelayMaximum / 1000u, Stats->PeerDelayMaximum % 1000u);
+        Seen->Echoes = Stats->PeerEchoes;
+    }
+    if (Stats->PeerState != 0u && Seen->Up == 0u) {
+        printf("CONNECT up (the driver holds the session; the adapter needs an "
+               "address)\n");
+        Seen->Up = 1u;
+    } else if (Stats->PeerState == 0u && Seen->Up != 0u) {
+        printf("CONNECT down\n");
+        Seen->Up = 0u;
+    }
 }
 
 int
@@ -91,239 +134,113 @@ IwanNtRunConnect(
     _In_ char **Argv
     )
 {
-    IWAN_NT_PEER handshake;
+    IWAN_NT_CONNECT_SEEN seen;
     IWAN_NT_STATS_ABI stats;
-    uint8_t frame[IWAN_NT_CONTROL_MAX];
-    UINT8 address[16];
-    UINT16 family = 0;
-    USHORT port;
-    USHORT mtu = 1400;
-    unsigned long seconds = 15;
-    ULONGLONG deadline;
-    int status = 0;
+    uint8_t address[16];
+    uint16_t family;
+    uint16_t mtu;
+    DWORD seconds;
+    DWORD started;
+    uint32_t port;
 
     if (Argc < 6) {
         fprintf(stderr,
-                "usage: iwannt-ctl connect <ip> <port> <user> <password> [mtu] [seconds]\n"
-                "  seconds 0 (the default is 15) keeps the session alive until interrupted\n");
+                "usage: connect <ip> <port> <user> <password> [mtu] [seconds]\n"
+                "  mtu defaults to 1400, seconds to 15; 0 means until "
+                "interrupted.\n");
+        return 2;
+    }
+
+    port = (uint32_t)strtoul(Argv[2], NULL, 10);
+    if (port == 0u || port > 65535u) {
+        fprintf(stderr, "invalid port: %s\n", Argv[2]);
+        return 2;
+    }
+
+    if (!IwanNtParseEndpoint(Argv[1], address, &family)) {
+        fprintf(stderr, "invalid address: %s\n", Argv[1]);
+        return 2;
+    }
+
+    mtu = (Argc > 6) ? (uint16_t)strtoul(Argv[6], NULL, 10) : 1400u;
+    if (mtu == 0u) {
+        fprintf(stderr, "invalid mtu: %s\n", Argv[6]);
+        return 2;
+    }
+    seconds = (Argc > 7) ? (DWORD)strtoul(Argv[7], NULL, 10) : 15u;
+
+    if (WaitForTransport(Device) != 0) {
         return 1;
     }
 
-    if (!IwanNtParseEndpoint(Argv[2], address, &family)) {
-        fprintf(stderr, "bad address %s\n", Argv[2]);
+    if (IwanNtGetStats(Device, &stats) == FALSE) {
+        fprintf(stderr, "GET_STATS failed: %lu\n", GetLastError());
         return 1;
     }
-    port = _byteswap_ushort((USHORT)strtoul(Argv[3], NULL, 10));
-    if (Argc >= 7) {
-        mtu = (USHORT)strtoul(Argv[6], NULL, 10);
-    }
-    if (Argc >= 8) {
-        seconds = strtoul(Argv[7], NULL, 10);
-    }
-
-    if (IwanNtSetPeer(Device, address, (family == 6) ? AF_INET6 : AF_INET,
-                      port) == FALSE) {
-        fprintf(stderr, "SET_PEER failed: %lu\n", GetLastError());
-        return 1;
-    }
-    if (IwanNtPeerInitialize(&handshake, Argv[4], Argv[5], mtu,
-                                  GetTickCount64()) == 0) {
-        fprintf(stderr, "user or password too long\n");
-        return 1;
-    }
-
-    /*
-     * The transport only runs while the adapter does, and a freshly installed
-     * root adapter starts disabled. Finding that out from the first send wastes a
-     * retry interval on an error the operator can fix in one command, so check
-     * the state first and say what is wrong.
-     */
-    {
-        ULONGLONG waitUntil = GetTickCount64() + 5000ull;
-
-        for (;;) {
-            memset(&stats, 0, sizeof(stats));
-            if (IwanNtGetStats(Device, &stats) == FALSE) {
-                fprintf(stderr, "GET_STATS failed: %lu\n", GetLastError());
-                return 1;
-            }
-            if (stats.Running != 0) {
-                break;
-            }
-            if (GetTickCount64() >= waitUntil) {
-                fprintf(stderr,
-                        "the adapter is not up, so the transport is not running\n"
-                        "  netsh interface set interface \"iWAN NT Transport Adapter\" admin=enable\n");
-                return 1;
-            }
-            Sleep(100);
-        }
-    }
-
-    /*
-     * One device carries one session. A second connect would overwrite the first
-     * one's identifiers while it is still running and then clear them on its own
-     * exit, so refuse instead of letting two processes fight over the device.
-     */
-    if (stats.SessionValid != 0) {
+    if (stats.PeerReady != 0u) {
         fprintf(stderr,
-                "the device already carries a session, so another connect owns it\n"
+                "the driver is already running a handshake; stop it first\n"
+                "  iwannt-ctl disconnect\n");
+        return 1;
+    }
+    if (stats.SessionValid != 0u) {
+        fprintf(stderr,
+                "the device already carries a session, so another connect "
+                "owns it\n"
                 "  iwannt-ctl clear   (only when that process is gone)\n");
         return 1;
     }
 
-    /*
-     * Zero means "until interrupted". Keepalives live in this process by design:
-     * when it exits, the peer stops hearing from us and times the session out, so
-     * a tunnel that should outlive a shell needs this to run as a service.
-     */
-    deadline = (seconds == 0) ? 0 : GetTickCount64() + (ULONGLONG)seconds * 1000ull;
+    if (IwanNtSetPeer(Device, address, family, (uint16_t)port) == FALSE) {
+        fprintf(stderr, "SET_PEER failed: %lu\n", GetLastError());
+        return 1;
+    }
+    if (IwanNtStartPeer(Device, Argv[3], Argv[4], mtu) == FALSE) {
+        fprintf(stderr, "START_PEER failed: %lu\n", GetLastError());
+        return 1;
+    }
+
+    printf("CONNECT handshake handed to the driver (mtu=%u, peer=", mtu);
+    PrintAddress(address, family);
+    printf(":%u)\n", (unsigned)port);
+
+    memset(&seen, 0, sizeof(seen));
+    started = GetTickCount();
 
     for (;;) {
-        ULONGLONG now = GetTickCount64();
-        UINT32 required = 0;
-        size_t length = 0;
-        ULONG timeoutsBefore;
-        int pending;
-        int read;
+        if (IwanNtGetStats(Device, &stats) == FALSE) {
+            fprintf(stderr, "GET_STATS failed: %lu\n", GetLastError());
+            (void)IwanNtStopPeer(Device);
+            return 1;
+        }
 
-        if (deadline != 0 && now >= deadline) {
+        Report(&stats, &seen);
+
+        if (seconds != 0u && GetTickCount() - started >= seconds * 1000u) {
             break;
         }
-
-        timeoutsBefore = handshake.Timeouts;
-        pending = IwanNtPeerTick(&handshake, now, frame, sizeof(frame),
-                                      &length);
-        if (handshake.Timeouts != timeoutsBefore) {
-            printf("CONNECT timeout after %us of silence (#%lu), reconnecting\n",
-                   (unsigned)(IWAN_NT_PEER_DATA_TIMEOUT_MS / 1000u),
-                   (unsigned long)handshake.Timeouts);
-        }
-        if (handshake.Fault != IwanNtSessionOk) {
-            fprintf(stderr, "frame build failed: %d\n", (int)handshake.Fault);
-            status = 1;
-            break;
-        }
-        if (pending) {
-            if (Send(Device, frame, length) != 0) {
-                status = 1;
-                break;
-            }
-        }
-
-        /*
-         * One frame per pass. The ring is bounded and an empty queue is reported
-         * as zero bytes, so this drains without ever blocking the timer.
-         */
-        read = IwanNtReadControl(Device, frame, sizeof(frame), &required);
-        if (read < 0) {
-            if (GetLastError() != ERROR_NO_MORE_ITEMS) {
-                fprintf(stderr, "READ_CONTROL failed: %lu\n", GetLastError());
-                status = 1;
-                break;
-            }
-        } else if (read > 0) {
-            IWAN_NT_PEER_EVENT event = IwanNtPeerOnFrame(
-                &handshake, frame, (size_t)read, GetTickCount64());
-
-            if (event == IwanNtPeerEventEstablished) {
-                printf("CONNECT ack sid=%u token=%08lx mtu=%u encrypted=%lu",
-                       (unsigned)handshake.Sid, (unsigned long)handshake.Token,
-                       (unsigned)handshake.MtuFromPeer,
-                       (unsigned long)handshake.Encrypted);
-                if (handshake.HasAddress) {
-                    printf(" tun=");
-                    PrintAddress(handshake.Address);
-                }
-                if (handshake.HasGateway) {
-                    printf(" gw=");
-                    PrintAddress(handshake.Gateway);
-                }
-                printf("\n");
-                if (handshake.MtuFromPeer != 0u &&
-                    handshake.MtuFromPeer < handshake.Mtu) {
-                    /*
-                     * NDIS does not let a miniport change its MTU at runtime, and
-                     * the deployed client uses min(configured, peer) on its tun
-                     * device, so the remaining step belongs to the host.
-                     */
-                    printf("CONNECT the peer accepts %u-byte packets; "
-                           "lower the adapter to match:\n"
-                           "  netsh interface ipv4 set subinterface "
-                           "\"iWAN NT Transport Adapter\" mtu=%u store=persistent\n",
-                           (unsigned)handshake.MtuFromPeer,
-                           (unsigned)handshake.MtuFromPeer);
-                }
-                if (handshake.HasAddress) {
-                    /*
-                     * Print the command rather than running it: the tool talks to
-                     * the device, it does not own the host's routing table.
-                     */
-                    printf("CONNECT to carry traffic, give the adapter that address:\n"
-                           "  netsh interface ipv4 set address name=\"iWAN NT Transport Adapter\" "
-                           "static %u.%u.%u.%u 255.255.255.0\n",
-                           handshake.Address[0], handshake.Address[1],
-                           handshake.Address[2], handshake.Address[3]);
-                }
-            } else if (event == IwanNtPeerEventRejected) {
-                printf("CONNECT rejected (#%lu)\n",
-                       (unsigned long)handshake.Rejects);
-            } else if (event == IwanNtPeerEventClosed) {
-                printf("CONNECT closed by peer (#%lu)\n",
-                       (unsigned long)handshake.Closes);
-            } else if (event == IwanNtPeerEventEchoAnswer) {
-                printf("CONNECT echo current=%luus min=%luus max=%luus\n",
-                       (unsigned long)handshake.DelayCurrent,
-                       (unsigned long)handshake.DelayMinimum,
-                       (unsigned long)handshake.DelayMaximum);
-            } else if (event == IwanNtPeerEventFault) {
-                fprintf(stderr, "frame rejected: %d\n", (int)handshake.Fault);
-                status = 1;
-                break;
-            }
-
-        }
-
-        /*
-         * Mirror the state machine every pass: a data timeout resets it without
-         * any frame arriving, and the driver must hear about that too.
-         */
-        if (ApplyState(Device, &handshake) != 0) {
-            status = 1;
-            break;
-        }
-
-        Sleep(10);
+        Sleep(IWAN_NT_CONNECT_POLL_MS);
     }
 
-    printf("CONNECT done opens=%lu echoes=%lu answered=%lu rejected=%lu closed=%lu "
-           "foreign=%lu state=%s\n",
-           (unsigned long)handshake.Opens, (unsigned long)handshake.Echoes,
-           (unsigned long)handshake.EchoAnswers, (unsigned long)handshake.Rejects,
-           (unsigned long)handshake.Closes, (unsigned long)handshake.ForeignFrames,
-           (handshake.State == IwanNtPeerUp) ? "up" : "down");
+    printf("CONNECT done opens=%llu echoes=%llu answered=%llu rejected=%llu "
+           "closed=%llu foreign=%llu timeouts=%llu state=%s\n",
+           (unsigned long long)stats.PeerOpens,
+           (unsigned long long)stats.PeerEchoes,
+           (unsigned long long)stats.PeerEchoAnswers,
+           (unsigned long long)stats.PeerRejects,
+           (unsigned long long)stats.PeerCloses,
+           (unsigned long long)stats.PeerForeign,
+           (unsigned long long)stats.PeerTimeouts,
+           stats.PeerState != 0u ? "up" : "down");
 
     /*
-     * Leave the driver in the state this process ended in. A session nobody is
-     * keeping alive would otherwise make the adapter look connected while every
-     * packet it carries goes nowhere.
+     * Leaving the handshake running would keep the tunnel alive behind a command
+     * that has already exited, and the next connect would then be refused.
      */
-    if (handshake.State == IwanNtPeerUp) {
-        (void)IwanNtClearSession(Device);
+    if (IwanNtStopPeer(Device) == FALSE) {
+        fprintf(stderr, "STOP_PEER failed: %lu\n", GetLastError());
+        return 1;
     }
 
-    if (handshake.EverEstablished == 0) {
-        status = 3;
-    } else if (handshake.State == IwanNtPeerUp) {
-        memset(&stats, 0, sizeof(stats));
-        if (IwanNtGetStats(Device, &stats) != FALSE) {
-            printf("CONNECT stats tx=%llu rx=%llu delivered=%llu inflight=%lu\n",
-                   (unsigned long long)stats.TxAccepted,
-                   (unsigned long long)stats.RxIndicated,
-                   (unsigned long long)stats.Delivered,
-                   (unsigned long)stats.TxInFlight);
-        }
-    }
-
-    return status;
+    return (seen.Up != 0u) ? 0 : 3;
 }

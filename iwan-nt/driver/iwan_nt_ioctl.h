@@ -77,7 +77,7 @@
 
 #define IWAN_NT_SESSION_STRUCT_SIZE 24u
 #define IWAN_NT_ADDR_STRUCT_SIZE 24u
-#define IWAN_NT_STATS_STRUCT_SIZE 192u
+#define IWAN_NT_STATS_STRUCT_SIZE 272u
 #define IWAN_NT_CREDENTIALS_STRUCT_SIZE 136u
 
 /* Field widths inside IWAN_NT_CREDENTIALS_ABI. */
@@ -171,6 +171,24 @@ typedef struct _IWAN_NT_STATS_ABI {
      */
     uint64_t RxOversize;
     uint64_t RxSinkErrors;
+
+    /*
+     * What the in-kernel handshake is doing. Without these the only way to tell
+     * "the server never answered" from "we never asked" is a packet capture.
+     */
+    uint64_t PeerOpens;            /* OPEN frames sent */
+    uint64_t PeerEchoes;           /* ECHOREQ frames sent */
+    uint64_t PeerEchoAnswers;      /* ECHORESP frames accepted */
+    uint64_t PeerRejects;          /* OPEN_REJECT frames accepted */
+    uint64_t PeerCloses;           /* CLOSE frames accepted */
+    uint64_t PeerForeign;          /* control frames that failed the signature */
+    uint64_t PeerTimeouts;         /* 15 s of silence while up */
+    uint32_t PeerState;            /* nonzero: the peer believes it is up */
+    uint32_t PeerReady;            /* nonzero: the handshake is running */
+    uint32_t PeerDelayCurrent;     /* microseconds, last ECHORESP RTT */
+    uint32_t PeerDelayMinimum;
+    uint32_t PeerDelayMaximum;
+    uint32_t Reserved1;            /* must be zero */
 } IWAN_NT_STATS_ABI;
 
 /*
