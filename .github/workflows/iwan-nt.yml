@@ -61,7 +61,7 @@ jobs:
             @{ n = 'ndis.lib';        v = (Get-ChildItem "$sdk\Lib" -Recurse -Filter ndis.lib -ErrorAction SilentlyContinue | Select-Object -First 2 -Expand FullName) -join ';' },
             @{ n = 'driver toolset props'; v = (Get-ChildItem "$vs\MSBuild" -Recurse -Filter 'WindowsKernelModeDriver*.props' -ErrorAction SilentlyContinue | Select-Object -First 2 -Expand FullName) -join ';' }
           )
-          foreach ($p in $probe) { "$($p.n) = $($p.v)" } | Tee-Object -FilePath probe.log
+          $probe | ForEach-Object { "$($_.n) = $($_.v)" } | Tee-Object -FilePath probe.log
           $lines = @('--- where WskGetLocalAddress lives ---')
           $wsk = Join-Path $inc.FullName 'km\wsk.h'
           if (Test-Path $wsk) {
