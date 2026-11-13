@@ -524,12 +524,20 @@ IwanNtMiniportInitializeEx(
         MiniportAdapterHandle, IWAN_NT_CONTROL_RING_BYTES,
         IWAN_NT_MINIPORT_POOL_TAG, NormalPoolPriority);
     if (adapter->ControlStorage == NULL) {
-        status = NDIS_STATUS_RESOURCES;
-        goto Failure;
+        /*
+         * The control ring only carries handshake and keepalive frames for the
+         * user-mode control plane. Losing it degrades the adapter to data-only
+         * instead of taking the whole interface down, so report it and carry
+         * on: a device that never starts cannot be diagnosed from user mode at
+         * all, while a running one reports the gap in its counters.
+         */
+        IwanNtTrace(205u);
+    } else {
+        IwanNtTrace(IWAN_NT_STAGE_RINGS);
+        IwanNtTransportSetControlRing(&adapter->Transport,
+                                      adapter->ControlStorage,
+                                      IWAN_NT_CONTROL_RING_BYTES);
     }
-    IwanNtTrace(IWAN_NT_STAGE_RINGS);
-    IwanNtTransportSetControlRing(&adapter->Transport, adapter->ControlStorage,
-                                  IWAN_NT_CONTROL_RING_BYTES);
     NdisZeroMemory(&registration, sizeof(registration));
     registration.Header.Type =
         NDIS_OBJECT_TYPE_MINIPORT_ADAPTER_REGISTRATION_ATTRIBUTES;
