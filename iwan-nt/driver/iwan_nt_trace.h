@@ -10,6 +10,7 @@
  * last value written names the step that never returned.
  */
 VOID IwanNtTrace(_In_ ULONG Stage);
+VOID IwanNtTraceStatus(_In_ ULONG Stage, _In_ ULONG Status);
 
 #define IWAN_NT_STAGE_ENTRY 1u
 #define IWAN_NT_STAGE_MINIPORT 2u
@@ -26,5 +27,8 @@ VOID IwanNtTrace(_In_ ULONG Stage);
 #define IWAN_NT_STAGE_RESTART_ENTER 20u
 #define IWAN_NT_STAGE_START 21u
 #define IWAN_NT_STAGE_RESTART_DONE 22u
+#define IWAN_NT_STAGE_SLOTS 16u
+#define IWAN_NT_STAGE_RINGS 17u
+#define IWAN_NT_STAGE_STATUS 30u
 
 #endif

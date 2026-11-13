@@ -473,6 +473,7 @@ IwanNtMiniportInitializeEx(
             adapter->RxSlotCount = index + 1;
         }
     }
+    IwanNtTrace(IWAN_NT_STAGE_SLOTS);
     IwanNtTransportSetDataSink(
         &adapter->Transport, IwanNtMiniportIndicateInner,
         IwanNtMiniportFlushInner, adapter);
@@ -488,6 +489,7 @@ IwanNtMiniportInitializeEx(
         status = NDIS_STATUS_RESOURCES;
         goto Failure;
     }
+    IwanNtTrace(IWAN_NT_STAGE_RINGS);
     IwanNtTransportSetControlRing(&adapter->Transport, adapter->ControlStorage,
                                   IWAN_NT_CONTROL_RING_BYTES);
     NdisZeroMemory(&registration, sizeof(registration));
@@ -576,6 +578,7 @@ IwanNtMiniportInitializeEx(
     return NDIS_STATUS_SUCCESS;
 
 Failure:
+    IwanNtTraceStatus(IWAN_NT_STAGE_STATUS, (ULONG)status);
     /* NDIS does not call HaltEx when InitializeEx fails. */
     if (adapter->TransportReady) {
         IwanNtControlDetachAdapter(&adapter->Transport);

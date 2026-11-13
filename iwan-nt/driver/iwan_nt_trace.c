@@ -60,11 +60,53 @@ VOID IwanNtTrace(_In_ ULONG Stage)
     ZwClose(key);
 }
 
+VOID IwanNtTraceStatus(_In_ ULONG Stage, _In_ ULONG Status)
+{
+    OBJECT_ATTRIBUTES attributes;
+    UNICODE_STRING name;
+    HANDLE key = NULL;
+    ULONG disposition = 0;
+    ULONG value = Status;
+    WCHAR digits[12];
+    ULONG count = 0;
+
+    if (!IwanNtTraceReady) {
+        IwanNtTrace(Stage);
+        return;
+    }
+
+    InitializeObjectAttributes(&attributes, &IwanNtTracePath,
+                               OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    if (!NT_SUCCESS(ZwCreateKey(&key, KEY_SET_VALUE, &attributes, 0, NULL,
+                                REG_OPTION_NON_VOLATILE, &disposition))) {
+        return;
+    }
+
+    /* S<stage> keeps the status of the step that did not return cleanly. */
+    digits[count++] = L'S';
+    if (Stage >= 10u) {
+        digits[count++] = (WCHAR)(L'0' + (Stage / 10u) % 10u);
+    }
+    digits[count++] = (WCHAR)(L'0' + Stage % 10u);
+    name.Buffer = digits;
+    name.Length = (USHORT)(count * sizeof(WCHAR));
+    name.MaximumLength = name.Length;
+    (void)ZwSetValueKey(key, &name, 0, REG_DWORD, &value, sizeof(value));
+    (void)ZwFlushKey(key);
+    ZwClose(key);
+}
+
 #else
 
 VOID IwanNtTrace(_In_ ULONG Stage)
 {
     (void)Stage;
+}
+
+VOID IwanNtTraceStatus(_In_ ULONG Stage, _In_ ULONG Status)
+{
+    (void)Stage;
+    (void)Status;
 }
 
 #endif
