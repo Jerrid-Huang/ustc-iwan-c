@@ -1,6 +1,7 @@
 #include "iwan_nt_miniport.h"
 #include "iwan_nt_frame.h"
 #include "iwan_nt_transport.h"
+#include "iwan_nt_trace.h"
 #include "iwan_nt_tx.h"
 #include "iwan_nt_control.h"
 
@@ -377,6 +378,8 @@ IwanNtMiniportInitializeEx(
     UNREFERENCED_PARAMETER(MiniportDriverContext);
     UNREFERENCED_PARAMETER(MiniportInitParameters);
 
+    IwanNtTrace(IWAN_NT_STAGE_INIT_ENTER);
+
     /* The only allocation is one fixed-size, nonpaged adapter context. */
     adapter = NdisAllocateMemoryWithTagPriority(
         MiniportAdapterHandle, sizeof(*adapter), IWAN_NT_MINIPORT_POOL_TAG,
@@ -396,6 +399,7 @@ IwanNtMiniportInitializeEx(
         goto Failure;
     }
     adapter->TransportReady = TRUE;
+    IwanNtTrace(IWAN_NT_STAGE_TRANSPORT);
     NdisAllocateSpinLock(&adapter->SendLock);
     adapter->SendLockReady = TRUE;
     adapter->SendScratch = NdisAllocateMemoryWithTagPriority(
@@ -419,6 +423,7 @@ IwanNtMiniportInitializeEx(
         params.PoolTag = IWAN_NT_MINIPORT_POOL_TAG;
         adapter->RxPool = NdisAllocateNetBufferListPool(MiniportAdapterHandle,
                                                         &params);
+    IwanNtTrace(IWAN_NT_STAGE_RXPOOL);
         if (adapter->RxPool == NULL) {
             status = NDIS_STATUS_RESOURCES;
             goto Failure;
@@ -502,6 +507,8 @@ IwanNtMiniportInitializeEx(
         goto Failure;
     }
 
+    IwanNtTrace(IWAN_NT_STAGE_ATTRIBUTES);
+
     NdisZeroMemory(&power, sizeof(power));
     power.Header.Type = NDIS_OBJECT_TYPE_DEFAULT;
     power.Header.Revision = NDIS_PM_CAPABILITIES_REVISION_2;
@@ -560,6 +567,10 @@ IwanNtMiniportInitializeEx(
         source.SessionChanged = IwanNtMiniportSessionChanged;
         IwanNtControlAttachAdapter(&adapter->Transport, &source);
     }
+
+    IwanNtTrace(IWAN_NT_STAGE_CONTROL);
+
+    IwanNtTrace(IWAN_NT_STAGE_INIT_DONE);
 
     /* NDIS initializes an adapter in Paused; Restart enables its data path. */
     return NDIS_STATUS_SUCCESS;
@@ -689,7 +700,10 @@ IwanNtMiniportRestart(
         return NDIS_STATUS_NOT_ACCEPTED;
     }
     if (adapter->TransportReady) {
-        NDIS_STATUS status = IwanNtTransportStart(&adapter->Transport);
+        NDIS_STATUS status;
+
+        IwanNtTrace(IWAN_NT_STAGE_RESTART_ENTER);
+        status = IwanNtTransportStart(&adapter->Transport);
         if (!NT_SUCCESS(status)) {
             InterlockedExchange(&adapter->State, IwanNtMiniportPaused);
             return NDIS_STATUS_DEVICE_FAILED;

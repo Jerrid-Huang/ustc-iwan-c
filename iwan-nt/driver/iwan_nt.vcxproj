@@ -118,6 +118,7 @@
     </ClCompile>
     <ClCompile Include="iwan_nt_ring.c" />
     <ClCompile Include="iwan_nt_transport.c" />
+    <ClCompile Include="iwan_nt_trace.c" />
     <ClCompile Include="iwan_nt_tx.c" />
     <ClCompile Include="iwan_nt_timer.c" />
     <ClCompile Include="iwan_nt_wsk.c" />
@@ -137,6 +138,7 @@
     <ClInclude Include="iwan_nt_miniport.h" />
     <ClInclude Include="iwan_nt_ring.h" />
     <ClInclude Include="iwan_nt_transport.h" />
+    <ClInclude Include="iwan_nt_trace.h" />
     <ClInclude Include="iwan_nt_tx.h" />
     <ClInclude Include="iwan_nt_timer.h" />
     <ClInclude Include="iwan_nt_types.h" />

@@ -1,5 +1,6 @@
 #include "iwan_nt_miniport.h"
 #include "iwan_nt_control.h"
+#include "iwan_nt_trace.h"
 
 static NDIS_HANDLE IwanNtMiniportDriverHandle;
 
@@ -35,6 +36,8 @@ DriverEntry(
 
     IwanNtMiniportDriverHandle = NULL;
 
+    IwanNtTrace(IWAN_NT_STAGE_ENTRY);
+
     /*
      * Register the miniport driver first. NdisRegisterDeviceEx below relies on
      * the wrapper state that NdisMRegisterMiniportDriver installs; calling it
@@ -48,6 +51,8 @@ DriverEntry(
         return status;
     }
 
+    IwanNtTrace(IWAN_NT_STAGE_MINIPORT);
+
     /*
      * The control device comes second. A miniport that came up without a way
      * to install a session would advertise a tunnel that never carries
@@ -58,6 +63,10 @@ DriverEntry(
         IwanNtMiniportUnregisterDriver(&IwanNtMiniportDriverHandle);
         return status;
     }
+
+    IwanNtTrace(IWAN_NT_STAGE_CONTROL);
+
+    IwanNtTrace(IWAN_NT_STAGE_ENTRY_DONE);
 
     return STATUS_SUCCESS;
 }
