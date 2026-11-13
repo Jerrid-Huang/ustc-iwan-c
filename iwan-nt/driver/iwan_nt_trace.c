@@ -18,8 +18,13 @@ VOID IwanNtTrace(_In_ ULONG Stage)
     ULONG count = 0;
 
     if (!IwanNtTraceReady) {
+        /*
+         * Under Control, not under the service key: the loader cannot create
+         * Services\iwannt\Parameters while the service is only half installed,
+         * and a failed create silently loses the whole trace.
+         */
         static const WCHAR path[] =
-            L"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\iwannt\\Parameters";
+            L"\\Registry\\Machine\\System\\CurrentControlSet\\Control\\IwanNtTrace";
         RtlInitUnicodeString(&IwanNtTracePath, path);
         IwanNtTraceReady = TRUE;
     }
