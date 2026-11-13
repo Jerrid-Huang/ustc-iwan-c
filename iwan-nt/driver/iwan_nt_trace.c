@@ -6,6 +6,57 @@
 static UNICODE_STRING IwanNtTracePath;
 static BOOLEAN IwanNtTraceReady;
 
+/*
+ * The registry values show the last stage but not the order and not how many
+ * times a step was attempted, and a lost ZwSetValueKey is indistinguishable
+ * from a step that never ran. Appending a line to a file keeps all three.
+ */
+static VOID
+IwanNtTraceAppend(
+    _In_ ULONG Stage
+    )
+{
+    static const WCHAR pathText[] = L"\\??\\C:\\iwan\\trace.log";
+    UNICODE_STRING path;
+    OBJECT_ATTRIBUTES attributes;
+    IO_STATUS_BLOCK status;
+    HANDLE file = NULL;
+    CHAR line[12];
+    CHAR reversed[12];
+    ULONG digits = 0;
+    ULONG length = 0;
+    ULONG value = Stage;
+
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        return;
+    }
+
+    do {
+        reversed[digits++] = (CHAR)('0' + (value % 10u));
+        value /= 10u;
+    } while (value != 0u && digits < sizeof(reversed));
+    while (digits > 0u) {
+        line[length++] = reversed[--digits];
+    }
+    line[length++] = '\r';
+    line[length++] = '\n';
+
+    RtlInitUnicodeString(&path, pathText);
+    InitializeObjectAttributes(&attributes, &path,
+                               OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+                               NULL, NULL);
+    if (!NT_SUCCESS(ZwCreateFile(&file, FILE_APPEND_DATA | SYNCHRONIZE,
+                                 &attributes, &status, NULL,
+                                 FILE_ATTRIBUTE_NORMAL,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                 FILE_OPEN_IF, FILE_SYNCHRONOUS_IO_NONALERT,
+                                 NULL, 0))) {
+        return;
+    }
+    (void)ZwWriteFile(file, NULL, NULL, NULL, &status, line, length, NULL, NULL);
+    ZwClose(file);
+}
+
 VOID IwanNtTrace(_In_ ULONG Stage)
 {
     OBJECT_ATTRIBUTES attributes;
@@ -16,6 +67,8 @@ VOID IwanNtTrace(_In_ ULONG Stage)
     WCHAR letter = L'T';
     WCHAR digits[12];
     ULONG count = 0;
+
+    IwanNtTraceAppend(Stage);
 
     if (!IwanNtTraceReady) {
         /*
