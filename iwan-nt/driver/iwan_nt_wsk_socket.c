@@ -359,19 +359,20 @@ IwanNtWskDatagramBind(
      * operation gate, and failing it is not fatal: the tunnel works either way.
      */
     if (NT_SUCCESS(status)) {
-        const WSK_PROVIDER_BASIC_DISPATCH *basic =
-            IwanNtWskDatagramGetBasicDispatch(Datagram->Socket);
+        NTSTATUS localStatus = IwanNtWskDatagramPrepareIrp(Datagram);
 
-        if (basic != NULL && basic->WskGetLocalAddress != NULL) {
-            NTSTATUS localStatus = IwanNtWskDatagramPrepareIrp(Datagram);
-
-            if (NT_SUCCESS(localStatus)) {
-                localStatus = basic->WskGetLocalAddress(
-                    Datagram->Socket, (PSOCKADDR)&Datagram->BoundAddress,
-                    Datagram->LifecycleIrp);
-                (void)IwanNtWskDatagramFinishIrp(
-                    Datagram, localStatus, &information);
-            }
+        if (NT_SUCCESS(localStatus)) {
+            /*
+             * WskGetLocalAddress is one of the inline entry points that the WSK
+             * header expands into the provider call, so it is called by name
+             * instead of through a dispatch field: the field lives in a
+             * provider structure the header does not publish member names for.
+             */
+            localStatus = WskGetLocalAddress(
+                Datagram->Socket, (PSOCKADDR)&Datagram->BoundAddress,
+                Datagram->LifecycleIrp);
+            (void)IwanNtWskDatagramFinishIrp(
+                Datagram, localStatus, &information);
         }
     }
 

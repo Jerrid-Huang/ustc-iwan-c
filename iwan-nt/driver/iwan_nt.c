@@ -32,15 +32,23 @@ DriverEntry(
     PUNICODE_STRING RegistryPath
     )
 {
+#ifdef IWAN_NT_BISECT_EMPTY_ENTRY
+    /*
+     * Bisect switch: prove whether the loader reaches DriverEntry at all. The
+     * whole body is compiled out rather than skipped with an early return,
+     * because unreachable code is a warning and this project builds with /WX.
+     */
+    IwanNtTrace(IWAN_NT_STAGE_ENTRY);
+
+    UNREFERENCED_PARAMETER(DriverObject);
+    UNREFERENCED_PARAMETER(RegistryPath);
+    UNREFERENCED_PARAMETER(IwanNtMiniportUnload);
+
+    return STATUS_SUCCESS;
+#else
     NTSTATUS status;
 
     IwanNtTrace(IWAN_NT_STAGE_ENTRY);
-
-#ifdef IWAN_NT_BISECT_EMPTY_ENTRY
-    /* Bisect switch: prove whether the loader reaches DriverEntry at all. */
-    UNREFERENCED_PARAMETER(RegistryPath);
-    return STATUS_SUCCESS;
-#endif
 
     IwanNtMiniportDriverHandle = NULL;
 
@@ -75,4 +83,5 @@ DriverEntry(
     IwanNtTrace(IWAN_NT_STAGE_ENTRY_DONE);
 
     return STATUS_SUCCESS;
+#endif
 }

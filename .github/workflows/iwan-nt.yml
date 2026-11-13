@@ -62,6 +62,13 @@ jobs:
             @{ n = 'driver toolset props'; v = (Get-ChildItem "$vs\MSBuild" -Recurse -Filter 'WindowsKernelModeDriver*.props' -ErrorAction SilentlyContinue | Select-Object -First 2 -Expand FullName) -join ';' }
           )
           foreach ($p in $probe) { "$($p.n) = $($p.v)" }
+          Write-Output '--- where WskGetLocalAddress lives ---'
+          $wsk = Join-Path $inc.FullName 'km\wsk.h'
+          if (Test-Path $wsk) {
+            Select-String -Path $wsk -Pattern 'WskGetLocalAddress' | ForEach-Object { "$($_.LineNumber): $($_.Line.Trim())" }
+            Select-String -Path $wsk -Pattern '_WSK_PROVIDER_(BASIC|DATAGRAM)_DISPATCH \{' | ForEach-Object { "$($_.LineNumber): $($_.Line.Trim())" }
+          }
+          Write-Output '--- end ---'
 
       # Compile without linking first: link errors then cannot hide compile errors.
       - name: msbuild compile only (no link)
