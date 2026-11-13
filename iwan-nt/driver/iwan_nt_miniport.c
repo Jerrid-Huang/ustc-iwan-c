@@ -49,7 +49,7 @@ typedef enum _IWAN_NT_MINIPORT_STATE {
  */
 #define IWAN_NT_MINIPORT_SEND_BATCH IWAN_NT_TX_SLOTS
 
-#define IWAN_NT_MINIPORT_RX_SLOTS 64u
+#define IWAN_NT_MINIPORT_RX_SLOTS 4u
 
 /*
  * NDIS rounds a net buffer list context up to a 16-byte boundary and rejects
@@ -463,14 +463,14 @@ IwanNtMiniportInitializeEx(
                 MiniportAdapterHandle, IWAN_NT_MINIPORT_MTU,
                 IWAN_NT_MINIPORT_POOL_TAG, NormalPoolPriority);
             if (slot->Buffer == NULL) {
-                IwanNtTrace(41u);
+                IwanNtTrace(201u);
                 status = NDIS_STATUS_RESOURCES;
                 goto Failure;
             }
             slot->Mdl = NdisAllocateMdl(MiniportAdapterHandle, slot->Buffer,
                                         IWAN_NT_MINIPORT_MTU);
             if (slot->Mdl == NULL) {
-                IwanNtTrace(42u);
+                IwanNtTrace(202u);
                 status = NDIS_STATUS_RESOURCES;
                 goto Failure;
             }
@@ -478,7 +478,7 @@ IwanNtMiniportInitializeEx(
                 adapter->RxPool, sizeof(IWAN_NT_MINIPORT_RX_CONTEXT), 0,
                 slot->Mdl, 0, IWAN_NT_MINIPORT_MTU);
             if (slot->Nbl == NULL) {
-                IwanNtTrace(43u);
+                IwanNtTrace(203u);
                 status = NDIS_STATUS_RESOURCES;
                 goto Failure;
             }
