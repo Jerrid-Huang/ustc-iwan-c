@@ -76,7 +76,7 @@
       <CompileAs>CompileAsC</CompileAs>
       <LanguageStandard_C>stdc11</LanguageStandard_C>
       <ExceptionHandling>false</ExceptionHandling>
-      <PreprocessorDefinitions>_AMD64_;AMD64;IWAN_NT_KERNEL;IWAN_NT_BISECT_EMPTY_ENTRY;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_AMD64_;AMD64;IWAN_NT_KERNEL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
       <!-- netio.lib provides Wsk*, ndis.lib the miniport entry points, and

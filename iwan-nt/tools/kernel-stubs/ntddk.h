@@ -407,3 +407,4 @@ static __inline LONG IwanNtStubInterlockedCompareExchange(volatile LONG *Target,
 #define InterlockedDecrement(p) (--(*(volatile long *)(p)))
 
 #endif /* IWAN_NT_NTDDK_STUB_H */
+static __inline NTSTATUS ZwFlushKey(HANDLE KeyHandle) { (void)KeyHandle; return 0; }
