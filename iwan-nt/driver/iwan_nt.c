@@ -61,6 +61,8 @@ DriverEntry(
      * before any miniport registration faults inside NDIS with a near-null
      * write (observed as bugcheck 0x50).
      */
+    IwanNtTrace(IWAN_NT_STAGE_MINIPORT_ENTER);
+
     status = IwanNtMiniportRegisterDriver(
         DriverObject, RegistryPath, IwanNtMiniportUnload,
         &IwanNtMiniportDriverHandle);
@@ -75,6 +77,8 @@ DriverEntry(
      * to install a session would advertise a tunnel that never carries
      * traffic, so failing here rolls the miniport registration back.
      */
+    IwanNtTrace(IWAN_NT_STAGE_CONTROL_ENTER);
+
     status = IwanNtControlRegister(DriverObject);
     if (!NT_SUCCESS(status)) {
         IwanNtMiniportUnregisterDriver(&IwanNtMiniportDriverHandle);
