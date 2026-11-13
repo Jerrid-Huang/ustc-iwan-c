@@ -34,16 +34,15 @@ DriverEntry(
 {
     NTSTATUS status;
 
+    IwanNtTrace(IWAN_NT_STAGE_ENTRY);
+
 #ifdef IWAN_NT_BISECT_EMPTY_ENTRY
     /* Bisect switch: prove whether the loader reaches DriverEntry at all. */
-    IwanNtTrace(IWAN_NT_STAGE_ENTRY);
     UNREFERENCED_PARAMETER(RegistryPath);
     return STATUS_SUCCESS;
 #endif
 
     IwanNtMiniportDriverHandle = NULL;
-
-    IwanNtTrace(IWAN_NT_STAGE_ENTRY);
 
     /*
      * Register the miniport driver first. NdisRegisterDeviceEx below relies on

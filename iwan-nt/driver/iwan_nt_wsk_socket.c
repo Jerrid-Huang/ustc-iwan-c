@@ -358,14 +358,20 @@ IwanNtWskDatagramBind(
      * takes an IRP like every other provider call, so it runs inside the same
      * operation gate, and failing it is not fatal: the tunnel works either way.
      */
-    if (NT_SUCCESS(status) && dispatch->Basic.WskGetLocalAddress != NULL) {
-        NTSTATUS localStatus = IwanNtWskDatagramPrepareIrp(Datagram);
+    if (NT_SUCCESS(status)) {
+        const WSK_PROVIDER_BASIC_DISPATCH *basic =
+            IwanNtWskDatagramGetBasicDispatch(Datagram->Socket);
 
-        if (NT_SUCCESS(localStatus)) {
-            localStatus = dispatch->Basic.WskGetLocalAddress(
-                Datagram->Socket, (PSOCKADDR)&Datagram->BoundAddress,
-                Datagram->LifecycleIrp);
-            (void)IwanNtWskDatagramFinishIrp(Datagram, localStatus, &information);
+        if (basic != NULL && basic->WskGetLocalAddress != NULL) {
+            NTSTATUS localStatus = IwanNtWskDatagramPrepareIrp(Datagram);
+
+            if (NT_SUCCESS(localStatus)) {
+                localStatus = basic->WskGetLocalAddress(
+                    Datagram->Socket, (PSOCKADDR)&Datagram->BoundAddress,
+                    Datagram->LifecycleIrp);
+                (void)IwanNtWskDatagramFinishIrp(
+                    Datagram, localStatus, &information);
+            }
         }
     }
 
