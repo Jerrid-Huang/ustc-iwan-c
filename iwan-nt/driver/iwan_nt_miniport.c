@@ -443,6 +443,8 @@ IwanNtMiniportInitializeEx(
             IWAN_NT_MINIPORT_RX_SLOT *slot = &adapter->RxSlots[index];
             PVOID *context;
 
+            IwanNtTrace(40u + index);
+
             slot->Buffer = NdisAllocateMemoryWithTagPriority(
                 MiniportAdapterHandle, IWAN_NT_MINIPORT_MTU,
                 IWAN_NT_MINIPORT_POOL_TAG, NormalPoolPriority);

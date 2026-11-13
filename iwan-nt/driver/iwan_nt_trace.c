@@ -41,6 +41,9 @@ VOID IwanNtTrace(_In_ ULONG Stage)
     (void)ZwSetValueKey(key, &name, 0, REG_DWORD, &value, sizeof(value));
 
     digits[count++] = letter;
+    if (Stage >= 100u) {
+        digits[count++] = (WCHAR)(L'0' + (Stage / 100u) % 10u);
+    }
     if (Stage >= 10u) {
         digits[count++] = (WCHAR)(L'0' + (Stage / 10u) % 10u);
     }
@@ -84,6 +87,9 @@ VOID IwanNtTraceStatus(_In_ ULONG Stage, _In_ ULONG Status)
 
     /* S<stage> keeps the status of the step that did not return cleanly. */
     digits[count++] = L'S';
+    if (Stage >= 100u) {
+        digits[count++] = (WCHAR)(L'0' + (Stage / 100u) % 10u);
+    }
     if (Stage >= 10u) {
         digits[count++] = (WCHAR)(L'0' + (Stage / 10u) % 10u);
     }
