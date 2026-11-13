@@ -175,3 +175,27 @@ jobs:
             cl-build.log
             msbuild.log
             prefast.log
+
+      # The developer host has no GitHub API credentials of its own, but it can
+      # fetch over SSH. Publishing the driver to a branch keeps that path usable
+      # after the API token expires.
+      - name: Publish the driver to the ci-artifacts branch
+        if: always()
+        shell: pwsh
+        run: |
+          $files = @(
+            'build/x64/Release/iwannt.sys',
+            'build/x64/Release/iwannt-ctl.exe',
+            'cl-build.log',
+            'user-build.log'
+          )
+          $present = @($files | Where-Object { Test-Path $_ })
+          if ($present.Count -eq 0) { Write-Host 'nothing to publish'; exit 0 }
+          git config user.email 'ci@localhost'
+          git config user.name 'iwan-nt ci'
+          git checkout -B ci-artifacts
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          foreach ($f in $present) { Copy-Item $f 'artifacts/' -Force }
+          git add -f artifacts
+          git commit -m "ci: publish $env:GITHUB_SHA"
+          git push --force origin HEAD:ci-artifacts
