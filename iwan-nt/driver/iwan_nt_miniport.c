@@ -51,6 +51,18 @@ typedef enum _IWAN_NT_MINIPORT_STATE {
 
 #define IWAN_NT_MINIPORT_RX_SLOTS 64u
 
+/*
+ * NDIS rounds a net buffer list context up to a 16-byte boundary and rejects
+ * anything smaller, so the slot pointer gets a full aligned block rather
+ * than sizeof(PVOID).
+ */
+#define IWAN_NT_MINIPORT_RX_CONTEXT 16u
+
+typedef struct _IWAN_NT_MINIPORT_RX_CONTEXT {
+    void *Slot;
+    UCHAR Reserved[IWAN_NT_MINIPORT_RX_CONTEXT - sizeof(void *)];
+} IWAN_NT_MINIPORT_RX_CONTEXT, *PIWAN_NT_MINIPORT_RX_CONTEXT;
+
 typedef struct _IWAN_NT_MINIPORT_RX_SLOT {
     PUCHAR Buffer;
     PMDL Mdl;
@@ -459,8 +471,8 @@ IwanNtMiniportInitializeEx(
                 goto Failure;
             }
             slot->Nbl = NdisAllocateNetBufferAndNetBufferList(
-                adapter->RxPool, sizeof(PVOID), 0, slot->Mdl, 0,
-                IWAN_NT_MINIPORT_MTU);
+                adapter->RxPool, sizeof(IWAN_NT_MINIPORT_RX_CONTEXT), 0,
+                slot->Mdl, 0, IWAN_NT_MINIPORT_MTU);
             if (slot->Nbl == NULL) {
                 status = NDIS_STATUS_RESOURCES;
                 goto Failure;
@@ -470,7 +482,7 @@ IwanNtMiniportInitializeEx(
              * travels in the NBL context sized by the call above.
              */
             context = (PVOID *)NET_BUFFER_LIST_CONTEXT_DATA_START(slot->Nbl);
-            *context = slot;
+            ((PIWAN_NT_MINIPORT_RX_CONTEXT)context)->Slot = slot;
             slot->InUse = 0;
             adapter->RxSlotCount = index + 1;
         }
@@ -756,9 +768,12 @@ IwanNtMiniportFlushInner(
 
         for (current = chain; current != NULL;
              current = NET_BUFFER_LIST_NEXT_NBL(current)) {
-            PVOID *context = (PVOID *)NET_BUFFER_LIST_CONTEXT_DATA_START(current);
+            PIWAN_NT_MINIPORT_RX_CONTEXT context =
+                (PIWAN_NT_MINIPORT_RX_CONTEXT)
+                    NET_BUFFER_LIST_CONTEXT_DATA_START(current);
             IWAN_NT_MINIPORT_RX_SLOT *slot =
-                (context != NULL) ? *context : NULL;
+                (context != NULL) ? (IWAN_NT_MINIPORT_RX_SLOT *)context->Slot
+                                  : NULL;
 
             NET_BUFFER_LIST_NEXT_NBL(current) = NULL;
             if (slot == NULL) {
@@ -1092,8 +1107,12 @@ IwanNtMiniportReturnNetBufferLists(
      */
     for (current = NetBufferLists; current != NULL;
          current = NET_BUFFER_LIST_NEXT_NBL(current)) {
-        PVOID *context = (PVOID *)NET_BUFFER_LIST_CONTEXT_DATA_START(current);
-        IWAN_NT_MINIPORT_RX_SLOT *slot = (context != NULL) ? *context : NULL;
+        PIWAN_NT_MINIPORT_RX_CONTEXT context =
+            (PIWAN_NT_MINIPORT_RX_CONTEXT)
+                NET_BUFFER_LIST_CONTEXT_DATA_START(current);
+        IWAN_NT_MINIPORT_RX_SLOT *slot =
+            (context != NULL) ? (IWAN_NT_MINIPORT_RX_SLOT *)context->Slot
+                              : NULL;
 
         if (slot == NULL) {
             continue;
