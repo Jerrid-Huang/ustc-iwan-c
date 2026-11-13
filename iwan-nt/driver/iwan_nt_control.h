@@ -52,7 +52,7 @@ typedef struct _IWAN_NT_CONTROL_COUNTER_SOURCE {
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 IwanNtControlRegister(
-    _In_ PDRIVER_OBJECT DriverObject
+    _In_ NDIS_HANDLE MiniportDriverHandle
     );
 
 /*

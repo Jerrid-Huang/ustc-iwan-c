@@ -542,7 +542,7 @@ IwanNtControlDispatch(
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
 IwanNtControlRegister(
-    _In_ PDRIVER_OBJECT DriverObject
+    _In_ NDIS_HANDLE MiniportDriverHandle
     )
 {
     NDIS_DEVICE_OBJECT_ATTRIBUTES attributes;
@@ -594,8 +594,13 @@ IwanNtControlRegister(
     attributes.DefaultSDDLString = &sddl;
     attributes.DeviceClassGuid = NULL;
 
+    /*
+     * The first argument is the miniport driver handle from
+     * NdisMRegisterMiniportDriver, not the DRIVER_OBJECT. NDIS dereferences it
+     * as its own wrapper and a driver object faults with a near-null write.
+     */
     status = NdisRegisterDeviceEx(
-        DriverObject, &attributes, &g_Control.DeviceObject,
+        MiniportDriverHandle, &attributes, &g_Control.DeviceObject,
         &g_Control.DeviceHandle);
     if (!NT_SUCCESS(status)) {
         g_Control.DeviceObject = NULL;

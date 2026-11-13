@@ -79,7 +79,7 @@ DriverEntry(
      */
     IwanNtTrace(IWAN_NT_STAGE_CONTROL_ENTER);
 
-    status = IwanNtControlRegister(DriverObject);
+    status = IwanNtControlRegister(IwanNtMiniportDriverHandle);
     if (!NT_SUCCESS(status)) {
         IwanNtMiniportUnregisterDriver(&IwanNtMiniportDriverHandle);
         return status;
