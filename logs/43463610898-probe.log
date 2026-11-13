@@ -1,0 +1,66 @@
+sdk include versions = 10.0.10240.0,10.0.17763.0,10.0.19041.0,10.0.22621.0,10.0.26100.0,wdf
+km\wsk.h = True
+km\ndis.h = True
+netio.lib = C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\km\arm64\netio.lib;C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\km\x64\netio.lib
+wsk npi in libs = 
+wsk npi in um libs = C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\um\x64\Uuid.Lib
+ndis.lib = C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\km\arm64\ndis.lib;C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\km\x64\ndis.lib
+driver toolset props = 
+--- where WskGetLocalAddress lives ---
+1570: PFN_WSK_GET_LOCAL_ADDRESS   WskGetLocalAddress;
+1587: PFN_WSK_GET_LOCAL_ADDRESS   WskGetLocalAddress;
+1606: PFN_WSK_GET_LOCAL_ADDRESS   WskGetLocalAddress;
+1636: PFN_WSK_GET_LOCAL_ADDRESS   WskGetLocalAddress;
+wsk.h: //
+wsk.h: 
+wsk.h: typedef struct _WSK_PROVIDER_BASIC_DISPATCH {
+wsk.h:     PFN_WSK_CONTROL_SOCKET       WskControlSocket;
+wsk.h:     PFN_WSK_CLOSE_SOCKET         WskCloseSocket;
+wsk.h: } WSK_PROVIDER_BASIC_DISPATCH, *PWSK_PROVIDER_BASIC_DISPATCH;
+wsk.h: 
+wsk.h: //
+wsk.h: // Listening socket downcalls
+wsk.h: //
+wsk.h: 
+wsk.h: typedef struct _WSK_PROVIDER_LISTEN_DISPATCH {
+wsk.h: #ifdef __cplusplus
+wsk.h:     WSK_PROVIDER_BASIC_DISPATCH Basic;
+wsk.h: #else
+wsk.h:     WSK_PROVIDER_BASIC_DISPATCH;
+wsk.h: #endif
+wsk.h:     PFN_WSK_BIND                WskBind;
+wsk.h:     PFN_WSK_ACCEPT              WskAccept;
+wsk.h:     PFN_WSK_INSPECT_COMPLETE    WskInspectComplete;
+wsk.h:     PFN_WSK_GET_LOCAL_ADDRESS   WskGetLocalAddress;
+wsk.h: } WSK_PROVIDER_LISTEN_DISPATCH, *PWSK_PROVIDER_LISTEN_DISPATCH;
+wsk.h: 
+wsk.h: //
+wsk.h: // Datagram socket downcalls
+wsk.h: //
+wsk.h: 
+wsk.h: typedef struct _WSK_PROVIDER_DATAGRAM_DISPATCH {
+wsk.h: #ifdef __cplusplus
+wsk.h:     WSK_PROVIDER_BASIC_DISPATCH Basic;
+wsk.h: #else
+wsk.h:     WSK_PROVIDER_BASIC_DISPATCH;
+wsk.h: #endif
+wsk.h:     PFN_WSK_BIND                WskBind;
+wsk.h:     PFN_WSK_SEND_TO             WskSendTo;
+wsk.h:     PFN_WSK_RECEIVE_FROM        WskReceiveFrom;
+wsk.h:     PFN_WSK_RELEASE_DATAGRAM_INDICATION_LIST WskRelease;
+wsk.h:     PFN_WSK_GET_LOCAL_ADDRESS   WskGetLocalAddress;
+wsk.h: #if (NTDDI_VERSION >= NTDDI_WIN8)
+wsk.h:     PFN_WSK_SEND_MESSAGES       WskSendMessages;
+wsk.h: #endif // if (NTDDI_VERSION >= NTDDI_WIN8)
+wsk.h: } WSK_PROVIDER_DATAGRAM_DISPATCH, *PWSK_PROVIDER_DATAGRAM_DISPATCH;
+wsk.h: 
+wsk.h: 
+wsk.h: //
+wsk.h: // Connected socket downcalls
+wsk.h: //
+wsk.h: 
+wsk.h: typedef struct _WSK_PROVIDER_CONNECTION_DISPATCH {
+wsk.h: #ifdef __cplusplus
+wsk.h:     WSK_PROVIDER_BASIC_DISPATCH Basic;
+wsk.h: #else
+--- end ---
