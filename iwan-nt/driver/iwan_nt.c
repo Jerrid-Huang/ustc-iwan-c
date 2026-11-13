@@ -2,8 +2,11 @@
 #include "iwan_nt_control.h"
 #include "iwan_nt_trace.h"
 
+#ifndef IWAN_NT_BISECT_EMPTY_ENTRY
 static NDIS_HANDLE IwanNtMiniportDriverHandle;
+#endif
 
+#ifndef IWAN_NT_BISECT_EMPTY_ENTRY
 _Function_class_(MINIPORT_UNLOAD)
 _Use_decl_annotations_
 static VOID
@@ -23,6 +26,7 @@ IwanNtMiniportUnload(
     /* NDIS requires deregistration from this callback after all adapters halt. */
     IwanNtMiniportUnregisterDriver(&IwanNtMiniportDriverHandle);
 }
+#endif
 
 _Function_class_(DRIVER_INITIALIZE)
 _Use_decl_annotations_
@@ -42,7 +46,6 @@ DriverEntry(
 
     UNREFERENCED_PARAMETER(DriverObject);
     UNREFERENCED_PARAMETER(RegistryPath);
-    UNREFERENCED_PARAMETER(IwanNtMiniportUnload);
 
     return STATUS_SUCCESS;
 #else

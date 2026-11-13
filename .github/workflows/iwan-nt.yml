@@ -61,14 +61,17 @@ jobs:
             @{ n = 'ndis.lib';        v = (Get-ChildItem "$sdk\Lib" -Recurse -Filter ndis.lib -ErrorAction SilentlyContinue | Select-Object -First 2 -Expand FullName) -join ';' },
             @{ n = 'driver toolset props'; v = (Get-ChildItem "$vs\MSBuild" -Recurse -Filter 'WindowsKernelModeDriver*.props' -ErrorAction SilentlyContinue | Select-Object -First 2 -Expand FullName) -join ';' }
           )
-          foreach ($p in $probe) { "$($p.n) = $($p.v)" }
-          Write-Output '--- where WskGetLocalAddress lives ---'
+          foreach ($p in $probe) { "$($p.n) = $($p.v)" } | Tee-Object -FilePath probe.log
+          $lines = @('--- where WskGetLocalAddress lives ---')
           $wsk = Join-Path $inc.FullName 'km\wsk.h'
           if (Test-Path $wsk) {
-            Select-String -Path $wsk -Pattern 'WskGetLocalAddress' | ForEach-Object { "$($_.LineNumber): $($_.Line.Trim())" }
-            Select-String -Path $wsk -Pattern '_WSK_PROVIDER_(BASIC|DATAGRAM)_DISPATCH \{' | ForEach-Object { "$($_.LineNumber): $($_.Line.Trim())" }
+            $lines += Select-String -Path $wsk -Pattern 'WskGetLocalAddress' | ForEach-Object { "$($_.LineNumber): $($_.Line.Trim())" }
+            $lines += Select-String -Path $wsk -Pattern '_WSK_PROVIDER_(BASIC|DATAGRAM)_DISPATCH' | ForEach-Object { "$($_.LineNumber): $($_.Line.Trim())" }
+          } else {
+            $lines += 'wsk.h not found'
           }
-          Write-Output '--- end ---'
+          $lines += '--- end ---'
+          $lines | Tee-Object -FilePath probe.log -Append
 
       # Compile without linking first: link errors then cannot hide compile errors.
       - name: msbuild compile only (no link)
@@ -162,7 +165,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             gh api -X POST "/repos/$repo/git/refs" -f ref='refs/heads/ci-logs' -f sha=$sha | Out-Null
           }
-          foreach ($name in @('user-build.log', 'cl-build.log')) {
+          foreach ($name in @('user-build.log', 'cl-build.log', 'probe.log')) {
             if (-not (Test-Path $name)) { continue }
             $text = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((Get-Content $name -Raw)))
             gh api -X PUT "/repos/$repo/contents/logs/$run-$name" -f message='ci: publish build log' -f content=$text -f branch='ci-logs'
