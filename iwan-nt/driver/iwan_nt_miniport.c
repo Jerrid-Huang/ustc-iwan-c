@@ -484,6 +484,7 @@ IwanNtMiniportInitializeEx(
                 status = NDIS_STATUS_RESOURCES;
                 goto Failure;
             }
+            IwanNtTrace(221u);
             slot->Mdl = NdisAllocateMdl(MiniportAdapterHandle, slot->Buffer,
                                         IWAN_NT_MINIPORT_MTU);
             if (slot->Mdl == NULL) {
@@ -492,6 +493,7 @@ IwanNtMiniportInitializeEx(
                 status = NDIS_STATUS_RESOURCES;
                 goto Failure;
             }
+            IwanNtTrace(222u);
             slot->Nbl = NdisAllocateNetBufferAndNetBufferList(
                 adapter->RxPool, sizeof(IWAN_NT_MINIPORT_RX_CONTEXT), 0,
                 slot->Mdl, 0, IWAN_NT_MINIPORT_MTU);
@@ -505,10 +507,12 @@ IwanNtMiniportInitializeEx(
              * ReturnNetBufferLists only gets the NBL, so the slot pointer
              * travels in the NBL context sized by the call above.
              */
+            IwanNtTrace(223u);
             context = (PVOID *)NET_BUFFER_LIST_CONTEXT_DATA_START(slot->Nbl);
             ((PIWAN_NT_MINIPORT_RX_CONTEXT)context)->Slot = slot;
             slot->InUse = 0;
             adapter->RxSlotCount = index + 1;
+            IwanNtTrace(224u);
         }
     }
     IwanNtTrace(IWAN_NT_STAGE_SLOTS);
