@@ -437,6 +437,7 @@ IwanNtMiniportInitializeEx(
                                                         &params);
     IwanNtTrace(IWAN_NT_STAGE_RXPOOL);
         if (adapter->RxPool == NULL) {
+            IwanNtTrace(31u);
             status = NDIS_STATUS_RESOURCES;
             goto Failure;
         }
@@ -448,6 +449,7 @@ IwanNtMiniportInitializeEx(
      */
     KeInitializeEvent(&adapter->RxIdle, NotificationEvent, TRUE);
     adapter->RxIdleReady = TRUE;
+    IwanNtTrace(18u);
     {
         ULONG index;
 
