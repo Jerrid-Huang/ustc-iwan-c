@@ -373,6 +373,22 @@ IwanNtMiniportFlushInner(
     _In_opt_ void *Context
     );
 
+/*
+ * Event log fallback. The registry trace can lose writes (pool pressure, hive
+ * trouble), and a silent init failure is the worst possible outcome, so every
+ * failure branch also drops an entry with its stage and status.
+ */
+static VOID
+IwanNtMiniportFault(
+    _In_ NDIS_HANDLE MiniportAdapterHandle,
+    _In_ ULONG Stage,
+    _In_ ULONG Status
+    )
+{
+    NdisWriteErrorLogEntry(MiniportAdapterHandle, NDIS_ERROR_CODE_OUT_OF_RESOURCES,
+                           3, Stage, Status, 0);
+}
+
 _Use_decl_annotations_
 static NDIS_STATUS
 IwanNtMiniportInitializeEx(
@@ -463,6 +479,7 @@ IwanNtMiniportInitializeEx(
                 MiniportAdapterHandle, IWAN_NT_MINIPORT_MTU,
                 IWAN_NT_MINIPORT_POOL_TAG, NormalPoolPriority);
             if (slot->Buffer == NULL) {
+                IwanNtMiniportFault(MiniportAdapterHandle, 201u, 0);
                 IwanNtTrace(201u);
                 status = NDIS_STATUS_RESOURCES;
                 goto Failure;
@@ -470,6 +487,7 @@ IwanNtMiniportInitializeEx(
             slot->Mdl = NdisAllocateMdl(MiniportAdapterHandle, slot->Buffer,
                                         IWAN_NT_MINIPORT_MTU);
             if (slot->Mdl == NULL) {
+                IwanNtMiniportFault(MiniportAdapterHandle, 202u, 0);
                 IwanNtTrace(202u);
                 status = NDIS_STATUS_RESOURCES;
                 goto Failure;
@@ -478,6 +496,7 @@ IwanNtMiniportInitializeEx(
                 adapter->RxPool, sizeof(IWAN_NT_MINIPORT_RX_CONTEXT), 0,
                 slot->Mdl, 0, IWAN_NT_MINIPORT_MTU);
             if (slot->Nbl == NULL) {
+                IwanNtMiniportFault(MiniportAdapterHandle, 203u, 0);
                 IwanNtTrace(203u);
                 status = NDIS_STATUS_RESOURCES;
                 goto Failure;
@@ -526,6 +545,7 @@ IwanNtMiniportInitializeEx(
     status = NdisMSetMiniportAttributes(
         MiniportAdapterHandle, (PNDIS_MINIPORT_ADAPTER_ATTRIBUTES)&registration);
     if (status != NDIS_STATUS_SUCCESS) {
+        IwanNtMiniportFault(MiniportAdapterHandle, 301u, (ULONG)status);
         IwanNtTrace(301u);
         goto Failure;
     }
@@ -577,6 +597,7 @@ IwanNtMiniportInitializeEx(
         MiniportAdapterHandle, (PNDIS_MINIPORT_ADAPTER_ATTRIBUTES)&general);
     if (status != NDIS_STATUS_SUCCESS) {
         /* 0xC000009A here means NDIS disliked the attributes, not memory. */
+        IwanNtMiniportFault(MiniportAdapterHandle, 302u, (ULONG)status);
         IwanNtTrace(302u);
         goto Failure;
     }
