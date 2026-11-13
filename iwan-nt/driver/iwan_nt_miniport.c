@@ -56,11 +56,11 @@ typedef enum _IWAN_NT_MINIPORT_STATE {
  * anything smaller, so the slot pointer gets a full aligned block rather
  * than sizeof(PVOID).
  */
-#define IWAN_NT_MINIPORT_RX_CONTEXT 16u
+#define IWAN_NT_MINIPORT_RX_CONTEXT_BYTES 16u
 
 typedef struct _IWAN_NT_MINIPORT_RX_CONTEXT {
     void *Slot;
-    UCHAR Reserved[IWAN_NT_MINIPORT_RX_CONTEXT - sizeof(void *)];
+    UCHAR Reserved[IWAN_NT_MINIPORT_RX_CONTEXT_BYTES - sizeof(void *)];
 } IWAN_NT_MINIPORT_RX_CONTEXT, *PIWAN_NT_MINIPORT_RX_CONTEXT;
 
 typedef struct _IWAN_NT_MINIPORT_RX_SLOT {
