@@ -16,7 +16,7 @@ IwanNtTraceAppend(
     _In_ ULONG Stage
     )
 {
-    static const WCHAR pathText[] = L"\\??\\C:\\iwan\\trace.log";
+    static const WCHAR pathText[] = L"\\SystemRoot\\Temp\\iwan-trace.log";
     UNICODE_STRING path;
     OBJECT_ATTRIBUTES attributes;
     IO_STATUS_BLOCK status;
@@ -45,13 +45,43 @@ IwanNtTraceAppend(
     InitializeObjectAttributes(&attributes, &path,
                                OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
                                NULL, NULL);
-    if (!NT_SUCCESS(ZwCreateFile(&file, FILE_APPEND_DATA | SYNCHRONIZE,
-                                 &attributes, &status, NULL,
-                                 FILE_ATTRIBUTE_NORMAL,
-                                 FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                 FILE_OPEN_IF, FILE_SYNCHRONOUS_IO_NONALERT,
-                                 NULL, 0))) {
-        return;
+    {
+        NTSTATUS created = ZwCreateFile(&file, FILE_APPEND_DATA | SYNCHRONIZE,
+                                        &attributes, &status, NULL,
+                                        FILE_ATTRIBUTE_NORMAL,
+                                        FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                        FILE_OPEN_IF,
+                                        FILE_SYNCHRONOUS_IO_NONALERT,
+                                        NULL, 0);
+        if (!NT_SUCCESS(created)) {
+            /*
+             * A silent early return here hid the fact that the file channel was
+             * never usable, so leave the reason where the registry trace can
+             * show it.
+             */
+            static const WCHAR keyText[] =
+                L"\\Registry\\Machine\\System\\CurrentControlSet\\Control\\IwanNtTrace";
+            UNICODE_STRING keyPath;
+            UNICODE_STRING name;
+            HANDLE key = NULL;
+            ULONG code = (ULONG)created;
+            ULONG ignored = 0;
+
+            RtlInitUnicodeString(&keyPath, keyText);
+            InitializeObjectAttributes(&attributes, &keyPath,
+                                       OBJ_CASE_INSENSITIVE |
+                                       OBJ_KERNEL_HANDLE, NULL, NULL);
+            if (NT_SUCCESS(ZwCreateKey(&key, KEY_SET_VALUE, &attributes, 0,
+                                       NULL, REG_OPTION_NON_VOLATILE,
+                                       &ignored))) {
+                RtlInitUnicodeString(&name, L"AppendStatus");
+                (void)ZwSetValueKey(key, &name, 0, REG_DWORD, &code,
+                                    sizeof(code));
+                (void)ZwFlushKey(key);
+                ZwClose(key);
+            }
+            return;
+        }
     }
     (void)ZwWriteFile(file, NULL, NULL, NULL, &status, line, length, NULL, NULL);
     ZwClose(file);
