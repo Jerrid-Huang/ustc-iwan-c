@@ -36,19 +36,26 @@ DriverEntry(
     IwanNtMiniportDriverHandle = NULL;
 
     /*
-     * The control device comes first: a miniport that came up without a way to
-     * install a session would advertise a tunnel that can never carry traffic.
+     * Register the miniport driver first. NdisRegisterDeviceEx below relies on
+     * the wrapper state that NdisMRegisterMiniportDriver installs; calling it
+     * before any miniport registration faults inside NDIS with a near-null
+     * write (observed as bugcheck 0x50).
      */
-    status = IwanNtControlRegister(DriverObject);
-    if (!NT_SUCCESS(status)) {
-        return status;
-    }
-
     status = IwanNtMiniportRegisterDriver(
         DriverObject, RegistryPath, IwanNtMiniportUnload,
         &IwanNtMiniportDriverHandle);
     if (!NT_SUCCESS(status)) {
-        IwanNtControlDeregister();
+        return status;
+    }
+
+    /*
+     * The control device comes second. A miniport that came up without a way
+     * to install a session would advertise a tunnel that never carries
+     * traffic, so failing here rolls the miniport registration back.
+     */
+    status = IwanNtControlRegister(DriverObject);
+    if (!NT_SUCCESS(status)) {
+        IwanNtMiniportUnregisterDriver(&IwanNtMiniportDriverHandle);
         return status;
     }
 
