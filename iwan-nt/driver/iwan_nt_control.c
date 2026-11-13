@@ -554,7 +554,7 @@ IwanNtControlRegister(
 
     PAGED_CODE();
 
-    if (DriverObject == NULL) {
+    if (MiniportDriverHandle == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
     if (g_Control.Registered != FALSE) {
