@@ -522,9 +522,11 @@ IwanNtMiniportInitializeEx(
     registration.AttributeFlags =
         NDIS_MINIPORT_ATTRIBUTES_SURPRISE_REMOVE_OK;
     registration.InterfaceType = NdisInterfaceInternal;
+    IwanNtTrace(19u);
     status = NdisMSetMiniportAttributes(
         MiniportAdapterHandle, (PNDIS_MINIPORT_ADAPTER_ATTRIBUTES)&registration);
     if (status != NDIS_STATUS_SUCCESS) {
+        IwanNtTrace(301u);
         goto Failure;
     }
 
@@ -570,9 +572,12 @@ IwanNtMiniportInitializeEx(
     general.SupportedOidListLength = sizeof(IwanNtMiniportSupportedOids);
     general.PowerManagementCapabilitiesEx = &power;
     /* NULL RecvScaleCapabilities disables RSS: one logical TX/RX queue. */
+    IwanNtTrace(21u);
     status = NdisMSetMiniportAttributes(
         MiniportAdapterHandle, (PNDIS_MINIPORT_ADAPTER_ATTRIBUTES)&general);
     if (status != NDIS_STATUS_SUCCESS) {
+        /* 0xC000009A here means NDIS disliked the attributes, not memory. */
+        IwanNtTrace(302u);
         goto Failure;
     }
 
