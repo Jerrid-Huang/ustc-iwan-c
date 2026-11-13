@@ -66,7 +66,7 @@ jobs:
           $wsk = Join-Path $inc.FullName 'km\wsk.h'
           if (Test-Path $wsk) {
             $lines += Select-String -Path $wsk -Pattern 'WskGetLocalAddress' | ForEach-Object { "$($_.LineNumber): $($_.Line.Trim())" }
-            $lines += Select-String -Path $wsk -Pattern '_WSK_PROVIDER_(BASIC|DATAGRAM)_DISPATCH' | ForEach-Object { "$($_.LineNumber): $($_.Line.Trim())" }
+            $lines += (Get-Content $wsk)[1549..1600] | ForEach-Object { "wsk.h: $_" }
           } else {
             $lines += 'wsk.h not found'
           }

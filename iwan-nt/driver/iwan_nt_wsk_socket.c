@@ -363,12 +363,11 @@ IwanNtWskDatagramBind(
 
         if (NT_SUCCESS(localStatus)) {
             /*
-             * WskGetLocalAddress is one of the inline entry points that the WSK
-             * header expands into the provider call, so it is called by name
-             * instead of through a dispatch field: the field lives in a
-             * provider structure the header does not publish member names for.
+             * The datagram dispatch table carries this entry point; the basic
+             * table that shares its prefix does not, which is why the lookup
+             * has to stay on the datagram pointer.
              */
-            localStatus = WskGetLocalAddress(
+            localStatus = dispatch->WskGetLocalAddress(
                 Datagram->Socket, (PSOCKADDR)&Datagram->BoundAddress,
                 Datagram->LifecycleIrp);
             (void)IwanNtWskDatagramFinishIrp(

@@ -173,8 +173,3 @@ NTSTATUS WskCaptureProviderNPI(PWSK_REGISTRATION Registration, ULONG WaitTimeout
 VOID WskReleaseProviderNPI(PWSK_REGISTRATION Registration);
 
 #endif
-
-/* The header exposes this as a macro over the provider table. */
-#define WskGetLocalAddress(Socket, LocalAddress, Irp)                       \
-    (((const WSK_PROVIDER_BASIC_DISPATCH *)(Socket)->Dispatch)              \
-         ->WskGetLocalAddress((Socket), (LocalAddress), (Irp)))
