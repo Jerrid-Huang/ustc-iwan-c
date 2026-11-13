@@ -436,12 +436,6 @@ IwanNtMiniportInitializeEx(
         adapter->RxPool = NdisAllocateNetBufferListPool(MiniportAdapterHandle,
                                                         &params);
     IwanNtTrace(IWAN_NT_STAGE_RXPOOL);
-    /*
-     * BISECT ONLY: fail here on purpose so the reported problem status tells
-     * us whether the status we return is the status the stack shows.
-     */
-    status = NDIS_STATUS_RESOURCES;
-    goto Failure;
         if (adapter->RxPool == NULL) {
             IwanNtTrace(31u);
             status = NDIS_STATUS_RESOURCES;
@@ -469,12 +463,14 @@ IwanNtMiniportInitializeEx(
                 MiniportAdapterHandle, IWAN_NT_MINIPORT_MTU,
                 IWAN_NT_MINIPORT_POOL_TAG, NormalPoolPriority);
             if (slot->Buffer == NULL) {
+                IwanNtTrace(41u);
                 status = NDIS_STATUS_RESOURCES;
                 goto Failure;
             }
             slot->Mdl = NdisAllocateMdl(MiniportAdapterHandle, slot->Buffer,
                                         IWAN_NT_MINIPORT_MTU);
             if (slot->Mdl == NULL) {
+                IwanNtTrace(42u);
                 status = NDIS_STATUS_RESOURCES;
                 goto Failure;
             }
@@ -482,6 +478,7 @@ IwanNtMiniportInitializeEx(
                 adapter->RxPool, sizeof(IWAN_NT_MINIPORT_RX_CONTEXT), 0,
                 slot->Mdl, 0, IWAN_NT_MINIPORT_MTU);
             if (slot->Nbl == NULL) {
+                IwanNtTrace(43u);
                 status = NDIS_STATUS_RESOURCES;
                 goto Failure;
             }
