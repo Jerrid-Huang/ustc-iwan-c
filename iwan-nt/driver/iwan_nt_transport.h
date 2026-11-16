@@ -27,6 +27,10 @@ extern "C" {
 #define IWAN_NT_TX_DRAIN_MS 2000UL
 
 
+/* The kernel handshake gained (1) or lost (0) its session. */
+typedef VOID (*IWAN_NT_TRANSPORT_SESSION_CHANGED)(_In_opt_ void *Context,
+                                                  _In_ int Valid);
+
 typedef enum _IWAN_NT_TRANSPORT_STATE {
     IwanNtTransportUninitialized = 0,
     IwanNtTransportStopped,
@@ -93,6 +97,16 @@ typedef struct _IWAN_NT_TRANSPORT {
      */
     IWAN_NT_PEER Peer;
     BOOLEAN PeerReady;
+    /*
+     * Link state follows the session, and a session can appear from two
+     * directions: a SET_SESSION IOCTL, or the kernel handshake reaching Up.
+     * The transport is the only place that sees both, so it is the one that
+     * tells the adapter; without this the adapter stays Disconnected and the
+     * stack never hands it a packet to send.
+     */
+    IWAN_NT_TRANSPORT_SESSION_CHANGED SessionChanged;
+    void *SessionChangedContext;
+    LONG SessionNotified;
     IWAN_NT_TIMER PeerTimer;
     /*
      * Control frames the peer generates are built here. The buffer lives in the
@@ -149,6 +163,16 @@ _IRQL_requires_(PASSIVE_LEVEL)
 VOID
 IwanNtTransportClearSession(
     _Inout_ PIWAN_NT_TRANSPORT Transport
+    );
+
+/* Called from DISPATCH_LEVEL when the kernel handshake gains or loses its
+ * session, so the adapter can reflect the link state. */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+IwanNtTransportSetSessionCallback(
+    _Inout_ PIWAN_NT_TRANSPORT Transport,
+    _In_opt_ IWAN_NT_TRANSPORT_SESSION_CHANGED Callback,
+    _In_opt_ void *Context
     );
 
 /* Decrypted inner packet destination and the control queue storage. */

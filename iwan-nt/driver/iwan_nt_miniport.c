@@ -677,6 +677,16 @@ IwanNtMiniportInitializeEx(
         IwanNtControlAttachAdapter(&adapter->Transport, &source);
     }
 
+    /*
+     * The kernel handshake installs its own session, bypassing the control
+     * device, so the transport has to be the one that reports it: without this
+     * the adapter stays Disconnected and the IP stack refuses to send on it.
+     */
+    IwanNtTransportSetSessionCallback(&adapter->Transport,
+                                      IwanNtMiniportSessionChanged,
+                                      adapter);
+    }
+
     IwanNtTrace(IWAN_NT_STAGE_CONTROL);
 
     IwanNtTrace(IWAN_NT_STAGE_INIT_DONE);

@@ -142,6 +142,8 @@ IwanNtRunConnect(
     DWORD seconds;
     DWORD started;
     uint32_t port;
+    uint16_t abi_family;
+    uint16_t abi_port;
 
     if (Argc < 6) {
         fprintf(stderr,
@@ -151,14 +153,15 @@ IwanNtRunConnect(
         return 2;
     }
 
-    port = (uint32_t)strtoul(Argv[2], NULL, 10);
+    port = (uint32_t)strtoul(Argv[3], NULL, 10);
     if (port == 0u || port > 65535u) {
-        fprintf(stderr, "invalid port: %s\n", Argv[2]);
+        fprintf(stderr, "invalid port: %s\n", Argv[3]);
         return 2;
     }
 
-    if (!IwanNtParseEndpoint(Argv[1], address, &family)) {
-        fprintf(stderr, "invalid address: %s\n", Argv[1]);
+    /* Argv[1] is the verb itself: the dispatcher passes the full command line. */
+    if (!IwanNtParseEndpoint(Argv[2], address, &family)) {
+        fprintf(stderr, "invalid address: %s\n", Argv[2]);
         return 2;
     }
 
@@ -191,11 +194,19 @@ IwanNtRunConnect(
         return 1;
     }
 
-    if (IwanNtSetPeer(Device, address, family, (uint16_t)port) == FALSE) {
+    /*
+     * Two conversions the ABI demands and the command line does not carry:
+     * the literal parser reports 4/6 while the ABI spells AF_INET/AF_INET6,
+     * and the port has to reach the WSK sockaddr in network order (GET_LOCAL
+     * hands it back the same way, so both ends of the exchange agree).
+     */
+    abi_family = (family == 6) ? (uint16_t)AF_INET6 : (uint16_t)AF_INET;
+    abi_port = (uint16_t)(((port & 0xFFu) << 8) | ((port >> 8) & 0xFFu));
+    if (IwanNtSetPeer(Device, address, abi_family, abi_port) == FALSE) {
         fprintf(stderr, "SET_PEER failed: %lu\n", GetLastError());
         return 1;
     }
-    if (IwanNtStartPeer(Device, Argv[3], Argv[4], mtu) == FALSE) {
+    if (IwanNtStartPeer(Device, Argv[4], Argv[5], mtu) == FALSE) {
         fprintf(stderr, "START_PEER failed: %lu\n", GetLastError());
         return 1;
     }

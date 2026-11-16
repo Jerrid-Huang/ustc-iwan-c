@@ -199,6 +199,41 @@ IwanNtTransportApplyPeerStateLocked(
     } else if (Transport->Ingress.SessionValid != 0) {
         IwanNtIngressClearSession(&Transport->Ingress);
     }
+
+    /*
+     * Tell the adapter about the handshake's session. A control-plane
+     * SET_SESSION reports through the control device instead, so only a running
+     * peer is allowed to drive the link here: otherwise every timer tick of an
+     * idle peer would clear the link a SET_SESSION had just raised.
+     */
+    if (Transport->PeerReady) {
+        LONG valid = (Transport->Peer.State == IwanNtPeerUp) ? 1 : 0;
+
+        if (Transport->SessionNotified != valid) {
+            Transport->SessionNotified = valid;
+            if (Transport->SessionChanged != NULL) {
+                Transport->SessionChanged(Transport->SessionChangedContext,
+                                          (int)valid);
+            }
+        }
+    }
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+IwanNtTransportSetSessionCallback(
+    _Inout_ PIWAN_NT_TRANSPORT Transport,
+    _In_opt_ IWAN_NT_TRANSPORT_SESSION_CHANGED Callback,
+    _In_opt_ void *Context
+    )
+{
+    /*
+     * Written once at initialize time, before the transport can receive
+     * anything; the reader is the timer at DISPATCH_LEVEL.
+     */
+    Transport->SessionChanged = Callback;
+    Transport->SessionChangedContext = Context;
+    Transport->SessionNotified = 0;
 }
 
 /*
