@@ -685,7 +685,6 @@ IwanNtMiniportInitializeEx(
     IwanNtTransportSetSessionCallback(&adapter->Transport,
                                       IwanNtMiniportSessionChanged,
                                       adapter);
-    }
 
     IwanNtTrace(IWAN_NT_STAGE_CONTROL);
 
