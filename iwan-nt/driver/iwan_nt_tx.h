@@ -39,10 +39,18 @@ typedef struct _IWAN_NT_TX_SLOT {
     struct _IWAN_NT_TX *Owner;
     PVOID Buffer;
     PMDL Mdl;
+    /*
+     * Second link of the frame for an in-place send: the header lives in
+     * Buffer and this MDL describes the caller's packet, which is sent
+     * straight from its own memory. Unused on the copying path.
+     */
+    PMDL PayloadMdl;
     PIRP Irp;
     WSK_BUF_LIST List;
     ULONG Index;
     BOOLEAN InUse;
+    /* Handed back to the caller when this slot's send completes. */
+    void *CompleteOwner;
 } IWAN_NT_TX_SLOT, *PIWAN_NT_TX_SLOT;
 
 /*
@@ -65,13 +73,35 @@ typedef NTSTATUS (*IWAN_NT_TX_SUBMIT)(
 typedef struct _IWAN_NT_TX_ITEM {
     const uint8_t *Inner;
     size_t InnerLength;
+#ifdef IWAN_NT_KERNEL
+    /*
+     * In-place send. When Owner is set the pool does not copy the payload: it
+     * writes only the eight byte frame header, transforms Inner where it lies,
+     * and sends both pieces as one two link MDL chain. Inner must therefore be
+     * writable and must stay untouched until SlotComplete reports Owner back.
+     * Owner is NULL for the copying path, where Inner is only read.
+     */
+    void *Owner;
+#endif
 } IWAN_NT_TX_ITEM, *PIWAN_NT_TX_ITEM;
+
+/*
+ * Report a slot's Owner once the datagram that used it has completed. Runs at
+ * IRQL <= DISPATCH_LEVEL, after the slot is free again, and must not touch the
+ * slot itself. The pool calls it without holding Lock.
+ */
+typedef VOID (*IWAN_NT_TX_SLOT_COMPLETE)(_In_opt_ void *Context, _In_ void *Owner);
+
+/* Largest chain one submit may carry; matches the miniport batch size. */
+#define IWAN_NT_TX_MAX_CHAIN 32UL
 
 struct _IWAN_NT_TX {
     KSPIN_LOCK Lock;
     KEVENT IdleEvent;
     IWAN_NT_TX_SUBMIT Submit;
     void *SubmitContext;
+    IWAN_NT_TX_SLOT_COMPLETE SlotComplete;
+    void *SlotCompleteContext;
     IWAN_NT_SOCKADDR Remote;
     BOOLEAN RemoteValid;
     ULONG SlotCount;
@@ -112,6 +142,21 @@ _IRQL_requires_(PASSIVE_LEVEL)
 VOID
 IwanNtTxFinalize(
     _Inout_ PIWAN_NT_TX Tx
+    );
+
+/*
+ * Register the completion callback for in-place sends. Without it an in-place
+ * item would never be released, so the pool refuses in-place items while the
+ * callback is missing.
+ *
+ * IRQL: PASSIVE_LEVEL.
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID
+IwanNtTxSetSlotComplete(
+    _Inout_ PIWAN_NT_TX Tx,
+    _In_opt_ IWAN_NT_TX_SLOT_COMPLETE SlotComplete,
+    _In_opt_ void *Context
     );
 
 /* Peer address for every subsequent send. IRQL: PASSIVE_LEVEL. */

@@ -56,6 +56,13 @@ typedef enum _IWAN_NT_MINIPORT_STATE {
  */
 #define IWAN_NT_MINIPORT_SEND_BATCH 32UL
 
+/*
+ * How many lists may be handed back in one go while a send chain is being
+ * taken apart. Completion is not allowed under the send lock, so the walk
+ * collects finished lists into this array and drains it in between.
+ */
+#define IWAN_NT_MINIPORT_COMPLETE_CHUNK 32UL
+
 #define IWAN_NT_MINIPORT_RX_SLOTS 4u
 
 /*
@@ -397,6 +404,37 @@ IwanNtMiniportFault(
                            3, Stage, Status, 0);
 }
 
+/*
+ * A slot has finished with a packet that it borrowed instead of copying.
+ *
+ * The pool calls this at <= DISPATCH_LEVEL with no lock held, which is the
+ * only context in which NDIS may be told the list is done; the buffer list is
+ * returned here and nowhere else, so exactly one completion is reported per
+ * borrowed list.
+ */
+static VOID
+IwanNtMiniportSlotComplete(
+    void *Context,
+    void *Owner
+    )
+{
+    PIWAN_NT_MINIPORT_ADAPTER adapter = Context;
+    PNET_BUFFER_LIST nbl = Owner;
+    ULONG flags;
+
+    if (adapter == NULL || nbl == NULL) {
+        return;
+    }
+
+    flags = (KeGetCurrentIrql() == DISPATCH_LEVEL)
+                ? NDIS_SEND_COMPLETE_FLAGS_DISPATCH_LEVEL
+                : 0;
+
+    NET_BUFFER_LIST_STATUS(nbl) = NDIS_STATUS_SUCCESS;
+    NET_BUFFER_LIST_NEXT_NBL(nbl) = NULL;
+    NdisMSendNetBufferListsComplete(adapter->AdapterHandle, nbl, flags);
+}
+
 _Use_decl_annotations_
 static NDIS_STATUS
 IwanNtMiniportInitializeEx(
@@ -431,6 +469,14 @@ IwanNtMiniportInitializeEx(
     adapter->PowerState = NdisDeviceStateD0;
 
     status = IwanNtTransportInitialize(&adapter->Transport, 16);
+    if (NT_SUCCESS(status)) {
+        /*
+         * From here on the send path may keep a caller's packet in place and
+         * hand it back through this callback when the datagram is done.
+         */
+        IwanNtTxSetSlotComplete(&adapter->Transport.Tx, IwanNtMiniportSlotComplete,
+                                adapter);
+    }
     if (!NT_SUCCESS(status)) {
         goto Failure;
     }
@@ -1040,8 +1086,10 @@ _Use_decl_annotations_
 static BOOLEAN
 IwanNtMiniportStagePacket(
     _Inout_ PIWAN_NT_MINIPORT_ADAPTER Adapter,
+    _In_ PNET_BUFFER_LIST Nbl,
     _In_ PNET_BUFFER Nb,
     _In_ ULONG Slot,
+    _In_ BOOLEAN InPlace,
     _Out_ IWAN_NT_TX_ITEM *Item
     )
 {
@@ -1050,6 +1098,21 @@ IwanNtMiniportStagePacket(
 
     if (length == 0 || length > IWAN_NT_TX_BUFFER_BYTES) {
         return FALSE;
+    }
+
+    if (InPlace) {
+        /*
+         * Ask for the packet's own memory. Returns NULL unless the whole
+         * datagram sits in one MDL; the caller reads that as "copy instead",
+         * never as a failed send.
+         */
+        bytes = NdisGetDataBuffer(Nb, length, NULL, 0, 0);
+        if (bytes != NULL) {
+            Item->Inner = bytes;
+            Item->InnerLength = length;
+            Item->Owner = Nbl;
+            return TRUE;
+        }
     }
 
     bytes = NdisGetDataBuffer(
@@ -1061,6 +1124,7 @@ IwanNtMiniportStagePacket(
 
     Item->Inner = bytes;
     Item->InnerLength = length;
+    Item->Owner = NULL;
     return TRUE;
 }
 
@@ -1071,7 +1135,7 @@ IwanNtMiniportStagePacket(
  * hold are reported as resources so the stack retries them.
  */
 _Use_decl_annotations_
-static VOID
+static ULONG
 IwanNtMiniportFlushBatch(
     _Inout_ PIWAN_NT_MINIPORT_ADAPTER Adapter,
     _In_reads_(Count) const IWAN_NT_TX_ITEM *Items,
@@ -1082,7 +1146,7 @@ IwanNtMiniportFlushBatch(
     ULONG accepted = 0;
 
     if (Count == 0) {
-        return;
+        return 0;
     }
 
     (VOID)IwanNtTransportSendInnerBatch(
@@ -1093,6 +1157,8 @@ IwanNtMiniportFlushBatch(
         InterlockedExchangeAdd(&Adapter->TxRejected, (LONG)(Count - accepted));
         *PacketStatus = NDIS_STATUS_RESOURCES;
     }
+
+    return accepted;
 }
 
 _Use_decl_annotations_
@@ -1107,6 +1173,9 @@ IwanNtMiniportSendNetBufferLists(
     PIWAN_NT_MINIPORT_ADAPTER adapter = MiniportAdapterContext;
     NDIS_HANDLE handle = adapter->AdapterHandle;
     PNET_BUFFER_LIST current;
+    PNET_BUFFER_LIST done[IWAN_NT_MINIPORT_COMPLETE_CHUNK];
+    ULONG doneCount = 0;
+    ULONG index;
     ULONG completeFlags = 0;
     LONG state;
 
@@ -1132,10 +1201,13 @@ IwanNtMiniportSendNetBufferLists(
      * synchronous path stays single threaded even when several CPUs send.
      */
     NdisAcquireSpinLock(&adapter->SendLock);
-    for (current = NetBufferLists; current != NULL;
-         current = NET_BUFFER_LIST_NEXT_NBL(current)) {
+    for (current = NetBufferLists; current != NULL; ) {
+        PNET_BUFFER_LIST next = NET_BUFFER_LIST_NEXT_NBL(current);
         PNET_BUFFER nb;
         NDIS_STATUS packetStatus = NDIS_STATUS_SUCCESS;
+        BOOLEAN haveInPlace = FALSE;
+        ULONG inPlaceIndex = 0;
+        BOOLEAN owned = FALSE;
 
         /*
          * Accumulate up to SEND_BATCH packets of one inner family and hand
@@ -1145,7 +1217,18 @@ IwanNtMiniportSendNetBufferLists(
         {
             IWAN_NT_TX_ITEM items[IWAN_NT_MINIPORT_SEND_BATCH];
             ULONG count = 0;
+            ULONG accepted;
             unsigned family = 0;
+
+            /*
+             * Only a packet that arrives as a single network buffer may travel
+             * in place: the pool keeps the buffer list until the send
+             * completes, which is sound only when this list carries nothing
+             * else.
+             */
+            BOOLEAN allowInPlace =
+                (NET_BUFFER_LIST_FIRST_NB(current) != NULL &&
+                 NET_BUFFER_NEXT_NB(NET_BUFFER_LIST_FIRST_NB(current)) == NULL);
 
             for (nb = NET_BUFFER_LIST_FIRST_NB(current);
                  nb != NULL; nb = NET_BUFFER_NEXT_NB(nb)) {
@@ -1171,7 +1254,8 @@ IwanNtMiniportSendNetBufferLists(
                     count = 0;
                 }
 
-                if (!IwanNtMiniportStagePacket(adapter, nb, count, &item)) {
+                if (!IwanNtMiniportStagePacket(adapter, current, nb, count,
+                                               allowInPlace, &item)) {
                     packetStatus = NDIS_STATUS_RESOURCES;
                     continue;
                 }
@@ -1187,21 +1271,54 @@ IwanNtMiniportSendNetBufferLists(
                                              &packetStatus);
                     RtlCopyMemory(adapter->SendScratch, item.Inner, length);
                     item.Inner = adapter->SendScratch;
+                    /* The staging buffer is ours, so the packet stays here. */
+                    item.Owner = NULL;
                     count = 0;
                 }
 
                 family = nbFamily;
                 items[count] = item;
+                if (item.Owner != NULL) {
+                    haveInPlace = TRUE;
+                    inPlaceIndex = count;
+                }
                 count++;
             }
 
-            IwanNtMiniportFlushBatch(adapter, items, count, &packetStatus);
+            accepted = IwanNtMiniportFlushBatch(adapter, items, count,
+                                                &packetStatus);
+            owned = (haveInPlace && accepted > inPlaceIndex);
         }
-        NET_BUFFER_LIST_STATUS(current) = packetStatus;
+
+        if (!owned) {
+            /*
+             * Nothing kept this packet: its bytes are already inside a slot, so
+             * the list goes back now. It is unlinked so that the rest of the
+             * chain can be returned separately.
+             */
+            NET_BUFFER_LIST_STATUS(current) = packetStatus;
+            NET_BUFFER_LIST_NEXT_NBL(current) = NULL;
+            done[doneCount++] = current;
+            if (doneCount == IWAN_NT_MINIPORT_COMPLETE_CHUNK) {
+                NdisReleaseSpinLock(&adapter->SendLock);
+                for (index = 0; index < doneCount; index++) {
+                    NdisMSendNetBufferListsComplete(handle, done[index],
+                                                    completeFlags);
+                }
+                doneCount = 0;
+                NdisAcquireSpinLock(&adapter->SendLock);
+            }
+        }
+        /* Otherwise the slot owns the list and reports it back when it is done. */
+
+        current = next;
     }
     NdisReleaseSpinLock(&adapter->SendLock);
+
     /* No access to an NBL or adapter is made after returning its ownership. */
-    NdisMSendNetBufferListsComplete(handle, NetBufferLists, completeFlags);
+    for (index = 0; index < doneCount; index++) {
+        NdisMSendNetBufferListsComplete(handle, done[index], completeFlags);
+    }
 }
 
 _Use_decl_annotations_

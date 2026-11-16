@@ -24,6 +24,9 @@ IwanNtTxComplete(
     PIWAN_NT_TX tx;
     KIRQL oldIrql;
     BOOLEAN signalIdle;
+    void *owners[IWAN_NT_TX_MAX_CHAIN];
+    ULONG ownerCount = 0;
+    ULONG ownerIndex;
 
     UNREFERENCED_PARAMETER(DeviceObject);
     UNREFERENCED_PARAMETER(Irp);
@@ -52,6 +55,14 @@ IwanNtTxComplete(
 
             entry = entry->Next;
             member->List.Next = NULL;
+            if (member->Mdl->Next != NULL) {
+                member->Mdl->Next = NULL;
+            }
+            if (member->CompleteOwner != NULL &&
+                ownerCount < IWAN_NT_TX_MAX_CHAIN) {
+                owners[ownerCount++] = member->CompleteOwner;
+                member->CompleteOwner = NULL;
+            }
             member->InUse = FALSE;
             tx->FreeCount++;
             tx->InFlight--;
@@ -63,6 +74,17 @@ IwanNtTxComplete(
 
     if (signalIdle) {
         KeSetEvent(&tx->IdleEvent, IO_NO_INCREMENT, FALSE);
+    }
+
+    /*
+     * Packets that were transformed where they lay can only go back to the
+     * caller now, with no lock held: the callback re-enters NDIS and may
+     * complete the send synchronously.
+     */
+    if (tx->SlotComplete != NULL) {
+        for (ownerIndex = 0; ownerIndex < ownerCount; ownerIndex++) {
+            tx->SlotComplete(tx->SlotCompleteContext, owners[ownerIndex]);
+        }
     }
 
     return STATUS_MORE_PROCESSING_REQUIRED;
@@ -126,6 +148,20 @@ IwanNtTxInitialize(
         }
         MmBuildMdlForNonPagedPool(slot->Mdl);
 
+        /*
+         * Sized once for the largest frame this pool can carry; the address and
+         * length are rewritten for every in-place send, which is why it is
+         * allocated here (PASSIVE) and only re-initialised on the wire path.
+         */
+        slot->PayloadMdl = IoAllocateMdl(
+            slot->Buffer, IWAN_NT_TX_BUFFER_BYTES, FALSE, FALSE, NULL);
+        if (slot->PayloadMdl == NULL) {
+            IwanNtTxFinalize(Tx);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        MmBuildMdlForNonPagedPool(slot->PayloadMdl);
+        slot->CompleteOwner = NULL;
+
         slot->Irp = IoAllocateIrp(1, FALSE);
         if (slot->Irp == NULL) {
             IwanNtTxFinalize(Tx);
@@ -163,6 +199,10 @@ IwanNtTxFinalize(
             IoFreeIrp(slot->Irp);
             slot->Irp = NULL;
         }
+        if (slot->PayloadMdl != NULL) {
+            IoFreeMdl(slot->PayloadMdl);
+            slot->PayloadMdl = NULL;
+        }
         if (slot->Mdl != NULL) {
             IoFreeMdl(slot->Mdl);
             slot->Mdl = NULL;
@@ -195,6 +235,24 @@ IwanNtTxSetRemote(
     Tx->RemoteValid = TRUE;
 }
 
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID
+IwanNtTxSetSlotComplete(
+    _Inout_ PIWAN_NT_TX Tx,
+    _In_opt_ IWAN_NT_TX_SLOT_COMPLETE SlotComplete,
+    _In_opt_ void *Context
+    )
+{
+    PAGED_CODE();
+
+    if (Tx == NULL) {
+        return;
+    }
+
+    Tx->SlotComplete = SlotComplete;
+    Tx->SlotCompleteContext = Context;
+}
+
 _IRQL_requires_max_(DISPATCH_LEVEL)
 /*
  * Claim a free slot, or fail without touching the pool.
@@ -217,6 +275,7 @@ IwanNtTxClaimSlot(
         if (!Tx->Slots[index].InUse) {
             slot = &Tx->Slots[index];
             slot->InUse = TRUE;
+            slot->CompleteOwner = NULL;
             Tx->FreeCount--;
             Tx->InFlight++;
             KeClearEvent(&Tx->IdleEvent);
@@ -364,8 +423,21 @@ IwanNtTxSubmitChain(
          */
         for (;;) {
             PWSK_BUF_LIST next = Head->List.Next;
+            void *owner = Head->CompleteOwner;
 
+            Head->CompleteOwner = NULL;
+            if (Head->Mdl->Next != NULL) {
+                Head->Mdl->Next = NULL;
+            }
             IwanNtTxAbandonSlot(Tx, Head, TRUE);
+            /*
+             * The datagram never left, but its payload has already been
+             * transformed in place, so the packet still has to go back to the
+             * caller before the slot can be reused.
+             */
+            if (owner != NULL && Tx->SlotComplete != NULL) {
+                Tx->SlotComplete(Tx->SlotCompleteContext, owner);
+            }
             if (next == NULL) {
                 break;
             }
@@ -381,6 +453,61 @@ IwanNtTxSubmitChain(
 
     return STATUS_SUCCESS;
 }
+
+#ifdef IWAN_NT_KERNEL
+/*
+ * Build the frame around a packet that stays where it is.
+ *
+ * Only the eight byte header is written into the slot; the payload is
+ * transformed in the caller's memory and described by the second MDL of the
+ * chain, so the datagram leaves without ever being copied. The caller's buffer
+ * is writable by contract (an NDIS send packet is non-paged and owned by the
+ * sender until the send completes), and Slot->CompleteOwner keeps the packet
+ * alive until that completion.
+ */
+static NTSTATUS
+IwanNtTxSealInPlace(
+    _Inout_ PIWAN_NT_TX_SLOT Slot,
+    _Inout_ const uint8_t *Inner,
+    _In_ size_t InnerLength,
+    _In_ const IWAN_NT_FRAME_HEADER *Header,
+    _In_reads_bytes_opt_(IWAN_NT_FRAME_KEY_LEN) const uint8_t *Key,
+    _Out_ size_t *FrameLength
+    )
+{
+    IWAN_NT_FRAME_HEADER header = *Header;
+    uint8_t *payload = (uint8_t *)Inner;
+
+    if (IwanNtFrameTypeIsData(header.Type) == FALSE) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (IwanNtFrameInnerSane(payload, InnerLength) != IwanNtFrameOk) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (IwanNtFrameTypeIsEncrypted(header.Type)) {
+        if (Key == NULL) {
+            return STATUS_INVALID_PARAMETER;
+        }
+        header.Encrypt = 1u;
+    } else {
+        header.Encrypt = 0u;
+    }
+
+    IwanNtFrameHeaderEncode((uint8_t *)Slot->Buffer, &header);
+    if (header.Encrypt != 0u) {
+        IwanNtFrameXor(payload, InnerLength, Key);
+    }
+
+    MmInitializeMdl(Slot->Mdl, Slot->Buffer, IWAN_NT_FRAME_HDR_LEN);
+    MmBuildMdlForNonPagedPool(Slot->Mdl);
+    MmInitializeMdl(Slot->PayloadMdl, payload, InnerLength);
+    MmBuildMdlForNonPagedPool(Slot->PayloadMdl);
+    Slot->Mdl->Next = Slot->PayloadMdl;
+
+    *FrameLength = (size_t)IWAN_NT_FRAME_HDR_LEN + InnerLength;
+    return STATUS_SUCCESS;
+}
+#endif
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
@@ -430,12 +557,29 @@ IwanNtTxSendBatch(
             break;
         }
 
-        seal = IwanNtFrameSeal(
-            (uint8_t *)slot->Buffer, IWAN_NT_TX_BUFFER_BYTES, Items[index].Inner,
-            innerLength, Header, Key, &frameLength);
-        if (seal != IwanNtFrameOk) {
-            IwanNtTxAbandonSlot(Tx, slot, TRUE);
-            break;
+#ifdef IWAN_NT_KERNEL
+        if (Items[index].Owner != NULL && Tx->SlotComplete != NULL) {
+            NTSTATUS status = IwanNtTxSealInPlace(
+                slot, Items[index].Inner, innerLength, Header, Key,
+                &frameLength);
+
+            if (!NT_SUCCESS(status)) {
+                IwanNtTxAbandonSlot(Tx, slot, TRUE);
+                break;
+            }
+            slot->CompleteOwner = Items[index].Owner;
+        } else
+#endif
+        {
+            seal = IwanNtFrameSeal(
+                (uint8_t *)slot->Buffer, IWAN_NT_TX_BUFFER_BYTES,
+                Items[index].Inner, innerLength, Header, Key, &frameLength);
+            if (seal != IwanNtFrameOk) {
+                IwanNtTxAbandonSlot(Tx, slot, TRUE);
+                break;
+            }
+            /* The copying path owns the whole buffer, so one link is enough. */
+            slot->Mdl->Next = NULL;
         }
 
         slot->List.Next = NULL;
