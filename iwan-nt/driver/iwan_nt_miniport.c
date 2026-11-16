@@ -454,6 +454,13 @@ IwanNtMiniportInitializeEx(
          * much memory the machine has.
          */
         params.fAllocateNetBuffer = TRUE;
+        /*
+         * The per-list context has to be reserved in the pool as well: the
+         * ContextSize passed to NdisAllocateNetBufferAndNetBufferList may only
+         * shrink what the pool created, and an oversized request is refused
+         * with STATUS_INSUFFICIENT_RESOURCES.
+         */
+        params.ContextSize = (USHORT)sizeof(IWAN_NT_MINIPORT_RX_CONTEXT);
         params.PoolTag = IWAN_NT_MINIPORT_POOL_TAG;
         adapter->RxPool = NdisAllocateNetBufferListPool(MiniportAdapterHandle,
                                                         &params);
