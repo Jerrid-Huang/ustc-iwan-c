@@ -510,6 +510,17 @@ IwanNtMiniportInitializeEx(
             slot->Nbl = NdisAllocateNetBufferAndNetBufferList(
                 adapter->RxPool, sizeof(IWAN_NT_MINIPORT_RX_CONTEXT), 0,
                 slot->Mdl, 0, IWAN_NT_MINIPORT_MTU);
+            if (slot->Nbl != NULL) {
+                IwanNtTrace(231u);
+            } else {
+                /* The pool carries the context already: ask for none. */
+                slot->Nbl = NdisAllocateNetBufferAndNetBufferList(
+                    adapter->RxPool, 0, 0, slot->Mdl, 0,
+                    IWAN_NT_MINIPORT_MTU);
+                if (slot->Nbl != NULL) {
+                    IwanNtTrace(232u);
+                }
+            }
             if (slot->Nbl == NULL) {
                 IwanNtMiniportFault(MiniportAdapterHandle, 203u, 0);
                 IwanNtTrace(203u);
