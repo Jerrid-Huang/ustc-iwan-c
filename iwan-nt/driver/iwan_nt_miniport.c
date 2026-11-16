@@ -47,7 +47,14 @@ typedef enum _IWAN_NT_MINIPORT_STATE {
  * queue holds (MAX_STAGED_PACKETS 128); the ceiling here is the send pool, so
  * one batch can claim every slot at most.
  */
-#define IWAN_NT_MINIPORT_SEND_BATCH IWAN_NT_TX_SLOTS
+/*
+ * Batches stay small even though the slot pool is large: the batch size only
+ * decides how many messages share one WSK call, while the slot count decides
+ * how many may be in flight.  Keeping the batch at 32 caps the stack footprint
+ * of the item array and gives the completion path a chance to run between
+ * submissions.
+ */
+#define IWAN_NT_MINIPORT_SEND_BATCH 32UL
 
 #define IWAN_NT_MINIPORT_RX_SLOTS 4u
 

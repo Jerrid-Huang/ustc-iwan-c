@@ -23,7 +23,14 @@ extern "C" {
  * backpressure reaches the NDIS caller as NDIS_STATUS_RESOURCES rather than as
  * unbounded kernel memory.
  */
-#define IWAN_NT_TX_SLOTS 32UL
+/*
+ * A busy link keeps roughly (slots / completion latency) packets per second in
+ * flight, so the slot count caps throughput before the CPU does: with 32 slots
+ * and a ~450 us host-to-host completion the ceiling landed near 56 kpps, well
+ * below the 88 kpps the same link carried without the tunnel. 128 slots move
+ * that ceiling out of the way at the cost of 256 KB of non-paged send buffers.
+ */
+#define IWAN_NT_TX_SLOTS 128UL
 #define IWAN_NT_TX_BUFFER_BYTES 2048UL
 
 typedef struct _IWAN_NT_TX IWAN_NT_TX, *PIWAN_NT_TX;
