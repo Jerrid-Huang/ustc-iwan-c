@@ -99,6 +99,7 @@ typedef struct _IWAN_NT_MINIPORT_ADAPTER {
     BOOLEAN SendLockReady;
     PUCHAR SendScratch;
     NDIS_HANDLE RxPool;
+    NDIS_HANDLE RxPoolProbe;
     IWAN_NT_MINIPORT_RX_SLOT RxSlots[IWAN_NT_MINIPORT_RX_SLOTS];
     ULONG RxSlotCount;
     volatile LONG RxInFlight;
@@ -462,6 +463,10 @@ IwanNtMiniportInitializeEx(
          */
         params.ContextSize = (USHORT)sizeof(IWAN_NT_MINIPORT_RX_CONTEXT);
         params.PoolTag = IWAN_NT_MINIPORT_POOL_TAG;
+        params.fAllocateNetBuffer = FALSE;
+        adapter->RxPoolProbe = NdisAllocateNetBufferListPool(
+            MiniportAdapterHandle, &params);
+        params.fAllocateNetBuffer = TRUE;
         adapter->RxPool = NdisAllocateNetBufferListPool(MiniportAdapterHandle,
                                                         &params);
     IwanNtTrace(IWAN_NT_STAGE_RXPOOL);
@@ -519,6 +524,27 @@ IwanNtMiniportInitializeEx(
                     IWAN_NT_MINIPORT_MTU);
                 if (slot->Nbl != NULL) {
                     IwanNtTrace(232u);
+                }
+            }
+            if (slot->Nbl == NULL) {
+                /*
+                 * Probe the rest of the matrix once, so the next build does not
+                 * have to guess which combination of pool flags and context
+                 * sizes NDIS is willing to hand out.
+                 */
+                if (adapter->RxPoolProbe != NULL) {
+                    slot->Nbl = NdisAllocateNetBufferAndNetBufferList(
+                        adapter->RxPoolProbe, 0, 0, slot->Mdl, 0,
+                        IWAN_NT_MINIPORT_MTU);
+                    if (slot->Nbl != NULL) {
+                        IwanNtTrace(233u);
+                    } else {
+                        slot->Nbl = NdisAllocateNetBufferList(
+                            adapter->RxPoolProbe, 0, 0);
+                        if (slot->Nbl != NULL) {
+                            IwanNtTrace(234u);
+                        }
+                    }
                 }
             }
             if (slot->Nbl == NULL) {
@@ -677,6 +703,10 @@ Failure:
         adapter->SendLockReady = FALSE;
     }
     IwanNtMiniportFreeRxSlots(adapter);
+    if (adapter->RxPoolProbe != NULL) {
+        NdisFreeNetBufferListPool(adapter->RxPoolProbe);
+        adapter->RxPoolProbe = NULL;
+    }
     if (adapter->RxPool != NULL) {
         NdisFreeNetBufferListPool(adapter->RxPool);
         adapter->RxPool = NULL;
@@ -736,6 +766,10 @@ IwanNtMiniportHaltEx(
     }
     if (InterlockedCompareExchange(&adapter->RxInFlight, 0, 0) == 0) {
         IwanNtMiniportFreeRxSlots(adapter);
+    }
+    if (adapter->RxPoolProbe != NULL) {
+        NdisFreeNetBufferListPool(adapter->RxPoolProbe);
+        adapter->RxPoolProbe = NULL;
     }
     if (adapter->RxPool != NULL) {
         NdisFreeNetBufferListPool(adapter->RxPool);
