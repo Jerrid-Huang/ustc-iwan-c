@@ -253,6 +253,16 @@ IwanNtTransportGetLocal(
 
 _IRQL_requires_(PASSIVE_LEVEL)
 /*
+ * Copy out the lease the peer assigned. Takes SessionLock, so it may be called
+ * from anywhere that can take a spinlock; IRQL: <= DISPATCH_LEVEL.
+ */
+void
+IwanNtTransportGetLease(
+    _In_ PIWAN_NT_TRANSPORT Transport,
+    _Out_ IWAN_NT_PEER_LEASE *Lease
+    );
+
+/*
  * Install the credentials and start the handshake.
  *
  * IRQL: PASSIVE_LEVEL.

@@ -342,6 +342,52 @@ IwanNtControlGetLocal(
 }
 
 static NTSTATUS
+IwanNtControlGetLease(
+    _In_ PIRP Irp,
+    _In_ PIO_STACK_LOCATION Stack
+    )
+{
+    IWAN_NT_LEASE_ABI *reply;
+    IWAN_NT_PEER_LEASE peer;
+    PIWAN_NT_TRANSPORT transport;
+    NTSTATUS status;
+
+    if (Stack->Parameters.DeviceIoControl.OutputBufferLength <
+        IWAN_NT_LEASE_STRUCT_SIZE) {
+        Irp->IoStatus.Information = (ULONG_PTR)IWAN_NT_LEASE_STRUCT_SIZE;
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    reply = (IWAN_NT_LEASE_ABI *)Irp->AssociatedIrp.SystemBuffer;
+    if (reply == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    status = IwanNtControlBegin(&transport);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    RtlZeroMemory(&peer, sizeof(peer));
+    IwanNtTransportGetLease(transport, &peer);
+    RtlZeroMemory(reply, sizeof(*reply));
+    if (peer.HasAddress != 0) {
+        RtlCopyMemory(reply->Address, peer.Address, 4);
+        reply->HasAddress = 1;
+        /* See the ABI comment: the wire carries no netmask. */
+        reply->Prefix = 24u;
+    }
+    if (peer.HasGateway != 0) {
+        RtlCopyMemory(reply->Gateway, peer.Gateway, 4);
+        reply->HasGateway = 1;
+    }
+
+    IwanNtControlEnd();
+
+    Irp->IoStatus.Information = (ULONG_PTR)sizeof(*reply);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS
 IwanNtControlGetStats(
     _In_ PIRP Irp,
     _In_ PIO_STACK_LOCATION Stack
@@ -484,6 +530,8 @@ IwanNtControlDispatchDeviceControl(
         return IwanNtControlGetLocal(Irp, Stack);
     case IWAN_NT_IOCTL_GET_STATS:
         return IwanNtControlGetStats(Irp, Stack);
+    case IWAN_NT_IOCTL_GET_LEASE:
+        return IwanNtControlGetLease(Irp, Stack);
     case IWAN_NT_IOCTL_START_PEER:
         return IwanNtControlStartPeer(Irp, Stack);
     case IWAN_NT_IOCTL_STOP_PEER:

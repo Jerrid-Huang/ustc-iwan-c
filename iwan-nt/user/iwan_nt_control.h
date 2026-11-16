@@ -109,6 +109,16 @@ IwanNtSendControl(
  * caller can retry with a bigger buffer.
  */
 /*
+ * The address the server assigned in the last acknowledgement, network order.
+ * The driver only reports it; installing it on the adapter is the caller's job.
+ */
+BOOL
+IwanNtGetLease(
+    _In_ PIWAN_NT_DEVICE Device,
+    _Out_ IWAN_NT_LEASE_ABI *Lease
+    );
+
+/*
  * Read the address the driver's socket is bound to, in network order. Useful for
  * telling "the peer never answered" from "the answer went to another port".
  */

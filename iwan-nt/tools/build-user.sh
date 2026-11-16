@@ -24,10 +24,11 @@ mkdir -p "$(dirname "$out")"
     "$root/user/iwan_nt_control.c" \
     "$root/driver/iwan_nt_crypto.c" \
     "$root/user/iwan_nt_inet.c" \
+    "$root/user/iwan_nt_lease.c" \
     "$root/driver/iwan_nt_session.c" \
     "$root/driver/iwan_nt_peer.c" \
     "$root/user/iwannt_connect.c" \
     "$root/user/iwannt-ctl.c" \
-    -lws2_32
+    -liphlpapi -lws2_32
 
 echo "built $out"

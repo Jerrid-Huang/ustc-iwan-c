@@ -30,6 +30,7 @@
 #include "iwan_nt_inet.h"
 #include "iwan_nt_session.h"
 #include "iwannt_connect.h"
+#include "iwan_nt_lease.h"
 
 static VOID
 Usage(VOID)
@@ -38,6 +39,7 @@ Usage(VOID)
             "usage:\n"
             "  iwannt-ctl check\n"
             "  iwannt-ctl stats\n"
+            "  iwannt-ctl lease [ifindex]\n"
             "  iwannt-ctl peer <a.b.c.d> <port>\n"
             "  iwannt-ctl session <sid-hex> <token-hex> <0|1> <key-hex>\n"
             "  iwannt-ctl clear\n"
@@ -270,6 +272,47 @@ CommandStats(
            stats.PeerDelayMinimum / 1000u, stats.PeerDelayMinimum % 1000u,
            stats.PeerDelayMaximum / 1000u, stats.PeerDelayMaximum % 1000u);
 
+    return 0;
+}
+
+static int
+CommandLease(
+    _In_ PIWAN_NT_DEVICE Device,
+    _In_ int Argc,
+    _In_ char **Argv
+    )
+{
+    IWAN_NT_LEASE_ABI lease;
+    UINT32 ifIndex;
+
+    if (IwanNtGetLease(Device, &lease) == FALSE) {
+        fprintf(stderr, "lease failed: %lu\n", GetLastError());
+        return 1;
+    }
+    if (lease.HasAddress == 0) {
+        printf("lease: none (no acknowledgement accepted yet)\n");
+        return 0;
+    }
+
+    printf("lease: %u.%u.%u.%u/%u", lease.Address[0], lease.Address[1],
+           lease.Address[2], lease.Address[3], (unsigned)lease.Prefix);
+    if (lease.HasGateway != 0) {
+        printf(" gateway %u.%u.%u.%u", lease.Gateway[0], lease.Gateway[1],
+               lease.Gateway[2], lease.Gateway[3]);
+    }
+    printf("\n");
+
+    if (Argc < 3) {
+        return 0;
+    }
+
+    ifIndex = (UINT32)strtoul(Argv[2], NULL, 10);
+    if (IwanNtLeaseApply(ifIndex, &lease) == FALSE) {
+        fprintf(stderr, "apply failed on interface %lu: %lu\n",
+                (unsigned long)ifIndex, GetLastError());
+        return 1;
+    }
+    printf("applied on interface %lu\n", (unsigned long)ifIndex);
     return 0;
 }
 
@@ -564,6 +607,8 @@ main(
         result = CommandStats(&device);
     } else if (strcmp(argv[1], "local") == 0) {
         result = CommandLocal(&device);
+    } else if (strcmp(argv[1], "lease") == 0) {
+        result = CommandLease(&device, argc, argv);
     } else if (strcmp(argv[1], "peer") == 0) {
         result = CommandPeer(&device, argc, argv);
     } else if (strcmp(argv[1], "session") == 0) {

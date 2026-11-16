@@ -56,6 +56,31 @@ IwanNtPeerInitialize(
 }
 
 void
+IwanNtPeerGetLease(
+    const IWAN_NT_PEER *Handshake,
+    IWAN_NT_PEER_LEASE *Lease
+    )
+{
+    if (Lease == NULL) {
+        return;
+    }
+
+    IwanNtMemZero(Lease, sizeof(*Lease));
+    if (Handshake == NULL) {
+        return;
+    }
+
+    Lease->HasAddress = Handshake->HasAddress;
+    if (Handshake->HasAddress != 0) {
+        IwanNtMemCopy(Lease->Address, Handshake->Address, 4);
+    }
+    Lease->HasGateway = Handshake->HasGateway;
+    if (Handshake->HasGateway != 0) {
+        IwanNtMemCopy(Lease->Gateway, Handshake->Gateway, 4);
+    }
+}
+
+void
 IwanNtPeerReset(
     IWAN_NT_PEER *Handshake,
     uint64_t NowMs

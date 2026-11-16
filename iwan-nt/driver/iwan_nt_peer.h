@@ -56,6 +56,18 @@ typedef enum _IWAN_NT_PEER_EVENT {
     IwanNtPeerEventFault
 } IWAN_NT_PEER_EVENT;
 
+/*
+ * What the peer handed us in its acknowledgement. The protocol carries no
+ * netmask, so the caller has to pick one; the server hands out addresses from
+ * one subnet and puts itself in the gateway field.
+ */
+typedef struct _IWAN_NT_PEER_LEASE {
+    int HasAddress;
+    uint8_t Address[4];   /* network byte order, exactly as it arrived */
+    int HasGateway;
+    uint8_t Gateway[4];   /* network byte order */
+} IWAN_NT_PEER_LEASE;
+
 typedef struct _IWAN_NT_PEER {
     /* Configuration, copied in at initialize so the caller owns no pointers. */
     char User[64];
@@ -147,6 +159,17 @@ IWAN_NT_PEER *Handshake,
     const uint8_t *Frame,
     size_t Length,
     uint64_t NowMs
+    );
+
+/*
+ * Copy out the address the server assigned in the last accepted ACK. Reported,
+ * never applied: the adapter's addresses belong to the IP stack, so the caller
+ * installs them.
+ */
+void
+IwanNtPeerGetLease(
+    const IWAN_NT_PEER *Handshake,
+    IWAN_NT_PEER_LEASE *Lease
     );
 
 /* Drop the session at the caller's request, keeping the retry clock. */

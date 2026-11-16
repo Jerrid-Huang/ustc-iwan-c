@@ -1030,6 +1030,26 @@ IwanNtTransportSetPeer(
 
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS
+_IRQL_requires_max_(DISPATCH_LEVEL)
+void
+IwanNtTransportGetLease(
+    _In_ PIWAN_NT_TRANSPORT Transport,
+    _Out_ IWAN_NT_PEER_LEASE *Lease
+    )
+{
+    KIRQL oldIrql;
+
+    if (Transport == NULL || Lease == NULL) {
+        return;
+    }
+
+    KeAcquireSpinLock(&Transport->SessionLock, &oldIrql);
+    IwanNtPeerGetLease(&Transport->Peer, Lease);
+    KeReleaseSpinLock(&Transport->SessionLock, oldIrql);
+}
+
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS
 IwanNtTransportStartPeer(
     _Inout_ PIWAN_NT_TRANSPORT Transport,
     _In_reads_z_(64) const char *User,

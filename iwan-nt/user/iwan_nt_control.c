@@ -218,6 +218,29 @@ IwanNtGetLocal(
     return TRUE;
 }
 
+BOOL
+IwanNtGetLease(
+    _In_ PIWAN_NT_DEVICE Device,
+    _Out_ IWAN_NT_LEASE_ABI *Lease
+    )
+{
+    IWAN_NT_LEASE_ABI reply;
+    DWORD returned = 0;
+
+    if (Device == NULL || Lease == NULL) {
+        return FALSE;
+    }
+    if (DeviceIoControl(Device->Handle, IWAN_NT_IOCTL_GET_LEASE, NULL, 0,
+                        &reply, (DWORD)sizeof(reply), &returned, NULL) == FALSE) {
+        return FALSE;
+    }
+    if (returned < IWAN_NT_LEASE_STRUCT_SIZE) {
+        return FALSE;
+    }
+    CopyMemory(Lease, &reply, sizeof(reply));
+    return TRUE;
+}
+
 int
 IwanNtReadControl(
     _In_ PIWAN_NT_DEVICE Device,

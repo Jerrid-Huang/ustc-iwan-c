@@ -74,6 +74,12 @@
  */
 #define IWAN_NT_IOCTL_START_PEER IWAN_NT_CTL_CODE(0x807u)
 #define IWAN_NT_IOCTL_STOP_PEER IWAN_NT_CTL_CODE(0x808u)
+/*
+ * The address the server assigned in the last accepted acknowledgement.
+ * Reported only: the IP stack owns the adapter's addresses, so the caller
+ * installs the lease where it wants it.
+ */
+#define IWAN_NT_IOCTL_GET_LEASE IWAN_NT_CTL_CODE(0x809u)
 
 #define IWAN_NT_SESSION_STRUCT_SIZE 24u
 #define IWAN_NT_ADDR_STRUCT_SIZE 24u
@@ -132,6 +138,22 @@ typedef struct _IWAN_NT_ADDR_ABI {
  * datagram; no field is ever torn, because each is a naturally aligned 64-bit
  * or 32-bit quantity with a single writer.
  */
+#define IWAN_NT_LEASE_STRUCT_SIZE 12u
+
+typedef struct _IWAN_NT_LEASE_ABI {
+    uint8_t Address[4];   /* network byte order, as it arrived */
+    uint8_t Gateway[4];   /* network byte order */
+    /*
+     * The protocol carries no netmask. The server allocates from one subnet and
+     * puts itself in Gateway, so /24 is the only prefix that puts the gateway
+     * on link; it is filled in here rather than guessed by every caller.
+     */
+    uint8_t Prefix;
+    uint8_t HasAddress;
+    uint8_t HasGateway;
+    uint8_t Reserved;
+} IWAN_NT_LEASE_ABI;
+
 typedef struct _IWAN_NT_STATS_ABI {
     uint64_t Receives;             /* datagrams the receive path looked at */
     uint64_t Delivered;            /* inner packets indicated up to NDIS */
@@ -208,6 +230,9 @@ _Static_assert(sizeof(IWAN_NT_ADDR_ABI) == IWAN_NT_ADDR_STRUCT_SIZE,
                "address ABI size changed");
 _Static_assert(sizeof(IWAN_NT_STATS_ABI) == IWAN_NT_STATS_STRUCT_SIZE,
                "STATS ABI size changed");
+
+_Static_assert(sizeof(IWAN_NT_LEASE_ABI) == IWAN_NT_LEASE_STRUCT_SIZE,
+               "lease ABI size changed");
 
 _Static_assert(sizeof(IWAN_NT_CREDENTIALS_ABI) == IWAN_NT_CREDENTIALS_STRUCT_SIZE,
                "credentials ABI size changed");
