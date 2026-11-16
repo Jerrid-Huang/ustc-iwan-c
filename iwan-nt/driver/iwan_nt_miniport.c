@@ -447,7 +447,13 @@ IwanNtMiniportInitializeEx(
         params.Header.Revision = NET_BUFFER_LIST_POOL_PARAMETERS_REVISION_1;
         params.Header.Size = NDIS_SIZEOF_NET_BUFFER_LIST_POOL_PARAMETERS_REVISION_1;
         params.ProtocolId = NDIS_PROTOCOL_ID_DEFAULT;
-        params.fAllocateNetBuffer = FALSE;
+        /*
+         * NdisAllocateNetBufferAndNetBufferList initialises the NET_BUFFER that
+         * lives inside the list, so the pool has to reserve one: with FALSE the
+         * allocation fails with STATUS_INSUFFICIENT_RESOURCES no matter how
+         * much memory the machine has.
+         */
+        params.fAllocateNetBuffer = TRUE;
         params.PoolTag = IWAN_NT_MINIPORT_POOL_TAG;
         adapter->RxPool = NdisAllocateNetBufferListPool(MiniportAdapterHandle,
                                                         &params);
