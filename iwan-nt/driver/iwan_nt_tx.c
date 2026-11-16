@@ -1,5 +1,7 @@
 #include "iwan_nt_tx.h"
 
+#include "iwan_nt_string.h"
+
 #define IWAN_NT_TAG_TX_POOL 'pxTI'
 #define IWAN_NT_TAG_TX_BUFFER 'bxTI'
 
@@ -13,6 +15,27 @@
  * returned before the idle event is signalled, so a waiter that observes
  * InFlight == 0 can free the pool without racing this routine.
  */
+/*
+ * Put back a payload that was transformed in place but never left.
+ *
+ * Works on the slot rather than on a saved copy, because there is no copy: the
+ * caller's memory is the only place those bytes exist.
+ */
+static VOID
+IwanNtTxRestorePayload(
+    _Inout_ PIWAN_NT_TX_SLOT Slot
+    )
+{
+    if (Slot->RestorePayload == NULL || Slot->RestoreLength == 0) {
+        return;
+    }
+
+    IwanNtFrameXor((uint8_t *)Slot->RestorePayload, Slot->RestoreLength,
+                   Slot->RestoreKey);
+    Slot->RestorePayload = NULL;
+    Slot->RestoreLength = 0;
+}
+
 static NTSTATUS
 IwanNtTxComplete(
     _In_ PDEVICE_OBJECT DeviceObject,
@@ -54,6 +77,15 @@ IwanNtTxComplete(
                 CONTAINING_RECORD(entry, IWAN_NT_TX_SLOT, List);
 
             entry = entry->Next;
+            /*
+             * A cancelled or failed send means the bytes never left, so they go
+             * back to the caller unchanged; the status is reported as success
+             * because the packet is treated like one lost on the wire, which is
+             * what a tunnel can always do.
+             */
+            if (!NT_SUCCESS(Irp->IoStatus.Status)) {
+                IwanNtTxRestorePayload(member);
+            }
             member->List.Next = NULL;
             if (member->Mdl->Next != NULL) {
                 member->Mdl->Next = NULL;
@@ -276,6 +308,8 @@ IwanNtTxClaimSlot(
             slot = &Tx->Slots[index];
             slot->InUse = TRUE;
             slot->CompleteOwner = NULL;
+            slot->RestorePayload = NULL;
+            slot->RestoreLength = 0;
             Tx->FreeCount--;
             Tx->InFlight++;
             KeClearEvent(&Tx->IdleEvent);
@@ -423,21 +457,20 @@ IwanNtTxSubmitChain(
          */
         for (;;) {
             PWSK_BUF_LIST next = Head->List.Next;
-            void *owner = Head->CompleteOwner;
 
+            /*
+             * Nothing is reported from here. The caller is told which items the
+             * batch did not take through *Accepted, which is the same call, so
+             * the packet goes home through the path that already handles a
+             * rejected send. Reporting it here would re-enter the caller's
+             * completion while it still holds its own lock around this call.
+             */
             Head->CompleteOwner = NULL;
             if (Head->Mdl->Next != NULL) {
                 Head->Mdl->Next = NULL;
             }
+            IwanNtTxRestorePayload(Head);
             IwanNtTxAbandonSlot(Tx, Head, TRUE);
-            /*
-             * The datagram never left, but its payload has already been
-             * transformed in place, so the packet still has to go back to the
-             * caller before the slot can be reused.
-             */
-            if (owner != NULL && Tx->SlotComplete != NULL) {
-                Tx->SlotComplete(Tx->SlotCompleteContext, owner);
-            }
             if (next == NULL) {
                 break;
             }
@@ -496,6 +529,10 @@ IwanNtTxSealInPlace(
     IwanNtFrameHeaderEncode((uint8_t *)Slot->Buffer, &header);
     if (header.Encrypt != 0u) {
         IwanNtFrameXor(payload, InnerLength, Key);
+        /* Remembered so a failed submission can hand the bytes back intact. */
+        Slot->RestorePayload = payload;
+        Slot->RestoreLength = (ULONG)InnerLength;
+        IwanNtMemCopy(Slot->RestoreKey, Key, IWAN_NT_FRAME_KEY_LEN);
     }
 
     MmInitializeMdl(Slot->Mdl, Slot->Buffer, IWAN_NT_FRAME_HDR_LEN);

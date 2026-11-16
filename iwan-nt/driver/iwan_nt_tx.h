@@ -51,6 +51,14 @@ typedef struct _IWAN_NT_TX_SLOT {
     BOOLEAN InUse;
     /* Handed back to the caller when this slot's send completes. */
     void *CompleteOwner;
+    /*
+     * What was transformed where it lay, so a send that never made it out can
+     * be put back byte for byte. XOR is its own inverse; leaving a caller's
+     * packet scrambled after a failed send would corrupt a retry.
+     */
+    PVOID RestorePayload;
+    ULONG RestoreLength;
+    uint8_t RestoreKey[IWAN_NT_FRAME_KEY_LEN];
 } IWAN_NT_TX_SLOT, *PIWAN_NT_TX_SLOT;
 
 /*

@@ -1028,8 +1028,6 @@ IwanNtTransportSetPeer(
     return STATUS_SUCCESS;
 }
 
-_IRQL_requires_(PASSIVE_LEVEL)
-NTSTATUS
 _IRQL_requires_max_(DISPATCH_LEVEL)
 void
 IwanNtTransportGetLease(
