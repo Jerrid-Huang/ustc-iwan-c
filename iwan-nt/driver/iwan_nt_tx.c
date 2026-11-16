@@ -605,6 +605,11 @@ IwanNtTxSendBatch(
                 break;
             }
             slot->CompleteOwner = Items[index].Owner;
+            /*
+             * Advisory: the payload was transformed in place, so nothing of
+             * the caller's buffer was copied. A race here only loses a count.
+             */
+            Tx->InPlaceCount++;
         } else
 #endif
         {
@@ -617,6 +622,7 @@ IwanNtTxSendBatch(
             }
             /* The copying path owns the whole buffer, so one link is enough. */
             slot->Mdl->Next = NULL;
+            Tx->CopiedCount++;
         }
 
         slot->List.Next = NULL;

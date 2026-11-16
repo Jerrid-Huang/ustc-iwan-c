@@ -122,6 +122,14 @@ struct _IWAN_NT_TX {
     ULONG64 SubmitErrors;
     ULONG64 NoSlot;
     ULONG64 TooLarge;
+    /*
+     * Which path the last batches took: in place (no payload copy, the frame
+     * header lives in the slot while the payload stays the caller's buffer) or
+     * the copying path. These exist so a measurement can prove that the zero
+     * copy path is actually the one being exercised.
+     */
+    ULONG64 InPlaceCount;
+    ULONG64 CopiedCount;
     IWAN_NT_TX_SLOT Slots[IWAN_NT_TX_SLOTS];
 };
 

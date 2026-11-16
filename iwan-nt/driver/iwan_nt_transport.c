@@ -751,6 +751,8 @@ IwanNtTransportGetStats(
 
     Stats->TxAccepted = 0;
     Stats->TxRejected = 0;
+    Stats->TxInPlace = (uint64_t)Transport->Tx.InPlaceCount;
+    Stats->TxCopied = (uint64_t)Transport->Tx.CopiedCount;
     Stats->RxIndicated = 0;
     Stats->RxDropped = 0;
 
