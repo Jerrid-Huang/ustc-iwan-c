@@ -179,17 +179,49 @@ IwanNtFrameSeal(
 
     IwanNtFrameHeaderEncode(Out, &header);
 
-    /* Copy the inner packet body, then transform it in place. */
-    {
+    /*
+     * Copy and transform in one pass.
+     *
+     * The body starts at frame offset 8 and the key repeats every eight bytes,
+     * so body byte i is masked with Key[i & 7]. Fusing the copy with the XOR
+     * drops the second sweep over the packet: the old shape copied the payload
+     * first and then walked it again to transform it, which cost two passes of
+     * memory traffic per packet. The 64-bit inner loop exists so the compiler
+     * can turn eight byte moves into one load/store pair.
+     */
+    if (header.Encrypt != 0u) {
+        uint64_t mask = 0;
+        size_t i;
+
+        for (i = 0; i < IWAN_NT_FRAME_KEY_LEN; i++) {
+            mask |= (uint64_t)Key[i] << (unsigned)(i * 8u);
+        }
+
+        i = 0;
+        while (InnerLength - i >= 8u) {
+            uint64_t word = 0;
+            unsigned b;
+
+            for (b = 0; b < 8u; b++) {
+                word |= (uint64_t)Inner[i + b] << (b * 8u);
+            }
+            word ^= mask;
+            for (b = 0; b < 8u; b++) {
+                Out[body_start + i + b] = (uint8_t)(word >> (b * 8u));
+            }
+            i += 8u;
+        }
+        while (i < InnerLength) {
+            Out[body_start + i] =
+                (uint8_t)(Inner[i] ^ Key[i & (IWAN_NT_FRAME_KEY_LEN - 1u)]);
+            i++;
+        }
+    } else {
         size_t i;
 
         for (i = 0; i < InnerLength; i++) {
             Out[body_start + i] = Inner[i];
         }
-    }
-
-    if (header.Encrypt != 0u) {
-        IwanNtFrameXor(Out + body_start, InnerLength, Key);
     }
 
     *OutLength = body_start + InnerLength;
