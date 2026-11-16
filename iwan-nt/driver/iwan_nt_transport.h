@@ -107,6 +107,7 @@ typedef struct _IWAN_NT_TRANSPORT {
     IWAN_NT_TRANSPORT_SESSION_CHANGED SessionChanged;
     void *SessionChangedContext;
     LONG SessionNotified;
+    LONG SessionPending;   /* -1 = nothing to deliver */
     IWAN_NT_TIMER PeerTimer;
     /*
      * Control frames the peer generates are built here. The buffer lives in the
@@ -162,6 +163,18 @@ IwanNtTransportSetSession(
 _IRQL_requires_(PASSIVE_LEVEL)
 VOID
 IwanNtTransportClearSession(
+    _Inout_ PIWAN_NT_TRANSPORT Transport
+    );
+
+/*
+ * Delivers a session transition recorded by the receive path or the peer
+ * timer. Must be called with no transport lock held: the callback reaches
+ * NDIS, which may synchronously query the miniport, and an OID handler that
+ * took the session lock here would deadlock the CPU that is holding it.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+IwanNtTransportDeliverSession(
     _Inout_ PIWAN_NT_TRANSPORT Transport
     );
 

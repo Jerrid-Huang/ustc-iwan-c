@@ -127,6 +127,7 @@ IwanNtTransportReceiveChunk(
     }
 
     KeReleaseSpinLock(&transport->SessionLock, oldIrql);
+    IwanNtTransportDeliverSession(transport);
 
     if (!view.Taken) {
         /* Nothing downstream bound this datagram, so the reference is ours to
@@ -211,11 +212,21 @@ IwanNtTransportApplyPeerStateLocked(
 
         if (Transport->SessionNotified != valid) {
             Transport->SessionNotified = valid;
-            if (Transport->SessionChanged != NULL) {
-                Transport->SessionChanged(Transport->SessionChangedContext,
-                                          (int)valid);
-            }
+            Transport->SessionPending = valid;
         }
+    }
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+IwanNtTransportDeliverSession(
+    _Inout_ PIWAN_NT_TRANSPORT Transport
+    )
+{
+    LONG pending = InterlockedExchange(&Transport->SessionPending, -1);
+
+    if (pending >= 0 && Transport->SessionChanged != NULL) {
+        Transport->SessionChanged(Transport->SessionChangedContext, (int)pending);
     }
 }
 
@@ -234,6 +245,7 @@ IwanNtTransportSetSessionCallback(
     Transport->SessionChanged = Callback;
     Transport->SessionChangedContext = Context;
     Transport->SessionNotified = 0;
+    Transport->SessionPending = -1;
 }
 
 /*
@@ -287,6 +299,7 @@ IwanNtTransportPeerTimerCallback(
     IwanNtTransportApplyPeerStateLocked(transport);
     again = transport->PeerReady;
     KeReleaseSpinLock(&transport->SessionLock, oldIrql);
+    IwanNtTransportDeliverSession(transport);
 
     KeAcquireSpinLock(&transport->StateLock, &oldIrql);
     running = (BOOLEAN)(transport->State == IwanNtTransportRunning);
