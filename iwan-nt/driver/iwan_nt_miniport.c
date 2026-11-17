@@ -284,14 +284,14 @@ static NDIS_OID IwanNtMiniportSupportedOids[] = {
  */
 static VOID
 IwanNtMiniportFreeRxSlots(
-    _Inout_ PIWAN_NT_MINIPORT_ADAPTER Adapter
+    _Inout_ PIWAN_NT_MINIPORT_ADAPTER adapter
     )
 {
-    while (Adapter->RxSlotCount > 0) {
+    while (adapter->RxSlotCount > 0) {
         IWAN_NT_MINIPORT_RX_SLOT *slot;
 
-        Adapter->RxSlotCount--;
-        slot = &Adapter->RxSlots[Adapter->RxSlotCount];
+        adapter->RxSlotCount--;
+        slot = &adapter->RxSlots[adapter->RxSlotCount];
         if (slot->Nbl != NULL) {
             NdisFreeNetBufferList(slot->Nbl);
             slot->Nbl = NULL;
@@ -397,14 +397,14 @@ IwanNtMiniportUnregisterDriver(
  */
 static VOID
 IwanNtMiniportIndicateLink(
-    _Inout_ PIWAN_NT_MINIPORT_ADAPTER Adapter,
+    _Inout_ PIWAN_NT_MINIPORT_ADAPTER adapter,
     _In_ int Up
     )
 {
     NDIS_STATUS_INDICATION indication;
     NDIS_LINK_STATE state;
 
-    if (Adapter->AdapterHandle == NULL) {
+    if (adapter->AdapterHandle == NULL) {
         return;
     }
 
@@ -423,12 +423,12 @@ IwanNtMiniportIndicateLink(
     indication.Header.Type = NDIS_OBJECT_TYPE_STATUS_INDICATION;
     indication.Header.Revision = NDIS_STATUS_INDICATION_REVISION_1;
     indication.Header.Size = NDIS_SIZEOF_STATUS_INDICATION_REVISION_1;
-    indication.SourceHandle = Adapter->AdapterHandle;
+    indication.SourceHandle = adapter->AdapterHandle;
     indication.StatusCode = NDIS_STATUS_LINK_STATE;
     indication.StatusBuffer = &state;
     indication.StatusBufferSize = sizeof(state);
 
-    (void)NdisMIndicateStatusEx(Adapter->AdapterHandle, &indication);
+    (void)NdisMIndicateStatusEx(adapter->AdapterHandle, &indication);
 }
 
 /*
@@ -798,14 +798,14 @@ IwanNtMiniportInitializeEx(
         NDIS_SIZEOF_MINIPORT_ADAPTER_GENERAL_ATTRIBUTES_REVISION_2;
     general.MediaType = NdisMediumIP;
     general.PhysicalMediumType = NdisPhysicalMediumUnspecified;
-    general.MtuSize = Adapter->Mtu;
+    general.MtuSize = adapter->Mtu;
     general.MaxXmitLinkSpeed = IWAN_NT_MINIPORT_LINK_SPEED;
     general.MaxRcvLinkSpeed = IWAN_NT_MINIPORT_LINK_SPEED;
     general.XmitLinkSpeed = NDIS_LINK_SPEED_UNKNOWN;
     general.RcvLinkSpeed = NDIS_LINK_SPEED_UNKNOWN;
     general.MediaConnectState = MediaConnectStateDisconnected;
     general.MediaDuplexState = MediaDuplexStateFull;
-    general.LookaheadSize = Adapter->Mtu;
+    general.LookaheadSize = adapter->Mtu;
     general.MacOptions = NDIS_MAC_OPTION_COPY_LOOKAHEAD_DATA |
         NDIS_MAC_OPTION_TRANSFERS_NOT_PEND | NDIS_MAC_OPTION_NO_LOOPBACK;
     general.SupportedPacketFilters = IWAN_NT_MINIPORT_PACKET_FILTERS;
@@ -1119,7 +1119,7 @@ IwanNtMiniportIndicateInner(
      * datagram would fragment on the way out, and the peer cannot reassemble
      * outer fragments. Drop it instead.
      */
-    if (Inner == NULL || Length == 0 || Length > Adapter->Mtu) {
+    if (Inner == NULL || Length == 0 || Length > adapter->Mtu) {
         InterlockedIncrement(&adapter->RxDropped);
         return;
     }
@@ -1206,20 +1206,20 @@ _Use_decl_annotations_
  */
 static ULONG
 IwanNtMiniportSendLimit(
-    _In_ const IWAN_NT_MINIPORT_ADAPTER *Adapter
+    _In_ const IWAN_NT_MINIPORT_ADAPTER *adapter
     )
 {
-    ULONG limit = Adapter->Mtu;
+    ULONG limit = adapter->Mtu;
 
-    if (Adapter->PeerMtu != 0 && Adapter->PeerMtu < limit) {
-        limit = Adapter->PeerMtu;
+    if (adapter->PeerMtu != 0 && adapter->PeerMtu < limit) {
+        limit = adapter->PeerMtu;
     }
     return limit;
 }
 
 static BOOLEAN
 IwanNtMiniportStagePacket(
-    _Inout_ PIWAN_NT_MINIPORT_ADAPTER Adapter,
+    _Inout_ PIWAN_NT_MINIPORT_ADAPTER adapter,
     _In_ PNET_BUFFER Nb,
     _In_ ULONG Slot,
     _Out_ IWAN_NT_TX_ITEM *Item
@@ -1228,8 +1228,8 @@ IwanNtMiniportStagePacket(
     ULONG length = NET_BUFFER_DATA_LENGTH(Nb);
     PUCHAR bytes;
 
-    if (length != 0 && length > IwanNtMiniportSendLimit(Adapter)) {
-        InterlockedIncrement(&Adapter->MtuDropped);
+    if (length != 0 && length > IwanNtMiniportSendLimit(adapter)) {
+        InterlockedIncrement(&adapter->MtuDropped);
         return FALSE;
     }
     if (length == 0 || length > IWAN_NT_TX_BUFFER_BYTES) {
@@ -1243,7 +1243,7 @@ IwanNtMiniportStagePacket(
      * never is contiguous, so that path is not worth its weight.
      */
     bytes = NdisGetDataBuffer(
-        Nb, length, Adapter->SendScratch + (SIZE_T)Slot * IWAN_NT_TX_BUFFER_BYTES,
+        Nb, length, adapter->SendScratch + (SIZE_T)Slot * IWAN_NT_TX_BUFFER_BYTES,
         1, 0);
     if (bytes == NULL) {
         return FALSE;
@@ -1263,7 +1263,7 @@ IwanNtMiniportStagePacket(
 _Use_decl_annotations_
 static ULONG
 IwanNtMiniportFlushBatch(
-    _Inout_ PIWAN_NT_MINIPORT_ADAPTER Adapter,
+    _Inout_ PIWAN_NT_MINIPORT_ADAPTER adapter,
     _In_reads_(Count) const IWAN_NT_TX_ITEM *Items,
     _In_ ULONG Count,
     _Inout_ PNDIS_STATUS PacketStatus
@@ -1276,11 +1276,11 @@ IwanNtMiniportFlushBatch(
     }
 
     (VOID)IwanNtTransportSendInnerBatch(
-        &Adapter->Transport, Items, Count, &accepted);
+        &adapter->Transport, Items, Count, &accepted);
 
-    InterlockedExchangeAdd(&Adapter->TxAccepted, (LONG)accepted);
+    InterlockedExchangeAdd(&adapter->TxAccepted, (LONG)accepted);
     if (accepted < Count) {
-        InterlockedExchangeAdd(&Adapter->TxRejected, (LONG)(Count - accepted));
+        InterlockedExchangeAdd(&adapter->TxRejected, (LONG)(Count - accepted));
         *PacketStatus = NDIS_STATUS_RESOURCES;
     }
 
@@ -1597,7 +1597,7 @@ IwanNtMiniportOidRequest(
             }
             adapter->PacketFilter = value;
         } else if (oid == OID_GEN_CURRENT_LOOKAHEAD) {
-            if (value > Adapter->Mtu) {
+            if (value > adapter->Mtu) {
                 return NDIS_STATUS_INVALID_DATA;
             }
             adapter->Lookahead = value;
@@ -1674,7 +1674,7 @@ IwanNtMiniportOidRequest(
     case OID_GEN_MAXIMUM_LOOKAHEAD:
     case OID_GEN_MAXIMUM_FRAME_SIZE:
     case OID_GEN_MAXIMUM_TOTAL_SIZE:
-        value = Adapter->Mtu;
+        value = adapter->Mtu;
         break;
     case OID_GEN_MAC_OPTIONS:
         value = NDIS_MAC_OPTION_COPY_LOOKAHEAD_DATA |

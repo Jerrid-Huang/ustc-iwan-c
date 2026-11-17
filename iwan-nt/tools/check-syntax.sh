@@ -71,6 +71,16 @@ run_host_test peer tests/peer_test.c driver/iwan_nt_peer.c driver/iwan_nt_sessio
 run_host_test pipeline tests/pipeline_test.c driver/iwan_nt_ingress.c driver/iwan_nt_demux.c driver/iwan_nt_frame.c driver/iwan_nt_ring.c driver/iwan_nt_session.c driver/iwan_nt_crypto.c
 run_host_test stress tests/stress_test.c driver/iwan_nt_ingress.c driver/iwan_nt_demux.c driver/iwan_nt_frame.c driver/iwan_nt_ring.c
 
+# iwan_nt_miniport.c needs the full ndis.h and is compiled on the CI runner only.
+# The two mistakes that cost a round trip every time are a wrong parameter name
+# (the file used to mix Adapter and adapter) and a misplaced brace, and the first
+# one is greppable: every local pointer in that file is now lower case.
+if grep -n 'Adapter->' driver/iwan_nt_miniport.c 2>/dev/null | grep -q .; then
+    echo "iwan_nt_miniport.c mixes Adapter and adapter:"
+    grep -n 'Adapter->' driver/iwan_nt_miniport.c | head -5
+    status=1
+fi
+
 if grep -rlP '[^\x00-\x7F]' driver tools 2>/dev/null | grep -v '\.vcxproj$' | grep -q .; then
     echo "non-ASCII source found:"
     grep -rlP '[^\x00-\x7F]' driver tools | grep -v '\.vcxproj$'
