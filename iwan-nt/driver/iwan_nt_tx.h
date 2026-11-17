@@ -22,8 +22,8 @@ extern "C" {
  * costs far more than copying a packet, and the stack hands the miniport one
  * NBL per call, so submitting inside the NDIS send call means one provider call
  * per packet. Instead, every staged packet joins a pending chain which a system
- * thread drains in batches, and the miniport completes the NBL as soon as the
- * bytes have been copied into a slot. Measured on the test link: batch size 1
+ * send path submits whole batches itself (no thread wake per packet), and the
+ * miniport completes the NBL as soon as the bytes have been copied into a slot. Measured on the test link: batch size 1
  * gave ~15 kpps, and the cost was per-submit, not per-byte (64 B and 1400 B
  * payloads reached the same packet rate).
  *
@@ -46,23 +46,11 @@ extern "C" {
 #define IWAN_NT_TX_MAX_CHAIN 128UL
 
 /*
- * How long the drain thread waits for the pending chain to grow before it
- * submits what it has. This is only a safety net: the send path submits by
- * itself as soon as it has a worthwhile chain, and signals the thread for the
- * tail it leaves behind.
+ * How long the drain thread waits before looking for stranded slots. It is a
+ * safety net only: the send path submits inline, so under load this thread
+ * finds nothing and the wake never costs a packet.
  */
 #define IWAN_NT_TX_DRAIN_INTERVAL_MS 1UL
-
-/*
- * Chain length the send path submits itself, from inside the NDIS send call.
- *
- * Measured, not guessed: a fixed polling interval (1 ms) grew the chain to 23
- * frames per call but cost too much latency and dropped the link from 30 kpps
- * to 20 kpps; submitting every frame immediately cost one provider call per
- * packet. This threshold takes the middle: no added latency under load, and one
- * provider call per cluster of frames instead of per frame.
- */
-#define IWAN_NT_TX_INLINE_THRESHOLD 8UL
 
 typedef struct _IWAN_NT_TX IWAN_NT_TX, *PIWAN_NT_TX;
 

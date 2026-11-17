@@ -556,8 +556,8 @@ IwanNtTxSubmitSlot(
 }
 
 /*
- * Hang a filled slot on the pending chain, then either wake the drain thread or
- * submit right away when the chain is already as long as one submit may be.
+ * Hang a filled slot on the pending chain. Submitting is the caller's job, once
+ * per batch (IwanNtTxSendBatch), so this is only a list splice under the lock.
  *
  * IRQL: <= DISPATCH_LEVEL.
  */
@@ -568,7 +568,6 @@ IwanNtTxStageSlot(
     )
 {
     KIRQL oldIrql;
-    BOOLEAN full;
 
     KeAcquireSpinLock(&Tx->Lock, &oldIrql);
     Slot->List.Next = NULL;
@@ -580,20 +579,7 @@ IwanNtTxStageSlot(
     }
     Tx->PendingTail = Slot;
     Tx->PendingCount++;
-    full = (BOOLEAN)(Tx->PendingCount >= IWAN_NT_TX_INLINE_THRESHOLD);
     KeReleaseSpinLock(&Tx->Lock, oldIrql);
-
-    if (full) {
-        /* Batched submit from here: the chain is long enough to be worth it. */
-        IwanNtTxDrain(Tx);
-    } else {
-        /*
-         * Too short to batch yet. Hand the tail to the drain thread so a lone
-         * packet does not wait for the next cluster, and so the chain never
-         * sits idle.
-         */
-        KeSetEvent(&Tx->DrainEvent, IO_NO_INCREMENT, FALSE);
-    }
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -667,6 +653,15 @@ IwanNtTxSendBatch(
         return (Count == 0) ? STATUS_INVALID_PARAMETER
                             : STATUS_INSUFFICIENT_RESOURCES;
     }
+
+    /*
+     * Submit from the caller, once per batch, the way WireGuardNT does: the
+     * provider call is asynchronous (it returns STATUS_PENDING with our IRP),
+     * so the send path only pays for the enqueue, not for the wire. Waking the
+     * drain thread per packet cost 10-30us per packet and capped the tunnel at
+     * ~33k pps regardless of the bearer, as measured 2026-11-17.
+     */
+    IwanNtTxDrain(Tx);
 
     *Accepted = staged;
     return STATUS_SUCCESS;
