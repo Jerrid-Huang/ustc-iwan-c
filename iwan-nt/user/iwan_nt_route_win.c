@@ -44,10 +44,25 @@ IwanNtRouteParse(
 
     slash = strchr(text, '/');
     if (slash != NULL) {
+        /*
+         * Digits only, converted by hand: sscanf is flagged as unsafe by the MSVC
+         * CRT (C4996) and would need _CRT_SECURE_NO_WARNINGS for one call.
+         */
+        const char *digit = slash + 1;
         unsigned value = 0;
+        unsigned digits = 0;
 
         *slash = '\0';
-        if (sscanf(slash + 1, "%u", &value) != 1) {
+        while (*digit >= '0' && *digit <= '9') {
+            value = value * 10u + (unsigned)(*digit - '0');
+            if (value > 128u) {
+                SetLastError(ERROR_INVALID_PARAMETER);
+                return FALSE;
+            }
+            digit++;
+            digits++;
+        }
+        if (digits == 0 || *digit != '\0') {
             SetLastError(ERROR_INVALID_PARAMETER);
             return FALSE;
         }
