@@ -764,8 +764,8 @@ IwanNtTxSendRaw(
     return IwanNtTxSubmitSlot(Tx, slot, Length);
 }
 
-_IRQL_requires_(PASSIVE_LEVEL)
-BOOLEAN
+_IRQL_requires_max_(DISPATCH_LEVEL)
+void
 IwanNtTxGetCost(
     _In_ PIWAN_NT_TX Tx,
     _Out_ uint64_t *Seal,

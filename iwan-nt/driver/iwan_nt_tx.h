@@ -50,14 +50,6 @@ extern "C" {
  * safety net only: the send path submits inline, so under load this thread
  * finds nothing and the wake never costs a packet.
  */
-VOID
-IwanNtTxGetCost(
-    _In_ PIWAN_NT_TX Tx,
-    _Out_ uint64_t *Seal,
-    _Out_ uint64_t *Submit,
-    _Out_ uint64_t *Count
-    );
-
 #define IWAN_NT_TX_DRAIN_INTERVAL_MS 1UL
 
 typedef struct _IWAN_NT_TX IWAN_NT_TX, *PIWAN_NT_TX;
@@ -262,6 +254,16 @@ _IRQL_requires_max_(DISPATCH_LEVEL)
 ULONG
 IwanNtTxPending(
     _In_ PIWAN_NT_TX Tx
+    );
+
+/* Diagnostics: per-packet cost accumulators, in 100 ns units. */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+void
+IwanNtTxGetCost(
+    _In_ PIWAN_NT_TX Tx,
+    _Out_ uint64_t *Seal,
+    _Out_ uint64_t *Submit,
+    _Out_ uint64_t *Count
     );
 
 #ifdef __cplusplus
