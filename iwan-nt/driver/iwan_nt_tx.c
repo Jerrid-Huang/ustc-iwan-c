@@ -675,7 +675,15 @@ IwanNtTxSendBatch(
         KeReleaseSpinLock(&Tx->Lock, costIrql);
     }
 
-    IwanNtTxDrain(Tx);
+    /*
+     * One provider call costs 11-16us while staging costs 1.7us, so pay for a
+     * call every FRAMES_PER_CALL-th staging and let it drain the whole queue.
+     * The 1 ms drain thread is the safety net that keeps a lone frame moving.
+     */
+    if ((InterlockedIncrement(&Tx->SubmitTick) %
+         IWAN_NT_TX_FRAMES_PER_CALL) == 0) {
+        IwanNtTxDrain(Tx);
+    }
 
     *Accepted = staged;
     return STATUS_SUCCESS;

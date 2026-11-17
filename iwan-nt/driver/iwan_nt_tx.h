@@ -52,6 +52,14 @@ extern "C" {
  */
 #define IWAN_NT_TX_DRAIN_INTERVAL_MS 1UL
 
+/*
+ * Batches per provider call. One call costs ~11-16us on this path while staging
+ * costs ~1.7us, so a call per frame is most of the per-packet budget; every
+ * FRAMES_PER_CALL-th staging drains up to IWAN_NT_TX_MAX_CHAIN frames in one
+ * call. The 1 ms drain thread is the safety net for a lone packet.
+ */
+#define IWAN_NT_TX_FRAMES_PER_CALL 8UL
+
 typedef struct _IWAN_NT_TX IWAN_NT_TX, *PIWAN_NT_TX;
 
 typedef struct _IWAN_NT_TX_SLOT {
@@ -112,6 +120,8 @@ struct _IWAN_NT_TX {
     ULONG64 TooLarge;
     /* Largest chain the drain thread ever built; proves batching is working. */
     ULONG64 MaxBatch;
+    /* Counts staged batches so every N-th one pays for a provider call. */
+    ULONG SubmitTick;
     /*
      * Time spent per packet, in 100 ns units, accumulated over the whole run:
      * CostSeal covers copy+header+XOR and the list splice, CostSubmit covers the
