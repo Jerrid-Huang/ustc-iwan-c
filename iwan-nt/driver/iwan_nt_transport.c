@@ -1067,8 +1067,6 @@ IwanNtTransportSetPeer(
     return STATUS_SUCCESS;
 }
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
-void
 /*
  * The MTU the peer stated in its acknowledgement. Reported, not enforced: the
  * adapter already fixed its own MTU at init, so a smaller peer value can only
@@ -1090,6 +1088,9 @@ IwanNtTransportGetPeerMtu(
     KeReleaseSpinLock(&Transport->SessionLock, oldIrql);
     return mtu;
 }
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+void
 
 IwanNtTransportGetLease(
     _In_ PIWAN_NT_TRANSPORT Transport,

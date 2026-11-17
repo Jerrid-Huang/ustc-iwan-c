@@ -64,7 +64,13 @@ typedef enum _IWAN_NT_MINIPORT_STATE {
  */
 #define IWAN_NT_MINIPORT_COMPLETE_CHUNK 32UL
 
-#define IWAN_NT_MINIPORT_RX_SLOTS 4u
+/*
+ * Inbound indications that may be outstanding at once. Each one owns a buffer, an
+ * MDL and an NBL, so this is the receive-side equivalent of the send slot pool:
+ * deep enough that a burst arriving while the stack is busy is not dropped, small
+ * enough that the buffers stay uninteresting (32 x one MTU).
+ */
+#define IWAN_NT_MINIPORT_RX_SLOTS 32u
 
 /*
  * NDIS rounds a net buffer list context up to a 16-byte boundary and rejects

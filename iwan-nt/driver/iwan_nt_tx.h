@@ -27,20 +27,23 @@ extern "C" {
  * gave ~15 kpps, and the cost was per-submit, not per-byte (64 B and 1400 B
  * payloads reached the same packet rate).
  *
- * One slot per staged datagram. The depth bounds how many sends may be in
- * flight at once; a send that finds no free slot fails instead of queueing, so
- * backpressure reaches the NDIS caller as NDIS_STATUS_RESOURCES rather than as
- * unbounded kernel memory.
+ * One slot per staged datagram. The pool is the two-level queue in one array: the
+ * drain thread keeps up to IWAN_NT_TX_MAX_CHAIN slots in flight, the rest stay
+ * on the pending list and are submitted by the next round, so a burst is absorbed
+ * instead of rejected. Only when every slot is busy does a send fail, and then it
+ * fails as NDIS_STATUS_RESOURCES rather than growing kernel memory without bound.
  */
-#define IWAN_NT_TX_SLOTS 128UL
+#define IWAN_NT_TX_SLOTS 256UL
 #define IWAN_NT_TX_BUFFER_BYTES 2048UL
 
 /*
- * Largest number of frames handed to the provider in one call. This is the
- * batching window: with a 1 ms drain interval it fills at roughly packets per
- * millisecond, so it only caps very fast links.
+ * Largest number of frames handed to the provider in one call. WireGuardNT uses
+ * 256 per round (PEER_XMIT_PACKETS_PER_ROUND); 32 was the value every earlier
+ * measurement ran with, so raising it is an A/B: the drain loop takes as much as
+ * this and the pending chain allows, and the provider accepts the whole chain in
+ * one call.
  */
-#define IWAN_NT_TX_MAX_CHAIN 32UL
+#define IWAN_NT_TX_MAX_CHAIN 128UL
 
 /*
  * How long the drain thread waits for the pending chain to grow before it
