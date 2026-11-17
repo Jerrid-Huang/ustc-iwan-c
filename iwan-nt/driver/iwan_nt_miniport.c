@@ -520,7 +520,7 @@ IwanNtMiniportQueryCounters(
  * Install the allowed prefix table. Entries are validated by the shared helper,
  * which also proves the two bounds agree at compile time below.
  */
-static ULONG
+static NTSTATUS
 IwanNtMiniportSetPrefixes(
     _In_opt_ void *Context,
     _In_ const IWAN_NT_PREFIX_LIST_ABI *List,

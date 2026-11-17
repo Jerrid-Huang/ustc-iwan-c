@@ -58,7 +58,7 @@ typedef struct _IWAN_NT_CONTROL_COUNTER_SOURCE {
      * entries the adapter accepted; the rest of the list is returned so the
      * caller can tell a typo from a policy.
      */
-    _In_opt_ ULONG (*PrefixSet)(
+    _In_opt_ NTSTATUS (*PrefixSet)(
         _In_opt_ void *Context,
         _In_ const IWAN_NT_PREFIX_LIST_ABI *List,
         _Out_ ULONG *Accepted
