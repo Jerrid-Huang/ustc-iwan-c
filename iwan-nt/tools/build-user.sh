@@ -30,6 +30,6 @@ mkdir -p "$(dirname "$out")"
     "$root/driver/iwan_nt_peer.c" \
     "$root/user/iwannt_connect.c" \
     "$root/user/iwannt-ctl.c" \
-    -liphlpapi -lws2_32
+    -liphlpapi -ladvapi32 -lws2_32
 
 echo "built $out"
