@@ -1,0 +1,12 @@
+iwannt-ctl.c
+iwan_nt_control.c
+iwan_nt_mtu_win.c
+iwan_nt_crypto.c
+iwan_nt_inet.c
+iwan_nt_lease.c
+iwannt_connect.c
+iwan_nt_session.c
+iwan_nt_peer.c
+Generating Code...
+iwannt-ctl.obj : error LNK2019: unresolved external symbol IwanNtRouteAddPrefix referenced in function CommandLease
+build\x64\Release\iwannt-ctl.exe : fatal error LNK1120: 1 unresolved externals
