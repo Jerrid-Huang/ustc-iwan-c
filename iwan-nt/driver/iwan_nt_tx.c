@@ -580,18 +580,20 @@ IwanNtTxStageSlot(
     }
     Tx->PendingTail = Slot;
     Tx->PendingCount++;
-    full = (BOOLEAN)(Tx->PendingCount >= IWAN_NT_TX_MAX_CHAIN);
+    full = (BOOLEAN)(Tx->PendingCount >= IWAN_NT_TX_INLINE_THRESHOLD);
     KeReleaseSpinLock(&Tx->Lock, oldIrql);
 
     if (full) {
+        /* Batched submit from here: the chain is long enough to be worth it. */
         IwanNtTxDrain(Tx);
+    } else {
+        /*
+         * Too short to batch yet. Hand the tail to the drain thread so a lone
+         * packet does not wait for the next cluster, and so the chain never
+         * sits idle.
+         */
+        KeSetEvent(&Tx->DrainEvent, IO_NO_INCREMENT, FALSE);
     }
-    /*
-     * No signal on the ordinary path: waking the drain thread per packet made
-     * it submit whatever it had (measured average 2.9 frames per call), which
-     * leaves most of the batching win on the table. The thread polls once per
-     * drain interval instead, so the chain grows to packets-per-millisecond.
-     */
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)

@@ -44,10 +44,22 @@ extern "C" {
 
 /*
  * How long the drain thread waits for the pending chain to grow before it
- * submits what it has. One millisecond is short enough not to hurt interactive
- * latency and long enough to collect a batch at the rates the tunnel supports.
+ * submits what it has. This is only a safety net: the send path submits by
+ * itself as soon as it has a worthwhile chain, and signals the thread for the
+ * tail it leaves behind.
  */
 #define IWAN_NT_TX_DRAIN_INTERVAL_MS 1UL
+
+/*
+ * Chain length the send path submits itself, from inside the NDIS send call.
+ *
+ * Measured, not guessed: a fixed polling interval (1 ms) grew the chain to 23
+ * frames per call but cost too much latency and dropped the link from 30 kpps
+ * to 20 kpps; submitting every frame immediately cost one provider call per
+ * packet. This threshold takes the middle: no added latency under load, and one
+ * provider call per cluster of frames instead of per frame.
+ */
+#define IWAN_NT_TX_INLINE_THRESHOLD 8UL
 
 typedef struct _IWAN_NT_TX IWAN_NT_TX, *PIWAN_NT_TX;
 
