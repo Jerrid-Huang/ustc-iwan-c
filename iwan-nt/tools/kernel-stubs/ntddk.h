@@ -90,6 +90,7 @@ typedef const void *PCVOID;
 typedef void *HANDLE;
 typedef unsigned long KIRQL;
 typedef ULONG_PTR KSPIN_LOCK;
+typedef KSPIN_LOCK *PKSPIN_LOCK;
 
 #define TRUE 1
 #define FALSE 0

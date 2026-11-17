@@ -234,12 +234,14 @@ CommandStats(
            (unsigned long long)stats.ControlRead,
            (unsigned long long)stats.ControlSent,
            (unsigned long long)stats.ControlSendFailed);
-    printf("tx accepted=%llu rejected=%llu inflight=%lu staged=%llu maxbatch=%llu "
+    printf("tx accepted=%llu rejected=%llu inflight=%lu staged=%llu queued=%llu qdrops=%llu maxbatch=%llu "
            "batches=%llu\n",
            (unsigned long long)stats.TxAccepted,
            (unsigned long long)stats.TxRejected,
            (unsigned long)stats.TxInFlight,
            (unsigned long long)stats.TxPending,
+           (unsigned long long)stats.TxQueued,
+           (unsigned long long)stats.TxQueueDrops,
            (unsigned long long)stats.TxMaxBatch,
            (unsigned long long)stats.TxBatches);
     printf("rx indicated=%llu dropped=%llu batches=%llu\n",

@@ -1340,6 +1340,7 @@ IwanNtMiniportStagePacket(
     PIWAN_NT_TX_SLOT slot;
     PUCHAR bytes;
     PUCHAR body;
+    PUCHAR queued = NULL;
     LONG prefixCount;
 
     if (length != 0 && length > IwanNtMiniportSendLimit(adapter)) {
@@ -1347,6 +1348,7 @@ IwanNtMiniportStagePacket(
         return FALSE;
     }
     if (length == 0 || length + IWAN_NT_FRAME_HDR_LEN > IWAN_NT_TX_BUFFER_BYTES) {
+        InterlockedIncrement(&adapter->TxRejected);
         return FALSE;
     }
 
@@ -1357,15 +1359,31 @@ IwanNtMiniportStagePacket(
      * one of the two memory passes per packet.
      */
     slot = IwanNtTxClaimSlot(&adapter->Transport.Tx);
-    if (slot == NULL) {
-        *PacketStatus = NDIS_STATUS_RESOURCES;
-        return FALSE;
+    if (slot != NULL) {
+        body = (PUCHAR)slot->Buffer + IWAN_NT_FRAME_HDR_LEN;
+    } else {
+        /*
+         * The in-flight window is closed. Take a frame buffer from the second
+         * level and queue the packet there: dropping it here is what the stack
+         * used to do silently, and it cost a third of the traffic at four
+         * sending threads on 2026-11-17.
+         */
+        queued = IwanNtTxClaimQueueBuffer(&adapter->Transport.Tx);
+        if (queued == NULL) {
+            InterlockedIncrement(&adapter->TxRejected);
+            *PacketStatus = NDIS_STATUS_RESOURCES;
+            return FALSE;
+        }
+        body = queued + IWAN_NT_FRAME_HDR_LEN;
     }
-    body = (PUCHAR)slot->Buffer + IWAN_NT_FRAME_HDR_LEN;
 
     bytes = NdisGetDataBuffer(Nb, length, body, 1, 0);
     if (bytes == NULL) {
-        IwanNtTxAbandonSlot(&adapter->Transport.Tx, slot, TRUE);
+        if (slot != NULL) {
+            IwanNtTxAbandonSlot(&adapter->Transport.Tx, slot, TRUE);
+        } else {
+            IwanNtTxReleaseQueueBuffer(&adapter->Transport.Tx, queued);
+        }
         *PacketStatus = NDIS_STATUS_INVALID_PACKET;
         return FALSE;
     }
@@ -1388,13 +1406,18 @@ IwanNtMiniportStagePacket(
             IwanNtFrameInnerFamily(bytes, (size_t)length), bytes,
             (size_t)length)) {
         InterlockedIncrement(&adapter->TxNotAllowed);
-        IwanNtTxAbandonSlot(&adapter->Transport.Tx, slot, FALSE);
+        if (slot != NULL) {
+            IwanNtTxAbandonSlot(&adapter->Transport.Tx, slot, FALSE);
+        } else {
+            IwanNtTxReleaseQueueBuffer(&adapter->Transport.Tx, queued);
+        }
         return FALSE;
     }
 
     Item->Inner = bytes;
     Item->InnerLength = length;
     Item->Slot = slot;
+    Item->Queued = queued;
     return TRUE;
 }
 

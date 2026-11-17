@@ -15,6 +15,12 @@
  * returned before the idle event is signalled, so a waiter that observes
  * InFlight == 0 can free the pool without racing this routine.
  */
+static VOID
+IwanNtTxStageSlot(
+    _Inout_ PIWAN_NT_TX Tx,
+    _Inout_ PIWAN_NT_TX_SLOT Slot
+    );
+
 static NTSTATUS
 IwanNtTxComplete(
     _In_ PDEVICE_OBJECT DeviceObject,
@@ -168,6 +174,163 @@ IwanNtTxSubmitChain(
 }
 
 /*
+ * Second-level queue primitives.
+ *
+ * A slot costs an MDL and an IRP, so the pool of them is the in-flight window.
+ * Frames that arrive while that window is closed wait here as plain bytes.
+ * Claim and release are O(1) over a free-index stack; the ring keeps order.
+ */
+PUCHAR
+IwanNtTxClaimQueueBuffer(
+    _Inout_ PIWAN_NT_TX Tx
+    )
+{
+    PUCHAR buffer = NULL;
+    KIRQL oldIrql;
+
+    if (Tx == NULL || Tx->QueueStorage == NULL) {
+        return NULL;
+    }
+
+    KeAcquireSpinLock(&Tx->Lock, &oldIrql);
+    if (Tx->FreeTop > 0) {
+        ULONG index = Tx->FreeStack[--Tx->FreeTop];
+
+        buffer = Tx->QueueStorage + (SIZE_T)index * IWAN_NT_TX_QUEUE_BYTES;
+    }
+    KeReleaseSpinLock(&Tx->Lock, oldIrql);
+    return buffer;
+}
+
+void
+IwanNtTxReleaseQueueBuffer(
+    _Inout_ PIWAN_NT_TX Tx,
+    _Inout_ PUCHAR Buffer
+    )
+{
+    KIRQL oldIrql;
+    SIZE_T offset;
+
+    if (Tx == NULL || Buffer == NULL || Tx->QueueStorage == NULL) {
+        return;
+    }
+    offset = (SIZE_T)(Buffer - Tx->QueueStorage);
+    if (offset >= (SIZE_T)Tx->QueueCapacity * IWAN_NT_TX_QUEUE_BYTES) {
+        return;
+    }
+
+    KeAcquireSpinLock(&Tx->Lock, &oldIrql);
+    if (Tx->FreeTop < Tx->QueueCapacity) {
+        Tx->FreeStack[Tx->FreeTop++] = (ULONG)(offset / IWAN_NT_TX_QUEUE_BYTES);
+    }
+    KeReleaseSpinLock(&Tx->Lock, oldIrql);
+}
+
+BOOLEAN
+IwanNtTxQueueFrame(
+    _Inout_ PIWAN_NT_TX Tx,
+    _Inout_ PUCHAR Buffer,
+    _In_ ULONG Length
+    )
+{
+    KIRQL oldIrql;
+    BOOLEAN pushed = FALSE;
+
+    if (Tx == NULL || Buffer == NULL || Length == 0) {
+        return FALSE;
+    }
+
+    KeAcquireSpinLock(&Tx->Lock, &oldIrql);
+    if (Tx->RingCount < IWAN_NT_TX_QUEUE_MAX) {
+        Tx->Ring[Tx->RingTail].Buffer = Buffer;
+        Tx->Ring[Tx->RingTail].Length = Length;
+        Tx->RingTail = (Tx->RingTail + 1) % (ULONG)IWAN_NT_TX_QUEUE_MAX;
+        Tx->RingCount++;
+        pushed = TRUE;
+    } else {
+        /* Full: the sender has to drop this one, and the drop is counted. */
+        Tx->QueueDrops++;
+    }
+    KeReleaseSpinLock(&Tx->Lock, oldIrql);
+    return pushed;
+}
+
+ULONG
+IwanNtTxQueueDepth(
+    _In_ PIWAN_NT_TX Tx
+    )
+{
+    KIRQL oldIrql;
+    ULONG depth;
+
+    if (Tx == NULL) {
+        return 0;
+    }
+    KeAcquireSpinLock((PKSPIN_LOCK)(PVOID)&Tx->Lock, &oldIrql);
+    depth = Tx->RingCount;
+    KeReleaseSpinLock((PKSPIN_LOCK)(PVOID)&Tx->Lock, oldIrql);
+    return depth;
+}
+
+/*
+ * Pop one queued frame. The caller owns the buffer and must either stage it
+ * into a slot or release it back to the queue pool.
+ */
+static BOOLEAN
+IwanNtTxDequeueFrame(
+    _Inout_ PIWAN_NT_TX Tx,
+    _Out_ PUCHAR *Buffer,
+    _Out_ PULONG Length
+    )
+{
+    KIRQL oldIrql;
+    BOOLEAN popped = FALSE;
+
+    KeAcquireSpinLock(&Tx->Lock, &oldIrql);
+    if (Tx->RingCount != 0) {
+        *Buffer = Tx->Ring[Tx->RingHead].Buffer;
+        *Length = Tx->Ring[Tx->RingHead].Length;
+        Tx->RingHead = (Tx->RingHead + 1) % (ULONG)IWAN_NT_TX_QUEUE_MAX;
+        Tx->RingCount--;
+        popped = TRUE;
+    }
+    KeReleaseSpinLock(&Tx->Lock, oldIrql);
+    return popped;
+}
+
+/*
+ * Move every queued frame that a free slot can take into a slot and stage it.
+ * Called from the drain path, so the provider keeps seeing full batches even
+ * when the frames spent time waiting in the second level.
+ */
+static VOID
+IwanNtTxDrainQueued(
+    _Inout_ PIWAN_NT_TX Tx
+    )
+{
+    for (;;) {
+        PIWAN_NT_TX_SLOT slot;
+        PUCHAR buffer = NULL;
+        ULONG length = 0;
+
+        slot = IwanNtTxClaimSlot(Tx);
+        if (slot == NULL) {
+            return;
+        }
+        if (!IwanNtTxDequeueFrame(Tx, &buffer, &length)) {
+            IwanNtTxAbandonSlot(Tx, slot, FALSE);
+            return;
+        }
+        RtlCopyMemory(slot->Buffer, buffer, length);
+        slot->List.Buffer.Mdl = slot->Mdl;
+        slot->List.Buffer.Offset = 0;
+        slot->List.Buffer.Length = length;
+        IwanNtTxStageSlot(Tx, slot);
+        IwanNtTxReleaseQueueBuffer(Tx, buffer);
+    }
+}
+
+/*
  * Detach up to Max slots from the head of the pending chain. Returns NULL when
  * nothing is staged. The caller owns the returned chain and must submit or
  * abandon it.
@@ -232,6 +395,9 @@ IwanNtTxDrain(
     for (;;) {
         PIWAN_NT_TX_SLOT head;
         ULONG count = 0;
+
+        /* Frames that waited in the second level go first: they are the oldest. */
+        IwanNtTxDrainQueued(Tx);
 
         head = IwanNtTxTakePending(Tx, IWAN_NT_TX_MAX_CHAIN, &count);
         if (head == NULL || count == 0) {
@@ -330,6 +496,38 @@ IwanNtTxInitialize(
     Tx->FreeCount = IWAN_NT_TX_SLOTS;
 
     /*
+     * Second level: 1024 frame buffers of 2 KB (2 MB) plus the free-index
+     * stack. It is optional on purpose: if the allocation fails the tunnel
+     * still runs, it just falls back to dropping when the in-flight window
+     * closes.
+     */
+    Tx->QueueStorage = ExAllocatePool2(
+        POOL_FLAG_NON_PAGED, IWAN_NT_TX_QUEUE_MAX * IWAN_NT_TX_QUEUE_BYTES,
+        IWAN_NT_TAG_TX_BUFFER);
+    Tx->FreeStack = ExAllocatePool2(
+        POOL_FLAG_NON_PAGED, IWAN_NT_TX_QUEUE_MAX * sizeof(ULONG),
+        IWAN_NT_TAG_TX_BUFFER);
+    if (Tx->QueueStorage == NULL || Tx->FreeStack == NULL) {
+        if (Tx->QueueStorage != NULL) {
+            ExFreePoolWithTag(Tx->QueueStorage, IWAN_NT_TAG_TX_BUFFER);
+            Tx->QueueStorage = NULL;
+        }
+        if (Tx->FreeStack != NULL) {
+            ExFreePoolWithTag(Tx->FreeStack, IWAN_NT_TAG_TX_BUFFER);
+            Tx->FreeStack = NULL;
+        }
+        Tx->QueueCapacity = 0;
+    } else {
+        ULONG index2;
+
+        Tx->QueueCapacity = IWAN_NT_TX_QUEUE_MAX;
+        for (index2 = 0; index2 < IWAN_NT_TX_QUEUE_MAX; index2++) {
+            Tx->FreeStack[index2] = (IWAN_NT_TX_QUEUE_MAX - 1) - index2;
+        }
+        Tx->FreeTop = IWAN_NT_TX_QUEUE_MAX;
+    }
+
+    /*
      * The drain thread is created last: Finalize treats DrainRunning as "the
      * thread object must be closed", so nothing may set it before the thread
      * exists.
@@ -405,6 +603,20 @@ IwanNtTxFinalize(
             slot->Buffer = NULL;
         }
     }
+
+    if (Tx->QueueStorage != NULL) {
+        ExFreePoolWithTag(Tx->QueueStorage, IWAN_NT_TAG_TX_BUFFER);
+        Tx->QueueStorage = NULL;
+    }
+    if (Tx->FreeStack != NULL) {
+        ExFreePoolWithTag(Tx->FreeStack, IWAN_NT_TAG_TX_BUFFER);
+        Tx->FreeStack = NULL;
+    }
+    Tx->QueueCapacity = 0;
+    Tx->FreeTop = 0;
+    Tx->RingHead = 0;
+    Tx->RingTail = 0;
+    Tx->RingCount = 0;
 
     Tx->SlotCount = 0;
     Tx->FreeCount = 0;
@@ -509,6 +721,8 @@ IwanNtTxAbandonItems(
     for (index = 0; index < Count; index++) {
         if (Items[index].Slot != NULL) {
             IwanNtTxAbandonSlot(Tx, Items[index].Slot, TRUE);
+        } else if (Items[index].Queued != NULL) {
+            IwanNtTxReleaseQueueBuffer(Tx, Items[index].Queued);
         }
     }
 }
@@ -630,6 +844,7 @@ IwanNtTxSendBatch(
     started = KeQueryInterruptTime();
     for (index = 0; index < Count; index++) {
         PIWAN_NT_TX_SLOT slot = Items[index].Slot;
+        PUCHAR queued = Items[index].Queued;
         IWAN_NT_FRAME_RESULT seal;
         size_t frameLength;
         size_t innerLength = Items[index].InnerLength;
@@ -647,9 +862,38 @@ IwanNtTxSendBatch(
             break;
         }
 
+        if (queued != NULL) {
+            /*
+             * The caller ran out of slots and copied the packet into a frame
+             * buffer instead. Seal it there and park it in the second level;
+             * the drain path moves it into a slot when one frees. Nothing is
+             * dropped just because the in-flight window was closed.
+             */
+            seal = IwanNtFrameSealInPlace(
+                queued, IWAN_NT_TX_QUEUE_BYTES, innerLength, Header, Key,
+                &frameLength);
+            if (seal != IwanNtFrameOk ||
+                !IwanNtTxQueueFrame(Tx, queued, (ULONG)frameLength)) {
+                IwanNtTxReleaseQueueBuffer(Tx, queued);
+                break;
+            }
+            staged++;
+            continue;
+        }
+
         if (slot == NULL) {
             slot = IwanNtTxClaimSlot(Tx);
             if (slot == NULL) {
+                /*
+                 * No slot and the caller did not stage a frame buffer: count
+                 * the packet as rejected instead of letting the stack drop it
+                 * silently (that gap hid a third of the traffic on 2026-11-17).
+                 */
+                KIRQL dropIrql;
+
+                KeAcquireSpinLock(&Tx->Lock, &dropIrql);
+                Tx->NoSlot++;
+                KeReleaseSpinLock(&Tx->Lock, dropIrql);
                 break;
             }
 
@@ -713,7 +957,8 @@ IwanNtTxSendBatch(
      * fires on the wrong number of frames whenever a flush carries more than
      * one packet. The 1 ms drain thread keeps a lone frame moving.
      */
-    if (IwanNtTxPending(Tx) >= IWAN_NT_TX_FRAMES_PER_CALL) {
+    if (IwanNtTxPending(Tx) + IwanNtTxQueueDepth(Tx) >=
+        IWAN_NT_TX_FRAMES_PER_CALL) {
         IwanNtTxDrain(Tx);
     }
 

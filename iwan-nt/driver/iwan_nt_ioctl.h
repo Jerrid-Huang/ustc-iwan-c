@@ -89,7 +89,7 @@
 
 #define IWAN_NT_SESSION_STRUCT_SIZE 24u
 #define IWAN_NT_ADDR_STRUCT_SIZE 24u
-#define IWAN_NT_STATS_STRUCT_SIZE 392u
+#define IWAN_NT_STATS_STRUCT_SIZE 408u
 #define IWAN_NT_CREDENTIALS_STRUCT_SIZE 136u
 
 /* Field widths inside IWAN_NT_CREDENTIALS_ABI. */
@@ -203,6 +203,8 @@ typedef struct _IWAN_NT_STATS_ABI {
     uint64_t TxAccepted;           /* inner packets the miniport accepted */
     uint64_t TxRejected;           /* inner packets the miniport refused */
     uint64_t TxPending;            /* frames staged and waiting for the drain */
+    uint64_t TxQueued;             /* frames waiting in the second-level queue */
+    uint64_t TxQueueDrops;         /* frames dropped because that queue was full */
     uint64_t TxMaxBatch;           /* largest chain ever handed over in one call */
     uint64_t TxBatches;            /* WskSendMessages calls; accepted/batches = batch size */
     uint64_t RxIndicated;          /* NBLs indicated up */

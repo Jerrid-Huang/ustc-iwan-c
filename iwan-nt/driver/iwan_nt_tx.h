@@ -60,6 +60,21 @@ extern "C" {
  */
 #define IWAN_NT_TX_FRAMES_PER_CALL 32UL
 
+/*
+ * Second level of the queue: whole sealed frames kept in flat memory when no
+ * slot is free. Slots cost an MDL and an IRP each, so they stay the in-flight
+ * window (256); the overflow goes here as plain bytes and the drain thread
+ * moves them into slots as the provider completes. Without this level a burst
+ * that outran the in-flight window was dropped inside the stack with no
+ * counter moving at all (measured 2026-11-17: in-flight pegged at 256 while
+ * "rejected" stayed 0 and one third of the generator's packets never arrived).
+ *
+ * WireGuardNT keeps 1024 queued packets per peer (MAX_QUEUED_PACKETS); this is
+ * the same order of magnitude, sized to hold ~10 ms of a saturated link.
+ */
+#define IWAN_NT_TX_QUEUE_MAX 1024UL
+#define IWAN_NT_TX_QUEUE_BYTES 2048UL
+
 typedef struct _IWAN_NT_TX IWAN_NT_TX, *PIWAN_NT_TX;
 
 typedef struct _IWAN_NT_TX_SLOT {
@@ -103,7 +118,20 @@ typedef struct _IWAN_NT_TX_ITEM {
      * again. NULL means the batch has to claim a slot and copy the payload.
      */
     PIWAN_NT_TX_SLOT Slot;
+
+    /*
+     * Set instead of Slot when no slot could be claimed: a frame buffer from
+     * the second-level queue, already holding the inner packet at
+     * IWAN_NT_FRAME_HDR_LEN. Exactly one of Slot and Queued is non-NULL for a
+     * staged packet; both NULL means the payload is still in caller memory.
+     */
+    PUCHAR Queued;
 } IWAN_NT_TX_ITEM, *PIWAN_NT_TX_ITEM;
+
+typedef struct _IWAN_NT_TX_QUEUE_FRAME {
+    PUCHAR Buffer;
+    ULONG Length;
+} IWAN_NT_TX_QUEUE_FRAME;
 
 struct _IWAN_NT_TX {
     KSPIN_LOCK Lock;
@@ -144,6 +172,20 @@ struct _IWAN_NT_TX {
     ULONG64 CostEnterCount;
     IWAN_NT_TX_SLOT Slots[IWAN_NT_TX_SLOTS];
 
+    /*
+     * Second-level queue: claimed frame buffers and the ring of frames that
+     * are sealed but have no slot yet. FreeStack makes claim/release O(1);
+     * the ring keeps submission order.
+     */
+    PUCHAR QueueStorage;
+    ULONG QueueCapacity;
+    PULONG FreeStack;
+    ULONG FreeTop;
+    IWAN_NT_TX_QUEUE_FRAME Ring[IWAN_NT_TX_QUEUE_MAX];
+    ULONG RingHead;
+    ULONG RingTail;
+    ULONG RingCount;
+    ULONG64 QueueDrops;
     /* Deferred submit queue: filled slots waiting for the drain thread. */
     PIWAN_NT_TX_SLOT PendingHead;
     PIWAN_NT_TX_SLOT PendingTail;
@@ -295,6 +337,42 @@ IwanNtTxAbandonSlot(
     _Inout_ PIWAN_NT_TX Tx,
     _Inout_ PIWAN_NT_TX_SLOT Slot,
     _In_ BOOLEAN CountAsSubmitError
+    );
+
+/*
+ * Second-level queue. When no slot can be claimed the send path takes a frame
+ * buffer instead, copies the packet into it and hands it to IwanNtTxQueueFrame
+ * after sealing; the drain thread moves queued frames into slots as they free.
+ * Claim and release are O(1) and lock-protected; the queue is the only place a
+ * burst is allowed to wait, and a full queue is counted, never silent.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PUCHAR
+IwanNtTxClaimQueueBuffer(
+    _Inout_ PIWAN_NT_TX Tx
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+void
+IwanNtTxReleaseQueueBuffer(
+    _Inout_ PIWAN_NT_TX Tx,
+    _Inout_ PUCHAR Buffer
+    );
+
+/* Takes ownership of a sealed frame. FALSE means the queue is full. */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN
+IwanNtTxQueueFrame(
+    _Inout_ PIWAN_NT_TX Tx,
+    _Inout_ PUCHAR Buffer,
+    _In_ ULONG Length
+    );
+
+/* Frames waiting in the second-level queue. IRQL: any. */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+ULONG
+IwanNtTxQueueDepth(
+    _In_ PIWAN_NT_TX Tx
     );
 
 /*
