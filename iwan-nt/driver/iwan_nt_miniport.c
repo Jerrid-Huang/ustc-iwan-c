@@ -3,6 +3,11 @@
 #include "iwan_nt_mtu.h"
 #include "iwan_nt_prefix.h"
 
+#include "iwan_nt_transport.h"
+#include "iwan_nt_trace.h"
+#include "iwan_nt_tx.h"
+#include "iwan_nt_control.h"
+
 /*
  * Two names for the same bound: the driver's own table size and the size the ABI
  * publishes. If they ever drift the guest would send a table the driver refuses
@@ -10,10 +15,6 @@
  */
 _Static_assert(IWAN_NT_MAX_PREFIXES == IWAN_NT_PREFIX_MAX,
                "prefix bound disagrees with the ABI");
-#include "iwan_nt_transport.h"
-#include "iwan_nt_trace.h"
-#include "iwan_nt_tx.h"
-#include "iwan_nt_control.h"
 
 #define IWAN_NT_MINIPORT_POOL_TAG 'mNwI'
 
