@@ -58,7 +58,7 @@ extern "C" {
  * FRAMES_PER_CALL-th staging drains up to IWAN_NT_TX_MAX_CHAIN frames in one
  * call. The 1 ms drain thread is the safety net for a lone packet.
  */
-#define IWAN_NT_TX_FRAMES_PER_CALL 128UL
+#define IWAN_NT_TX_FRAMES_PER_CALL 32UL
 
 typedef struct _IWAN_NT_TX IWAN_NT_TX, *PIWAN_NT_TX;
 
