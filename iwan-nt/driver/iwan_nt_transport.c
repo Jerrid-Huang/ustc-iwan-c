@@ -1228,6 +1228,7 @@ IwanNtTransportSendInnerBatch(
     running = (BOOLEAN)(Transport->State == IwanNtTransportRunning);
     KeReleaseSpinLock(&Transport->StateLock, oldIrql);
     if (!running) {
+        IwanNtTxAbandonItems(&Transport->Tx, Items, Count);
         return STATUS_INVALID_DEVICE_STATE;
     }
 
@@ -1238,16 +1239,19 @@ IwanNtTransportSendInnerBatch(
      */
     for (index = 0; index < Count; index++) {
         if (Items[index].Inner == NULL || Items[index].InnerLength == 0) {
+            IwanNtTxAbandonItems(&Transport->Tx, Items, Count);
             return STATUS_INVALID_PARAMETER;
         }
         itemFamily = IwanNtFrameInnerFamily(Items[index].Inner,
                                             Items[index].InnerLength);
         if (itemFamily != 4 && itemFamily != 6) {
+            IwanNtTxAbandonItems(&Transport->Tx, Items, Count);
             return STATUS_INVALID_PARAMETER;
         }
         if (index == 0) {
             family = itemFamily;
         } else if (family != itemFamily) {
+            IwanNtTxAbandonItems(&Transport->Tx, Items, Count);
             return STATUS_INVALID_PARAMETER;
         }
     }
@@ -1262,6 +1266,12 @@ IwanNtTransportSendInnerBatch(
     KeReleaseSpinLock(&Transport->SessionLock, oldIrql);
 
     if (!sessionValid) {
+        /*
+         * The caller already copied the packets into their slots, so a refused
+         * batch has to hand them back: no session is the normal state right
+         * after a restart, and leaking slots there would stall the first flood.
+         */
+        IwanNtTxAbandonItems(&Transport->Tx, Items, Count);
         return STATUS_INVALID_DEVICE_STATE;
     }
 

@@ -494,6 +494,25 @@ IwanNtTxAbandonSlot(
     }
 }
 
+VOID
+IwanNtTxAbandonItems(
+    _Inout_ PIWAN_NT_TX Tx,
+    _In_reads_(Count) const IWAN_NT_TX_ITEM *Items,
+    _In_ ULONG Count
+    )
+{
+    ULONG index;
+
+    if (Tx == NULL || Items == NULL) {
+        return;
+    }
+    for (index = 0; index < Count; index++) {
+        if (Items[index].Slot != NULL) {
+            IwanNtTxAbandonSlot(Tx, Items[index].Slot, TRUE);
+        }
+    }
+}
+
 /*
  * Submit an already-filled slot holding Length bytes, without batching.
  *

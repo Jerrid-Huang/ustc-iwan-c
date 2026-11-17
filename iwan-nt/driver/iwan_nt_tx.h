@@ -298,6 +298,19 @@ IwanNtTxAbandonSlot(
     _In_ BOOLEAN CountAsSubmitError
     );
 
+/*
+ * Give back every slot handed over inside Items that was never accepted. A
+ * caller that refuses a whole batch has to return the slots, otherwise the pool
+ * shrinks by one slot per refused batch until the tunnel stalls.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+void
+IwanNtTxAbandonItems(
+    _Inout_ PIWAN_NT_TX Tx,
+    _In_reads_(Count) const IWAN_NT_TX_ITEM *Items,
+    _In_ ULONG Count
+    );
+
 /* Diagnostics: per-packet cost accumulators, in 100 ns units. */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 void
