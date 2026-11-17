@@ -392,6 +392,84 @@ TestSealRejections(void)
              IwanNtFrameBadType);
 }
 
+/*
+ * Sealing in place has to produce byte-identical frames to sealing with a
+ * separate source buffer. The send path relies on that: it copies the payload
+ * straight into the slot body and lets the pool seal it where it lies, so a
+ * divergence here would corrupt every packet on the wire.
+ */
+static void
+TestSealInPlace(void)
+{
+    uint8_t inner[128];
+    uint8_t copied[256];
+    uint8_t inPlace[256];
+    IWAN_NT_FRAME_HEADER header;
+    size_t innerLen;
+    size_t copiedLen = 0;
+    size_t inPlaceLen = 0;
+    uint8_t types[4];
+    unsigned t;
+
+    types[0] = IWAN_NT_TYPE_DATA;
+    types[1] = IWAN_NT_TYPE_DATA_ENC;
+    types[2] = IWAN_NT_TYPE_DATA6;
+    types[3] = IWAN_NT_TYPE_DATA6_ENC;
+
+    for (t = 0; t < 4; t++) {
+        const uint8_t *key = (t == 1 || t == 3) ? kKey : NULL;
+
+        header.Type = types[t];
+        header.Encrypt = 0;
+        header.Sid = 0x1234;
+        header.Token = 0x89abcdefu;
+
+        /*
+         * Odd lengths exercise the trailing bytes after the 8-byte loop, and
+         * the v6 types get a v6 inner packet.
+         */
+        innerLen = (t < 2) ? BuildIpv4(inner, sizeof(inner), 13)
+                           : BuildIpv6(inner, sizeof(inner), 17);
+
+        CHECK_EQ(IwanNtFrameSeal(copied, sizeof(copied), inner, innerLen,
+                                 &header, key, &copiedLen), IwanNtFrameOk);
+
+        memset(inPlace, 0xa5, sizeof(inPlace));
+        memcpy(inPlace + IWAN_NT_FRAME_HDR_LEN, inner, innerLen);
+        CHECK_EQ(IwanNtFrameSealInPlace(inPlace, sizeof(inPlace), innerLen,
+                                        &header, key, &inPlaceLen),
+                 IwanNtFrameOk);
+        CHECK_EQ(inPlaceLen, copiedLen);
+        CHECK(memcmp(inPlace, copied, copiedLen) == 0);
+    }
+
+    /* Capacity is measured from the frame, not from the body. */
+    memcpy(inPlace + IWAN_NT_FRAME_HDR_LEN, inner, 33);
+    header.Type = IWAN_NT_TYPE_DATA;
+    CHECK_EQ(IwanNtFrameSealInPlace(inPlace, 33 + IWAN_NT_FRAME_HDR_LEN - 1,
+                                    33, &header, NULL, &inPlaceLen),
+             IwanNtFrameTooLong);
+
+    /*
+     * Encrypted in place without a key is rejected before anything is written,
+     * and a body that is not a sane inner packet is rejected even with a key.
+     * Both checks run before the header or the body is touched.
+     */
+    innerLen = BuildIpv4(inner, sizeof(inner), 13);
+    header.Type = IWAN_NT_TYPE_DATA_ENC;
+    memcpy(inPlace + IWAN_NT_FRAME_HDR_LEN, inner, innerLen);
+    CHECK_EQ(IwanNtFrameSealInPlace(inPlace, sizeof(inPlace), innerLen,
+                                    &header, NULL, &inPlaceLen),
+             IwanNtFrameBadArgument);
+    CHECK(memcmp(inPlace + IWAN_NT_FRAME_HDR_LEN, inner, innerLen) == 0);
+
+    memset(inPlace + IWAN_NT_FRAME_HDR_LEN, 0x5a, innerLen);
+    CHECK_EQ(IwanNtFrameSealInPlace(inPlace, sizeof(inPlace), innerLen,
+                                    &header, kKey, &inPlaceLen),
+             IwanNtFrameBadFamily);
+    CHECK_EQ(inPlace[IWAN_NT_FRAME_HDR_LEN], 0x5a);
+}
+
 int
 main(void)
 {
@@ -406,6 +484,7 @@ main(void)
 
     TestOpenRejections();
     TestSealRejections();
+    TestSealInPlace();
 
     printf("frame: %u checks, %u failures\n", gChecks, gFailures);
     return gFailures == 0 ? 0 : 1;

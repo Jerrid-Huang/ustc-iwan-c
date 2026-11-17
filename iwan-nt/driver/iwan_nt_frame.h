@@ -145,6 +145,21 @@ IWAN_NT_FRAME_RESULT IwanNtFrameInnerSane(
  * the DATA_ENC/DATA6_ENC frame type and applies the XOR transform; the caller
  * must supply a key in that case.
  */
+/*
+ * Same contract as IwanNtFrameSeal, except the payload is already at
+ * Frame + IWAN_NT_FRAME_HDR_LEN and is transformed in place. It lets the send
+ * path copy a packet once, straight into the transmit slot, instead of copying
+ * it into a shared scratch buffer and then into the slot.
+ */
+IWAN_NT_FRAME_RESULT IwanNtFrameSealInPlace(
+    _Inout_updates_bytes_(Capacity) uint8_t *Frame,
+    size_t Capacity,
+    size_t InnerLength,
+    _In_ const IWAN_NT_FRAME_HEADER *Header,
+    _In_reads_bytes_opt_(IWAN_NT_FRAME_KEY_LEN) const uint8_t *Key,
+    _Out_ size_t *OutLength
+    );
+
 IWAN_NT_FRAME_RESULT IwanNtFrameSeal(
     _Out_writes_bytes_to_(OutCap, *OutLength) uint8_t *Out,
     _In_ size_t OutCap,

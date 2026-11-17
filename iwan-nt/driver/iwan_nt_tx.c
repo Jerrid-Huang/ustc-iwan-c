@@ -439,7 +439,7 @@ _IRQL_requires_max_(DISPATCH_LEVEL)
  * Returns NULL when every slot is in flight or staged; that is backpressure,
  * counted as NoSlot, not an error worth waiting for.
  */
-static PIWAN_NT_TX_SLOT
+PIWAN_NT_TX_SLOT
 IwanNtTxClaimSlot(
     _Inout_ PIWAN_NT_TX Tx
     )
@@ -472,7 +472,7 @@ IwanNtTxClaimSlot(
  * Return a slot that was claimed but never submitted, and bump the counter
  * that explains why. The idle event is signalled outside the lock.
  */
-static VOID
+VOID
 IwanNtTxAbandonSlot(
     _Inout_ PIWAN_NT_TX Tx,
     _Inout_ PIWAN_NT_TX_SLOT Slot,
@@ -610,7 +610,7 @@ IwanNtTxSendBatch(
 
     started = KeQueryInterruptTime();
     for (index = 0; index < Count; index++) {
-        PIWAN_NT_TX_SLOT slot;
+        PIWAN_NT_TX_SLOT slot = Items[index].Slot;
         IWAN_NT_FRAME_RESULT seal;
         size_t frameLength;
         size_t innerLength = Items[index].InnerLength;
@@ -628,19 +628,30 @@ IwanNtTxSendBatch(
             break;
         }
 
-        slot = IwanNtTxClaimSlot(Tx);
         if (slot == NULL) {
-            break;
-        }
+            slot = IwanNtTxClaimSlot(Tx);
+            if (slot == NULL) {
+                break;
+            }
 
-        /*
-         * The payload is copied into the slot, so the caller's packet is free
-         * to go as soon as this returns. That is what lets the miniport
-         * complete the NBL immediately and defer the provider call.
-         */
-        seal = IwanNtFrameSeal(
-            (uint8_t *)slot->Buffer, IWAN_NT_TX_BUFFER_BYTES,
-            Items[index].Inner, innerLength, Header, Key, &frameLength);
+            /*
+             * Payload still in the caller's memory: copy and transform in one
+             * pass into the slot. The packet is free to go once this returns,
+             * which is what lets the miniport complete the NBL immediately.
+             */
+            seal = IwanNtFrameSeal(
+                (uint8_t *)slot->Buffer, IWAN_NT_TX_BUFFER_BYTES,
+                Items[index].Inner, innerLength, Header, Key, &frameLength);
+        } else {
+            /*
+             * The caller already copied the payload straight into the slot
+             * body, one memory pass and no shared staging buffer, so the whole
+             * send path needs no adapter-wide lock. Seal it where it lies.
+             */
+            seal = IwanNtFrameSealInPlace(
+                (uint8_t *)slot->Buffer, IWAN_NT_TX_BUFFER_BYTES,
+                innerLength, Header, Key, &frameLength);
+        }
         if (seal != IwanNtFrameOk) {
             IwanNtTxAbandonSlot(Tx, slot, TRUE);
             break;

@@ -154,6 +154,91 @@ IwanNtFrameTypeIsData(
            Type == IWAN_NT_TYPE_DATA6_ENC;
 }
 
+/*
+ * The mask for one eight-byte step. Eight key bytes, little endian, so a 64-bit
+ * load/xor/store replaces eight byte operations per step.
+ */
+static uint64_t
+IwanNtFrameMask(
+    _In_reads_bytes_(IWAN_NT_FRAME_KEY_LEN) const uint8_t *Key
+    )
+{
+    uint64_t mask = 0;
+    size_t i;
+
+    for (i = 0; i < IWAN_NT_FRAME_KEY_LEN; i++) {
+        mask |= (uint64_t)Key[i] << (unsigned)(i * 8u);
+    }
+    return mask;
+}
+
+IWAN_NT_FRAME_RESULT
+IwanNtFrameSealInPlace(
+    uint8_t *Frame,
+    size_t Capacity,
+    size_t InnerLength,
+    const IWAN_NT_FRAME_HEADER *Header,
+    const uint8_t *Key,
+    size_t *OutLength
+    )
+{
+    IWAN_NT_FRAME_HEADER header;
+    size_t body_start = IWAN_NT_FRAME_HDR_LEN;
+
+    if (Frame == NULL || Header == NULL || OutLength == NULL) {
+        return IwanNtFrameBadArgument;
+    }
+    if (!IwanNtFrameTypeIsData(Header->Type)) {
+        return IwanNtFrameBadType;
+    }
+    if (Capacity < body_start || InnerLength > Capacity - body_start) {
+        return IwanNtFrameTooLong;
+    }
+    if (IwanNtFrameInnerSane(Frame + body_start, InnerLength) != IwanNtFrameOk) {
+        return IwanNtFrameBadFamily;
+    }
+
+    header = *Header;
+    if (IwanNtFrameTypeIsEncrypted(header.Type)) {
+        if (Key == NULL) {
+            return IwanNtFrameBadArgument;
+        }
+        header.Encrypt = 1u;
+    } else {
+        header.Encrypt = 0u;
+    }
+
+    IwanNtFrameHeaderEncode(Frame, &header);
+
+    if (header.Encrypt != 0u) {
+        uint8_t *body = Frame + body_start;
+        uint64_t mask = IwanNtFrameMask(Key);
+        size_t i = 0;
+
+        while (InnerLength - i >= 8u) {
+            uint64_t word = 0;
+            unsigned b;
+
+            for (b = 0; b < 8u; b++) {
+                word |= (uint64_t)body[i + b] << (b * 8u);
+            }
+            word ^= mask;
+            for (b = 0; b < 8u; b++) {
+                body[i + b] = (uint8_t)(word >> (b * 8u));
+            }
+            i += 8u;
+        }
+        while (i < InnerLength) {
+            body[i] =
+                (uint8_t)(body[i] ^ Key[i & (IWAN_NT_FRAME_KEY_LEN - 1u)]);
+            i++;
+        }
+    }
+
+    *OutLength = body_start + InnerLength;
+    return IwanNtFrameOk;
+}
+
 IWAN_NT_FRAME_RESULT
 IwanNtFrameSeal(
     uint8_t *Out,

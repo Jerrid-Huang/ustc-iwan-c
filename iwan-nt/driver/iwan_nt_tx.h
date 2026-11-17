@@ -91,9 +91,18 @@ typedef NTSTATUS (*IWAN_NT_TX_SUBMIT)(
  * One inner packet of a batch. The header and key are shared by the batch,
  * because a batch belongs to a single session and a single frame type.
  */
+typedef struct _IWAN_NT_TX_SLOT IWAN_NT_TX_SLOT, *PIWAN_NT_TX_SLOT;
+
 typedef struct _IWAN_NT_TX_ITEM {
     const uint8_t *Inner;
     size_t InnerLength;
+
+    /*
+     * Slot the caller already filled: Inner then points at Slot->Buffer plus
+     * the frame header, so the frame is sealed in place and nothing is copied
+     * again. NULL means the batch has to claim a slot and copy the payload.
+     */
+    PIWAN_NT_TX_SLOT Slot;
 } IWAN_NT_TX_ITEM, *PIWAN_NT_TX_ITEM;
 
 struct _IWAN_NT_TX {
@@ -267,6 +276,26 @@ _IRQL_requires_max_(DISPATCH_LEVEL)
 ULONG
 IwanNtTxPending(
     _In_ PIWAN_NT_TX Tx
+    );
+
+/*
+ * The send path claims a slot, copies the packet straight into the slot body
+ * (offset IWAN_NT_FRAME_HDR_LEN) and hands the slot over in IWAN_NT_TX_ITEM, so
+ * one copy per packet is all that is paid and no shared scratch buffer (and no
+ * lock around it) is needed.
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PIWAN_NT_TX_SLOT
+IwanNtTxClaimSlot(
+    _Inout_ PIWAN_NT_TX Tx
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+void
+IwanNtTxAbandonSlot(
+    _Inout_ PIWAN_NT_TX Tx,
+    _Inout_ PIWAN_NT_TX_SLOT Slot,
+    _In_ BOOLEAN CountAsSubmitError
     );
 
 /* Diagnostics: per-packet cost accumulators, in 100 ns units. */

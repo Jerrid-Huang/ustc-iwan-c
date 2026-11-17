@@ -135,9 +135,7 @@ typedef struct _IWAN_NT_MINIPORT_ADAPTER {
      * runs on contiguous bytes. The lock keeps that shared buffer, and the
      * transform itself, single threaded as the design requires.
      */
-    NDIS_SPIN_LOCK SendLock;
-    BOOLEAN SendLockReady;
-    PUCHAR SendScratch;
+
     NDIS_HANDLE RxPool;
     NDIS_HANDLE RxPoolProbe;
     IWAN_NT_MINIPORT_RX_SLOT RxSlots[IWAN_NT_MINIPORT_RX_SLOTS];
@@ -716,17 +714,6 @@ IwanNtMiniportInitializeEx(
     }
     adapter->TransportReady = TRUE;
     IwanNtTrace(IWAN_NT_STAGE_TRANSPORT);
-    NdisAllocateSpinLock(&adapter->SendLock);
-    adapter->SendLockReady = TRUE;
-    adapter->SendScratch = NdisAllocateMemoryWithTagPriority(
-        MiniportAdapterHandle,
-        IWAN_NT_TX_BUFFER_BYTES * IWAN_NT_MINIPORT_SEND_BATCH,
-        IWAN_NT_MINIPORT_POOL_TAG,
-        NormalPoolPriority);
-    if (adapter->SendScratch == NULL) {
-        status = NDIS_STATUS_RESOURCES;
-        goto Failure;
-    }
     {
         NET_BUFFER_LIST_POOL_PARAMETERS params;
 
@@ -997,10 +984,6 @@ Failure:
         IwanNtTransportFinalize(&adapter->Transport);
         adapter->TransportReady = FALSE;
     }
-    if (adapter->SendLockReady) {
-        NdisFreeSpinLock(&adapter->SendLock);
-        adapter->SendLockReady = FALSE;
-    }
     IwanNtMiniportFreeRxSlots(adapter);
     if (adapter->RxPoolProbe != NULL) {
         NdisFreeNetBufferListPool(adapter->RxPoolProbe);
@@ -1009,10 +992,6 @@ Failure:
     if (adapter->RxPool != NULL) {
         NdisFreeNetBufferListPool(adapter->RxPool);
         adapter->RxPool = NULL;
-    }
-    if (adapter->SendScratch != NULL) {
-        NdisFreeMemory(adapter->SendScratch, 0, 0);
-        adapter->SendScratch = NULL;
     }
     NdisFreeMemory(adapter, 0, 0);
     return status;
@@ -1046,10 +1025,6 @@ IwanNtMiniportHaltEx(
         IwanNtTransportFinalize(&adapter->Transport);
         adapter->TransportReady = FALSE;
     }
-    if (adapter->SendLockReady) {
-        NdisFreeSpinLock(&adapter->SendLock);
-        adapter->SendLockReady = FALSE;
-    }
     if (adapter->RxIdleReady) {
         LARGE_INTEGER timeout;
 
@@ -1073,10 +1048,6 @@ IwanNtMiniportHaltEx(
     if (adapter->RxPool != NULL) {
         NdisFreeNetBufferListPool(adapter->RxPool);
         adapter->RxPool = NULL;
-    }
-    if (adapter->SendScratch != NULL) {
-        NdisFreeMemory(adapter->SendScratch, 0, 0);
-        adapter->SendScratch = NULL;
     }
     NdisFreeMemory(adapter, 0, 0);
 }
@@ -1361,41 +1332,54 @@ static BOOLEAN
 IwanNtMiniportStagePacket(
     _Inout_ PIWAN_NT_MINIPORT_ADAPTER adapter,
     _In_ PNET_BUFFER Nb,
-    _In_ ULONG Slot,
-    _Out_ IWAN_NT_TX_ITEM *Item
+    _Out_ IWAN_NT_TX_ITEM *Item,
+    _Inout_ PNDIS_STATUS PacketStatus
     )
 {
     ULONG length = NET_BUFFER_DATA_LENGTH(Nb);
+    PIWAN_NT_TX_SLOT slot;
     PUCHAR bytes;
+    PUCHAR body;
     LONG prefixCount;
 
     if (length != 0 && length > IwanNtMiniportSendLimit(adapter)) {
         InterlockedIncrement(&adapter->MtuDropped);
         return FALSE;
     }
-    if (length == 0 || length > IWAN_NT_TX_BUFFER_BYTES) {
+    if (length == 0 || length + IWAN_NT_FRAME_HDR_LEN > IWAN_NT_TX_BUFFER_BYTES) {
         return FALSE;
     }
 
-
-
     /*
-     * Always copy: the pool may hold the bytes for a whole drain interval, so
-     * this staging area has to be ours. A single contiguous MDL would let the
-     * pool read the caller's memory instead, but measured on the test stack it
-     * never is contiguous, so that path is not worth its weight.
+     * Claim first, then copy straight into the slot body. The slot belongs to
+     * this packet alone, so nothing here needs an adapter-wide lock: that is
+     * what removed the send lock and the shared staging buffer, and with them
+     * one of the two memory passes per packet.
      */
-    bytes = NdisGetDataBuffer(
-        Nb, length, adapter->SendScratch + (SIZE_T)Slot * IWAN_NT_TX_BUFFER_BYTES,
-        1, 0);
-    if (bytes == NULL) {
+    slot = IwanNtTxClaimSlot(&adapter->Transport.Tx);
+    if (slot == NULL) {
+        *PacketStatus = NDIS_STATUS_RESOURCES;
         return FALSE;
+    }
+    body = (PUCHAR)slot->Buffer + IWAN_NT_FRAME_HDR_LEN;
+
+    bytes = NdisGetDataBuffer(Nb, length, body, 1, 0);
+    if (bytes == NULL) {
+        IwanNtTxAbandonSlot(&adapter->Transport.Tx, slot, TRUE);
+        *PacketStatus = NDIS_STATUS_INVALID_PACKET;
+        return FALSE;
+    }
+    if (bytes != body) {
+        /* Contiguous in the caller's MDL: rare on this stack, so copy it in. */
+        RtlCopyMemory(body, bytes, length);
+        bytes = body;
     }
 
     /*
-     * Egress prefix check, on the staged copy: a destination outside every
-     * allowed prefix did not reach us through a route we installed, so the packet
-     * is a routing mistake and must not be tunnelled.
+     * Egress prefix check, on the plaintext before the frame is sealed: a
+     * destination outside every allowed prefix did not reach us through a route
+     * we installed, so the packet is a routing mistake and must not be
+     * tunnelled.
      */
     prefixCount = (LONG)InterlockedCompareExchange(&adapter->PrefixCount, 0, 0);
     if (prefixCount != 0 &&
@@ -1404,11 +1388,13 @@ IwanNtMiniportStagePacket(
             IwanNtFrameInnerFamily(bytes, (size_t)length), bytes,
             (size_t)length)) {
         InterlockedIncrement(&adapter->TxNotAllowed);
+        IwanNtTxAbandonSlot(&adapter->Transport.Tx, slot, FALSE);
         return FALSE;
     }
 
     Item->Inner = bytes;
     Item->InnerLength = length;
+    Item->Slot = slot;
     return TRUE;
 }
 
@@ -1492,76 +1478,34 @@ IwanNtMiniportSendNetBufferLists(
     }
 
     /*
-     * One lock covers the shared staging buffer and the transform, so the
-     * synchronous path stays single threaded even when several CPUs send.
+     * No lock here: each packet stages into a slot it owns, and the slot pool
+     * does its own synchronisation. Several CPUs can therefore be inside this
+     * function at once, which is the other half of why throughput used to stop
+     * scaling with sender threads.
      */
-    NdisAcquireSpinLock(&adapter->SendLock);
     for (current = NetBufferLists; current != NULL; ) {
         PNET_BUFFER_LIST next = NET_BUFFER_LIST_NEXT_NBL(current);
         PNET_BUFFER nb;
         NDIS_STATUS packetStatus = NDIS_STATUS_SUCCESS;
+        IWAN_NT_TX_ITEM items[IWAN_NT_MINIPORT_SEND_BATCH];
+        ULONG count = 0;
 
-        /*
-         * Accumulate up to SEND_BATCH packets of one inner family and hand
-         * them over together. A family change flushes first: one frame header
-         * serves the batch, so the packets must agree.
-         */
-        {
-            IWAN_NT_TX_ITEM items[IWAN_NT_MINIPORT_SEND_BATCH];
-            ULONG count = 0;
-            unsigned family = 0;
-
-            for (nb = NET_BUFFER_LIST_FIRST_NB(current);
-                 nb != NULL; nb = NET_BUFFER_NEXT_NB(nb)) {
-                IWAN_NT_TX_ITEM item;
-                unsigned nbFamily;
-                ULONG length = NET_BUFFER_DATA_LENGTH(nb);
-
-                if (length == 0) {
-                    continue;
-                }
-                if (length > IWAN_NT_TX_BUFFER_BYTES) {
-                    packetStatus = NDIS_STATUS_INVALID_PACKET;
-                    continue;
-                }
-
-                /*
-                 * Flush before staging, so the slot index used here is always
-                 * inside the staging array.
-                 */
-                if (count == IWAN_NT_MINIPORT_SEND_BATCH) {
-                    IwanNtMiniportFlushBatch(adapter, items, count,
-                                             &packetStatus);
-                    count = 0;
-                }
-
-                if (!IwanNtMiniportStagePacket(adapter, nb, count, &item)) {
-                    packetStatus = NDIS_STATUS_RESOURCES;
-                    continue;
-                }
-                nbFamily = IwanNtFrameInnerFamily(item.Inner, length);
-
-                /*
-                 * A frame header serves the whole batch, so a family change
-                 * has to break it. The pending packets go out now; this one
-                 * moves to the front of the next batch.
-                 */
-                if (count != 0 && nbFamily != family) {
-                    IwanNtMiniportFlushBatch(adapter, items, count,
-                                             &packetStatus);
-                    RtlCopyMemory(adapter->SendScratch, item.Inner, length);
-                    item.Inner = adapter->SendScratch;
-                    count = 0;
-                }
-
-                family = nbFamily;
-                items[count] = item;
-                count++;
+        for (nb = NET_BUFFER_LIST_FIRST_NB(current);
+             nb != NULL; nb = NET_BUFFER_NEXT_NB(nb)) {
+            /* Flush first, so there is always room for one more packet. */
+            if (count == IWAN_NT_MINIPORT_SEND_BATCH) {
+                (void)IwanNtMiniportFlushBatch(adapter, items, count,
+                                              &packetStatus);
+                count = 0;
             }
-
-            (void)IwanNtMiniportFlushBatch(adapter, items, count,
-                                           &packetStatus);
+            if (!IwanNtMiniportStagePacket(adapter, nb, &items[count],
+                                           &packetStatus)) {
+                continue;
+            }
+            count++;
         }
+
+        (void)IwanNtMiniportFlushBatch(adapter, items, count, &packetStatus);
 
         /*
          * The staged bytes are the pool's own copy, so the list goes back now.
@@ -1572,18 +1516,15 @@ IwanNtMiniportSendNetBufferLists(
         NET_BUFFER_LIST_NEXT_NBL(current) = NULL;
         done[doneCount++] = current;
         if (doneCount == IWAN_NT_MINIPORT_COMPLETE_CHUNK) {
-            NdisReleaseSpinLock(&adapter->SendLock);
             for (index = 0; index < doneCount; index++) {
                 NdisMSendNetBufferListsComplete(handle, done[index],
                                                 completeFlags);
             }
             doneCount = 0;
-            NdisAcquireSpinLock(&adapter->SendLock);
         }
 
         current = next;
     }
-    NdisReleaseSpinLock(&adapter->SendLock);
 
     /* No access to an NBL or adapter is made after returning its ownership. */
     for (index = 0; index < doneCount; index++) {
