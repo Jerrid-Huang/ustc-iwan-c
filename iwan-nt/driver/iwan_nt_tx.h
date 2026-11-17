@@ -52,6 +52,14 @@ extern "C" {
  */
 #define IWAN_NT_TX_DRAIN_INTERVAL_MS 1UL
 
+/*
+ * Frames to accumulate before submitting without waiting for the DPC. Staging a
+ * frame costs ~1.7us while one provider call costs ~13-16us, so a chain of eight
+ * spreads that call over eight frames. Below the threshold the queued DPC sends
+ * whatever arrived, which keeps the latency of a single packet at one DPC.
+ */
+#define IWAN_NT_TX_SUBMIT_THRESHOLD 8UL
+
 typedef struct _IWAN_NT_TX IWAN_NT_TX, *PIWAN_NT_TX;
 
 typedef struct _IWAN_NT_TX_SLOT {
@@ -128,6 +136,7 @@ struct _IWAN_NT_TX {
     PIWAN_NT_TX_SLOT PendingTail;
     ULONG PendingCount;
     KEVENT DrainEvent;
+    KDPC DrainDpc;
     PVOID DrainThread;
     BOOLEAN DrainStop;
     BOOLEAN DrainRunning;

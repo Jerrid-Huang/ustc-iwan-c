@@ -247,6 +247,14 @@ IwanNtTxDrain(
  * provider and so that the provider sees batches instead of single frames.
  */
 static VOID
+IwanNtTxDrainDpc(
+    _In_ PKDPC Dpc,
+    _In_opt_ PVOID Context,
+    _In_opt_ PVOID Arg1,
+    _In_opt_ PVOID Arg2
+    );
+
+static VOID
 IwanNtTxDrainThread(
     _In_ PVOID Context
     )
@@ -292,6 +300,7 @@ IwanNtTxInitialize(
     KeInitializeSpinLock(&Tx->Lock);
     KeInitializeEvent(&Tx->IdleEvent, NotificationEvent, TRUE);
     KeInitializeEvent(&Tx->DrainEvent, NotificationEvent, FALSE);
+    KeInitializeDpc(&Tx->DrainDpc, IwanNtTxDrainDpc, (PVOID)Tx);
     Tx->Submit = Submit;
     Tx->SubmitContext = SubmitContext;
 
@@ -373,6 +382,13 @@ IwanNtTxFinalize(
      * Stop the drain thread before anything else: it reads the slot array, so
      * freeing a slot under it would be a use after free.
      */
+    /*
+     * A queued DPC holds a raw pointer to Tx, so it must be gone before any of
+     * the slots it would touch are freed.
+     */
+    KeRemoveQueueDpc(&Tx->DrainDpc);
+    KeFlushQueuedDpcs();
+
     if (Tx->DrainRunning) {
         Tx->DrainStop = TRUE;
         KeSetEvent(&Tx->DrainEvent, IO_NO_INCREMENT, FALSE);
@@ -565,6 +581,25 @@ IwanNtTxSubmitSlot(
  * IRQL: <= DISPATCH_LEVEL.
  */
 static VOID
+IwanNtTxDrainDpc(
+    _In_ PKDPC Dpc,
+    _In_opt_ PVOID Context,
+    _In_opt_ PVOID Arg1,
+    _In_opt_ PVOID Arg2
+    )
+{
+    PIWAN_NT_TX tx = (PIWAN_NT_TX)Context;
+
+    UNREFERENCED_PARAMETER(Dpc);
+    UNREFERENCED_PARAMETER(Arg1);
+    UNREFERENCED_PARAMETER(Arg2);
+
+    if (tx != NULL) {
+        IwanNtTxDrain(tx);
+    }
+}
+
+static VOID
 IwanNtTxStageSlot(
     _Inout_ PIWAN_NT_TX Tx,
     _Inout_ PIWAN_NT_TX_SLOT Slot
@@ -668,14 +703,27 @@ IwanNtTxSendBatch(
      */
     {
         KIRQL costIrql;
+        ULONG pending;
 
         KeAcquireSpinLock(&Tx->Lock, &costIrql);
         Tx->CostSeal += (ULONG64)(KeQueryInterruptTime() - started);
         Tx->CostCount += staged;
+        pending = Tx->PendingCount;
         KeReleaseSpinLock(&Tx->Lock, costIrql);
-    }
 
-    IwanNtTxDrain(Tx);
+        /*
+         * One provider call costs ~13-16us on this path while staging costs
+         * ~1.7us, so a call per frame is most of the per-packet budget. Submit
+         * inline once the chain is worth a call; otherwise hand the queue to a
+         * DPC that sends everything that accumulated meanwhile. A DPC costs
+         * microseconds, waking the drain thread cost 10-30us per frame.
+         */
+        if (pending >= IWAN_NT_TX_SUBMIT_THRESHOLD) {
+            IwanNtTxDrain(Tx);
+        } else {
+            (void)KeInsertQueueDpc(&Tx->DrainDpc, NULL, NULL);
+        }
+    }
 
     *Accepted = staged;
     return STATUS_SUCCESS;
