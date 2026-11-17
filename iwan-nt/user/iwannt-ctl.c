@@ -261,9 +261,10 @@ CommandStats(
     printf("drops: oversize=%llu sinkerrors=%llu\n",
            (unsigned long long)stats.RxOversize,
            (unsigned long long)stats.RxSinkErrors);
-    printf("prefixes: %lu allowed, %llu inner packets refused\n",
+    printf("prefixes: %lu allowed, %llu in refused, %llu out refused\n",
            (unsigned long)stats.PrefixCount,
-           (unsigned long long)stats.RxNotAllowed);
+           (unsigned long long)stats.RxNotAllowed,
+           (unsigned long long)stats.TxNotAllowed);
     printf("mtu: carrier=%lu effective=%lu peer=%lu dropped=%lu\n",
            (unsigned long)stats.CarrierMtu,
            (unsigned long)stats.EffectiveMtu,

@@ -156,6 +156,7 @@ typedef struct _IWAN_NT_MINIPORT_ADAPTER {
     IWAN_NT_PREFIX Prefixes[IWAN_NT_MAX_PREFIXES];
     volatile LONG PrefixCount;
     volatile LONG RxNotAllowed;
+    volatile LONG TxNotAllowed;
     volatile LONG RxIndicated;
     volatile LONG RxDropped;
     volatile LONG RxBatched;
@@ -603,7 +604,8 @@ IwanNtMiniportQueryMtu(
     _Out_ uint32_t *PeerMtu,
     _Out_ uint32_t *MtuDropped,
     _Out_ uint32_t *PrefixCount,
-    _Out_ uint64_t *RxNotAllowed
+    _Out_ uint64_t *RxNotAllowed,
+    _Out_ uint64_t *TxNotAllowed
     )
 {
     PIWAN_NT_MINIPORT_ADAPTER adapter = (PIWAN_NT_MINIPORT_ADAPTER)Context;
@@ -615,6 +617,7 @@ IwanNtMiniportQueryMtu(
         *MtuDropped = 0;
         *PrefixCount = 0;
         *RxNotAllowed = 0;
+        *TxNotAllowed = 0;
         return;
     }
 
@@ -627,6 +630,8 @@ IwanNtMiniportQueryMtu(
         &adapter->PrefixCount, 0, 0);
     *RxNotAllowed = (uint64_t)InterlockedCompareExchange(
         &adapter->RxNotAllowed, 0, 0);
+    *TxNotAllowed = (uint64_t)InterlockedCompareExchange(
+        &adapter->TxNotAllowed, 0, 0);
 }
 
 static VOID
@@ -1350,6 +1355,7 @@ IwanNtMiniportStagePacket(
 {
     ULONG length = NET_BUFFER_DATA_LENGTH(Nb);
     PUCHAR bytes;
+    LONG prefixCount;
 
     if (length != 0 && length > IwanNtMiniportSendLimit(adapter)) {
         InterlockedIncrement(&adapter->MtuDropped);
@@ -1358,6 +1364,8 @@ IwanNtMiniportStagePacket(
     if (length == 0 || length > IWAN_NT_TX_BUFFER_BYTES) {
         return FALSE;
     }
+
+
 
     /*
      * Always copy: the pool may hold the bytes for a whole drain interval, so
@@ -1369,6 +1377,21 @@ IwanNtMiniportStagePacket(
         Nb, length, adapter->SendScratch + (SIZE_T)Slot * IWAN_NT_TX_BUFFER_BYTES,
         1, 0);
     if (bytes == NULL) {
+        return FALSE;
+    }
+
+    /*
+     * Egress prefix check, on the staged copy: a destination outside every
+     * allowed prefix did not reach us through a route we installed, so the packet
+     * is a routing mistake and must not be tunnelled.
+     */
+    prefixCount = (LONG)InterlockedCompareExchange(&adapter->PrefixCount, 0, 0);
+    if (prefixCount != 0 &&
+        !IwanNtPrefixInnerAllowedTarget(
+            adapter->Prefixes, (unsigned)prefixCount,
+            IwanNtFrameInnerFamily(bytes, (size_t)length), bytes,
+            (size_t)length)) {
+        InterlockedIncrement(&adapter->TxNotAllowed);
         return FALSE;
     }
 

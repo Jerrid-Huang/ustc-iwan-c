@@ -134,16 +134,20 @@ IwanNtPrefixMatch(
     return 0;
 }
 
-int
-IwanNtPrefixInnerAllowed(
+static int
+IwanNtPrefixInnerAddressAllowed(
     const IWAN_NT_PREFIX *Table,
     unsigned Count,
     unsigned Family,
     const uint8_t *Inner,
-    size_t Length
+    size_t Length,
+    unsigned Offset4,
+    unsigned Offset6,
+    unsigned Minimum4,
+    unsigned Minimum6
     )
 {
-    const uint8_t *source;
+    const uint8_t *point;
 
     if (Count == 0u) {
         /* Not configured: the operator has not said what belongs in here. */
@@ -153,17 +157,45 @@ IwanNtPrefixInnerAllowed(
         return 0;
     }
     if (Family == 4u) {
-        if (Length < 20u) {
+        if (Length < (size_t)Minimum4) {
             return 0;
         }
-        source = Inner + 12;
+        point = Inner + Offset4;
     } else if (Family == 6u) {
-        if (Length < 40u) {
+        if (Length < (size_t)Minimum6) {
             return 0;
         }
-        source = Inner + 8;
+        point = Inner + Offset6;
     } else {
         return 0;
     }
-    return IwanNtPrefixMatch(Table, Count, Family, source);
+    return IwanNtPrefixMatch(Table, Count, Family, point);
+}
+
+int
+IwanNtPrefixInnerAllowed(
+    const IWAN_NT_PREFIX *Table,
+    unsigned Count,
+    unsigned Family,
+    const uint8_t *Inner,
+    size_t Length
+    )
+{
+    /* Source: 4 bytes into an IPv4 header, 8 bytes into an IPv6 header. */
+    return IwanNtPrefixInnerAddressAllowed(Table, Count, Family, Inner, Length,
+                                           12u, 8u, 20u, 40u);
+}
+
+int
+IwanNtPrefixInnerAllowedTarget(
+    const IWAN_NT_PREFIX *Table,
+    unsigned Count,
+    unsigned Family,
+    const uint8_t *Inner,
+    size_t Length
+    )
+{
+    /* Destination: 16 bytes into an IPv4 header, 24 bytes into an IPv6 one. */
+    return IwanNtPrefixInnerAddressAllowed(Table, Count, Family, Inner, Length,
+                                           16u, 24u, 20u, 40u);
 }

@@ -35,6 +35,37 @@ these rates.
   and report the ratio; absolute pps moves by a factor of two between quiet and busy
   periods.
 
+## MTU and in-bound filtering (added 2026-11-17)
+
+`stats` now reports three MTU numbers and two filter numbers:
+
+    mtu: carrier=1500 effective=1464 peer=1400 dropped=0
+    prefixes: 1 allowed, 0 in refused, 0 out refused
+
+- `carrier` comes from `Parameters\CarrierMtu` (default 1500); `effective` is
+  `min(carrier - 36, 1500)` for IPv4, so a 1500-byte carrier gives a 1464-byte
+  adapter MTU. `peer` is the MTU the server advertised in its ACK; the send limit is
+  `min(effective, peer)`, which is 1400 here, hence the <= 1372-byte payload rule.
+  Frames larger than the limit are counted in `dropped` instead of being fragmented.
+- `lease <ifindex> <prefix>...` installs the addresses, pushes the allowed-prefix
+  table into the driver (`SET_PREFIXES`) and adds one route per prefix. With a
+  non-empty table the receive path drops any inner packet whose source address is
+  outside every prefix and counts it in `in refused`, and the send path drops any
+  packet whose destination is outside every prefix and counts it in `out refused`;
+  an empty table disables both checks.
+
+One measured point with filtering enabled (1372 B payload, 2 threads, 10 s, host
+load ~2.3): tunnel 31,533 pps / 346.1 Mbps inner, `tx accepted` delta exactly equal
+to the generator's packet count, host sink 315,418 packets for 315,363 sent
+(100.0%). Same-window native baseline: 61,454 pps / 674.5 Mbps, i.e. the tunnel
+carried 51% of native pps.
+
+The refuse path is covered by `tests/prefix_test.c` (28 checks: v4/v6, /0,
+non-byte-aligned sources, host bits set, malformed entries, truncated headers) but
+has **not** been exercised end to end: the only host-side counterpart available is
+the sink server, which never originates inner traffic. A second sender is needed to
+watch `inner packets refused` move.
+
 ## Reproduce
 
     # adapter index, then lease

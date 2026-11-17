@@ -2,7 +2,7 @@
 #define IWAN_NT_PREFIX_H
 
 /*
- * Allowed inner prefixes: the receive-side half of WireGuard's AllowedIPs.
+ * Allowed inner prefixes: both halves of WireGuard's AllowedIPs.
  *
  * The reference client uses its prefix list twice, to choose a peer on egress
  * and to check the inner source address on ingress. A single-session tunnel has
@@ -41,6 +41,20 @@ IwanNtPrefixSetAllowed(
     unsigned Capacity,
     const IWAN_NT_PREFIX *Source,
     unsigned Count
+    );
+
+/*
+ * Same predicate for the inner packet's destination address, used on egress: a
+ * packet whose destination is outside every prefix has no business in the
+ * tunnel, and letting it in only hides a routing mistake.
+ */
+int
+IwanNtPrefixInnerAllowedTarget(
+    const IWAN_NT_PREFIX *Table,
+    unsigned Count,
+    unsigned Family,
+    const uint8_t *Inner,
+    size_t Length
     );
 
 /*

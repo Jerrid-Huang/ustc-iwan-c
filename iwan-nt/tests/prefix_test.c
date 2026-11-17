@@ -194,6 +194,48 @@ main(void)
     Check(IwanNtPrefixInnerAllowed(table, 1, 7, (const uint8_t *)"x", 20) == 0,
         "unknown family refused");
 
+    /* Egress uses the destination address, which sits at a different offset. */
+    {
+        IWAN_NT_PREFIX table[2];
+        IWAN_NT_PREFIX one;
+        uint8_t packet[40];
+        unsigned count;
+
+        one = Make4("198.18.0.0", 24u);
+        count = IwanNtPrefixSetAllowed(table, 2u, &one, 1u);
+
+        memset(packet, 0, sizeof(packet));
+        packet[0] = 0x45u;
+        packet[16] = 198u; packet[17] = 18u; packet[18] = 0u; packet[19] = 8u;
+        packet[12] = 10u;  packet[13] = 0u;  packet[14] = 0u;  packet[15] = 1u;
+        Check(IwanNtPrefixInnerAllowedTarget(table, count, 4u, packet,
+                                             sizeof(packet)) == 1,
+              "egress target inside");
+        Check(IwanNtPrefixInnerAllowed(table, count, 4u, packet,
+                                       sizeof(packet)) == 0,
+              "egress ignores the source, ingress sees it outside");
+
+        packet[18] = 1u;  /* outside the /24, the last byte alone would not be */
+        Check(IwanNtPrefixInnerAllowedTarget(table, count, 4u, packet,
+                                             sizeof(packet)) == 0,
+              "egress target outside");
+
+        memset(packet, 0, sizeof(packet));
+        one = Make6("fd000000000000000000000000000000", 16u);
+        count = IwanNtPrefixSetAllowed(table, 2u, &one, 1u);
+        packet[0] = 0x60u;
+        packet[23] = 0x01u;
+        packet[24] = 0xfdu;
+        Check(IwanNtPrefixInnerAllowedTarget(table, count, 6u, packet,
+                                             sizeof(packet)) == 1,
+              "egress target v6 inside");
+        packet[24] = 0xfeu;
+        packet[25] = 0xc0u;
+        Check(IwanNtPrefixInnerAllowedTarget(table, count, 6u, packet,
+                                             sizeof(packet)) == 0,
+              "egress target v6 outside");
+    }
+
     printf("PREFIX checks=%d failures=%d\n", Checks, Failures);
     return Failures == 0 ? 0 : 1;
 }
