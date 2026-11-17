@@ -113,6 +113,11 @@ struct _IWAN_NT_TX {
     IWAN_NT_SOCKADDR Remote;
     BOOLEAN RemoteValid;
     ULONG SlotCount;
+    /*
+     * One batch is one submit, which is one WskSendMessages call. Accepted/this
+     * is the average number of frames handed to the socket at once, which is the
+     * number to watch when per-frame cost dominates.
+     */
     ULONG Batches;
     ULONG FreeCount;
     ULONG InFlight;
@@ -130,12 +135,6 @@ struct _IWAN_NT_TX {
      */
     ULONG64 InPlaceCount;
     ULONG64 CopiedCount;
-    /*
-     * One batch is one WskSendMessages call. Accepted/Batches is the average
-     * number of frames we managed to hand the socket at once, which is the
-     * number to watch when per-frame cost dominates.
-     */
-    ULONG64 Batches;
     IWAN_NT_TX_SLOT Slots[IWAN_NT_TX_SLOTS];
 };
 

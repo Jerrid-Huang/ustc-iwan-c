@@ -570,8 +570,6 @@ IwanNtTxSendBatch(
         return STATUS_INVALID_PARAMETER;
     }
 
-    Tx->Batches++;
-
     for (index = 0; index < Count; index++) {
         PIWAN_NT_TX_SLOT slot;
         IWAN_NT_FRAME_RESULT seal;

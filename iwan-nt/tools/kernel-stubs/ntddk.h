@@ -143,7 +143,7 @@ typedef enum _KWAIT_REASON { Executive = 0 } KWAIT_REASON;
 typedef struct _IO_STATUS_BLOCK {
     NTSTATUS Status;
     ULONG_PTR Information;
-} IO_STATUS_BLOCK;
+} IO_STATUS_BLOCK, *PIO_STATUS_BLOCK;
 
 typedef struct _DEVICE_OBJECT DEVICE_OBJECT, *PDEVICE_OBJECT;
 typedef struct _IRP IRP, *PIRP;
@@ -261,6 +261,140 @@ typedef struct _UNICODE_STRING {
 typedef const UNICODE_STRING *PCUNICODE_STRING;
 typedef const wchar_t *PCWSTR;
 
+/*
+ * The registry and file surface used by the stage trace. The stub keeps the
+ * shapes that matter for compilation; nothing here has behaviour worth testing
+ * on the host, because the real routines only run in kernel mode.
+ */
+#define OBJ_CASE_INSENSITIVE 0x00000040L
+#define OBJ_KERNEL_HANDLE 0x00000200L
+#define FILE_APPEND_DATA 0x00000004L
+#define FILE_WRITE_ATTRIBUTES 0x00000100L
+#define FILE_SHARE_READ 0x00000001L
+#define FILE_SHARE_WRITE 0x00000002L
+#define FILE_OPEN_IF 3
+#define FILE_ATTRIBUTE_NORMAL 0x00000080L
+#define FILE_SYNCHRONOUS_IO_NONALERT 0x00000020L
+#define KEY_SET_VALUE 0x0002
+#define REG_DWORD 4
+#define REG_OPTION_VOLATILE 1
+#define REG_OPTION_NON_VOLATILE 0
+
+typedef struct _OBJECT_ATTRIBUTES {
+    ULONG Length;
+    HANDLE RootDirectory;
+    PUNICODE_STRING ObjectName;
+    ULONG Attributes;
+    PVOID SecurityDescriptor;
+    PVOID SecurityQualityOfService;
+} OBJECT_ATTRIBUTES, *POBJECT_ATTRIBUTES;
+
+static __inline VOID RtlInitUnicodeString(PUNICODE_STRING Dest, PCWSTR Source)
+{
+    size_t length = 0;
+    if (Source != NULL) {
+        while (Source[length] != 0) {
+            length++;
+        }
+    }
+    Dest->Buffer = (PWSTR)Source;
+    Dest->Length = (USHORT)(length * sizeof(wchar_t));
+    Dest->MaximumLength = (USHORT)((length + 1u) * sizeof(wchar_t));
+}
+
+static __inline VOID InitializeObjectAttributes(POBJECT_ATTRIBUTES Attributes,
+                                               PUNICODE_STRING Name,
+                                               ULONG Flags,
+                                               HANDLE RootDirectory,
+                                               PVOID SecurityDescriptor)
+{
+    Attributes->Length = (ULONG)sizeof(*Attributes);
+    Attributes->RootDirectory = RootDirectory;
+    Attributes->ObjectName = Name;
+    Attributes->Attributes = Flags;
+    Attributes->SecurityDescriptor = SecurityDescriptor;
+    Attributes->SecurityQualityOfService = NULL;
+}
+
+static __inline UCHAR KeGetCurrentIrql(VOID) { return PASSIVE_LEVEL; }
+
+#define SYNCHRONIZE 0x00100000L
+
+typedef HANDLE *PHANDLE;
+
+static __inline NTSTATUS ZwCreateFile(PHANDLE FileHandle,
+                                      ULONG DesiredAccess,
+                                      POBJECT_ATTRIBUTES ObjectAttributes,
+                                      PIO_STATUS_BLOCK IoStatusBlock,
+                                      PLARGE_INTEGER AllocationSize,
+                                      ULONG FileAttributes,
+                                      ULONG ShareAccess,
+                                      ULONG CreateDisposition,
+                                      ULONG CreateOptions,
+                                      PVOID EaBuffer,
+                                      ULONG EaLength)
+{
+    (void)DesiredAccess; (void)ObjectAttributes; (void)IoStatusBlock;
+    (void)AllocationSize; (void)FileAttributes; (void)ShareAccess;
+    (void)CreateDisposition; (void)CreateOptions; (void)EaBuffer;
+    (void)EaLength;
+    *FileHandle = NULL;
+    return STATUS_SUCCESS;
+}
+
+static __inline NTSTATUS ZwWriteFile(HANDLE FileHandle,
+                                     HANDLE Event,
+                                     PVOID ApcRoutine,
+                                     PVOID ApcContext,
+                                     PIO_STATUS_BLOCK IoStatusBlock,
+                                     PVOID Buffer,
+                                     ULONG Length,
+                                     PLARGE_INTEGER ByteOffset,
+                                     PULONG Key)
+{
+    (void)FileHandle; (void)Event; (void)ApcRoutine; (void)ApcContext;
+    (void)Buffer; (void)ByteOffset; (void)Key;
+    IoStatusBlock->Information = Length;
+    return STATUS_SUCCESS;
+}
+
+#define REG_OPTION_NON_VOLATILE 0
+
+static __inline NTSTATUS ZwCreateKey(PHANDLE KeyHandle,
+                                     ULONG DesiredAccess,
+                                     POBJECT_ATTRIBUTES ObjectAttributes,
+                                     ULONG TitleIndex,
+                                     PUNICODE_STRING Class,
+                                     ULONG CreateOptions,
+                                     PULONG Disposition)
+{
+    (void)DesiredAccess; (void)ObjectAttributes; (void)TitleIndex;
+    (void)Class; (void)CreateOptions;
+    if (Disposition != NULL) {
+        *Disposition = 1;
+    }
+    *KeyHandle = NULL;
+    return STATUS_SUCCESS;
+}
+
+static __inline NTSTATUS ZwSetValueKey(HANDLE KeyHandle,
+                                       PUNICODE_STRING ValueName,
+                                       ULONG TitleIndex,
+                                       ULONG Type,
+                                       PVOID Data,
+                                       ULONG DataSize)
+{
+    (void)KeyHandle; (void)ValueName; (void)TitleIndex; (void)Type;
+    (void)Data; (void)DataSize;
+    return STATUS_SUCCESS;
+}
+
+static __inline NTSTATUS ZwClose(HANDLE Handle)
+{
+    (void)Handle;
+    return STATUS_SUCCESS;
+}
+
 typedef NTSTATUS (*PDRIVER_DISPATCH)(PDEVICE_OBJECT, PIRP);
 
 typedef struct _DRIVER_OBJECT {
@@ -306,6 +440,16 @@ typedef enum _MM_PAGE_PRIORITY {
 #define MmGetSystemAddressForMdlSafe(Mdl, Priority) \
     ((PVOID)((Mdl)->MappedSystemVa))
 #define MmBuildMdlForNonPagedPool(Mdl) ((void)(Mdl))
+/*
+ * Re-point an existing MDL at a different buffer. The stub keeps the modelled
+ * invariant (address plus length) so the send path can be exercised on the host.
+ */
+static __inline VOID MmInitializeMdl(PMDL Mdl, PVOID BaseVa, SIZE_T Length)
+{
+    (Mdl)->Next = NULL;
+    (Mdl)->ByteCount = (ULONG)Length;
+    (Mdl)->MappedSystemVa = BaseVa;
+}
 
 VOID ExInitializeRundownProtection(EX_RUNDOWN_REF *);
 BOOLEAN ExAcquireRundownProtection(EX_RUNDOWN_REF *);
@@ -406,5 +550,6 @@ static __inline LONG IwanNtStubInterlockedCompareExchange(volatile LONG *Target,
 #define InterlockedIncrement(p) (++(*(volatile long *)(p)))
 #define InterlockedDecrement(p) (--(*(volatile long *)(p)))
 
-#endif /* IWAN_NT_NTDDK_STUB_H */
 static __inline NTSTATUS ZwFlushKey(HANDLE KeyHandle) { (void)KeyHandle; return 0; }
+
+#endif /* IWAN_NT_NTDDK_STUB_H */

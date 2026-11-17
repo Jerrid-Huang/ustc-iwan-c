@@ -95,12 +95,21 @@ typedef struct _WSK_CLIENT_DATAGRAM_DISPATCH {
     PFN_WSK_RECEIVE_FROM_EVENT WskReceiveFromEvent;
 } WSK_CLIENT_DATAGRAM_DISPATCH;
 
+typedef NTSTATUS (*PFN_WSK_GET_LOCAL_ADDRESS)(PVOID SocketContext,
+                                              PSOCKADDR LocalAddress,
+                                              PIRP Irp);
+
 typedef struct _WSK_PROVIDER_BASIC_DISPATCH {
     NTSTATUS (*WskControlSocket)(PVOID, WSK_CONTROL_SOCKET_TYPE, ULONG, ULONG,
                                  SIZE_T, PVOID, SIZE_T, PVOID, SIZE_T *, PIRP);
     NTSTATUS (*WskCloseSocket)(PVOID, PIRP);
-    PFN_WSK_GET_LOCAL_ADDRESS WskGetLocalAddress;
 } WSK_PROVIDER_BASIC_DISPATCH;
+
+/*
+ * WskGetLocalAddress sits on the datagram provider dispatch, not on the basic
+ * one: CI reported error C2039 'WskGetLocalAddress': is not a member of
+ * '_WSK_PROVIDER_BASIC_DISPATCH' when this stub had it there.
+ */
 
 typedef struct _WSK_SOCKET { const void *Dispatch; } WSK_SOCKET, *PWSK_SOCKET;
 
@@ -130,7 +139,14 @@ typedef NTSTATUS(WSKAPI *PFN_WSK_SEND_TO)(
  * used by this driver are named.
  */
 typedef struct _WSK_PROVIDER_DATAGRAM_DISPATCH {
-    WSK_PROVIDER_BASIC_DISPATCH Basic;
+    /*
+     * The basic entry points are inline members of the datagram dispatch in the
+     * real header, not a nested Basic struct (CI: error C2039 'Basic': is not a
+     * member of '_WSK_PROVIDER_DATAGRAM_DISPATCH').
+     */
+    NTSTATUS (*WskControlSocket)(PVOID, WSK_CONTROL_SOCKET_TYPE, ULONG, ULONG,
+                                 SIZE_T, PVOID, SIZE_T, PVOID, SIZE_T *, PIRP);
+    NTSTATUS (*WskCloseSocket)(PVOID, PIRP);
     NTSTATUS (*WskBind)(PVOID, PSOCKADDR, ULONG, PIRP);
     PFN_WSK_SEND_TO WskSendTo;
     /* Named only for its position: this driver never posts a receive IRP. */
@@ -146,6 +162,12 @@ typedef struct _WSK_PROVIDER_DATAGRAM_DISPATCH {
      */
     NTSTATUS (*WskSendMessages)(PVOID, PWSK_BUF_LIST, ULONG, PSOCKADDR, ULONG,
                                 PCMSGHDR, PIRP);
+    /*
+     * Fills in the address the socket is bound to. Three parameters with an
+     * IRP: the provider under WSK_KERNEL_MODE returns synchronously when no IRP
+     * is given, but the header still declares one.
+     */
+    PFN_WSK_GET_LOCAL_ADDRESS WskGetLocalAddress;
 } WSK_PROVIDER_DATAGRAM_DISPATCH;
 
 
