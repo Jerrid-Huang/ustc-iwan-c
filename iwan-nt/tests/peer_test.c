@@ -283,6 +283,54 @@ TestEchoAnswer(void)
     CHECK(handshake.EchoAnswers == 1u);
 }
 
+/*
+ * The round trip is measured locally from the tick we wrote: our own server
+ * echoes the request verbatim, so the delay fields it returns are our seed.
+ */
+static void
+TestEchoRoundTrip(void)
+{
+    IWAN_NT_PEER handshake;
+    uint8_t ack[128];
+    uint8_t echo[128];
+    size_t ackLength;
+    size_t echoLength;
+
+    CHECK(IwanNtPeerInitialize(&handshake, "u", "p", 1400, 0u));
+    CHECK(handshake.DelayMinimum == IWAN_NT_PEER_RTT_SEED_US);
+    ackLength = BuildAck(ack, sizeof(ack), 9u, 0xe4977730u);
+    CHECK(IwanNtPeerOnFrame(&handshake, ack, ackLength, 0u) ==
+          IwanNtPeerEventEstablished);
+
+    /* The peer echoes our own seed back; the tick says the trip took 7 ms. */
+    echoLength = BuildEchoAnswer(echo, sizeof(echo), 9u, 0xe4977730u,
+                                 1000u, 0u, IWAN_NT_PEER_RTT_SEED_US, 0u);
+    CHECK(IwanNtPeerOnFrame(&handshake, echo, echoLength, 1007u) ==
+          IwanNtPeerEventEchoAnswer);
+    CHECK(handshake.DelayCurrent == 7000u);
+    CHECK(handshake.DelayMinimum == 7000u);
+    CHECK(handshake.DelayMaximum == 7000u);
+
+    /* A faster answer lowers the minimum and keeps the maximum. */
+    echoLength = BuildEchoAnswer(echo, sizeof(echo), 9u, 0xe4977730u,
+                                 2000u, 0u, IWAN_NT_PEER_RTT_SEED_US, 0u);
+    CHECK(IwanNtPeerOnFrame(&handshake, echo, echoLength, 2005u) ==
+          IwanNtPeerEventEchoAnswer);
+    CHECK(handshake.DelayCurrent == 5000u);
+    CHECK(handshake.DelayMinimum == 5000u);
+    CHECK(handshake.DelayMaximum == 7000u);
+
+    /* A tick from the future is stale, not a negative trip. */
+    echoLength = BuildEchoAnswer(echo, sizeof(echo), 9u, 0xe4977730u,
+                                 9000u, 0u, IWAN_NT_PEER_RTT_SEED_US, 0u);
+    CHECK(IwanNtPeerOnFrame(&handshake, echo, echoLength, 100u) ==
+          IwanNtPeerEventEchoAnswer);
+    /* The reading that was real stays: the stale frame changes nothing. */
+    CHECK(handshake.DelayCurrent == 5000u);
+    CHECK(handshake.DelayMinimum == 5000u);
+    CHECK(handshake.DelayMaximum == 7000u);
+}
+
 /* A truncated or malformed answer is a fault, not a silent retry. */
 static void
 TestFault(void)
@@ -349,6 +397,7 @@ main(void)
     TestDataTimeout();
     TestClosed();
     TestEchoAnswer();
+    TestEchoRoundTrip();
     TestFault();
 
     if (Failures != 0) {

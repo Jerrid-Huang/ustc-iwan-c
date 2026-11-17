@@ -41,6 +41,19 @@ extern "C" {
  */
 #define IWAN_NT_PEER_DATA_TIMEOUT_MS 15000u
 
+/*
+ * Seed for the minimum delay, matching the reference client: it starts at five
+ * seconds and only ever shrinks, so a tunnel that never answers shows the seed
+ * instead of an implausible zero.
+ */
+#define IWAN_NT_PEER_RTT_SEED_US 5000000u
+
+/*
+ * A round trip above this is treated as a stale tick (the peer echoed an old
+ * request, or the clock source jumped) rather than as a real measurement.
+ */
+#define IWAN_NT_PEER_RTT_MAX_MS 60000u
+
 typedef enum _IWAN_NT_PEER_STATE {
     IwanNtPeerDown = 0,
     IwanNtPeerUp

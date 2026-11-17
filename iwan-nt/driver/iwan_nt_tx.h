@@ -130,6 +130,12 @@ struct _IWAN_NT_TX {
      */
     ULONG64 InPlaceCount;
     ULONG64 CopiedCount;
+    /*
+     * One batch is one WskSendMessages call. Accepted/Batches is the average
+     * number of frames we managed to hand the socket at once, which is the
+     * number to watch when per-frame cost dominates.
+     */
+    ULONG64 Batches;
     IWAN_NT_TX_SLOT Slots[IWAN_NT_TX_SLOTS];
 };
 

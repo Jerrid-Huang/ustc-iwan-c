@@ -471,6 +471,18 @@ IwanNtTransportStart(
         return status;
     }
 
+    /*
+     * Stop cancels the peer timer so no tick can outlive the socket. That means
+     * a Pause/Restart pair (NDIS does this on its own, and any adapter
+     * reconfiguration can trigger it) leaves a live session without a clock:
+     * keepalives stop, the server expires the session after two minutes, and the
+     * client keeps feeding a tunnel that no longer exists. Re-arm here whenever
+     * a session is already installed.
+     */
+    if (Transport->PeerReady) {
+        IwanNtTimerArm(&Transport->PeerTimer, IWAN_NT_PEER_TICK_MS);
+    }
+
     return STATUS_SUCCESS;
 }
 
@@ -753,6 +765,7 @@ IwanNtTransportGetStats(
     Stats->TxRejected = 0;
     Stats->TxInPlace = (uint64_t)Transport->Tx.InPlaceCount;
     Stats->TxCopied = (uint64_t)Transport->Tx.CopiedCount;
+    Stats->TxBatches = (uint64_t)Transport->Tx.Batches;
     Stats->RxIndicated = 0;
     Stats->RxDropped = 0;
 

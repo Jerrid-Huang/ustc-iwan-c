@@ -50,6 +50,7 @@ IwanNtPeerInitialize(
 
     Handshake->Mtu = Mtu;
     Handshake->State = IwanNtPeerDown;
+    Handshake->DelayMinimum = IWAN_NT_PEER_RTT_SEED_US;
     /* Send the first OPEN on the first tick rather than a full interval later. */
     Handshake->NextActionMs = NowMs;
     return 1;
@@ -94,6 +95,14 @@ IwanNtPeerReset(
     Handshake->Sid = 0;
     Handshake->Token = 0;
     Handshake->Encrypted = 0;
+    /*
+     * Delays survive a reconnect on purpose: a flapping link keeps its history,
+     * and the minimum keeps the reference client's five second seed until a real
+     * answer beats it.
+     */
+    if (Handshake->DelayMinimum == 0u) {
+        Handshake->DelayMinimum = IWAN_NT_PEER_RTT_SEED_US;
+    }
     IwanNtMemZero(Handshake->Key, sizeof(Handshake->Key));
     /*
      * Wait one interval before the next OPEN: an immediate retry would spin
@@ -281,9 +290,42 @@ IwanNtPeerOnFrame(
             return IwanNtPeerEventNone;
         }
 
-        Handshake->DelayCurrent = echo.Current;
-        Handshake->DelayMinimum = echo.Minimum;
-        Handshake->DelayMaximum = echo.Maximum;
+        /*
+         * Measure the round trip here instead of trusting the frame. A server
+         * that only echoes the request back verbatim (ours does) returns our own
+         * seed fields, and a real Panabit fills them from its clock, which is a
+         * one way delay -- neither is a round trip we can compare across peers.
+         * The tick we wrote is milliseconds since boot, and NowMs uses the same
+         * source, so the difference is the round trip.
+         */
+        uint32_t measured = 0u;
+
+        if (echo.Tick != 0u && NowMs >= echo.Tick &&
+            (NowMs - echo.Tick) < (uint64_t)IWAN_NT_PEER_RTT_MAX_MS) {
+            measured = (uint32_t)(NowMs - echo.Tick) * 1000u;
+        }
+
+        if (measured != 0u) {
+            Handshake->DelayCurrent = measured;
+            if (measured < Handshake->DelayMinimum) {
+                Handshake->DelayMinimum = measured;
+            }
+            if (measured > Handshake->DelayMaximum) {
+                Handshake->DelayMaximum = measured;
+            }
+        } else {
+            /* No usable tick: fall back to whatever the peer reported. A zero
+             * there means "not filled in", so keep the last real reading. */
+            if (echo.Current != 0u) {
+                Handshake->DelayCurrent = echo.Current;
+            }
+            if (echo.Minimum != 0u && echo.Minimum < Handshake->DelayMinimum) {
+                Handshake->DelayMinimum = echo.Minimum;
+            }
+            if (echo.Maximum > Handshake->DelayMaximum) {
+                Handshake->DelayMaximum = echo.Maximum;
+            }
+        }
         Handshake->EchoAnswers++;
         return IwanNtPeerEventEchoAnswer;
     }
