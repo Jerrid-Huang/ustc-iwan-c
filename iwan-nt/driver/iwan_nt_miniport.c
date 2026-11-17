@@ -1292,8 +1292,9 @@ IwanNtMiniportIndicateInner(
      * purpose: one chain may mix IPv4 and IPv6, so NDIS_RECEIVE_FLAGS_SINGLE_
      * ETHER_TYPE must stay off.
      */
+    /* The info slot is PVOID-typed, so the value travels through ULONG_PTR. */
     NET_BUFFER_LIST_INFO(slot->Nbl, NetBufferListFrameType) =
-        RtlUshortByteSwap((Family == 6u) ? 0x86DDu : 0x0800u);
+        (PVOID)(ULONG_PTR)RtlUshortByteSwap((Family == 6u) ? 0x86DDu : 0x0800u);
     NET_BUFFER_LIST_STATUS(slot->Nbl) = NDIS_STATUS_SUCCESS;
     NET_BUFFER_LIST_NEXT_NBL(slot->Nbl) = NULL;
 
