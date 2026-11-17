@@ -1462,11 +1462,19 @@ IwanNtMiniportSendNetBufferLists(
     ULONG index;
     ULONG completeFlags = 0;
     LONG state;
+    ULONG64 entered = KeQueryInterruptTime();
+    ULONG nblCount = 0;
+    PNET_BUFFER_LIST cursor;
 
     UNREFERENCED_PARAMETER(PortNumber);
 
     if ((SendFlags & NDIS_SEND_FLAGS_DISPATCH_LEVEL) != 0) {
         completeFlags = NDIS_SEND_COMPLETE_FLAGS_DISPATCH_LEVEL;
+    }
+
+    for (cursor = NetBufferLists; cursor != NULL;
+         cursor = NET_BUFFER_LIST_NEXT_NBL(cursor)) {
+        nblCount++;
     }
 
     state = InterlockedCompareExchange(
@@ -1477,6 +1485,9 @@ IwanNtMiniportSendNetBufferLists(
             NET_BUFFER_LIST_STATUS(current) = NDIS_STATUS_PAUSED;
         }
         NdisMSendNetBufferListsComplete(handle, NetBufferLists, completeFlags);
+        IwanNtTxAddEnterCost(
+            &adapter->Transport.Tx,
+            (uint64_t)(KeQueryInterruptTime() - entered), (uint64_t)nblCount);
         return;
     }
 
@@ -1578,6 +1589,10 @@ IwanNtMiniportSendNetBufferLists(
     for (index = 0; index < doneCount; index++) {
         NdisMSendNetBufferListsComplete(handle, done[index], completeFlags);
     }
+
+    IwanNtTxAddEnterCost(
+        &adapter->Transport.Tx,
+        (uint64_t)(KeQueryInterruptTime() - entered), (uint64_t)nblCount);
 }
 
 _Use_decl_annotations_

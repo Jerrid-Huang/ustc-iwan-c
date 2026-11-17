@@ -525,22 +525,6 @@ KeInitializeDpc(KDPC *Dpc, void *DeferredRoutine, void *DeferredContext)
 }
 
 static __inline unsigned char
-KeInsertQueueDpc(KDPC *Dpc, void *Arg1, void *Arg2)
-{
-    (void)Dpc;
-    (void)Arg1;
-    (void)Arg2;
-    return 0;
-}
-
-static __inline unsigned char
-KeRemoveQueueDpc(KDPC *Dpc)
-{
-    (void)Dpc;
-    return 0;
-}
-
-static __inline unsigned char
 KeSetCoalescableTimer(KTIMER *Timer, LARGE_INTEGER DueTime, unsigned long Period,
                       unsigned long TolerableDelay, KDPC *Dpc)
 {

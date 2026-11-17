@@ -275,6 +275,11 @@ CommandStats(
                (double)stats.CostSubmit / perPacket / 10.0,
                (unsigned long long)stats.CostCount);
     }
+    if (stats.CostEnterCount != 0) {
+        printf("cost: send entry=%.2fus per NBL (n=%llu)\n",
+               (double)stats.CostEnter / (double)stats.CostEnterCount / 10.0,
+               (unsigned long long)stats.CostEnterCount);
+    }
     printf("mtu: carrier=%lu effective=%lu peer=%lu dropped=%lu\n",
            (unsigned long)stats.CarrierMtu,
            (unsigned long)stats.EffectiveMtu,

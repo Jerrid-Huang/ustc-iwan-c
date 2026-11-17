@@ -791,7 +791,8 @@ IwanNtTransportGetStats(
     Stats->TxMaxBatch = Transport->Tx.MaxBatch;
     Stats->TxBatches = (uint64_t)Transport->Tx.Batches;
     IwanNtTxGetCost(&Transport->Tx, &Stats->CostSeal, &Stats->CostSubmit,
-                    &Stats->CostCount);
+                    &Stats->CostCount, &Stats->CostEnter,
+                    &Stats->CostEnterCount);
     Stats->RxIndicated = 0;
     Stats->RxDropped = 0;
 

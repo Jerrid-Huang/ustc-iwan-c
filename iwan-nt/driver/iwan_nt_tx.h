@@ -52,14 +52,6 @@ extern "C" {
  */
 #define IWAN_NT_TX_DRAIN_INTERVAL_MS 1UL
 
-/*
- * Frames to accumulate before submitting without waiting for the DPC. Staging a
- * frame costs ~1.7us while one provider call costs ~13-16us, so a chain of eight
- * spreads that call over eight frames. Below the threshold the queued DPC sends
- * whatever arrived, which keeps the latency of a single packet at one DPC.
- */
-#define IWAN_NT_TX_SUBMIT_THRESHOLD 8UL
-
 typedef struct _IWAN_NT_TX IWAN_NT_TX, *PIWAN_NT_TX;
 
 typedef struct _IWAN_NT_TX_SLOT {
@@ -129,6 +121,9 @@ struct _IWAN_NT_TX {
     ULONG64 CostSeal;
     ULONG64 CostSubmit;
     ULONG64 CostCount;
+    /* Wall time the caller spent inside its send entry, 100 ns units. */
+    ULONG64 CostEnter;
+    ULONG64 CostEnterCount;
     IWAN_NT_TX_SLOT Slots[IWAN_NT_TX_SLOTS];
 
     /* Deferred submit queue: filled slots waiting for the drain thread. */
@@ -136,7 +131,6 @@ struct _IWAN_NT_TX {
     PIWAN_NT_TX_SLOT PendingTail;
     ULONG PendingCount;
     KEVENT DrainEvent;
-    KDPC DrainDpc;
     PVOID DrainThread;
     BOOLEAN DrainStop;
     BOOLEAN DrainRunning;
@@ -268,11 +262,21 @@ IwanNtTxPending(
 /* Diagnostics: per-packet cost accumulators, in 100 ns units. */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 void
+IwanNtTxAddEnterCost(
+    _In_ PIWAN_NT_TX Tx,
+    _In_ uint64_t Ticks,
+    _In_ uint64_t Count
+    );
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+void
 IwanNtTxGetCost(
     _In_ PIWAN_NT_TX Tx,
     _Out_ uint64_t *Seal,
     _Out_ uint64_t *Submit,
-    _Out_ uint64_t *Count
+    _Out_ uint64_t *Count,
+    _Out_ uint64_t *Enter,
+    _Out_ uint64_t *EnterCount
     );
 
 #ifdef __cplusplus
