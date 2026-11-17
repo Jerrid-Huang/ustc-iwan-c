@@ -180,10 +180,17 @@ static uint64_t
 IwanNtTransportNowMicros(VOID)
 {
     /*
-     * Same clock, finer unit: 10,000,000 ticks make a second. The echo tick
-     * rides on this one because a local round trip is far below a millisecond.
+     * The echo tick rides on a microsecond clock because a local round trip is
+     * far below a millisecond. KeQueryInterruptTime is per-CPU: each processor
+     * tracks its own interrupt time, so a request built on one CPU and answered
+     * on another can look like it came from the future and the sample is
+     * dropped. KeQuerySystemTimePrecise is system wide (QPC backed), so the
+     * subtraction is meaningful; 10 ticks make a microsecond.
      */
-    return (uint64_t)(KeQueryInterruptTime() / 10u);
+    LARGE_INTEGER now;
+
+    KeQuerySystemTimePrecise(&now);
+    return (uint64_t)(now.QuadPart / 10);
 }
 
 /*

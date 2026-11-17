@@ -485,6 +485,7 @@ PMDL IoAllocateMdl(
     PVOID VirtualAddress, ULONG Length, BOOLEAN SecondaryBuffer,
     BOOLEAN ChargeQuota, PIRP Irp);
 VOID IoFreeMdl(PMDL);
+VOID KeQuerySystemTimePrecise(LARGE_INTEGER *CurrentTime);
 
 #define THREAD_ALL_ACCESS 0x1FFFFFUL
 
