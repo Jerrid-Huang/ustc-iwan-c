@@ -107,6 +107,7 @@ IwanNtTxSubmitChain(
     NTSTATUS status;
     KIRQL oldIrql;
     BOOLEAN remoteValid;
+    ULONG64 submitStart;
 
     if (Count == 0) {
         return STATUS_INVALID_PARAMETER;
@@ -124,6 +125,7 @@ IwanNtTxSubmitChain(
     IoSetCompletionRoutine(
         Head->Irp, IwanNtTxComplete, Head, TRUE, TRUE, TRUE);
 
+    submitStart = KeQueryInterruptTime();
     status = Tx->Submit(
         Tx->SubmitContext, &Head->List, Count, &remote, Head->Irp);
 
@@ -155,6 +157,7 @@ IwanNtTxSubmitChain(
 
     KeAcquireSpinLock(&Tx->Lock, &oldIrql);
     Tx->Submitted += Count;
+    Tx->CostSubmit += (ULONG64)(KeQueryInterruptTime() - submitStart);
     Tx->Batches++;
     if ((ULONG64)Count > Tx->MaxBatch) {
         Tx->MaxBatch = (ULONG64)Count;
@@ -595,6 +598,7 @@ IwanNtTxSendBatch(
 {
     ULONG staged = 0;
     ULONG index;
+    ULONG64 started;
 
     if (Accepted != NULL) {
         *Accepted = 0;
@@ -604,6 +608,7 @@ IwanNtTxSendBatch(
         return STATUS_INVALID_PARAMETER;
     }
 
+    started = KeQueryInterruptTime();
     for (index = 0; index < Count; index++) {
         PIWAN_NT_TX_SLOT slot;
         IWAN_NT_FRAME_RESULT seal;
@@ -661,6 +666,15 @@ IwanNtTxSendBatch(
      * drain thread per packet cost 10-30us per packet and capped the tunnel at
      * ~33k pps regardless of the bearer, as measured 2026-11-17.
      */
+    {
+        KIRQL costIrql;
+
+        KeAcquireSpinLock(&Tx->Lock, &costIrql);
+        Tx->CostSeal += (ULONG64)(KeQueryInterruptTime() - started);
+        Tx->CostCount += staged;
+        KeReleaseSpinLock(&Tx->Lock, costIrql);
+    }
+
     IwanNtTxDrain(Tx);
 
     *Accepted = staged;
@@ -751,6 +765,27 @@ IwanNtTxSendRaw(
 }
 
 _IRQL_requires_(PASSIVE_LEVEL)
+BOOLEAN
+IwanNtTxGetCost(
+    _In_ PIWAN_NT_TX Tx,
+    _Out_ uint64_t *Seal,
+    _Out_ uint64_t *Submit,
+    _Out_ uint64_t *Count
+    )
+{
+    KIRQL oldIrql;
+
+    if (Tx == NULL || Seal == NULL || Submit == NULL || Count == NULL) {
+        return;
+    }
+    KeAcquireSpinLock(&Tx->Lock, &oldIrql);
+    *Seal = Tx->CostSeal;
+    *Submit = Tx->CostSubmit;
+    *Count = Tx->CostCount;
+    KeReleaseSpinLock(&Tx->Lock, oldIrql);
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN
 IwanNtTxWaitIdle(
     _Inout_ PIWAN_NT_TX Tx,

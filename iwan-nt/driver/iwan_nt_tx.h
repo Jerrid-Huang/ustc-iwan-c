@@ -50,6 +50,14 @@ extern "C" {
  * safety net only: the send path submits inline, so under load this thread
  * finds nothing and the wake never costs a packet.
  */
+VOID
+IwanNtTxGetCost(
+    _In_ PIWAN_NT_TX Tx,
+    _Out_ uint64_t *Seal,
+    _Out_ uint64_t *Submit,
+    _Out_ uint64_t *Count
+    );
+
 #define IWAN_NT_TX_DRAIN_INTERVAL_MS 1UL
 
 typedef struct _IWAN_NT_TX IWAN_NT_TX, *PIWAN_NT_TX;
@@ -112,6 +120,15 @@ struct _IWAN_NT_TX {
     ULONG64 TooLarge;
     /* Largest chain the drain thread ever built; proves batching is working. */
     ULONG64 MaxBatch;
+    /*
+     * Time spent per packet, in 100 ns units, accumulated over the whole run:
+     * CostSeal covers copy+header+XOR and the list splice, CostSubmit covers the
+     * provider call itself. Reported so the next optimization is chosen from
+     * numbers instead of guesswork (see module comment).
+     */
+    ULONG64 CostSeal;
+    ULONG64 CostSubmit;
+    ULONG64 CostCount;
     IWAN_NT_TX_SLOT Slots[IWAN_NT_TX_SLOTS];
 
     /* Deferred submit queue: filled slots waiting for the drain thread. */

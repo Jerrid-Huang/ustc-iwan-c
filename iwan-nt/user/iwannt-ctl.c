@@ -268,6 +268,13 @@ CommandStats(
     printf("receive: %llu zero copy, %llu copied\n",
            (unsigned long long)stats.RxZeroCopy,
            (unsigned long long)stats.RxCopied);
+    if (stats.CostCount != 0) {
+        double perPacket = (double)stats.CostCount;
+        printf("cost: staging=%.2fus submit=%.2fus per packet (n=%llu)\n",
+               (double)stats.CostSeal / perPacket / 10.0,
+               (double)stats.CostSubmit / perPacket / 10.0,
+               (unsigned long long)stats.CostCount);
+    }
     printf("mtu: carrier=%lu effective=%lu peer=%lu dropped=%lu\n",
            (unsigned long)stats.CarrierMtu,
            (unsigned long)stats.EffectiveMtu,

@@ -89,7 +89,7 @@
 
 #define IWAN_NT_SESSION_STRUCT_SIZE 24u
 #define IWAN_NT_ADDR_STRUCT_SIZE 24u
-#define IWAN_NT_STATS_STRUCT_SIZE 352u
+#define IWAN_NT_STATS_STRUCT_SIZE 376u
 #define IWAN_NT_CREDENTIALS_STRUCT_SIZE 136u
 
 /* Field widths inside IWAN_NT_CREDENTIALS_ABI. */
@@ -263,6 +263,14 @@ typedef struct _IWAN_NT_STATS_ABI {
     uint64_t TxNotAllowed;
     uint64_t RxZeroCopy;
     uint64_t RxCopied;
+    /*
+     * Per-packet cost accounting in 100 ns units, summed over the run: staging
+     * (copy + header + XOR + list splice) and the provider call. Divide by
+     * CostCount for the per-packet figure. Diagnostics only.
+     */
+    uint64_t CostSeal;
+    uint64_t CostSubmit;
+    uint64_t CostCount;
 } IWAN_NT_STATS_ABI;
 
 /*

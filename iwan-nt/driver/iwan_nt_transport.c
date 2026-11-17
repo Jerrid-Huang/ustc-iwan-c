@@ -790,6 +790,8 @@ IwanNtTransportGetStats(
     Stats->TxPending = (uint64_t)IwanNtTxPending(&Transport->Tx);
     Stats->TxMaxBatch = Transport->Tx.MaxBatch;
     Stats->TxBatches = (uint64_t)Transport->Tx.Batches;
+    IwanNtTxGetCost(&Transport->Tx, &Stats->CostSeal, &Stats->CostSubmit,
+                    &Stats->CostCount);
     Stats->RxIndicated = 0;
     Stats->RxDropped = 0;
 
