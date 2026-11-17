@@ -706,12 +706,14 @@ IwanNtTxSendBatch(
     }
 
     /*
-     * One provider call costs 11-16us while staging costs 1.7us, so pay for a
-     * call every FRAMES_PER_CALL-th staging and let it drain the whole queue.
-     * The 1 ms drain thread is the safety net that keeps a lone frame moving.
+     * One provider call costs 11-16us while staging costs 1.7us, so only pay
+     * for a call once the queue actually holds FRAMES_PER_CALL frames; the
+     * drain takes the whole queue, not just these. Gating on the queue depth
+     * instead of a call counter is what the cost model asks for: a counter
+     * fires on the wrong number of frames whenever a flush carries more than
+     * one packet. The 1 ms drain thread keeps a lone frame moving.
      */
-    if ((InterlockedIncrement(&Tx->SubmitTick) %
-         IWAN_NT_TX_FRAMES_PER_CALL) == 0) {
+    if (IwanNtTxPending(Tx) >= IWAN_NT_TX_FRAMES_PER_CALL) {
         IwanNtTxDrain(Tx);
     }
 
