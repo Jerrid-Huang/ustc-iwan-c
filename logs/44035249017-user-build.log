@@ -1,0 +1,16 @@
+iwannt-ctl.c
+iwan_nt_control.c
+iwan_nt_mtu_win.c
+iwan_nt_crypto.c
+iwan_nt_inet.c
+iwan_nt_lease.c
+iwannt_connect.c
+iwan_nt_session.c
+iwan_nt_peer.c
+Generating Code...
+iwan_nt_mtu_win.obj : error LNK2019: unresolved external symbol __imp_RegCloseKey referenced in function IwanNtMtuReadCarrier
+iwan_nt_mtu_win.obj : error LNK2019: unresolved external symbol __imp_RegCreateKeyExA referenced in function IwanNtMtuWriteCarrier
+iwan_nt_mtu_win.obj : error LNK2019: unresolved external symbol __imp_RegOpenKeyExA referenced in function IwanNtMtuReadCarrier
+iwan_nt_mtu_win.obj : error LNK2019: unresolved external symbol __imp_RegQueryValueExA referenced in function IwanNtMtuReadCarrier
+iwan_nt_mtu_win.obj : error LNK2019: unresolved external symbol __imp_RegSetValueExA referenced in function IwanNtMtuWriteCarrier
+build\x64\Release\iwannt-ctl.exe : fatal error LNK1120: 5 unresolved externals
