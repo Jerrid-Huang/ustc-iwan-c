@@ -115,6 +115,7 @@ int
 IwanNtPeerTick(
     IWAN_NT_PEER *Handshake,
     uint64_t NowMs,
+    uint64_t NowMicros,
     uint8_t *Buffer,
     size_t Capacity,
     size_t *Length
@@ -143,8 +144,14 @@ IwanNtPeerTick(
     }
 
     if (Handshake->State == IwanNtPeerUp) {
+        /*
+         * The echo carries microseconds, not the millisecond clock the timers
+         * use: a local round trip is well under a millisecond, so a
+         * millisecond tick measured zero on every LAN exchange.
+         */
         IWAN_NT_SESSION_RESULT result = IwanNtSessionBuildEchoRequest(
-            Handshake->Sid, Handshake->Token, NowMs, Buffer, Capacity, Length);
+            Handshake->Sid, Handshake->Token, NowMicros, Buffer, Capacity,
+            Length);
 
         if (result != IwanNtSessionOk) {
             Handshake->Fault = result;
@@ -210,7 +217,8 @@ IwanNtPeerOnFrame(
     IWAN_NT_PEER *Handshake,
     const uint8_t *Frame,
     size_t Length,
-    uint64_t NowMs
+    uint64_t NowMs,
+    uint64_t NowMicros
     )
 {
     if (Handshake == NULL || Frame == NULL || Length < 1u) {
@@ -295,14 +303,14 @@ IwanNtPeerOnFrame(
          * that only echoes the request back verbatim (ours does) returns our own
          * seed fields, and a real Panabit fills them from its clock, which is a
          * one way delay -- neither is a round trip we can compare across peers.
-         * The tick we wrote is milliseconds since boot, and NowMs uses the same
-         * source, so the difference is the round trip.
+         * The tick we wrote is microseconds since boot, and NowMicros uses the
+         * same source, so the difference is the round trip directly.
          */
         uint32_t measured = 0u;
 
-        if (echo.Tick != 0u && NowMs >= echo.Tick &&
-            (NowMs - echo.Tick) < (uint64_t)IWAN_NT_PEER_RTT_MAX_MS) {
-            measured = (uint32_t)(NowMs - echo.Tick) * 1000u;
+        if (echo.Tick != 0u && NowMicros >= echo.Tick &&
+            (NowMicros - echo.Tick) < (uint64_t)IWAN_NT_PEER_RTT_MAX_US) {
+            measured = (uint32_t)(NowMicros - echo.Tick);
         }
 
         if (measured != 0u) {

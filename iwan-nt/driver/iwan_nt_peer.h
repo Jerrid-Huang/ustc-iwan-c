@@ -52,7 +52,7 @@ extern "C" {
  * A round trip above this is treated as a stale tick (the peer echoed an old
  * request, or the clock source jumped) rather than as a real measurement.
  */
-#define IWAN_NT_PEER_RTT_MAX_MS 60000u
+#define IWAN_NT_PEER_RTT_MAX_US 60000000u
 
 typedef enum _IWAN_NT_PEER_STATE {
     IwanNtPeerDown = 0,
@@ -146,6 +146,7 @@ int
 IwanNtPeerTick(
 IWAN_NT_PEER *Handshake,
     uint64_t NowMs,
+    uint64_t NowMicros,
     uint8_t *Buffer,
     size_t Capacity,
     size_t *Length
@@ -171,7 +172,8 @@ IwanNtPeerOnFrame(
 IWAN_NT_PEER *Handshake,
     const uint8_t *Frame,
     size_t Length,
-    uint64_t NowMs
+    uint64_t NowMs,
+    uint64_t NowMicros
     );
 
 /*

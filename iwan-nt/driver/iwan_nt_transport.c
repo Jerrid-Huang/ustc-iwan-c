@@ -11,6 +11,10 @@ static uint64_t
 IwanNtTransportNowMs(VOID);
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
+static uint64_t
+IwanNtTransportNowMicros(VOID);
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
 static VOID
 IwanNtTransportApplyPeerStateLocked(
     _Inout_ PIWAN_NT_TRANSPORT Transport
@@ -119,7 +123,8 @@ IwanNtTransportReceiveChunk(
     if (transport->PeerReady &&
         IwanNtPeerWantsFrame(&transport->Peer, payload, Length)) {
         (VOID)IwanNtPeerOnFrame(
-            &transport->Peer, payload, Length, IwanNtTransportNowMs());
+            &transport->Peer, payload, Length, IwanNtTransportNowMs(),
+            IwanNtTransportNowMicros());
         IwanNtTransportApplyPeerStateLocked(transport);
     } else {
         (VOID)IwanNtIngressReceiveWithView(
@@ -168,6 +173,17 @@ IwanNtTransportNowMs(VOID)
      * make a millisecond.
      */
     return (uint64_t)(KeQueryInterruptTime() / 10000u);
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static uint64_t
+IwanNtTransportNowMicros(VOID)
+{
+    /*
+     * Same clock, finer unit: 10,000,000 ticks make a second. The echo tick
+     * rides on this one because a local round trip is far below a millisecond.
+     */
+    return (uint64_t)(KeQueryInterruptTime() / 10u);
 }
 
 /*
@@ -277,6 +293,7 @@ IwanNtTransportPeerTimerCallback(
         IwanNtPeerTick(
             &transport->Peer,
             IwanNtTransportNowMs(),
+            IwanNtTransportNowMicros(),
             transport->PeerScratch,
             sizeof(transport->PeerScratch),
             &length)) {
