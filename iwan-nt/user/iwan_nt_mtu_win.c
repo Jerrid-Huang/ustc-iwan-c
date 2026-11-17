@@ -76,7 +76,7 @@ IwanNtMtuProbeRoute(
     _Out_ DWORD *IfIndex
     )
 {
-    struct in_addr address;
+    IN_ADDR address;
     MIB_IPFORWARDROW route;
     MIB_IPINTERFACE_ROW ipInterface;
     DWORD status;
@@ -85,8 +85,9 @@ IwanNtMtuProbeRoute(
         SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
-    address.s_addr = inet_addr(PeerIp);
-    if (address.s_addr == INADDR_NONE) {
+    /* InetPton rather than inet_addr: the deprecated form returns the same
+     * INADDR_NONE for 255.255.255.255 as it does for a parse failure. */
+    if (InetPtonA(AF_INET, PeerIp, &address) != 1) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
