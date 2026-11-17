@@ -575,11 +575,23 @@ IwanNtControlSetPrefixes(
         return STATUS_INVALID_PARAMETER;
     }
     status = source.PrefixSet(source.Context, list, &accepted);
+    if (NT_SUCCESS(status) && source.PrefixQuery != NULL &&
+        Stack->Parameters.DeviceIoControl.OutputBufferLength >=
+            sizeof(IWAN_NT_PREFIX_LIST_ABI)) {
+        /*
+         * Return what the adapter actually kept, not what the caller sent: a
+         * partial install is not an error, and the only way to notice a rejected
+         * entry is to see the table that came back.
+         */
+        output = (IWAN_NT_PREFIX_LIST_ABI *)Irp->AssociatedIrp.SystemBuffer;
+        if (output != NULL) {
+            output->Count = 0;
+            output->Reserved = 0;
+            source.PrefixQuery(source.Context, output);
+            Irp->IoStatus.Information = sizeof(IWAN_NT_PREFIX_LIST_ABI);
+        }
+    }
     IwanNtControlEnd();
-    /*
-     * A partial install is not an error: the adapter keeps what validated and
-     * the caller learns how much that was by reading the table back.
-     */
     (void)accepted;
     return status;
 }
