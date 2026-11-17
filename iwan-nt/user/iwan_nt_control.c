@@ -218,6 +218,64 @@ IwanNtGetLocal(
     return TRUE;
 }
 
+/*
+ * Replace the allowed prefix table. Count == 0 clears enforcement, which is the
+ * only way to open the ingress check again once it has been configured.
+ */
+BOOL
+IwanNtSetPrefixes(
+    _In_ PIWAN_NT_DEVICE Device,
+    _In_ const IWAN_NT_PREFIX_LIST_ABI *List
+    )
+{
+    IWAN_NT_PREFIX_LIST_ABI reply;
+    DWORD returned = 0;
+
+    if (Device == NULL || List == NULL || List->Count > IWAN_NT_PREFIX_MAX) {
+        return FALSE;
+    }
+    CopyMemory(&reply, List, sizeof(reply));
+    reply.Reserved = 0;
+    if (DeviceIoControl(Device->Handle, IWAN_NT_IOCTL_SET_PREFIXES,
+                        &reply, (DWORD)sizeof(reply),
+                        &reply, (DWORD)sizeof(reply), &returned, NULL) == FALSE) {
+        return FALSE;
+    }
+    if (returned < IWAN_NT_PREFIX_LIST_STRUCT_SIZE) {
+        return FALSE;
+    }
+    CopyMemory((PVOID)List, &reply, sizeof(reply));
+    return TRUE;
+}
+
+/*
+ * Read the table the adapter is enforcing. The reply carries the validated
+ * entries, not the ones the caller asked for, which is how a rejected entry
+ * becomes visible.
+ */
+BOOL
+IwanNtGetPrefixes(
+    _In_ PIWAN_NT_DEVICE Device,
+    _Out_ IWAN_NT_PREFIX_LIST_ABI *List
+    )
+{
+    IWAN_NT_PREFIX_LIST_ABI reply;
+    DWORD returned = 0;
+
+    if (Device == NULL || List == NULL) {
+        return FALSE;
+    }
+    if (DeviceIoControl(Device->Handle, IWAN_NT_IOCTL_SET_PREFIXES, NULL, 0,
+                        &reply, (DWORD)sizeof(reply), &returned, NULL) == FALSE) {
+        return FALSE;
+    }
+    if (returned < IWAN_NT_PREFIX_LIST_STRUCT_SIZE) {
+        return FALSE;
+    }
+    CopyMemory(List, &reply, sizeof(reply));
+    return TRUE;
+}
+
 BOOL
 IwanNtGetLease(
     _In_ PIWAN_NT_DEVICE Device,

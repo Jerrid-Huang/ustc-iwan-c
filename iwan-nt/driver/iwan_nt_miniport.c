@@ -1,6 +1,15 @@
 #include "iwan_nt_miniport.h"
 #include "iwan_nt_frame.h"
 #include "iwan_nt_mtu.h"
+#include "iwan_nt_prefix.h"
+
+/*
+ * Two names for the same bound: the driver's own table size and the size the ABI
+ * publishes. If they ever drift the guest would send a table the driver refuses
+ * to read, so make the compiler say so.
+ */
+_Static_assert(IWAN_NT_MAX_PREFIXES == IWAN_NT_PREFIX_MAX,
+               "prefix bound disagrees with the ABI");
 #include "iwan_nt_transport.h"
 #include "iwan_nt_trace.h"
 #include "iwan_nt_tx.h"
@@ -139,6 +148,13 @@ typedef struct _IWAN_NT_MINIPORT_ADAPTER {
     volatile LONG TxRejected;
     /* Inner packets refused because they exceed the negotiated size. */
     volatile LONG MtuDropped;
+    /*
+     * Allowed inner prefixes. Empty means the operator has not configured any,
+     * which is the only state in which the ingress check is open.
+     */
+    IWAN_NT_PREFIX Prefixes[IWAN_NT_MAX_PREFIXES];
+    volatile LONG PrefixCount;
+    volatile LONG RxNotAllowed;
     volatile LONG RxIndicated;
     volatile LONG RxDropped;
     volatile LONG RxBatched;
@@ -499,13 +515,94 @@ IwanNtMiniportQueryCounters(
         &adapter->RxBatched, 0, 0);
 }
 
+/*
+ * Install the allowed prefix table. Entries are validated by the shared helper,
+ * which also proves the two bounds agree at compile time below.
+ */
+static ULONG
+IwanNtMiniportSetPrefixes(
+    _In_opt_ void *Context,
+    _In_ const IWAN_NT_PREFIX_LIST_ABI *List,
+    _Out_ ULONG *Accepted
+    )
+{
+    PIWAN_NT_MINIPORT_ADAPTER adapter = (PIWAN_NT_MINIPORT_ADAPTER)Context;
+    IWAN_NT_PREFIX validated[IWAN_NT_MAX_PREFIXES];
+    unsigned count;
+    unsigned index;
+
+    if (Accepted != NULL) {
+        *Accepted = 0;
+    }
+    if (adapter == NULL || List == NULL || List->Count > IWAN_NT_PREFIX_MAX) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    RtlZeroMemory(validated, sizeof(validated));
+    for (index = 0; index < List->Count; index++) {
+        validated[index].Family = List->Prefixes[index].Family;
+        validated[index].Length = List->Prefixes[index].Length;
+        RtlCopyMemory(validated[index].Address, List->Prefixes[index].Address,
+            sizeof(validated[index].Address));
+    }
+    count = IwanNtPrefixSetAllowed(adapter->Prefixes, IWAN_NT_MAX_PREFIXES,
+        validated, List->Count);
+
+    /*
+     * Order matters: publish the count only after the table is complete, and
+     * clear it before rewriting so the ingress path never matches a half written
+     * entry.
+     */
+    InterlockedExchange(&adapter->PrefixCount, 0);
+    if (count != 0) {
+        InterlockedExchange(&adapter->PrefixCount, (LONG)count);
+    }
+    if (Accepted != NULL) {
+        *Accepted = count;
+    }
+    return STATUS_SUCCESS;
+}
+
+static VOID
+IwanNtMiniportQueryPrefixes(
+    _In_opt_ void *Context,
+    _Inout_ IWAN_NT_PREFIX_LIST_ABI *List
+    )
+{
+    PIWAN_NT_MINIPORT_ADAPTER adapter = (PIWAN_NT_MINIPORT_ADAPTER)Context;
+    LONG count;
+    LONG index;
+
+    if (List == NULL) {
+        return;
+    }
+    RtlZeroMemory(List, sizeof(*List));
+    if (adapter == NULL) {
+        return;
+    }
+    count = InterlockedCompareExchange(&adapter->PrefixCount, 0, 0);
+    if (count <= 0) {
+        return;
+    }
+    for (index = 0; index < count && index < (LONG)IWAN_NT_PREFIX_MAX; index++) {
+        List->Prefixes[index].Family = adapter->Prefixes[index].Family;
+        List->Prefixes[index].Length = adapter->Prefixes[index].Length;
+        RtlCopyMemory(List->Prefixes[index].Address,
+            adapter->Prefixes[index].Address,
+            sizeof(List->Prefixes[index].Address));
+    }
+    List->Count = (uint32_t)index;
+}
+
 static VOID
 IwanNtMiniportQueryMtu(
     _In_opt_ void *Context,
     _Out_ uint32_t *CarrierMtu,
     _Out_ uint32_t *EffectiveMtu,
     _Out_ uint32_t *PeerMtu,
-    _Out_ uint32_t *MtuDropped
+    _Out_ uint32_t *MtuDropped,
+    _Out_ uint32_t *PrefixCount,
+    _Out_ uint64_t *RxNotAllowed
     )
 {
     PIWAN_NT_MINIPORT_ADAPTER adapter = (PIWAN_NT_MINIPORT_ADAPTER)Context;
@@ -515,6 +612,8 @@ IwanNtMiniportQueryMtu(
         *EffectiveMtu = 0;
         *PeerMtu = 0;
         *MtuDropped = 0;
+        *PrefixCount = 0;
+        *RxNotAllowed = 0;
         return;
     }
 
@@ -523,6 +622,10 @@ IwanNtMiniportQueryMtu(
     *PeerMtu = adapter->PeerMtu;
     *MtuDropped = (uint32_t)InterlockedCompareExchange(
         &adapter->MtuDropped, 0, 0);
+    *PrefixCount = (uint32_t)InterlockedCompareExchange(
+        &adapter->PrefixCount, 0, 0);
+    *RxNotAllowed = (uint64_t)InterlockedCompareExchange(
+        &adapter->RxNotAllowed, 0, 0);
 }
 
 static VOID
@@ -843,6 +946,8 @@ IwanNtMiniportInitializeEx(
         source.Query = IwanNtMiniportQueryCounters;
         source.MtuQuery = IwanNtMiniportQueryMtu;
         source.SessionChanged = IwanNtMiniportSessionChanged;
+        source.PrefixSet = IwanNtMiniportSetPrefixes;
+        source.PrefixQuery = IwanNtMiniportQueryPrefixes;
         IwanNtControlAttachAdapter(&adapter->Transport, &source);
     }
 
@@ -1122,6 +1227,23 @@ IwanNtMiniportIndicateInner(
     if (Inner == NULL || Length == 0 || Length > adapter->Mtu) {
         InterlockedIncrement(&adapter->RxDropped);
         return;
+    }
+    /*
+     * The peer says what is inside the frame; it is not an authority on whose
+     * address that is. Anything outside the configured prefixes is dropped here
+     * rather than handed to the stack, which would route it as if it had arrived
+     * over a trusted link.
+     */
+    {
+        LONG prefixCount = InterlockedCompareExchange(
+            &adapter->PrefixCount, 0, 0);
+
+        if (prefixCount != 0 &&
+            !IwanNtPrefixInnerAllowed(adapter->Prefixes, (unsigned)prefixCount,
+                Family, Inner, Length)) {
+            InterlockedIncrement(&adapter->RxNotAllowed);
+            return;
+        }
     }
     state = InterlockedCompareExchange(
         &adapter->State, IwanNtMiniportPaused, IwanNtMiniportPaused);

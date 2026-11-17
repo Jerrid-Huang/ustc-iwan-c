@@ -405,6 +405,8 @@ IwanNtControlGetStats(
     uint32_t effectiveMtu = 0;
     uint32_t peerMtu = 0;
     uint32_t mtuDropped = 0;
+    uint32_t prefixCount = 0;
+    uint64_t rxNotAllowed = 0;
     NTSTATUS status;
 
     if (Stack->Parameters.DeviceIoControl.OutputBufferLength <
@@ -443,11 +445,14 @@ IwanNtControlGetStats(
         stats->RxBatches = rxBatches;
         if (source.MtuQuery != NULL) {
             source.MtuQuery(source.Context, &carrierMtu, &effectiveMtu,
-                            &peerMtu, &mtuDropped);
+                            &peerMtu, &mtuDropped, &prefixCount,
+                            &rxNotAllowed);
             stats->CarrierMtu = carrierMtu;
             stats->EffectiveMtu = effectiveMtu;
             stats->PeerMtu = peerMtu;
             stats->MtuDropped = mtuDropped;
+            stats->PrefixCount = prefixCount;
+            stats->RxNotAllowed = rxNotAllowed;
         }
     }
 
@@ -503,6 +508,78 @@ IwanNtControlStartPeer(
     return status;
 }
 
+/*
+ * Replace the allowed prefix table. Write replaces, read reports: a caller that
+ * only sends the new entries never has to know the old ones, and a caller that
+ * wants to clear enforcement writes a list with Count = 0.
+ */
+static NTSTATUS
+IwanNtControlSetPrefixes(
+    _In_ PIRP Irp,
+    _In_ PIO_STACK_LOCATION Stack
+    )
+{
+    IWAN_NT_CONTROL_COUNTER_SOURCE source;
+    const IWAN_NT_PREFIX_LIST_ABI *list;
+    IWAN_NT_PREFIX_LIST_ABI *output;
+    PIWAN_NT_TRANSPORT transport;
+    ULONG accepted = 0;
+    NTSTATUS status;
+
+    status = IwanNtControlBegin(&transport);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+    RtlZeroMemory(&source, sizeof(source));
+    (void)IwanNtControlTransportLocked(&source);
+
+    if (Stack->Parameters.DeviceIoControl.OutputBufferLength != 0) {
+        if (Stack->Parameters.DeviceIoControl.OutputBufferLength <
+            sizeof(IWAN_NT_PREFIX_LIST_ABI)) {
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        if (Stack->Parameters.DeviceIoControl.InputBufferLength != 0) {
+            /*
+             * A read of the live table: nothing to install, just copy it out.
+             */
+            if (source.PrefixQuery == NULL) {
+                IwanNtControlEnd();
+                return STATUS_NOT_SUPPORTED;
+            }
+            output = (IWAN_NT_PREFIX_LIST_ABI *)
+                Irp->AssociatedIrp.SystemBuffer;
+            output->Reserved = 0;
+            source.PrefixQuery(source.Context, output);
+            Irp->IoStatus.Information = sizeof(IWAN_NT_PREFIX_LIST_ABI);
+            IwanNtControlEnd();
+            return STATUS_SUCCESS;
+        }
+    }
+
+    if (source.PrefixSet == NULL) {
+        IwanNtControlEnd();
+        return STATUS_NOT_SUPPORTED;
+    }
+    if (Stack->Parameters.DeviceIoControl.InputBufferLength !=
+        sizeof(IWAN_NT_PREFIX_LIST_ABI)) {
+        IwanNtControlEnd();
+        return STATUS_INFO_LENGTH_MISMATCH;
+    }
+    list = (const IWAN_NT_PREFIX_LIST_ABI *)Irp->AssociatedIrp.SystemBuffer;
+    if (list->Count > IWAN_NT_PREFIX_MAX || list->Reserved != 0) {
+        IwanNtControlEnd();
+        return STATUS_INVALID_PARAMETER;
+    }
+    status = source.PrefixSet(source.Context, list, &accepted);
+    IwanNtControlEnd();
+    /*
+     * A partial install is not an error: the adapter keeps what validated and
+     * the caller learns how much that was by reading the table back.
+     */
+    (void)accepted;
+    return status;
+}
+
 static NTSTATUS
 IwanNtControlStopPeer(
     VOID
@@ -546,6 +623,8 @@ IwanNtControlDispatchDeviceControl(
         return IwanNtControlGetLease(Irp, Stack);
     case IWAN_NT_IOCTL_START_PEER:
         return IwanNtControlStartPeer(Irp, Stack);
+    case IWAN_NT_IOCTL_SET_PREFIXES:
+        return IwanNtControlSetPrefixes(Irp, Stack);
     case IWAN_NT_IOCTL_STOP_PEER:
         (VOID)Irp;
         (VOID)Stack;

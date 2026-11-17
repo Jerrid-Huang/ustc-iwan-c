@@ -80,10 +80,16 @@
  * installs the lease where it wants it.
  */
 #define IWAN_NT_IOCTL_GET_LEASE IWAN_NT_CTL_CODE(0x809u)
+/*
+ * Allowed inner prefixes. Write replaces the whole table, so a caller either
+ * sends its complete list or clears enforcement with Count = 0. Read returns the
+ * table the driver is enforcing.
+ */
+#define IWAN_NT_IOCTL_SET_PREFIXES IWAN_NT_CTL_CODE(0x80au)
 
 #define IWAN_NT_SESSION_STRUCT_SIZE 24u
 #define IWAN_NT_ADDR_STRUCT_SIZE 24u
-#define IWAN_NT_STATS_STRUCT_SIZE 320u
+#define IWAN_NT_STATS_STRUCT_SIZE 328u
 #define IWAN_NT_CREDENTIALS_STRUCT_SIZE 136u
 
 /* Field widths inside IWAN_NT_CREDENTIALS_ABI. */
@@ -140,6 +146,11 @@ typedef struct _IWAN_NT_ADDR_ABI {
  */
 #define IWAN_NT_LEASE_STRUCT_SIZE 12u
 
+/* Upper bound on the prefix table, matched by the driver's own define. */
+#define IWAN_NT_PREFIX_MAX 32u
+#define IWAN_NT_PREFIX_STRUCT_SIZE 24u
+#define IWAN_NT_PREFIX_LIST_STRUCT_SIZE 776u
+
 typedef struct _IWAN_NT_LEASE_ABI {
     uint8_t Address[4];   /* network byte order, as it arrived */
     uint8_t Gateway[4];   /* network byte order */
@@ -153,6 +164,24 @@ typedef struct _IWAN_NT_LEASE_ABI {
     uint8_t HasGateway;
     uint8_t Reserved;
 } IWAN_NT_LEASE_ABI;
+
+/*
+ * One allowed prefix. Address is in network byte order and the bits outside
+ * Length must be zero; the driver drops entries that violate that instead of
+ * masking them, because a table that reads differently from the configuration
+ * file is worse than a table that is short.
+ */
+typedef struct _IWAN_NT_PREFIX_ABI {
+    uint32_t Family;      /* 4 or 6 */
+    uint32_t Length;      /* prefix length in bits */
+    uint8_t Address[16];
+} IWAN_NT_PREFIX_ABI;
+
+typedef struct _IWAN_NT_PREFIX_LIST_ABI {
+    uint32_t Count;       /* entries in Prefixes, at most IWAN_NT_PREFIX_MAX */
+    uint32_t Reserved;    /* must be zero */
+    IWAN_NT_PREFIX_ABI Prefixes[IWAN_NT_PREFIX_MAX];
+} IWAN_NT_PREFIX_LIST_ABI;
 
 typedef struct _IWAN_NT_STATS_ABI {
     uint64_t Receives;             /* datagrams the receive path looked at */
@@ -227,7 +256,10 @@ typedef struct _IWAN_NT_STATS_ABI {
     uint32_t PeerMtu;
     /* Inner packets refused because they exceed the negotiated size. */
     uint32_t MtuDropped;
-    uint32_t Reserved1;            /* must be zero */
+    /* Entries the adapter is enforcing; zero means the check is open. */
+    uint32_t PrefixCount;
+    /* Inner packets whose source address was outside the allowed prefixes. */
+    uint64_t RxNotAllowed;
 } IWAN_NT_STATS_ABI;
 
 /*
@@ -246,6 +278,10 @@ _Static_assert(sizeof(IWAN_NT_ADDR_ABI) == IWAN_NT_ADDR_STRUCT_SIZE,
                "address ABI size changed");
 _Static_assert(sizeof(IWAN_NT_STATS_ABI) == IWAN_NT_STATS_STRUCT_SIZE,
                "STATS ABI size changed");
+_Static_assert(sizeof(IWAN_NT_PREFIX_ABI) == IWAN_NT_PREFIX_STRUCT_SIZE,
+               "prefix ABI size changed");
+_Static_assert(sizeof(IWAN_NT_PREFIX_LIST_ABI) == IWAN_NT_PREFIX_LIST_STRUCT_SIZE,
+               "prefix list ABI size changed");
 
 _Static_assert(sizeof(IWAN_NT_LEASE_ABI) == IWAN_NT_LEASE_STRUCT_SIZE,
                "lease ABI size changed");

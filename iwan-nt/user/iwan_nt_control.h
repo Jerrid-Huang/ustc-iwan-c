@@ -112,6 +112,19 @@ IwanNtSendControl(
  * The address the server assigned in the last acknowledgement, network order.
  * The driver only reports it; installing it on the adapter is the caller's job.
  */
+/* Replace or read the allowed inner prefix table. */
+BOOL
+IwanNtSetPrefixes(
+    _In_ PIWAN_NT_DEVICE Device,
+    _In_ const IWAN_NT_PREFIX_LIST_ABI *List
+    );
+
+BOOL
+IwanNtGetPrefixes(
+    _In_ PIWAN_NT_DEVICE Device,
+    _Out_ IWAN_NT_PREFIX_LIST_ABI *List
+    );
+
 BOOL
 IwanNtGetLease(
     _In_ PIWAN_NT_DEVICE Device,

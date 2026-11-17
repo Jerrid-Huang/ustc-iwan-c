@@ -31,6 +31,7 @@
 #include "iwan_nt_session.h"
 #include "iwannt_connect.h"
 #include "iwan_nt_lease.h"
+#include "iwan_nt_route_win.h"
 #include "iwan_nt_mtu_win.h"
 
 static VOID
@@ -40,7 +41,7 @@ Usage(VOID)
             "usage:\n"
             "  iwannt-ctl check\n"
             "  iwannt-ctl stats\n"
-            "  iwannt-ctl lease [ifindex]\n"
+            "  iwannt-ctl lease [ifindex] [prefix ...]\n"
             "  iwannt-ctl mtu [<carrier-mtu>|<peer address>]\n"
             "  iwannt-ctl peer <a.b.c.d> <port>\n"
             "  iwannt-ctl session <sid-hex> <token-hex> <0|1> <key-hex>\n"
@@ -260,6 +261,9 @@ CommandStats(
     printf("drops: oversize=%llu sinkerrors=%llu\n",
            (unsigned long long)stats.RxOversize,
            (unsigned long long)stats.RxSinkErrors);
+    printf("prefixes: %lu allowed, %llu inner packets refused\n",
+           (unsigned long)stats.PrefixCount,
+           (unsigned long long)stats.RxNotAllowed);
     printf("mtu: carrier=%lu effective=%lu peer=%lu dropped=%lu\n",
            (unsigned long)stats.CarrierMtu,
            (unsigned long)stats.EffectiveMtu,
@@ -381,6 +385,70 @@ CommandLease(
         return 1;
     }
     printf("applied on interface %lu\n", (unsigned long)ifIndex);
+
+    /*
+     * Remaining arguments are the allowed inner prefixes. Each one is installed
+     * as a route and pushed to the driver as the ingress filter, so there is one
+     * place where "which inner addresses exist" is written down.
+     */
+    if (Argc > 3) {
+        IWAN_NT_PREFIX_LIST_ABI list;
+        int index;
+
+        memset(&list, 0, sizeof(list));
+        for (index = 3; index < Argc && list.Count < IWAN_NT_PREFIX_MAX;
+             index++) {
+            IWAN_NT_PREFIX_ABI *entry = &list.Prefixes[list.Count];
+            unsigned length = 0;
+            char text[64];
+            const char *slash = strchr(Argv[index], '/');
+            size_t prefixLength;
+
+            prefixLength = slash != NULL
+                ? (size_t)(slash - Argv[index])
+                : strlen(Argv[index]);
+            if (prefixLength == 0 || prefixLength >= sizeof(text)) {
+                fprintf(stderr, "prefix %s: bad length\n", Argv[index]);
+                return 1;
+            }
+            memcpy(text, Argv[index], prefixLength);
+            text[prefixLength] = '\0';
+            if (slash != NULL) {
+                length = (unsigned)strtoul(slash + 1, NULL, 10);
+            } else {
+                length = (strchr(text, ':') != NULL) ? 128u : 32u;
+            }
+            entry->Family = (strchr(text, ':') != NULL) ? 6u : 4u;
+            entry->Length = length;
+            /*
+             * The project's own literal parser, not InetPtonA: the latter needs
+             * ws2tcpip.h before windows.h and a _WIN32_WINNT that MinGW does not
+             * default to, and this file has no other reason to drag winsock in.
+             */
+            if ((entry->Family == 6u
+                    ? IwanNtParseIPv6(text, entry->Address)
+                    : IwanNtParseIPv4(text, entry->Address)) == 0) {
+                fprintf(stderr, "prefix %s: not an address\n", Argv[index]);
+                return 1;
+            }
+            list.Count++;
+        }
+
+        if (IwanNtSetPrefixes(Device, &list) == FALSE) {
+            fprintf(stderr, "prefixes: set failed: %lu\n", GetLastError());
+            return 1;
+        }
+        printf("prefixes: %u accepted by the driver\n", (unsigned)list.Count);
+        for (index = 3; index < Argc; index++) {
+            if (IwanNtRouteAddPrefix(ifIndex, Argv[index]) == FALSE) {
+                fprintf(stderr, "route %s: failed: %lu\n", Argv[index],
+                        GetLastError());
+                return 1;
+            }
+            printf("route: %s -> interface %lu\n", Argv[index],
+                   (unsigned long)ifIndex);
+        }
+    }
     return 0;
 }
 

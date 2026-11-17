@@ -39,7 +39,9 @@ typedef struct _IWAN_NT_CONTROL_COUNTER_SOURCE {
         _Out_ uint32_t *CarrierMtu,
         _Out_ uint32_t *EffectiveMtu,
         _Out_ uint32_t *PeerMtu,
-        _Out_ uint32_t *MtuDropped
+        _Out_ uint32_t *MtuDropped,
+        _Out_ uint32_t *PrefixCount,
+        _Out_ uint64_t *RxNotAllowed
         );
     /*
      * Optional. Called after a session is installed (Valid != 0) or dropped
@@ -50,6 +52,24 @@ typedef struct _IWAN_NT_CONTROL_COUNTER_SOURCE {
     _In_opt_ VOID (*SessionChanged)(
         _In_opt_ void *Context,
         _In_ int Valid
+        );
+    /*
+     * Optional. Replaces the allowed inner prefix table and reports how many
+     * entries the adapter accepted; the rest of the list is returned so the
+     * caller can tell a typo from a policy.
+     */
+    _In_opt_ ULONG (*PrefixSet)(
+        _In_opt_ void *Context,
+        _In_ const IWAN_NT_PREFIX_LIST_ABI *List,
+        _Out_ ULONG *Accepted
+        );
+    /*
+     * Optional. Copies the table the adapter is enforcing into List and reports
+     * the entry count; List->Count must be large enough or the call fails.
+     */
+    _In_opt_ VOID (*PrefixQuery)(
+        _In_opt_ void *Context,
+        _Inout_ IWAN_NT_PREFIX_LIST_ABI *List
         );
 } IWAN_NT_CONTROL_COUNTER_SOURCE;
 

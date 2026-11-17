@@ -831,7 +831,7 @@ IwanNtTransportGetStats(
     Stats->PeerDelayCurrent = Transport->Peer.DelayCurrent;
     Stats->PeerDelayMinimum = Transport->Peer.DelayMinimum;
     Stats->PeerDelayMaximum = Transport->Peer.DelayMaximum;
-    Stats->Reserved1 = 0;
+    /* PrefixCount and RxNotAllowed belong to the adapter, not the transport. */
     KeReleaseSpinLock(&Transport->SessionLock, oldIrql);
 
     Stats->TxInFlight = (uint32_t)IwanNtTxInFlight(&Transport->Tx);
