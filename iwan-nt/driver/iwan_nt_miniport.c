@@ -1284,11 +1284,16 @@ IwanNtMiniportIndicateInner(
     }
 
     /*
-     * No EtherType metadata and no NDIS_RECEIVE_FLAGS_SINGLE_ETHER_TYPE: this is
-     * a raw IP miniport, so NDIS reads the version nibble from the packet itself.
-     * Both the frame-type info and that flag describe Ethernet framing, which
-     * does not exist here.
+     * NDIS wants the frame type even on a raw IP miniport: with it left unset the
+     * first receive component drops every frame as "Unsupported EtherType"
+     * (pktmon DropReason, DropLocation 0xE0001007, measured 2026-11-17 - the
+     * downlink had never delivered a single packet because of this). The value is
+     * the on-wire EtherType in host order, and it is set per net buffer list on
+     * purpose: one chain may mix IPv4 and IPv6, so NDIS_RECEIVE_FLAGS_SINGLE_
+     * ETHER_TYPE must stay off.
      */
+    NET_BUFFER_LIST_INFO(slot->Nbl, NetBufferListFrameType) =
+        RtlUshortByteSwap((Family == 6u) ? 0x86DDu : 0x0800u);
     NET_BUFFER_LIST_STATUS(slot->Nbl) = NDIS_STATUS_SUCCESS;
     NET_BUFFER_LIST_NEXT_NBL(slot->Nbl) = NULL;
 
