@@ -96,15 +96,19 @@ Two items from the WireGuardNT comparison are deliberately not built yet:
    tiered cache would only change how those slots are sized. Measured batch sizes
    stay between 3 and 8 frames, and 64-byte payloads run at the same packet rate as
    1200-byte ones, so packet size is not what limits the link.
-2. **A second queue level in front of the send pool.** A full pool currently
-   returns `NDIS_STATUS_RESOURCES` and lets TCP/IP retry; on the test stack that
-   path carried 0.44% of packets in the worst run and zero in the runs that matter
-   (30.9 kpps at 1372 bytes with `rejected=0`). Holding net buffer lists in front of
-   the pool is exactly what cost throughput earlier: the variant that held them
-   until the provider completed ran at 15.0 kpps against 30.0 kpps for the variant
-   that returns them immediately.
+2. ~~A second queue level in front of the send pool.~~ Built, because a measurement
+   moved the answer. The pool closes at 256 in-flight frames, and when it did the
+   staging path returned `NDIS_STATUS_RESOURCES` with no counter at all: four sending
+   threads generated 1,015,051 packets and only 570,888 reached the driver, while
+   `rejected` stayed 0. A third of the traffic vanished silently. There are now 1024
+   flat frame buffers behind an O(1) free-index stack and an order-preserving ring
+   (`IWAN_NT_TX_QUEUE_MAX`), claimed when no slot is free and moved into slots by the
+   drain path; only a full queue drops, and it is counted in `TxQueueDrops`. The
+   earlier objection still stands and is why this queue holds *sealed copies* and not
+   net buffer lists: holding the caller's NBL until the provider completes cost half
+   the throughput (15.0 vs 30.0 kpps).
 
-Both are revisited when a measurement moves the answer, not before.
+The remaining item is revisited when a measurement moves the answer, not before.
 
 ## Explicit non-goals
 

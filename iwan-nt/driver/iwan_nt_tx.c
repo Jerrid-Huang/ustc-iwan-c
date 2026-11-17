@@ -659,8 +659,17 @@ IwanNtTxClaimSlot(
     PIWAN_NT_TX_SLOT slot = NULL;
     KIRQL oldIrql;
     ULONG index;
+    ULONGLONG lockStart;
 
+    /*
+     * Time spent waiting for the pool lock: if this grows with the number of
+     * sending threads, the global pool is the serializer and the next step is a
+     * per-CPU pool rather than a faster one.
+     */
+    lockStart = KeQueryInterruptTime();
     KeAcquireSpinLock(&Tx->Lock, &oldIrql);
+    Tx->CostLock += (KeQueryInterruptTime() - lockStart);
+    Tx->CostLockCount++;
     for (index = 0; index < Tx->SlotCount; index++) {
         if (!Tx->Slots[index].InUse) {
             slot = &Tx->Slots[index];
@@ -1075,13 +1084,16 @@ IwanNtTxGetCost(
     _Out_ uint64_t *Submit,
     _Out_ uint64_t *Count,
     _Out_ uint64_t *Enter,
-    _Out_ uint64_t *EnterCount
+    _Out_ uint64_t *EnterCount,
+    _Out_ uint64_t *LockWait,
+    _Out_ uint64_t *LockCount
     )
 {
     KIRQL oldIrql;
 
     if (Tx == NULL || Seal == NULL || Submit == NULL || Count == NULL ||
-        Enter == NULL || EnterCount == NULL) {
+        Enter == NULL || EnterCount == NULL || LockWait == NULL ||
+        LockCount == NULL) {
         return;
     }
     KeAcquireSpinLock(&Tx->Lock, &oldIrql);
@@ -1090,6 +1102,8 @@ IwanNtTxGetCost(
     *Count = Tx->CostCount;
     *Enter = Tx->CostEnter;
     *EnterCount = Tx->CostEnterCount;
+    *LockWait = Tx->CostLock;
+    *LockCount = Tx->CostLockCount;
     KeReleaseSpinLock(&Tx->Lock, oldIrql);
 }
 

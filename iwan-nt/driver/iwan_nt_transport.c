@@ -65,10 +65,12 @@ IwanNtTransportReceiveChunk(
     uint8_t *payload = NULL;
     KIRQL oldIrql;
     BOOLEAN direct;
+    ULONGLONG rxStart;
 
     if (transport == NULL || Mdl == NULL) {
         return FALSE;
     }
+    rxStart = KeQueryInterruptTime();
     if (Length == 0 || Length > IWAN_NT_SCRATCH_BYTES) {
         /* Beyond the transform's working size: counted as an oversize drop by
          * the socket layer, so the reference stays with the caller. */
@@ -133,6 +135,14 @@ IwanNtTransportReceiveChunk(
 
     KeReleaseSpinLock(&transport->SessionLock, oldIrql);
     IwanNtTransportDeliverSession(transport);
+
+    /*
+     * Decapsulation plus the indication, per datagram. Together with the send
+     * side numbers this says whether the receive half leaves anything on the
+     * table worth attacking (see docs/throughput.md).
+     */
+    transport->CostRx += (KeQueryInterruptTime() - rxStart);
+    transport->CostRxCount++;
 
     if (!view.Taken) {
         /* Nothing downstream bound this datagram, so the reference is ours to
@@ -794,7 +804,8 @@ IwanNtTransportGetStats(
     Stats->TxBatches = (uint64_t)Transport->Tx.Batches;
     IwanNtTxGetCost(&Transport->Tx, &Stats->CostSeal, &Stats->CostSubmit,
                     &Stats->CostCount, &Stats->CostEnter,
-                    &Stats->CostEnterCount);
+                    &Stats->CostEnterCount, &Stats->CostLock,
+                    &Stats->CostLockCount);
     Stats->RxIndicated = 0;
     Stats->RxDropped = 0;
 
@@ -808,6 +819,8 @@ IwanNtTransportGetStats(
     Stats->RxSinkErrors = (uint64_t)Transport->Datagram.SinkErrors;
     Stats->ControlRead = Transport->ControlRead;
     Stats->ControlSent = Transport->ControlSent;
+    Stats->CostRx = Transport->CostRx;
+    Stats->CostRxCount = Transport->CostRxCount;
     Stats->ControlSendFailed = Transport->ControlSendFailed;
     Stats->Running =
         (uint32_t)(Transport->State == IwanNtTransportRunning ? 1u : 0u);

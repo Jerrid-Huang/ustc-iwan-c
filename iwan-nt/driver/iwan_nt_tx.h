@@ -170,6 +170,9 @@ struct _IWAN_NT_TX {
     /* Wall time the caller spent inside its send entry, 100 ns units. */
     ULONG64 CostEnter;
     ULONG64 CostEnterCount;
+    /* Time waited for the pool lock, 100 ns units, and how many claims. */
+    ULONG64 CostLock;
+    ULONG64 CostLockCount;
     IWAN_NT_TX_SLOT Slots[IWAN_NT_TX_SLOTS];
 
     /*
@@ -405,7 +408,9 @@ IwanNtTxGetCost(
     _Out_ uint64_t *Submit,
     _Out_ uint64_t *Count,
     _Out_ uint64_t *Enter,
-    _Out_ uint64_t *EnterCount
+    _Out_ uint64_t *EnterCount,
+    _Out_ uint64_t *LockWait,
+    _Out_ uint64_t *LockCount
     );
 
 #ifdef __cplusplus

@@ -115,6 +115,14 @@ typedef struct _IWAN_NT_TRANSPORT {
      * allocate.
      */
     uint8_t PeerScratch[IWAN_NT_SESSION_CONTROL_MAX];
+    /*
+     * Receive cost per datagram: decapsulation plus the indication, in 100 ns
+     * units. Written under SessionLock from the receive path, read by the stats
+     * query, which is why it lives beside the control counters rather than in a
+     * per-CPU structure.
+     */
+    ULONG64 CostRx;
+    ULONG64 CostRxCount;
     /* Control-plane counters; one writer each, see the getter below. */
     ULONG64 ControlSent;
     ULONG64 ControlSendFailed;

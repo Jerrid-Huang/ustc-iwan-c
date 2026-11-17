@@ -89,7 +89,7 @@
 
 #define IWAN_NT_SESSION_STRUCT_SIZE 24u
 #define IWAN_NT_ADDR_STRUCT_SIZE 24u
-#define IWAN_NT_STATS_STRUCT_SIZE 408u
+#define IWAN_NT_STATS_STRUCT_SIZE 440u
 #define IWAN_NT_CREDENTIALS_STRUCT_SIZE 136u
 
 /* Field widths inside IWAN_NT_CREDENTIALS_ABI. */
@@ -276,6 +276,10 @@ typedef struct _IWAN_NT_STATS_ABI {
     /* Wall time the miniport send entry took, and the NBLs it covered. */
     uint64_t CostEnter;
     uint64_t CostEnterCount;
+    uint64_t CostLock;             /* time waited for the send pool lock, 100ns */
+    uint64_t CostLockCount;
+    uint64_t CostRx;               /* per datagram: decapsulation plus indication */
+    uint64_t CostRxCount;
 } IWAN_NT_STATS_ABI;
 
 /*

@@ -115,3 +115,66 @@ must both come from `KeQuerySystemTimePrecise`: `KeQueryInterruptTime` is tracke
 CPU, so a request built on one processor and answered on another can look like it
 came from the future and every sample is dropped. On this link the round trip reads
 0.245-0.711 ms.
+## Both directions, and the receive path bug that hid it (2026-11-17, 2.0.0.0)
+
+The downlink had never delivered a single datagram. `win_sink` counted zero while the
+adapter reported `rx indicated` climbing by more than a million, and the UDP counters
+in `netstat -s` rose by exactly the number of frames the driver indicated, which made
+the loss look like a socket problem. It was not: `pktmon` on the tunnel adapter showed
+every frame dropped by the first receive component.
+
+```
+DropReason Unsupported EtherType, DropLocation 0xE0001007
+ip: 198.18.0.250.9999 > 198.18.0.2.9999: UDP, length 1172
+```
+
+The packet was well formed and the net buffer list carried no frame type. NDIS wants
+`NetBufferListFrameType` even on a raw IP miniport, in host order (the on-wire
+EtherType byte swapped), and it has to be set per net buffer list rather than per
+indication, because one chain may mix IPv4 and IPv6 and
+`NDIS_RECEIVE_FLAGS_SINGLE_ETHER_TYPE` would then state a falsehood. The uplink never
+noticed - the stack originates those packets - so the bug only existed on the side that
+had no measurement until the injector was written.
+
+With the fix, `receive:` reports 100% zero copy: the frame is decrypted in place in
+the provider's MDL and indicated without a copy.
+
+### Downlink (server injects, no uplink traffic)
+
+`win_vsrv.exe -b 127.0.0.1 -p 46001 -r <pps> -z 1200 -j <threads>` in the guest, the
+client connected to it, `win_sink.exe -B <lease> -p 9999 -S 10` as the receiver.
+
+| offered (pps x threads) | sink | Mbps | zero copy |
+|---|---|---|---|
+| 50k x 2 | 69,015 pps | 647.1 | 100% |
+| 50k x 4 | 74,623 pps | 699.7 | 100% |
+| 60k x 4 | 60,377 pps | 566.1 | 100% |
+| 60k x 6 | 57,738 pps | 541.4 | 100% |
+
+The receive path saturates at 69-75k pps / 650-700 Mbps of inner traffic, and pushing
+the offered load higher makes it *slower* because the injector, the driver and the sink
+then share the same eight vCPUs. Both the injected count and `rx indicated` move
+together, so nothing is lost inside the driver.
+
+### Both directions at once
+
+Same run, generator on the uplink and injector on the downlink, 10 s:
+
+| direction | pps | Mbps | accounting |
+|---|---|---|---|
+| uplink (to a remote inner address) | 42,885 | 470.7 | `accepted` 428,515 of 428,935 generated, `rejected=6` |
+| downlink (from the server, to the lease) | 46,189 | 433.1 | sink delta, 100% zero copy |
+| combined | 89,074 | 903.8 | |
+
+### Uplink, final build
+
+| path | threads | pps | Mbps |
+|---|---|---|---|
+| guest to host over slirp (1.9.0.0) | 1 / 2 / 4 | 29,572 / 49,787 / 54,000 | 324.6 / 546.5 / ~593 |
+| guest to guest over loopback (1.6.0.0) | 2 / 4 / 6 | 65,000 / 115,700 / 147,100 | 718 / 1,270 / 1,614 |
+
+The slirp column is the emulated bearer, not the driver: the same build reaches
+1.6 Gbps when the outer socket never leaves the guest, and at four threads every
+generated packet is accounted for as either `accepted` or `rejected` - the silent
+drops that used to swallow 44% are gone (see the second-level queue in the
+architecture notes).

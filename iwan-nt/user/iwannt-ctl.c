@@ -278,6 +278,16 @@ CommandStats(
                (unsigned long long)stats.CostCount);
     }
     if (stats.CostEnterCount != 0) {
+        printf("cost: tx lock=%.2fus per claim (n=%llu)\n",
+               (stats.CostLockCount != 0)
+                   ? (double)stats.CostLock * 0.01 / (double)stats.CostLockCount
+                   : 0.0,
+               (unsigned long long)stats.CostLockCount);
+        printf("cost: receive=%.2fus per packet (n=%llu)\n",
+               (stats.CostRxCount != 0)
+                   ? (double)stats.CostRx * 0.01 / (double)stats.CostRxCount
+                   : 0.0,
+               (unsigned long long)stats.CostRxCount);
         printf("cost: send entry=%.2fus per NBL (n=%llu)\n",
                (double)stats.CostEnter / (double)stats.CostEnterCount / 10.0,
                (unsigned long long)stats.CostEnterCount);
