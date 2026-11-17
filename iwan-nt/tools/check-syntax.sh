@@ -75,6 +75,20 @@ run_host_test stress tests/stress_test.c driver/iwan_nt_ingress.c driver/iwan_nt
 # The two mistakes that cost a round trip every time are a wrong parameter name
 # (the file used to mix Adapter and adapter) and a misplaced brace, and the first
 # one is greppable: every local pointer in that file is now lower case.
+# Every driver translation unit must be listed in the vcxproj, or the CI link
+# fails with unresolved symbols for a file that compiles fine on its own.
+missing=0
+for unit in driver/*.c; do
+    base=$(basename "$unit")
+    if ! grep -q "ClCompile Include=\"$base\"" driver/iwan_nt.vcxproj; then
+        echo "$base is missing from iwan_nt.vcxproj"
+        missing=1
+    fi
+done
+if [ "$missing" -ne 0 ]; then
+    status=1
+fi
+
 if grep -n 'Adapter->' driver/iwan_nt_miniport.c 2>/dev/null | grep -q .; then
     echo "iwan_nt_miniport.c mixes Adapter and adapter:"
     grep -n 'Adapter->' driver/iwan_nt_miniport.c | head -5

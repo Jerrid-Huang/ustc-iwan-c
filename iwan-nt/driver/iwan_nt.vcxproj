@@ -112,6 +112,7 @@
     <ClCompile Include="iwan_nt_crypto.c" />
     <ClCompile Include="iwan_nt_frame.c" />
     <ClCompile Include="iwan_nt_mtu.c" />
+    <ClCompile Include="iwan_nt_prefix.c" />
     <ClCompile Include="iwan_nt_control.c" />
     <ClCompile Include="iwan_nt_ingress.c" />
     <ClCompile Include="iwan_nt_miniport.c">
