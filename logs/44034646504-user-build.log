@@ -1,0 +1,12 @@
+iwannt-ctl.c
+iwan_nt_control.c
+iwan_nt_mtu_win.c
+iwan-nt\user\iwan_nt_mtu_win.c(88): error C2220: the following warning is treated as an error
+iwan-nt\user\iwan_nt_mtu_win.c(88): warning C4996: 'inet_addr': Use inet_pton() or InetPton() instead or define _WINSOCK_DEPRECATED_NO_WARNINGS to disable deprecated API warnings
+iwan_nt_crypto.c
+iwan_nt_inet.c
+iwan_nt_lease.c
+iwannt_connect.c
+iwan_nt_session.c
+iwan_nt_peer.c
+Generating Code...
