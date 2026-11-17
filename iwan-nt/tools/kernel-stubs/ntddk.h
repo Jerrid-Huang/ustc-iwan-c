@@ -486,6 +486,18 @@ PMDL IoAllocateMdl(
     BOOLEAN ChargeQuota, PIRP Irp);
 VOID IoFreeMdl(PMDL);
 
+#define THREAD_ALL_ACCESS 0x1FFFFFUL
+
+NTSTATUS PsCreateSystemThread(
+    HANDLE *ThreadHandle, ULONG DesiredAccess, PVOID ObjectAttributes,
+    HANDLE ProcessHandle, PVOID ClientId,
+    VOID (*StartRoutine)(PVOID), PVOID StartContext);
+NTSTATUS PsTerminateSystemThread(NTSTATUS ExitStatus);
+NTSTATUS ObReferenceObjectByHandle(
+    HANDLE Handle, ULONG DesiredAccess, PVOID ObjectType, MODE AccessMode,
+    PVOID *Object, PVOID HandleInformation);
+VOID ObDereferenceObject(PVOID Object);
+
 USHORT RtlUshortByteSwap(USHORT);
 
 #endif

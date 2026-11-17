@@ -173,8 +173,8 @@ typedef struct _IWAN_NT_STATS_ABI {
     uint64_t ControlSendFailed;
     uint64_t TxAccepted;           /* inner packets the miniport accepted */
     uint64_t TxRejected;           /* inner packets the miniport refused */
-    uint64_t TxInPlace;            /* frames sent in place (no payload copy) */
-    uint64_t TxCopied;             /* frames that had to be copied into a slot */
+    uint64_t TxPending;            /* frames staged and waiting for the drain */
+    uint64_t TxMaxBatch;           /* largest chain ever handed over in one call */
     uint64_t TxBatches;            /* WskSendMessages calls; accepted/batches = batch size */
     uint64_t RxIndicated;          /* NBLs indicated up */
     uint64_t RxDropped;            /* indications that could not be built */

@@ -11,27 +11,43 @@ extern "C" {
 #endif
 
 /*
- * Outbound slot pool.
+ * Outbound slot pool with a deferred submit queue.
  *
  * The send path must not allocate on the transmit path: an NDIS send can arrive
  * at DISPATCH_LEVEL, where neither IRPs nor MDLs may be created. Every slot is
  * therefore built once at PASSIVE_LEVEL and recycled by the IRP completion
  * routine, which runs at DISPATCH_LEVEL.
  *
- * One slot per outstanding datagram. The depth bounds how many sends may be in
+ * The pool also decides *when* to talk to the socket. One WskSendMessages call
+ * costs far more than copying a packet, and the stack hands the miniport one
+ * NBL per call, so submitting inside the NDIS send call means one provider call
+ * per packet. Instead, every staged packet joins a pending chain which a system
+ * thread drains in batches, and the miniport completes the NBL as soon as the
+ * bytes have been copied into a slot. Measured on the test link: batch size 1
+ * gave ~15 kpps, and the cost was per-submit, not per-byte (64 B and 1400 B
+ * payloads reached the same packet rate).
+ *
+ * One slot per staged datagram. The depth bounds how many sends may be in
  * flight at once; a send that finds no free slot fails instead of queueing, so
  * backpressure reaches the NDIS caller as NDIS_STATUS_RESOURCES rather than as
  * unbounded kernel memory.
  */
-/*
- * A busy link keeps roughly (slots / completion latency) packets per second in
- * flight, so the slot count caps throughput before the CPU does: with 32 slots
- * and a ~450 us host-to-host completion the ceiling landed near 56 kpps, well
- * below the 88 kpps the same link carried without the tunnel. 128 slots move
- * that ceiling out of the way at the cost of 256 KB of non-paged send buffers.
- */
 #define IWAN_NT_TX_SLOTS 128UL
 #define IWAN_NT_TX_BUFFER_BYTES 2048UL
+
+/*
+ * Largest number of frames handed to the provider in one call. This is the
+ * batching window: with a 1 ms drain interval it fills at roughly packets per
+ * millisecond, so it only caps very fast links.
+ */
+#define IWAN_NT_TX_MAX_CHAIN 32UL
+
+/*
+ * How long the drain thread waits for the pending chain to grow before it
+ * submits what it has. One millisecond is short enough not to hurt interactive
+ * latency and long enough to collect a batch at the rates the tunnel supports.
+ */
+#define IWAN_NT_TX_DRAIN_INTERVAL_MS 1UL
 
 typedef struct _IWAN_NT_TX IWAN_NT_TX, *PIWAN_NT_TX;
 
@@ -39,26 +55,12 @@ typedef struct _IWAN_NT_TX_SLOT {
     struct _IWAN_NT_TX *Owner;
     PVOID Buffer;
     PMDL Mdl;
-    /*
-     * Second link of the frame for an in-place send: the header lives in
-     * Buffer and this MDL describes the caller's packet, which is sent
-     * straight from its own memory. Unused on the copying path.
-     */
-    PMDL PayloadMdl;
     PIRP Irp;
     WSK_BUF_LIST List;
     ULONG Index;
     BOOLEAN InUse;
-    /* Handed back to the caller when this slot's send completes. */
-    void *CompleteOwner;
-    /*
-     * What was transformed where it lay, so a send that never made it out can
-     * be put back byte for byte. XOR is its own inverse; leaving a caller's
-     * packet scrambled after a failed send would corrupt a retry.
-     */
-    PVOID RestorePayload;
-    ULONG RestoreLength;
-    uint8_t RestoreKey[IWAN_NT_FRAME_KEY_LEN];
+    /* Set while the slot hangs on the pending chain, waiting for the drain. */
+    BOOLEAN Staged;
 } IWAN_NT_TX_SLOT, *PIWAN_NT_TX_SLOT;
 
 /*
@@ -81,35 +83,13 @@ typedef NTSTATUS (*IWAN_NT_TX_SUBMIT)(
 typedef struct _IWAN_NT_TX_ITEM {
     const uint8_t *Inner;
     size_t InnerLength;
-#ifdef IWAN_NT_KERNEL
-    /*
-     * In-place send. When Owner is set the pool does not copy the payload: it
-     * writes only the eight byte frame header, transforms Inner where it lies,
-     * and sends both pieces as one two link MDL chain. Inner must therefore be
-     * writable and must stay untouched until SlotComplete reports Owner back.
-     * Owner is NULL for the copying path, where Inner is only read.
-     */
-    void *Owner;
-#endif
 } IWAN_NT_TX_ITEM, *PIWAN_NT_TX_ITEM;
-
-/*
- * Report a slot's Owner once the datagram that used it has completed. Runs at
- * IRQL <= DISPATCH_LEVEL, after the slot is free again, and must not touch the
- * slot itself. The pool calls it without holding Lock.
- */
-typedef VOID (*IWAN_NT_TX_SLOT_COMPLETE)(_In_opt_ void *Context, _In_ void *Owner);
-
-/* Largest chain one submit may carry; matches the miniport batch size. */
-#define IWAN_NT_TX_MAX_CHAIN 32UL
 
 struct _IWAN_NT_TX {
     KSPIN_LOCK Lock;
     KEVENT IdleEvent;
     IWAN_NT_TX_SUBMIT Submit;
     void *SubmitContext;
-    IWAN_NT_TX_SLOT_COMPLETE SlotComplete;
-    void *SlotCompleteContext;
     IWAN_NT_SOCKADDR Remote;
     BOOLEAN RemoteValid;
     ULONG SlotCount;
@@ -127,19 +107,22 @@ struct _IWAN_NT_TX {
     ULONG64 SubmitErrors;
     ULONG64 NoSlot;
     ULONG64 TooLarge;
-    /*
-     * Which path the last batches took: in place (no payload copy, the frame
-     * header lives in the slot while the payload stays the caller's buffer) or
-     * the copying path. These exist so a measurement can prove that the zero
-     * copy path is actually the one being exercised.
-     */
-    ULONG64 InPlaceCount;
-    ULONG64 CopiedCount;
+    /* Largest chain the drain thread ever built; proves batching is working. */
+    ULONG64 MaxBatch;
     IWAN_NT_TX_SLOT Slots[IWAN_NT_TX_SLOTS];
+
+    /* Deferred submit queue: filled slots waiting for the drain thread. */
+    PIWAN_NT_TX_SLOT PendingHead;
+    PIWAN_NT_TX_SLOT PendingTail;
+    ULONG PendingCount;
+    KEVENT DrainEvent;
+    PVOID DrainThread;
+    BOOLEAN DrainStop;
+    BOOLEAN DrainRunning;
 };
 
 /*
- * Build the slot pool.
+ * Build the slot pool and start the drain thread.
  *
  * IRQL: PASSIVE_LEVEL.
  * Ownership: Tx is caller-owned and must outlive every send.
@@ -153,9 +136,9 @@ IwanNtTxInitialize(
     );
 
 /*
- * Release the pool. The caller must have stopped sending and waited for
- * IwanNtTxWaitIdle, because a completion routine touch of a freed slot cannot
- * be recovered from.
+ * Release the pool. Stops and waits for the drain thread, then flushes what is
+ * still pending, and finally requires that nothing is in flight: a completion
+ * routine touch of a freed slot cannot be recovered from.
  *
  * IRQL: PASSIVE_LEVEL.
  */
@@ -163,21 +146,6 @@ _IRQL_requires_(PASSIVE_LEVEL)
 VOID
 IwanNtTxFinalize(
     _Inout_ PIWAN_NT_TX Tx
-    );
-
-/*
- * Register the completion callback for in-place sends. Without it an in-place
- * item would never be released, so the pool refuses in-place items while the
- * callback is missing.
- *
- * IRQL: PASSIVE_LEVEL.
- */
-_IRQL_requires_(PASSIVE_LEVEL)
-VOID
-IwanNtTxSetSlotComplete(
-    _Inout_ PIWAN_NT_TX Tx,
-    _In_opt_ IWAN_NT_TX_SLOT_COMPLETE SlotComplete,
-    _In_opt_ void *Context
     );
 
 /* Peer address for every subsequent send. IRQL: PASSIVE_LEVEL. */
@@ -189,7 +157,8 @@ IwanNtTxSetRemote(
     );
 
 /*
- * Transform one inner packet and submit it as one outer datagram.
+ * Transform one inner packet and submit it as one outer datagram, without
+ * batching.
  *
  * IRQL: <= DISPATCH_LEVEL.
  * Ownership: Inner is read only and may be released when this returns; the
@@ -211,22 +180,17 @@ IwanNtTxSend(
     );
 
 /*
- * Submit one already-assembled datagram payload verbatim.
+ * Stage up to Count inner packets for the next batched submit.
  *
  * IRQL: <= DISPATCH_LEVEL.
- * Used by the control plane: OPEN, OPEN_ACK, ECHO and CLOSE frames are built
- * in user mode (header, signature and TLVs included), so this path performs
- * no transform at all.
- */
-_IRQL_requires_max_(DISPATCH_LEVEL)
-/*
- * Send up to Count inner packets with one provider call.
+ * Ownership: Inner is copied before this returns, so the caller may release
+ * the packet immediately, even though the submit happens later.
  *
- * IRQL: <= DISPATCH_LEVEL.
- * Returns the number of packets accepted (0..Count) through Accepted, and a
- * status that is an error only when nothing was submitted. A short batch is
+ * Returns the number of packets staged (0..Count) through Accepted, and a
+ * status that is an error only when nothing was staged. A short batch is
  * backpressure: the caller keeps the remainder and reports it as resources.
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 IwanNtTxSendBatch(
     _Inout_ PIWAN_NT_TX Tx,
@@ -237,6 +201,14 @@ IwanNtTxSendBatch(
     _Out_ PULONG Accepted
     );
 
+/*
+ * Submit one already-assembled datagram payload verbatim, without batching.
+ *
+ * IRQL: <= DISPATCH_LEVEL.
+ * Used by the control plane: OPEN, OPEN_ACK, ECHO and CLOSE frames are built
+ * in user mode (header, signature and TLVs included), so this path performs
+ * no transform at all and must not wait for the drain thread.
+ */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
 IwanNtTxSendRaw(
@@ -246,7 +218,7 @@ IwanNtTxSendRaw(
     );
 
 /*
- * Wait until no datagram is in flight.
+ * Wait until nothing is staged or in flight. Pending frames are flushed first.
  *
  * IRQL: PASSIVE_LEVEL.
  * Returns TRUE when the pool drained, FALSE on timeout. A timeout is a real
@@ -262,6 +234,13 @@ IwanNtTxWaitIdle(
 _IRQL_requires_max_(DISPATCH_LEVEL)
 ULONG
 IwanNtTxInFlight(
+    _In_ PIWAN_NT_TX Tx
+    );
+
+/* Frames staged but not yet handed to the provider. IRQL: any. */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+ULONG
+IwanNtTxPending(
     _In_ PIWAN_NT_TX Tx
     );
 

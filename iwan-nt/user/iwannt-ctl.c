@@ -231,13 +231,13 @@ CommandStats(
            (unsigned long long)stats.ControlRead,
            (unsigned long long)stats.ControlSent,
            (unsigned long long)stats.ControlSendFailed);
-    printf("tx accepted=%llu rejected=%llu inflight=%lu inplace=%llu copied=%llu "
+    printf("tx accepted=%llu rejected=%llu inflight=%lu staged=%llu maxbatch=%llu "
            "batches=%llu\n",
            (unsigned long long)stats.TxAccepted,
            (unsigned long long)stats.TxRejected,
            (unsigned long)stats.TxInFlight,
-           (unsigned long long)stats.TxInPlace,
-           (unsigned long long)stats.TxCopied,
+           (unsigned long long)stats.TxPending,
+           (unsigned long long)stats.TxMaxBatch,
            (unsigned long long)stats.TxBatches);
     printf("rx indicated=%llu dropped=%llu batches=%llu\n",
            (unsigned long long)stats.RxIndicated,

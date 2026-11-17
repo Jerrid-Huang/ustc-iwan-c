@@ -15,27 +15,6 @@
  * returned before the idle event is signalled, so a waiter that observes
  * InFlight == 0 can free the pool without racing this routine.
  */
-/*
- * Put back a payload that was transformed in place but never left.
- *
- * Works on the slot rather than on a saved copy, because there is no copy: the
- * caller's memory is the only place those bytes exist.
- */
-static VOID
-IwanNtTxRestorePayload(
-    _Inout_ PIWAN_NT_TX_SLOT Slot
-    )
-{
-    if (Slot->RestorePayload == NULL || Slot->RestoreLength == 0) {
-        return;
-    }
-
-    IwanNtFrameXor((uint8_t *)Slot->RestorePayload, Slot->RestoreLength,
-                   Slot->RestoreKey);
-    Slot->RestorePayload = NULL;
-    Slot->RestoreLength = 0;
-}
-
 static NTSTATUS
 IwanNtTxComplete(
     _In_ PDEVICE_OBJECT DeviceObject,
@@ -47,9 +26,6 @@ IwanNtTxComplete(
     PIWAN_NT_TX tx;
     KIRQL oldIrql;
     BOOLEAN signalIdle;
-    void *owners[IWAN_NT_TX_MAX_CHAIN];
-    ULONG ownerCount = 0;
-    ULONG ownerIndex;
 
     UNREFERENCED_PARAMETER(DeviceObject);
     UNREFERENCED_PARAMETER(Irp);
@@ -66,7 +42,7 @@ IwanNtTxComplete(
      * IRQL-raising form rather than the at-DPC form.
      *
      * One IRP covers the whole batch, so walk the chain this slot heads and
-     * release every slot on it. The list is circular: stop when we come back.
+     * release every slot on it.
      */
     KeAcquireSpinLock(&tx->Lock, &oldIrql);
     {
@@ -77,25 +53,9 @@ IwanNtTxComplete(
                 CONTAINING_RECORD(entry, IWAN_NT_TX_SLOT, List);
 
             entry = entry->Next;
-            /*
-             * A cancelled or failed send means the bytes never left, so they go
-             * back to the caller unchanged; the status is reported as success
-             * because the packet is treated like one lost on the wire, which is
-             * what a tunnel can always do.
-             */
-            if (!NT_SUCCESS(Irp->IoStatus.Status)) {
-                IwanNtTxRestorePayload(member);
-            }
             member->List.Next = NULL;
-            if (member->Mdl->Next != NULL) {
-                member->Mdl->Next = NULL;
-            }
-            if (member->CompleteOwner != NULL &&
-                ownerCount < IWAN_NT_TX_MAX_CHAIN) {
-                owners[ownerCount++] = member->CompleteOwner;
-                member->CompleteOwner = NULL;
-            }
             member->InUse = FALSE;
+            member->Staged = FALSE;
             tx->FreeCount++;
             tx->InFlight--;
             tx->Completed++;
@@ -106,17 +66,6 @@ IwanNtTxComplete(
 
     if (signalIdle) {
         KeSetEvent(&tx->IdleEvent, IO_NO_INCREMENT, FALSE);
-    }
-
-    /*
-     * Packets that were transformed where they lay can only go back to the
-     * caller now, with no lock held: the callback re-enters NDIS and may
-     * complete the send synchronously.
-     */
-    if (tx->SlotComplete != NULL) {
-        for (ownerIndex = 0; ownerIndex < ownerCount; ownerIndex++) {
-            tx->SlotComplete(tx->SlotCompleteContext, owners[ownerIndex]);
-        }
     }
 
     return STATUS_MORE_PROCESSING_REQUIRED;
@@ -134,9 +83,188 @@ IwanNtTxReleaseSlotLocked(
     )
 {
     Slot->InUse = FALSE;
+    Slot->Staged = FALSE;
     Tx->FreeCount++;
     Tx->InFlight--;
     return (BOOLEAN)(Tx->InFlight == 0);
+}
+
+/*
+ * Submit a chain of already-filled slots under one IRP.
+ *
+ * IRQL: <= DISPATCH_LEVEL.
+ * The chain hangs off Head->List.Next; the completion routine walks it and
+ * releases every slot, so a failure here has to unwind them itself.
+ */
+static NTSTATUS
+IwanNtTxSubmitChain(
+    _Inout_ PIWAN_NT_TX Tx,
+    _Inout_ PIWAN_NT_TX_SLOT Head,
+    _In_ ULONG Count
+    )
+{
+    IWAN_NT_SOCKADDR remote;
+    NTSTATUS status;
+    KIRQL oldIrql;
+    BOOLEAN remoteValid;
+
+    if (Count == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    KeAcquireSpinLock(&Tx->Lock, &oldIrql);
+    remoteValid = Tx->RemoteValid;
+    remote = Tx->Remote;
+    KeReleaseSpinLock(&Tx->Lock, oldIrql);
+    if (remoteValid == FALSE) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
+    IoReuseIrp(Head->Irp, STATUS_SUCCESS);
+    IoSetCompletionRoutine(
+        Head->Irp, IwanNtTxComplete, Head, TRUE, TRUE, TRUE);
+
+    status = Tx->Submit(
+        Tx->SubmitContext, &Head->List, Count, &remote, Head->Irp);
+
+    if (!NT_SUCCESS(status) && status != STATUS_PENDING) {
+        /*
+         * The completion routine never ran, so nothing has been released: walk
+         * the chain here and hand every slot back. A lost datagram is what a
+         * tunnel can always do, so it is counted, not retried.
+         */
+        for (;;) {
+            PWSK_BUF_LIST next = Head->List.Next;
+            BOOLEAN signalIdle;
+
+            KeAcquireSpinLock(&Tx->Lock, &oldIrql);
+            Tx->SubmitErrors++;
+            signalIdle = IwanNtTxReleaseSlotLocked(Tx, Head);
+            KeReleaseSpinLock(&Tx->Lock, oldIrql);
+            if (signalIdle) {
+                KeSetEvent(&Tx->IdleEvent, IO_NO_INCREMENT, FALSE);
+            }
+
+            if (next == NULL) {
+                break;
+            }
+            Head = CONTAINING_RECORD(next, IWAN_NT_TX_SLOT, List);
+        }
+        return status;
+    }
+
+    KeAcquireSpinLock(&Tx->Lock, &oldIrql);
+    Tx->Submitted += Count;
+    Tx->Batches++;
+    if ((ULONG64)Count > Tx->MaxBatch) {
+        Tx->MaxBatch = (ULONG64)Count;
+    }
+    KeReleaseSpinLock(&Tx->Lock, oldIrql);
+
+    return STATUS_SUCCESS;
+}
+
+/*
+ * Detach up to Max slots from the head of the pending chain. Returns NULL when
+ * nothing is staged. The caller owns the returned chain and must submit or
+ * abandon it.
+ */
+static PIWAN_NT_TX_SLOT
+IwanNtTxTakePending(
+    _Inout_ PIWAN_NT_TX Tx,
+    _In_ ULONG Max,
+    _Out_ PULONG Count
+    )
+{
+    PIWAN_NT_TX_SLOT head;
+    PIWAN_NT_TX_SLOT slot;
+    ULONG taken = 0;
+    KIRQL oldIrql;
+
+    *Count = 0;
+
+    KeAcquireSpinLock(&Tx->Lock, &oldIrql);
+    head = Tx->PendingHead;
+    slot = head;
+    while (slot != NULL) {
+        PWSK_BUF_LIST nextList = slot->List.Next;
+        PIWAN_NT_TX_SLOT next = (nextList == NULL)
+                                    ? NULL
+                                    : CONTAINING_RECORD(
+                                          nextList, IWAN_NT_TX_SLOT, List);
+
+        slot->Staged = FALSE;
+        taken++;
+        if (taken == Max || next == NULL) {
+            /* Detached chain ends here; whatever follows stays staged. */
+            slot->List.Next = NULL;
+            Tx->PendingHead = next;
+            if (next == NULL) {
+                Tx->PendingTail = NULL;
+            }
+            break;
+        }
+        slot = next;
+    }
+    Tx->PendingCount -= taken;
+    KeReleaseSpinLock(&Tx->Lock, oldIrql);
+
+    *Count = taken;
+    return head;
+}
+
+/*
+ * Submit everything that is staged, one provider call per IWAN_NT_TX_MAX_CHAIN
+ * frames.
+ *
+ * IRQL: <= DISPATCH_LEVEL.
+ * A submit that fails abandons its own slots, so a failure here never leaves
+ * the chain hanging.
+ */
+static VOID
+IwanNtTxDrain(
+    _Inout_ PIWAN_NT_TX Tx
+    )
+{
+    for (;;) {
+        PIWAN_NT_TX_SLOT head;
+        ULONG count = 0;
+
+        head = IwanNtTxTakePending(Tx, IWAN_NT_TX_MAX_CHAIN, &count);
+        if (head == NULL || count == 0) {
+            return;
+        }
+        (void)IwanNtTxSubmitChain(Tx, head, count);
+    }
+}
+
+/*
+ * The drain thread: wake at least once per drain interval and submit whatever
+ * has accumulated. It exists so that the NDIS send call never waits on the
+ * provider and so that the provider sees batches instead of single frames.
+ */
+static VOID
+IwanNtTxDrainThread(
+    _In_ PVOID Context
+    )
+{
+    PIWAN_NT_TX tx = (PIWAN_NT_TX)Context;
+    LARGE_INTEGER timeout;
+
+    timeout.QuadPart = -((LONGLONG)IWAN_NT_TX_DRAIN_INTERVAL_MS * 10000LL);
+
+    for (;;) {
+        KeWaitForSingleObject(
+            &tx->DrainEvent, Executive, KernelMode, FALSE, &timeout);
+        KeClearEvent(&tx->DrainEvent);
+
+        if (tx->DrainStop) {
+            break;
+        }
+        IwanNtTxDrain(tx);
+    }
+
+    PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -148,6 +276,8 @@ IwanNtTxInitialize(
     )
 {
     ULONG index;
+    NTSTATUS status;
+    HANDLE handle = NULL;
 
     PAGED_CODE();
 
@@ -158,6 +288,7 @@ IwanNtTxInitialize(
     RtlZeroMemory(Tx, sizeof(*Tx));
     KeInitializeSpinLock(&Tx->Lock);
     KeInitializeEvent(&Tx->IdleEvent, NotificationEvent, TRUE);
+    KeInitializeEvent(&Tx->DrainEvent, NotificationEvent, FALSE);
     Tx->Submit = Submit;
     Tx->SubmitContext = SubmitContext;
 
@@ -180,20 +311,6 @@ IwanNtTxInitialize(
         }
         MmBuildMdlForNonPagedPool(slot->Mdl);
 
-        /*
-         * Sized once for the largest frame this pool can carry; the address and
-         * length are rewritten for every in-place send, which is why it is
-         * allocated here (PASSIVE) and only re-initialised on the wire path.
-         */
-        slot->PayloadMdl = IoAllocateMdl(
-            slot->Buffer, IWAN_NT_TX_BUFFER_BYTES, FALSE, FALSE, NULL);
-        if (slot->PayloadMdl == NULL) {
-            IwanNtTxFinalize(Tx);
-            return STATUS_INSUFFICIENT_RESOURCES;
-        }
-        MmBuildMdlForNonPagedPool(slot->PayloadMdl);
-        slot->CompleteOwner = NULL;
-
         slot->Irp = IoAllocateIrp(1, FALSE);
         if (slot->Irp == NULL) {
             IwanNtTxFinalize(Tx);
@@ -203,10 +320,35 @@ IwanNtTxInitialize(
         slot->Owner = Tx;
         slot->Index = index;
         slot->InUse = FALSE;
+        slot->Staged = FALSE;
     }
 
     Tx->SlotCount = IWAN_NT_TX_SLOTS;
     Tx->FreeCount = IWAN_NT_TX_SLOTS;
+
+    /*
+     * The drain thread is created last: Finalize treats DrainRunning as "the
+     * thread object must be closed", so nothing may set it before the thread
+     * exists.
+     */
+    status = PsCreateSystemThread(
+        &handle, THREAD_ALL_ACCESS, NULL, NULL, NULL,
+        IwanNtTxDrainThread, Tx);
+    if (!NT_SUCCESS(status)) {
+        IwanNtTxFinalize(Tx);
+        return status;
+    }
+
+    Tx->DrainRunning = TRUE;
+    status = ObReferenceObjectByHandle(
+        handle, THREAD_ALL_ACCESS, NULL, KernelMode, &Tx->DrainThread, NULL);
+    ZwClose(handle);
+    if (!NT_SUCCESS(status)) {
+        Tx->DrainRunning = FALSE;
+        IwanNtTxFinalize(Tx);
+        return status;
+    }
+
     return STATUS_SUCCESS;
 }
 
@@ -224,16 +366,32 @@ IwanNtTxFinalize(
         return;
     }
 
+    /*
+     * Stop the drain thread before anything else: it reads the slot array, so
+     * freeing a slot under it would be a use after free.
+     */
+    if (Tx->DrainRunning) {
+        Tx->DrainStop = TRUE;
+        KeSetEvent(&Tx->DrainEvent, IO_NO_INCREMENT, FALSE);
+        if (Tx->DrainThread != NULL) {
+            KeWaitForSingleObject(
+                Tx->DrainThread, Executive, KernelMode, FALSE, NULL);
+            ObDereferenceObject(Tx->DrainThread);
+            Tx->DrainThread = NULL;
+        }
+        Tx->DrainRunning = FALSE;
+    }
+
+    /* Nothing can stage any more, so what is left may be submitted now. */
+    IwanNtTxDrain(Tx);
+    (void)IwanNtTxWaitIdle(Tx, 2000);
+
     for (index = 0; index < IWAN_NT_TX_SLOTS; index++) {
         PIWAN_NT_TX_SLOT slot = &Tx->Slots[index];
 
         if (slot->Irp != NULL) {
             IoFreeIrp(slot->Irp);
             slot->Irp = NULL;
-        }
-        if (slot->PayloadMdl != NULL) {
-            IoFreeMdl(slot->PayloadMdl);
-            slot->PayloadMdl = NULL;
         }
         if (slot->Mdl != NULL) {
             IoFreeMdl(slot->Mdl);
@@ -248,6 +406,9 @@ IwanNtTxFinalize(
     Tx->SlotCount = 0;
     Tx->FreeCount = 0;
     Tx->InFlight = 0;
+    Tx->PendingHead = NULL;
+    Tx->PendingTail = NULL;
+    Tx->PendingCount = 0;
 }
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -267,31 +428,13 @@ IwanNtTxSetRemote(
     Tx->RemoteValid = TRUE;
 }
 
-_IRQL_requires_(PASSIVE_LEVEL)
-VOID
-IwanNtTxSetSlotComplete(
-    _Inout_ PIWAN_NT_TX Tx,
-    _In_opt_ IWAN_NT_TX_SLOT_COMPLETE SlotComplete,
-    _In_opt_ void *Context
-    )
-{
-    PAGED_CODE();
-
-    if (Tx == NULL) {
-        return;
-    }
-
-    Tx->SlotComplete = SlotComplete;
-    Tx->SlotCompleteContext = Context;
-}
-
 _IRQL_requires_max_(DISPATCH_LEVEL)
 /*
  * Claim a free slot, or fail without touching the pool.
  *
  * IRQL: <= DISPATCH_LEVEL.
- * Returns NULL when every slot is in flight; that is backpressure, counted as
- * NoSlot, not an error worth waiting for.
+ * Returns NULL when every slot is in flight or staged; that is backpressure,
+ * counted as NoSlot, not an error worth waiting for.
  */
 static PIWAN_NT_TX_SLOT
 IwanNtTxClaimSlot(
@@ -307,9 +450,7 @@ IwanNtTxClaimSlot(
         if (!Tx->Slots[index].InUse) {
             slot = &Tx->Slots[index];
             slot->InUse = TRUE;
-            slot->CompleteOwner = NULL;
-            slot->RestorePayload = NULL;
-            slot->RestoreLength = 0;
+            slot->Staged = FALSE;
             Tx->FreeCount--;
             Tx->InFlight++;
             KeClearEvent(&Tx->IdleEvent);
@@ -351,7 +492,7 @@ IwanNtTxAbandonSlot(
 }
 
 /*
- * Submit an already-filled slot holding Length bytes.
+ * Submit an already-filled slot holding Length bytes, without batching.
  *
  * IRQL: <= DISPATCH_LEVEL.
  * The IRP stays associated with the slot for its whole life. IoReuseIrp gives
@@ -406,145 +547,48 @@ IwanNtTxSubmitSlot(
     KeAcquireSpinLock(&Tx->Lock, &oldIrql);
     Tx->Submitted++;
     Tx->Batches++;
+    if (Tx->MaxBatch < 1) {
+        Tx->MaxBatch = 1;
+    }
     KeReleaseSpinLock(&Tx->Lock, oldIrql);
 
     return STATUS_SUCCESS;
 }
 
 /*
- * Submit a chain of already-filled slots under one IRP.
+ * Hang a filled slot on the pending chain, then either wake the drain thread or
+ * submit right away when the chain is already as long as one submit may be.
  *
  * IRQL: <= DISPATCH_LEVEL.
- * The chain hangs off Head->List.List; the completion routine walks it and
- * releases every slot, so a failure here has to unwind them itself.
  */
-static NTSTATUS
-IwanNtTxSubmitChain(
+static VOID
+IwanNtTxStageSlot(
     _Inout_ PIWAN_NT_TX Tx,
-    _Inout_ PIWAN_NT_TX_SLOT Head,
-    _In_ ULONG Count
+    _Inout_ PIWAN_NT_TX_SLOT Slot
     )
 {
-    IWAN_NT_SOCKADDR remote;
-    NTSTATUS status;
     KIRQL oldIrql;
-    BOOLEAN remoteValid;
-
-    if (Count == 0) {
-        return STATUS_INVALID_PARAMETER;
-    }
+    BOOLEAN full;
 
     KeAcquireSpinLock(&Tx->Lock, &oldIrql);
-    remoteValid = Tx->RemoteValid;
-    remote = Tx->Remote;
-    KeReleaseSpinLock(&Tx->Lock, oldIrql);
-    if (remoteValid == FALSE) {
-        return STATUS_INVALID_DEVICE_STATE;
-    }
-
-    IoReuseIrp(Head->Irp, STATUS_SUCCESS);
-    IoSetCompletionRoutine(
-        Head->Irp, IwanNtTxComplete, Head, TRUE, TRUE, TRUE);
-
-    status = Tx->Submit(
-        Tx->SubmitContext, &Head->List, Count, &remote, Head->Irp);
-
-    if (!NT_SUCCESS(status) && status != STATUS_PENDING) {
-        /*
-         * The completion routine never ran, so nothing has been released: walk
-         * the chain here. AbandonSlot touches the counters, so it happens once
-         * per slot inside the loop.
-         */
-        for (;;) {
-            PWSK_BUF_LIST next = Head->List.Next;
-
-            /*
-             * Nothing is reported from here. The caller is told which items the
-             * batch did not take through *Accepted, which is the same call, so
-             * the packet goes home through the path that already handles a
-             * rejected send. Reporting it here would re-enter the caller's
-             * completion while it still holds its own lock around this call.
-             */
-            Head->CompleteOwner = NULL;
-            if (Head->Mdl->Next != NULL) {
-                Head->Mdl->Next = NULL;
-            }
-            IwanNtTxRestorePayload(Head);
-            IwanNtTxAbandonSlot(Tx, Head, TRUE);
-            if (next == NULL) {
-                break;
-            }
-            Head = CONTAINING_RECORD(next, IWAN_NT_TX_SLOT, List);
-        }
-        return status;
-    }
-
-    KeAcquireSpinLock(&Tx->Lock, &oldIrql);
-    Tx->Submitted += Count;
-    Tx->Batches++;
-    KeReleaseSpinLock(&Tx->Lock, oldIrql);
-
-    return STATUS_SUCCESS;
-}
-
-#ifdef IWAN_NT_KERNEL
-/*
- * Build the frame around a packet that stays where it is.
- *
- * Only the eight byte header is written into the slot; the payload is
- * transformed in the caller's memory and described by the second MDL of the
- * chain, so the datagram leaves without ever being copied. The caller's buffer
- * is writable by contract (an NDIS send packet is non-paged and owned by the
- * sender until the send completes), and Slot->CompleteOwner keeps the packet
- * alive until that completion.
- */
-static NTSTATUS
-IwanNtTxSealInPlace(
-    _Inout_ PIWAN_NT_TX_SLOT Slot,
-    _Inout_ const uint8_t *Inner,
-    _In_ size_t InnerLength,
-    _In_ const IWAN_NT_FRAME_HEADER *Header,
-    _In_reads_bytes_opt_(IWAN_NT_FRAME_KEY_LEN) const uint8_t *Key,
-    _Out_ size_t *FrameLength
-    )
-{
-    IWAN_NT_FRAME_HEADER header = *Header;
-    uint8_t *payload = (uint8_t *)Inner;
-
-    if (IwanNtFrameTypeIsData(header.Type) == FALSE) {
-        return STATUS_INVALID_PARAMETER;
-    }
-    if (IwanNtFrameInnerSane(payload, InnerLength) != IwanNtFrameOk) {
-        return STATUS_INVALID_PARAMETER;
-    }
-    if (IwanNtFrameTypeIsEncrypted(header.Type)) {
-        if (Key == NULL) {
-            return STATUS_INVALID_PARAMETER;
-        }
-        header.Encrypt = 1u;
+    Slot->List.Next = NULL;
+    Slot->Staged = TRUE;
+    if (Tx->PendingTail == NULL) {
+        Tx->PendingHead = Slot;
     } else {
-        header.Encrypt = 0u;
+        Tx->PendingTail->List.Next = &Slot->List;
     }
+    Tx->PendingTail = Slot;
+    Tx->PendingCount++;
+    full = (BOOLEAN)(Tx->PendingCount >= IWAN_NT_TX_MAX_CHAIN);
+    KeReleaseSpinLock(&Tx->Lock, oldIrql);
 
-    IwanNtFrameHeaderEncode((uint8_t *)Slot->Buffer, &header);
-    if (header.Encrypt != 0u) {
-        IwanNtFrameXor(payload, InnerLength, Key);
-        /* Remembered so a failed submission can hand the bytes back intact. */
-        Slot->RestorePayload = payload;
-        Slot->RestoreLength = (ULONG)InnerLength;
-        IwanNtMemCopy(Slot->RestoreKey, Key, IWAN_NT_FRAME_KEY_LEN);
+    if (full) {
+        IwanNtTxDrain(Tx);
+    } else {
+        KeSetEvent(&Tx->DrainEvent, IO_NO_INCREMENT, FALSE);
     }
-
-    MmInitializeMdl(Slot->Mdl, Slot->Buffer, IWAN_NT_FRAME_HDR_LEN);
-    MmBuildMdlForNonPagedPool(Slot->Mdl);
-    MmInitializeMdl(Slot->PayloadMdl, payload, InnerLength);
-    MmBuildMdlForNonPagedPool(Slot->PayloadMdl);
-    Slot->Mdl->Next = Slot->PayloadMdl;
-
-    *FrameLength = (size_t)IWAN_NT_FRAME_HDR_LEN + InnerLength;
-    return STATUS_SUCCESS;
 }
-#endif
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS
@@ -557,9 +601,7 @@ IwanNtTxSendBatch(
     _Out_ PULONG Accepted
     )
 {
-    PIWAN_NT_TX_SLOT head = NULL;
-    PIWAN_NT_TX_SLOT tail = NULL;
-    ULONG taken = 0;
+    ULONG staged = 0;
     ULONG index;
 
     if (Accepted != NULL) {
@@ -594,67 +636,33 @@ IwanNtTxSendBatch(
             break;
         }
 
-#ifdef IWAN_NT_KERNEL
-        if (Items[index].Owner != NULL && Tx->SlotComplete != NULL) {
-            NTSTATUS status = IwanNtTxSealInPlace(
-                slot, Items[index].Inner, innerLength, Header, Key,
-                &frameLength);
-
-            if (!NT_SUCCESS(status)) {
-                IwanNtTxAbandonSlot(Tx, slot, TRUE);
-                break;
-            }
-            slot->CompleteOwner = Items[index].Owner;
-            /*
-             * Advisory: the payload was transformed in place, so nothing of
-             * the caller's buffer was copied. A race here only loses a count.
-             */
-            Tx->InPlaceCount++;
-        } else
-#endif
-        {
-            seal = IwanNtFrameSeal(
-                (uint8_t *)slot->Buffer, IWAN_NT_TX_BUFFER_BYTES,
-                Items[index].Inner, innerLength, Header, Key, &frameLength);
-            if (seal != IwanNtFrameOk) {
-                IwanNtTxAbandonSlot(Tx, slot, TRUE);
-                break;
-            }
-            /* The copying path owns the whole buffer, so one link is enough. */
-            slot->Mdl->Next = NULL;
-            Tx->CopiedCount++;
+        /*
+         * The payload is copied into the slot, so the caller's packet is free
+         * to go as soon as this returns. That is what lets the miniport
+         * complete the NBL immediately and defer the provider call.
+         */
+        seal = IwanNtFrameSeal(
+            (uint8_t *)slot->Buffer, IWAN_NT_TX_BUFFER_BYTES,
+            Items[index].Inner, innerLength, Header, Key, &frameLength);
+        if (seal != IwanNtFrameOk) {
+            IwanNtTxAbandonSlot(Tx, slot, TRUE);
+            break;
         }
 
-        slot->List.Next = NULL;
         slot->List.Buffer.Mdl = slot->Mdl;
         slot->List.Buffer.Offset = 0;
         slot->List.Buffer.Length = frameLength;
 
-        if (head == NULL) {
-            head = slot;
-        } else {
-            tail->List.Next = &slot->List;
-        }
-        tail = slot;
-        taken++;
+        IwanNtTxStageSlot(Tx, slot);
+        staged++;
     }
 
-    if (taken == 0) {
+    if (staged == 0) {
         return (Count == 0) ? STATUS_INVALID_PARAMETER
                             : STATUS_INSUFFICIENT_RESOURCES;
     }
-    UNREFERENCED_PARAMETER(tail);
 
-    {
-        NTSTATUS status = IwanNtTxSubmitChain(Tx, head, taken);
-
-        if (!NT_SUCCESS(status)) {
-            /* SubmitChain unwound every slot on the failing path. */
-            return status;
-        }
-    }
-
-    *Accepted = taken;
+    *Accepted = staged;
     return STATUS_SUCCESS;
 }
 
@@ -733,7 +741,8 @@ IwanNtTxSendRaw(
 
     /*
      * Verbatim: the control plane assembles its own frame header, signature
-     * and TLVs, so nothing is transformed here.
+     * and TLVs, so nothing is transformed here. Control frames skip the drain
+     * thread: a handshake must not wait behind data.
      */
     RtlCopyMemory(slot->Buffer, Payload, Length);
 
@@ -756,6 +765,15 @@ IwanNtTxWaitIdle(
         return FALSE;
     }
 
+    /*
+     * Staged frames are the caller's responsibility too: reporting idle while a
+     * chain waits for the drain thread would let the caller close the socket
+     * they still need.
+     */
+    if (IwanNtTxPending(Tx) != 0) {
+        IwanNtTxDrain(Tx);
+    }
+
     if (IwanNtTxInFlight(Tx) == 0) {
         return TRUE;
     }
@@ -771,8 +789,8 @@ IwanNtTxWaitIdle(
         return FALSE;
     }
 
-    /* The event is notification type, so re-check the counter it stands for. */
-    return (BOOLEAN)(IwanNtTxInFlight(Tx) == 0);
+    /* The event is notification type, so re-check the counters it stands for. */
+    return (BOOLEAN)(IwanNtTxInFlight(Tx) == 0 && IwanNtTxPending(Tx) == 0);
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -792,4 +810,23 @@ IwanNtTxInFlight(
     inFlight = Tx->InFlight;
     KeReleaseSpinLock(&Tx->Lock, oldIrql);
     return inFlight;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+ULONG
+IwanNtTxPending(
+    _In_ PIWAN_NT_TX Tx
+    )
+{
+    KIRQL oldIrql;
+    ULONG pending;
+
+    if (Tx == NULL) {
+        return 0;
+    }
+
+    KeAcquireSpinLock(&Tx->Lock, &oldIrql);
+    pending = Tx->PendingCount;
+    KeReleaseSpinLock(&Tx->Lock, oldIrql);
+    return pending;
 }
