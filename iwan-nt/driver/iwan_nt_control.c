@@ -533,27 +533,31 @@ IwanNtControlSetPrefixes(
     RtlZeroMemory(&source, sizeof(source));
     (void)IwanNtControlTransportLocked(&source);
 
-    if (Stack->Parameters.DeviceIoControl.OutputBufferLength != 0) {
+    /*
+     * Direction is decided by the input length, not by the output length: the
+     * buffered ioctl path passes the same buffer in and out, so a write also has
+     * a non-zero output length.
+     */
+    if (Stack->Parameters.DeviceIoControl.InputBufferLength == 0) {
         if (Stack->Parameters.DeviceIoControl.OutputBufferLength <
             sizeof(IWAN_NT_PREFIX_LIST_ABI)) {
+            IwanNtControlEnd();
             return STATUS_BUFFER_TOO_SMALL;
         }
-        if (Stack->Parameters.DeviceIoControl.InputBufferLength != 0) {
-            /*
-             * A read of the live table: nothing to install, just copy it out.
-             */
-            if (source.PrefixQuery == NULL) {
-                IwanNtControlEnd();
-                return STATUS_NOT_SUPPORTED;
-            }
-            output = (IWAN_NT_PREFIX_LIST_ABI *)
-                Irp->AssociatedIrp.SystemBuffer;
-            output->Reserved = 0;
-            source.PrefixQuery(source.Context, output);
-            Irp->IoStatus.Information = sizeof(IWAN_NT_PREFIX_LIST_ABI);
+        if (source.PrefixQuery == NULL) {
             IwanNtControlEnd();
-            return STATUS_SUCCESS;
+            return STATUS_NOT_SUPPORTED;
         }
+        output = (IWAN_NT_PREFIX_LIST_ABI *)Irp->AssociatedIrp.SystemBuffer;
+        if (output == NULL) {
+            IwanNtControlEnd();
+            return STATUS_INVALID_PARAMETER;
+        }
+        output->Reserved = 0;
+        source.PrefixQuery(source.Context, output);
+        Irp->IoStatus.Information = sizeof(IWAN_NT_PREFIX_LIST_ABI);
+        IwanNtControlEnd();
+        return STATUS_SUCCESS;
     }
 
     if (source.PrefixSet == NULL) {

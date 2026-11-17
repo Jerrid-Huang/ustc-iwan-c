@@ -127,6 +127,14 @@ IwanNtRouteAddPrefix(
 
     status = CreateIpForwardEntry2(&row);
     if (status != NO_ERROR) {
+        /*
+         * Installing the same prefix twice is the state to be in: the lease apply
+         * already adds a route for the address it configures, and an operator may
+         * list that prefix again.
+         */
+        if (status == ERROR_OBJECT_ALREADY_EXISTS) {
+            return TRUE;
+        }
         SetLastError((DWORD)status);
         return FALSE;
     }
