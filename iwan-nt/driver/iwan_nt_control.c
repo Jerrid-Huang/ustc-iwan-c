@@ -401,6 +401,10 @@ IwanNtControlGetStats(
     uint64_t rxIndicated = 0;
     uint64_t rxDropped = 0;
     uint64_t rxBatches = 0;
+    uint32_t carrierMtu = 0;
+    uint32_t effectiveMtu = 0;
+    uint32_t peerMtu = 0;
+    uint32_t mtuDropped = 0;
     NTSTATUS status;
 
     if (Stack->Parameters.DeviceIoControl.OutputBufferLength <
@@ -437,6 +441,14 @@ IwanNtControlGetStats(
         stats->RxIndicated = rxIndicated;
         stats->RxDropped = rxDropped;
         stats->RxBatches = rxBatches;
+        if (source.MtuQuery != NULL) {
+            source.MtuQuery(source.Context, &carrierMtu, &effectiveMtu,
+                            &peerMtu, &mtuDropped);
+            stats->CarrierMtu = carrierMtu;
+            stats->EffectiveMtu = effectiveMtu;
+            stats->PeerMtu = peerMtu;
+            stats->MtuDropped = mtuDropped;
+        }
     }
 
     IwanNtControlEnd();

@@ -251,6 +251,15 @@ IwanNtTransportGetLocal(
     _Out_ PIWAN_NT_SOCKADDR Local
     );
 
+/*
+ * The MTU stated by the peer in its acknowledgement, or 0 when no session has
+ * been accepted yet. Takes SessionLock, so IRQL: <= DISPATCH_LEVEL.
+ */
+uint16_t
+IwanNtTransportGetPeerMtu(
+    _In_ PIWAN_NT_TRANSPORT Transport
+    );
+
 _IRQL_requires_(PASSIVE_LEVEL)
 /*
  * Copy out the lease the peer assigned. Takes SessionLock, so it may be called

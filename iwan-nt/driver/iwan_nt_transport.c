@@ -1069,6 +1069,28 @@ IwanNtTransportSetPeer(
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
 void
+/*
+ * The MTU the peer stated in its acknowledgement. Reported, not enforced: the
+ * adapter already fixed its own MTU at init, so a smaller peer value can only
+ * narrow what the send path accepts.
+ */
+uint16_t
+IwanNtTransportGetPeerMtu(
+    _In_ PIWAN_NT_TRANSPORT Transport
+    )
+{
+    KIRQL oldIrql;
+    uint16_t mtu;
+
+    if (Transport == NULL) {
+        return 0;
+    }
+    KeAcquireSpinLock(&Transport->SessionLock, &oldIrql);
+    mtu = Transport->Peer.MtuFromPeer;
+    KeReleaseSpinLock(&Transport->SessionLock, oldIrql);
+    return mtu;
+}
+
 IwanNtTransportGetLease(
     _In_ PIWAN_NT_TRANSPORT Transport,
     _Out_ IWAN_NT_PEER_LEASE *Lease

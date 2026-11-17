@@ -31,6 +31,7 @@
 #include "iwan_nt_session.h"
 #include "iwannt_connect.h"
 #include "iwan_nt_lease.h"
+#include "iwan_nt_mtu_win.h"
 
 static VOID
 Usage(VOID)
@@ -40,6 +41,7 @@ Usage(VOID)
             "  iwannt-ctl check\n"
             "  iwannt-ctl stats\n"
             "  iwannt-ctl lease [ifindex]\n"
+            "  iwannt-ctl mtu [<carrier-mtu>|<peer address>]\n"
             "  iwannt-ctl peer <a.b.c.d> <port>\n"
             "  iwannt-ctl session <sid-hex> <token-hex> <0|1> <key-hex>\n"
             "  iwannt-ctl clear\n"
@@ -258,6 +260,11 @@ CommandStats(
     printf("drops: oversize=%llu sinkerrors=%llu\n",
            (unsigned long long)stats.RxOversize,
            (unsigned long long)stats.RxSinkErrors);
+    printf("mtu: carrier=%lu effective=%lu peer=%lu dropped=%lu\n",
+           (unsigned long)stats.CarrierMtu,
+           (unsigned long)stats.EffectiveMtu,
+           (unsigned long)stats.PeerMtu,
+           (unsigned long)stats.MtuDropped);
     printf("state: running=%lu session=%lu\n",
            (unsigned long)stats.Running, (unsigned long)stats.SessionValid);
     printf("peer: ready=%lu state=%s opens=%llu echoes=%llu answered=%llu "
@@ -276,6 +283,63 @@ CommandStats(
            stats.PeerDelayMinimum / 1000u, stats.PeerDelayMinimum % 1000u,
            stats.PeerDelayMaximum / 1000u, stats.PeerDelayMaximum % 1000u);
 
+    return 0;
+}
+
+/*
+ * mtu                     show what the driver will read at the next start
+ * mtu <number>            record a carrier MTU by hand
+ * mtu <peer address>      derive it from the route to that peer
+ *
+ * The driver resolves the advertised MTU once, at adapter init, so a change here
+ * takes effect on the next adapter start (device restart), not on the live one.
+ */
+static int
+CommandMtu(
+    _In_ int Argc,
+    _In_ char **Argv
+    )
+{
+    DWORD carrierMtu = 0;
+    DWORD ifIndex = 0;
+
+    if (Argc >= 3 && strchr(Argv[2], '.') != NULL) {
+        if (IwanNtMtuProbeRoute(Argv[2], &carrierMtu, &ifIndex) == FALSE) {
+            fprintf(stderr, "route probe to %s failed: %lu\n", Argv[2],
+                    GetLastError());
+            return 1;
+        }
+        printf("route to %s leaves via interface %lu with MTU %lu\n", Argv[2],
+               (unsigned long)ifIndex, (unsigned long)carrierMtu);
+    } else if (Argc >= 3) {
+        char *end = NULL;
+        unsigned long value = strtoul(Argv[2], &end, 10);
+        if (end == Argv[2] || *end != '\0' || value < 576 || value > 9216) {
+            fprintf(stderr, "carrier MTU must be a number in [576, 9216]\n");
+            return 2;
+        }
+        carrierMtu = (DWORD)value;
+    }
+
+    if (carrierMtu != 0) {
+        if (IwanNtMtuWriteCarrier(carrierMtu) == FALSE) {
+            fprintf(stderr,
+                    "writing %s\\%s failed: %lu (the tool needs administrator)\n",
+                    IWAN_NT_MTU_REGISTRY_SUBKEY, IWAN_NT_MTU_REGISTRY_VALUE,
+                    GetLastError());
+            return 1;
+        }
+        printf("recorded carrier MTU %lu; restart the adapter to use it\n",
+               (unsigned long)carrierMtu);
+        return 0;
+    }
+
+    if (IwanNtMtuReadCarrier(&carrierMtu) == FALSE) {
+        printf("carrier MTU: not set (the driver uses %u)\n", 1500u);
+        return 0;
+    }
+    printf("carrier MTU: %lu (effective inner MTU lands at carrier-36 for IPv4)\n",
+           (unsigned long)carrierMtu);
     return 0;
 }
 
@@ -585,6 +649,13 @@ main(
      */
     if (strcmp(argv[1], "open") == 0) {
         return CommandOpen(argc, argv);
+    }
+    /*
+     * mtu only touches the registry and the route table, so it must work with
+     * the driver stopped: that is exactly when its value is about to be read.
+     */
+    if (strcmp(argv[1], "mtu") == 0) {
+        return CommandMtu(argc, argv);
     }
 
     device.Handle = INVALID_HANDLE_VALUE;

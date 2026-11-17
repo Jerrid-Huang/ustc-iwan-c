@@ -89,6 +89,7 @@ IwanNtFrameInnerSane(
 {
     unsigned family;
     size_t declared;
+    unsigned fragments;
 
     if (Inner == NULL) {
         return IwanNtFrameBadArgument;
@@ -103,7 +104,20 @@ IwanNtFrameInnerSane(
             return IwanNtFrameBadLength;
         }
         total = ((size_t)Inner[2] << 8) | (size_t)Inner[3];
-        if (total < ihl || total > Length) {
+        if (total < ihl) {
+            return IwanNtFrameBadLength;
+        }
+        /* IPv4 fragments: the first fragment still carries the original total
+         * length, which is by definition larger than the fragment that
+         * transports it, and later fragments carry only their own length.
+         * Reassembly belongs to the stack on the receiving side, so any
+         * packet that claims to be a fragment is accepted here; a bogus chain
+         * dies there instead of silently swallowing every large datagram. */
+        fragments = (((unsigned)Inner[6] << 8) | (unsigned)Inner[7]) & 0x3fffu;
+        if (fragments != 0u) {
+            return IwanNtFrameOk;
+        }
+        if (total > Length) {
             return IwanNtFrameBadLength;
         }
         return IwanNtFrameOk;

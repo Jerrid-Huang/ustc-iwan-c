@@ -1,5 +1,6 @@
 #include "iwan_nt_miniport.h"
 #include "iwan_nt_frame.h"
+#include "iwan_nt_mtu.h"
 #include "iwan_nt_transport.h"
 #include "iwan_nt_trace.h"
 #include "iwan_nt_tx.h"
@@ -95,6 +96,15 @@ typedef struct _IWAN_NT_MINIPORT_ADAPTER {
     volatile LONG State;
     ULONG PacketFilter;
     ULONG Lookahead;
+    /*
+     * MTU is resolved once at init: the carrier MTU comes from the registry
+     * value the control tool writes, and the peer's own MTU can only be learnt
+     * during the handshake. Changing either therefore needs the adapter to be
+     * restarted, which is why nothing here is recomputed at runtime.
+     */
+    ULONG CarrierMtu;
+    ULONG Mtu;
+    ULONG PeerMtu;
     NDIS_DEVICE_POWER_STATE PowerState;
     IWAN_NT_TRANSPORT Transport;
     BOOLEAN TransportReady;
@@ -121,6 +131,8 @@ typedef struct _IWAN_NT_MINIPORT_ADAPTER {
     BOOLEAN RxIdleReady;
     volatile LONG TxAccepted;
     volatile LONG TxRejected;
+    /* Inner packets refused because they exceed the negotiated size. */
+    volatile LONG MtuDropped;
     volatile LONG RxIndicated;
     volatile LONG RxDropped;
     volatile LONG RxBatched;
@@ -161,6 +173,76 @@ IwanNtMiniportIndicateInner(
     unsigned Family,
     void *View
     );
+
+/*
+ * The driver's own registry path, kept from DriverEntry. Per-adapter parameters
+ * live next to it, so no configuration context (and no device object) is needed
+ * to read them.
+ */
+static WCHAR IwanNtMiniportRegistryPathText[256];
+static UNICODE_STRING IwanNtMiniportRegistryPath;
+
+/*
+ * Reads Parameters\CarrierMtu. Returns 0 when the value is missing, malformed,
+ * or unreadable: a missing registry value must mean "use the documented default"
+ * and never fail adapter init. Called at PASSIVE_LEVEL only.
+ */
+static ULONG
+IwanNtMiniportReadCarrierMtu(
+    VOID
+    )
+{
+    static const WCHAR suffix[] = L"\\Parameters";
+    WCHAR path[sizeof(IwanNtMiniportRegistryPathText) / sizeof(WCHAR) + 16];
+    UNICODE_STRING keyPath;
+    OBJECT_ATTRIBUTES attributes;
+    UNICODE_STRING valueName;
+    HANDLE key = NULL;
+    UCHAR buffer[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(ULONG)];
+    PKEY_VALUE_PARTIAL_INFORMATION info = (PKEY_VALUE_PARTIAL_INFORMATION)buffer;
+    ULONG length = 0;
+    ULONG mtu = 0;
+    ULONG index;
+    NTSTATUS status;
+
+    if (IwanNtMiniportRegistryPath.Length == 0 ||
+        IwanNtMiniportRegistryPath.Length >=
+            sizeof(IwanNtMiniportRegistryPathText) - sizeof(suffix)) {
+        return 0;
+    }
+
+    for (index = 0; index < IwanNtMiniportRegistryPath.Length / sizeof(WCHAR);
+         index++) {
+        path[index] = IwanNtMiniportRegistryPath.Buffer[index];
+    }
+    for (length = 0; length < sizeof(suffix) / sizeof(WCHAR) - 1u; length++) {
+        path[index + length] = suffix[length];
+    }
+    path[index + length] = L'\0';
+    RtlInitUnicodeString(&keyPath, path);
+    InitializeObjectAttributes(&attributes, &keyPath,
+                               OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+                               NULL, NULL);
+    status = ZwOpenKey(&key, KEY_READ, &attributes);
+    if (!NT_SUCCESS(status)) {
+        return 0;
+    }
+
+    RtlInitUnicodeString(&valueName, L"CarrierMtu");
+    status = ZwQueryValueKey(key, &valueName, KeyValuePartialInformation,
+                             info, sizeof(buffer), &length);
+    ZwClose(key);
+    if (!NT_SUCCESS(status) || info->Type != REG_DWORD ||
+        info->DataLength != sizeof(ULONG)) {
+        return 0;
+    }
+    mtu = *(const ULONG *)(const VOID *)info->Data;
+    if (mtu < IWAN_NT_MTU_MIN || mtu > IWAN_NT_MTU_MAX_CARRIER) {
+        /* A carrier MTU outside the plausible range is a typo, not a policy. */
+        return 0;
+    }
+    return mtu;
+}
 
 /* NDIS caches the general-attribute OIDs on our behalf. */
 static NDIS_OID IwanNtMiniportSupportedOids[] = {
@@ -233,6 +315,26 @@ IwanNtMiniportRegisterDriver(
     *DriverHandle = NULL;
     if (UnloadHandler == NULL) {
         return NDIS_STATUS_INVALID_PARAMETER;
+    }
+
+    /*
+     * Keep the driver's registry path so the per-adapter parameters can be read
+     * later. A path that does not fit is simply not remembered: the parameters
+     * then fall back to their defaults instead of failing registration.
+     */
+    IwanNtMiniportRegistryPath.Length = 0;
+    IwanNtMiniportRegistryPath.MaximumLength = 0;
+    IwanNtMiniportRegistryPath.Buffer = NULL;
+    if (RegistryPath != NULL && RegistryPath->Length != 0 &&
+        RegistryPath->Length < sizeof(IwanNtMiniportRegistryPathText)) {
+        NdisMoveMemory(IwanNtMiniportRegistryPathText, RegistryPath->Buffer,
+                       RegistryPath->Length);
+        IwanNtMiniportRegistryPathText[RegistryPath->Length / sizeof(WCHAR)] =
+            L'\0';
+        IwanNtMiniportRegistryPath.Buffer = IwanNtMiniportRegistryPathText;
+        IwanNtMiniportRegistryPath.Length = RegistryPath->Length;
+        IwanNtMiniportRegistryPath.MaximumLength =
+            (USHORT)(RegistryPath->Length + sizeof(WCHAR));
     }
 
     NdisZeroMemory(&characteristics, sizeof(characteristics));
@@ -338,6 +440,14 @@ IwanNtMiniportSessionChanged(
     if (adapter == NULL) {
         return;
     }
+    if (Valid != 0) {
+        /*
+         * The handshake lives in the transport, so this is the first place the
+         * peer's MTU becomes known. It can only narrow the send limit; the MTU
+         * advertised to NDIS is fixed and needs an adapter restart to change.
+         */
+        adapter->PeerMtu = IwanNtTransportGetPeerMtu(&adapter->Transport);
+    }
     if (InterlockedExchange(&adapter->LinkUp, (Valid != 0) ? 1 : 0) ==
         ((Valid != 0) ? 1 : 0)) {
         return;
@@ -381,6 +491,32 @@ IwanNtMiniportQueryCounters(
         &adapter->RxDropped, 0, 0);
     *RxBatches = (uint64_t)InterlockedCompareExchange(
         &adapter->RxBatched, 0, 0);
+}
+
+static VOID
+IwanNtMiniportQueryMtu(
+    _In_opt_ void *Context,
+    _Out_ uint32_t *CarrierMtu,
+    _Out_ uint32_t *EffectiveMtu,
+    _Out_ uint32_t *PeerMtu,
+    _Out_ uint32_t *MtuDropped
+    )
+{
+    PIWAN_NT_MINIPORT_ADAPTER adapter = (PIWAN_NT_MINIPORT_ADAPTER)Context;
+
+    if (adapter == NULL) {
+        *CarrierMtu = 0;
+        *EffectiveMtu = 0;
+        *PeerMtu = 0;
+        *MtuDropped = 0;
+        return;
+    }
+
+    *CarrierMtu = adapter->CarrierMtu;
+    *EffectiveMtu = adapter->Mtu;
+    *PeerMtu = adapter->PeerMtu;
+    *MtuDropped = (uint32_t)InterlockedCompareExchange(
+        &adapter->MtuDropped, 0, 0);
 }
 
 static VOID
@@ -434,7 +570,19 @@ IwanNtMiniportInitializeEx(
     NdisZeroMemory(adapter, sizeof(*adapter));
     adapter->AdapterHandle = MiniportAdapterHandle;
     adapter->State = IwanNtMiniportPaused;
-    adapter->Lookahead = IWAN_NT_MINIPORT_MTU;
+    /*
+     * Resolve the MTU before any buffer is sized. The carrier value is a
+     * registry setting the control tool maintains; the peer's own MTU arrives
+     * with the handshake and can only lower what we accept, never raise the
+     * buffer sizes chosen here.
+     */
+    adapter->CarrierMtu = IwanNtMiniportReadCarrierMtu();
+    if (adapter->CarrierMtu == 0) {
+        adapter->CarrierMtu = IWAN_NT_MTU_CARRIER_DEFAULT;
+    }
+    adapter->PeerMtu = 0;
+    adapter->Mtu = IwanNtMtuEffective(adapter->CarrierMtu, 0, 4);
+    adapter->Lookahead = adapter->Mtu;
     adapter->PowerState = NdisDeviceStateD0;
 
     status = IwanNtTransportInitialize(&adapter->Transport, 16);
@@ -508,7 +656,7 @@ IwanNtMiniportInitializeEx(
             IwanNtTrace(40u + index);
 
             slot->Buffer = NdisAllocateMemoryWithTagPriority(
-                MiniportAdapterHandle, IWAN_NT_MINIPORT_MTU,
+                MiniportAdapterHandle, adapter->Mtu,
                 IWAN_NT_MINIPORT_POOL_TAG, NormalPoolPriority);
             if (slot->Buffer == NULL) {
                 IwanNtMiniportFault(MiniportAdapterHandle, 201u, 0);
@@ -518,7 +666,7 @@ IwanNtMiniportInitializeEx(
             }
             IwanNtTrace(221u);
             slot->Mdl = NdisAllocateMdl(MiniportAdapterHandle, slot->Buffer,
-                                        IWAN_NT_MINIPORT_MTU);
+                                        adapter->Mtu);
             if (slot->Mdl == NULL) {
                 IwanNtMiniportFault(MiniportAdapterHandle, 202u, 0);
                 IwanNtTrace(202u);
@@ -528,14 +676,14 @@ IwanNtMiniportInitializeEx(
             IwanNtTrace(222u);
             slot->Nbl = NdisAllocateNetBufferAndNetBufferList(
                 adapter->RxPool, sizeof(IWAN_NT_MINIPORT_RX_CONTEXT), 0,
-                slot->Mdl, 0, IWAN_NT_MINIPORT_MTU);
+                slot->Mdl, 0, adapter->Mtu);
             if (slot->Nbl != NULL) {
                 IwanNtTrace(231u);
             } else {
                 /* The pool carries the context already: ask for none. */
                 slot->Nbl = NdisAllocateNetBufferAndNetBufferList(
                     adapter->RxPool, 0, 0, slot->Mdl, 0,
-                    IWAN_NT_MINIPORT_MTU);
+                    adapter->Mtu);
                 if (slot->Nbl != NULL) {
                     IwanNtTrace(232u);
                 }
@@ -549,7 +697,7 @@ IwanNtMiniportInitializeEx(
                 if (adapter->RxPoolProbe != NULL) {
                     slot->Nbl = NdisAllocateNetBufferAndNetBufferList(
                         adapter->RxPoolProbe, 0, 0, slot->Mdl, 0,
-                        IWAN_NT_MINIPORT_MTU);
+                        adapter->Mtu);
                     if (slot->Nbl != NULL) {
                         IwanNtTrace(233u);
                     } else {
@@ -644,14 +792,14 @@ IwanNtMiniportInitializeEx(
         NDIS_SIZEOF_MINIPORT_ADAPTER_GENERAL_ATTRIBUTES_REVISION_2;
     general.MediaType = NdisMediumIP;
     general.PhysicalMediumType = NdisPhysicalMediumUnspecified;
-    general.MtuSize = IWAN_NT_MINIPORT_MTU;
+    general.MtuSize = Adapter->Mtu;
     general.MaxXmitLinkSpeed = IWAN_NT_MINIPORT_LINK_SPEED;
     general.MaxRcvLinkSpeed = IWAN_NT_MINIPORT_LINK_SPEED;
     general.XmitLinkSpeed = NDIS_LINK_SPEED_UNKNOWN;
     general.RcvLinkSpeed = NDIS_LINK_SPEED_UNKNOWN;
     general.MediaConnectState = MediaConnectStateDisconnected;
     general.MediaDuplexState = MediaDuplexStateFull;
-    general.LookaheadSize = IWAN_NT_MINIPORT_MTU;
+    general.LookaheadSize = Adapter->Mtu;
     general.MacOptions = NDIS_MAC_OPTION_COPY_LOOKAHEAD_DATA |
         NDIS_MAC_OPTION_TRANSFERS_NOT_PEND | NDIS_MAC_OPTION_NO_LOOPBACK;
     general.SupportedPacketFilters = IWAN_NT_MINIPORT_PACKET_FILTERS;
@@ -687,6 +835,7 @@ IwanNtMiniportInitializeEx(
 
         source.Context = adapter;
         source.Query = IwanNtMiniportQueryCounters;
+        source.MtuQuery = IwanNtMiniportQueryMtu;
         source.SessionChanged = IwanNtMiniportSessionChanged;
         IwanNtControlAttachAdapter(&adapter->Transport, &source);
     }
@@ -960,11 +1109,11 @@ IwanNtMiniportIndicateInner(
     UNREFERENCED_PARAMETER(Family);
 
     /*
-     * The adapter advertises IWAN_NT_MINIPORT_MTU, so the stack should never hand
-     * us more. If it does, drop rather than build a datagram that would fragment
-     * on the way out.
+     * Nothing may leave this adapter larger than the advertised MTU: such a
+     * datagram would fragment on the way out, and the peer cannot reassemble
+     * outer fragments. Drop it instead.
      */
-    if (Inner == NULL || Length == 0 || Length > IWAN_NT_MINIPORT_MTU) {
+    if (Inner == NULL || Length == 0 || Length > Adapter->Mtu) {
         InterlockedIncrement(&adapter->RxDropped);
         return;
     }
@@ -1044,6 +1193,24 @@ IwanNtMiniportIndicateInner(
  * copies from these pointers only after the whole batch is assembled.
  */
 _Use_decl_annotations_
+/*
+ * Largest inner packet that may leave: the advertised MTU, narrowed by the peer's
+ * own value once a session exists. A packet above this would fragment outside the
+ * tunnel, where the peer cannot reassemble it, so it is dropped and counted.
+ */
+static ULONG
+IwanNtMiniportSendLimit(
+    _In_ const IWAN_NT_MINIPORT_ADAPTER *Adapter
+    )
+{
+    ULONG limit = Adapter->Mtu;
+
+    if (Adapter->PeerMtu != 0 && Adapter->PeerMtu < limit) {
+        limit = Adapter->PeerMtu;
+    }
+    return limit;
+}
+
 static BOOLEAN
 IwanNtMiniportStagePacket(
     _Inout_ PIWAN_NT_MINIPORT_ADAPTER Adapter,
@@ -1055,6 +1222,10 @@ IwanNtMiniportStagePacket(
     ULONG length = NET_BUFFER_DATA_LENGTH(Nb);
     PUCHAR bytes;
 
+    if (length != 0 && length > IwanNtMiniportSendLimit(Adapter)) {
+        InterlockedIncrement(&Adapter->MtuDropped);
+        return FALSE;
+    }
     if (length == 0 || length > IWAN_NT_TX_BUFFER_BYTES) {
         return FALSE;
     }
@@ -1420,7 +1591,7 @@ IwanNtMiniportOidRequest(
             }
             adapter->PacketFilter = value;
         } else if (oid == OID_GEN_CURRENT_LOOKAHEAD) {
-            if (value > IWAN_NT_MINIPORT_MTU) {
+            if (value > Adapter->Mtu) {
                 return NDIS_STATUS_INVALID_DATA;
             }
             adapter->Lookahead = value;
@@ -1497,7 +1668,7 @@ IwanNtMiniportOidRequest(
     case OID_GEN_MAXIMUM_LOOKAHEAD:
     case OID_GEN_MAXIMUM_FRAME_SIZE:
     case OID_GEN_MAXIMUM_TOTAL_SIZE:
-        value = IWAN_NT_MINIPORT_MTU;
+        value = Adapter->Mtu;
         break;
     case OID_GEN_MAC_OPTIONS:
         value = NDIS_MAC_OPTION_COPY_LOOKAHEAD_DATA |

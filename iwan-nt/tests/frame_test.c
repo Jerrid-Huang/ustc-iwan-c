@@ -179,6 +179,68 @@ TestInnerChecks(void)
     v6[4] = 0xff;
     v6[5] = 0xff;
     CHECK_EQ(IwanNtFrameInnerSane(v6, n6), IwanNtFrameBadLength);
+    v6[4] = 0x00;
+    v6[5] = (uint8_t)(n6 - IWAN_NT_INNER_IP6_MIN);
+
+    /* IPv4 fragments. The first fragment declares the original total length,
+     * which cannot fit in the fragment it travels in; the stack on the far
+     * side reassembles, so this must not be rejected. */
+    {
+        uint8_t frag[64];
+        size_t nf = BuildIpv4(frag, sizeof(frag), 24);
+        size_t i;
+
+        /* First fragment: MF set, offset 0, total = whole datagram. */
+        for (i = IWAN_NT_INNER_IP4_MIN; i < nf; i++) {
+            frag[i] = (uint8_t)(0x10u + i);
+        }
+        frag[2] = 0x05;
+        frag[3] = 0xdc;         /* 1500 byte datagram, this fragment is 44 */
+        frag[6] = 0x20;         /* MF */
+        frag[7] = 0x00;
+        CHECK_EQ(IwanNtFrameInnerSane(frag, nf), IwanNtFrameOk);
+
+        /* Middle fragment: offset 185, no MF, length is its own. */
+        frag[2] = 0x00;
+        frag[3] = (uint8_t)nf;
+        frag[6] = 0x00;
+        frag[7] = 0xb9;
+        CHECK_EQ(IwanNtFrameInnerSane(frag, nf), IwanNtFrameOk);
+
+        /* Last fragment: MF clear, offset 370. */
+        frag[7] = 0x72;
+        frag[6] = 0x01;
+        CHECK_EQ(IwanNtFrameInnerSane(frag, nf), IwanNtFrameOk);
+
+        /* Non-fragment packet with a bogus declared length is still refused. */
+        frag[6] = 0x00;
+        frag[7] = 0x00;
+        frag[2] = 0x00;
+        frag[3] = (uint8_t)(nf + 16);
+        CHECK_EQ(IwanNtFrameInnerSane(frag, nf), IwanNtFrameBadLength);
+
+        /* A fragment whose declared length is below its own header is
+         * malformed no matter what the fragment bits say. */
+        frag[2] = 0x00;
+        frag[3] = 0x08;
+        frag[6] = 0x20;
+        frag[7] = 0x00;
+        CHECK_EQ(IwanNtFrameInnerSane(frag, nf), IwanNtFrameBadLength);
+    }
+
+    /* IPv6 fragment header (next header 44): every fragment states its own
+     * payload length, so the plain check already holds. */
+    {
+        uint8_t frag6[80];
+        size_t nf6 = BuildIpv6(frag6, sizeof(frag6), 24);
+
+        frag6[6] = 44;          /* next header = fragment */
+        frag6[40] = 17;         /* fragment header: next header = UDP */
+        frag6[41] = 0x00;
+        frag6[42] = 0x00;       /* offset 0, M = 1 */
+        frag6[43] = 0x01;
+        CHECK_EQ(IwanNtFrameInnerSane(frag6, nf6), IwanNtFrameOk);
+    }
 }
 
 static void

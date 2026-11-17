@@ -111,6 +111,7 @@
     <ClCompile Include="iwan_nt_session.c" />
     <ClCompile Include="iwan_nt_crypto.c" />
     <ClCompile Include="iwan_nt_frame.c" />
+    <ClCompile Include="iwan_nt_mtu.c" />
     <ClCompile Include="iwan_nt_control.c" />
     <ClCompile Include="iwan_nt_ingress.c" />
     <ClCompile Include="iwan_nt_miniport.c">
@@ -132,6 +133,7 @@
     <ClInclude Include="iwan_nt_session.h" />
     <ClInclude Include="iwan_nt_crypto.h" />
     <ClInclude Include="iwan_nt_frame.h" />
+    <ClInclude Include="iwan_nt_mtu.h" />
     <ClInclude Include="iwan_nt_control.h" />
     <ClInclude Include="iwan_nt_ioctl.h" />
     <ClInclude Include="iwan_nt_ingress.h" />

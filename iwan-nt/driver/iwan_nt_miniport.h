@@ -13,14 +13,13 @@ extern "C" {
 #endif
 
 /*
- * 1400, not 1500: the outer datagram is the inner packet plus an 8-byte frame
- * header, plus 20 bytes of outer IPv4 and 8 of UDP. An inner 1500 would therefore
- * leave the adapter as a 1536-byte datagram and be fragmented by the IP stack,
- * which is exactly what the deployed client avoids by negotiating 1400. The
- * carrier MTU minus the documented overhead (36 bytes for IPv4) gives 1464 as the
- * ceiling; the protocol's own value is the safer one to advertise.
+ * The advertised inner MTU is not a constant any more. It is derived at init from
+ * the carrier MTU (registry value Parameters\CarrierMtu, written by iwannt-ctl,
+ * default 1500) minus the tunnel overhead, and the peer's own MTU can only lower
+ * what is accepted. See iwan_nt_mtu.h for the arithmetic and its tests; a change
+ * to either input needs the adapter restarted, because NDIS fixes the MTU at
+ * initialize time.
  */
-#define IWAN_NT_MINIPORT_MTU 1400UL
 #define IWAN_NT_MINIPORT_TX_QUEUE_COUNT 1UL
 #define IWAN_NT_MINIPORT_RX_QUEUE_COUNT 1UL
 

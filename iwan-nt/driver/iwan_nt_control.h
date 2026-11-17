@@ -30,6 +30,18 @@ typedef struct _IWAN_NT_CONTROL_COUNTER_SOURCE {
         _Out_ uint64_t *RxBatches
         );
     /*
+     * Optional. The MTU numbers live with the adapter, not with the transport,
+     * because the advertised value is fixed at miniport init. Reported through a
+     * separate callback so the counter query above keeps its long-standing shape.
+     */
+    _In_ VOID (*MtuQuery)(
+        _In_opt_ void *Context,
+        _Out_ uint32_t *CarrierMtu,
+        _Out_ uint32_t *EffectiveMtu,
+        _Out_ uint32_t *PeerMtu,
+        _Out_ uint32_t *MtuDropped
+        );
+    /*
      * Optional. Called after a session is installed (Valid != 0) or dropped
      * (Valid == 0), so the adapter can report its link state. The transport is
      * up long before a session exists; telling the stack that the link is up

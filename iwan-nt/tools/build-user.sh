@@ -25,6 +25,7 @@ mkdir -p "$(dirname "$out")"
     "$root/driver/iwan_nt_crypto.c" \
     "$root/user/iwan_nt_inet.c" \
     "$root/user/iwan_nt_lease.c" \
+    "$root/user/iwan_nt_mtu_win.c" \
     "$root/driver/iwan_nt_session.c" \
     "$root/driver/iwan_nt_peer.c" \
     "$root/user/iwannt_connect.c" \

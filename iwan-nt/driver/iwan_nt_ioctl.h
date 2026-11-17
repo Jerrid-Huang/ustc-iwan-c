@@ -83,7 +83,7 @@
 
 #define IWAN_NT_SESSION_STRUCT_SIZE 24u
 #define IWAN_NT_ADDR_STRUCT_SIZE 24u
-#define IWAN_NT_STATS_STRUCT_SIZE 304u
+#define IWAN_NT_STATS_STRUCT_SIZE 320u
 #define IWAN_NT_CREDENTIALS_STRUCT_SIZE 136u
 
 /* Field widths inside IWAN_NT_CREDENTIALS_ABI. */
@@ -214,6 +214,19 @@ typedef struct _IWAN_NT_STATS_ABI {
     uint32_t PeerDelayCurrent;     /* microseconds, last ECHORESP RTT */
     uint32_t PeerDelayMinimum;
     uint32_t PeerDelayMaximum;
+
+    /*
+     * Sizes, in bytes, from three different places: what the control tool told
+     * the driver about the carrier, what the adapter advertises to NDIS, and
+     * what the peer stated in its acknowledgement. EffectiveMtu is fixed at
+     * adapter init, so a smaller PeerMtu only narrows the send limit until the
+     * adapter is restarted.
+     */
+    uint32_t CarrierMtu;
+    uint32_t EffectiveMtu;
+    uint32_t PeerMtu;
+    /* Inner packets refused because they exceed the negotiated size. */
+    uint32_t MtuDropped;
     uint32_t Reserved1;            /* must be zero */
 } IWAN_NT_STATS_ABI;
 
