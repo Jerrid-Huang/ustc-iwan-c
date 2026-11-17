@@ -265,6 +265,9 @@ CommandStats(
            (unsigned long)stats.PrefixCount,
            (unsigned long long)stats.RxNotAllowed,
            (unsigned long long)stats.TxNotAllowed);
+    printf("receive: %llu zero copy, %llu copied\n",
+           (unsigned long long)stats.RxZeroCopy,
+           (unsigned long long)stats.RxCopied);
     printf("mtu: carrier=%lu effective=%lu peer=%lu dropped=%lu\n",
            (unsigned long)stats.CarrierMtu,
            (unsigned long)stats.EffectiveMtu,

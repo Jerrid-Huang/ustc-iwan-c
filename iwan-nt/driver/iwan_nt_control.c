@@ -408,6 +408,8 @@ IwanNtControlGetStats(
     uint32_t prefixCount = 0;
     uint64_t rxNotAllowed = 0;
     uint64_t txNotAllowed = 0;
+    uint64_t rxZeroCopy = 0;
+    uint64_t rxCopied = 0;
     NTSTATUS status;
 
     if (Stack->Parameters.DeviceIoControl.OutputBufferLength <
@@ -447,7 +449,7 @@ IwanNtControlGetStats(
         if (source.MtuQuery != NULL) {
             source.MtuQuery(source.Context, &carrierMtu, &effectiveMtu,
                             &peerMtu, &mtuDropped, &prefixCount,
-                            &rxNotAllowed, &txNotAllowed);
+                            &rxNotAllowed, &txNotAllowed, &rxZeroCopy, &rxCopied);
             stats->CarrierMtu = carrierMtu;
             stats->EffectiveMtu = effectiveMtu;
             stats->PeerMtu = peerMtu;
@@ -455,6 +457,8 @@ IwanNtControlGetStats(
             stats->PrefixCount = prefixCount;
             stats->RxNotAllowed = rxNotAllowed;
             stats->TxNotAllowed = txNotAllowed;
+            stats->RxZeroCopy = rxZeroCopy;
+            stats->RxCopied = rxCopied;
         }
     }
 

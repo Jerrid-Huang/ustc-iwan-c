@@ -42,7 +42,9 @@ typedef struct _IWAN_NT_CONTROL_COUNTER_SOURCE {
         _Out_ uint32_t *MtuDropped,
         _Out_ uint32_t *PrefixCount,
         _Out_ uint64_t *RxNotAllowed,
-        _Out_ uint64_t *TxNotAllowed
+        _Out_ uint64_t *TxNotAllowed,
+        _Out_ uint64_t *RxZeroCopy,
+        _Out_ uint64_t *RxCopied
         );
     /*
      * Optional. Called after a session is installed (Valid != 0) or dropped

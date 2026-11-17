@@ -89,7 +89,7 @@
 
 #define IWAN_NT_SESSION_STRUCT_SIZE 24u
 #define IWAN_NT_ADDR_STRUCT_SIZE 24u
-#define IWAN_NT_STATS_STRUCT_SIZE 336u
+#define IWAN_NT_STATS_STRUCT_SIZE 352u
 #define IWAN_NT_CREDENTIALS_STRUCT_SIZE 136u
 
 /* Field widths inside IWAN_NT_CREDENTIALS_ABI. */
@@ -261,6 +261,8 @@ typedef struct _IWAN_NT_STATS_ABI {
     /* Inner packets whose source address was outside the allowed prefixes. */
     uint64_t RxNotAllowed;
     uint64_t TxNotAllowed;
+    uint64_t RxZeroCopy;
+    uint64_t RxCopied;
 } IWAN_NT_STATS_ABI;
 
 /*

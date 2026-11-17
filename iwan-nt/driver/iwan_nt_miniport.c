@@ -157,6 +157,8 @@ typedef struct _IWAN_NT_MINIPORT_ADAPTER {
     volatile LONG PrefixCount;
     volatile LONG RxNotAllowed;
     volatile LONG TxNotAllowed;
+    volatile LONG RxZeroCopy;
+    volatile LONG RxCopied;
     volatile LONG RxIndicated;
     volatile LONG RxDropped;
     volatile LONG RxBatched;
@@ -605,7 +607,9 @@ IwanNtMiniportQueryMtu(
     _Out_ uint32_t *MtuDropped,
     _Out_ uint32_t *PrefixCount,
     _Out_ uint64_t *RxNotAllowed,
-    _Out_ uint64_t *TxNotAllowed
+    _Out_ uint64_t *TxNotAllowed,
+    _Out_ uint64_t *RxZeroCopy,
+    _Out_ uint64_t *RxCopied
     )
 {
     PIWAN_NT_MINIPORT_ADAPTER adapter = (PIWAN_NT_MINIPORT_ADAPTER)Context;
@@ -618,6 +622,8 @@ IwanNtMiniportQueryMtu(
         *PrefixCount = 0;
         *RxNotAllowed = 0;
         *TxNotAllowed = 0;
+        *RxZeroCopy = 0;
+        *RxCopied = 0;
         return;
     }
 
@@ -632,6 +638,10 @@ IwanNtMiniportQueryMtu(
         &adapter->RxNotAllowed, 0, 0);
     *TxNotAllowed = (uint64_t)InterlockedCompareExchange(
         &adapter->TxNotAllowed, 0, 0);
+    *RxZeroCopy = (uint64_t)InterlockedCompareExchange(
+        &adapter->RxZeroCopy, 0, 0);
+    *RxCopied = (uint64_t)InterlockedCompareExchange(
+        &adapter->RxCopied, 0, 0);
 }
 
 static VOID
@@ -1290,6 +1300,7 @@ IwanNtMiniportIndicateInner(
         NET_BUFFER_DATA_LENGTH(nb) = (ULONG)Length;
         slot->Reference = view->Reference;
         view->Taken = TRUE;
+        InterlockedIncrement(&adapter->RxZeroCopy);
     } else {
         NdisMoveMemory(slot->Buffer, Inner, Length);
         NET_BUFFER_FIRST_MDL(nb) = slot->Mdl;
@@ -1298,6 +1309,7 @@ IwanNtMiniportIndicateInner(
         NET_BUFFER_DATA_OFFSET(nb) = 0;
         NET_BUFFER_DATA_LENGTH(nb) = (ULONG)Length;
         slot->Reference = NULL;
+        InterlockedIncrement(&adapter->RxCopied);
     }
 
     /*

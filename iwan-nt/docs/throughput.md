@@ -54,11 +54,19 @@ these rates.
   packet whose destination is outside every prefix and counts it in `out refused`;
   an empty table disables both checks.
 
-One measured point with filtering enabled (1372 B payload, 2 threads, 10 s, host
-load ~2.3): tunnel 31,533 pps / 346.1 Mbps inner, `tx accepted` delta exactly equal
-to the generator's packet count, host sink 315,418 packets for 315,363 sent
-(100.0%). Same-window native baseline: 61,454 pps / 674.5 Mbps, i.e. the tunnel
-carried 51% of native pps.
+Two measured points with filtering enabled (1372 B payload, 2 threads, 10 s, host
+load ~2.3-3.0):
+
+| build | tunnel pps | tunnel Mbps | accepted delta | host sink | native pps |
+| --- | --- | --- | --- | --- | --- |
+| 1.3.2.0 (ingress only) | 31,533 | 346.1 | 315,363 = generator | 315,418 | 61,454 |
+| 1.4.0.0 (ingress + egress) | 30,920 | 339.4 | 309,244 = generator | 309,244 | - |
+
+In both runs `tx accepted` moved by exactly the generator's packet count and the
+host sink received the same number, so the prefix checks cost nothing measurable
+and drop nothing that belongs in the tunnel. `out refused` sits at a few dozen
+packets per session: broadcast and multicast traffic the stack hands to a
+connected interface before the lease address exists.
 
 The refuse path is covered by `tests/prefix_test.c` (28 checks: v4/v6, /0,
 non-byte-aligned sources, host bits set, malformed entries, truncated headers) but
