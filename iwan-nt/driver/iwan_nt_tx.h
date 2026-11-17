@@ -121,7 +121,7 @@ struct _IWAN_NT_TX {
     /* Largest chain the drain thread ever built; proves batching is working. */
     ULONG64 MaxBatch;
     /* Counts staged batches so every N-th one pays for a provider call. */
-    ULONG SubmitTick;
+    volatile LONG SubmitTick;
     /*
      * Time spent per packet, in 100 ns units, accumulated over the whole run:
      * CostSeal covers copy+header+XOR and the list splice, CostSubmit covers the
