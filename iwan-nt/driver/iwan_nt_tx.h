@@ -60,6 +60,9 @@ extern "C" {
  */
 #define IWAN_NT_TX_FRAMES_PER_CALL 32UL
 
+/* A flush this short is latency sensitive (acknowledgements), drain at once. */
+#define IWAN_NT_TX_IMMEDIATE_FRAMES 4UL
+
 /*
  * Second level of the queue: whole sealed frames kept in flat memory when no
  * slot is free. Slots cost an MDL and an IRP each, so they stay the in-flight

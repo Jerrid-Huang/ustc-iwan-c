@@ -967,7 +967,16 @@ IwanNtTxSendBatch(
      * one packet. The 1 ms drain thread keeps a lone frame moving.
      */
     if (IwanNtTxPending(Tx) + IwanNtTxQueueDepth(Tx) >=
-        IWAN_NT_TX_FRAMES_PER_CALL) {
+            IWAN_NT_TX_FRAMES_PER_CALL ||
+        staged <= IWAN_NT_TX_IMMEDIATE_FRAMES) {
+        /*
+         * A short flush is an acknowledgement carrying burst, not bulk data.
+         * Holding it until the queue reaches FRAMES_PER_CALL adds up to 1 ms
+         * of delay to every acknowledgement, which inflates the round trip the
+         * peer's congestion control sees; a download stalls exactly there. Such
+         * bursts are drained at once, a provider call for a handful of frames is
+         * cheaper than the delay it causes.
+         */
         IwanNtTxDrain(Tx);
     }
 
