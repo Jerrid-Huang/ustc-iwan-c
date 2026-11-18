@@ -56,6 +56,18 @@ IwanNtPeerInitialize(
     return 1;
 }
 
+int
+IwanNtPeerSetSalt(
+    IWAN_NT_PEER *Handshake,
+    const char *Salt
+    )
+{
+    if (Handshake == NULL) {
+        return 0;
+    }
+    return CopyName(Handshake->Salt, sizeof(Handshake->Salt), Salt);
+}
+
 void
 IwanNtPeerGetLease(
     const IWAN_NT_PEER *Handshake,
@@ -168,6 +180,7 @@ IwanNtPeerTick(
 
         open.User = Handshake->User;
         open.Password = Handshake->Password;
+        open.Salt = Handshake->Salt;
         open.Mtu = Handshake->Mtu;
 
         result = IwanNtSessionBuildOpen(&open, Buffer, Capacity, Length);

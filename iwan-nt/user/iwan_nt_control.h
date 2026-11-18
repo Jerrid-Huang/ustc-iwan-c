@@ -69,6 +69,7 @@ IwanNtStartPeer(
     _In_ PIWAN_NT_DEVICE Device,
     _In_z_ const char *User,
     _In_z_ const char *Password,
+    _In_opt_z_ const char *Salt,
     _In_ UINT16 Mtu
     );
 

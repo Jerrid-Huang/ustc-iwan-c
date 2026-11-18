@@ -107,6 +107,7 @@ IwanNtStartPeer(
     _In_ PIWAN_NT_DEVICE Device,
     _In_z_ const char *User,
     _In_z_ const char *Password,
+    _In_opt_z_ const char *Salt,
     _In_ UINT16 Mtu
     )
 {
@@ -132,6 +133,14 @@ IwanNtStartPeer(
     ZeroMemory(&request, sizeof(request));
     CopyMemory(request.User, User, userLength);
     CopyMemory(request.Password, Password, passwordLength);
+    if (Salt != NULL && Salt[0] != '\0') {
+        size_t saltLength = strlen(Salt);
+        if (saltLength >= IWAN_NT_CREDENTIALS_SALT_MAX) {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
+        CopyMemory(request.Salt, Salt, saltLength);
+    }
     request.Mtu = Mtu;
 
     return IwanNtIoctl(

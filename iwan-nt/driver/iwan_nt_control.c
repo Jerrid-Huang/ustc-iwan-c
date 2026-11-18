@@ -503,7 +503,8 @@ IwanNtControlStartPeer(
         return status;
     }
 
-    status = IwanNtTransportStartPeer(transport, user, password, request->Mtu);
+    status = IwanNtTransportStartPeer(transport, user, password, (const char *)request->Salt,
+                                      request->Mtu);
     if (NT_SUCCESS(status)) {
         /* The peer drives the session now, so the manual one must not linger. */
         IwanNtControlNotifySession(0);

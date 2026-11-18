@@ -85,6 +85,8 @@ typedef struct _IWAN_NT_PEER {
     /* Configuration, copied in at initialize so the caller owns no pointers. */
     char User[64];
     char Password[64];
+    /* Per-line salt from /m/config; empty means the unsalted 1009 derivation. */
+    char Salt[32];
     uint16_t Mtu;
 
     /* Session, valid while State == Up. */
@@ -130,11 +132,18 @@ typedef struct _IWAN_NT_PEER {
 /* Returns nonzero on success; a name or password that does not fit is a bug. */
 int
 IwanNtPeerInitialize(
-IWAN_NT_PEER *Handshake,
+    IWAN_NT_PEER *Handshake,
     const char *User,
     const char *Password,
     uint16_t Mtu,
     uint64_t NowMs
+    );
+
+/* Copy the controller's per-line salt in; call before the first tick. */
+int
+IwanNtPeerSetSalt(
+    IWAN_NT_PEER *Handshake,
+    const char *Salt
     );
 
 /*

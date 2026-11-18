@@ -53,6 +53,12 @@ extern "C" {
 typedef struct _IWAN_NT_SESSION_OPEN {
     const char *User;
     const char *Password;
+    /*
+     * Per-line salt from the controller's /m/config entry (24 characters in the
+     * deployment). NULL or empty reproduces the 1009 desktop derivation, which
+     * had no salt; the current server rejects that and wants the salted form.
+     */
+    const char *Salt;
     uint16_t Mtu;
 } IWAN_NT_SESSION_OPEN;
 

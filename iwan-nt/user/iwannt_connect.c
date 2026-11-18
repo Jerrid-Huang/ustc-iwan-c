@@ -140,6 +140,7 @@ IwanNtRunConnect(
     uint16_t family;
     uint16_t mtu;
     DWORD seconds;
+    const char *salt;
     DWORD started;
     uint32_t port;
     uint16_t abi_family;
@@ -147,7 +148,7 @@ IwanNtRunConnect(
 
     if (Argc < 6) {
         fprintf(stderr,
-                "usage: connect <ip> <port> <user> <password> [mtu] [seconds]\n"
+                "usage: connect <ip> <port> <user> <password> [mtu] [seconds] [salt]\n"
                 "  mtu defaults to 1400, seconds to 15; 0 means until "
                 "interrupted.\n");
         return 2;
@@ -171,6 +172,13 @@ IwanNtRunConnect(
         return 2;
     }
     seconds = (Argc > 7) ? (DWORD)strtoul(Argv[7], NULL, 10) : 15u;
+    /*
+     * The current controller salts the OPEN key material per line; the salt is
+     * not secret (it comes back in /m/config next to the server entry) but it is
+     * required, so it rides at the end of the line to keep the older argument
+     * positions stable.
+     */
+    salt = (Argc > 8) ? Argv[8] : NULL;
 
     if (WaitForTransport(Device) != 0) {
         return 1;
@@ -206,7 +214,7 @@ IwanNtRunConnect(
         fprintf(stderr, "SET_PEER failed: %lu\n", GetLastError());
         return 1;
     }
-    if (IwanNtStartPeer(Device, Argv[4], Argv[5], mtu) == FALSE) {
+    if (IwanNtStartPeer(Device, Argv[4], Argv[5], salt, mtu) == FALSE) {
         fprintf(stderr, "START_PEER failed: %lu\n", GetLastError());
         return 1;
     }

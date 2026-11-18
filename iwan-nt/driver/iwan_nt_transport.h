@@ -291,6 +291,7 @@ IwanNtTransportStartPeer(
     _Inout_ PIWAN_NT_TRANSPORT Transport,
     _In_reads_z_(64) const char *User,
     _In_reads_z_(64) const char *Password,
+    _In_opt_z_ const char *Salt,
     _In_ uint16_t Mtu
     );
 

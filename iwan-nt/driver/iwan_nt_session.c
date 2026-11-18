@@ -168,6 +168,7 @@ IwanNtSessionKey(
 static size_t
 IwanNtSessionPasswordBlock(
     const char *User,
+    const char *Salt,
     const char *Password,
     uint8_t Out[16]
     )
@@ -180,6 +181,11 @@ IwanNtSessionPasswordBlock(
     IwanNtMd5Initialize(&context);
     IwanNtMd5Update(&context, IwanNtSessionMagic, sizeof(IwanNtSessionMagic));
     IwanNtMd5Update(&context, User, IwanNtStringLength(User));
+    if (Salt != NULL && Salt[0] != '\0') {
+        /* The controller's salt is part of the key material, not of the wire
+         * format: the server looks the salt up by user name. */
+        IwanNtMd5Update(&context, Salt, IwanNtStringLength(Salt));
+    }
     IwanNtMd5Finalize(&context, key);
 
     /*
@@ -255,7 +261,7 @@ IwanNtSessionBuildOpen(
     offset += 2u + userLength;
 
     /* TLV 2: AES-128-ECB of the zero-padded password. */
-    (void)IwanNtSessionPasswordBlock(Open->User, Open->Password, password);
+    (void)IwanNtSessionPasswordBlock(Open->User, Open->Salt, Open->Password, password);
     Buffer[offset + 0u] = IWAN_NT_SESSION_TLV_PASSWORD;
     Buffer[offset + 1u] = 18;
     IwanNtMemCopy(Buffer + offset + 2u, password, sizeof(password));

@@ -1176,6 +1176,11 @@ IwanNtTransportStartPeer(
         KeReleaseSpinLock(&Transport->SessionLock, oldIrql);
         return STATUS_INVALID_PARAMETER;
     }
+    if (!IwanNtPeerSetSalt(&Transport->Peer, Salt)) {
+        IwanNtPeerReset(&Transport->Peer, IwanNtTransportNowMs());
+        KeReleaseSpinLock(&Transport->SessionLock, oldIrql);
+        return STATUS_INVALID_PARAMETER;
+    }
     Transport->PeerReady = TRUE;
     KeReleaseSpinLock(&Transport->SessionLock, oldIrql);
 

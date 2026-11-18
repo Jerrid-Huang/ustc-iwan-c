@@ -98,6 +98,7 @@ TestOpen(void)
 
     open.User = "_rev_m_2";
     open.Password = "testpass123";
+    open.Salt = NULL;
     open.Mtu = 1400;
 
     result = IwanNtSessionBuildOpen(&open, frame, sizeof(frame), &length);
@@ -140,11 +141,39 @@ TestOpen(void)
 
         wire.User = "_rev_m_2";
         wire.Password = "testpass123";
+        wire.Salt = NULL;
         wire.Mtu = 1400u;
         result = IwanNtSessionBuildOpen(&wire, built, sizeof(built), &builtLength);
         Check("wire-ok", result == IwanNtSessionOk);
         Check("wire-length", builtLength == sizeof(expected));
         CheckBytes("wire-bytes", built, expected, sizeof(expected));
+    }
+
+    /*
+     * Salted form: the current controller sends a per-line salt in /m/config and
+     * the server folds it into the OPEN key material (md5("mw" + user + salt)).
+     * Built outside this code the same way as the vector above.
+     */
+    {
+        static const uint8_t expected_salted[] = {
+            0x13, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x36, 0x01, 0x68, 0x0d,
+            0xe3, 0xa6, 0xb3, 0xdd, 0x33, 0x6a, 0xc5, 0x57, 0xc8, 0x7b, 0x50, 0x1b,
+            0x03, 0x04, 0x05, 0x78, 0x01, 0x0a, 0x5f, 0x72, 0x65, 0x76, 0x5f, 0x6d,
+            0x5f, 0x32, 0x02, 0x12, 0x87, 0xa4, 0x84, 0xdf, 0x9f, 0x85, 0x40, 0xd5,
+            0xd9, 0xa3, 0xa9, 0x2b, 0xc4, 0x22, 0x3b, 0x2b, 0x08, 0x03, 0x01,
+        };
+        IWAN_NT_SESSION_OPEN salted;
+        uint8_t built[128];
+        size_t builtLength = 0u;
+
+        salted.User = "_rev_m_2";
+        salted.Password = "testpass123";
+        salted.Salt = "X8LKultXNQL4h9ntism9tE40";
+        salted.Mtu = 1400u;
+        result = IwanNtSessionBuildOpen(&salted, built, sizeof(built), &builtLength);
+        Check("salted-ok", result == IwanNtSessionOk);
+        Check("salted-length", builtLength == sizeof(expected_salted));
+        CheckBytes("salted-bytes", built, expected_salted, sizeof(expected_salted));
     }
 }
 

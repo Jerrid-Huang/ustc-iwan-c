@@ -90,11 +90,16 @@
 #define IWAN_NT_SESSION_STRUCT_SIZE 24u
 #define IWAN_NT_ADDR_STRUCT_SIZE 24u
 #define IWAN_NT_STATS_STRUCT_SIZE 440u
-#define IWAN_NT_CREDENTIALS_STRUCT_SIZE 136u
+#define IWAN_NT_CREDENTIALS_STRUCT_SIZE 176u
 
 /* Field widths inside IWAN_NT_CREDENTIALS_ABI. */
 #define IWAN_NT_CREDENTIALS_USER_MAX 64u
 #define IWAN_NT_CREDENTIALS_PASSWORD_MAX 64u
+/*
+ * Per-line salt from the controller's /m/config (24 characters in the
+ * deployment). Empty keeps the unsalted 1009 derivation.
+ */
+#define IWAN_NT_CREDENTIALS_SALT_MAX 33u
 
 /* Largest control frame accepted in either direction. */
 #define IWAN_NT_CONTROL_MAX 512u
@@ -111,6 +116,12 @@ typedef struct _IWAN_NT_CREDENTIALS_ABI {
     uint16_t Mtu;
     uint16_t Reserved0;
     uint32_t Reserved1;
+    /*
+     * The current controller salts the OPEN key material (md5("mw" + user +
+     * salt)); a 1009 desktop client sends the unsalted form and is rejected.
+     * NUL terminated when non-empty, all zero for the legacy derivation.
+     */
+    uint8_t Salt[40];
 } IWAN_NT_CREDENTIALS_ABI;
 
 typedef struct _IWAN_NT_SESSION_ABI {

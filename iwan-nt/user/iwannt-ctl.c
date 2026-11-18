@@ -692,6 +692,7 @@ CommandOpen(
 
     open.User = Argv[2];
     open.Password = Argv[3];
+    open.Salt = NULL;
     open.Mtu = (uint16_t)strtoul(Argv[4], NULL, 10);
 
     status = IwanNtSessionBuildOpen(&open, frame, sizeof(frame), &length);
