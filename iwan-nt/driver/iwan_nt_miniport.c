@@ -80,7 +80,7 @@ typedef enum _IWAN_NT_MINIPORT_STATE {
  * deep enough that a burst arriving while the stack is busy is not dropped, small
  * enough that the buffers stay uninteresting (32 x one MTU).
  */
-#define IWAN_NT_MINIPORT_RX_SLOTS 32u
+#define IWAN_NT_MINIPORT_RX_SLOTS 256u
 
 /*
  * NDIS rounds a net buffer list context up to a 16-byte boundary and rejects
