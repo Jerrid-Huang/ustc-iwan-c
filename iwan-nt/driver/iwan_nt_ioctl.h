@@ -99,7 +99,7 @@
  * Per-line salt from the controller's /m/config (24 characters in the
  * deployment). Empty keeps the unsalted 1009 derivation.
  */
-#define IWAN_NT_CREDENTIALS_SALT_MAX 33u
+#define IWAN_NT_CREDENTIALS_SALT_MAX 40u
 
 /* Largest control frame accepted in either direction. */
 #define IWAN_NT_CONTROL_MAX 512u
